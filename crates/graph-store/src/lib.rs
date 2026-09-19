@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u64 = 1;
+/// `Node::origin` of files written by a directory run; only these are pruned.
+pub const ORIGIN_DIRECTORY: &str = "directory";
 /// Spans are `u32` byte offsets.
 pub const MAX_SOURCE_BYTES: usize = u32::MAX as usize;
 
@@ -195,7 +197,7 @@ impl Store {
             DatabaseError::DatabaseAlreadyOpen => {
                 StoreError::Locked(path.as_ref().display().to_string())
             }
-            e => StoreError::Storage(e.to_string()),
+            e => StoreError::Storage(format!("{}: {e}", path.as_ref().display())),
         })?;
         let found = {
             let rt = db.begin_read()?;
@@ -228,13 +230,17 @@ impl Store {
         })
     }
 
-    /// Remove files of `org/repo` whose (normalized) path is not in `keep`.
-    /// Returns the removed paths. Nothing else is touched.
+    /// Remove files of `org/repo` whose (normalized) path is not in `keep`,
+    /// considering only files whose last ingest came from a directory run
+    /// (`ORIGIN_DIRECTORY`). Returns the removed paths. Nothing else is
+    /// touched. With `dry_run` nothing is changed and the paths that would be
+    /// removed are returned.
     pub fn prune_files(
         &self,
         org: &str,
         repo: &str,
         keep: &std::collections::HashSet<String>,
+        dry_run: bool,
     ) -> Result<Vec<String>> {
         let wt = self.db.begin_write()?;
         let mut removed = Vec::new();
@@ -262,7 +268,11 @@ impl Store {
                         .get(fid)?
                         .ok_or_else(|| StoreError::Corrupt("dangling file".into()))?
                         .value())?;
-                    if keep.contains(&f.name) {
+                    if keep.contains(&f.name) || f.origin.as_deref() != Some(ORIGIN_DIRECTORY) {
+                        continue;
+                    }
+                    if dry_run {
+                        removed.push(f.name);
                         continue;
                     }
                     remove_descendants(&mut nodes, &mut children, &mut tokens, fid)?;
@@ -273,7 +283,11 @@ impl Store {
                 }
             }
         }
-        wt.commit()?;
+        if dry_run {
+            wt.abort()?;
+        } else {
+            wt.commit()?;
+        }
         removed.sort();
         Ok(removed)
     }
@@ -295,6 +309,20 @@ impl Store {
         bytes: &[u8],
         language: Option<&str>,
     ) -> Result<IngestStats> {
+        self.index_bytes_with_origin(org, repo, path, bytes, language, None)
+    }
+
+    /// Like `index_bytes`, recording `origin` on the file node (replacing any
+    /// earlier value: the last ingest wins).
+    pub fn index_bytes_with_origin(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+        bytes: &[u8],
+        language: Option<&str>,
+        origin: Option<&str>,
+    ) -> Result<IngestStats> {
         if bytes.len() > MAX_SOURCE_BYTES {
             return Err(StoreError::TooLarge(format!("`{path}`")));
         }
@@ -303,7 +331,7 @@ impl Store {
         let path = normalize_path(path);
         let lang = language.map_or_else(|| detect_language(&path), str::to_ascii_lowercase);
         let ex = self.registry.extract(&lang, src);
-        self.ingest_file(org, repo, &path, &lang, &ex)
+        self.ingest_file_with_origin(org, repo, &path, &lang, &ex, origin)
     }
 
     pub fn get(&self, id: NodeId) -> Result<Option<Node>> {
@@ -346,6 +374,19 @@ impl Store {
         language: &str,
         ex: &Extraction,
     ) -> Result<IngestStats> {
+        self.ingest_file_with_origin(org, repo, path, language, ex, None)
+    }
+
+    /// `ingest_file` that also sets the file's `origin` (see `Node::origin`).
+    pub fn ingest_file_with_origin(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+        language: &str,
+        ex: &Extraction,
+        origin: Option<&str>,
+    ) -> Result<IngestStats> {
         if org.is_empty() || repo.is_empty() {
             return Err(StoreError::Rejected(
                 "org and repo must not be empty".into(),
@@ -387,6 +428,7 @@ impl Store {
                     lang_kind: None,
                     token_class: None,
                     has_errors: false,
+                    origin: None,
                     span: None,
                 };
                 nodes.insert(id, enc(&node).as_slice())?;
@@ -412,9 +454,10 @@ impl Store {
                 Some(language),
             )?;
             stats.file_id = file_id;
-            if !existed && ex.has_errors {
+            if !existed {
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
-                f.has_errors = true;
+                f.has_errors = ex.has_errors;
+                f.origin = origin.map(Into::into);
                 nodes.insert(file_id, enc(&f).as_slice())?;
             }
             stats.replaced = existed;
@@ -429,6 +472,7 @@ impl Store {
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
                 f.language = Some(language.into());
                 f.has_errors = ex.has_errors;
+                f.origin = origin.map(Into::into);
                 nodes.insert(file_id, enc(&f).as_slice())?;
             }
 
@@ -505,6 +549,7 @@ impl Store {
                             lang_kind: s.lang_kind.clone(),
                             token_class: None,
                             has_errors: false,
+                            origin: None,
                             span: Some(s.span),
                         },
                         &mut nodes,
@@ -528,6 +573,7 @@ impl Store {
                             lang_kind: None,
                             token_class: Some(t.class),
                             has_errors: false,
+                            origin: None,
                             span: Some(t.span),
                         },
                         &mut nodes,

@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use graph_core::{SymbolKind, TokenClass};
-use graph_store::{Grain, Query, Store};
+use graph_store::{Grain, Query, Store, ORIGIN_DIRECTORY};
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -36,11 +37,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
         /// Skip files larger than this many bytes (lockfiles, minified bundles, dumps)
-        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        #[arg(long, default_value_t = 8 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..))]
         max_file_size: u64,
-        /// Remove files of this repo that were not indexed in this run (deleted, renamed, newly ignored or skipped)
+        /// Remove files of this repo that were not indexed in this run (deleted, renamed, newly ignored or
+        /// skipped). Only files last indexed by a directory run are considered: `index-file` clears that
+        /// mark, and a later directory run sets it again. Skipped when some paths were unreadable; refused
+        /// when nothing was indexed and files would be removed, unless --force
         #[arg(long)]
         prune: bool,
+        /// With --prune: allow removing files even when this run indexed nothing
+        #[arg(long, requires = "prune")]
+        force: bool,
         dir: PathBuf,
     },
     /// Find tokens by exact text
@@ -74,6 +81,31 @@ struct DirOpts<'a> {
     json: bool,
     max_file_size: u64,
     prune: bool,
+    force: bool,
+}
+
+/// Whether `path` is the database file itself: (dev, ino) on unix, otherwise a
+/// canonical-path comparison limited to entries with the database's file name.
+fn is_db_file(
+    meta: &std::fs::Metadata,
+    path: &std::path::Path,
+    db_meta: Option<&std::fs::Metadata>,
+    db_canon: Option<&std::path::Path>,
+    db_name: Option<&std::ffi::OsStr>,
+) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = (path, db_canon, db_name);
+        db_meta.is_some_and(|d| d.dev() == meta.dev() && d.ino() == meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (meta, db_meta);
+        path.file_name() == db_name
+            && db_canon.is_some()
+            && path.canonicalize().ok().as_deref() == db_canon
+    }
 }
 
 /// Index every text file under `dir`. Paths are stored relative to `dir`.
@@ -95,7 +127,9 @@ fn index_dir(o: DirOpts) -> Result<()> {
     let start = std::time::Instant::now();
     let mut store = Store::open(o.db)?;
     store.register(Box::new(graph_lang_rust::RustExtractor));
+    let db_meta = std::fs::metadata(o.db).ok();
     let db_canon = o.db.canonicalize().ok();
+    let db_name = o.db.file_name();
     let (mut files, mut symbols, mut tokens) = (0usize, 0usize, 0usize);
     let mut by_lang: BTreeMap<String, usize> = BTreeMap::new();
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -125,57 +159,79 @@ fn index_dir(o: DirOpts) -> Result<()> {
                 continue;
             }
         };
-        let ft = entry.file_type();
-        let rel = entry.path().strip_prefix(o.dir).unwrap_or(entry.path());
-        if ft.is_some_and(|t| t.is_symlink()) {
-            skipped
-                .entry("symlink".into())
-                .or_default()
-                .push(rel.to_string_lossy().into_owned());
+        if entry.depth() == 0 {
             continue;
         }
-        if !ft.is_some_and(|t| t.is_file()) {
+        let ft = entry.file_type();
+        let rel = entry.path().strip_prefix(o.dir).unwrap_or(entry.path());
+        let skip = |skipped: &mut BTreeMap<String, Vec<String>>, why: &str| {
+            skipped
+                .entry(why.into())
+                .or_default()
+                .push(rel.to_string_lossy().into_owned());
+        };
+        let Some(ft) = ft else { continue };
+        if ft.is_symlink() {
+            skip(&mut skipped, "symlink");
+            continue;
+        }
+        if ft.is_dir() {
+            continue;
+        }
+        if !ft.is_file() {
+            skip(&mut skipped, "not a regular file");
             continue;
         }
         let Some(rel_s) = rel.to_str().map(str::to_owned) else {
-            skipped
-                .entry("non-UTF-8 path".into())
-                .or_default()
-                .push(rel.to_string_lossy().into_owned());
+            skip(&mut skipped, "non-UTF-8 path");
             continue;
         };
-        if db_canon.is_some() && entry.path().canonicalize().ok() == db_canon {
+        let Ok(meta) = entry.metadata() else {
+            walk_errors = true;
+            skipped.entry("unreadable".into()).or_default().push(rel_s);
+            continue;
+        };
+        if is_db_file(
+            &meta,
+            entry.path(),
+            db_meta.as_ref(),
+            db_canon.as_deref(),
+            db_name,
+        ) {
             skipped
                 .entry("database file".into())
                 .or_default()
                 .push(rel_s);
             continue;
         }
-        match entry.metadata() {
-            Ok(m) if m.len() > o.max_file_size => {
-                skipped.entry("too large".into()).or_default().push(rel_s);
-                continue;
-            }
-            Err(_) => {
-                walk_errors = true;
-                skipped.entry("unreadable".into()).or_default().push(rel_s);
-                continue;
-            }
-            _ => {}
+        // Enforce the cap while reading so a file that grows after the walk
+        // cannot exhaust memory.
+        let mut bytes = Vec::new();
+        let read = std::fs::File::open(entry.path()).and_then(|f| {
+            f.take(o.max_file_size.saturating_add(1))
+                .read_to_end(&mut bytes)
+        });
+        if read.is_err() {
+            walk_errors = true;
+            skipped.entry("unreadable".into()).or_default().push(rel_s);
+            continue;
         }
-        let bytes = match std::fs::read(entry.path()) {
-            Ok(b) => b,
-            Err(_) => {
-                walk_errors = true;
-                skipped.entry("unreadable".into()).or_default().push(rel_s);
-                continue;
-            }
-        };
+        if bytes.len() as u64 > o.max_file_size {
+            skipped.entry("too large".into()).or_default().push(rel_s);
+            continue;
+        }
         if bytes.contains(&0) {
             skipped.entry("binary".into()).or_default().push(rel_s);
             continue;
         }
-        match store.index_bytes(o.org, o.repo, &rel_s, &bytes, None) {
+        match store.index_bytes_with_origin(
+            o.org,
+            o.repo,
+            &rel_s,
+            &bytes,
+            None,
+            Some(ORIGIN_DIRECTORY),
+        ) {
             Ok(st) => {
                 files += 1;
                 symbols += st.symbols;
@@ -204,7 +260,19 @@ fn index_dir(o: DirOpts) -> Result<()> {
         if walk_errors {
             eprintln!("warning: --prune skipped because some paths could not be read");
         } else {
-            pruned = store.prune_files(o.org, o.repo, &seen)?;
+            if files == 0 && !o.force {
+                let would = store.prune_files(o.org, o.repo, &seen, true)?;
+                if !would.is_empty() {
+                    bail!(
+                        "--prune refused: no files were indexed but {}/{} has {} directory-indexed file(s) that would be removed; check `{}` or pass --force",
+                        o.org,
+                        o.repo,
+                        would.len(),
+                        o.dir.display()
+                    );
+                }
+            }
+            pruned = store.prune_files(o.org, o.repo, &seen, false)?;
         }
     }
     let ms = start.elapsed().as_millis();
@@ -223,6 +291,18 @@ fn index_dir(o: DirOpts) -> Result<()> {
         );
         for (l, n) in &by_lang {
             println!("  {l}: {n}");
+        }
+        if !pruned.is_empty() {
+            println!("  pruned:");
+            for p in pruned.iter().take(20) {
+                println!("    {p}");
+            }
+            if pruned.len() > 20 {
+                println!(
+                    "    ... and {} more (use --json for all)",
+                    pruned.len() - 20
+                );
+            }
         }
         for (r, v) in &skipped {
             println!("  skipped ({r}): {}", v.len());
@@ -277,6 +357,7 @@ fn main() -> Result<()> {
             json,
             max_file_size,
             prune,
+            force,
             dir,
         } => index_dir(DirOpts {
             db: &cli.db,
@@ -286,6 +367,7 @@ fn main() -> Result<()> {
             json,
             max_file_size,
             prune,
+            force,
         })?,
         Cmd::Search {
             text,

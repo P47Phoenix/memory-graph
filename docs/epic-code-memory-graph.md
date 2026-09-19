@@ -151,6 +151,7 @@ So that a codebase is searchable in one step.
 - Given a binary file, When encountered, Then it must be skipped and counted with a reason.
 - Given a file extension with no known language, When indexed, Then it must go through the fallback tokenizer and not be skipped.
 - Given completion, When the summary prints, Then it must show files, symbols, tokens, skipped files and elapsed time.
+- Given `--prune`, When the run completes cleanly, Then files of that repo that a previous directory run indexed but this run did not must be removed and listed; files added with `index-file` must be kept; and a run that indexed nothing must be refused unless `--force`.
 
 **11. Symbol search by name, kind and language (5 pts)**
 As an AI-agent integrator

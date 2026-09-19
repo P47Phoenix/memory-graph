@@ -469,3 +469,279 @@ mod dir_edge_cases {
         );
     }
 }
+
+mod prune_and_limits {
+    use super::run;
+
+    fn idx(db: &str, repo: &str, extra: &[&str], dir: &std::path::Path) -> (bool, String, String) {
+        let mut a = vec!["--db", db, "index", "--org", "o", "--repo", repo];
+        a.extend_from_slice(extra);
+        a.push(dir.to_str().unwrap());
+        run(&a)
+    }
+
+    fn files_of(db: &str, repo: &str) -> Vec<String> {
+        let (_, out, _) = run(&[
+            "--db", db, "search", "foo", "--grain", "file", "--repo", repo, "--json",
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["file"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn setup(names: &[&str]) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("p");
+        std::fs::create_dir_all(&root).unwrap();
+        for n in names {
+            std::fs::write(root.join(n), "foo\n").unwrap();
+        }
+        let db = d.path().join("g").to_string_lossy().into_owned();
+        (d, root, db)
+    }
+
+    #[test]
+    fn prune_refused_on_empty_walk_unless_forced() {
+        let (_d, root, db) = setup(&["a.txt", "b.txt"]);
+        assert!(idx(&db, "r", &[], &root).0);
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        let (ok, _, err) = idx(&db, "r", &["--prune"], &root);
+        assert!(
+            !ok && err.contains("--prune refused") && err.contains("--force"),
+            "{err}"
+        );
+        assert_eq!(files_of(&db, "r"), ["a.txt", "b.txt"]);
+        let (ok, out, err) = idx(&db, "r", &["--prune", "--force", "--json"], &root);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["pruned"], serde_json::json!(["a.txt", "b.txt"]));
+        assert!(files_of(&db, "r").is_empty());
+        // Nothing to lose: an empty walk is fine without --force.
+        assert!(idx(&db, "r", &["--prune"], &root).0);
+        // --force alone is rejected.
+        assert!(!idx(&db, "r", &["--force"], &root).0);
+    }
+
+    #[test]
+    fn prune_is_scoped_per_repo_and_spares_index_file_files() {
+        let (d, root, db) = setup(&["a.txt", "b.txt"]);
+        assert!(idx(&db, "r1", &[], &root).0);
+        assert!(idx(&db, "r2", &[], &root).0);
+        let single = d.path().join("s.txt");
+        std::fs::write(&single, "foo\n").unwrap();
+        let (ok, o, e) = run(&[
+            "--db",
+            &db,
+            "index-file",
+            "--org",
+            "o",
+            "--repo",
+            "r1",
+            "--language",
+            "text",
+            single.to_str().unwrap(),
+        ]);
+        assert!(ok, "{o}{e}");
+        // b.txt re-added via index-file (same stored path) loses its directory mark.
+        let b = root.join("b.txt");
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+            .current_dir(&root)
+            .args([
+                "--db",
+                &db,
+                "index-file",
+                "--org",
+                "o",
+                "--repo",
+                "r1",
+                "b.txt",
+            ])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        std::fs::remove_file(&b).unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        std::fs::write(root.join("c.txt"), "foo\n").unwrap();
+        let (ok, out, err) = idx(&db, "r1", &["--prune", "--json"], &root);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["pruned"], serde_json::json!(["a.txt"]));
+        let f = files_of(&db, "r1");
+        assert!(f.contains(&"c.txt".to_string()) && !f.contains(&"a.txt".to_string()));
+        assert_eq!(f.len(), 3, "{f:?}"); // b.txt (unmarked), c.txt, absolute s.txt
+        assert_eq!(files_of(&db, "r2"), ["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn prune_after_file_becomes_binary_or_ignored_and_text_output_lists_paths() {
+        let (_d, root, db) = setup(&["a.txt", "b.txt", "c.txt"]);
+        assert!(idx(&db, "r", &[], &root).0);
+        std::fs::write(root.join("a.txt"), [b'f', 0, 1]).unwrap();
+        std::fs::write(root.join(".gitignore"), "b.txt\n").unwrap(); // no .git dir needed
+        let (ok, out, err) = idx(&db, "r", &["--prune"], &root);
+        assert!(ok, "{err}");
+        assert!(
+            out.contains("pruned=2") && out.contains("    a.txt") && out.contains("    b.txt"),
+            "{out}"
+        );
+        assert_eq!(files_of(&db, "r"), ["c.txt"]);
+    }
+
+    #[test]
+    fn prune_text_output_caps_at_twenty() {
+        let (_d, root, db) = setup(&["keep.txt"]);
+        for i in 0..25 {
+            std::fs::write(root.join(format!("f{i:02}.txt")), "foo\n").unwrap();
+        }
+        assert!(idx(&db, "r", &[], &root).0);
+        for i in 0..25 {
+            std::fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
+        }
+        let (ok, out, _) = idx(&db, "r", &["--prune"], &root);
+        assert!(ok && out.contains("... and 5 more"), "{out}");
+    }
+
+    #[test]
+    fn max_file_size_boundary_and_zero_rejected() {
+        let (_d, root, db) = setup(&[]);
+        std::fs::write(root.join("exact.txt"), "12345").unwrap();
+        std::fs::write(root.join("over.txt"), "123456").unwrap();
+        let (ok, out, err) = idx(&db, "r", &["--max-file-size", "5", "--json"], &root);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["files"], 1);
+        assert_eq!(
+            v["skipped_by_reason"]["too large"],
+            serde_json::json!(["over.txt"])
+        );
+        let (ok, _, err) = idx(&db, "r", &["--max-file-size", "0"], &root);
+        assert!(!ok && err.contains("--max-file-size"), "{err}");
+    }
+
+    #[test]
+    fn json_keys_and_clean_stderr() {
+        let (_d, root, db) = setup(&["a.txt"]);
+        let (ok, out, err) = idx(&db, "r", &["--json", "--prune"], &root);
+        assert!(ok && err.is_empty(), "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert!(v["pruned"].as_array().unwrap().is_empty());
+        assert!(v["skipped_by_reason"].is_object());
+    }
+
+    #[test]
+    fn db_in_missing_directory_names_the_path() {
+        let (d, root, _) = setup(&["a.txt"]);
+        let db = d.path().join("missing").join("g");
+        let (ok, _, err) = idx(db.to_str().unwrap(), "r", &[], &root);
+        assert!(!ok && err.contains("missing"), "{err}");
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        #[test]
+        fn prune_skipped_and_data_kept_when_subdir_unreadable() {
+            let (_d, root, db) = setup(&["a.txt", "gone.txt"]);
+            std::fs::create_dir(root.join("priv")).unwrap();
+            std::fs::write(root.join("priv/p.txt"), "foo\n").unwrap();
+            assert!(idx(&db, "r", &[], &root).0);
+            std::fs::remove_file(root.join("gone.txt")).unwrap();
+            std::fs::set_permissions(root.join("priv"), std::fs::Permissions::from_mode(0o0))
+                .unwrap();
+            let unreadable = std::fs::read_dir(root.join("priv")).is_err();
+            let (ok, out, err) = idx(&db, "r", &["--prune", "--json"], &root);
+            std::fs::set_permissions(root.join("priv"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            if !unreadable {
+                return; // running as root: permissions are not enforced
+            }
+            assert!(ok, "{err}");
+            assert!(err.contains("--prune skipped"), "{err}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            assert!(v["pruned"].as_array().unwrap().is_empty());
+            assert_eq!(files_of(&db, "r"), ["a.txt", "gone.txt", "priv/p.txt"]);
+        }
+
+        #[test]
+        fn non_utf8_filename_is_skipped() {
+            let (_d, root, db) = setup(&["ok.txt"]);
+            let bad = root.join(std::ffi::OsStr::from_bytes(b"bad\xff.txt"));
+            if std::fs::write(&bad, "foo\n").is_err() {
+                return; // filesystem refuses such names
+            }
+            let (ok, out, err) = idx(&db, "r", &["--json"], &root);
+            assert!(ok, "{err}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            assert_eq!(v["files"], 1);
+            assert_eq!(
+                v["skipped_by_reason"]["non-UTF-8 path"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        #[test]
+        fn symlinked_root_is_indexed_without_bogus_skip() {
+            let (d, root, db) = setup(&["a.txt"]);
+            let link = d.path().join("link");
+            symlink(&root, &link).unwrap();
+            let (ok, out, err) = idx(&db, "r", &["--json"], &link);
+            assert!(ok, "{err}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            assert_eq!(v["files"], 1);
+            assert!(
+                v["skipped_by_reason"].as_object().unwrap().is_empty(),
+                "{v}"
+            );
+        }
+
+        #[test]
+        fn fifo_is_skipped_as_not_a_regular_file() {
+            let (_d, root, db) = setup(&["a.txt"]);
+            let made = std::process::Command::new("mkfifo")
+                .arg(root.join("pipe"))
+                .status()
+                .is_ok_and(|s| s.success());
+            if !made {
+                return;
+            }
+            let (ok, out, err) = idx(&db, "r", &["--json"], &root);
+            assert!(ok, "{err}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            assert_eq!(
+                v["skipped_by_reason"]["not a regular file"],
+                serde_json::json!(["pipe"])
+            );
+            assert_eq!(v["files"], 1);
+        }
+
+        #[test]
+        fn db_file_inside_dir_is_skipped_via_hard_link_too() {
+            let (_d, root, _) = setup(&["a.txt"]);
+            let db = root.join("g.redb");
+            let dbs = db.to_str().unwrap();
+            assert!(idx(dbs, "r", &[], &root).0);
+            std::fs::hard_link(&db, root.join("alias.redb")).unwrap();
+            let (ok, out, err) = idx(dbs, "r", &["--json"], &root);
+            assert!(ok, "{err}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            assert_eq!(
+                v["skipped_by_reason"]["database file"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
+}
