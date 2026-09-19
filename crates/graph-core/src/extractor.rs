@@ -23,6 +23,25 @@ pub trait Extractor {
     /// Language string stored on File nodes.
     fn language(&self) -> &str;
     fn extract(&self, source: &str) -> Extraction;
+    /// Version of this extractor's output. Bump it whenever a change would
+    /// alter what `extract` returns, so stored files are re-indexed.
+    ///
+    /// Extractors that use the shared tokenizer should include
+    /// `tokenizer::TOKENIZER_VERSION` in it.
+    fn version(&self) -> String {
+        "1".to_string()
+    }
+}
+
+/// Base version of the fallback (tokenizer-only) extraction; its `version()`
+/// also carries `tokenizer::TOKENIZER_VERSION`.
+pub const FALLBACK_EXTRACTOR_VERSION: &str = "fallback-1";
+
+fn fallback_version() -> String {
+    format!(
+        "{FALLBACK_EXTRACTOR_VERSION}+tok{}",
+        crate::tokenizer::TOKENIZER_VERSION
+    )
 }
 
 /// Fallback: tokens only, no symbols. Works for any language.
@@ -41,6 +60,9 @@ impl FallbackExtractor {
 impl Extractor for FallbackExtractor {
     fn language(&self) -> &str {
         &self.language
+    }
+    fn version(&self) -> String {
+        fallback_version()
     }
     fn extract(&self, source: &str) -> Extraction {
         Extraction {
@@ -67,6 +89,14 @@ impl Registry {
         match self.extractors.get(language) {
             Some(e) => e.extract(source),
             None => FallbackExtractor::new(language).extract(source),
+        }
+    }
+
+    /// Version of the extractor that `extract` would use for `language`.
+    pub fn version(&self, language: &str) -> String {
+        match self.extractors.get(language) {
+            Some(e) => e.version(),
+            None => fallback_version(),
         }
     }
 

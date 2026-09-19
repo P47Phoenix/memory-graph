@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use graph_core::TokenClass;
-use graph_store::{Grain, Query, Store, SymbolQuery, ORIGIN_DIRECTORY};
+use graph_store::{Grain, IndexOptions, Query, Store, SymbolQuery, ORIGIN_DIRECTORY};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -33,6 +33,9 @@ enum Cmd {
         /// Language override (default: detected from extension)
         #[arg(long)]
         language: Option<String>,
+        /// Re-index even when the file is unchanged since it was last indexed
+        #[arg(long)]
+        reindex: bool,
         path: PathBuf,
     },
     /// Index a directory as a repo (honors .gitignore; skips binary files)
@@ -55,6 +58,10 @@ enum Cmd {
         /// With --prune: allow removing files even when this run indexed nothing
         #[arg(long, requires = "prune")]
         force: bool,
+        /// Re-index every file even when unchanged since it was last indexed (by default files with the
+        /// same content, language and extractor version are skipped). Does not affect --prune's safety checks
+        #[arg(long)]
+        reindex: bool,
         dir: PathBuf,
     },
     /// Show what is indexed: per repo, the languages present and each language's symbol kinds
@@ -137,6 +144,16 @@ struct DirOpts<'a> {
     max_file_size: u64,
     prune: bool,
     force: bool,
+    reindex: bool,
+}
+
+/// Open the store for a command that indexes, with every shipped extractor
+/// registered: the extractor version is part of a file's fingerprint, so
+/// indexing without one would downgrade already-indexed files to tokens only.
+fn open_for_indexing(db: &std::path::Path) -> Result<Store> {
+    let mut store = Store::open(db)?;
+    store.register(Box::new(graph_lang_rust::RustExtractor));
+    Ok(store)
 }
 
 /// Whether `path` is the database file itself: (dev, ino) on unix, otherwise a
@@ -169,6 +186,7 @@ const BATCH_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Default)]
 struct Tally {
     files: usize,
+    unchanged: usize,
     symbols: usize,
     tokens: usize,
     by_lang: std::collections::BTreeMap<String, usize>,
@@ -195,17 +213,20 @@ fn flush_batch(
             origin: Some(ORIGIN_DIRECTORY),
         })
         .collect();
-    let outcomes = store.index_batch(o.org, o.repo, &inputs).with_context(|| {
-        format!(
-            "database error while indexing a batch of {} files ({} files were already stored)",
-            inputs.len(),
-            t.files
-        )
-    })?;
+    let outcomes = store
+        .index_batch(o.org, o.repo, &inputs, IndexOptions { reindex: o.reindex })
+        .with_context(|| {
+            format!(
+                "database error while indexing a batch of {} files ({} files were already stored)",
+                inputs.len(),
+                t.files
+            )
+        })?;
     for ((rel, _), r) in pending.iter().zip(outcomes) {
         match r {
             Ok(st) => {
                 t.files += 1;
+                t.unchanged += usize::from(st.unchanged);
                 t.symbols += st.symbols;
                 t.tokens += st.tokens;
                 *t.by_lang.entry(st.language).or_default() += 1;
@@ -245,8 +266,7 @@ fn index_dir(o: DirOpts) -> Result<()> {
         );
     }
     let start = std::time::Instant::now();
-    let mut store = Store::open(o.db)?;
-    store.register(Box::new(graph_lang_rust::RustExtractor));
+    let store = open_for_indexing(o.db)?;
     let db_meta = std::fs::metadata(o.db).ok();
     let db_canon = o.db.canonicalize().ok();
     let db_name = o.db.file_name();
@@ -355,6 +375,7 @@ fn index_dir(o: DirOpts) -> Result<()> {
     flush_batch(&store, &o, &mut pending, &mut tally)?;
     let Tally {
         files,
+        unchanged,
         symbols,
         tokens,
         by_lang,
@@ -388,14 +409,14 @@ fn index_dir(o: DirOpts) -> Result<()> {
     let skipped_n: usize = skipped.values().map(Vec::len).sum();
     if o.json {
         let out = serde_json::json!({
-            "org": o.org, "repo": o.repo, "files": files, "symbols": symbols, "tokens": tokens,
+            "org": o.org, "repo": o.repo, "files": files, "unchanged": unchanged, "symbols": symbols, "tokens": tokens,
             "languages": by_lang, "skipped": skipped_n, "skipped_by_reason": skipped,
             "pruned": pruned, "elapsed_ms": ms,
         });
         out!("{}", serde_json::to_string(&out)?);
     } else {
         out!(
-            "indexed {}/{}: files={files} symbols={symbols} tokens={tokens} skipped={skipped_n} pruned={} elapsed={ms}ms",
+            "indexed {}/{}: files={files} unchanged={unchanged} symbols={symbols} tokens={tokens} skipped={skipped_n} pruned={} elapsed={ms}ms",
             o.org, o.repo, pruned.len()
         );
         for (l, n) in &by_lang {
@@ -520,6 +541,7 @@ fn run() -> Result<()> {
             org,
             repo,
             language,
+            reindex,
             path,
         } => {
             let bytes = std::fs::read(&path)
@@ -533,17 +555,25 @@ fn run() -> Result<()> {
                     cli.db.display()
                 );
             }
-            let mut store = Store::open(&cli.db)?;
-            store.register(Box::new(graph_lang_rust::RustExtractor));
-            let st = store.index_bytes(&org, &repo, path_str, &bytes, language.as_deref())?;
+            let store = open_for_indexing(&cli.db)?;
+            let st = store.index_bytes_opts(
+                &org,
+                &repo,
+                path_str,
+                &bytes,
+                language.as_deref(),
+                None,
+                IndexOptions { reindex },
+            )?;
             let lang = st.language.clone();
             out!(
-                "indexed {} ({}) tokens={} symbols={}{}{}",
+                "indexed {} ({}) tokens={} symbols={}{}{}{}",
                 path.display(),
                 lang,
                 st.tokens,
                 st.symbols,
                 if st.replaced { " [replaced]" } else { "" },
+                if st.unchanged { " [unchanged]" } else { "" },
                 if st.has_errors { " [has_errors]" } else { "" }
             );
         }
@@ -554,6 +584,7 @@ fn run() -> Result<()> {
             max_file_size,
             prune,
             force,
+            reindex,
             dir,
         } => index_dir(DirOpts {
             db: &cli.db,
@@ -564,6 +595,7 @@ fn run() -> Result<()> {
             max_file_size,
             prune,
             force,
+            reindex,
         })?,
         Cmd::Describe { org, repo, json } => {
             let store = open_existing(&cli.db)?;

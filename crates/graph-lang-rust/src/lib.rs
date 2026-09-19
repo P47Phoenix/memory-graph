@@ -16,6 +16,10 @@ impl Extractor for RustExtractor {
         "rust"
     }
 
+    fn version(&self) -> String {
+        format!("rust-syn-1+tok{}", graph_core::tokenizer::TOKENIZER_VERSION)
+    }
+
     fn extract(&self, source: &str) -> Extraction {
         let tokens = tokenize(source);
         // syn strips a BOM before lexing, so its byte ranges start after it.
