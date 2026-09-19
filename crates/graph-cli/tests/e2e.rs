@@ -183,3 +183,73 @@ fn non_utf8_stores_nothing_and_lock_is_reported() {
     ]);
     assert!(!ok && err.contains("directory"));
 }
+
+#[test]
+fn rust_symbols_grains_end_to_end() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let rs = d.path().join("lib.rs");
+    std::fs::write(&rs, "struct S;\nimpl S {\n    fn a(&self) { foo(); foo(); }\n    fn b(&self) { foo(); }\n}\nfn free() { foo(); }\n").unwrap();
+    let zig = d.path().join("m.zig");
+    std::fs::write(&zig, "pub fn main() void { foo(); }\n").unwrap();
+    for (o, f) in [("o1", &rs), ("o2", &zig)] {
+        let (ok, out, err) = run(&[
+            "--db",
+            &db,
+            "index-file",
+            "--org",
+            o,
+            "--repo",
+            "r",
+            f.to_str().unwrap(),
+        ]);
+        assert!(ok, "{out}{err}");
+    }
+    let rows = |args: &[&str]| -> Vec<serde_json::Value> {
+        let mut a = vec!["--db", &db, "search", "foo", "--json"];
+        a.extend_from_slice(args);
+        let (_, out, _) = run(&a);
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(rows(&["--grain", "token"]).len(), 5);
+    let m = rows(&["--grain", "symbol", "--symbol-kind", "method"]);
+    let got: Vec<_> = m
+        .iter()
+        .map(|r| {
+            (
+                r["symbol"].as_str().map(String::from),
+                r["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    // Rows are ordered by file then offset; the roll-up row for free() (no
+    // enclosing method) sits at offset 0 of its file.
+    assert_eq!(got[0], (None, 1));
+    assert_eq!(m[0]["no_matching_symbol"], true);
+    assert_eq!(got[1], (Some("S::a".into()), 2));
+    assert_eq!(got[2], (Some("S::b".into()), 1));
+    assert_eq!(m[3]["no_symbols"], true);
+    assert_eq!(rows(&["--grain", "file"]).len(), 2);
+    assert_eq!(rows(&["--grain", "repo"]).len(), 2);
+    assert_eq!(rows(&["--grain", "org"]).len(), 2);
+    // Syntax error falls back and is reported.
+    let bad = d.path().join("bad.rs");
+    std::fs::write(&bad, "fn foo( {").unwrap();
+    let (ok, out, _) = run(&[
+        "--db",
+        &db,
+        "index-file",
+        "--org",
+        "o1",
+        "--repo",
+        "r",
+        bad.to_str().unwrap(),
+    ]);
+    assert!(
+        ok && out.contains("[has_errors]") && out.contains("symbols=0"),
+        "{out}"
+    );
+}

@@ -1,0 +1,10 @@
+[package]
+name = "graph-lang-rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+graph-core = { path = "../graph-core" }
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }

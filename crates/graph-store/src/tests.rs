@@ -39,6 +39,7 @@ const ZIG: &str = "pub fn main() void { foo(); }\n";
 fn setup(dir: &std::path::Path) -> Store {
     let s = Store::open(dir.join("g.redb")).unwrap();
     let ex = Extraction {
+        has_errors: false,
         symbols: vec![
             sym("S", SymbolKind::Type, span_of(RUST, RUST.trim_end(), 0)),
             sym(
@@ -56,6 +57,7 @@ fn setup(dir: &std::path::Path) -> Store {
     };
     s.ingest_file("o1", "r1", "lib.rs", "rust", &ex).unwrap();
     let z = Extraction {
+        has_errors: false,
         symbols: vec![],
         tokens: tokenize(ZIG),
     };
@@ -132,6 +134,7 @@ fn reindex_no_duplicates() {
         s.count_nodes(NodeKind::Symbol).unwrap(),
     );
     let z = Extraction {
+        has_errors: false,
         symbols: vec![],
         tokens: tokenize(ZIG),
     };
@@ -148,6 +151,7 @@ fn reindex_no_duplicates() {
     assert_eq!(s.search(&Query::new("foo")).unwrap().len(), 4);
     // Shrinking the file removes stale tokens.
     let e = Extraction {
+        has_errors: false,
         symbols: vec![],
         tokens: tokenize("bar"),
     };
@@ -203,6 +207,7 @@ fn partial_overlap_and_bad_spans_rejected_atomically() {
     let mk = |a: &str, b: &str| (span_of(src, a, 0), span_of(src, b, 0));
     let (a, b) = mk("aaaa bbbb", "bbbb cccc"); // b starts inside a, ends after
     let ex = Extraction {
+        has_errors: false,
         symbols: vec![sym("A", SymbolKind::Type, a), sym("B", SymbolKind::Type, b)],
         tokens: tokenize(src),
     };
@@ -216,6 +221,7 @@ fn partial_overlap_and_bad_spans_rejected_atomically() {
     bad.end = 0;
     bad.start = 3;
     let ex = Extraction {
+        has_errors: false,
         symbols: vec![sym("A", SymbolKind::Type, bad)],
         tokens: vec![],
     };

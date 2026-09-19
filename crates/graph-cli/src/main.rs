@@ -70,16 +70,18 @@ fn main() -> Result<()> {
                     cli.db.display()
                 );
             }
-            let store = Store::open(&cli.db)?;
+            let mut store = Store::open(&cli.db)?;
+            store.register(Box::new(graph_lang_rust::RustExtractor));
             let st = store.index_bytes(&org, &repo, path_str, &bytes, language.as_deref())?;
             let lang = st.language.clone();
             println!(
-                "indexed {} ({}) tokens={} symbols={}{}",
+                "indexed {} ({}) tokens={} symbols={}{}{}",
                 path.display(),
                 lang,
                 st.tokens,
                 st.symbols,
-                if st.replaced { " [replaced]" } else { "" }
+                if st.replaced { " [replaced]" } else { "" },
+                if st.has_errors { " [has_errors]" } else { "" }
             );
         }
         Cmd::Search {

@@ -14,6 +14,8 @@ pub struct SymbolDecl {
 pub struct Extraction {
     pub symbols: Vec<SymbolDecl>,
     pub tokens: Vec<TokenDecl>,
+    /// The source had syntax errors; the extractor fell back to tokens only.
+    pub has_errors: bool,
 }
 
 /// Language support plugs in here. Implementations use only schema types.
@@ -44,6 +46,31 @@ impl Extractor for FallbackExtractor {
         Extraction {
             symbols: vec![],
             tokens: crate::tokenizer::tokenize(source),
+            has_errors: false,
         }
+    }
+}
+
+/// Maps language names to extractors; unknown languages use the fallback.
+#[derive(Default)]
+pub struct Registry {
+    extractors: std::collections::HashMap<String, Box<dyn Extractor>>,
+}
+
+impl Registry {
+    pub fn register(&mut self, e: Box<dyn Extractor>) {
+        self.extractors.insert(e.language().to_ascii_lowercase(), e);
+    }
+
+    /// Extract with the registered extractor for `language`, else the fallback.
+    pub fn extract(&self, language: &str, source: &str) -> Extraction {
+        match self.extractors.get(language) {
+            Some(e) => e.extract(source),
+            None => FallbackExtractor::new(language).extract(source),
+        }
+    }
+
+    pub fn has(&self, language: &str) -> bool {
+        self.extractors.contains_key(language)
     }
 }

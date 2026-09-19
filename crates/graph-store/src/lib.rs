@@ -1,8 +1,8 @@
 //! Embedded graph store on `redb` (pure Rust). Knows nothing about any
 //! particular language.
 use graph_core::{
-    check_contains, detect_language, normalize_path, Extraction, Extractor, FallbackExtractor,
-    Node, NodeId, NodeKind, Span, SymbolKind, TokenClass,
+    check_contains, detect_language, normalize_path, Extraction, Extractor, Node, NodeId, NodeKind,
+    Registry, Span, SymbolKind, TokenClass,
 };
 use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
@@ -54,6 +54,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct Store {
     db: Database,
+    registry: Registry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -138,6 +139,8 @@ pub struct IngestStats {
     pub tokens: usize,
     /// True when an existing file was replaced.
     pub replaced: bool,
+    /// The file was flagged `has_errors`.
+    pub has_errors: bool,
     /// Normalized path and language actually stored.
     pub path: String,
     pub language: String,
@@ -190,7 +193,15 @@ impl Store {
                 wt.commit()?;
             }
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            registry: Registry::default(),
+        })
+    }
+
+    /// Register a language extractor used by `index_bytes`.
+    pub fn register(&mut self, e: Box<dyn Extractor>) {
+        self.registry.register(e);
     }
 
     /// Index raw file bytes: the single entry point shared by the CLI and
@@ -214,8 +225,8 @@ impl Store {
             .map_err(|e| StoreError::Rejected(format!("`{path}` is not valid UTF-8 ({e})")))?;
         let path = normalize_path(path);
         let lang = language.map_or_else(|| detect_language(&path), str::to_ascii_lowercase);
-        let ex = FallbackExtractor::new(lang.as_str());
-        self.ingest_file(org, repo, &path, ex.language(), &ex.extract(src))
+        let ex = self.registry.extract(&lang, src);
+        self.ingest_file(org, repo, &path, &lang, &ex)
     }
 
     pub fn get(&self, id: NodeId) -> Result<Option<Node>> {
@@ -293,6 +304,7 @@ impl Store {
                     symbol_kind: None,
                     lang_kind: None,
                     token_class: None,
+                    has_errors: false,
                     span: None,
                 };
                 nodes.insert(id, enc(&node).as_slice())?;
@@ -318,7 +330,13 @@ impl Store {
                 Some(language),
             )?;
             stats.file_id = file_id;
+            if !existed && ex.has_errors {
+                let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
+                f.has_errors = true;
+                nodes.insert(file_id, enc(&f).as_slice())?;
+            }
             stats.replaced = existed;
+            stats.has_errors = ex.has_errors;
             stats.path = path.to_string();
             stats.language = language.to_string();
 
@@ -345,6 +363,7 @@ impl Store {
                 // Refresh language.
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
                 f.language = Some(language.into());
+                f.has_errors = ex.has_errors;
                 nodes.insert(file_id, enc(&f).as_slice())?;
             }
 
@@ -420,6 +439,7 @@ impl Store {
                             symbol_kind: Some(s.kind),
                             lang_kind: s.lang_kind.clone(),
                             token_class: None,
+                            has_errors: false,
                             span: Some(s.span),
                         },
                         &mut nodes,
@@ -442,6 +462,7 @@ impl Store {
                             symbol_kind: None,
                             lang_kind: None,
                             token_class: Some(t.class),
+                            has_errors: false,
                             span: Some(t.span),
                         },
                         &mut nodes,
