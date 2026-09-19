@@ -16,8 +16,8 @@ impl Extractor for RustExtractor {
         "rust"
     }
 
-    fn version(&self) -> &str {
-        "rust-syn-1"
+    fn version(&self) -> String {
+        format!("rust-syn-1+tok{}", graph_core::tokenizer::TOKENIZER_VERSION)
     }
 
     fn extract(&self, source: &str) -> Extraction {

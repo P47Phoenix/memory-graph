@@ -523,8 +523,21 @@ mod prune_and_limits {
         assert!(files_of(&db, "r").is_empty());
         // Nothing to lose: an empty walk is fine without --force.
         assert!(idx(&db, "r", &["--prune"], &root).0);
-        // --force alone is accepted: it means "re-index regardless".
-        assert!(idx(&db, "r", &["--force"], &root).0);
+        // --force only makes sense with --prune.
+        let (ok, _, err) = idx(&db, "r", &["--force"], &root);
+        assert!(!ok && err.contains("--prune"), "{err}");
+        // --reindex is not --force: it never bypasses the empty-run guard.
+        assert!(idx(&db, "r", &[], &root).0);
+    }
+
+    #[test]
+    fn reindex_prune_on_empty_dir_is_still_refused() {
+        let (_d, root, db) = setup(&["a.txt"]);
+        assert!(idx(&db, "r", &[], &root).0);
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        let (ok, _, err) = idx(&db, "r", &["--reindex", "--prune"], &root);
+        assert!(!ok && err.contains("--prune refused"), "{err}");
+        assert_eq!(files_of(&db, "r"), ["a.txt"]);
     }
 
     #[test]
@@ -1278,8 +1291,14 @@ mod unchanged_files {
             serde_json::json!([]),
             "old symbol gone: {out}"
         );
-        // --force re-indexes everything.
-        let v = idx(db, &["--force"], &src);
+        // --force --prune alone does not re-index.
+        let v = idx(db, &["--prune", "--force"], &src);
+        assert_eq!(
+            (v["files"].as_u64(), v["unchanged"].as_u64()),
+            (Some(4), Some(4))
+        );
+        // --reindex re-indexes everything.
+        let v = idx(db, &["--reindex"], &src);
         assert_eq!(
             (v["files"].as_u64(), v["unchanged"].as_u64()),
             (Some(4), Some(0))
@@ -1287,7 +1306,7 @@ mod unchanged_files {
     }
 
     #[test]
-    fn index_file_reports_unchanged_and_force_reindexes() {
+    fn index_file_reports_unchanged_and_reindex_reindexes() {
         let d = tempfile::tempdir().unwrap();
         let db = d.path().join("g");
         let db = db.to_str().unwrap();
@@ -1308,11 +1327,43 @@ mod unchanged_files {
             out.contains("[unchanged]") && out.contains("symbols=0"),
             "{out}"
         );
-        let out = go(&["--force"]);
+        let out = go(&["--reindex"]);
         assert!(
             out.contains("[replaced]") && !out.contains("[unchanged]"),
             "{out}"
         );
         assert!(out.contains("symbols=1"), "{out}");
+    }
+
+    #[test]
+    fn index_and_index_file_share_extractors_so_files_stay_unchanged() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g");
+        let db = db.to_str().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn a() {}\n").unwrap();
+        // index-file stores the path as given (known issue), so run it from inside `src`.
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+            .current_dir(&src)
+            .args([
+                "--db",
+                db,
+                "index-file",
+                "--org",
+                "o",
+                "--repo",
+                "r",
+                "a.rs",
+            ])
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success() && out.contains("symbols=1"), "{out}");
+        // Both paths register the Rust extractor: the directory run sees an identical fingerprint.
+        let v = idx(db, &[], &src);
+        assert_eq!(v["unchanged"].as_u64(), Some(1), "{v}");
+        let (_, out, _) = run(&["--db", db, "symbols", "a", "--json"]);
+        assert!(out.contains("\"a\""), "{out}");
     }
 }

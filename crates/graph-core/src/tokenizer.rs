@@ -1,6 +1,12 @@
 //! Generic fallback tokenizer: language-agnostic, never fails.
 use crate::schema::{Span, TokenClass, TokenDecl};
 
+/// Version of the tokenizer's output. Bump it whenever a change alters the
+/// tokens `tokenize` returns for any input; it is folded into extractor
+/// versions (and so file fingerprints) so stored files re-index. The golden
+/// test `tokenizer_output_is_pinned` fails when output changes without a bump.
+pub const TOKENIZER_VERSION: u32 = 1;
+
 const OPERATOR_CHARS: &str = "+-*/%=<>!&|^~?@";
 
 /// Tokenize everything except whitespace (a BOM counts as whitespace; offsets
@@ -118,6 +124,38 @@ mod tests {
 
     fn texts(s: &str) -> Vec<String> {
         tokenize(s).into_iter().map(|t| t.text).collect()
+    }
+
+    const GOLDEN: u64 = 0x4ee808b12b2ae44e;
+    const GOLDEN_VERSION: u32 = 1;
+
+    /// Golden test: pins tokenizer output for a fixed source set.
+    #[test]
+    fn tokenizer_output_is_pinned() {
+        const SOURCES: &[&str] = &[
+            "fn main() { let x = 1 + 2; // hi\n}\n",
+            "/* block */ \"str\" 'c' 0xFF 1.5e3 a::b -> c",
+            "\u{feff}def f(a, b):\n    return a >= b  # cmp\n",
+            "unterminated \"string",
+            "/* unterminated",
+            "héllo wörld = ünï",
+        ];
+        // FNV-1a 64 over the Debug rendering of every token.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for src in SOURCES {
+            for b in format!("{:?}", tokenize(src)).bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+            }
+        }
+        assert_eq!(
+            h, GOLDEN,
+            "tokenizer output changed (hash {h:#x}): bump TOKENIZER_VERSION in \
+             graph-core/src/tokenizer.rs and update GOLDEN in this test"
+        );
+        assert_eq!(
+            TOKENIZER_VERSION, GOLDEN_VERSION,
+            "update GOLDEN_VERSION with the bump"
+        );
     }
 
     #[test]

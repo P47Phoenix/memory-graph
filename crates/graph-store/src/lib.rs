@@ -94,7 +94,13 @@ type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     db: Database,
     registry: Registry,
-    force: bool,
+}
+
+/// Options for `index_bytes_opts` / `index_batch`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexOptions {
+    /// Re-index files even when their fingerprint is unchanged.
+    pub reindex: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -425,7 +431,6 @@ impl Store {
         Ok(Self {
             db,
             registry: Registry::default(),
-            force: false,
         })
     }
 
@@ -492,12 +497,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// With `force`, `index_bytes*` and `index_batch` re-index files even when
-    /// their fingerprint is unchanged.
-    pub fn set_force(&mut self, force: bool) {
-        self.force = force;
-    }
-
     /// Fingerprint of `bytes` indexed as `lang` with the current extractor.
     fn fingerprint(&self, bytes: &[u8], lang: &str) -> String {
         use sha2::{Digest, Sha256};
@@ -520,6 +519,7 @@ impl Store {
         org: &str,
         repo: &str,
         path: &str,
+        lang: &str,
         fp: &str,
         origin: Option<&str>,
     ) -> Result<Option<(IngestStats, bool)>> {
@@ -553,7 +553,7 @@ impl Store {
             unchanged: true,
             has_errors: f.has_errors,
             path: path.to_string(),
-            language: f.language.clone().unwrap_or_default(),
+            language: lang.to_string(),
             ..IngestStats::default()
         };
         if dirty {
@@ -564,6 +564,11 @@ impl Store {
     }
 
     /// Register a language extractor used by `index_bytes`.
+    ///
+    /// Register every shipped extractor before indexing: the extractor version
+    /// is part of a file's fingerprint, so a store without (say) the Rust
+    /// extractor treats already-indexed Rust files as changed and re-indexes
+    /// them with the token-only fallback, silently dropping their symbols.
     pub fn register(&mut self, e: Box<dyn Extractor>) {
         self.registry.register(e);
     }
@@ -594,6 +599,29 @@ impl Store {
         language: Option<&str>,
         origin: Option<&str>,
     ) -> Result<IngestStats> {
+        self.index_bytes_opts(
+            org,
+            repo,
+            path,
+            bytes,
+            language,
+            origin,
+            IndexOptions::default(),
+        )
+    }
+
+    /// Like `index_bytes_with_origin` with explicit `opts` (e.g. `reindex`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_bytes_opts(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+        bytes: &[u8],
+        language: Option<&str>,
+        origin: Option<&str>,
+        opts: IndexOptions,
+    ) -> Result<IngestStats> {
         if bytes.len() > MAX_SOURCE_BYTES {
             return Err(StoreError::TooLarge(format!("`{path}`")));
         }
@@ -606,8 +634,9 @@ impl Store {
         );
         let fp = self.fingerprint(bytes, &lang);
         let wt = self.db.begin_write()?;
-        if !self.force {
-            if let Some((stats, dirty)) = Self::check_unchanged(&wt, org, repo, &path, &fp, origin)?
+        if !opts.reindex {
+            if let Some((stats, dirty)) =
+                Self::check_unchanged(&wt, org, repo, &path, &lang, &fp, origin)?
             {
                 if dirty {
                     wt.commit()?;
@@ -692,6 +721,7 @@ impl Store {
         org: &str,
         repo: &str,
         files: &[BatchFile<'_>],
+        opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
         let wt = self.db.begin_write()?;
         let mut out = Vec::with_capacity(files.len());
@@ -710,9 +740,9 @@ impl Store {
                 str::to_ascii_lowercase,
             );
             let fp = self.fingerprint(f.bytes, &lang);
-            if !self.force {
+            if !opts.reindex {
                 if let Some((stats, _)) =
-                    Self::check_unchanged(&wt, org, repo, &path, &fp, f.origin)?
+                    Self::check_unchanged(&wt, org, repo, &path, &lang, &fp, f.origin)?
                 {
                     out.push(Ok(stats));
                     continue;

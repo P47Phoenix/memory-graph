@@ -300,7 +300,9 @@ fn every_parsed_token_is_stored() {
                     origin: None,
                 })
                 .collect();
-            let stats = store.index_batch(org, repo, &batch).unwrap();
+            let stats = store
+                .index_batch(org, repo, &batch, graph_store::IndexOptions::default())
+                .unwrap();
             for ((rel, bytes), st) in rels.iter().zip(&contents).zip(stats) {
                 let st = st.unwrap();
                 let src = std::str::from_utf8(bytes).unwrap();
@@ -398,7 +400,8 @@ fn token_classes_are_sensible_on_real_code() {
 }
 
 /// A second `index` of the same corpus skips every file, changes nothing and
-/// reports it; `--force` re-indexes them all.
+/// reports it; `--reindex` re-indexes them all. A `--force --prune` run alone
+/// must not re-index.
 #[test]
 fn second_index_of_the_corpus_reports_everything_unchanged() {
     let m = manifest();
@@ -417,20 +420,33 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         serde_json::from_slice(&o.stdout).unwrap()
     };
+    let describe = || -> serde_json::Value {
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+            .args(["--db", dbs, "describe", "--json"])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
     let mut checked = 0;
     for app in m["applications"].as_array().unwrap() {
         let org = app["name"].as_str().unwrap();
         for repo in strings(&app["repos"]) {
             let first = index(&[], org, repo);
             assert_eq!(first["unchanged"], 0, "{repo}");
+            let before = describe();
             let second = index(&["--prune"], org, repo);
+            assert_eq!(describe(), before, "{repo}: second run changed the graph");
             assert_eq!(second["files"], first["files"], "{repo}");
             assert_eq!(second["unchanged"], second["files"], "{repo}");
             assert_eq!(second["symbols"], 0);
             assert_eq!(second["tokens"], 0);
             assert_eq!(second["pruned"], serde_json::json!([]));
-            let forced = index(&["--force"], org, repo);
+            let forced = index(&["--prune", "--force"], org, repo);
+            assert_eq!(forced["unchanged"], forced["files"], "{repo}");
+            let forced = index(&["--reindex"], org, repo);
             assert_eq!(forced["unchanged"], 0, "{repo}");
+            assert_eq!(describe(), before, "{repo}: reindex changed the totals");
             assert_eq!(forced["tokens"], first["tokens"], "{repo}");
             checked += 1;
         }
