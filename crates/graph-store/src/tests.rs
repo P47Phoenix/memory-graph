@@ -92,7 +92,7 @@ fn grains() {
     let s = setup(d.path());
     let mut q = Query::new("foo");
     q.grain = Grain::Symbol;
-    q.symbol_kind = Some(SymbolKind::Method);
+    q.symbol_kind = Some("method".into());
     let h = s.search(&q).unwrap();
     // a (2 hits), b (1 hit), plus the zig file rolled up with no_symbols.
     let counts: Vec<_> = h
@@ -237,7 +237,7 @@ fn no_matching_symbol_is_distinct_from_no_symbols() {
     let s = setup(d.path());
     let mut q = Query::new("impl");
     q.grain = Grain::Symbol;
-    q.symbol_kind = Some(SymbolKind::Method);
+    q.symbol_kind = Some("method".into());
     // `impl` sits inside type S but not inside a method.
     let h = s.search(&q).unwrap();
     assert_eq!(
@@ -446,7 +446,7 @@ fn symbol_search_name_kind_language_scope_prefix() {
     // Exact name: 2 rust (function + method) x 2 repos + python.
     assert_eq!(names(&SymbolQuery::new("parse")).len(), 5);
     let mut q = SymbolQuery::new("parse");
-    q.kind = Some(SymbolKind::Method);
+    q.kind = Some("method".into());
     assert_eq!(names(&q), ["o1/r1:S::parse", "o1/r2:S::parse"]);
     let mut q = SymbolQuery::new("parse");
     q.language = Some("Python".into());
@@ -536,4 +536,24 @@ fn symbol_index_backfilled_for_older_databases() {
         s.search_symbols(&SymbolQuery::new("parse")).unwrap().len(),
         5
     );
+}
+
+#[test]
+fn describe_polyglot_repo() {
+    let d = tempfile::tempdir().unwrap();
+    let s = symbol_fixture(d.path());
+    let all = s.describe(None, None).unwrap();
+    assert_eq!(all.len(), 3);
+    let r1 = &s.describe(Some("o1"), Some("r1")).unwrap()[0];
+    let rust = &r1.languages["rust"];
+    assert_eq!((r1.files, rust.files, rust.symbols), (1, 1, 5));
+    assert_eq!(rust.symbol_kinds["method/fn"], 3);
+    assert_eq!(rust.symbol_kinds["other/impl"], 1);
+    assert!(r1.kind_names(Some("RUST")).contains("impl"));
+    assert!(r1.kind_names(Some("python")).is_empty());
+    assert!(s.describe(Some("nope"), None).unwrap().is_empty());
+    // Matching a language-specific kind name.
+    let mut q = SymbolQuery::new("S");
+    q.kind = Some("impl".into());
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 2);
 }
