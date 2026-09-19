@@ -16,6 +16,9 @@ pub const SCHEMA_VERSION: u64 = 1;
 /// Version of the derived symbol-name index. Bump it whenever the index
 /// contents or keying change; databases with another value rebuild it on open.
 pub const SYMBOL_INDEX_VERSION: u64 = 1;
+/// Version of the file fingerprint scheme (what goes into `Node::fingerprint`).
+/// Bump it to force every file to re-index once.
+pub const FINGERPRINT_FORMAT_VERSION: u64 = 1;
 /// `Node::origin` of files written by a directory run; only these are pruned.
 pub const ORIGIN_DIRECTORY: &str = "directory";
 /// Spans are `u32` byte offsets.
@@ -91,6 +94,13 @@ type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     db: Database,
     registry: Registry,
+}
+
+/// Options for `index_bytes_opts` / `index_batch`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexOptions {
+    /// Re-index files even when their fingerprint is unchanged.
+    pub reindex: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -271,6 +281,10 @@ pub struct IngestStats {
     pub tokens: usize,
     /// True when an existing file was replaced.
     pub replaced: bool,
+    /// The stored file had an identical fingerprint (same content, language,
+    /// extractor version and index format), so nothing was re-indexed:
+    /// `symbols` and `tokens` are 0 and the existing nodes were left untouched.
+    pub unchanged: bool,
     /// The file was flagged `has_errors`.
     pub has_errors: bool,
     /// Normalized path and language actually stored.
@@ -483,7 +497,78 @@ impl Store {
         Ok(removed)
     }
 
+    /// Fingerprint of `bytes` indexed as `lang` with the current extractor.
+    fn fingerprint(&self, bytes: &[u8], lang: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let hash: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!(
+            "sha256:{hash}|{}|{}|{FINGERPRINT_FORMAT_VERSION}",
+            lang.to_ascii_lowercase(),
+            self.registry.version(lang)
+        )
+    }
+
+    /// If the file already stored under org/repo/path carries `fp`, leave its
+    /// nodes alone (only refreshing `origin` if it differs) and return its
+    /// stats plus whether anything was written.
+    fn check_unchanged(
+        wt: &redb::WriteTransaction,
+        org: &str,
+        repo: &str,
+        path: &str,
+        lang: &str,
+        fp: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<(IngestStats, bool)>> {
+        let names = wt.open_table(NAMES)?;
+        let mut nodes = wt.open_table(NODES)?;
+        let find = |parent: Option<NodeId>, kind: NodeKind, name: &str| -> Result<Option<NodeId>> {
+            Ok(names
+                .get(name_key(parent, kind, name).as_str())?
+                .map(|v| v.value()))
+        };
+        let Some(org_id) = find(None, NodeKind::Org, org)? else {
+            return Ok(None);
+        };
+        let Some(repo_id) = find(Some(org_id), NodeKind::Repo, repo)? else {
+            return Ok(None);
+        };
+        let Some(file_id) = find(Some(repo_id), NodeKind::File, path)? else {
+            return Ok(None);
+        };
+        let Some(raw) = nodes.get(file_id)? else {
+            return Ok(None);
+        };
+        let mut f = dec(raw.value())?;
+        drop(raw);
+        if f.fingerprint.as_deref() != Some(fp) {
+            return Ok(None);
+        }
+        let dirty = f.origin.as_deref() != origin;
+        let stats = IngestStats {
+            file_id,
+            unchanged: true,
+            has_errors: f.has_errors,
+            path: path.to_string(),
+            language: lang.to_string(),
+            ..IngestStats::default()
+        };
+        if dirty {
+            f.origin = origin.map(Into::into);
+            nodes.insert(file_id, enc(&f).as_slice())?;
+        }
+        Ok(Some((stats, dirty)))
+    }
+
     /// Register a language extractor used by `index_bytes`.
+    ///
+    /// Register every shipped extractor before indexing: the extractor version
+    /// is part of a file's fingerprint, so a store without (say) the Rust
+    /// extractor treats already-indexed Rust files as changed and re-indexes
+    /// them with the token-only fallback, silently dropping their symbols.
     pub fn register(&mut self, e: Box<dyn Extractor>) {
         self.registry.register(e);
     }
@@ -514,6 +599,29 @@ impl Store {
         language: Option<&str>,
         origin: Option<&str>,
     ) -> Result<IngestStats> {
+        self.index_bytes_opts(
+            org,
+            repo,
+            path,
+            bytes,
+            language,
+            origin,
+            IndexOptions::default(),
+        )
+    }
+
+    /// Like `index_bytes_with_origin` with explicit `opts` (e.g. `reindex`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_bytes_opts(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+        bytes: &[u8],
+        language: Option<&str>,
+        origin: Option<&str>,
+        opts: IndexOptions,
+    ) -> Result<IngestStats> {
         if bytes.len() > MAX_SOURCE_BYTES {
             return Err(StoreError::TooLarge(format!("`{path}`")));
         }
@@ -524,8 +632,22 @@ impl Store {
             || detect_language_from_content(&path, src),
             str::to_ascii_lowercase,
         );
+        let fp = self.fingerprint(bytes, &lang);
+        let wt = self.db.begin_write()?;
+        if !opts.reindex {
+            if let Some((stats, dirty)) =
+                Self::check_unchanged(&wt, org, repo, &path, &lang, &fp, origin)?
+            {
+                if dirty {
+                    wt.commit()?;
+                }
+                return Ok(stats);
+            }
+        }
         let ex = self.registry.extract(&lang, src);
-        self.ingest_file_with_origin(org, repo, &path, &lang, &ex, origin)
+        let stats = Self::ingest_into(&wt, org, repo, &path, &lang, &ex, (origin, Some(&fp)))?;
+        wt.commit()?;
+        Ok(stats)
     }
 
     pub fn get(&self, id: NodeId) -> Result<Option<Node>> {
@@ -582,7 +704,7 @@ impl Store {
         origin: Option<&str>,
     ) -> Result<IngestStats> {
         let wt = self.db.begin_write()?;
-        let stats = Self::ingest_into(&wt, org, repo, path, language, ex, origin)?;
+        let stats = Self::ingest_into(&wt, org, repo, path, language, ex, (origin, None))?;
         wt.commit()?;
         Ok(stats)
     }
@@ -599,6 +721,7 @@ impl Store {
         org: &str,
         repo: &str,
         files: &[BatchFile<'_>],
+        opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
         let wt = self.db.begin_write()?;
         let mut out = Vec::with_capacity(files.len());
@@ -616,9 +739,24 @@ impl Store {
                 || detect_language_from_content(&path, src),
                 str::to_ascii_lowercase,
             );
+            let fp = self.fingerprint(f.bytes, &lang);
+            if !opts.reindex {
+                if let Some((stats, _)) =
+                    Self::check_unchanged(&wt, org, repo, &path, &lang, &fp, f.origin)?
+                {
+                    out.push(Ok(stats));
+                    continue;
+                }
+            }
             let ex = self.registry.extract(&lang, src);
             out.push(Ok(Self::ingest_into(
-                &wt, org, repo, &path, &lang, &ex, f.origin,
+                &wt,
+                org,
+                repo,
+                &path,
+                &lang,
+                &ex,
+                (f.origin, Some(&fp)),
             )?));
         }
         wt.commit()?;
@@ -632,7 +770,7 @@ impl Store {
         path: &str,
         language: &str,
         ex: &Extraction,
-        origin: Option<&str>,
+        (origin, fingerprint): (Option<&str>, Option<&str>),
     ) -> Result<IngestStats> {
         if org.is_empty() || repo.is_empty() {
             return Err(StoreError::Rejected(
@@ -678,6 +816,7 @@ impl Store {
                     token_class: None,
                     has_errors: false,
                     origin: None,
+                    fingerprint: None,
                     span: None,
                 };
                 nodes.insert(id, enc(&node).as_slice())?;
@@ -707,6 +846,7 @@ impl Store {
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
                 f.has_errors = ex.has_errors;
                 f.origin = origin.map(Into::into);
+                f.fingerprint = fingerprint.map(Into::into);
                 nodes.insert(file_id, enc(&f).as_slice())?;
             }
             stats.replaced = existed;
@@ -728,6 +868,7 @@ impl Store {
                 f.language = Some(language.into());
                 f.has_errors = ex.has_errors;
                 f.origin = origin.map(Into::into);
+                f.fingerprint = fingerprint.map(Into::into);
                 nodes.insert(file_id, enc(&f).as_slice())?;
             }
 
@@ -805,6 +946,7 @@ impl Store {
                             token_class: None,
                             has_errors: false,
                             origin: None,
+                            fingerprint: None,
                             span: Some(s.span),
                         },
                         &mut nodes,
@@ -830,6 +972,7 @@ impl Store {
                             token_class: Some(t.class),
                             has_errors: false,
                             origin: None,
+                            fingerprint: None,
                             span: Some(t.span),
                         },
                         &mut nodes,

@@ -158,6 +158,12 @@ pub struct Node {
     /// directory run). Absent in older databases and for single-file ingests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// File only: fingerprint of what was indexed (content hash + language +
+    /// extractor version + index format version). Used to skip re-indexing an
+    /// unchanged file. Absent in older databases and after `ingest_file` with a
+    /// pre-built extraction (content unknown); such files re-index once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     /// Symbol and token.
     pub span: Option<Span>,
 }
@@ -204,6 +210,7 @@ mod tests {
             token_class: None,
             has_errors: false,
             origin: None,
+            fingerprint: None,
             span: Some(Span {
                 start: 0,
                 end: 5,

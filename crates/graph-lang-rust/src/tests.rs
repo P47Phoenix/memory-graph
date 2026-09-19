@@ -55,3 +55,10 @@ fn spans_line_col() {
     assert_eq!((g.span.start_line, g.span.start_col), (2, 1));
     assert_eq!(e.symbols[0].span.start_col, 1);
 }
+
+#[test]
+fn version_includes_tokenizer_version() {
+    assert!(RustExtractor
+        .version()
+        .ends_with(&format!("+tok{}", graph_core::tokenizer::TOKENIZER_VERSION)));
+}
