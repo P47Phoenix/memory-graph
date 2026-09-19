@@ -893,3 +893,324 @@ fn polyglot_repo_is_described_and_filters_are_validated() {
         "{out}"
     );
 }
+
+fn indexed_db(d: &tempfile::TempDir) -> String {
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    for i in 0..30 {
+        std::fs::write(src.join(format!("f{i:02}.rs")), "fn foo() { foo(); }\n").unwrap();
+    }
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("files=30"), "{out}");
+    db
+}
+
+#[test]
+fn limit_flags_and_pattern_errors() {
+    let d = tempfile::tempdir().unwrap();
+    let db = indexed_db(&d);
+    let (ok, out, _) = run(&["--db", &db, "symbols", "foo", "--limit", "3", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let r = v["results"].as_array().unwrap();
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0]["file"], "f00.rs");
+    let (ok, out, _) = run(&["--db", &db, "search", "foo", "--limit", "5", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["results"].as_array().unwrap().len(), 5);
+    let (ok, _, err) = run(&["--db", &db, "symbols", "foo", "--limit", "0"]);
+    assert!(!ok && err.contains("limit"), "{err}");
+    let (ok, _, err) = run(&["--db", &db, "symbols", "**"]);
+    assert!(!ok && err.contains("ambiguous"), "{err}");
+    let (ok, _, err) = run(&["--db", &db, "symbols", ""]);
+    assert!(!ok && err.contains("empty"), "{err}");
+    let (ok, _, err) = run(&["--db", &db, "symbols", "foo", "--org", ""]);
+    assert!(!ok && err.contains("empty"), "{err}");
+    // `other` is a valid generic kind even when nothing of that kind exists.
+    let (ok, _, err) = run(&["--db", &db, "symbols", "foo", "--kind", "other"]);
+    assert!(ok, "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_pipe_is_not_a_panic() {
+    use std::process::Stdio;
+    let d = tempfile::tempdir().unwrap();
+    let db = indexed_db(&d);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+        .args(["--db", &db, "symbols", "*"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(c.stdout.take()); // close the read end immediately
+    let o = c.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(o.status.success(), "{err}");
+}
+
+fn write_rust_repo(d: &tempfile::TempDir) -> std::path::PathBuf {
+    let src = d.path().join("rs");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(
+        src.join("a.rs"),
+        "struct S;\nimpl S {\n    fn m(&self) {}\n}\nfn foo() {}\nfn foobar() {}\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("b.rs"), "fn foo() { foo(); }\n").unwrap();
+    src
+}
+
+fn symbols_json(db: &str, extra: &[&str]) -> Vec<serde_json::Value> {
+    let mut a = vec!["--db", db, "symbols"];
+    a.extend_from_slice(extra);
+    a.push("--json");
+    let (ok, out, err) = run(&a);
+    assert!(ok, "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    v["results"].as_array().unwrap().clone()
+}
+
+#[test]
+fn old_database_without_symbol_index_version_is_upgraded_via_cli() {
+    use redb::{Database, MultimapTableDefinition, TableDefinition};
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, o, e) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src.to_str().unwrap(),
+    ]);
+    assert!(ok, "{o}{e}");
+    {
+        // Simulate a database written before the symbol index existed.
+        let raw = Database::open(&db).unwrap();
+        let wt = raw.begin_write().unwrap();
+        wt.open_table(TableDefinition::<&str, u64>::new("meta"))
+            .unwrap()
+            .remove("symbol_index_version")
+            .unwrap();
+        wt.delete_multimap_table(MultimapTableDefinition::<&str, u64>::new("symbols_by_name"))
+            .unwrap();
+        wt.commit().unwrap();
+    }
+    let r = symbols_json(&db, &["foo"]);
+    assert_eq!(r.len(), 2, "{r:?}");
+    // The stamp is written back, so the next open is a no-op.
+    let raw = Database::open(&db).unwrap();
+    let rt = raw.begin_read().unwrap();
+    let v = rt
+        .open_table(TableDefinition::<&str, u64>::new("meta"))
+        .unwrap()
+        .get("symbol_index_version")
+        .unwrap()
+        .map(|v| v.value());
+    assert_eq!(v, Some(graph_store::SYMBOL_INDEX_VERSION));
+}
+
+#[test]
+fn symbols_trailing_star_and_escaped_star_via_cli() {
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    assert!(
+        run(&[
+            "--db",
+            &db,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            src.to_str().unwrap()
+        ])
+        .0
+    );
+    let names = |p: &str| -> Vec<String> {
+        symbols_json(&db, &[p])
+            .iter()
+            .map(|x| x["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names("foo*"), ["foo", "foobar", "foo"]);
+    assert_eq!(names("foo"), ["foo", "foo"]);
+    // `foo\*` is the literal name `foo*`: nothing is indexed under it.
+    assert!(names("foo\\*").is_empty());
+    // Documented edges.
+    let (ok, _, err) = run(&["--db", &db, "symbols", "foo\\**"]);
+    assert!(!ok && err.contains("ambiguous"), "{err}");
+    assert!(names("foo\\").is_empty());
+}
+
+#[test]
+fn kind_other_and_case_insensitive_kinds_match_real_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    assert!(
+        run(&[
+            "--db",
+            &db,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            src.to_str().unwrap()
+        ])
+        .0
+    );
+    // The `impl S` block is generic kind `other`, language kind `impl`.
+    for k in ["other", "Other", "OTHER", "impl", "IMPL"] {
+        let r = symbols_json(&db, &["*", "--kind", k]);
+        assert_eq!(r.len(), 1, "{k}: {r:?}");
+        assert_eq!(r[0]["lang_kind"], "impl");
+    }
+    let r = symbols_json(&db, &["*", "--kind", "Function", "--language", "RUST"]);
+    assert_eq!(r.len(), 3, "{r:?}");
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--kind", "nosuchkind"]);
+    assert!(!ok && err.contains("nosuchkind"), "{err}");
+    // Search's --symbol-kind is case-insensitive too.
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "search",
+        "S",
+        "--grain",
+        "symbol",
+        "--symbol-kind",
+        "IMPL",
+        "--json",
+    ]);
+    assert!(ok, "{out}{err}");
+}
+
+#[test]
+fn help_distinguishes_token_class_from_symbol_kind_and_documents_pattern_edges() {
+    let (ok, out, _) = run(&["search", "--help"]);
+    assert!(ok);
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("Token class (NOT a symbol kind"), "{out}");
+    assert!(flat.contains("symbol kind"), "{out}");
+    let (ok, out, _) = run(&["symbols", "--help"]);
+    assert!(ok);
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("token class"), "{out}");
+    assert!(flat.contains("case-insensitive"), "{out}");
+    assert!(flat.contains("rejected as ambiguous"), "{out}");
+    assert!(flat.contains("trailing backslash"), "{out}");
+}
+
+#[test]
+fn directory_batch_ingest_matches_individual_index_file() {
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    std::fs::write(src.join("c.txt"), "hello foo world\n").unwrap();
+    let db_a = d.path().join("a").to_string_lossy().into_owned();
+    let db_b = d.path().join("b").to_string_lossy().into_owned();
+    assert!(
+        run(&[
+            "--db",
+            &db_a,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            src.to_str().unwrap()
+        ])
+        .0
+    );
+    for f in ["a.rs", "b.rs", "c.txt"] {
+        let p = src.join(f);
+        // index-file stores the path as given; run from the directory for relative paths.
+        let o = Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+            .current_dir(&src)
+            .args(["--db", &db_b, "index-file", "--org", "o", "--repo", "r", f])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{p:?}");
+    }
+    let dump = |db: &str| {
+        let syms = symbols_json(db, &["*"]);
+        let (_, toks, _) = run(&["--db", db, "search", "foo", "--json"]);
+        let (_, desc, _) = run(&["--db", db, "describe", "--json"]);
+        (syms, toks, desc)
+    };
+    assert_eq!(dump(&db_a), dump(&db_b));
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_is_not_a_panic_for_index_and_index_file() {
+    use std::process::Stdio;
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let file = src.join("a.rs");
+    let cases: [Vec<&str>; 3] = [
+        vec![
+            "--db",
+            &db,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            src.to_str().unwrap(),
+        ],
+        vec![
+            "--db",
+            &db,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--json",
+            src.to_str().unwrap(),
+        ],
+        vec![
+            "--db",
+            &db,
+            "index-file",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            file.to_str().unwrap(),
+        ],
+    ];
+    for args in cases {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(c.stdout.take());
+        let o = c.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+        assert!(o.status.success(), "{args:?}: {err}");
+    }
+}

@@ -557,3 +557,459 @@ fn describe_polyglot_repo() {
     q.kind = Some("impl".into());
     assert_eq!(s.search_symbols(&q).unwrap().len(), 2);
 }
+
+fn rust_store(dir: &std::path::Path) -> Store {
+    let mut s = Store::open(dir.join("g.redb")).unwrap();
+    s.register(Box::new(graph_lang_rust::RustExtractor));
+    s
+}
+
+#[test]
+fn stale_symbol_index_is_rebuilt_on_version_change() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let s = rust_store(d.path());
+        s.index_bytes("o", "r", "a.rs", b"fn foo() {}\nfn bar() {}\n", None)
+            .unwrap();
+        // Corrupt the derived index and mark it as an older version.
+        let wt = s.db.begin_write().unwrap();
+        {
+            wt.delete_multimap_table(SYMBOLS).unwrap();
+            let mut idx = wt.open_multimap_table(SYMBOLS).unwrap();
+            idx.insert("stale", 999_999u64).unwrap();
+            wt.open_table(META)
+                .unwrap()
+                .insert("symbol_index_version", SYMBOL_INDEX_VERSION - 1)
+                .unwrap();
+        }
+        wt.commit().unwrap();
+    }
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+    assert!(s
+        .search_symbols(&SymbolQuery::new("stale"))
+        .unwrap()
+        .is_empty());
+    let rt = s.db.begin_read().unwrap();
+    let v = rt
+        .open_table(META)
+        .unwrap()
+        .get("symbol_index_version")
+        .unwrap()
+        .unwrap()
+        .value();
+    assert_eq!(v, SYMBOL_INDEX_VERSION);
+}
+
+#[test]
+fn search_symbols_skips_dangling_ids() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    s.index_bytes("o", "r", "a.rs", b"fn foo() {}\n", None)
+        .unwrap();
+    let wt = s.db.begin_write().unwrap();
+    wt.open_multimap_table(SYMBOLS)
+        .unwrap()
+        .insert("foo", 999_999u64)
+        .unwrap();
+    wt.commit().unwrap();
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+}
+
+#[test]
+fn open_failed_hint_only_for_permission_errors() {
+    let path = std::path::Path::new("x.redb");
+    let io = |k: std::io::ErrorKind| {
+        DatabaseError::Storage(redb::StorageError::Io(std::io::Error::from(k)))
+    };
+    let denied = open_failed(path, &io(std::io::ErrorKind::PermissionDenied)).to_string();
+    assert!(denied.contains("cannot open database") && denied.contains("must be writable"));
+    let ro = open_failed(path, &io(std::io::ErrorKind::ReadOnlyFilesystem)).to_string();
+    assert!(ro.contains("must be writable"), "{ro}");
+    let other = open_failed(path, &io(std::io::ErrorKind::NotFound)).to_string();
+    assert!(!other.contains("writable"), "{other}");
+}
+
+#[test]
+fn opening_a_directory_has_no_read_only_hint() {
+    let d = tempfile::tempdir().unwrap();
+    let msg = Store::open(d.path()).err().expect("must fail").to_string();
+    assert!(msg.contains("cannot open database"), "{msg}");
+    assert!(!msg.contains("writable"), "{msg}");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_database_gives_clear_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("g.redb");
+    drop(Store::open(&p).unwrap());
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new().write(true).open(&p).is_ok() {
+        // Root ignores file modes; the hint mapping is covered deterministically
+        // by `open_failed_hint_only_for_permission_errors`.
+        eprintln!("SKIPPED read_only_database_gives_clear_error: running with write access to 0444 files (root)");
+        return;
+    }
+    let msg = Store::open(&p).err().expect("must fail").to_string();
+    assert!(
+        msg.contains("cannot open database") && msg.contains("must be writable"),
+        "{msg}"
+    );
+}
+
+fn set_meta(s: &Store, key: &str, v: Option<u64>) {
+    let wt = s.db.begin_write().unwrap();
+    {
+        let mut m = wt.open_table(META).unwrap();
+        match v {
+            Some(v) => m.insert(key, v).unwrap(),
+            None => m.remove(key).unwrap(),
+        };
+    }
+    wt.commit().unwrap();
+}
+
+fn meta(s: &Store, key: &str) -> Option<u64> {
+    let rt = s.db.begin_read().unwrap();
+    let t = rt.open_table(META).unwrap();
+    let v = t.get(key).unwrap().map(|v| v.value());
+    v
+}
+
+#[test]
+fn newer_symbol_index_is_refused_and_untouched() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("g.redb");
+    {
+        let s = rust_store(d.path());
+        s.index_bytes("o", "r", "a.rs", b"fn foo() {}\n", None)
+            .unwrap();
+        set_meta(&s, "symbol_index_version", Some(SYMBOL_INDEX_VERSION + 1));
+    }
+    let err = Store::open(&p).err().expect("must refuse");
+    assert!(
+        matches!(err, StoreError::IndexTooNew { found } if found == SYMBOL_INDEX_VERSION + 1),
+        "{err}"
+    );
+    assert!(err.to_string().contains("newer"), "{err}");
+    // Nothing was rewritten: the stamp is unchanged and the index still there.
+    let db = Database::create(&p).unwrap();
+    let rt = db.begin_read().unwrap();
+    let v = rt
+        .open_table(META)
+        .unwrap()
+        .get("symbol_index_version")
+        .unwrap()
+        .unwrap()
+        .value();
+    assert_eq!(v, SYMBOL_INDEX_VERSION + 1);
+    assert_eq!(
+        rt.open_multimap_table(SYMBOLS)
+            .unwrap()
+            .get("foo")
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn missing_version_key_with_existing_table_is_rebuilt() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let s = rust_store(d.path());
+        s.index_bytes("o", "r", "a.rs", b"fn foo() {}\n", None)
+            .unwrap();
+        set_meta(&s, "symbol_index_version", None);
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut idx = wt.open_multimap_table(SYMBOLS).unwrap();
+            idx.insert("stale", 999_999u64).unwrap();
+        }
+        wt.commit().unwrap();
+        assert_eq!(meta(&s, "symbol_index_version"), None);
+    }
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    assert_eq!(meta(&s, "symbol_index_version"), Some(SYMBOL_INDEX_VERSION));
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+    assert!(s
+        .search_symbols(&SymbolQuery::new("stale"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn search_symbols_skips_ids_of_non_symbol_nodes() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    let st = s
+        .index_bytes("o", "r", "a.rs", b"fn foo() {}\n", None)
+        .unwrap();
+    let wt = s.db.begin_write().unwrap();
+    wt.open_multimap_table(SYMBOLS)
+        .unwrap()
+        .insert("foo", st.file_id)
+        .unwrap();
+    wt.commit().unwrap();
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+}
+
+#[test]
+fn same_file_and_offset_ties_break_by_node_id() {
+    let src = "abcdef\n";
+    let zero = span_of(src, "c", 0);
+    let zero = Span {
+        end: zero.start,
+        end_col: zero.start_col,
+        ..zero
+    };
+    let order = |first: &str, second: &str| {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path().join("g.redb")).unwrap();
+        let mk = |k: &str| SymbolDecl {
+            lang_kind: Some(k.into()),
+            ..sym("dup", SymbolKind::Function, zero)
+        };
+        let ex = Extraction {
+            has_errors: false,
+            symbols: vec![mk(first), mk(second)],
+            tokens: vec![],
+        };
+        s.ingest_file("o", "r", "a.txt", "text", &ex).unwrap();
+        s.search_symbols(&SymbolQuery::new("dup"))
+            .unwrap()
+            .into_iter()
+            .map(|h| h.lang_kind.unwrap())
+            .collect::<Vec<_>>()
+    };
+    let ab = order("a", "b");
+    assert_eq!(ab.len(), 2);
+    assert_eq!(ab, order("a", "b"));
+    let ba = order("b", "a");
+    assert_eq!(ba.len(), 2);
+    assert_ne!(ab, ba, "ties follow insertion (node id) order");
+}
+
+struct CountingExtractor(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Extractor for CountingExtractor {
+    fn language(&self) -> &str {
+        "count"
+    }
+    fn extract(&self, source: &str) -> Extraction {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut bad = span_of("xxxx", "xx", 0);
+        if source.starts_with("bad") {
+            bad.start = 3;
+            bad.end = 1;
+        }
+        Extraction {
+            has_errors: false,
+            symbols: vec![sym("s", SymbolKind::Function, bad)],
+            tokens: vec![],
+        }
+    }
+}
+
+#[test]
+fn batch_error_rolls_back_everything_and_extracts_lazily() {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = Store::open(d.path().join("g.redb")).unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    s.register(Box::new(CountingExtractor(calls.clone())));
+    let f = |p, b: &'static [u8]| BatchFile {
+        path: p,
+        bytes: b,
+        language: Some("count"),
+        origin: None,
+    };
+    let files = [
+        f("ok1.c", b"xxxx"),
+        f("bad.c", b"bad-span"),
+        f("never.c", b"xxxx"),
+        f("never2.c", b"xxxx"),
+    ];
+    let err = s.index_batch("o", "r", &files).unwrap_err();
+    assert!(matches!(err, StoreError::InvalidSpan(_)), "{err}");
+    // The failing file aborted the batch: later files were never extracted...
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // ...and the earlier, successfully staged file was rolled back.
+    assert!(s.file_tokens("o", "r", "ok1.c").unwrap().is_none());
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
+    assert_eq!(s.count_nodes(NodeKind::Org).unwrap(), 0);
+}
+
+#[test]
+fn batch_duplicate_paths_collapse_to_one_file() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    let f = |p, b: &'static [u8]| BatchFile {
+        path: p,
+        bytes: b,
+        language: None,
+        origin: Some(ORIGIN_DIRECTORY),
+    };
+    let out = s
+        .index_batch(
+            "o",
+            "r",
+            &[f("./a.rs", b"fn one() {}\n"), f("a.rs", b"fn two() {}\n")],
+        )
+        .unwrap();
+    assert!(!out[0].as_ref().unwrap().replaced);
+    assert!(out[1].as_ref().unwrap().replaced);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    assert!(s
+        .search_symbols(&SymbolQuery::new("one"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(s.search_symbols(&SymbolQuery::new("two")).unwrap().len(), 1);
+}
+
+#[test]
+fn kind_filter_is_case_insensitive() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    s.index_bytes("o", "r", "a.rs", b"struct Foo;\nfn foo() {}\n", None)
+        .unwrap();
+    for k in ["struct", "STRUCT", "Struct", "TYPE", "Function"] {
+        let mut q = SymbolQuery::new("*");
+        q.kind = Some(k.into());
+        assert!(!s.search_symbols(&q).unwrap().is_empty(), "{k}");
+    }
+}
+
+#[test]
+fn limit_is_deterministic_for_search_and_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    for f in ["b.rs", "a.rs", "c.rs"] {
+        s.index_bytes("o", "r", f, b"fn foo() { foo(); }\n", None)
+            .unwrap();
+    }
+    let all = s.search_symbols(&SymbolQuery::new("foo")).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].file, "a.rs");
+    let mut q = SymbolQuery::new("foo");
+    q.limit = Some(2);
+    assert_eq!(s.search_symbols(&q).unwrap(), all[..2]);
+    let mut q = Query::new("foo");
+    let full = s.search(&q).unwrap();
+    q.limit = Some(4);
+    assert_eq!(s.search(&q).unwrap(), full[..4]);
+    assert_eq!(full[0].file.as_deref(), Some("a.rs"));
+}
+
+#[test]
+fn symbol_pattern_edge_cases() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    for bad in ["", "**", "a**"] {
+        assert!(
+            matches!(
+                s.search_symbols(&SymbolQuery::new(bad)),
+                Err(StoreError::Rejected(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    let mut q = SymbolQuery::new("S");
+    q.org = Some(String::new());
+    assert!(matches!(s.search_symbols(&q), Err(StoreError::Rejected(_))));
+    // `*` lists everything.
+    assert_eq!(s.search_symbols(&SymbolQuery::new("*")).unwrap().len(), 3);
+    // A symbol whose name is a literal `*` is reachable with `\*`.
+    let src = "fn f() {}\n";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![sym("*", SymbolKind::Function, span_of(src, "fn f() {}", 0))],
+        tokens: tokenize(src),
+    };
+    s.ingest_file("o3", "r3", "star.rs", "rust", &ex).unwrap();
+    let hits = s.search_symbols(&SymbolQuery::new("\\*")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "*");
+}
+
+#[test]
+fn ingest_file_lowercases_language() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![],
+        tokens: tokenize("x"),
+    };
+    let st = s.ingest_file("o", "r", "x.txt", "RuSt", &ex).unwrap();
+    assert_eq!(st.language, "rust");
+    let mut q = Query::new("x");
+    q.language = Some("rust".into());
+    assert_eq!(s.search(&q).unwrap().len(), 1);
+}
+
+#[test]
+fn kind_other_matches_uncategorised_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    let src = "thing\n";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![sym("thing", SymbolKind::Other, span_of(src, "thing", 0))],
+        tokens: tokenize(src),
+    };
+    s.ingest_file("o", "r", "t.zig", "zig", &ex).unwrap();
+    let mut q = SymbolQuery::new("thing");
+    q.kind = Some("other".into());
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 1);
+    let mut sq = Query::new("thing");
+    (sq.grain, sq.symbol_kind) = (Grain::Symbol, Some("other".into()));
+    assert_eq!(sq_symbol(&s, &sq), Some("thing".into()));
+    let info = &s.describe(Some("o"), Some("r")).unwrap()[0];
+    assert!(info.kind_names(None).contains("other"));
+}
+
+fn sq_symbol(s: &Store, q: &Query) -> Option<String> {
+    s.search(q).unwrap()[0].symbol.clone()
+}
+
+#[test]
+fn batch_matches_individual_ingest() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    let files = [
+        BatchFile {
+            path: "./a.rs",
+            bytes: b"fn foo() {}\n",
+            language: None,
+            origin: Some(ORIGIN_DIRECTORY),
+        },
+        BatchFile {
+            path: "bad.txt",
+            bytes: &[0xff, 0xfe],
+            language: None,
+            origin: None,
+        },
+        BatchFile {
+            path: "b.py",
+            bytes: b"x = 1\n",
+            language: Some("PYTHON"),
+            origin: None,
+        },
+    ];
+    let out = s.index_batch("o", "r", &files).unwrap();
+    assert_eq!(out.len(), 3);
+    let a = out[0].as_ref().unwrap();
+    assert_eq!(
+        (a.path.as_str(), a.language.as_str(), a.symbols),
+        ("a.rs", "rust", 1)
+    );
+    assert!(matches!(out[1], Err(StoreError::NotUtf8(_))));
+    assert_eq!(out[2].as_ref().unwrap().language, "python");
+    assert_eq!(s.file_tokens("o", "r", "b.py").unwrap().unwrap().len(), 3);
+    assert!(s.file_tokens("o", "r", "bad.txt").unwrap().is_none());
+    // Re-running replaces, not duplicates.
+    let again = s.index_batch("o", "r", &files).unwrap();
+    assert!(again[0].as_ref().unwrap().replaced);
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+}

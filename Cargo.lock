@@ -249,6 +249,7 @@ dependencies = [
  "graph-lang-rust",
  "graph-store",
  "ignore",
+ "redb",
  "serde_json",
  "tempfile",
 ]
@@ -277,6 +278,7 @@ name = "graph-store"
 version = "0.1.0"
 dependencies = [
  "graph-core",
+ "graph-lang-rust",
  "redb",
  "serde",
  "serde_json",
