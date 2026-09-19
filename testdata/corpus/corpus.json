@@ -1,0 +1,141 @@
+{
+  "note": "Vendored subsets of PUBLIC, permissively licensed (MIT / Apache-2.0) upstream repositories. Each folder under testdata/corpus/ stands for one distinct repo; applications group repos that form a larger system, and links say how the repos connect. Regenerate with scripts/vendor-corpus.py. Never add private code here.",
+  "applications": [
+    {
+      "name": "messaging",
+      "description": "The Rebus service bus and two libraries that plug into it (a RabbitMQ transport and a SQL Server transport/storage).",
+      "repos": ["rebus", "rebus-rabbitmq", "rebus-sqlserver"]
+    },
+    {
+      "name": "conduit",
+      "description": "A Medium-style blogging app (RealWorld/Conduit) as one larger application: an Angular UI, a REST/GraphQL API layer, a MyBatis data-access layer, and the SQL schema scripts.",
+      "repos": ["conduit-ui", "conduit-api", "conduit-data-access", "conduit-sql"]
+    },
+    {
+      "name": "rust-library",
+      "description": "A stand-alone Rust crate; exercises the Rust extractor (symbols) on real code.",
+      "repos": ["anyhow"]
+    }
+  ],
+  "repos": [
+    {
+      "dir": "rebus",
+      "kind": "message-bus library",
+      "upstream": "https://github.com/rebus-org/Rebus",
+      "commit": "0face0d4754740ed472680d1bc069ab77a22ae07",
+      "license": "MIT",
+      "include": ["Rebus", "LICENSE.md", "README.md"],
+      "languages": ["csharp"]
+    },
+    {
+      "dir": "rebus-rabbitmq",
+      "kind": "message-bus transport (implements Rebus)",
+      "upstream": "https://github.com/rebus-org/Rebus.RabbitMq",
+      "commit": "9b4f2df37b0d83ae789c358f1da6f8c7cec9c1c3",
+      "license": "MIT",
+      "include": ["Rebus.RabbitMq", "LICENSE.md", "README.md"],
+      "languages": ["csharp"]
+    },
+    {
+      "dir": "rebus-sqlserver",
+      "kind": "message-bus transport and storage on SQL Server (implements Rebus)",
+      "upstream": "https://github.com/rebus-org/Rebus.SqlServer",
+      "commit": "1ee018e552c633c54182e5cdcebccb212402b3d9",
+      "license": "MIT",
+      "include": ["Rebus.SqlServer", "LICENSE.md", "README.md"],
+      "languages": ["csharp"]
+    },
+    {
+      "dir": "conduit-ui",
+      "kind": "ui",
+      "upstream": "https://github.com/gothinkster/angular-realworld-example-app",
+      "commit": "dd99ed2cf39c805d719f943c5d7061a5683d98a8",
+      "license": "MIT",
+      "include": ["src", "package.json", "angular.json", "LICENSE", "README.md"],
+      "languages": ["typescript"]
+    },
+    {
+      "dir": "conduit-api",
+      "kind": "backend api",
+      "upstream": "https://github.com/gothinkster/spring-boot-realworld-example-app",
+      "commit": "ee17e31aafe733d98c4853c8b9a74d7f2f6c924a",
+      "license": "MIT",
+      "split": "api, application, core and graphql layers of the upstream app",
+      "include": [
+        "src/main/java/io/spring/api",
+        "src/main/java/io/spring/application",
+        "src/main/java/io/spring/core",
+        "src/main/java/io/spring/graphql",
+        "src/main/resources/schema",
+        "build.gradle",
+        "LICENSE"
+      ],
+      "languages": ["java"]
+    },
+    {
+      "dir": "conduit-data-access",
+      "kind": "data-access layer",
+      "upstream": "https://github.com/gothinkster/spring-boot-realworld-example-app",
+      "commit": "ee17e31aafe733d98c4853c8b9a74d7f2f6c924a",
+      "license": "MIT",
+      "split": "infrastructure (repositories, read services) and MyBatis mapper XML of the upstream app",
+      "include": [
+        "src/main/java/io/spring/infrastructure",
+        "src/main/resources/mapper",
+        "LICENSE"
+      ],
+      "languages": ["java", "xml"]
+    },
+    {
+      "dir": "conduit-sql",
+      "kind": "database scripts",
+      "upstream": "https://github.com/gothinkster/spring-boot-realworld-example-app",
+      "commit": "ee17e31aafe733d98c4853c8b9a74d7f2f6c924a",
+      "license": "MIT",
+      "split": "Flyway migration scripts of the upstream app",
+      "include": ["src/main/resources/db", "LICENSE"],
+      "languages": ["sql"]
+    },
+    {
+      "dir": "anyhow",
+      "kind": "rust library",
+      "upstream": "https://github.com/dtolnay/anyhow",
+      "commit": "c63b279f3f4af2b02ca6267d9eb47d6d10497f69",
+      "license": "MIT OR Apache-2.0",
+      "include": ["src", "tests", "Cargo.toml", "build.rs", "LICENSE-MIT", "LICENSE-APACHE", "README.md"],
+      "languages": ["rust"]
+    }
+  ],
+  "links": [
+    {
+      "kind": "implements",
+      "from": "rebus-rabbitmq", "from_file": "Rebus.RabbitMq/RabbitMq/RabbitMqTransport.cs", "from_contains": "AbstractRebusTransport",
+      "to": "rebus", "to_file": "Rebus/Transport/AbstractRebusTransport.cs", "to_contains": "class AbstractRebusTransport"
+    },
+    {
+      "kind": "package-reference",
+      "from": "rebus-rabbitmq", "from_file": "Rebus.RabbitMq/Rebus.RabbitMq.csproj", "from_contains": "Include=\"rebus\"",
+      "to": "rebus", "to_file": "Rebus/Rebus.csproj", "to_contains": "Rebus"
+    },
+    {
+      "kind": "implements",
+      "from": "rebus-sqlserver", "from_file": "Rebus.SqlServer/SqlServer/Transport/SqlServerTransport.cs", "from_contains": "ITransport",
+      "to": "rebus", "to_file": "Rebus/Transport/ITransport.cs", "to_contains": "interface ITransport"
+    },
+    {
+      "kind": "http",
+      "from": "conduit-ui", "from_file": "src/app/features/article/services/articles.service.ts", "from_contains": "/articles",
+      "to": "conduit-api", "to_file": "src/main/java/io/spring/api/ArticlesApi.java", "to_contains": "\"/articles\""
+    },
+    {
+      "kind": "implements",
+      "from": "conduit-data-access", "from_file": "src/main/java/io/spring/infrastructure/repository/MyBatisArticleRepository.java", "from_contains": "implements ArticleRepository",
+      "to": "conduit-api", "to_file": "src/main/java/io/spring/core/article/ArticleRepository.java", "to_contains": "interface ArticleRepository"
+    },
+    {
+      "kind": "table",
+      "from": "conduit-data-access", "from_file": "src/main/resources/mapper/ArticleMapper.xml", "from_contains": "insert into articles",
+      "to": "conduit-sql", "to_file": "src/main/resources/db/migration/V1__create_tables.sql", "to_contains": "create table articles"
+    }
+  ]
+}
