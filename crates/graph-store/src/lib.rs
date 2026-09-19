@@ -24,6 +24,8 @@ const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 const NAMES: TableDefinition<&str, u64> = TableDefinition::new("names");
 const CHILDREN: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("children");
 const TOKENS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("tokens_by_text");
+/// Symbol name -> symbol node ids (exact and prefix lookup).
+const SYMBOLS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("symbols_by_name");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -113,6 +115,47 @@ impl Query {
     }
 }
 
+/// Symbol lookup by name (exact, or prefix with a trailing `*`).
+#[derive(Debug, Clone)]
+pub struct SymbolQuery {
+    pub pattern: String,
+    pub kind: Option<SymbolKind>,
+    pub language: Option<String>,
+    pub org: Option<String>,
+    pub repo: Option<String>,
+    /// Restrict to one file path (normalized, relative as indexed).
+    pub file: Option<String>,
+}
+
+impl SymbolQuery {
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            kind: None,
+            language: None,
+            org: None,
+            repo: None,
+            file: None,
+        }
+    }
+}
+
+/// A symbol with its containment path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SymbolHit {
+    pub org: String,
+    pub repo: String,
+    pub file: String,
+    pub language: Option<String>,
+    pub name: String,
+    /// Qualified path from the outermost enclosing symbol, e.g. `S::a`.
+    pub qualified: String,
+    pub kind: SymbolKind,
+    /// Language-specific kind string (`struct`, `impl`, `fn`, ...).
+    pub lang_kind: Option<String>,
+    pub span: Option<Span>,
+}
+
 /// One result row at the requested grain, with its containment path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Hit {
@@ -169,6 +212,7 @@ fn remove_descendants(
     nodes: &mut redb::Table<u64, &[u8]>,
     children: &mut redb::MultimapTable<u64, u64>,
     tokens: &mut redb::MultimapTable<&str, u64>,
+    symbols: &mut redb::MultimapTable<&str, u64>,
     root: NodeId,
 ) -> Result<()> {
     let ids = |it: redb::MultimapValue<u64>| -> Result<Vec<NodeId>> {
@@ -181,8 +225,14 @@ fn remove_descendants(
         stack.extend(ids(children.remove_all(id)?)?);
         if let Some(old) = nodes.remove(id)? {
             let n = dec(old.value())?;
-            if n.kind == NodeKind::Token {
-                tokens.remove(n.name.as_str(), id)?;
+            match n.kind {
+                NodeKind::Token => {
+                    tokens.remove(n.name.as_str(), id)?;
+                }
+                NodeKind::Symbol => {
+                    symbols.remove(n.name.as_str(), id)?;
+                }
+                _ => {}
             }
         }
     }
@@ -209,7 +259,28 @@ impl Store {
         };
         match found {
             Some(v) if v != SCHEMA_VERSION => return Err(StoreError::SchemaMismatch { found: v }),
-            Some(_) => {}
+            Some(_) => {
+                // Databases written before the symbol index existed: build it once.
+                let missing = matches!(
+                    db.begin_read()?.open_multimap_table(SYMBOLS),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                );
+                if missing {
+                    let wt = db.begin_write()?;
+                    {
+                        let nodes = wt.open_table(NODES)?;
+                        let mut idx = wt.open_multimap_table(SYMBOLS)?;
+                        for r in nodes.iter()? {
+                            let (id, v) = r?;
+                            let n = dec(v.value())?;
+                            if n.kind == NodeKind::Symbol {
+                                idx.insert(n.name.as_str(), id.value())?;
+                            }
+                        }
+                    }
+                    wt.commit()?;
+                }
+            }
             None => {
                 let wt = db.begin_write()?;
                 {
@@ -220,6 +291,7 @@ impl Store {
                     wt.open_table(NAMES)?;
                     wt.open_multimap_table(CHILDREN)?;
                     wt.open_multimap_table(TOKENS)?;
+                    wt.open_multimap_table(SYMBOLS)?;
                 }
                 wt.commit()?;
             }
@@ -249,6 +321,7 @@ impl Store {
             let mut names = wt.open_table(NAMES)?;
             let mut children = wt.open_multimap_table(CHILDREN)?;
             let mut tokens = wt.open_multimap_table(TOKENS)?;
+            let mut sym_idx = wt.open_multimap_table(SYMBOLS)?;
             let org_id = names
                 .get(name_key(None, NodeKind::Org, org).as_str())?
                 .map(|v| v.value());
@@ -275,7 +348,7 @@ impl Store {
                         removed.push(f.name);
                         continue;
                     }
-                    remove_descendants(&mut nodes, &mut children, &mut tokens, fid)?;
+                    remove_descendants(&mut nodes, &mut children, &mut tokens, &mut sym_idx, fid)?;
                     nodes.remove(fid)?;
                     names.remove(name_key(Some(repo_id), NodeKind::File, &f.name).as_str())?;
                     children.remove(repo_id, fid)?;
@@ -400,6 +473,7 @@ impl Store {
             let mut names = wt.open_table(NAMES)?;
             let mut children = wt.open_multimap_table(CHILDREN)?;
             let mut tokens = wt.open_multimap_table(TOKENS)?;
+            let mut sym_idx = wt.open_multimap_table(SYMBOLS)?;
             let mut next = meta.get("next_id")?.map(|v| v.value()).unwrap_or(1);
 
             let mut ensure = |parent: Option<NodeId>,
@@ -467,7 +541,13 @@ impl Store {
 
             if existed {
                 // Drop the old subtree.
-                remove_descendants(&mut nodes, &mut children, &mut tokens, file_id)?;
+                remove_descendants(
+                    &mut nodes,
+                    &mut children,
+                    &mut tokens,
+                    &mut sym_idx,
+                    file_id,
+                )?;
                 // Refresh language.
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
                 f.language = Some(language.into());
@@ -555,6 +635,7 @@ impl Store {
                         &mut nodes,
                         &mut children,
                     )?;
+                    sym_idx.insert(s.name.as_str(), id)?;
                     open.push((id, s.span.end));
                     stats.symbols += 1;
                 } else {
@@ -587,6 +668,108 @@ impl Store {
         }
         wt.commit()?;
         Ok(stats)
+    }
+
+    /// Find symbols by name. `pattern` is exact, or a prefix when it ends in `*`.
+    /// Results are ordered by org, repo, file and byte offset.
+    pub fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
+        let rt = self.db.begin_read()?;
+        let nodes = rt.open_table(NODES)?;
+        let idx = rt.open_multimap_table(SYMBOLS)?;
+        let load = |id: NodeId| -> Result<Node> {
+            dec(nodes
+                .get(id)?
+                .ok_or_else(|| StoreError::Corrupt(format!("dangling node {id}")))?
+                .value())
+        };
+        let mut ids: Vec<NodeId> = Vec::new();
+        match q.pattern.strip_suffix('*') {
+            Some(prefix) => {
+                for r in idx.range(prefix..)? {
+                    let (k, vals) = r?;
+                    if !k.value().starts_with(prefix) {
+                        break;
+                    }
+                    for v in vals {
+                        ids.push(v?.value());
+                    }
+                }
+            }
+            None => {
+                for v in idx.get(q.pattern.as_str())? {
+                    ids.push(v?.value());
+                }
+            }
+        }
+        let want_file = q.file.as_deref().map(normalize_path);
+        let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
+        let mut out: Vec<SymbolHit> = Vec::new();
+        for id in ids {
+            let sym = load(id)?;
+            if q.kind.is_some() && sym.symbol_kind != q.kind {
+                continue;
+            }
+            let mut quals = vec![sym.name.clone()];
+            let mut cur = sym.parent;
+            let mut file = None;
+            while let Some(pid) = cur {
+                let n = load(pid)?;
+                cur = n.parent;
+                if n.kind == NodeKind::Symbol {
+                    quals.push(n.name);
+                } else {
+                    file = Some(n);
+                    break;
+                }
+            }
+            let file = file.ok_or_else(|| StoreError::Corrupt("symbol without file".into()))?;
+            let repo = load(
+                file.parent
+                    .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?,
+            )?;
+            let org = load(
+                repo.parent
+                    .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
+            )?;
+            if want_lang
+                .as_ref()
+                .is_some_and(|l| file.language.as_ref() != Some(l))
+                || q.org.as_ref().is_some_and(|o| &org.name != o)
+                || q.repo.as_ref().is_some_and(|r| &repo.name != r)
+                || want_file.as_ref().is_some_and(|f| &file.name != f)
+            {
+                continue;
+            }
+            quals.reverse();
+            out.push(SymbolHit {
+                org: org.name,
+                repo: repo.name,
+                file: file.name,
+                language: file.language,
+                name: sym.name,
+                qualified: quals.join("::"),
+                kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
+                lang_kind: sym.lang_kind,
+                span: sym.span,
+            });
+        }
+        out.sort_by(|a, b| {
+            (
+                &a.org,
+                &a.repo,
+                &a.file,
+                a.span.map(|s| s.start),
+                &a.qualified,
+            )
+                .cmp(&(
+                    &b.org,
+                    &b.repo,
+                    &b.file,
+                    b.span.map(|s| s.start),
+                    &b.qualified,
+                ))
+        });
+        Ok(out)
     }
 
     /// Token-text search with roll-up to the requested grain.

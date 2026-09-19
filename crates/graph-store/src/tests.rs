@@ -371,3 +371,169 @@ fn open_in_missing_directory_names_the_path() {
     let e = Store::open(&p).err().unwrap().to_string();
     assert!(e.contains("nope"), "{e}");
 }
+
+fn symbol_fixture(dir: &std::path::Path) -> Store {
+    let s = Store::open(dir.join("g.redb")).unwrap();
+    let src = "fn parse() {}\nstruct S;\nimpl S { fn parse(&self) {} fn parser(&self) {} fn other(&self) {} }\n";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![
+            SymbolDecl {
+                name: "parse".into(),
+                kind: SymbolKind::Function,
+                lang_kind: Some("fn".into()),
+                span: span_of(src, "fn parse() {}", 0),
+            },
+            SymbolDecl {
+                name: "S".into(),
+                kind: SymbolKind::Other,
+                lang_kind: Some("impl".into()),
+                span: span_of(
+                    src,
+                    "impl S { fn parse(&self) {} fn parser(&self) {} fn other(&self) {} }",
+                    0,
+                ),
+            },
+            SymbolDecl {
+                name: "parse".into(),
+                kind: SymbolKind::Method,
+                lang_kind: Some("fn".into()),
+                span: span_of(src, "fn parse(&self) {}", 0),
+            },
+            SymbolDecl {
+                name: "parser".into(),
+                kind: SymbolKind::Method,
+                lang_kind: Some("fn".into()),
+                span: span_of(src, "fn parser(&self) {}", 0),
+            },
+            SymbolDecl {
+                name: "other".into(),
+                kind: SymbolKind::Method,
+                lang_kind: Some("fn".into()),
+                span: span_of(src, "fn other(&self) {}", 0),
+            },
+        ],
+        tokens: tokenize(src),
+    };
+    s.ingest_file("o1", "r1", "a.rs", "rust", &ex).unwrap();
+    s.ingest_file("o1", "r2", "b.rs", "rust", &ex).unwrap();
+    // A Python file with a `parse` function (language filter).
+    let py = Extraction {
+        has_errors: false,
+        symbols: vec![SymbolDecl {
+            name: "parse".into(),
+            kind: SymbolKind::Function,
+            lang_kind: Some("def".into()),
+            span: span_of("def parse(): pass", "def parse(): pass", 0),
+        }],
+        tokens: tokenize("def parse(): pass"),
+    };
+    s.ingest_file("o2", "r3", "p.py", "python", &py).unwrap();
+    s
+}
+
+#[test]
+fn symbol_search_name_kind_language_scope_prefix() {
+    let d = tempfile::tempdir().unwrap();
+    let s = symbol_fixture(d.path());
+    let names = |q: &SymbolQuery| -> Vec<String> {
+        s.search_symbols(q)
+            .unwrap()
+            .iter()
+            .map(|h| format!("{}/{}:{}", h.org, h.repo, h.qualified))
+            .collect()
+    };
+    // Exact name: 2 rust (function + method) x 2 repos + python.
+    assert_eq!(names(&SymbolQuery::new("parse")).len(), 5);
+    let mut q = SymbolQuery::new("parse");
+    q.kind = Some(SymbolKind::Method);
+    assert_eq!(names(&q), ["o1/r1:S::parse", "o1/r2:S::parse"]);
+    let mut q = SymbolQuery::new("parse");
+    q.language = Some("Python".into());
+    assert_eq!(names(&q), ["o2/r3:parse"]);
+    let mut q = SymbolQuery::new("parse");
+    q.repo = Some("r2".into());
+    assert_eq!(names(&q), ["o1/r2:parse", "o1/r2:S::parse"]);
+    q.file = Some("./b.rs".into());
+    assert_eq!(names(&q).len(), 2);
+    q.file = Some("a.rs".into());
+    assert!(names(&q).is_empty());
+    // Prefix: parse, parse, parser per rust repo (+ python parse), not `other`.
+    let mut q = SymbolQuery::new("pars*");
+    q.org = Some("o1".into());
+    assert_eq!(names(&q).len(), 6);
+    assert!(names(&SymbolQuery::new("nomatch*")).is_empty());
+    assert!(names(&SymbolQuery::new("Parse")).is_empty()); // case-sensitive
+                                                           // Path and kind strings.
+    let h = &s.search_symbols(&SymbolQuery::new("parser")).unwrap()[0];
+    assert_eq!(
+        (
+            h.qualified.as_str(),
+            h.lang_kind.as_deref(),
+            h.file.as_str()
+        ),
+        ("S::parser", Some("fn"), "a.rs")
+    );
+    assert_eq!(h.span.unwrap().start_line, 3);
+}
+
+#[test]
+fn symbol_index_follows_reindex_and_prune() {
+    let d = tempfile::tempdir().unwrap();
+    let s = symbol_fixture(d.path());
+    // Re-index a.rs without symbols: its symbols leave the index.
+    s.ingest_file(
+        "o1",
+        "r1",
+        "a.rs",
+        "rust",
+        &Extraction {
+            has_errors: false,
+            symbols: vec![],
+            tokens: tokenize("x"),
+        },
+    )
+    .unwrap();
+    let mut q = SymbolQuery::new("parse");
+    q.repo = Some("r1".into());
+    assert!(s.search_symbols(&q).unwrap().is_empty());
+    // Pruned directory-origin file leaves the index too.
+    s.ingest_file_with_origin(
+        "o1",
+        "r2",
+        "b.rs",
+        "rust",
+        &Extraction {
+            has_errors: false,
+            symbols: vec![],
+            tokens: tokenize("x"),
+        },
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    s.prune_files("o1", "r2", &Default::default(), false)
+        .unwrap();
+    assert_eq!(
+        s.search_symbols(&SymbolQuery::new("parse")).unwrap().len(),
+        1
+    ); // python only
+}
+
+#[test]
+fn symbol_index_backfilled_for_older_databases() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("g.redb");
+    drop(symbol_fixture(d.path()));
+    {
+        // Simulate a database from before the symbol index existed.
+        let db = Database::create(&p).unwrap();
+        let wt = db.begin_write().unwrap();
+        wt.delete_multimap_table(SYMBOLS).unwrap();
+        wt.commit().unwrap();
+    }
+    let s = Store::open(&p).unwrap();
+    assert_eq!(
+        s.search_symbols(&SymbolQuery::new("parse")).unwrap().len(),
+        5
+    );
+}

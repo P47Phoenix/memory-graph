@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use graph_core::{SymbolKind, TokenClass};
-use graph_store::{Grain, Query, Store, ORIGIN_DIRECTORY};
+use graph_store::{Grain, Query, Store, SymbolQuery, ORIGIN_DIRECTORY};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -49,6 +49,25 @@ enum Cmd {
         #[arg(long, requires = "prune")]
         force: bool,
         dir: PathBuf,
+    },
+    /// Find symbols (definitions) by name; a trailing `*` matches a prefix
+    Symbols {
+        /// Exact name, or `prefix*`
+        pattern: String,
+        /// Generic kind: module, type, function, method, variable, constant, other
+        #[arg(long)]
+        kind: Option<SymbolKind>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict to one file path as indexed (relative to the indexed directory)
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Find tokens by exact text
     Search {
@@ -369,6 +388,44 @@ fn main() -> Result<()> {
             prune,
             force,
         })?,
+        Cmd::Symbols {
+            pattern,
+            kind,
+            language,
+            org,
+            repo,
+            file,
+            json,
+        } => {
+            if !cli.db.is_file() {
+                bail!("database `{}` does not exist", cli.db.display());
+            }
+            let store = Store::open(&cli.db)?;
+            let mut q = SymbolQuery::new(&pattern);
+            (q.kind, q.language, q.org, q.repo, q.file) = (kind, language, org, repo, file);
+            let hits = store.search_symbols(&q)?;
+            if json {
+                let out = serde_json::json!({ "query": pattern, "results": hits });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                for h in &hits {
+                    let loc = h
+                        .span
+                        .map(|s| format!(":{}:{}", s.start_line, s.start_col))
+                        .unwrap_or_default();
+                    println!(
+                        "{}/{}/{}{loc}\t{}\t{} ({})\t{}",
+                        h.org,
+                        h.repo,
+                        h.file,
+                        h.language.as_deref().unwrap_or("-"),
+                        h.kind.as_str(),
+                        h.lang_kind.as_deref().unwrap_or("-"),
+                        h.qualified
+                    );
+                }
+            }
+        }
         Cmd::Search {
             text,
             language,
