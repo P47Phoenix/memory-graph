@@ -6,5 +6,5 @@ pub mod schema;
 pub mod tokenizer;
 
 pub use extractor::{Extraction, Extractor, FallbackExtractor, Registry, SymbolDecl};
-pub use language::{detect_language, normalize_path};
+pub use language::{detect_language, detect_language_from_content, normalize_path};
 pub use schema::*;

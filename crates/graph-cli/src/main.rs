@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use graph_core::{SymbolKind, TokenClass};
-use graph_store::{Grain, Query, Store, ORIGIN_DIRECTORY};
+use graph_core::TokenClass;
+use graph_store::{Grain, Query, Store, SymbolQuery, ORIGIN_DIRECTORY};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -50,6 +50,34 @@ enum Cmd {
         force: bool,
         dir: PathBuf,
     },
+    /// Show what is indexed: per repo, the languages present and each language's symbol kinds
+    Describe {
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find symbols (definitions) by name; a trailing `*` matches a prefix
+    Symbols {
+        /// Exact name, or `prefix*`
+        pattern: String,
+        /// Kind name: generic (function, method, type, ...) or language-specific (struct, trait, impl, ...). Run `describe` to see what exists.
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict to one file path as indexed (relative to the indexed directory)
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Find tokens by exact text
     Search {
         text: String,
@@ -65,9 +93,9 @@ enum Cmd {
         /// token, symbol, file, repo or org
         #[arg(long, default_value = "token")]
         grain: Grain,
-        /// With --grain symbol: only symbols of this kind (e.g. method)
+        /// With --grain symbol: only symbols of this kind (generic or language-specific; see `describe`)
         #[arg(long)]
-        symbol_kind: Option<SymbolKind>,
+        symbol_kind: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -317,6 +345,62 @@ fn index_dir(o: DirOpts) -> Result<()> {
     Ok(())
 }
 
+fn open_existing(db: &std::path::Path) -> Result<Store> {
+    if !db.is_file() {
+        bail!("database `{}` does not exist", db.display());
+    }
+    Ok(Store::open(db)?)
+}
+
+/// Filters are checked against what is actually indexed (in the org/repo
+/// scope), so a typo fails loudly and lists the valid choices rather than
+/// returning nothing.
+fn validate_filters(
+    store: &Store,
+    org: Option<&str>,
+    repo: Option<&str>,
+    language: Option<&str>,
+    kind: Option<&str>,
+) -> Result<()> {
+    let infos = store.describe(org, repo)?;
+    if infos.is_empty() {
+        if org.is_some() || repo.is_some() {
+            bail!("no indexed repo matches --org/--repo; run `describe` to list what is indexed");
+        }
+        return Ok(());
+    }
+    if let Some(l) = language {
+        let langs: std::collections::BTreeSet<&String> =
+            infos.iter().flat_map(|i| i.languages.keys()).collect();
+        if !langs.iter().any(|x| x.eq_ignore_ascii_case(l)) {
+            bail!(
+                "no files of language `{l}` in scope; languages present: {}",
+                join(langs.iter().copied())
+            );
+        }
+    }
+    if let Some(k) = kind {
+        let kinds: std::collections::BTreeSet<String> =
+            infos.iter().flat_map(|i| i.kind_names(language)).collect();
+        if !kinds.contains(k) {
+            bail!(
+                "no symbols of kind `{k}` in scope; kinds present: {}",
+                join(kinds.iter())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn join<'a>(it: impl Iterator<Item = &'a String>) -> String {
+    let v: Vec<&str> = it.map(String::as_str).collect();
+    if v.is_empty() {
+        "(none)".into()
+    } else {
+        v.join(", ")
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -369,6 +453,71 @@ fn main() -> Result<()> {
             prune,
             force,
         })?,
+        Cmd::Describe { org, repo, json } => {
+            let store = open_existing(&cli.db)?;
+            let infos = store.describe(org.as_deref(), repo.as_deref())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({ "repos": infos }))?
+                );
+            } else {
+                for i in &infos {
+                    println!("{}/{}: {} files", i.org, i.repo, i.files);
+                    for (l, li) in &i.languages {
+                        println!(
+                            "  {l}: {} files, {} symbols, {} tokens",
+                            li.files, li.symbols, li.tokens
+                        );
+                        for (k, n) in &li.symbol_kinds {
+                            println!("    {k}: {n}");
+                        }
+                    }
+                }
+            }
+        }
+        Cmd::Symbols {
+            pattern,
+            kind,
+            language,
+            org,
+            repo,
+            file,
+            json,
+        } => {
+            let store = open_existing(&cli.db)?;
+            validate_filters(
+                &store,
+                org.as_deref(),
+                repo.as_deref(),
+                language.as_deref(),
+                kind.as_deref(),
+            )?;
+            let mut q = SymbolQuery::new(&pattern);
+            (q.kind, q.language, q.org, q.repo, q.file) = (kind, language, org, repo, file);
+            let hits = store.search_symbols(&q)?;
+            if json {
+                let out = serde_json::json!({ "query": pattern, "results": hits });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                for h in &hits {
+                    let loc = h
+                        .span
+                        .map(|s| format!(":{}:{}", s.start_line, s.start_col))
+                        .unwrap_or_default();
+                    println!(
+                        "{}/{}/{}{loc}\t{}\t{} ({})\t{}",
+                        h.org,
+                        h.repo,
+                        h.file,
+                        h.language.as_deref().unwrap_or("-"),
+                        h.kind.as_str(),
+                        h.lang_kind.as_deref().unwrap_or("-"),
+                        h.qualified
+                    );
+                }
+            }
+        }
         Cmd::Search {
             text,
             language,
@@ -382,10 +531,14 @@ fn main() -> Result<()> {
             if symbol_kind.is_some() && grain != Grain::Symbol {
                 bail!("--symbol-kind requires --grain symbol");
             }
-            if !cli.db.is_file() {
-                bail!("database `{}` does not exist", cli.db.display());
-            }
-            let store = Store::open(&cli.db)?;
+            let store = open_existing(&cli.db)?;
+            validate_filters(
+                &store,
+                org.as_deref(),
+                repo.as_deref(),
+                language.as_deref(),
+                symbol_kind.as_deref(),
+            )?;
             let mut q = Query::new(&text);
             (q.language, q.org, q.repo, q.class, q.grain, q.symbol_kind) =
                 (language, org, repo, kind, grain, symbol_kind);

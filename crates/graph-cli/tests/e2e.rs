@@ -745,3 +745,151 @@ mod prune_and_limits {
         }
     }
 }
+
+#[test]
+fn symbols_command() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("p");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn parse() {}\nstruct S;\nimpl S {\n    fn parse(&self) {}\n    fn parser(&self) {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("other.py"), "def parse(): pass\n").unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let q = |args: &[&str]| -> Vec<serde_json::Value> {
+        let mut a = vec!["--db", &db, "symbols", "--json"];
+        a.extend_from_slice(args);
+        let (ok, out, err) = run(&a);
+        assert!(ok && err.is_empty(), "{err}");
+        serde_json::from_str::<serde_json::Value>(out.trim()).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(q(&["parse"]).len(), 2); // Python's `def parse` has no extractor, so only Rust symbols
+    let m = q(&["parse", "--kind", "method"]);
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0]["qualified"], "S::parse");
+    assert_eq!(m[0]["lang_kind"], "fn");
+    assert_eq!(m[0]["file"], "src/lib.rs");
+    assert_eq!(q(&["pars*"]).len(), 3);
+    assert_eq!(q(&["pars*", "--language", "python"]).len(), 0);
+    assert_eq!(
+        q(&["pars*", "--file", "src/lib.rs", "--repo", "r"]).len(),
+        3
+    );
+    let (ok, out, _) = run(&["--db", &db, "symbols", "parser"]);
+    assert!(
+        ok && out.contains("src/lib.rs:5:")
+            && out.contains("method (fn)")
+            && out.contains("S::parser"),
+        "{out}"
+    );
+    let (ok, _, err) = run(&["--db", "/no/such.redb", "symbols", "x"]);
+    assert!(!ok && err.contains("does not exist"));
+}
+
+#[test]
+fn polyglot_repo_is_described_and_filters_are_validated() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("mono");
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::write(root.join("lib.rs"), "struct Widget;\ntrait Draw { fn draw(&self); }\nenum E { A }\nimpl Widget { fn new() -> Self { Widget } }\n").unwrap();
+    std::fs::write(
+        root.join("bin/tool"),
+        "#!/usr/bin/env python3\nprint('hi')\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("build.zig"), "pub fn main() void {}\n").unwrap();
+    std::fs::write(root.join("Makefile"), "all:\n\techo hi\n").unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "mono",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    // Languages were detected (shebang, filename, extension); nothing was dictated.
+    let (ok, out, _) = run(&["--db", &db, "describe", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let langs = &v["repos"][0]["languages"];
+    for l in ["rust", "python", "zig", "make"] {
+        assert!(langs[l]["files"].as_u64().unwrap() >= 1, "{l}: {langs}");
+    }
+    let kinds = langs["rust"]["symbol_kinds"].as_object().unwrap();
+    for k in [
+        "type/struct",
+        "type/trait",
+        "type/enum",
+        "other/impl",
+        "method/fn",
+    ] {
+        assert!(kinds.contains_key(k), "{k} in {kinds:?}");
+    }
+    assert!(langs["zig"]["symbols"] == 0);
+    // --kind accepts generic and language-specific names.
+    let count = |args: &[&str]| -> usize {
+        let mut a = vec!["--db", &db, "symbols", "--json"];
+        a.extend_from_slice(args);
+        let (ok, out, err) = run(&a);
+        assert!(ok, "{err}");
+        serde_json::from_str::<serde_json::Value>(out.trim()).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count(&["*", "--kind", "trait"]), 1);
+    assert_eq!(count(&["*", "--kind", "type"]), 3); // struct, trait, enum
+    assert_eq!(count(&["W*", "--kind", "struct", "--language", "rust"]), 1);
+    // Unknown values fail loudly and list what exists.
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--kind", "class"]);
+    assert!(
+        !ok && err.contains("kinds present") && err.contains("struct"),
+        "{err}"
+    );
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--language", "cobol"]);
+    assert!(
+        !ok && err.contains("languages present") && err.contains("python"),
+        "{err}"
+    );
+    let (ok, _, err) = run(&["--db", &db, "search", "x", "--language", "cobol"]);
+    assert!(!ok && err.contains("languages present"));
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--repo", "nope"]);
+    assert!(!ok && err.contains("describe"));
+    // A kind that exists, but not for the chosen language, is rejected too.
+    let (ok, _, _) = run(&[
+        "--db",
+        &db,
+        "symbols",
+        "*",
+        "--kind",
+        "struct",
+        "--language",
+        "zig",
+    ]);
+    assert!(!ok);
+    let (ok, out, _) = run(&["--db", &db, "describe"]);
+    assert!(
+        ok && out.contains("o/mono") && out.contains("python") && out.contains("type/struct"),
+        "{out}"
+    );
+}

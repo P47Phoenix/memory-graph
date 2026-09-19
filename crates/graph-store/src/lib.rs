@@ -1,8 +1,8 @@
 //! Embedded graph store on `redb` (pure Rust). Knows nothing about any
 //! particular language.
 use graph_core::{
-    check_contains, detect_language, normalize_path, Extraction, Extractor, Node, NodeId, NodeKind,
-    Registry, Span, SymbolKind, TokenClass,
+    check_contains, detect_language_from_content, normalize_path, Extraction, Extractor, Node,
+    NodeId, NodeKind, Registry, Span, SymbolKind, TokenClass,
 };
 use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
@@ -24,6 +24,8 @@ const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 const NAMES: TableDefinition<&str, u64> = TableDefinition::new("names");
 const CHILDREN: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("children");
 const TOKENS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("tokens_by_text");
+/// Symbol name -> symbol node ids (exact and prefix lookup).
+const SYMBOLS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("symbols_by_name");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -95,8 +97,9 @@ pub struct Query {
     pub repo: Option<String>,
     pub class: Option<TokenClass>,
     pub grain: Grain,
-    /// Restrict the symbol grain to this kind (e.g. methods).
-    pub symbol_kind: Option<SymbolKind>,
+    /// Restrict the symbol grain to this kind: generic (`method`) or
+    /// language-specific (`struct`).
+    pub symbol_kind: Option<String>,
 }
 
 impl Query {
@@ -110,6 +113,84 @@ impl Query {
             grain: Grain::Token,
             symbol_kind: None,
         }
+    }
+}
+
+/// Symbol lookup by name (exact, or prefix with a trailing `*`).
+#[derive(Debug, Clone)]
+pub struct SymbolQuery {
+    pub pattern: String,
+    /// Generic kind (`method`) or language-specific kind (`struct`, `trait`).
+    pub kind: Option<String>,
+    pub language: Option<String>,
+    pub org: Option<String>,
+    pub repo: Option<String>,
+    /// Restrict to one file path (normalized, relative as indexed).
+    pub file: Option<String>,
+}
+
+impl SymbolQuery {
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            kind: None,
+            language: None,
+            org: None,
+            repo: None,
+            file: None,
+        }
+    }
+}
+
+/// A symbol with its containment path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SymbolHit {
+    pub org: String,
+    pub repo: String,
+    pub file: String,
+    pub language: Option<String>,
+    pub name: String,
+    /// Qualified path from the outermost enclosing symbol, e.g. `S::a`.
+    pub qualified: String,
+    pub kind: SymbolKind,
+    /// Language-specific kind string (`struct`, `impl`, `fn`, ...).
+    pub lang_kind: Option<String>,
+    pub span: Option<Span>,
+}
+
+/// Per-language contents of a repo. `symbol_kinds` keys are `generic` or
+/// `generic/language-specific` (e.g. `type/struct`, `method/fn`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LanguageInfo {
+    pub files: usize,
+    pub symbols: usize,
+    pub tokens: usize,
+    pub symbol_kinds: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoInfo {
+    pub org: String,
+    pub repo: String,
+    pub files: usize,
+    pub languages: BTreeMap<String, LanguageInfo>,
+    pub token_classes: BTreeMap<String, usize>,
+}
+
+impl RepoInfo {
+    /// Every kind name usable with `--kind` (generic and language-specific),
+    /// optionally limited to one language.
+    pub fn kind_names(&self, language: Option<&str>) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for (lang, li) in &self.languages {
+            if language.is_some_and(|l| !lang.eq_ignore_ascii_case(l)) {
+                continue;
+            }
+            for k in li.symbol_kinds.keys() {
+                out.extend(k.split('/').map(str::to_string));
+            }
+        }
+        out
     }
 }
 
@@ -152,6 +233,13 @@ pub struct IngestStats {
     pub language: String,
 }
 
+/// A symbol matches a kind name if it is its generic kind or its
+/// language-specific kind string.
+fn kind_matches(sym: &Node, kind: &str) -> bool {
+    sym.symbol_kind.unwrap_or(SymbolKind::Other).as_str() == kind
+        || sym.lang_kind.as_deref() == Some(kind)
+}
+
 fn enc(n: &Node) -> Vec<u8> {
     serde_json::to_vec(n).expect("node serializes")
 }
@@ -169,6 +257,7 @@ fn remove_descendants(
     nodes: &mut redb::Table<u64, &[u8]>,
     children: &mut redb::MultimapTable<u64, u64>,
     tokens: &mut redb::MultimapTable<&str, u64>,
+    symbols: &mut redb::MultimapTable<&str, u64>,
     root: NodeId,
 ) -> Result<()> {
     let ids = |it: redb::MultimapValue<u64>| -> Result<Vec<NodeId>> {
@@ -181,8 +270,14 @@ fn remove_descendants(
         stack.extend(ids(children.remove_all(id)?)?);
         if let Some(old) = nodes.remove(id)? {
             let n = dec(old.value())?;
-            if n.kind == NodeKind::Token {
-                tokens.remove(n.name.as_str(), id)?;
+            match n.kind {
+                NodeKind::Token => {
+                    tokens.remove(n.name.as_str(), id)?;
+                }
+                NodeKind::Symbol => {
+                    symbols.remove(n.name.as_str(), id)?;
+                }
+                _ => {}
             }
         }
     }
@@ -209,7 +304,28 @@ impl Store {
         };
         match found {
             Some(v) if v != SCHEMA_VERSION => return Err(StoreError::SchemaMismatch { found: v }),
-            Some(_) => {}
+            Some(_) => {
+                // Databases written before the symbol index existed: build it once.
+                let missing = matches!(
+                    db.begin_read()?.open_multimap_table(SYMBOLS),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                );
+                if missing {
+                    let wt = db.begin_write()?;
+                    {
+                        let nodes = wt.open_table(NODES)?;
+                        let mut idx = wt.open_multimap_table(SYMBOLS)?;
+                        for r in nodes.iter()? {
+                            let (id, v) = r?;
+                            let n = dec(v.value())?;
+                            if n.kind == NodeKind::Symbol {
+                                idx.insert(n.name.as_str(), id.value())?;
+                            }
+                        }
+                    }
+                    wt.commit()?;
+                }
+            }
             None => {
                 let wt = db.begin_write()?;
                 {
@@ -220,6 +336,7 @@ impl Store {
                     wt.open_table(NAMES)?;
                     wt.open_multimap_table(CHILDREN)?;
                     wt.open_multimap_table(TOKENS)?;
+                    wt.open_multimap_table(SYMBOLS)?;
                 }
                 wt.commit()?;
             }
@@ -249,6 +366,7 @@ impl Store {
             let mut names = wt.open_table(NAMES)?;
             let mut children = wt.open_multimap_table(CHILDREN)?;
             let mut tokens = wt.open_multimap_table(TOKENS)?;
+            let mut sym_idx = wt.open_multimap_table(SYMBOLS)?;
             let org_id = names
                 .get(name_key(None, NodeKind::Org, org).as_str())?
                 .map(|v| v.value());
@@ -275,7 +393,7 @@ impl Store {
                         removed.push(f.name);
                         continue;
                     }
-                    remove_descendants(&mut nodes, &mut children, &mut tokens, fid)?;
+                    remove_descendants(&mut nodes, &mut children, &mut tokens, &mut sym_idx, fid)?;
                     nodes.remove(fid)?;
                     names.remove(name_key(Some(repo_id), NodeKind::File, &f.name).as_str())?;
                     children.remove(repo_id, fid)?;
@@ -329,7 +447,10 @@ impl Store {
         let src =
             std::str::from_utf8(bytes).map_err(|_| StoreError::NotUtf8(format!("`{path}`")))?;
         let path = normalize_path(path);
-        let lang = language.map_or_else(|| detect_language(&path), str::to_ascii_lowercase);
+        let lang = language.map_or_else(
+            || detect_language_from_content(&path, src),
+            str::to_ascii_lowercase,
+        );
         let ex = self.registry.extract(&lang, src);
         self.ingest_file_with_origin(org, repo, &path, &lang, &ex, origin)
     }
@@ -400,6 +521,7 @@ impl Store {
             let mut names = wt.open_table(NAMES)?;
             let mut children = wt.open_multimap_table(CHILDREN)?;
             let mut tokens = wt.open_multimap_table(TOKENS)?;
+            let mut sym_idx = wt.open_multimap_table(SYMBOLS)?;
             let mut next = meta.get("next_id")?.map(|v| v.value()).unwrap_or(1);
 
             let mut ensure = |parent: Option<NodeId>,
@@ -467,7 +589,13 @@ impl Store {
 
             if existed {
                 // Drop the old subtree.
-                remove_descendants(&mut nodes, &mut children, &mut tokens, file_id)?;
+                remove_descendants(
+                    &mut nodes,
+                    &mut children,
+                    &mut tokens,
+                    &mut sym_idx,
+                    file_id,
+                )?;
                 // Refresh language.
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
                 f.language = Some(language.into());
@@ -555,6 +683,7 @@ impl Store {
                         &mut nodes,
                         &mut children,
                     )?;
+                    sym_idx.insert(s.name.as_str(), id)?;
                     open.push((id, s.span.end));
                     stats.symbols += 1;
                 } else {
@@ -587,6 +716,197 @@ impl Store {
         }
         wt.commit()?;
         Ok(stats)
+    }
+
+    /// What is actually in the database (optionally scoped to an org and/or
+    /// repo): per repo, the languages present and, per language, its symbol
+    /// kinds and token counts. Callers use this to discover valid filter
+    /// values instead of guessing them; a repo may be polyglot.
+    pub fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
+        use std::collections::HashMap;
+        let rt = self.db.begin_read()?;
+        let nodes = rt.open_table(NODES)?;
+        let mut all: Vec<Node> = Vec::new();
+        for r in nodes.iter()? {
+            all.push(dec(r?.1.value())?);
+        }
+        all.sort_by_key(|n| n.id); // parents are always created before children
+
+        let mut org_name: HashMap<NodeId, String> = HashMap::new();
+        let mut repo_key: HashMap<NodeId, (String, String)> = HashMap::new();
+        let mut file_of: HashMap<NodeId, NodeId> = HashMap::new(); // symbol -> its file
+        let mut file_info: HashMap<NodeId, ((String, String), String)> = HashMap::new();
+        let mut infos: BTreeMap<(String, String), RepoInfo> = BTreeMap::new();
+        for n in &all {
+            match n.kind {
+                NodeKind::Org => {
+                    org_name.insert(n.id, n.name.clone());
+                }
+                NodeKind::Repo => {
+                    let o = n
+                        .parent
+                        .and_then(|p| org_name.get(&p))
+                        .cloned()
+                        .unwrap_or_default();
+                    let key = (o.clone(), n.name.clone());
+                    infos.entry(key.clone()).or_insert_with(|| RepoInfo {
+                        org: o,
+                        repo: n.name.clone(),
+                        files: 0,
+                        languages: BTreeMap::new(),
+                        token_classes: BTreeMap::new(),
+                    });
+                    repo_key.insert(n.id, key);
+                }
+                NodeKind::File => {
+                    let Some(key) = n.parent.and_then(|p| repo_key.get(&p)).cloned() else {
+                        continue;
+                    };
+                    let lang = n.language.clone().unwrap_or_else(|| "unknown".into());
+                    let info = infos.get_mut(&key).expect("repo registered");
+                    info.files += 1;
+                    info.languages.entry(lang.clone()).or_default().files += 1;
+                    file_info.insert(n.id, (key, lang));
+                }
+                NodeKind::Symbol | NodeKind::Token => {
+                    let Some(parent) = n.parent else { continue };
+                    let file = if file_info.contains_key(&parent) {
+                        parent
+                    } else {
+                        *file_of.get(&parent).unwrap_or(&0)
+                    };
+                    let Some((key, lang)) = file_info.get(&file) else {
+                        continue;
+                    };
+                    let info = infos.get_mut(key).expect("repo registered");
+                    let l = info.languages.entry(lang.clone()).or_default();
+                    if n.kind == NodeKind::Symbol {
+                        file_of.insert(n.id, file);
+                        l.symbols += 1;
+                        let generic = n.symbol_kind.unwrap_or(SymbolKind::Other).as_str();
+                        let label = match &n.lang_kind {
+                            Some(k) if k != generic => format!("{generic}/{k}"),
+                            _ => generic.to_string(),
+                        };
+                        *l.symbol_kinds.entry(label).or_default() += 1;
+                    } else {
+                        l.tokens += 1;
+                        if let Some(c) = n.token_class {
+                            *info
+                                .token_classes
+                                .entry(c.as_str().to_string())
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(infos
+            .into_values()
+            .filter(|i| org.is_none_or(|o| i.org == o) && repo.is_none_or(|r| i.repo == r))
+            .collect())
+    }
+
+    /// Find symbols by name. `pattern` is exact, or a prefix when it ends in `*`.
+    /// Results are ordered by org, repo, file and byte offset.
+    pub fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
+        let rt = self.db.begin_read()?;
+        let nodes = rt.open_table(NODES)?;
+        let idx = rt.open_multimap_table(SYMBOLS)?;
+        let load = |id: NodeId| -> Result<Node> {
+            dec(nodes
+                .get(id)?
+                .ok_or_else(|| StoreError::Corrupt(format!("dangling node {id}")))?
+                .value())
+        };
+        let mut ids: Vec<NodeId> = Vec::new();
+        match q.pattern.strip_suffix('*') {
+            Some(prefix) => {
+                for r in idx.range(prefix..)? {
+                    let (k, vals) = r?;
+                    if !k.value().starts_with(prefix) {
+                        break;
+                    }
+                    for v in vals {
+                        ids.push(v?.value());
+                    }
+                }
+            }
+            None => {
+                for v in idx.get(q.pattern.as_str())? {
+                    ids.push(v?.value());
+                }
+            }
+        }
+        let want_file = q.file.as_deref().map(normalize_path);
+        let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
+        let mut out: Vec<SymbolHit> = Vec::new();
+        for id in ids {
+            let sym = load(id)?;
+            if q.kind.as_deref().is_some_and(|k| !kind_matches(&sym, k)) {
+                continue;
+            }
+            let mut quals = vec![sym.name.clone()];
+            let mut cur = sym.parent;
+            let mut file = None;
+            while let Some(pid) = cur {
+                let n = load(pid)?;
+                cur = n.parent;
+                if n.kind == NodeKind::Symbol {
+                    quals.push(n.name);
+                } else {
+                    file = Some(n);
+                    break;
+                }
+            }
+            let file = file.ok_or_else(|| StoreError::Corrupt("symbol without file".into()))?;
+            let repo = load(
+                file.parent
+                    .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?,
+            )?;
+            let org = load(
+                repo.parent
+                    .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
+            )?;
+            if want_lang
+                .as_ref()
+                .is_some_and(|l| file.language.as_ref() != Some(l))
+                || q.org.as_ref().is_some_and(|o| &org.name != o)
+                || q.repo.as_ref().is_some_and(|r| &repo.name != r)
+                || want_file.as_ref().is_some_and(|f| &file.name != f)
+            {
+                continue;
+            }
+            quals.reverse();
+            out.push(SymbolHit {
+                org: org.name,
+                repo: repo.name,
+                file: file.name,
+                language: file.language,
+                name: sym.name,
+                qualified: quals.join("::"),
+                kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
+                lang_kind: sym.lang_kind,
+                span: sym.span,
+            });
+        }
+        out.sort_by(|a, b| {
+            (
+                &a.org,
+                &a.repo,
+                &a.file,
+                a.span.map(|s| s.start),
+                &a.qualified,
+            )
+                .cmp(&(
+                    &b.org,
+                    &b.repo,
+                    &b.file,
+                    b.span.map(|s| s.start),
+                    &b.qualified,
+                ))
+        });
+        Ok(out)
     }
 
     /// Token-text search with roll-up to the requested grain.
@@ -711,7 +1031,7 @@ impl Store {
                     // Innermost enclosing symbol of the requested kind.
                     let pick = symbols
                         .iter()
-                        .position(|s| q.symbol_kind.is_none() || s.symbol_kind == q.symbol_kind);
+                        .position(|s| q.symbol_kind.as_deref().is_none_or(|k| kind_matches(s, k)));
                     match pick {
                         Some(i) => {
                             let s = &symbols[i];
