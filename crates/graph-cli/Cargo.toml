@@ -20,3 +20,4 @@ serde_json.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 graph-store = { path = "../graph-store" }
+redb.workspace = true

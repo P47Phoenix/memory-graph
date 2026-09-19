@@ -68,10 +68,13 @@ enum Cmd {
     },
     /// Find symbols (definitions) by name; a trailing `*` matches a prefix
     Symbols {
-        /// Exact name, `prefix*` (a prefix), `*` (everything) or `name\*` (a name ending in a literal `*`)
+        /// Exact name, `prefix*` (a prefix), `*` (everything) or `name\*` (a name ending in a literal `*`).
+        /// Edges: `**` at the end is rejected as ambiguous (so `a\**` is too), and a trailing backslash not
+        /// followed by `*` is an ordinary character (`a\` matches the name `a\` exactly)
         pattern: String,
-        /// Only symbols of this kind: generic (module, type, function, method, variable, constant, other)
-        /// or language-specific (struct, trait, impl, ...). `describe` lists the kinds present
+        /// Only symbols of this symbol kind (case-insensitive): generic (module, type, function, method,
+        /// variable, constant, other) or language-specific (struct, trait, impl, ...). `describe` lists the
+        /// kinds present. (`search --kind` is a token class, a different thing)
         #[arg(long)]
         kind: Option<String>,
         /// Only files of this language (case-insensitive, e.g. rust); `describe` lists the languages present
@@ -112,7 +115,8 @@ enum Cmd {
         /// Level results are rolled up to: token, symbol, file, repo or org
         #[arg(long, default_value = "token")]
         grain: Grain,
-        /// With --grain symbol: only symbols of this kind (generic or language-specific; see `describe`)
+        /// With --grain symbol: only symbols of this symbol kind (case-insensitive; generic or
+        /// language-specific; see `describe`)
         #[arg(long)]
         symbol_kind: Option<String>,
         /// Show at most this many rows (ordered by org, repo, file, position)
@@ -388,34 +392,34 @@ fn index_dir(o: DirOpts) -> Result<()> {
             "languages": by_lang, "skipped": skipped_n, "skipped_by_reason": skipped,
             "pruned": pruned, "elapsed_ms": ms,
         });
-        println!("{}", serde_json::to_string(&out)?);
+        out!("{}", serde_json::to_string(&out)?);
     } else {
-        println!(
+        out!(
             "indexed {}/{}: files={files} symbols={symbols} tokens={tokens} skipped={skipped_n} pruned={} elapsed={ms}ms",
             o.org, o.repo, pruned.len()
         );
         for (l, n) in &by_lang {
-            println!("  {l}: {n}");
+            out!("  {l}: {n}");
         }
         if !pruned.is_empty() {
-            println!("  pruned:");
+            out!("  pruned:");
             for p in pruned.iter().take(20) {
-                println!("    {p}");
+                out!("    {p}");
             }
             if pruned.len() > 20 {
-                println!(
+                out!(
                     "    ... and {} more (use --json for all)",
                     pruned.len() - 20
                 );
             }
         }
         for (r, v) in &skipped {
-            println!("  skipped ({r}): {}", v.len());
+            out!("  skipped ({r}): {}", v.len());
             for p in v.iter().take(20) {
-                println!("    {p}");
+                out!("    {p}");
             }
             if v.len() > 20 {
-                println!("    ... and {} more (use --json for all)", v.len() - 20);
+                out!("    ... and {} more (use --json for all)", v.len() - 20);
             }
         }
     }
@@ -470,7 +474,12 @@ fn validate_filters(
         let kinds: std::collections::BTreeSet<String> =
             infos.iter().flat_map(|i| i.kind_names(language)).collect();
         // Generic kinds are always valid (`other` covers symbols without a kind).
-        if !kinds.contains(k) && k.parse::<graph_core::SymbolKind>().is_err() {
+        let known = kinds.iter().any(|x| x.eq_ignore_ascii_case(k));
+        if !known
+            && k.to_ascii_lowercase()
+                .parse::<graph_core::SymbolKind>()
+                .is_err()
+        {
             bail!(
                 "no symbols of kind `{k}` in scope; kinds present: {}",
                 join(kinds.iter())
@@ -528,7 +537,7 @@ fn run() -> Result<()> {
             store.register(Box::new(graph_lang_rust::RustExtractor));
             let st = store.index_bytes(&org, &repo, path_str, &bytes, language.as_deref())?;
             let lang = st.language.clone();
-            println!(
+            out!(
                 "indexed {} ({}) tokens={} symbols={}{}{}",
                 path.display(),
                 lang,

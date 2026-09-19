@@ -38,8 +38,8 @@ pub enum StoreError {
     SchemaMismatch { found: u64 },
     #[error("cannot open database {path}: {reason}")]
     OpenFailed { path: String, reason: String },
-    #[error("database {path} needs its symbol index rebuilt but cannot be written ({reason}); open it once with write access")]
-    NeedsWrite { path: String, reason: String },
+    #[error("database symbol index version {found} is newer than this build supports ({SYMBOL_INDEX_VERSION}); database left unmodified, use a newer build")]
+    IndexTooNew { found: u64 },
     #[error("rejected: {0}")]
     Rejected(String),
     #[error("rejected: {0} is not valid UTF-8")]
@@ -62,6 +62,27 @@ impl<E: Into<redb::Error>> From<E> for StoreError {
             redb::Error::DatabaseAlreadyOpen => StoreError::Locked("already open".into()),
             other => StoreError::Storage(other.to_string()),
         }
+    }
+}
+
+/// Map an open failure; the read-only hint is given only for permission errors.
+fn open_failed(path: &Path, e: &DatabaseError) -> StoreError {
+    let denied = matches!(
+        e,
+        DatabaseError::Storage(redb::StorageError::Io(io))
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+    );
+    let hint = if denied {
+        " (the database file and its directory must be writable; read-only databases are not supported)"
+    } else {
+        ""
+    };
+    StoreError::OpenFailed {
+        path: path.display().to_string(),
+        reason: format!("{e}{hint}"),
     }
 }
 
@@ -258,10 +279,16 @@ pub struct IngestStats {
 }
 
 /// A symbol matches a kind name if it is its generic kind or its
-/// language-specific kind string.
+/// language-specific kind string (ASCII case-insensitive, like `--language`).
 fn kind_matches(sym: &Node, kind: &str) -> bool {
-    sym.symbol_kind.unwrap_or(SymbolKind::Other).as_str() == kind
-        || sym.lang_kind.as_deref() == Some(kind)
+    sym.symbol_kind
+        .unwrap_or(SymbolKind::Other)
+        .as_str()
+        .eq_ignore_ascii_case(kind)
+        || sym
+            .lang_kind
+            .as_deref()
+            .is_some_and(|k| k.eq_ignore_ascii_case(kind))
 }
 
 fn enc(n: &Node) -> Vec<u8> {
@@ -309,17 +336,17 @@ fn remove_descendants(
 }
 
 impl Store {
-    /// Open or create a database file. Fails without modifying the file on a
-    /// schema mismatch or when another process holds it.
+    /// Open or create a database file. The file must be writable: redb 2 has
+    /// no read-only open mode. Fails without modifying the file on a schema
+    /// mismatch, on a symbol index newer than this build, or when another
+    /// process holds it. A database whose symbol index is missing or older is
+    /// rebuilt once on open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::create(path.as_ref()).map_err(|e| match e {
             DatabaseError::DatabaseAlreadyOpen => {
                 StoreError::Locked(path.as_ref().display().to_string())
             }
-            e => StoreError::OpenFailed {
-                path: path.as_ref().display().to_string(),
-                reason: format!("{e} (a read-only file or directory cannot be opened)"),
-            },
+            e => open_failed(path.as_ref(), &e),
         })?;
         let found = {
             let rt = db.begin_read()?;
@@ -334,7 +361,8 @@ impl Store {
             Some(_) => {
                 // Databases written before the symbol index existed, or with an
                 // older index layout: rebuild it once. Nothing is written when
-                // the index is current, so read-only media work in that case.
+                // the index is current. A newer index is never rewritten (that
+                // would silently downgrade it).
                 let current = {
                     let rt = db.begin_read()?;
                     let ver = match rt.open_table(META) {
@@ -342,6 +370,9 @@ impl Store {
                         Err(redb::TableError::TableDoesNotExist(_)) => None,
                         Err(e) => return Err(e.into()),
                     };
+                    if let Some(v) = ver.filter(|&v| v > SYMBOL_INDEX_VERSION) {
+                        return Err(StoreError::IndexTooNew { found: v });
+                    }
                     ver == Some(SYMBOL_INDEX_VERSION)
                         && !matches!(
                             rt.open_multimap_table(SYMBOLS),
@@ -349,11 +380,7 @@ impl Store {
                         )
                 };
                 if !current {
-                    let need_write = |e: redb::Error| StoreError::NeedsWrite {
-                        path: path.as_ref().display().to_string(),
-                        reason: e.to_string(),
-                    };
-                    let wt = db.begin_write().map_err(|e| need_write(e.into()))?;
+                    let wt = db.begin_write()?;
                     {
                         let nodes = wt.open_table(NODES)?;
                         wt.delete_multimap_table(SYMBOLS)?;
@@ -368,7 +395,7 @@ impl Store {
                         wt.open_table(META)?
                             .insert("symbol_index_version", SYMBOL_INDEX_VERSION)?;
                     }
-                    wt.commit().map_err(|e| need_write(e.into()))?;
+                    wt.commit()?;
                 }
             }
             None => {
@@ -561,24 +588,27 @@ impl Store {
     }
 
     /// Index many files of one repo in a single write transaction (one commit
-    /// instead of one per file). Extraction runs before the transaction opens.
-    /// Files that are not UTF-8 or too large yield a per-file `Err` and are
-    /// not stored; a storage or span error aborts the whole batch (nothing is
-    /// stored). Outcomes are in input order.
+    /// instead of one per file). Each file is extracted just before it is
+    /// stored and its extraction dropped right after, so memory use is bounded
+    /// by the sources, not by the number of tokens across the batch. Files
+    /// that are not UTF-8 or too large yield a per-file `Err` and are not
+    /// stored; a storage or span error aborts the whole batch (nothing is
+    /// stored, later files are not extracted). Outcomes are in input order.
     pub fn index_batch(
         &self,
         org: &str,
         repo: &str,
         files: &[BatchFile<'_>],
     ) -> Result<Vec<Result<IngestStats>>> {
-        let mut prepared = Vec::with_capacity(files.len());
+        let wt = self.db.begin_write()?;
+        let mut out = Vec::with_capacity(files.len());
         for f in files {
             if f.bytes.len() > MAX_SOURCE_BYTES {
-                prepared.push(Err(StoreError::TooLarge(format!("`{}`", f.path))));
+                out.push(Err(StoreError::TooLarge(format!("`{}`", f.path))));
                 continue;
             }
             let Ok(src) = std::str::from_utf8(f.bytes) else {
-                prepared.push(Err(StoreError::NotUtf8(format!("`{}`", f.path))));
+                out.push(Err(StoreError::NotUtf8(format!("`{}`", f.path))));
                 continue;
             };
             let path = normalize_path(f.path);
@@ -587,17 +617,9 @@ impl Store {
                 str::to_ascii_lowercase,
             );
             let ex = self.registry.extract(&lang, src);
-            prepared.push(Ok((path, lang, ex, f.origin)));
-        }
-        let wt = self.db.begin_write()?;
-        let mut out = Vec::with_capacity(prepared.len());
-        for p in prepared {
-            out.push(match p {
-                Ok((path, lang, ex, origin)) => Ok(Self::ingest_into(
-                    &wt, org, repo, &path, &lang, &ex, origin,
-                )?),
-                Err(e) => Err(e),
-            });
+            out.push(Ok(Self::ingest_into(
+                &wt, org, repo, &path, &lang, &ex, f.origin,
+            )?));
         }
         wt.commit()?;
         Ok(out)
