@@ -88,6 +88,7 @@ So that code in any language is stored and queried the same way.
 - Given a parent and child, When a CONTAINS edge is created, Then only the valid hierarchy Org > Repo > File > Symbol* > Token must be accepted and other pairings must be rejected.
 - Given the Extractor trait, When a language implements it, Then it must take file bytes and return symbols and tokens using only the schema types, with no dependency on storage or query code.
 - Given every node and edge type, When unit tests run, Then round-trip serialization must pass.
+- Given any node, When its parent is requested, Then the store returns it in one lookup (parent pointer per node), so results can roll up to symbol, file, repo or org. The full traversal API stays in story 12.
 
 **5. Persist graph to disk and reopen (3 pts)**
 As a developer or agent
@@ -126,6 +127,9 @@ So that I can locate identifiers and literals in any language.
 - Given `--kind identifier`, When searched, Then only tokens of that class must be returned.
 - Given no matches, When searched, Then the result must be empty and the exit code 0.
 - Given results, When printed, Then they must be ordered by org, repo, path and byte offset.
+- Given `--json`, When searched, Then stdout must be one JSON document `{"query":…,"grain":…,"results":[…]}` and nothing else, so an agent can consume it.
+- Given `--grain token|symbol|file|repo|org` (default `token`), When searched, Then results are the distinct nodes of that grain containing a match, each with its containment path and a hit count; `--symbol-kind method` restricts the symbol grain to that kind.
+- Given a match in a file with no enclosing symbol of the requested kind, When searched at symbol grain, Then it rolls up to its File and is flagged `no_symbols`.
 
 **9. Rust extractor (8 pts)**
 As an AI-agent integrator

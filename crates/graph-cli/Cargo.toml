@@ -1,0 +1,19 @@
+[package]
+name = "graph-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "memory-graph"
+path = "src/main.rs"
+
+[dependencies]
+graph-core = { path = "../graph-core" }
+graph-store = { path = "../graph-store" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,539 @@
+//! Embedded graph store on `redb` (pure Rust). Knows nothing about any
+//! particular language.
+use graph_core::{
+    check_contains, Extraction, Node, NodeId, NodeKind, Span, SymbolKind, TokenClass,
+};
+use redb::{
+    Database, DatabaseError, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
+    TableDefinition,
+};
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+
+pub const SCHEMA_VERSION: u64 = 1;
+
+const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
+/// `parent\0kind\0name` -> node id, for idempotent org/repo/file lookup.
+const NAMES: TableDefinition<&str, u64> = TableDefinition::new("names");
+const CHILDREN: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("children");
+const TOKENS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("tokens_by_text");
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("database is locked by another process: {0}")]
+    Locked(String),
+    #[error("incompatible schema version {found} (this build supports {SCHEMA_VERSION}); database left unmodified")]
+    SchemaMismatch { found: u64 },
+    #[error("corrupt database: {0}")]
+    Corrupt(String),
+    #[error(transparent)]
+    Schema(graph_core::SchemaError),
+    #[error("storage error: {0}")]
+    Storage(String),
+}
+
+impl<E: Into<redb::Error>> From<E> for StoreError {
+    fn from(e: E) -> Self {
+        match e.into() {
+            redb::Error::DatabaseAlreadyOpen => StoreError::Locked("already open".into()),
+            other => StoreError::Storage(other.to_string()),
+        }
+    }
+}
+
+type Result<T> = std::result::Result<T, StoreError>;
+
+pub struct Store {
+    db: Database,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Grain {
+    Token,
+    Symbol,
+    File,
+    Repo,
+    Org,
+}
+
+impl std::str::FromStr for Grain {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        Ok(match s {
+            "token" => Self::Token,
+            "symbol" => Self::Symbol,
+            "file" => Self::File,
+            "repo" => Self::Repo,
+            "org" => Self::Org,
+            _ => return Err(format!("unknown grain `{s}` (token|symbol|file|repo|org)")),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Query {
+    pub text: String,
+    pub language: Option<String>,
+    pub org: Option<String>,
+    pub repo: Option<String>,
+    pub class: Option<TokenClass>,
+    pub grain: Grain,
+    /// Restrict the symbol grain to this kind (e.g. methods).
+    pub symbol_kind: Option<SymbolKind>,
+}
+
+impl Query {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            language: None,
+            org: None,
+            repo: None,
+            class: None,
+            grain: Grain::Token,
+            symbol_kind: None,
+        }
+    }
+}
+
+/// One result row at the requested grain, with its containment path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Hit {
+    pub grain: Grain,
+    pub org: String,
+    pub repo: Option<String>,
+    pub file: Option<String>,
+    pub language: Option<String>,
+    /// Qualified enclosing symbol path, e.g. `Foo::bar`.
+    pub symbol: Option<String>,
+    pub symbol_kind: Option<SymbolKind>,
+    pub lang_kind: Option<String>,
+    /// Token grain: the token's class.
+    pub token_class: Option<TokenClass>,
+    /// Token grain: the token; symbol grain: the symbol.
+    pub span: Option<Span>,
+    /// Number of matching tokens contained in this node.
+    pub count: usize,
+    /// Symbol grain only: no enclosing symbol qualified, rolled up to the file.
+    pub no_symbols: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct IngestStats {
+    pub file_id: NodeId,
+    pub symbols: usize,
+    pub tokens: usize,
+    /// True when an existing file was replaced.
+    pub replaced: bool,
+}
+
+fn enc(n: &Node) -> Vec<u8> {
+    serde_json::to_vec(n).expect("node serializes")
+}
+
+fn dec(b: &[u8]) -> Result<Node> {
+    serde_json::from_slice(b).map_err(|e| StoreError::Corrupt(e.to_string()))
+}
+
+fn name_key(parent: Option<NodeId>, kind: NodeKind, name: &str) -> String {
+    format!("{}\0{:?}\0{}", parent.unwrap_or(0), kind, name)
+}
+
+impl Store {
+    /// Open or create a database file. Fails without modifying the file on a
+    /// schema mismatch or when another process holds it.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let db = Database::create(path.as_ref()).map_err(|e| match e {
+            DatabaseError::DatabaseAlreadyOpen => {
+                StoreError::Locked(path.as_ref().display().to_string())
+            }
+            e => StoreError::Storage(e.to_string()),
+        })?;
+        let found = {
+            let rt = db.begin_read()?;
+            match rt.open_table(META) {
+                Ok(t) => t.get("schema_version")?.map(|v| v.value()),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        match found {
+            Some(v) if v != SCHEMA_VERSION => return Err(StoreError::SchemaMismatch { found: v }),
+            Some(_) => {}
+            None => {
+                let wt = db.begin_write()?;
+                {
+                    let mut m = wt.open_table(META)?;
+                    m.insert("schema_version", SCHEMA_VERSION)?;
+                    m.insert("next_id", 1)?;
+                    wt.open_table(NODES)?;
+                    wt.open_table(NAMES)?;
+                    wt.open_multimap_table(CHILDREN)?;
+                    wt.open_multimap_table(TOKENS)?;
+                }
+                wt.commit()?;
+            }
+        }
+        Ok(Self { db })
+    }
+
+    pub fn get(&self, id: NodeId) -> Result<Option<Node>> {
+        let rt = self.db.begin_read()?;
+        let t = rt.open_table(NODES)?;
+        let r = t.get(id)?.map(|v| dec(v.value())).transpose();
+        r
+    }
+
+    /// Parent pointer lookup (one hop).
+    pub fn parent(&self, id: NodeId) -> Result<Option<Node>> {
+        match self.get(id)? {
+            Some(Node {
+                parent: Some(p), ..
+            }) => self.get(p),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
+        let rt = self.db.begin_read()?;
+        let t = rt.open_table(NODES)?;
+        let mut n = 0;
+        for r in t.iter()? {
+            if dec(r?.1.value())?.kind == kind {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Index one file (idempotent: re-indexing replaces the file's subtree).
+    /// The extraction's symbols must have spans; parents are derived from
+    /// span containment and tokens attach to their innermost symbol.
+    pub fn ingest_file(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+        language: &str,
+        ex: &Extraction,
+    ) -> Result<IngestStats> {
+        let wt = self.db.begin_write()?;
+        let mut stats = IngestStats::default();
+        {
+            let mut meta = wt.open_table(META)?;
+            let mut nodes = wt.open_table(NODES)?;
+            let mut names = wt.open_table(NAMES)?;
+            let mut children = wt.open_multimap_table(CHILDREN)?;
+            let mut tokens = wt.open_multimap_table(TOKENS)?;
+            let mut next = meta.get("next_id")?.map(|v| v.value()).unwrap_or(1);
+
+            let mut ensure = |parent: Option<NodeId>,
+                              parent_kind: Option<NodeKind>,
+                              kind: NodeKind,
+                              name: &str,
+                              language: Option<&str>|
+             -> Result<(NodeId, bool)> {
+                if let Some(pk) = parent_kind {
+                    check_contains(pk, kind).map_err(StoreError::Schema)?;
+                }
+                let key = name_key(parent, kind, name);
+                let existing = names.get(key.as_str())?.map(|v| v.value());
+                if let Some(id) = existing {
+                    return Ok((id, true));
+                }
+                let id = next;
+                next += 1;
+                let node = Node {
+                    id,
+                    parent,
+                    kind,
+                    name: name.into(),
+                    language: language.map(Into::into),
+                    symbol_kind: None,
+                    lang_kind: None,
+                    token_class: None,
+                    span: None,
+                };
+                nodes.insert(id, enc(&node).as_slice())?;
+                names.insert(key.as_str(), id)?;
+                if let Some(p) = parent {
+                    children.insert(p, id)?;
+                }
+                Ok((id, false))
+            };
+            let (org_id, _) = ensure(None, None, NodeKind::Org, org, None)?;
+            let (repo_id, _) = ensure(
+                Some(org_id),
+                Some(NodeKind::Org),
+                NodeKind::Repo,
+                repo,
+                None,
+            )?;
+            let (file_id, existed) = ensure(
+                Some(repo_id),
+                Some(NodeKind::Repo),
+                NodeKind::File,
+                path,
+                Some(language),
+            )?;
+            stats.file_id = file_id;
+            stats.replaced = existed;
+
+            if existed {
+                // Drop the old subtree.
+                let mut stack: Vec<NodeId> = children
+                    .get(file_id)?
+                    .map(|v| v.map(|g| g.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                children.remove_all(file_id)?;
+                while let Some(id) = stack.pop() {
+                    let kids: Vec<NodeId> = children
+                        .remove_all(id)?
+                        .map(|v| v.map(|g| g.value()))
+                        .collect::<std::result::Result<_, _>>()?;
+                    stack.extend(kids);
+                    if let Some(old) = nodes.remove(id)? {
+                        let n = dec(old.value())?;
+                        if n.kind == NodeKind::Token {
+                            tokens.remove(n.name.as_str(), id)?;
+                        }
+                    }
+                }
+                // Refresh language.
+                let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
+                f.language = Some(language.into());
+                nodes.insert(file_id, enc(&f).as_slice())?;
+            }
+
+            let mut syms: Vec<_> = ex.symbols.iter().collect();
+            syms.sort_by_key(|s| (s.span.start, std::cmp::Reverse(s.span.end)));
+            let mut toks: Vec<_> = ex.tokens.iter().collect();
+            toks.sort_by_key(|t| t.span.start);
+
+            // Open-symbol stack: (id, end).
+            let mut open: Vec<(NodeId, u32)> = Vec::new();
+            let mut si = 0;
+            let alloc = |next: &mut u64| {
+                let id = *next;
+                *next += 1;
+                id
+            };
+            let insert = |node: Node,
+                          nodes: &mut redb::Table<u64, &[u8]>,
+                          children: &mut redb::MultimapTable<u64, u64>|
+             -> Result<()> {
+                nodes.insert(node.id, enc(&node).as_slice())?;
+                if let Some(p) = node.parent {
+                    children.insert(p, node.id)?;
+                }
+                Ok(())
+            };
+            let mut ti = 0;
+            // Merge symbols and tokens in source order (symbols first on ties).
+            while si < syms.len() || ti < toks.len() {
+                let take_sym = si < syms.len()
+                    && (ti >= toks.len() || syms[si].span.start <= toks[ti].span.start);
+                let pos = if take_sym {
+                    syms[si].span.start
+                } else {
+                    toks[ti].span.start
+                };
+                while open.last().is_some_and(|&(_, end)| end <= pos) {
+                    open.pop();
+                }
+                let (parent, pkind) = match open.last() {
+                    Some(&(id, _)) => (id, NodeKind::Symbol),
+                    None => (file_id, NodeKind::File),
+                };
+                if take_sym {
+                    let s = syms[si];
+                    si += 1;
+                    check_contains(pkind, NodeKind::Symbol).map_err(StoreError::Schema)?;
+                    let id = alloc(&mut next);
+                    insert(
+                        Node {
+                            id,
+                            parent: Some(parent),
+                            kind: NodeKind::Symbol,
+                            name: s.name.clone(),
+                            language: None,
+                            symbol_kind: Some(s.kind),
+                            lang_kind: s.lang_kind.clone(),
+                            token_class: None,
+                            span: Some(s.span),
+                        },
+                        &mut nodes,
+                        &mut children,
+                    )?;
+                    open.push((id, s.span.end));
+                    stats.symbols += 1;
+                } else {
+                    let t = toks[ti];
+                    ti += 1;
+                    check_contains(pkind, NodeKind::Token).map_err(StoreError::Schema)?;
+                    let id = alloc(&mut next);
+                    insert(
+                        Node {
+                            id,
+                            parent: Some(parent),
+                            kind: NodeKind::Token,
+                            name: t.text.clone(),
+                            language: None,
+                            symbol_kind: None,
+                            lang_kind: None,
+                            token_class: Some(t.class),
+                            span: Some(t.span),
+                        },
+                        &mut nodes,
+                        &mut children,
+                    )?;
+                    tokens.insert(t.text.as_str(), id)?;
+                    stats.tokens += 1;
+                }
+            }
+            meta.insert("next_id", next)?;
+        }
+        wt.commit()?;
+        Ok(stats)
+    }
+
+    /// Token-text search with roll-up to the requested grain.
+    pub fn search(&self, q: &Query) -> Result<Vec<Hit>> {
+        let rt = self.db.begin_read()?;
+        let nodes = rt.open_table(NODES)?;
+        let tokens = rt.open_multimap_table(TOKENS)?;
+        let mut cache: HashMap<NodeId, Node> = HashMap::new();
+        let mut load = |id: NodeId| -> Result<Node> {
+            if let Some(n) = cache.get(&id) {
+                return Ok(n.clone());
+            }
+            let n = dec(nodes
+                .get(id)?
+                .ok_or_else(|| StoreError::Corrupt(format!("dangling node {id}")))?
+                .value())?;
+            cache.insert(id, n.clone());
+            Ok(n)
+        };
+
+        type Key = (String, String, String, u32, u64);
+        let mut rows: BTreeMap<Key, Hit> = BTreeMap::new();
+        for id in tokens.get(q.text.as_str())? {
+            let tok = load(id?.value())?;
+            if q.class.is_some() && tok.token_class != q.class {
+                continue;
+            }
+            // Ancestor chain, innermost first: symbols..., file, repo, org.
+            let mut symbols: Vec<Node> = Vec::new();
+            let mut cur = tok.parent;
+            let mut file = None;
+            while let Some(pid) = cur {
+                let n = load(pid)?;
+                cur = n.parent;
+                if n.kind == NodeKind::Symbol {
+                    symbols.push(n);
+                } else {
+                    file = Some(n);
+                    break;
+                }
+            }
+            let file = file.ok_or_else(|| StoreError::Corrupt("token without file".into()))?;
+            let repo = load(
+                file.parent
+                    .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?,
+            )?;
+            let org = load(
+                repo.parent
+                    .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
+            )?;
+            if q.language
+                .as_deref()
+                .is_some_and(|l| file.language.as_deref() != Some(l))
+                || q.org.as_deref().is_some_and(|o| org.name != o)
+                || q.repo.as_deref().is_some_and(|r| repo.name != r)
+            {
+                continue;
+            }
+            let qual = |syms: &[Node]| {
+                (!syms.is_empty()).then(|| {
+                    syms.iter()
+                        .rev()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                })
+            };
+            let mut hit = Hit {
+                grain: q.grain,
+                org: org.name.clone(),
+                repo: Some(repo.name.clone()),
+                file: Some(file.name.clone()),
+                language: file.language.clone(),
+                symbol: None,
+                symbol_kind: None,
+                lang_kind: None,
+                token_class: None,
+                span: None,
+                count: 1,
+                no_symbols: false,
+            };
+            let base = (org.name.clone(), repo.name.clone(), file.name.clone());
+            let key: Key;
+            match q.grain {
+                Grain::Token => {
+                    hit.symbol = qual(&symbols);
+                    hit.symbol_kind = symbols.first().and_then(|s| s.symbol_kind);
+                    hit.lang_kind = symbols.first().and_then(|s| s.lang_kind.clone());
+                    hit.token_class = tok.token_class;
+                    hit.span = tok.span;
+                    key = (
+                        base.0,
+                        base.1,
+                        base.2,
+                        tok.span.map_or(0, |s| s.start),
+                        tok.id,
+                    );
+                }
+                Grain::Symbol => {
+                    // Innermost enclosing symbol of the requested kind.
+                    let pick = symbols
+                        .iter()
+                        .position(|s| q.symbol_kind.is_none() || s.symbol_kind == q.symbol_kind);
+                    match pick {
+                        Some(i) => {
+                            let s = &symbols[i];
+                            hit.symbol = qual(&symbols[i..]);
+                            hit.symbol_kind = s.symbol_kind;
+                            hit.lang_kind = s.lang_kind.clone();
+                            hit.span = s.span;
+                            key = (base.0, base.1, base.2, s.span.map_or(0, |x| x.start), s.id);
+                        }
+                        None => {
+                            hit.no_symbols = true;
+                            key = (base.0, base.1, base.2, 0, 0);
+                        }
+                    }
+                }
+                Grain::File => key = (base.0, base.1, base.2, 0, 0),
+                Grain::Repo => {
+                    hit.file = None;
+                    hit.language = None;
+                    key = (base.0, base.1, String::new(), 0, 0);
+                }
+                Grain::Org => {
+                    hit.repo = None;
+                    hit.file = None;
+                    hit.language = None;
+                    key = (base.0, String::new(), String::new(), 0, 0);
+                }
+            }
+            rows.entry(key).and_modify(|h| h.count += 1).or_insert(hit);
+        }
+        Ok(rows.into_values().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests;
