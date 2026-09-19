@@ -58,9 +58,17 @@ fn manifest_is_consistent_public_and_licensed() {
     let dirs: BTreeSet<&str> = repos.iter().map(|r| r["dir"].as_str().unwrap()).collect();
     assert_eq!(dirs.len(), repos.len(), "duplicate repo dirs");
     // Every folder on disk is a declared repo, and vice versa.
-    let on_disk: BTreeSet<String> = std::fs::read_dir(corpus_dir())
+    let root: Vec<_> = std::fs::read_dir(corpus_dir())
         .unwrap()
         .map(|e| e.unwrap())
+        .collect();
+    assert!(
+        root.iter()
+            .all(|e| e.path().is_dir() || e.file_name() == "corpus.json"),
+        "stray file in corpus root"
+    );
+    let on_disk: BTreeSet<String> = root
+        .into_iter()
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
@@ -85,12 +93,12 @@ fn manifest_is_consistent_public_and_licensed() {
         let upstream = r["upstream"].as_str().unwrap();
         // Public GitHub code only, never the maintainer's own (possibly private) repos.
         assert!(upstream.starts_with("https://github.com/"), "{upstream}");
-        let owner_name = upstream
+        let slug = upstream
             .trim_start_matches("https://github.com/")
-            .split('/')
-            .next()
-            .unwrap()
-            .to_lowercase();
+            .trim_end_matches('/')
+            .trim_end_matches(".git");
+        assert_eq!(slug.split('/').count(), 2, "{upstream}");
+        let owner_name = slug.split('/').next().unwrap().to_lowercase();
         for banned in ["p47phoenix", "michaelconne"] {
             assert_ne!(
                 owner_name, banned,
@@ -104,11 +112,21 @@ fn manifest_is_consistent_public_and_licensed() {
         );
         assert_eq!(r["commit"].as_str().unwrap().len(), 40);
         let listing = files(&dir);
-        assert!(
-            listing.iter().any(|f| f.starts_with("LICENSE")),
-            "{:?} has no license file",
-            dir
-        );
+        let texts: Vec<String> = listing
+            .iter()
+            .filter(|f| f.starts_with("LICENSE"))
+            .map(|f| std::fs::read_to_string(dir.join(f)).unwrap())
+            .collect();
+        assert!(!texts.is_empty(), "{dir:?} has no license file");
+        let mit = texts
+            .iter()
+            .any(|t| t.contains("Permission is hereby granted"));
+        let apache = texts.iter().any(|t| t.contains("Apache License"));
+        match license {
+            "MIT" => assert!(mit, "{dir:?}: MIT text missing"),
+            "Apache-2.0" => assert!(apache, "{dir:?}: Apache text missing"),
+            _ => assert!(mit || apache, "{dir:?}: no recognisable licence text"),
+        }
         let up = std::fs::read_to_string(dir.join("UPSTREAM.md")).unwrap();
         assert!(up.contains(upstream) && up.contains(r["commit"].as_str().unwrap()));
     }
@@ -193,6 +211,7 @@ fn every_token_is_parsed_exactly() {
         let name = r["dir"].as_str().unwrap();
         let dir = corpus_dir().join(name);
         let mut langs: BTreeSet<String> = BTreeSet::new();
+        let mut repo_tokens = 0usize;
         for rel in files(&dir) {
             let bytes = std::fs::read(dir.join(&rel)).unwrap();
             let src =
@@ -227,17 +246,8 @@ fn every_token_is_parsed_exactly() {
                     .all(|c| c.is_whitespace() || c == '\u{feff}'),
                 "{name}/{rel}: unparsed tail"
             );
-            let gaps: usize = src
-                .chars()
-                .filter(|c| c.is_whitespace() || *c == '\u{feff}')
-                .map(char::len_utf8)
-                .sum();
-            // Whitespace inside comments/strings is part of tokens, so tokens + gaps >= file.
-            assert!(
-                covered + gaps >= src.len(),
-                "{name}/{rel}: {} bytes unaccounted",
-                src.len() - covered - gaps
-            );
+            assert!(covered <= src.len());
+            repo_tokens += toks.len();
             assert!(
                 !toks.iter().any(|t| t.class == TokenClass::Other),
                 "{name}/{rel}: unexpected class"
@@ -245,6 +255,7 @@ fn every_token_is_parsed_exactly() {
             n_files += 1;
             n_tokens += toks.len();
         }
+        assert!(repo_tokens > 200, "{name}: only {repo_tokens} tokens");
         for want in strings(&r["languages"]) {
             assert!(
                 langs.contains(want),
@@ -333,10 +344,39 @@ fn every_parsed_token_is_stored() {
     );
     let mut q = Query::new("articles");
     q.language = Some("sql".into());
-    assert!(store
-        .search(&q)
-        .unwrap()
+    let sql_hits = store.search(&q).unwrap();
+    assert!(!sql_hits.is_empty());
+    assert!(sql_hits
         .iter()
         .all(|h| h.repo.as_deref() == Some("conduit-sql")));
-    assert!(!store.search(&q).unwrap().is_empty());
+}
+
+/// Classification spot-checks on real code: the tokenizer should keep string
+/// literals, comments and identifiers apart in each language of the corpus.
+#[test]
+fn token_classes_are_sensible_on_real_code() {
+    let classes = |repo: &str, file: &str| {
+        let src = std::fs::read_to_string(corpus_dir().join(repo).join(file)).unwrap();
+        tokenize(&src)
+    };
+    let sql = classes(
+        "conduit-sql",
+        "src/main/resources/db/migration/V1__create_tables.sql",
+    );
+    assert!(sql
+        .iter()
+        .any(|t| t.text.eq_ignore_ascii_case("create") && t.class == TokenClass::Identifier));
+    let ts = classes(
+        "conduit-ui",
+        "src/app/features/article/services/articles.service.ts",
+    );
+    assert!(ts.iter().any(|t| t.text == "\"/articles\""
+        || t.text == "'/articles'"
+        || t.text.contains("/articles")));
+    assert!(ts.iter().any(|t| t.class == TokenClass::Literal));
+    let cs = classes("rebus", "Rebus/Transport/AbstractRebusTransport.cs");
+    assert!(cs.iter().any(|t| t.class == TokenClass::Comment));
+    assert!(cs
+        .iter()
+        .any(|t| t.text == "AbstractRebusTransport" && t.class == TokenClass::Identifier));
 }

@@ -48,7 +48,7 @@
     {
       "dir": "conduit-ui",
       "kind": "ui",
-      "upstream": "https://github.com/gothinkster/angular-realworld-example-app",
+      "upstream": "https://github.com/realworld-apps/angular-realworld-example-app",
       "commit": "dd99ed2cf39c805d719f943c5d7061a5683d98a8",
       "license": "MIT",
       "include": ["src", "package.json", "angular.json", "LICENSE", "README.md"],

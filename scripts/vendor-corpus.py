@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Vendor the public test corpus described by testdata/corpus/corpus.json.
 
-For each repo: shallow-clone the upstream at the pinned commit, copy the
+For each repo: fetch the upstream (depth 1) at the pinned commit, copy the
 `include` paths (skipping bin/obj/.git, binaries and files over 1 MiB), keep
 the license files, and write UPSTREAM.md. Refuses a repo that is not public
-(checked with `gh api` when available). Usage: python3 scripts/vendor-corpus.py [repo-dir ...]
+(checked with `gh api`; fails closed unless --skip-visibility-check) and any
+owner on the ban-list or licence outside the allow-list. Skipped files are reported.
+Usage: python3 scripts/vendor-corpus.py [--skip-visibility-check] [repo-dir ...]
 """
 import json, os, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "testdata", "corpus")
 SKIP_DIRS = {"bin", "obj", ".git", "node_modules", "target"}
 MAX_BYTES = 1 << 20
+BANNED_OWNERS = {"p47phoenix", "michaelconne"}
+LICENSES = {"MIT", "Apache-2.0", "MIT OR Apache-2.0"}
+SKIPPED = []
 
 def is_text(path):
     with open(path, "rb") as f:
@@ -29,36 +34,48 @@ def copy_tree(src, dst):
         for name in sorted(files):
             p = os.path.join(base, name)
             if os.path.islink(p) or not is_text(p):
+                SKIPPED.append(os.path.relpath(p, src))
                 continue
             rel = os.path.relpath(p, os.path.dirname(src) if os.path.isfile(src) else src)
             out = os.path.join(dst, rel)
             os.makedirs(os.path.dirname(out), exist_ok=True)
             shutil.copyfile(p, out)
 
-def check_public(url):
-    slug = url.removeprefix("https://github.com/")
+def check_public(url, skip):
+    slug = url.removeprefix("https://github.com/").removesuffix("/").removesuffix(".git")
+    if not url.startswith("https://github.com/") or slug.split("/")[0].lower() in BANNED_OWNERS:
+        sys.exit(f"refusing {url}: must be a public GitHub repo not owned by a banned owner")
+    if skip:
+        return
     try:
         vis = subprocess.check_output(["gh", "api", f"repos/{slug}", "--jq", ".visibility"], text=True).strip()
     except (OSError, subprocess.CalledProcessError):
-        print(f"warning: could not verify visibility of {slug}", file=sys.stderr)
-        return
+        sys.exit(f"cannot verify {slug} is public (need `gh`); pass --skip-visibility-check to override")
     if vis != "public":
         sys.exit(f"refusing to vendor non-public repo {slug} ({vis})")
 
 def main():
     manifest = json.load(open(os.path.join(ROOT, "corpus.json")))
-    only = set(sys.argv[1:])
+    args = sys.argv[1:]
+    skip = "--skip-visibility-check" in args
+    only = {a for a in args if not a.startswith("--")}
     for repo in manifest["repos"]:
         if only and repo["dir"] not in only:
             continue
-        check_public(repo["upstream"])
+        if repo["license"] not in LICENSES:
+            sys.exit(f"{repo['dir']}: licence {repo['license']} not allowed")
+        check_public(repo["upstream"], skip)
         dest = os.path.join(ROOT, repo["dir"])
-        shutil.rmtree(dest, ignore_errors=True)
         with tempfile.TemporaryDirectory() as tmp:
-            subprocess.check_call(["git", "clone", "-q", repo["upstream"], tmp + "/u"])
-            subprocess.check_call(["git", "-C", tmp + "/u", "checkout", "-q", repo["commit"]])
+            u = tmp + "/u"
+            subprocess.check_call(["git", "init", "-q", u])
+            subprocess.check_call(["git", "-C", u, "fetch", "-q", "--depth", "1", repo["upstream"], repo["commit"]])
+            subprocess.check_call(["git", "-C", u, "checkout", "-q", "FETCH_HEAD"])
+            shutil.rmtree(dest, ignore_errors=True)  # only after a successful fetch
             for inc in repo["include"]:
-                src = os.path.join(tmp, "u", inc)
+                src = os.path.realpath(os.path.join(u, inc))
+                if not src.startswith(os.path.realpath(u) + os.sep):
+                    sys.exit(f"{repo['dir']}: include {inc} escapes the repo")
                 if os.path.isdir(src):
                     copy_tree(src, os.path.join(dest, inc))
                 elif os.path.isfile(src):
@@ -74,5 +91,8 @@ def main():
                 f.write(f"- split: {repo['split']}\n")
             f.write("\nPublic code only; kept for parser/indexer tests. Do not edit; rerun scripts/vendor-corpus.py.\n")
         print("vendored", repo["dir"])
+    if SKIPPED:
+        print(f"skipped {len(SKIPPED)} non-text/oversize/symlink files, e.g. {SKIPPED[:5]}")
 
-main()
+if __name__ == "__main__":
+    main()
