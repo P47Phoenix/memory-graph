@@ -268,7 +268,37 @@ fn index_bytes_normalizes() {
     assert_eq!(h[1].span.unwrap().start_col, 1);
     assert!(matches!(
         s.index_bytes("o", "r", "c.bin", &[0xff, 0xfe], None),
-        Err(StoreError::Rejected(_))
+        Err(StoreError::NotUtf8(_))
     ));
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+}
+
+#[test]
+fn prune_removes_unlisted_files_only() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    s.index_bytes("o2", "r2", "extra.zig", b"foo", None)
+        .unwrap();
+    assert_eq!(s.search(&Query::new("foo")).unwrap().len(), 5);
+    let keep = ["main.zig".to_string()].into();
+    let gone = s.prune_files("o2", "r2", &keep).unwrap();
+    assert_eq!(gone, ["extra.zig"]);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    // Other repos untouched; pruned file's tokens are gone from the index.
+    assert_eq!(s.search(&Query::new("foo")).unwrap().len(), 4);
+    assert!(s.prune_files("nope", "r", &keep).unwrap().is_empty());
+    // Re-adding works (name entry was cleaned).
+    s.index_bytes("o2", "r2", "extra.zig", b"foo", None)
+        .unwrap();
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 3);
+}
+
+#[test]
+fn empty_org_or_repo_rejected() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    assert!(matches!(
+        s.index_bytes("", "r", "a", b"x", None),
+        Err(StoreError::Rejected(_))
+    ));
 }

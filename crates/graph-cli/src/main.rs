@@ -35,6 +35,12 @@ enum Cmd {
         repo: String,
         #[arg(long)]
         json: bool,
+        /// Skip files larger than this many bytes (lockfiles, minified bundles, dumps)
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        max_file_size: u64,
+        /// Remove files of this repo that were not indexed in this run (deleted, renamed, newly ignored or skipped)
+        #[arg(long)]
+        prune: bool,
         dir: PathBuf,
     },
     /// Find tokens by exact text
@@ -60,90 +66,172 @@ enum Cmd {
     },
 }
 
-/// Index every text file under `dir`. Paths are stored relative to `dir`.
-fn index_dir(
-    db: &std::path::Path,
-    org: &str,
-    repo: &str,
-    dir: &std::path::Path,
+struct DirOpts<'a> {
+    db: &'a std::path::Path,
+    org: &'a str,
+    repo: &'a str,
+    dir: &'a std::path::Path,
     json: bool,
-) -> Result<()> {
-    use std::collections::BTreeMap;
-    if !dir.is_dir() {
-        bail!("`{}` is not a directory", dir.display());
+    max_file_size: u64,
+    prune: bool,
+}
+
+/// Index every text file under `dir`. Paths are stored relative to `dir`.
+/// Per-file problems are counted as skips; only database failures abort.
+fn index_dir(o: DirOpts) -> Result<()> {
+    use std::collections::{BTreeMap, HashSet};
+    if o.org.is_empty() || o.repo.is_empty() {
+        bail!("--org and --repo must not be empty");
     }
-    if db.is_dir() {
+    if !o.dir.is_dir() {
+        bail!("`{}` is not a directory", o.dir.display());
+    }
+    if o.db.is_dir() {
         bail!(
             "--db `{}` is a directory; give a database file path",
-            db.display()
+            o.db.display()
         );
     }
     let start = std::time::Instant::now();
-    let mut store = Store::open(db)?;
+    let mut store = Store::open(o.db)?;
     store.register(Box::new(graph_lang_rust::RustExtractor));
+    let db_canon = o.db.canonicalize().ok();
     let (mut files, mut symbols, mut tokens) = (0usize, 0usize, 0usize);
     let mut by_lang: BTreeMap<String, usize> = BTreeMap::new();
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let walker = ignore::WalkBuilder::new(dir)
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut walk_errors = false;
+    // Only the directory's own .gitignore files (and parents') apply: global
+    // git config, .git/info/exclude and .ignore files would make results
+    // differ between machines.
+    let walker = ignore::WalkBuilder::new(o.dir)
         .hidden(false)
         .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
         .sort_by_file_path(|a, b| a.cmp(b))
         .filter_entry(|e| e.file_name() != ".git")
         .build();
     for entry in walker {
-        let entry = entry?;
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
-        let rel_s = rel.to_string_lossy().into_owned();
-        let bytes = match std::fs::read(entry.path()) {
-            Ok(b) => b,
-            Err(e) => {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                walk_errors = true;
                 skipped
-                    .entry(format!("unreadable: {e}"))
+                    .entry("unreadable".into())
                     .or_default()
-                    .push(rel_s);
+                    .push(err.to_string());
                 continue;
             }
         };
-        if bytes[..bytes.len().min(8192)].contains(&0) {
+        let ft = entry.file_type();
+        let rel = entry.path().strip_prefix(o.dir).unwrap_or(entry.path());
+        if ft.is_some_and(|t| t.is_symlink()) {
+            skipped
+                .entry("symlink".into())
+                .or_default()
+                .push(rel.to_string_lossy().into_owned());
+            continue;
+        }
+        if !ft.is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let Some(rel_s) = rel.to_str().map(str::to_owned) else {
+            skipped
+                .entry("non-UTF-8 path".into())
+                .or_default()
+                .push(rel.to_string_lossy().into_owned());
+            continue;
+        };
+        if db_canon.is_some() && entry.path().canonicalize().ok() == db_canon {
+            skipped
+                .entry("database file".into())
+                .or_default()
+                .push(rel_s);
+            continue;
+        }
+        match entry.metadata() {
+            Ok(m) if m.len() > o.max_file_size => {
+                skipped.entry("too large".into()).or_default().push(rel_s);
+                continue;
+            }
+            Err(_) => {
+                walk_errors = true;
+                skipped.entry("unreadable".into()).or_default().push(rel_s);
+                continue;
+            }
+            _ => {}
+        }
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(b) => b,
+            Err(_) => {
+                walk_errors = true;
+                skipped.entry("unreadable".into()).or_default().push(rel_s);
+                continue;
+            }
+        };
+        if bytes.contains(&0) {
             skipped.entry("binary".into()).or_default().push(rel_s);
             continue;
         }
-        match store.index_bytes(org, repo, &rel_s, &bytes, None) {
+        match store.index_bytes(o.org, o.repo, &rel_s, &bytes, None) {
             Ok(st) => {
                 files += 1;
                 symbols += st.symbols;
                 tokens += st.tokens;
                 *by_lang.entry(st.language).or_default() += 1;
+                seen.insert(st.path);
             }
-            Err(graph_store::StoreError::Rejected(r)) => {
-                let reason = if r.contains("UTF-8") {
-                    "not valid UTF-8"
-                } else {
-                    "too large"
-                };
-                skipped.entry(reason.into()).or_default().push(rel_s);
+            Err(graph_store::StoreError::NotUtf8(_)) => {
+                skipped
+                    .entry("not valid UTF-8".into())
+                    .or_default()
+                    .push(rel_s);
             }
-            Err(e) => return Err(e.into()),
+            Err(graph_store::StoreError::TooLarge(_)) => {
+                skipped.entry("too large".into()).or_default().push(rel_s);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "database error while indexing `{rel_s}` ({files} files were already stored)"
+                )))
+            }
+        }
+    }
+    let mut pruned = Vec::new();
+    if o.prune {
+        if walk_errors {
+            eprintln!("warning: --prune skipped because some paths could not be read");
+        } else {
+            pruned = store.prune_files(o.org, o.repo, &seen)?;
         }
     }
     let ms = start.elapsed().as_millis();
     let skipped_n: usize = skipped.values().map(Vec::len).sum();
-    if json {
+    if o.json {
         let out = serde_json::json!({
-            "org": org, "repo": repo, "files": files, "symbols": symbols, "tokens": tokens,
-            "languages": by_lang, "skipped": skipped_n, "skipped_by_reason": skipped, "elapsed_ms": ms,
+            "org": o.org, "repo": o.repo, "files": files, "symbols": symbols, "tokens": tokens,
+            "languages": by_lang, "skipped": skipped_n, "skipped_by_reason": skipped,
+            "pruned": pruned, "elapsed_ms": ms,
         });
         println!("{}", serde_json::to_string(&out)?);
     } else {
-        println!("indexed {org}/{repo}: files={files} symbols={symbols} tokens={tokens} skipped={skipped_n} elapsed={ms}ms");
+        println!(
+            "indexed {}/{}: files={files} symbols={symbols} tokens={tokens} skipped={skipped_n} pruned={} elapsed={ms}ms",
+            o.org, o.repo, pruned.len()
+        );
         for (l, n) in &by_lang {
             println!("  {l}: {n}");
         }
         for (r, v) in &skipped {
             println!("  skipped ({r}): {}", v.len());
+            for p in v.iter().take(20) {
+                println!("    {p}");
+            }
+            if v.len() > 20 {
+                println!("    ... and {} more (use --json for all)", v.len() - 20);
+            }
         }
     }
     Ok(())
@@ -187,8 +275,18 @@ fn main() -> Result<()> {
             org,
             repo,
             json,
+            max_file_size,
+            prune,
             dir,
-        } => index_dir(&cli.db, &org, &repo, &dir, json)?,
+        } => index_dir(DirOpts {
+            db: &cli.db,
+            org: &org,
+            repo: &repo,
+            dir: &dir,
+            json,
+            max_file_size,
+            prune,
+        })?,
         Cmd::Search {
             text,
             language,

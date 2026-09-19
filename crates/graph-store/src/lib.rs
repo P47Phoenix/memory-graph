@@ -31,6 +31,10 @@ pub enum StoreError {
     SchemaMismatch { found: u64 },
     #[error("rejected: {0}")]
     Rejected(String),
+    #[error("rejected: {0} is not valid UTF-8")]
+    NotUtf8(String),
+    #[error("rejected: {0} is larger than 4 GiB")]
+    TooLarge(String),
     #[error("invalid span: {0}")]
     InvalidSpan(String),
     #[error("corrupt database: {0}")]
@@ -158,6 +162,31 @@ fn name_key(parent: Option<NodeId>, kind: NodeKind, name: &str) -> String {
     format!("{}\0{:?}\0{}", parent.unwrap_or(0), kind, name)
 }
 
+/// Delete everything below `root` (not `root` itself), including token postings.
+fn remove_descendants(
+    nodes: &mut redb::Table<u64, &[u8]>,
+    children: &mut redb::MultimapTable<u64, u64>,
+    tokens: &mut redb::MultimapTable<&str, u64>,
+    root: NodeId,
+) -> Result<()> {
+    let ids = |it: redb::MultimapValue<u64>| -> Result<Vec<NodeId>> {
+        Ok(it
+            .map(|v| v.map(|g| g.value()))
+            .collect::<std::result::Result<_, _>>()?)
+    };
+    let mut stack = ids(children.remove_all(root)?)?;
+    while let Some(id) = stack.pop() {
+        stack.extend(ids(children.remove_all(id)?)?);
+        if let Some(old) = nodes.remove(id)? {
+            let n = dec(old.value())?;
+            if n.kind == NodeKind::Token {
+                tokens.remove(n.name.as_str(), id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open or create a database file. Fails without modifying the file on a
     /// schema mismatch or when another process holds it.
@@ -199,6 +228,56 @@ impl Store {
         })
     }
 
+    /// Remove files of `org/repo` whose (normalized) path is not in `keep`.
+    /// Returns the removed paths. Nothing else is touched.
+    pub fn prune_files(
+        &self,
+        org: &str,
+        repo: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let wt = self.db.begin_write()?;
+        let mut removed = Vec::new();
+        {
+            let mut nodes = wt.open_table(NODES)?;
+            let mut names = wt.open_table(NAMES)?;
+            let mut children = wt.open_multimap_table(CHILDREN)?;
+            let mut tokens = wt.open_multimap_table(TOKENS)?;
+            let org_id = names
+                .get(name_key(None, NodeKind::Org, org).as_str())?
+                .map(|v| v.value());
+            let repo_id = match org_id {
+                Some(o) => names
+                    .get(name_key(Some(o), NodeKind::Repo, repo).as_str())?
+                    .map(|v| v.value()),
+                None => None,
+            };
+            if let Some(repo_id) = repo_id {
+                let files: Vec<NodeId> = children
+                    .get(repo_id)?
+                    .map(|v| v.map(|g| g.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for fid in files {
+                    let f = dec(nodes
+                        .get(fid)?
+                        .ok_or_else(|| StoreError::Corrupt("dangling file".into()))?
+                        .value())?;
+                    if keep.contains(&f.name) {
+                        continue;
+                    }
+                    remove_descendants(&mut nodes, &mut children, &mut tokens, fid)?;
+                    nodes.remove(fid)?;
+                    names.remove(name_key(Some(repo_id), NodeKind::File, &f.name).as_str())?;
+                    children.remove(repo_id, fid)?;
+                    removed.push(f.name);
+                }
+            }
+        }
+        wt.commit()?;
+        removed.sort();
+        Ok(removed)
+    }
+
     /// Register a language extractor used by `index_bytes`.
     pub fn register(&mut self, e: Box<dyn Extractor>) {
         self.registry.register(e);
@@ -217,12 +296,10 @@ impl Store {
         language: Option<&str>,
     ) -> Result<IngestStats> {
         if bytes.len() > MAX_SOURCE_BYTES {
-            return Err(StoreError::Rejected(format!(
-                "`{path}` is larger than 4 GiB"
-            )));
+            return Err(StoreError::TooLarge(format!("`{path}`")));
         }
-        let src = std::str::from_utf8(bytes)
-            .map_err(|e| StoreError::Rejected(format!("`{path}` is not valid UTF-8 ({e})")))?;
+        let src =
+            std::str::from_utf8(bytes).map_err(|_| StoreError::NotUtf8(format!("`{path}`")))?;
         let path = normalize_path(path);
         let lang = language.map_or_else(|| detect_language(&path), str::to_ascii_lowercase);
         let ex = self.registry.extract(&lang, src);
@@ -269,6 +346,11 @@ impl Store {
         language: &str,
         ex: &Extraction,
     ) -> Result<IngestStats> {
+        if org.is_empty() || repo.is_empty() {
+            return Err(StoreError::Rejected(
+                "org and repo must not be empty".into(),
+            ));
+        }
         let wt = self.db.begin_write()?;
         let mut stats = IngestStats::default();
         {
@@ -342,24 +424,7 @@ impl Store {
 
             if existed {
                 // Drop the old subtree.
-                let mut stack: Vec<NodeId> = children
-                    .get(file_id)?
-                    .map(|v| v.map(|g| g.value()))
-                    .collect::<std::result::Result<_, _>>()?;
-                children.remove_all(file_id)?;
-                while let Some(id) = stack.pop() {
-                    let kids: Vec<NodeId> = children
-                        .remove_all(id)?
-                        .map(|v| v.map(|g| g.value()))
-                        .collect::<std::result::Result<_, _>>()?;
-                    stack.extend(kids);
-                    if let Some(old) = nodes.remove(id)? {
-                        let n = dec(old.value())?;
-                        if n.kind == NodeKind::Token {
-                            tokens.remove(n.name.as_str(), id)?;
-                        }
-                    }
-                }
+                remove_descendants(&mut nodes, &mut children, &mut tokens, file_id)?;
                 // Refresh language.
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
                 f.language = Some(language.into());

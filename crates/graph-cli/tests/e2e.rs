@@ -313,3 +313,159 @@ fn index_directory() {
     let (ok, _, err) = run(&["--db", &db, "index", "--org", "o", "--repo", "p", "/no/dir"]);
     assert!(!ok && err.contains("not a directory"));
 }
+
+#[cfg(unix)]
+mod dir_edge_cases {
+    use super::run;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn json(args: &[&str]) -> serde_json::Value {
+        let (ok, out, err) = run(args);
+        assert!(ok, "{out}{err}");
+        serde_json::from_str(out.trim()).unwrap()
+    }
+
+    #[test]
+    fn symlinks_unreadable_dirs_large_and_db_file_are_skipped_not_fatal() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("p");
+        std::fs::create_dir_all(root.join("priv")).unwrap();
+        std::fs::create_dir_all(root.join("ok")).unwrap();
+        std::fs::write(root.join("ok/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("priv/p.rs"), "fn p() {}\n").unwrap();
+        std::fs::write(root.join("big.txt"), vec![b'x'; 5000]).unwrap();
+        std::fs::write(root.join("late.bin"), [vec![b'a'; 9000], vec![0]].concat()).unwrap();
+        symlink(root.join("ok/a.rs"), root.join("link.rs")).unwrap();
+        symlink(&root, root.join("loop")).unwrap();
+        symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+        std::fs::set_permissions(root.join("priv"), std::fs::Permissions::from_mode(0o0)).unwrap();
+        let db = root.join("graph.db");
+        let dbs = db.to_str().unwrap();
+        let r = root.to_str().unwrap();
+        run(&["--db", dbs, "index", "--org", "o", "--repo", "r", r]); // creates the db inside the dir
+        let v = json(&[
+            "--db",
+            dbs,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--json",
+            "--max-file-size",
+            "1000",
+            r,
+        ]);
+        std::fs::set_permissions(root.join("priv"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let s = &v["skipped_by_reason"];
+        assert_eq!(s["symlink"].as_array().unwrap().len(), 3);
+        assert_eq!(s["too large"].as_array().unwrap().len(), 2, "{s}"); // big.txt, late.bin (9 KB)
+        assert_eq!(s["database file"].as_array().unwrap().len(), 1);
+        assert!(!s["unreadable"].as_array().unwrap().is_empty());
+        assert_eq!(v["languages"]["rust"], 1);
+    }
+
+    #[test]
+    fn nul_after_8k_is_binary() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("p");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("late.bin"), [vec![b'a'; 9000], vec![0]].concat()).unwrap();
+        let db = d.path().join("g");
+        let v = json(&[
+            "--db",
+            db.to_str().unwrap(),
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--json",
+            root.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            v["skipped_by_reason"]["binary"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn prune_deleted_files_and_nested_gitignore_negation() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("p");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join(".gitignore"), "*.log\n!keep.log\n").unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "hidden.txt\n").unwrap();
+        for f in [
+            "a.rs",
+            "b.rs",
+            "x.log",
+            "keep.log",
+            "sub/hidden.txt",
+            "sub/shown.txt",
+        ] {
+            std::fs::write(root.join(f), "foo\n").unwrap();
+        }
+        let db = d.path().join("g");
+        let (dbs, r) = (db.to_str().unwrap(), root.to_str().unwrap());
+        let v = json(&[
+            "--db", dbs, "index", "--org", "o", "--repo", "r", "--json", r,
+        ]);
+        assert_eq!(v["files"], 6); // a.rs b.rs keep.log shown.txt + two .gitignore files
+        std::fs::remove_file(root.join("b.rs")).unwrap();
+        // Without --prune the deleted file stays.
+        json(&[
+            "--db", dbs, "index", "--org", "o", "--repo", "r", "--json", r,
+        ]);
+        let (_, out, _) = run(&["--db", dbs, "search", "foo", "--grain", "file", "--json"]);
+        assert!(out.contains("b.rs"));
+        let v = json(&[
+            "--db", dbs, "index", "--org", "o", "--repo", "r", "--json", "--prune", r,
+        ]);
+        assert_eq!(v["pruned"], serde_json::json!(["b.rs"]));
+        let (_, out, _) = run(&["--db", dbs, "search", "foo", "--grain", "file", "--json"]);
+        assert!(
+            !out.contains("b.rs")
+                && out.contains("a.rs")
+                && out.contains("keep.log")
+                && !out.contains("x.log")
+        );
+        assert!(!out.contains("hidden.txt") && out.contains("shown.txt"));
+    }
+
+    #[test]
+    fn empty_org_rejected_and_text_summary_lists_skips() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("p");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("x.bin"), [0u8, 1]).unwrap();
+        let db = d.path().join("g");
+        let dbs = db.to_str().unwrap();
+        let (ok, _, err) = run(&[
+            "--db",
+            dbs,
+            "index",
+            "--org",
+            "",
+            "--repo",
+            "r",
+            root.to_str().unwrap(),
+        ]);
+        assert!(!ok && err.contains("must not be empty"));
+        let (ok, out, _) = run(&[
+            "--db",
+            dbs,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            root.to_str().unwrap(),
+        ]);
+        assert!(
+            ok && out.contains("skipped (binary): 1") && out.contains("x.bin"),
+            "{out}"
+        );
+    }
+}
