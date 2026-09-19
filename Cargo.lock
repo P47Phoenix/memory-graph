@@ -189,6 +189,7 @@ dependencies = [
  "anyhow",
  "clap",
  "graph-core",
+ "graph-lang-rust",
  "graph-store",
  "serde_json",
  "tempfile",
@@ -202,6 +203,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "graph-lang-rust"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proc-macro2",
+ "syn 2.0.119",
 ]
 
 [[package]]

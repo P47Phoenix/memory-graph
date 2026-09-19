@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/graph-core", "crates/graph-store", "crates/graph-cli"]
+members = ["crates/graph-lang-rust", "crates/graph-core", "crates/graph-store", "crates/graph-cli"]
 
 [workspace.package]
 version = "0.1.0"

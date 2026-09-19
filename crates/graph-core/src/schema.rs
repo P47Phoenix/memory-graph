@@ -151,6 +151,9 @@ pub struct Node {
     pub lang_kind: Option<String>,
     /// Token only.
     pub token_class: Option<TokenClass>,
+    /// File only: the extractor hit a syntax error and fell back to tokens only.
+    #[serde(default)]
+    pub has_errors: bool,
     /// Symbol and token.
     pub span: Option<Span>,
 }
@@ -195,6 +198,7 @@ mod tests {
             symbol_kind: Some(SymbolKind::Method),
             lang_kind: Some("fn".into()),
             token_class: None,
+            has_errors: false,
             span: Some(Span {
                 start: 0,
                 end: 5,
