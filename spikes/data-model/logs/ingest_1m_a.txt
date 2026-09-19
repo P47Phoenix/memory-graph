@@ -1,0 +1,2 @@
+model=a stopK=0 copies=4 mutate=true files=2564 tokens=966552 src_MB=6.79 txs=32 ingest_s=6.19 files/s=414 tokens/s=156185 MB/s=1.10 peakRSS_MB=294 db_MB=539.50 B/token=558.2 B/file=210415 wchar_MB=586.2 write_bytes_MB=614.1 write_amp(wchar/db)=1.09
+  largest single-commit file growth: 269.5 MB (of 32 commits)

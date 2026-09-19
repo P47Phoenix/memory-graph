@@ -1,0 +1,8 @@
+p_names          entries=26619     stored=   1647357 meta=   183217 frag=  1700178 leaf_pages=829     branch_pages=33     height=3
+p_ent            entries=9954838   stored= 234251542 meta= 44660988 frag=272904686 leaf_pages=132649  branch_pages=2072   height=4
+p_terms          entries=412008    stored=  19363378 meta=  2999388 frag= 12998002 leaf_pages=8101    branch_pages=530    height=6
+p_termtxt        entries=412008    stored=  19363378 meta=  1965860 frag= 19356330 leaf_pages=9800    branch_pages=133    height=3
+e_toks           entries=9907158   stored=  79257264 meta=  6771860 frag= 79150268 leaf_pages=38903   branch_pages=1424   height=6
+e_children       entries=9954828   stored=  79638624 meta=  2128219 frag= 74356293 leaf_pages=30159   branch_pages=7957   height=5
+compact rounds that changed something: 1
+file bytes: before compact 1078472704 after compact 1078472704

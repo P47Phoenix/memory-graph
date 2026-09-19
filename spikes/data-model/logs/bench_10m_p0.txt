@@ -1,0 +1,70 @@
+model=p stopK=0 open_ms=1.86 (first open, includes any rebuild) 
+search | very common punct  "(" | token  | none          | rows=798721  count=798721   p50=587.888ms p95=691.302ms mean=598.240
+search | very common punct  "(" | token  | lang=rust     | rows=233003  count=233003   p50=135.467ms p95=137.245ms mean=135.509
+search | very common punct  "(" | token  | class=keyword | rows=0       count=0        p50=268.039ms p95=269.934ms mean=267.308
+search | very common punct  "(" | symbol | none          | rows=39593   count=798721   p50=397.375ms p95=405.514ms mean=398.240
+search | very common punct  "(" | file   | none          | rows=23575   count=798721   p50=14.255ms p95=14.686ms mean=14.240
+search | very common punct  "(" | file   | lang=rust     | rows=1476    count=233003   p50=5.689ms p95=6.138ms mean=5.710
+search | very common punct  "(" | file   | class=keyword | rows=0       count=0        p50=265.392ms p95=267.499ms mean=265.237
+search | very common punct  "(" | repo   | none          | rows=328     count=798721   p50=7.222ms p95=7.979ms mean=7.306
+search | very common punct  "(" | org    | none          | rows=10      count=798721   p50=6.466ms p95=6.547ms mean=6.450
+search | very common 2      ")" | token  | none          | rows=797409  count=797409   p50=583.617ms p95=587.045ms mean=583.643
+search | very common 2      ")" | token  | lang=rust     | rows=233003  count=233003   p50=135.762ms p95=137.127ms mean=135.477
+search | very common 2      ")" | token  | class=keyword | rows=0       count=0        p50=266.407ms p95=268.659ms mean=265.796
+search | very common 2      ")" | symbol | none          | rows=39552   count=797409   p50=395.111ms p95=396.525ms mean=394.697
+search | very common 2      ")" | symbol | lang=rust     | rows=17494   count=233003   p50=82.281ms p95=82.786ms mean=82.243
+search | very common 2      ")" | symbol | class=keyword | rows=0       count=0        p50=267.502ms p95=268.578ms mean=267.256
+search | very common 2      ")" | file   | none          | rows=23534   count=797409   p50=13.960ms p95=15.180ms mean=14.101
+search | very common 2      ")" | file   | lang=rust     | rows=1476    count=233003   p50=5.614ms p95=6.202ms mean=5.687
+search | very common 2      ")" | file   | class=keyword | rows=0       count=0        p50=264.284ms p95=269.154ms mean=264.499
+search | very common 2      ")" | repo   | none          | rows=328     count=797409   p50=7.265ms p95=8.118ms mean=7.367
+search | very common 2      ")" | repo   | lang=rust     | rows=41      count=233003   p50=5.273ms p95=5.325ms mean=5.276
+search | very common 2      ")" | repo   | class=keyword | rows=0       count=0        p50=262.253ms p95=265.784ms mean=262.606
+search | very common 2      ")" | org    | none          | rows=10      count=797409   p50=6.424ms p95=7.158ms mean=6.504
+search | very common 2      ")" | org    | lang=rust     | rows=10      count=233003   p50=5.288ms p95=5.533ms mean=5.328
+search | very common 2      ")" | org    | class=keyword | rows=0       count=0        p50=263.946ms p95=268.897ms mean=264.351
+search | common ident       "public" | token  | none          | rows=79130   count=79130    p50=211.513ms p95=212.366ms mean=211.397
+search | common ident       "public" | token  | lang=rust     | rows=0       count=0        p50=4.262ms p95=5.410ms mean=4.397
+search | common ident       "public" | token  | class=keyword | rows=0       count=0        p50=171.818ms p95=173.903ms mean=171.630
+search | common ident       "public" | symbol | none          | rows=19721   count=79130    p50=193.598ms p95=198.405ms mean=193.923
+search | common ident       "public" | symbol | lang=rust     | rows=0       count=0        p50=4.258ms p95=4.895ms mean=4.330
+search | common ident       "public" | symbol | class=keyword | rows=0       count=0        p50=172.004ms p95=173.963ms mean=172.202
+search | common ident       "public" | file   | none          | rows=19721   count=79130    p50=11.164ms p95=11.938ms mean=11.204
+search | common ident       "public" | file   | lang=rust     | rows=0       count=0        p50=4.296ms p95=4.469ms mean=4.312
+search | common ident       "public" | file   | class=keyword | rows=0       count=0        p50=173.298ms p95=177.584ms mean=173.526
+search | common ident       "public" | repo   | none          | rows=246     count=79130    p50=5.741ms p95=6.294ms mean=5.822
+search | common ident       "public" | repo   | lang=rust     | rows=0       count=0        p50=4.257ms p95=4.288ms mean=4.246
+search | common ident       "public" | repo   | class=keyword | rows=0       count=0        p50=171.973ms p95=173.080ms mean=172.043
+search | common ident       "public" | org    | none          | rows=10      count=79130    p50=5.277ms p95=5.825ms mean=5.359
+search | common ident       "public" | org    | lang=rust     | rows=0       count=0        p50=4.231ms p95=4.257ms mean=4.232
+search | common ident       "public" | org    | class=keyword | rows=0       count=0        p50=171.715ms p95=174.280ms mean=171.841
+search | mid (rank~500)     "Time" | token  | none          | rows=32      count=32       p50=0.666ms p95=0.921ms mean=0.695
+search | mid (rank~500)     "Time" | token  | lang=rust     | rows=0       count=0        p50=0.009ms p95=0.015ms mean=0.010
+search | mid (rank~500)     "Time" | token  | class=keyword | rows=0       count=0        p50=0.656ms p95=0.664ms mean=0.656
+search | mid (rank~500)     "Time" | symbol | none          | rows=30      count=32       p50=0.661ms p95=0.668ms mean=0.662
+search | mid (rank~500)     "Time" | file   | none          | rows=30      count=32       p50=0.013ms p95=0.020ms mean=0.014
+search | mid (rank~500)     "Time" | file   | lang=rust     | rows=0       count=0        p50=0.008ms p95=0.009ms mean=0.008
+search | mid (rank~500)     "Time" | file   | class=keyword | rows=0       count=0        p50=0.657ms p95=0.667ms mean=0.657
+search | mid (rank~500)     "Time" | repo   | none          | rows=2       count=32       p50=0.010ms p95=0.016ms mean=0.011
+search | mid (rank~500)     "Time" | org    | none          | rows=1       count=32       p50=0.010ms p95=0.010ms mean=0.010
+search | rare (count 2)     "\"    \"" | token  | none          | rows=82      count=82       p50=0.851ms p95=1.160ms mean=0.891
+search | rare (count 2)     "\"    \"" | token  | lang=rust     | rows=82      count=82       p50=0.844ms p95=0.856ms mean=0.843
+search | rare (count 2)     "\"    \"" | token  | class=keyword | rows=0       count=0        p50=0.816ms p95=0.836ms mean=0.819
+search | rare (count 2)     "\"    \"" | symbol | none          | rows=41      count=82       p50=1.048ms p95=1.065ms mean=1.047
+search | rare (count 2)     "\"    \"" | file   | none          | rows=41      count=82       p50=0.031ms p95=0.042ms mean=0.032
+search | rare (count 2)     "\"    \"" | file   | lang=rust     | rows=41      count=82       p50=0.030ms p95=0.032ms mean=0.030
+search | rare (count 2)     "\"    \"" | file   | class=keyword | rows=0       count=0        p50=0.827ms p95=0.836ms mean=0.825
+search | rare (count 2)     "\"    \"" | repo   | none          | rows=41      count=82       p50=0.030ms p95=0.037ms mean=0.030
+search | rare (count 2)     "\"    \"" | org    | none          | rows=10      count=82       p50=0.026ms p95=0.028ms mean=0.026
+search | absent             "zzz_nope_zzz" | token  | none          | rows=0       count=0        p50=0.002ms p95=0.010ms mean=0.002
+search | absent             "zzz_nope_zzz" | token  | lang=rust     | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+search | absent             "zzz_nope_zzz" | token  | class=keyword | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+search | absent             "zzz_nope_zzz" | symbol | none          | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+search | absent             "zzz_nope_zzz" | file   | none          | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+search | absent             "zzz_nope_zzz" | file   | lang=rust     | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+search | absent             "zzz_nope_zzz" | file   | class=keyword | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+search | absent             "zzz_nope_zzz" | repo   | none          | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+search | absent             "zzz_nope_zzz" | org    | none          | rows=0       count=0        p50=0.002ms p95=0.002ms mean=0.002
+symbols exact `new` -> 370 hits
+symbols | p50=0.283ms p95=0.389ms
+describe | p50=4.045ms p95=4.681ms (66 search cases)

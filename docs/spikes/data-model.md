@@ -1,19 +1,23 @@
 # Spike: data model (story 18 precursor)
 
-Status: measurements for [ADR 0003](../adr/0003-data-model.md). Date 2026-09-19. Author: solution-architect review.
+Status: measurements for [ADR 0003](../adr/0003-data-model.md) (revised after architecture, dev and QA review). Date 2026-09-19. Author: solution-architect review.
 
-**Labels.** Every figure is **[M] measured** unless marked **[E] estimated**. Where a number is an estimate the method is stated next to it. Nothing in `crates/` or `Cargo.lock` changed; the prototypes are throwaway (see "Method").
+**TL;DR.** Today a token costs ~525 B of tree pages because every occurrence is a ~248 B JSON node, not because of repeated text. A dictionary + per-file compact stream + `(term,file)` postings prototype measured ~20 B/token (about 25x smaller, order of magnitude), 3-5x faster ingest, 20-370x faster roll-ups of very common terms, with exact spans round-tripping on all 241,638 corpus tokens. Separately, every CLI call spends 134 ms in an O(tokens) `describe`. Details follow; raw data is in `spikes/data-model/` (code, README, logs).
+
+**Baselines.** Models A/E/P were measured against `main` at commit `293bb2a`. The skip-unchanged work was measured on branch commit `47e8616`; it has since been merged to main as `231109a` (PR #8). Re-baseline the A numbers after that merge if they matter (the fingerprint string is now in the file node).
+
+**Labels.** Every figure is **[M] measured** unless marked **[E] estimated**. Where a number is an estimate the method is stated next to it. Nothing in `crates/` or `Cargo.lock` changed; the prototype is committed as reference code under `spikes/data-model/` and is **not** part of the workspace build (see "Method" and `spikes/data-model/README.md`).
 
 ## 0. Summary
 
 | Question | Answer |
 |---|---|
-| Where does the space go today? | Not in token text (3.1% of the JSON bytes of a token node). It goes into the per-occurrence node envelope: ~248 B of JSON per token (six span fields with key names, kind, parent, class), ~230 B of B-tree page slack on top, plus a `children` entry and a `tokens_by_text` entry per token. [M] |
+| Where does the space go today? | Not in token text (2.2% of the JSON bytes of a token node: average text 5.53 B of 247.8 B). It goes into the per-occurrence node envelope: ~248 B of JSON per token (six span fields with key names, kind, parent, class), ~230 B of B-tree page slack on top, plus a `children` entry and a `tokens_by_text` entry per token. [M] |
 | Current cost | 525 B of tree pages per token (560 B of file per token); 5.2 GB of pages for 9.9 M tokens. [M] |
-| Best measured alternative | Interned dictionary + one compact stream per file + positional postings (tokens are not nodes): 20 B of pages per token, **25x smaller**, 4-6x faster ingest, 16-370x faster file/repo/org roll-ups of common terms and 19-23x faster token/symbol grain for very common terms. Spans stay exact (round-trip verified on all 241,638 corpus tokens). [M] |
+| Best measured alternative | Interned dictionary + one compact stream per file + `(term,file)` postings with per-occurrence ordinals in the prototype (tokens are not nodes): 20 B of pages per token, **about 25x smaller** (order of magnitude; 9.9 M-token set); ingest 5.0x faster at 1x and 4.3x at 9.9 M, but the prototype omits validation, `origin`, `has_errors` and prune and its own throughput degrades 827 k -> 549 k tok/s from the 4x to the 41x set, so read "~3-5x" as the honest range; roll-ups of very common terms 20-370x faster (9.9 M set, `(`: file 179x, repo 340x, org 370x) and 19-23x at token/symbol grain. Headline multiples mix data sets: size is 9.9 M, ingest is 1x-41x, latency is 9.9 M unless stated. A's 41x search numbers are 2 repetitions. Spans stay exact (round-trip verified on all 241,638 corpus tokens). [M] |
 | Does a stop-list of very common terms help? | Yes but modestly: -22% size, -12% ingest time, at the price of 25-50x slower file/repo/org roll-ups for the stopped terms (scan). The big win is the representation, not the stop-list. [M] |
 | Cheaper intermediate | Binary per-token nodes (still one node per token): 96 B/token pages, 5.5x smaller than today, trivial migration, but 4.6x bigger than the stream model and keeps the O(tokens) costs. [M] |
-| A finding independent of the model | Every CLI `search` and `symbols` call runs `Store::describe` (full node scan) to validate flags: 215 ms on the 241 k-token corpus DB, ~0.5 s at 1 M, ~7.7 s at 9.9 M tokens, before any query work. [M] |
+| A finding independent of the model | Every CLI `search` and `symbols` call runs `Store::describe` (full node scan) to validate flags: 134 ms of the ~215-261 ms wall time of a CLI call on the 241 k-token corpus DB (the rest is process start and the query); in-process `describe` is ~0.54 s at 4x and ~7.7 s at 9.9 M tokens, before any query work. [M] |
 
 ## 1. Method
 
@@ -40,9 +44,9 @@ Status: measurements for [ADR 0003](../adr/0003-data-model.md). Date 2026-09-19.
 - *Peak RSS*: `VmHWM` of the process. redb keeps a page cache (1 GiB by default, **[E]** from the redb docs, not re-verified here) so RSS during ingest of a big DB is dominated by that cache, not by the workload.
 - *IO*: `/proc/self/io` `wchar`, `write_bytes`, `read_bytes`.
 
-**Reproduction.** The spike is a single example file (`crates/graph-store/examples/spike.rs` in a scratch worktree, ~500 lines: corpus loader, scaler, codec, model E, prototype P, benchmarks). It is not committed (throwaway). Commands: `spike freq|verify|ingest|stats|bench|mutate|search1`. Ask and it can be committed under `spikes/`.
+**Reproduction.** The spike is committed at `spikes/data-model/spike.rs` (~500 lines: corpus loader, scaler, codec, model E, prototype P, benchmarks). It needs the `graph-store` crate at commit `293bb2a` plus two extra dev-dependencies; see `spikes/data-model/README.md`. It is not built by the workspace. Raw 1 M and 10 M benchmark logs are in `spikes/data-model/logs/`; the corpus-level (1x) search table in section 7.1 and the process-level CLI/cold-cache timings (7.4, 7.5) were not saved as log files.
 
-**Pure-Rust gate.** The spike added two dev-dependencies, `sha2` (already in the in-flight fingerprint PR) and `miniz_oxide` (deflate, used only to measure compressibility). `python3 scripts/check-no-c-deps.py` passes with both ("checked 88 dependencies, pure-Rust gate passed"). No other new crate is proposed.
+**Pure-Rust gate.** The spike needs two dev-dependencies (not added to the workspace), `sha2` (already in the in-flight fingerprint PR) and `miniz_oxide` (deflate, used only to measure compressibility). `python3 scripts/check-no-c-deps.py` passes with both ("checked 88 dependencies, pure-Rust gate passed"). No other new crate is proposed.
 
 ## 2. The data: token frequency (corpus, [M])
 
@@ -59,7 +63,7 @@ Status: measurements for [ADR 0003](../adr/0003-data-model.md). Date 2026-09-19.
 - Top texts: `(` 8.06%, `)` 8.05%, `.` 6.26%, `;` 5.50%, `=` 3.40%, `,` 2.90%, `{` 2.62%, `:` 2.62%, `}` 2.61%, `$` 2.27%; then `public` 0.80%, `using` 0.76%, `new` 0.73%, `var` 0.60%, `string` 0.60%, `if` 0.53%, `return` 0.45%. Rank 100 = `headers` (207), rank 500 = `Time` (32), rank 2000 = a 33-character identifier (7).
 - Breakdown by class (occurrences): identifier 100,043 (41.4%), punctuation 104,346 (43.2%), operator 25,843 (10.7%), literal 4,031 (1.7%), comment 7,375 (3.1%), **keyword 0** and other 0. By majority class over distinct texts: identifier 6,619, literal 1,802, comment 3,167, operator 15, punctuation 26.
 - Consequences: (1) the user's hunch is right about the distribution (the 100 most common texts are 71% of all tokens); (2) the dictionary is small: 414,017 bytes of text for 11,629 entries; (3) **no extractor currently emits the `keyword` class** (the fallback tokenizer labels keywords as identifiers, the Rust extractor uses the same tokenizer), so `search --kind keyword` returns nothing in every model. That is a separate bug or gap; the design keeps the class per occurrence (3 bits) so it does not assume class is a function of text.
-- Identical-content files: 4 duplicates among 641 files, 4,976 duplicate bytes (0.3%). The corpus is a poor test for blob sharing (see ADR); real monorepos and vendored trees have far more.
+- Identical-content files: 2 groups of duplicates among 641 files, 4,976 redundant bytes (0.3%). The corpus is a poor test for blob sharing (see ADR); real monorepos and vendored trees have far more.
 
 ## 3. Current model (A): where the bytes go [M]
 
@@ -74,8 +78,8 @@ Corpus, after `memory-graph index` of 8 repos (8 write transactions):
 | **Total** | | **68.8 MB** | **126.8 MB** | **525 B** |
 | **DB file** | | | **135.3 MB** | **560 B** |
 
-- A token node is **247.8 B of JSON on average** (org 151, repo 162, file 223, symbol 247). Field names (`"start_line"`, `"end_col"`, `"token_class"`, ...), a 20-digit-capable id and parent, and `null`/default fields dominate; the token text is 3.1% of it.
-- `nodes` payload is 62.1 MB but occupies 118 MB of pages: **54 MB (46%) is B-tree slack** (values of ~250 B in 4 KiB pages; `fragmented_bytes` in redb stats). Compaction (`Database::compact`) reclaims little of it (9.9 M tokens: 6.45 GB -> 5.85 GB file; 1x and 4x: nothing).
+- A token node is **247.8 B of JSON on average** (org 151, repo 162, file 223, symbol 247). Field names (`"start_line"`, `"end_col"`, `"token_class"`, ...), a 20-digit-capable id and parent, and `null`/default fields dominate; the token text is 2.2% of it (5.53 B average text / 247.8 B).
+- `nodes` payload is 64.2 MB (stored + metadata) but occupies 118 MB of pages: **54 MB (46%) is B-tree slack** (values of ~250 B in 4 KiB pages; `fragmented_bytes` in redb stats). Compaction (`Database::compact`) reclaims little of it (9.9 M tokens: 6.45 GB -> 5.85 GB file; 1x and 4x: nothing).
 - 1.6 MB of source becomes a **135 MB** file: **81x the source size**.
 - Existing spike (`docs/spikes/storage.md`) measured ~690 B/token on a single file; consistent.
 
@@ -103,8 +107,8 @@ Bytes per token use each set's token count (241,638 / 966,552 / 9,907,158).
 
 File-size caveat: at 4x and 41x the three P variants show the same file size because redb grew the file by the same step; use the pages/payload columns to compare them.
 
-**Where P's bytes go at 9.9 M tokens** (pages): dictionary 76 MB (`text->id` 35 MB plus `id->text` 41 MB, 412 k terms), postings 79 MB (1.95 M `(term,file)` entries, ~41 B each in pages), streams 40 MB (**4.0 B/token**, exact spans), entities 7 MB (26,281 files + 21,061 symbols), names 4 MB. Observations:
-- The stream itself is **3.13 B/token** on the corpus (756,432 B for 241,638 tokens, exact spans, class and term id). Per-file `deflate(6)` (miniz_oxide) shrinks the streams 3.0x to **1.05 B/token** (253,732 B). Whole-file `gzip -6` on the 4x DBs: A 539.5 MB -> 40.0 MB (13.5x), E -> not run, P 34.2 MB -> 6.5 MB (5.3x). So A's redundancy is enormous, but even gzipped it is 6x bigger than uncompressed P.
+**Where P's bytes go at 9.9 M tokens** (pages): dictionary 76 MB (`text->id` 35 MB plus `id->text` 41 MB, 412 k terms), postings 79 MB (1.95 M `(term,file)` entries, ~41 B each in pages), streams 40 MB (**4.0 B/token**, exact spans), entities 7 MB (26,281 files + 21,061 symbols as reported by the spike; 741 symbols x 41 copies would be 30,381 and the difference was not reconciled, so treat symbol counts and symbol-grain row counts at this scale as unverified; the 7 MB is dominated by files), names 4 MB. Observations:
+- The stream itself is **3.13 B/token** on the corpus (756,432 B for 241,638 tokens, exact spans, class and term id). Per-file `deflate(6)` (miniz_oxide) shrinks the streams 3.0x to **1.05 B/token** (253,732 B). Whole-file `gzip -6` on the 4x DBs: A 539.5 MB -> 40.0 MB (13.5x), E not run, P 34.2 MB -> 6.5 MB (5.3x). Gzipped A (40.0 MB) is 1.2x the uncompressed P file (34.2 MB) and 2.1x its tree pages (19.2 MB); gzipped A vs gzipped P (6.5 MB) is 6x. A's redundancy is enormous, and compression alone gets it only to about P's uncompressed size.
 - Dictionary and postings are the largest P components at scale, and both are **inefficiently stored in the prototype** (two copies of every term text; one postings row per `(term,file)` with ~19 B fixed overhead for typical 3-5 occurrence lists). **[E]** A single sorted dictionary plus block-encoded postings (one row per term per ~4 KiB block, delta-coded file ids) should reach roughly 8-12 B/token total; this was not built, so treat it as a target, not a result.
 - A stop-list of 256 terms removes 46 MB of postings at 9.9 M tokens (-22% of P's pages).
 
@@ -131,7 +135,7 @@ Single-threaded, extraction included (the Rust extractor for `.rs`, the fallback
 | 41x | P stop-100k | 14.5 s | 1,810 | 682 k | 4.94 | 266 MB | 1,021 MB | 3.78 | 135 MB |
 
 - Three repetitions at 1x gave <=4% spread (A: 1.36/1.38/1.41 s). 4x and 41x are single runs (each costs minutes): treat +-10% as noise.
-- Bytes written per token at 41x: A 751 B, E 270 B, P 160 B, P stop-256 133 B. The write-amplification ratio (bytes written / final size) of P is high (up to 5.9x) because the commits rewrite the same hot pages (dictionary and postings B-trees) once per repo transaction; in absolute bytes it is still 4.7x less than A. Larger batches reduce it. **[E]**
+- Bytes written per token at 41x: A 751 B, E 270 B, P 160 B, P stop-256 133 B. Bytes written are `wchar` (bytes passed to write(2)), not device bytes, so they exclude btrfs/NVMe amplification and count cached rewrites. The write-amplification ratio (bytes written / final size) of P is high (up to 5.9x) because the commits rewrite the same hot pages (dictionary and postings B-trees) once per repo transaction; in absolute bytes it is still 4.7x less than A. Larger batches reduce it. **[E]**
 - P's ingest is not extractor-bound at this scale (>=1 M tokens/s including tokenizing); A is bound by JSON serialization plus three B-tree inserts per token.
 - Real CLI (release, `memory-graph index` per repo, corpus): 0.01-0.51 s per repo, 1.59 s in total for 8 processes, peak RSS 10-57 MB per process.
 - RSS during A ingest at 41x (1.18 GB) is the redb page cache filling up; P at 290 MB. Cache size is configurable (`Builder::set_cache_size`), so RSS is a tuning knob for all models; it is not per-token memory.
@@ -156,7 +160,7 @@ Single-threaded, extraction included (the Rust extractor for `.rs`, the fallback
 Percentiles are p50 / p95 in ms, in-process, warm. Counts are hit counts; rows are the rows returned at that grain. "P scan only" is the no-postings model (at 10 M, stop-100k).
 
 ### 7.1 Corpus DB (241 k tokens): selected rows
-(Full per-case logs are in the job directory; the 1 M and 10 M tables below use the same cases.)
+(Raw logs are in `spikes/data-model/logs/`; the 1 M and 10 M tables below use the same cases.)
 
 | Case | A | P all |
 |---|---|---|
@@ -250,7 +254,7 @@ Reading the tables:
 | Open (first, in-process) | 1.9 ms (P: 1.3 ms) | 19.5 ms | 7.5-12.2 ms | 7.1 ms | 1.9 ms |
 
 - **`describe` is O(tokens) in A** (it iterates every node to count tokens per language and class); P computes it from the file rows (O(files)): 1,900x faster at 9.9 M tokens.
-- **CLI overhead (release CLI, corpus DB, 15 runs, p50 / p95 wall):** `search '('` 261 / 280 ms, `search '(' --grain org` 245 / 259 ms, `search Rebus --grain file` 218 / 224 ms, `symbols new` 215 / 221 ms, `describe` 217 / 227 ms; peak RSS 167 MB for all of them. The in-process query itself takes 0.09-38 ms, so **~200 ms of every CLI call is the `store.describe` validation** at the top of `search` and `symbols` (`crates/graph-cli/src/main.rs`, `validate_scope`). This is separate from the model choice but proportional to token count and should be fixed first (e.g. keep per-file counts on the file node; or validate lazily on an empty result).
+- **CLI overhead (release CLI, corpus DB, 15 runs, p50 / p95 wall):** `search '('` 261 / 280 ms, `search '(' --grain org` 245 / 259 ms, `search Rebus --grain file` 218 / 224 ms, `symbols new` 215 / 221 ms, `describe` 217 / 227 ms; peak RSS 167 MB for all of them. The in-process query itself takes 0.09-38 ms, so **134 ms of every ~215-261 ms CLI call is the `store.describe` validation** at the top of `search` and `symbols` (`crates/graph-cli/src/main.rs`, `validate_filters`). This is separate from the model choice but proportional to token count and should be fixed first (e.g. keep per-file counts on the file node; or validate lazily on an empty result).
 - Open time is 1-20 ms for every model; the run-to-run spread (P 1.3 ms vs 7.1 ms vs 14 ms for identical files) is larger than any model difference. Schema check plus symbol index check; no O(N) work unless the symbol index must be rebuilt (a migration case).
 
 ### 7.5 Cold cache and memory during search (fresh process, one query)
@@ -285,8 +289,12 @@ Reading the tables:
 - The prototype is a spike: no `Store` API integration, no schema/version handling, error paths, overlap checks (`InvalidSpan`), `origin`, `has_errors` handling on read, or `prune`.
 - `E` (binary per-token nodes) was measured for size and ingest only; its search latency was not built (**[E]**: about A's minus JSON decoding, i.e. same shape, maybe 1.5-2x faster for node-walking cases).
 - Single run for 4x/41x ingest; A at 41x searches use 2 repetitions.
-- Synthetic scaling (rare identifiers renamed per copy). Real distinct-text ratios vary by language mix; 4-5% (corpus and both scaled sets) is only what we can say for this corpus.
+- Synthetic scaling (rare identifiers renamed per copy, uniform distribution across copies; the distinct-text ratio is understated for real multi-repo data because real repos add vocabulary, while the rare-identifier part may be overstated). Real distinct-text ratios vary by language mix; 4-5% (corpus and both scaled sets) is only what we can say for this corpus.
 - Cold-cache uses `dd oflag=nocache` (page-cache eviction of that file), not a drop of all caches; btrfs compression is not enabled on this volume, so sizes are logical file sizes.
 - The corpus is mostly C#/Java/TypeScript; only Rust gets symbols (741), so symbol-grain behavior with dense symbol data (e.g. 100 k symbols) is untested. In P symbols are rows in the same table with per-file ranges, so I expect no surprise, but it is unmeasured.
 - Multi-writer, concurrent readers during writes, and crash safety were not tested (redb provides the transaction semantics in every model).
 - Query results were compared for equality between A and P on this corpus only.
+
+## 10. Decisions taken after this spike (by the user)
+
+Recorded in [ADR 0003](../adr/0003-data-model.md): scale above 100 M tokens and horizontal scaling must be supported (so packed dictionary and block postings are core, and the store must be shardable); pre-1.0 re-index is acceptable but migration must exist and be tested before 1.0; readers get point-in-time snapshots. Consequence for this spike: its [E] estimates for 100 M and for the packed dictionary/block postings are now on the critical path and must be replaced by measurements (ADR stories 3a, 3b).
