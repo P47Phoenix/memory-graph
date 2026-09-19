@@ -74,7 +74,7 @@ As a project maintainer
 I want CI to fail when a C or C++ dependency enters the build
 So that the pure-Rust rule holds as dependencies change.
 - Given a clean workspace, When CI runs the gate, Then it must pass and print the checked dependency count.
-- Given a dependency whose crate name ends in `-sys` or that has a `build.rs` compiling C or C++, When CI runs the gate, Then it must fail and name the offending crate.
+- Given a dependency that links a native library (a `links` key, typically a `-sys` crate) or has a `build.rs` using a C/C++ build tool (`cc`, `cmake`, `bindgen`, ...); pure-Rust `-sys` crates such as `windows-sys` and `linux-raw-sys` are allowed, When CI runs the gate, Then it must fail and name the offending crate.
 - Given an approved exception file (initially empty), When an exception is listed, Then the gate must pass for that crate only and print the exception.
 - Given the gate, When run locally with one documented command, Then it must produce the same result as CI.
 
@@ -92,9 +92,9 @@ So that code in any language is stored and queried the same way.
 
 **5. Persist graph to disk and reopen (3 pts)**
 As a developer or agent
-I want the graph stored in a database directory I choose
+I want the graph stored in a database file I choose
 So that I index once and query in later sessions.
-- Given a graph written with `--db ./g`, When the process exits and `./g` is reopened, Then all nodes and edges must be present and unchanged.
+- Given a graph written with `--db ./g`, When the process exits and `./g` (a single file) is reopened, Then all nodes and edges must be present and unchanged.
 - Given a database from an incompatible schema version, When opened, Then the tool must report the mismatch and must not modify the data.
 - Given a second process opens a database that is already locked, When it starts, Then it must fail with a clear message and must not corrupt data.
 

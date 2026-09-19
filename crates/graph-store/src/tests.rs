@@ -193,3 +193,76 @@ fn parent_lookup() {
         .unwrap();
     assert_eq!(s.parent(f.id).unwrap().unwrap().kind, NodeKind::Repo);
 }
+
+#[test]
+fn partial_overlap_and_bad_spans_rejected_atomically() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    let before = s.search(&Query::new("foo")).unwrap().len();
+    let src = "aaaa bbbb cccc";
+    let mk = |a: &str, b: &str| (span_of(src, a, 0), span_of(src, b, 0));
+    let (a, b) = mk("aaaa bbbb", "bbbb cccc"); // b starts inside a, ends after
+    let ex = Extraction {
+        symbols: vec![sym("A", SymbolKind::Type, a), sym("B", SymbolKind::Type, b)],
+        tokens: tokenize(src),
+    };
+    let err = s
+        .ingest_file("o2", "r2", "main.zig", "zig", &ex)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidSpan(_)), "{err}");
+    // Old version of the file is intact (transaction aborted).
+    assert_eq!(s.search(&Query::new("foo")).unwrap().len(), before);
+    let mut bad = span_of(src, "aaaa", 0);
+    bad.end = 0;
+    bad.start = 3;
+    let ex = Extraction {
+        symbols: vec![sym("A", SymbolKind::Type, bad)],
+        tokens: vec![],
+    };
+    assert!(matches!(
+        s.ingest_file("o", "r", "x", "l", &ex),
+        Err(StoreError::InvalidSpan(_))
+    ));
+}
+
+#[test]
+fn no_matching_symbol_is_distinct_from_no_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    let mut q = Query::new("impl");
+    q.grain = Grain::Symbol;
+    q.symbol_kind = Some(SymbolKind::Method);
+    // `impl` sits inside type S but not inside a method.
+    let h = s.search(&q).unwrap();
+    assert_eq!(
+        (h.len(), h[0].no_symbols, h[0].no_matching_symbol),
+        (1, false, true)
+    );
+}
+
+#[test]
+fn index_bytes_normalizes() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    s.index_bytes("o", "r", "./a.rs", b"\xEF\xBB\xBFfoo bar", None)
+        .unwrap();
+    let st = s
+        .index_bytes("o", "r", "x/../a.rs", b"foo", Some("Rust"))
+        .unwrap();
+    assert!(st.replaced);
+    assert_eq!((st.path.as_str(), st.language.as_str()), ("a.rs", "rust"));
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    let mut q = Query::new("foo");
+    q.language = Some("RUST".into());
+    assert_eq!(s.search(&q).unwrap().len(), 1);
+    // BOM is not a token and does not shift columns beyond its bytes.
+    s.index_bytes("o", "r", "b.rs", b"\xEF\xBB\xBFfoo", None)
+        .unwrap();
+    let h = s.search(&Query::new("foo")).unwrap();
+    assert_eq!(h[1].span.unwrap().start_col, 1);
+    assert!(matches!(
+        s.index_bytes("o", "r", "c.bin", &[0xff, 0xfe], None),
+        Err(StoreError::Rejected(_))
+    ));
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+}

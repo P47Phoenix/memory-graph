@@ -9,4 +9,4 @@ memory-graph --db ./g search foo --language rust --json
 memory-graph --db ./g search foo --grain file      # token|symbol|file|repo|org
 python3 scripts/check-no-c-deps.py                 # pure-Rust gate, same as CI
 ```
-Every language is tokenized by a generic fallback; symbols arrive with per-language extractors (later stories).
+Language names are lowercased; a UTF-8 BOM is ignored; file paths are normalized (`./a.rs` = `a.rs`). Every language is tokenized by a generic fallback; symbols arrive with per-language extractors (later stories).

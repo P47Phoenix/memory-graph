@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use graph_core::{Extractor, FallbackExtractor, SymbolKind, TokenClass};
+use graph_core::{SymbolKind, TokenClass};
 use graph_store::{Grain, Query, Store};
 use std::path::PathBuf;
 
@@ -50,29 +50,6 @@ enum Cmd {
     },
 }
 
-/// Language name from extension; unknown extensions use the extension itself.
-fn detect_language(path: &std::path::Path) -> String {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "rs" => "rust",
-        "py" => "python",
-        "js" | "mjs" | "cjs" => "javascript",
-        "ts" => "typescript",
-        "go" => "go",
-        "c" | "h" => "c",
-        "cc" | "cpp" | "hpp" => "cpp",
-        "java" => "java",
-        "rb" => "ruby",
-        "" => "unknown",
-        other => return other.to_string(),
-    }
-    .to_string()
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -84,21 +61,18 @@ fn main() -> Result<()> {
         } => {
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("cannot read `{}`", path.display()))?;
-            let src = String::from_utf8(bytes).map_err(|e| {
-                anyhow::anyhow!("`{}` rejected: not valid UTF-8 ({e})", path.display())
-            })?;
-            let lang = language.unwrap_or_else(|| detect_language(&path));
-            // No language extractors are registered yet; everything uses the fallback.
-            let ex = FallbackExtractor::new(&lang);
-            let extraction = ex.extract(&src);
+            let path_str = path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("`{}` is not a valid UTF-8 path", path.display()))?;
+            if cli.db.is_dir() {
+                bail!(
+                    "--db `{}` is a directory; give a database file path",
+                    cli.db.display()
+                );
+            }
             let store = Store::open(&cli.db)?;
-            let st = store.ingest_file(
-                &org,
-                &repo,
-                &path.to_string_lossy(),
-                ex.language(),
-                &extraction,
-            )?;
+            let st = store.index_bytes(&org, &repo, path_str, &bytes, language.as_deref())?;
+            let lang = st.language.clone();
             println!(
                 "indexed {} ({}) tokens={} symbols={}{}",
                 path.display(),
@@ -121,7 +95,7 @@ fn main() -> Result<()> {
             if symbol_kind.is_some() && grain != Grain::Symbol {
                 bail!("--symbol-kind requires --grain symbol");
             }
-            if !cli.db.exists() {
+            if !cli.db.is_file() {
                 bail!("database `{}` does not exist", cli.db.display());
             }
             let store = Store::open(&cli.db)?;
@@ -148,7 +122,13 @@ fn main() -> Result<()> {
                         h.language.as_deref().unwrap_or("-"),
                         h.symbol.as_deref().unwrap_or("-"),
                         h.count,
-                        if h.no_symbols { "\tno_symbols" } else { "" }
+                        if h.no_symbols {
+                            "\tno_symbols"
+                        } else if h.no_matching_symbol {
+                            "\tno_matching_symbol"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }

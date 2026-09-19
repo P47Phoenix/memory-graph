@@ -3,7 +3,10 @@ use crate::schema::{Span, TokenClass, TokenDecl};
 
 const OPERATOR_CHARS: &str = "+-*/%=<>!&|^~?@";
 
-/// Tokenize everything except whitespace. Unterminated strings and comments
+/// Tokenize everything except whitespace (a BOM counts as whitespace; offsets
+/// stay relative to the original text). Callers must ensure `src.len() <= u32::MAX`
+/// (spans are `u32`); `Store::index_bytes` enforces this.
+/// Unterminated strings and comments
 /// run to end of input (or line, for `//`).
 pub fn tokenize(src: &str) -> Vec<TokenDecl> {
     let b = src.as_bytes();
@@ -15,14 +18,14 @@ pub fn tokenize(src: &str) -> Vec<TokenDecl> {
             if c == '\n' {
                 *line += 1;
                 *col = 1;
-            } else {
+            } else if c != '\u{feff}' {
                 *col += 1;
             }
         }
     };
     while i < b.len() {
         let c = src[i..].chars().next().unwrap();
-        if c.is_whitespace() {
+        if c.is_whitespace() || c == '\u{feff}' {
             adv(i, i + c.len_utf8(), &mut line, &mut col);
             i += c.len_utf8();
             continue;
@@ -109,6 +112,10 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn is_gap(c: char) -> bool {
+        c.is_whitespace() || c == '\u{feff}'
+    }
+
     fn texts(s: &str) -> Vec<String> {
         tokenize(s).into_iter().map(|t| t.text).collect()
     }
@@ -125,6 +132,13 @@ mod tests {
         assert_eq!(texts("x \"abc"), ["x", "\"abc"]);
         assert_eq!(texts("x /* abc"), ["x", "/* abc"]);
         assert_eq!(texts("fn f<'a>()")[3..5], ["'", "a"]);
+    }
+
+    #[test]
+    fn bom_is_not_a_token() {
+        let t = tokenize("\u{feff}foo bar");
+        assert_eq!(t[0].text, "foo");
+        assert_eq!((t[0].span.start, t[0].span.start_col), (3, 1)); // BOM takes no column
     }
 
     #[test]
@@ -145,19 +159,19 @@ mod tests {
                 prop_assert_eq!(&src[s..e], t.text.as_str());
                 prop_assert!(s >= prev_end);
                 // Gap between tokens is whitespace only.
-                prop_assert!(src[prev_end..s].chars().all(char::is_whitespace));
+                prop_assert!(src[prev_end..s].chars().all(is_gap));
                 // Independent line/col computation.
                 let before = &src[..s];
                 let line = 1 + before.matches('\n').count() as u32;
-                let col = 1 + before.rsplit('\n').next().unwrap().chars().count() as u32;
+                let col = 1 + before.rsplit('\n').next().unwrap().chars().filter(|&c| c != '\u{feff}').count() as u32;
                 prop_assert_eq!((t.span.start_line, t.span.start_col), (line, col));
                 let upto = &src[..e];
                 let el = 1 + upto.matches('\n').count() as u32;
-                let ec = 1 + upto.rsplit('\n').next().unwrap().chars().count() as u32;
+                let ec = 1 + upto.rsplit('\n').next().unwrap().chars().filter(|&c| c != '\u{feff}').count() as u32;
                 prop_assert_eq!((t.span.end_line, t.span.end_col), (el, ec));
                 prev_end = e;
             }
-            prop_assert!(src[prev_end..].chars().all(char::is_whitespace));
+            prop_assert!(src[prev_end..].chars().all(is_gap));
         }
     }
 }

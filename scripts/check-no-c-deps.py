@@ -6,16 +6,17 @@ Exceptions: one crate name per line in scripts/c-deps-exceptions.txt (initially 
 """
 import json, os, subprocess, sys
 
-C_BUILD_DEPS = {"cc", "cmake", "bindgen", "cxx-build", "pkg-config", "vcpkg", "autocfg-c"}
+C_BUILD_DEPS = {"cc", "cmake", "bindgen", "cxx-build", "pkg-config", "vcpkg"}
 here = os.path.dirname(os.path.abspath(__file__))
-exc_file = os.path.join(here, "c-deps-exceptions.txt")
+exc_file = os.environ.get("C_DEPS_EXCEPTIONS", os.path.join(here, "c-deps-exceptions.txt"))
 exceptions = set()
 if os.path.exists(exc_file):
     exceptions = {l.strip() for l in open(exc_file) if l.strip() and not l.startswith("#")}
 
-meta = json.loads(subprocess.check_output(
-    ["cargo", "metadata", "--format-version", "1", "--locked"] if os.path.exists("Cargo.lock")
-    else ["cargo", "metadata", "--format-version", "1"]))
+try:
+    meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1"], stderr=subprocess.PIPE))
+except subprocess.CalledProcessError as e:
+    sys.exit("cargo metadata failed (is Cargo.lock up to date?):\n" + e.stderr.decode())
 workspace = set(meta["workspace_members"])
 checked, bad, used = 0, [], []
 for p in meta["packages"]:

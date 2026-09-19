@@ -1,7 +1,8 @@
 //! Embedded graph store on `redb` (pure Rust). Knows nothing about any
 //! particular language.
 use graph_core::{
-    check_contains, Extraction, Node, NodeId, NodeKind, Span, SymbolKind, TokenClass,
+    check_contains, detect_language, normalize_path, Extraction, Extractor, FallbackExtractor,
+    Node, NodeId, NodeKind, Span, SymbolKind, TokenClass,
 };
 use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
@@ -12,6 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u64 = 1;
+/// Spans are `u32` byte offsets.
+pub const MAX_SOURCE_BYTES: usize = u32::MAX as usize;
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
@@ -26,6 +29,10 @@ pub enum StoreError {
     Locked(String),
     #[error("incompatible schema version {found} (this build supports {SCHEMA_VERSION}); database left unmodified")]
     SchemaMismatch { found: u64 },
+    #[error("rejected: {0}")]
+    Rejected(String),
+    #[error("invalid span: {0}")]
+    InvalidSpan(String),
     #[error("corrupt database: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -117,8 +124,11 @@ pub struct Hit {
     pub span: Option<Span>,
     /// Number of matching tokens contained in this node.
     pub count: usize,
-    /// Symbol grain only: no enclosing symbol qualified, rolled up to the file.
+    /// Symbol grain only: the file has no symbols at all (e.g. fallback language).
     pub no_symbols: bool,
+    /// Symbol grain only: the file has symbols, but none enclosing the match
+    /// (of the requested kind); rolled up to the file.
+    pub no_matching_symbol: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -128,6 +138,9 @@ pub struct IngestStats {
     pub tokens: usize,
     /// True when an existing file was replaced.
     pub replaced: bool,
+    /// Normalized path and language actually stored.
+    pub path: String,
+    pub language: String,
 }
 
 fn enc(n: &Node) -> Vec<u8> {
@@ -178,6 +191,31 @@ impl Store {
             }
         }
         Ok(Self { db })
+    }
+
+    /// Index raw file bytes: the single entry point shared by the CLI and
+    /// library users. Rejects non-UTF-8 and oversized input (nothing stored),
+    /// normalizes the path, lowercases the language (default: detected from the
+    /// extension) and uses the fallback tokenizer.
+    pub fn index_bytes(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+        bytes: &[u8],
+        language: Option<&str>,
+    ) -> Result<IngestStats> {
+        if bytes.len() > MAX_SOURCE_BYTES {
+            return Err(StoreError::Rejected(format!(
+                "`{path}` is larger than 4 GiB"
+            )));
+        }
+        let src = std::str::from_utf8(bytes)
+            .map_err(|e| StoreError::Rejected(format!("`{path}` is not valid UTF-8 ({e})")))?;
+        let path = normalize_path(path);
+        let lang = language.map_or_else(|| detect_language(&path), str::to_ascii_lowercase);
+        let ex = FallbackExtractor::new(lang.as_str());
+        self.ingest_file(org, repo, &path, ex.language(), &ex.extract(src))
     }
 
     pub fn get(&self, id: NodeId) -> Result<Option<Node>> {
@@ -281,6 +319,8 @@ impl Store {
             )?;
             stats.file_id = file_id;
             stats.replaced = existed;
+            stats.path = path.to_string();
+            stats.language = language.to_string();
 
             if existed {
                 // Drop the old subtree.
@@ -348,6 +388,23 @@ impl Store {
                     Some(&(id, _)) => (id, NodeKind::Symbol),
                     None => (file_id, NodeKind::File),
                 };
+                let (span_start, span_end) = if take_sym {
+                    (syms[si].span.start, syms[si].span.end)
+                } else {
+                    (toks[ti].span.start, toks[ti].span.end)
+                };
+                if span_start > span_end {
+                    return Err(StoreError::InvalidSpan(format!(
+                        "start {span_start} > end {span_end}"
+                    )));
+                }
+                if let Some(&(_, end)) = open.last() {
+                    if span_end > end {
+                        return Err(StoreError::InvalidSpan(format!(
+                            "bytes {span_start}..{span_end} partially overlap an enclosing symbol ending at {end}"
+                        )));
+                    }
+                }
                 if take_sym {
                     let s = syms[si];
                     si += 1;
@@ -405,6 +462,8 @@ impl Store {
         let rt = self.db.begin_read()?;
         let nodes = rt.open_table(NODES)?;
         let tokens = rt.open_multimap_table(TOKENS)?;
+        let kids = rt.open_multimap_table(CHILDREN)?;
+        let mut sym_memo: HashMap<NodeId, bool> = HashMap::new();
         let mut cache: HashMap<NodeId, Node> = HashMap::new();
         let mut load = |id: NodeId| -> Result<Node> {
             if let Some(n) = cache.get(&id) {
@@ -416,6 +475,25 @@ impl Store {
                 .value())?;
             cache.insert(id, n.clone());
             Ok(n)
+        };
+
+        let mut has_syms = |file: NodeId| -> Result<bool> {
+            if let Some(&b) = sym_memo.get(&file) {
+                return Ok(b);
+            }
+            let mut found = false;
+            for c in kids.get(file)? {
+                let n = dec(nodes
+                    .get(c?.value())?
+                    .ok_or_else(|| StoreError::Corrupt("dangling child".into()))?
+                    .value())?;
+                if n.kind == NodeKind::Symbol {
+                    found = true;
+                    break;
+                }
+            }
+            sym_memo.insert(file, found);
+            Ok(found)
         };
 
         type Key = (String, String, String, u32, u64);
@@ -450,7 +528,7 @@ impl Store {
             )?;
             if q.language
                 .as_deref()
-                .is_some_and(|l| file.language.as_deref() != Some(l))
+                .is_some_and(|l| file.language.as_deref() != Some(l.to_ascii_lowercase().as_str()))
                 || q.org.as_deref().is_some_and(|o| org.name != o)
                 || q.repo.as_deref().is_some_and(|r| repo.name != r)
             {
@@ -478,6 +556,7 @@ impl Store {
                 span: None,
                 count: 1,
                 no_symbols: false,
+                no_matching_symbol: false,
             };
             let base = (org.name.clone(), repo.name.clone(), file.name.clone());
             let key: Key;
@@ -511,7 +590,11 @@ impl Store {
                             key = (base.0, base.1, base.2, s.span.map_or(0, |x| x.start), s.id);
                         }
                         None => {
-                            hit.no_symbols = true;
+                            if !has_syms(file.id)? {
+                                hit.no_symbols = true;
+                            } else {
+                                hit.no_matching_symbol = true;
+                            }
                             key = (base.0, base.1, base.2, 0, 0);
                         }
                     }
