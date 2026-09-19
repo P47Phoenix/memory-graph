@@ -202,6 +202,8 @@ So that keeping the graph current is fast.
 - Given a file deleted from disk, When re-indexed, Then its File node and all descendants must be removed.
 - Given a file whose language extractor version changed, When re-indexed, Then that file must be re-parsed.
 
+*Status: the skip-unchanged part is implemented.* File nodes carry a fingerprint (SHA-256 of the content + lowercased language + `Extractor::version()` + store index format version); an identical fingerprint skips the file and is reported as `unchanged` (`index`, `index-file`, `--json`, `IngestStats`, `index_batch`). `--force` re-indexes regardless. Pre-fingerprint files re-index once. Deleted-file removal is `--prune` (story 10).
+
 **16. Python extractor via the Extractor trait (5 pts)**
 As an AI-agent integrator
 I want Python files indexed with symbols

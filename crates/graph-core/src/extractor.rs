@@ -23,7 +23,15 @@ pub trait Extractor {
     /// Language string stored on File nodes.
     fn language(&self) -> &str;
     fn extract(&self, source: &str) -> Extraction;
+    /// Version of this extractor's output. Bump it whenever a change would
+    /// alter what `extract` returns, so stored files are re-indexed.
+    fn version(&self) -> &str {
+        "1"
+    }
 }
+
+/// Version of the fallback (tokenizer-only) extraction.
+pub const FALLBACK_EXTRACTOR_VERSION: &str = "fallback-1";
 
 /// Fallback: tokens only, no symbols. Works for any language.
 pub struct FallbackExtractor {
@@ -41,6 +49,9 @@ impl FallbackExtractor {
 impl Extractor for FallbackExtractor {
     fn language(&self) -> &str {
         &self.language
+    }
+    fn version(&self) -> &str {
+        FALLBACK_EXTRACTOR_VERSION
     }
     fn extract(&self, source: &str) -> Extraction {
         Extraction {
@@ -67,6 +78,14 @@ impl Registry {
         match self.extractors.get(language) {
             Some(e) => e.extract(source),
             None => FallbackExtractor::new(language).extract(source),
+        }
+    }
+
+    /// Version of the extractor that `extract` would use for `language`.
+    pub fn version(&self, language: &str) -> String {
+        match self.extractors.get(language) {
+            Some(e) => e.version().to_string(),
+            None => FALLBACK_EXTRACTOR_VERSION.to_string(),
         }
     }
 

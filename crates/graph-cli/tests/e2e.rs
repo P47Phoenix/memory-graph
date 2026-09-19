@@ -523,8 +523,8 @@ mod prune_and_limits {
         assert!(files_of(&db, "r").is_empty());
         // Nothing to lose: an empty walk is fine without --force.
         assert!(idx(&db, "r", &["--prune"], &root).0);
-        // --force alone is rejected.
-        assert!(!idx(&db, "r", &["--force"], &root).0);
+        // --force alone is accepted: it means "re-index regardless".
+        assert!(idx(&db, "r", &["--force"], &root).0);
     }
 
     #[test]
@@ -1212,5 +1212,107 @@ fn closed_stdout_is_not_a_panic_for_index_and_index_file() {
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(!err.contains("panicked"), "{args:?}: {err}");
         assert!(o.status.success(), "{args:?}: {err}");
+    }
+}
+
+mod unchanged_files {
+    use super::run;
+
+    fn idx(db: &str, extra: &[&str], dir: &std::path::Path) -> serde_json::Value {
+        let mut a = vec!["--db", db, "index", "--org", "o", "--repo", "r", "--json"];
+        a.extend_from_slice(extra);
+        a.push(dir.to_str().unwrap());
+        let (ok, out, err) = run(&a);
+        assert!(ok, "{out}{err}");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    #[test]
+    fn index_reports_unchanged_and_reindexes_only_what_changed() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g");
+        let db = db.to_str().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        for i in 0..5 {
+            std::fs::write(src.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+        }
+        let v = idx(db, &[], &src);
+        assert_eq!(
+            (v["files"].as_u64(), v["unchanged"].as_u64()),
+            (Some(5), Some(0))
+        );
+        let v = idx(db, &["--prune"], &src);
+        assert_eq!(
+            (v["files"].as_u64(), v["unchanged"].as_u64()),
+            (Some(5), Some(5))
+        );
+        assert_eq!(v["pruned"], serde_json::json!([]));
+        // Text summary carries the count too.
+        let (ok, out, _) = run(&[
+            "--db",
+            db,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            src.to_str().unwrap(),
+        ]);
+        assert!(ok && out.contains("files=5 unchanged=5"), "{out}");
+        // Edit one file, delete another: one re-indexed, others skipped, prune still works.
+        std::fs::write(src.join("f0.rs"), "fn changed() {}\n").unwrap();
+        std::fs::remove_file(src.join("f4.rs")).unwrap();
+        let v = idx(db, &["--prune"], &src);
+        assert_eq!(
+            (v["files"].as_u64(), v["unchanged"].as_u64()),
+            (Some(4), Some(3))
+        );
+        assert_eq!(v["pruned"], serde_json::json!(["f4.rs"]));
+        let (ok, out, _) = run(&["--db", db, "symbols", "changed", "--json"]);
+        assert!(ok && out.contains("changed"), "{out}");
+        let (_, out, _) = run(&["--db", db, "symbols", "f0", "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["results"],
+            serde_json::json!([]),
+            "old symbol gone: {out}"
+        );
+        // --force re-indexes everything.
+        let v = idx(db, &["--force"], &src);
+        assert_eq!(
+            (v["files"].as_u64(), v["unchanged"].as_u64()),
+            (Some(4), Some(0))
+        );
+    }
+
+    #[test]
+    fn index_file_reports_unchanged_and_force_reindexes() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g");
+        let db = db.to_str().unwrap();
+        let f = d.path().join("a.rs");
+        std::fs::write(&f, "fn a() {}\n").unwrap();
+        let go = |extra: &[&str]| {
+            let mut a = vec!["--db", db, "index-file", "--org", "o", "--repo", "r"];
+            a.extend_from_slice(extra);
+            a.push(f.to_str().unwrap());
+            let (ok, out, err) = run(&a);
+            assert!(ok, "{out}{err}");
+            out
+        };
+        let out = go(&[]);
+        assert!(!out.contains("[unchanged]"), "{out}");
+        let out = go(&[]);
+        assert!(
+            out.contains("[unchanged]") && out.contains("symbols=0"),
+            "{out}"
+        );
+        let out = go(&["--force"]);
+        assert!(
+            out.contains("[replaced]") && !out.contains("[unchanged]"),
+            "{out}"
+        );
+        assert!(out.contains("symbols=1"), "{out}");
     }
 }

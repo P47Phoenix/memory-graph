@@ -8,6 +8,7 @@ license.workspace = true
 graph-core = { path = "../graph-core" }
 redb.workspace = true
 serde.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 

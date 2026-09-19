@@ -1008,8 +1008,280 @@ fn batch_matches_individual_ingest() {
     assert_eq!(out[2].as_ref().unwrap().language, "python");
     assert_eq!(s.file_tokens("o", "r", "b.py").unwrap().unwrap().len(), 3);
     assert!(s.file_tokens("o", "r", "bad.txt").unwrap().is_none());
-    // Re-running replaces, not duplicates.
+    // Re-running skips unchanged files; forcing replaces, never duplicates.
+    let again = s.index_batch("o", "r", &files).unwrap();
+    assert!(again[0].as_ref().unwrap().unchanged);
+    let mut s = s;
+    s.set_force(true);
     let again = s.index_batch("o", "r", &files).unwrap();
     assert!(again[0].as_ref().unwrap().replaced);
     assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+}
+
+// --- skip unchanged files -------------------------------------------------
+
+fn file_token_ids(s: &Store, path: &str) -> Vec<NodeId> {
+    s.file_tokens("o", "r", path)
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|n| n.id)
+        .collect()
+}
+
+fn file_fingerprint(s: &Store, path: &str) -> Option<String> {
+    let rt = s.db.begin_read().unwrap();
+    let names = rt.open_table(NAMES).unwrap();
+    let o = names
+        .get(name_key(None, NodeKind::Org, "o").as_str())
+        .unwrap()
+        .unwrap()
+        .value();
+    let r = names
+        .get(name_key(Some(o), NodeKind::Repo, "r").as_str())
+        .unwrap()
+        .unwrap()
+        .value();
+    let f = names
+        .get(name_key(Some(r), NodeKind::File, path).as_str())
+        .unwrap()
+        .unwrap()
+        .value();
+    s.get(f).unwrap().unwrap().fingerprint
+}
+
+#[test]
+fn unchanged_file_is_skipped_without_writes() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    let src = b"fn foo() { foo(); }\n";
+    let first = s.index_bytes("o", "r", "a.rs", src, None).unwrap();
+    assert!(!first.unchanged && !first.replaced);
+    let ids = file_token_ids(&s, "a.rs");
+    let next = meta(&s, "next_id");
+    let nodes = s.count_nodes(NodeKind::Token).unwrap();
+    let second = s.index_bytes("o", "r", "a.rs", src, None).unwrap();
+    assert!(second.unchanged && !second.replaced);
+    assert_eq!((second.symbols, second.tokens), (0, 0));
+    assert_eq!(second.file_id, first.file_id);
+    assert_eq!(second.language, "rust");
+    assert_eq!(file_token_ids(&s, "a.rs"), ids);
+    assert_eq!(meta(&s, "next_id"), next, "no ids allocated");
+    assert_eq!(s.count_nodes(NodeKind::Token).unwrap(), nodes);
+    assert!(file_fingerprint(&s, "a.rs").unwrap().starts_with("sha256:"));
+}
+
+#[test]
+fn unchanged_file_still_updates_origin() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    s.index_bytes_with_origin("o", "r", "a.rs", b"fn f() {}\n", None, None)
+        .unwrap();
+    let st = s
+        .index_bytes_with_origin(
+            "o",
+            "r",
+            "a.rs",
+            b"fn f() {}\n",
+            None,
+            Some(ORIGIN_DIRECTORY),
+        )
+        .unwrap();
+    assert!(st.unchanged);
+    assert_eq!(
+        origin_of(&s, "o", "r", "a.rs").as_deref(),
+        Some(ORIGIN_DIRECTORY)
+    );
+    let st = s
+        .index_bytes_with_origin("o", "r", "a.rs", b"fn f() {}\n", None, None)
+        .unwrap();
+    assert!(st.unchanged);
+    assert_eq!(origin_of(&s, "o", "r", "a.rs"), None);
+}
+
+#[test]
+fn changed_content_or_language_reindexes_without_duplicates() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    s.index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
+        .unwrap();
+    let st = s
+        .index_bytes("o", "r", "a.rs", b"fn g() {}\nfn h() {}\n", None)
+        .unwrap();
+    assert!(st.replaced && !st.unchanged);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    assert_eq!(s.count_nodes(NodeKind::Symbol).unwrap(), 2);
+    // Same bytes, other language: re-index (different fingerprint), language refreshed.
+    let st = s
+        .index_bytes("o", "r", "a.rs", b"fn g() {}\nfn h() {}\n", Some("Zig"))
+        .unwrap();
+    assert!(st.replaced && !st.unchanged);
+    assert_eq!(st.language, "zig");
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    assert_eq!(s.count_nodes(NodeKind::Symbol).unwrap(), 0);
+    // Language is compared case-insensitively.
+    let st = s
+        .index_bytes("o", "r", "a.rs", b"fn g() {}\nfn h() {}\n", Some("ZIG"))
+        .unwrap();
+    assert!(st.unchanged);
+}
+
+struct Versioned(&'static str);
+impl Extractor for Versioned {
+    fn language(&self) -> &str {
+        "vx"
+    }
+    fn version(&self) -> &str {
+        self.0
+    }
+    fn extract(&self, source: &str) -> Extraction {
+        Extraction {
+            has_errors: false,
+            symbols: vec![],
+            tokens: tokenize(source),
+        }
+    }
+}
+
+#[test]
+fn extractor_version_change_reindexes() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("g.redb");
+    let put = |v: &'static str| {
+        let mut s = Store::open(&path).unwrap();
+        s.register(Box::new(Versioned(v)));
+        s.index_bytes("o", "r", "a.vx", b"a b c\n", Some("vx"))
+            .unwrap()
+    };
+    assert!(!put("1").unchanged);
+    assert!(put("1").unchanged);
+    let st = put("2");
+    assert!(st.replaced && !st.unchanged);
+    assert!(put("2").unchanged);
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    assert_eq!(s.count_nodes(NodeKind::Token).unwrap(), 3);
+}
+
+#[test]
+fn fallback_and_rust_versions_are_distinct() {
+    let mut r = Registry::default();
+    r.register(Box::new(Versioned("v")));
+    assert_eq!(r.version("vx"), "v");
+    assert_eq!(r.version("zig"), graph_core::FALLBACK_EXTRACTOR_VERSION);
+    assert_ne!(
+        graph_lang_rust::RustExtractor.version(),
+        graph_core::FALLBACK_EXTRACTOR_VERSION
+    );
+    assert_ne!(graph_lang_rust::RustExtractor.version(), "1");
+}
+
+#[test]
+fn file_without_fingerprint_reindexes_once() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    // ingest_file has no content, so it stores no fingerprint (like an old DB).
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![],
+        tokens: tokenize("fn f() {}\n"),
+    };
+    s.ingest_file("o", "r", "a.rs", "rust", &ex).unwrap();
+    assert_eq!(file_fingerprint(&s, "a.rs"), None);
+    let st = s
+        .index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
+        .unwrap();
+    assert!(st.replaced && !st.unchanged);
+    assert!(file_fingerprint(&s, "a.rs").is_some());
+    assert!(
+        s.index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
+            .unwrap()
+            .unchanged
+    );
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+}
+
+#[test]
+fn nodes_without_fingerprint_field_still_deserialize() {
+    let old = br#"{"id":1,"parent":null,"kind":"file","name":"a","language":null,"symbol_kind":null,"lang_kind":null,"token_class":null,"has_errors":false,"origin":"directory","span":null}"#;
+    assert_eq!(dec(old).unwrap().fingerprint, None);
+}
+
+#[test]
+fn force_reindexes_unchanged_files() {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = rust_store(d.path());
+    s.index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
+        .unwrap();
+    s.set_force(true);
+    let st = s
+        .index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
+        .unwrap();
+    assert!(st.replaced && !st.unchanged);
+    assert_eq!(st.symbols, 1);
+    s.set_force(false);
+    assert!(
+        s.index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
+            .unwrap()
+            .unchanged
+    );
+}
+
+#[test]
+fn batch_skips_unchanged_and_reindexes_changed() {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = rust_store(d.path());
+    let f = |p, b: &'static [u8], origin| BatchFile {
+        path: p,
+        bytes: b,
+        language: None,
+        origin,
+    };
+    let v1 = [
+        f("a.rs", b"fn a() {}\n", None),
+        f("b.rs", b"fn b() {}\n", None),
+    ];
+    assert!(s
+        .index_batch("o", "r", &v1)
+        .unwrap()
+        .iter()
+        .all(|r| !r.as_ref().unwrap().unchanged));
+    let ids = file_token_ids(&s, "a.rs");
+    let v2 = [
+        f("./a.rs", b"fn a() {}\n", Some(ORIGIN_DIRECTORY)),
+        f("b.rs", b"fn b2() {}\n", None),
+    ];
+    let out = s.index_batch("o", "r", &v2).unwrap();
+    let (a, b) = (out[0].as_ref().unwrap(), out[1].as_ref().unwrap());
+    assert!(a.unchanged && a.path == "a.rs");
+    assert!(b.replaced && !b.unchanged);
+    assert_eq!(file_token_ids(&s, "a.rs"), ids);
+    assert_eq!(
+        origin_of(&s, "o", "r", "a.rs").as_deref(),
+        Some(ORIGIN_DIRECTORY)
+    );
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    s.set_force(true);
+    let out = s.index_batch("o", "r", &v2).unwrap();
+    assert!(out.iter().all(|r| !r.as_ref().unwrap().unchanged));
+}
+
+#[test]
+fn skipped_files_are_still_seen_by_prune() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    let f = |p, b: &'static [u8]| BatchFile {
+        path: p,
+        bytes: b,
+        language: None,
+        origin: Some(ORIGIN_DIRECTORY),
+    };
+    let files = [f("a.rs", b"fn a() {}\n"), f("b.rs", b"fn b() {}\n")];
+    s.index_batch("o", "r", &files).unwrap();
+    let out = s.index_batch("o", "r", &files[..1]).unwrap();
+    assert!(out[0].as_ref().unwrap().unchanged);
+    let keep: std::collections::HashSet<String> = ["a.rs".to_string()].into();
+    let removed = s.prune_files("o", "r", &keep, false).unwrap();
+    assert_eq!(removed, vec!["b.rs".to_string()]);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
 }

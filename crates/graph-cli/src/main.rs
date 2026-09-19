@@ -33,6 +33,9 @@ enum Cmd {
         /// Language override (default: detected from extension)
         #[arg(long)]
         language: Option<String>,
+        /// Re-index even when the file is unchanged since it was last indexed
+        #[arg(long)]
+        force: bool,
         path: PathBuf,
     },
     /// Index a directory as a repo (honors .gitignore; skips binary files)
@@ -52,8 +55,10 @@ enum Cmd {
         /// when nothing was indexed and files would be removed, unless --force
         #[arg(long)]
         prune: bool,
-        /// With --prune: allow removing files even when this run indexed nothing
-        #[arg(long, requires = "prune")]
+        /// Re-index every file even when unchanged since it was last indexed (by default files with the
+        /// same content, language and extractor version are skipped). With --prune: also allow removing
+        /// files even when this run indexed nothing
+        #[arg(long)]
         force: bool,
         dir: PathBuf,
     },
@@ -169,6 +174,7 @@ const BATCH_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Default)]
 struct Tally {
     files: usize,
+    unchanged: usize,
     symbols: usize,
     tokens: usize,
     by_lang: std::collections::BTreeMap<String, usize>,
@@ -206,6 +212,7 @@ fn flush_batch(
         match r {
             Ok(st) => {
                 t.files += 1;
+                t.unchanged += usize::from(st.unchanged);
                 t.symbols += st.symbols;
                 t.tokens += st.tokens;
                 *t.by_lang.entry(st.language).or_default() += 1;
@@ -246,6 +253,7 @@ fn index_dir(o: DirOpts) -> Result<()> {
     }
     let start = std::time::Instant::now();
     let mut store = Store::open(o.db)?;
+    store.set_force(o.force);
     store.register(Box::new(graph_lang_rust::RustExtractor));
     let db_meta = std::fs::metadata(o.db).ok();
     let db_canon = o.db.canonicalize().ok();
@@ -355,6 +363,7 @@ fn index_dir(o: DirOpts) -> Result<()> {
     flush_batch(&store, &o, &mut pending, &mut tally)?;
     let Tally {
         files,
+        unchanged,
         symbols,
         tokens,
         by_lang,
@@ -388,14 +397,14 @@ fn index_dir(o: DirOpts) -> Result<()> {
     let skipped_n: usize = skipped.values().map(Vec::len).sum();
     if o.json {
         let out = serde_json::json!({
-            "org": o.org, "repo": o.repo, "files": files, "symbols": symbols, "tokens": tokens,
+            "org": o.org, "repo": o.repo, "files": files, "unchanged": unchanged, "symbols": symbols, "tokens": tokens,
             "languages": by_lang, "skipped": skipped_n, "skipped_by_reason": skipped,
             "pruned": pruned, "elapsed_ms": ms,
         });
         out!("{}", serde_json::to_string(&out)?);
     } else {
         out!(
-            "indexed {}/{}: files={files} symbols={symbols} tokens={tokens} skipped={skipped_n} pruned={} elapsed={ms}ms",
+            "indexed {}/{}: files={files} unchanged={unchanged} symbols={symbols} tokens={tokens} skipped={skipped_n} pruned={} elapsed={ms}ms",
             o.org, o.repo, pruned.len()
         );
         for (l, n) in &by_lang {
@@ -520,6 +529,7 @@ fn run() -> Result<()> {
             org,
             repo,
             language,
+            force,
             path,
         } => {
             let bytes = std::fs::read(&path)
@@ -535,15 +545,17 @@ fn run() -> Result<()> {
             }
             let mut store = Store::open(&cli.db)?;
             store.register(Box::new(graph_lang_rust::RustExtractor));
+            store.set_force(force);
             let st = store.index_bytes(&org, &repo, path_str, &bytes, language.as_deref())?;
             let lang = st.language.clone();
             out!(
-                "indexed {} ({}) tokens={} symbols={}{}{}",
+                "indexed {} ({}) tokens={} symbols={}{}{}{}",
                 path.display(),
                 lang,
                 st.tokens,
                 st.symbols,
                 if st.replaced { " [replaced]" } else { "" },
+                if st.unchanged { " [unchanged]" } else { "" },
                 if st.has_errors { " [has_errors]" } else { "" }
             );
         }

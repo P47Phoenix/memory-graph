@@ -396,3 +396,44 @@ fn token_classes_are_sensible_on_real_code() {
         .iter()
         .any(|t| t.text == "AbstractRebusTransport" && t.class == TokenClass::Identifier));
 }
+
+/// A second `index` of the same corpus skips every file, changes nothing and
+/// reports it; `--force` re-indexes them all.
+#[test]
+fn second_index_of_the_corpus_reports_everything_unchanged() {
+    let m = manifest();
+    let db = tempfile::tempdir().unwrap();
+    let dbp = db.path().join("corpus.redb");
+    let dbs = dbp.to_str().unwrap();
+    let index = |extra: &[&str], org: &str, repo: &str| -> serde_json::Value {
+        let dir = corpus_dir().join(repo);
+        let mut args = vec!["--db", dbs, "index", "--org", org, "--repo", repo, "--json"];
+        args.extend_from_slice(extra);
+        args.push(dir.to_str().unwrap());
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    let mut checked = 0;
+    for app in m["applications"].as_array().unwrap() {
+        let org = app["name"].as_str().unwrap();
+        for repo in strings(&app["repos"]) {
+            let first = index(&[], org, repo);
+            assert_eq!(first["unchanged"], 0, "{repo}");
+            let second = index(&["--prune"], org, repo);
+            assert_eq!(second["files"], first["files"], "{repo}");
+            assert_eq!(second["unchanged"], second["files"], "{repo}");
+            assert_eq!(second["symbols"], 0);
+            assert_eq!(second["tokens"], 0);
+            assert_eq!(second["pruned"], serde_json::json!([]));
+            let forced = index(&["--force"], org, repo);
+            assert_eq!(forced["unchanged"], 0, "{repo}");
+            assert_eq!(forced["tokens"], first["tokens"], "{repo}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+}
