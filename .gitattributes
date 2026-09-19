@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Vendored corpus must stay byte-identical to upstream on every platform.
+testdata/corpus/** -text

@@ -14,3 +14,13 @@ memory-graph --db ./g search foo --grain file      # token|symbol|file|repo|org
 python3 scripts/check-no-c-deps.py                 # pure-Rust gate, same as CI
 ```
 Languages are detected per file (extension, filename such as `Makefile`, or a `#!` line), so a polyglot repo needs no flags; `describe` shows what was found, and `--language`/`--kind` values are checked against it. Language names are lowercased; a UTF-8 BOM is ignored; file paths are normalized (`./a.rs` = `a.rs`). Every language is tokenized by a generic fallback; symbols arrive with per-language extractors (later stories).
+
+## Test corpus
+
+`testdata/corpus/` vendors real public code (MIT/Apache-2.0 only, pinned commits, see each folder's `UPSTREAM.md`) as distinct repos grouped into applications by `corpus.json`:
+
+- **messaging**: `rebus` + `rebus-rabbitmq` + `rebus-sqlserver` (transports implementing Rebus)
+- **conduit**: `conduit-ui` (Angular) → `conduit-api` (Spring) → `conduit-data-access` (MyBatis) → `conduit-sql`
+- **rust-library**: `anyhow`
+
+`cargo test -p graph-cli --test corpus` checks the manifest (public, licensed), that every cross-repo link resolves, that every token of every file is parsed with exact spans, and that the graph stores exactly those tokens. Re-vendor with `scripts/vendor-corpus.py`.

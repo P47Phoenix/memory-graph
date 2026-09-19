@@ -718,6 +718,47 @@ impl Store {
         Ok(stats)
     }
 
+    /// All tokens stored for one file, in source order. `None` if the file is
+    /// not indexed. Used to verify that everything parsed was stored.
+    pub fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
+        let rt = self.db.begin_read()?;
+        let names = rt.open_table(NAMES)?;
+        let nodes = rt.open_table(NODES)?;
+        let kids = rt.open_multimap_table(CHILDREN)?;
+        let find = |parent: Option<NodeId>, kind: NodeKind, name: &str| -> Result<Option<NodeId>> {
+            Ok(names
+                .get(name_key(parent, kind, name).as_str())?
+                .map(|v| v.value()))
+        };
+        let Some(o) = find(None, NodeKind::Org, org)? else {
+            return Ok(None);
+        };
+        let Some(r) = find(Some(o), NodeKind::Repo, repo)? else {
+            return Ok(None);
+        };
+        let Some(f) = find(Some(r), NodeKind::File, &normalize_path(path))? else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        let mut stack = vec![f];
+        while let Some(id) = stack.pop() {
+            for c in kids.get(id)? {
+                let cid = c?.value();
+                let n = dec(nodes
+                    .get(cid)?
+                    .ok_or_else(|| StoreError::Corrupt(format!("dangling node {cid}")))?
+                    .value())?;
+                if n.kind == NodeKind::Token {
+                    out.push(n);
+                } else {
+                    stack.push(cid);
+                }
+            }
+        }
+        out.sort_by_key(|n| n.span.map_or(0, |s| s.start));
+        Ok(Some(out))
+    }
+
     /// What is actually in the database (optionally scoped to an org and/or
     /// repo): per repo, the languages present and, per language, its symbol
     /// kinds and token counts. Callers use this to discover valid filter

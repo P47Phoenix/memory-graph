@@ -1,0 +1,46 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>Library</OutputType>
+		<TargetFrameworks>netstandard2.0;net6.0;net7.0;net8.0;net9.0;net10.0</TargetFrameworks>
+		<LangVersion>14</LangVersion>
+		<GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+		<Authors>mookid8000</Authors>
+		<PackageProjectUrl>https://rebus.fm/what-is-rebus/</PackageProjectUrl>
+		<Copyright>Copyright Rebus FM ApS 2012</Copyright>
+		<PackageTags>rebus queue messaging service bus</PackageTags>
+		<PackageDescription>Rebus is a lean service bus for .NET</PackageDescription>
+		<RepositoryUrl>https://github.com/rebus-org/Rebus</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<EmbedUntrackedSources>true</EmbedUntrackedSources>
+		<AllowedOutputExtensionsInPackageBuildOutputFolder>$(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb</AllowedOutputExtensionsInPackageBuildOutputFolder>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageIcon>little_rebusbus2_copy-500x500.png</PackageIcon>
+		<Company>Rebus FM</Company>
+		<GenerateDocumentationFile>True</GenerateDocumentationFile>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(TargetFramework)' == 'net9.0' OR '$(TargetFramework)' == 'net10.0'">
+		<DefineConstants>HASGUIDV7</DefineConstants>
+	</PropertyGroup>
+	<ItemGroup Condition="'$(EnableSourceLink)' != 'false'">
+		<PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.202" PrivateAssets="All" />
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+	</ItemGroup>
+	<ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+		<PackageReference Include="system.text.json" Version="10.0.6" />
+		<PackageReference Include="Microsoft.CSharp" Version="4.7.0" />
+	</ItemGroup>
+	<ItemGroup>
+		<None Include="..\artwork\little_rebusbus2_copy-500x500.png">
+			<Pack>True</Pack>
+			<PackagePath></PackagePath>
+		</None>
+		<None Include="..\README.md">
+			<Pack>True</Pack>
+			<PackagePath>\</PackagePath>
+		</None>
+	</ItemGroup>
+</Project>
