@@ -13,6 +13,7 @@ graph-core = { path = "../graph-core" }
 graph-store = { path = "../graph-store" }
 graph-lang-rust = { path = "../graph-lang-rust" }
 clap.workspace = true
+ignore.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 

@@ -27,6 +27,16 @@ enum Cmd {
         language: Option<String>,
         path: PathBuf,
     },
+    /// Index a directory as a repo (honors .gitignore; skips binary files)
+    Index {
+        #[arg(long)]
+        org: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        json: bool,
+        dir: PathBuf,
+    },
     /// Find tokens by exact text
     Search {
         text: String,
@@ -48,6 +58,95 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Index every text file under `dir`. Paths are stored relative to `dir`.
+fn index_dir(
+    db: &std::path::Path,
+    org: &str,
+    repo: &str,
+    dir: &std::path::Path,
+    json: bool,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    if !dir.is_dir() {
+        bail!("`{}` is not a directory", dir.display());
+    }
+    if db.is_dir() {
+        bail!(
+            "--db `{}` is a directory; give a database file path",
+            db.display()
+        );
+    }
+    let start = std::time::Instant::now();
+    let mut store = Store::open(db)?;
+    store.register(Box::new(graph_lang_rust::RustExtractor));
+    let (mut files, mut symbols, mut tokens) = (0usize, 0usize, 0usize);
+    let mut by_lang: BTreeMap<String, usize> = BTreeMap::new();
+    let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .require_git(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    for entry in walker {
+        let entry = entry?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
+        let rel_s = rel.to_string_lossy().into_owned();
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(b) => b,
+            Err(e) => {
+                skipped
+                    .entry(format!("unreadable: {e}"))
+                    .or_default()
+                    .push(rel_s);
+                continue;
+            }
+        };
+        if bytes[..bytes.len().min(8192)].contains(&0) {
+            skipped.entry("binary".into()).or_default().push(rel_s);
+            continue;
+        }
+        match store.index_bytes(org, repo, &rel_s, &bytes, None) {
+            Ok(st) => {
+                files += 1;
+                symbols += st.symbols;
+                tokens += st.tokens;
+                *by_lang.entry(st.language).or_default() += 1;
+            }
+            Err(graph_store::StoreError::Rejected(r)) => {
+                let reason = if r.contains("UTF-8") {
+                    "not valid UTF-8"
+                } else {
+                    "too large"
+                };
+                skipped.entry(reason.into()).or_default().push(rel_s);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let ms = start.elapsed().as_millis();
+    let skipped_n: usize = skipped.values().map(Vec::len).sum();
+    if json {
+        let out = serde_json::json!({
+            "org": org, "repo": repo, "files": files, "symbols": symbols, "tokens": tokens,
+            "languages": by_lang, "skipped": skipped_n, "skipped_by_reason": skipped, "elapsed_ms": ms,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+    } else {
+        println!("indexed {org}/{repo}: files={files} symbols={symbols} tokens={tokens} skipped={skipped_n} elapsed={ms}ms");
+        for (l, n) in &by_lang {
+            println!("  {l}: {n}");
+        }
+        for (r, v) in &skipped {
+            println!("  skipped ({r}): {}", v.len());
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -84,6 +183,12 @@ fn main() -> Result<()> {
                 if st.has_errors { " [has_errors]" } else { "" }
             );
         }
+        Cmd::Index {
+            org,
+            repo,
+            json,
+            dir,
+        } => index_dir(&cli.db, &org, &repo, &dir, json)?,
         Cmd::Search {
             text,
             language,

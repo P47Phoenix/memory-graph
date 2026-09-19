@@ -253,3 +253,63 @@ fn rust_symbols_grains_end_to_end() {
         "{out}"
     );
 }
+
+#[test]
+fn index_directory() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("target")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "fn foo() {}\n").unwrap();
+    std::fs::write(root.join("main.zig"), "pub fn foo() void {}\n").unwrap();
+    std::fs::write(root.join("target/gen.rs"), "fn foo() {}\n").unwrap();
+    std::fs::write(root.join("a.log"), "foo\n").unwrap();
+    std::fs::write(root.join(".git/config"), "foo\n").unwrap();
+    std::fs::write(root.join("img.png"), [0x89, b'P', 0, 1, 2]).unwrap();
+    std::fs::write(root.join("latin1.txt"), [b'f', 0xe9]).unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let r = root.to_str().unwrap();
+    let (ok, out, err) = run(&[
+        "--db", &db, "index", "--org", "o", "--repo", "p", "--json", r,
+    ]);
+    assert!(ok, "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    // .gitignore itself is text and indexed; ignored and .git paths are not.
+    assert_eq!(v["languages"]["rust"], 1);
+    assert_eq!(v["languages"]["zig"], 1);
+    assert_eq!(
+        v["skipped_by_reason"]["binary"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        v["skipped_by_reason"]["not valid UTF-8"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(v["elapsed_ms"].is_u64() && v["symbols"].as_u64().unwrap() >= 1);
+    let (_, out, _) = run(&["--db", &db, "search", "foo", "--grain", "file", "--json"]);
+    let s: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let files: Vec<_> = s["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, ["main.zig", "src/lib.rs"]);
+    // Re-running is idempotent.
+    run(&["--db", &db, "index", "--org", "o", "--repo", "p", r]);
+    let (_, out, _) = run(&["--db", &db, "search", "foo", "--grain", "file", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (ok, _, err) = run(&["--db", &db, "index", "--org", "o", "--repo", "p", "/no/dir"]);
+    assert!(!ok && err.contains("not a directory"));
+}
