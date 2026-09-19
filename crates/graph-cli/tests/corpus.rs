@@ -3,7 +3,7 @@
 //! every file is parsed with exact spans and stored in the graph.
 use graph_core::tokenizer::tokenize;
 use graph_core::{detect_language_from_content, TokenClass};
-use graph_store::{Query, Store};
+use graph_store::{BatchFile, Query, Store};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -284,11 +284,27 @@ fn every_parsed_token_is_stored() {
         let org = app["name"].as_str().unwrap();
         for repo in strings(&app["repos"]) {
             let dir = corpus_dir().join(repo);
-            for rel in files(&dir) {
-                let bytes = std::fs::read(dir.join(&rel)).unwrap();
-                let src = std::str::from_utf8(&bytes).unwrap();
-                let lang = detect_language_from_content(&rel, src);
-                let st = store.index_bytes(org, repo, &rel, &bytes, None).unwrap();
+            // One write transaction per repo instead of one per file.
+            let rels = files(&dir);
+            let contents: Vec<Vec<u8>> = rels
+                .iter()
+                .map(|rel| std::fs::read(dir.join(rel)).unwrap())
+                .collect();
+            let batch: Vec<BatchFile> = rels
+                .iter()
+                .zip(&contents)
+                .map(|(rel, bytes)| BatchFile {
+                    path: rel,
+                    bytes,
+                    language: None,
+                    origin: None,
+                })
+                .collect();
+            let stats = store.index_batch(org, repo, &batch).unwrap();
+            for ((rel, bytes), st) in rels.iter().zip(&contents).zip(stats) {
+                let st = st.unwrap();
+                let src = std::str::from_utf8(bytes).unwrap();
+                let lang = detect_language_from_content(rel, src);
                 assert!(
                     !st.has_errors || lang == "rust",
                     "{repo}/{rel} unexpectedly flagged has_errors"
@@ -297,7 +313,7 @@ fn every_parsed_token_is_stored() {
                     rust_symbols += st.symbols;
                 }
                 // Stored tokens are identical to the parser's, in text, class and span.
-                let stored = store.file_tokens(org, repo, &rel).unwrap().unwrap();
+                let stored = store.file_tokens(org, repo, rel).unwrap().unwrap();
                 let parsed = tokenize(src);
                 assert_eq!(stored.len(), parsed.len(), "{repo}/{rel}");
                 for (a, b) in stored.iter().zip(&parsed) {

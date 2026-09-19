@@ -13,6 +13,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u64 = 1;
+/// Version of the derived symbol-name index. Bump it whenever the index
+/// contents or keying change; databases with another value rebuild it on open.
+pub const SYMBOL_INDEX_VERSION: u64 = 1;
 /// `Node::origin` of files written by a directory run; only these are pruned.
 pub const ORIGIN_DIRECTORY: &str = "directory";
 /// Spans are `u32` byte offsets.
@@ -33,6 +36,10 @@ pub enum StoreError {
     Locked(String),
     #[error("incompatible schema version {found} (this build supports {SCHEMA_VERSION}); database left unmodified")]
     SchemaMismatch { found: u64 },
+    #[error("cannot open database {path}: {reason}")]
+    OpenFailed { path: String, reason: String },
+    #[error("database {path} needs its symbol index rebuilt but cannot be written ({reason}); open it once with write access")]
+    NeedsWrite { path: String, reason: String },
     #[error("rejected: {0}")]
     Rejected(String),
     #[error("rejected: {0} is not valid UTF-8")]
@@ -100,6 +107,8 @@ pub struct Query {
     /// Restrict the symbol grain to this kind: generic (`method`) or
     /// language-specific (`struct`).
     pub symbol_kind: Option<String>,
+    /// Keep at most this many rows (after deterministic ordering).
+    pub limit: Option<usize>,
 }
 
 impl Query {
@@ -112,11 +121,14 @@ impl Query {
             class: None,
             grain: Grain::Token,
             symbol_kind: None,
+            limit: None,
         }
     }
 }
 
-/// Symbol lookup by name (exact, or prefix with a trailing `*`).
+/// Symbol lookup by name: exact, or a prefix with a trailing `*` (`*` alone
+/// lists everything). A trailing `\*` is a literal star (exact match on a name
+/// ending in `*`). Empty patterns and `**` are rejected as ambiguous.
 #[derive(Debug, Clone)]
 pub struct SymbolQuery {
     pub pattern: String,
@@ -127,6 +139,8 @@ pub struct SymbolQuery {
     pub repo: Option<String>,
     /// Restrict to one file path (normalized, relative as indexed).
     pub file: Option<String>,
+    /// Keep at most this many rows (after deterministic ordering).
+    pub limit: Option<usize>,
 }
 
 impl SymbolQuery {
@@ -138,6 +152,7 @@ impl SymbolQuery {
             org: None,
             repo: None,
             file: None,
+            limit: None,
         }
     }
 }
@@ -219,6 +234,15 @@ pub struct Hit {
     pub no_matching_symbol: bool,
 }
 
+/// One input of `Store::index_batch`.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchFile<'a> {
+    pub path: &'a str,
+    pub bytes: &'a [u8],
+    pub language: Option<&'a str>,
+    pub origin: Option<&'a str>,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct IngestStats {
     pub file_id: NodeId,
@@ -292,7 +316,10 @@ impl Store {
             DatabaseError::DatabaseAlreadyOpen => {
                 StoreError::Locked(path.as_ref().display().to_string())
             }
-            e => StoreError::Storage(format!("{}: {e}", path.as_ref().display())),
+            e => StoreError::OpenFailed {
+                path: path.as_ref().display().to_string(),
+                reason: format!("{e} (a read-only file or directory cannot be opened)"),
+            },
         })?;
         let found = {
             let rt = db.begin_read()?;
@@ -305,15 +332,31 @@ impl Store {
         match found {
             Some(v) if v != SCHEMA_VERSION => return Err(StoreError::SchemaMismatch { found: v }),
             Some(_) => {
-                // Databases written before the symbol index existed: build it once.
-                let missing = matches!(
-                    db.begin_read()?.open_multimap_table(SYMBOLS),
-                    Err(redb::TableError::TableDoesNotExist(_))
-                );
-                if missing {
-                    let wt = db.begin_write()?;
+                // Databases written before the symbol index existed, or with an
+                // older index layout: rebuild it once. Nothing is written when
+                // the index is current, so read-only media work in that case.
+                let current = {
+                    let rt = db.begin_read()?;
+                    let ver = match rt.open_table(META) {
+                        Ok(t) => t.get("symbol_index_version")?.map(|v| v.value()),
+                        Err(redb::TableError::TableDoesNotExist(_)) => None,
+                        Err(e) => return Err(e.into()),
+                    };
+                    ver == Some(SYMBOL_INDEX_VERSION)
+                        && !matches!(
+                            rt.open_multimap_table(SYMBOLS),
+                            Err(redb::TableError::TableDoesNotExist(_))
+                        )
+                };
+                if !current {
+                    let need_write = |e: redb::Error| StoreError::NeedsWrite {
+                        path: path.as_ref().display().to_string(),
+                        reason: e.to_string(),
+                    };
+                    let wt = db.begin_write().map_err(|e| need_write(e.into()))?;
                     {
                         let nodes = wt.open_table(NODES)?;
+                        wt.delete_multimap_table(SYMBOLS)?;
                         let mut idx = wt.open_multimap_table(SYMBOLS)?;
                         for r in nodes.iter()? {
                             let (id, v) = r?;
@@ -322,8 +365,10 @@ impl Store {
                                 idx.insert(n.name.as_str(), id.value())?;
                             }
                         }
+                        wt.open_table(META)?
+                            .insert("symbol_index_version", SYMBOL_INDEX_VERSION)?;
                     }
-                    wt.commit()?;
+                    wt.commit().map_err(|e| need_write(e.into()))?;
                 }
             }
             None => {
@@ -332,6 +377,7 @@ impl Store {
                     let mut m = wt.open_table(META)?;
                     m.insert("schema_version", SCHEMA_VERSION)?;
                     m.insert("next_id", 1)?;
+                    m.insert("symbol_index_version", SYMBOL_INDEX_VERSION)?;
                     wt.open_table(NODES)?;
                     wt.open_table(NAMES)?;
                     wt.open_multimap_table(CHILDREN)?;
@@ -508,12 +554,71 @@ impl Store {
         ex: &Extraction,
         origin: Option<&str>,
     ) -> Result<IngestStats> {
+        let wt = self.db.begin_write()?;
+        let stats = Self::ingest_into(&wt, org, repo, path, language, ex, origin)?;
+        wt.commit()?;
+        Ok(stats)
+    }
+
+    /// Index many files of one repo in a single write transaction (one commit
+    /// instead of one per file). Extraction runs before the transaction opens.
+    /// Files that are not UTF-8 or too large yield a per-file `Err` and are
+    /// not stored; a storage or span error aborts the whole batch (nothing is
+    /// stored). Outcomes are in input order.
+    pub fn index_batch(
+        &self,
+        org: &str,
+        repo: &str,
+        files: &[BatchFile<'_>],
+    ) -> Result<Vec<Result<IngestStats>>> {
+        let mut prepared = Vec::with_capacity(files.len());
+        for f in files {
+            if f.bytes.len() > MAX_SOURCE_BYTES {
+                prepared.push(Err(StoreError::TooLarge(format!("`{}`", f.path))));
+                continue;
+            }
+            let Ok(src) = std::str::from_utf8(f.bytes) else {
+                prepared.push(Err(StoreError::NotUtf8(format!("`{}`", f.path))));
+                continue;
+            };
+            let path = normalize_path(f.path);
+            let lang = f.language.map_or_else(
+                || detect_language_from_content(&path, src),
+                str::to_ascii_lowercase,
+            );
+            let ex = self.registry.extract(&lang, src);
+            prepared.push(Ok((path, lang, ex, f.origin)));
+        }
+        let wt = self.db.begin_write()?;
+        let mut out = Vec::with_capacity(prepared.len());
+        for p in prepared {
+            out.push(match p {
+                Ok((path, lang, ex, origin)) => Ok(Self::ingest_into(
+                    &wt, org, repo, &path, &lang, &ex, origin,
+                )?),
+                Err(e) => Err(e),
+            });
+        }
+        wt.commit()?;
+        Ok(out)
+    }
+
+    fn ingest_into(
+        wt: &redb::WriteTransaction,
+        org: &str,
+        repo: &str,
+        path: &str,
+        language: &str,
+        ex: &Extraction,
+        origin: Option<&str>,
+    ) -> Result<IngestStats> {
         if org.is_empty() || repo.is_empty() {
             return Err(StoreError::Rejected(
                 "org and repo must not be empty".into(),
             ));
         }
-        let wt = self.db.begin_write()?;
+        let language = language.to_ascii_lowercase();
+        let language = language.as_str();
         let mut stats = IngestStats::default();
         {
             let mut meta = wt.open_table(META)?;
@@ -714,7 +819,6 @@ impl Store {
             }
             meta.insert("next_id", next)?;
         }
-        wt.commit()?;
         Ok(stats)
     }
 
@@ -860,30 +964,64 @@ impl Store {
                 .ok_or_else(|| StoreError::Corrupt(format!("dangling node {id}")))?
                 .value())
         };
+        for (what, v) in [
+            ("org", &q.org),
+            ("repo", &q.repo),
+            ("language", &q.language),
+            ("file", &q.file),
+            ("kind", &q.kind),
+        ] {
+            if v.as_deref() == Some("") {
+                return Err(StoreError::Rejected(format!("empty {what} filter")));
+            }
+        }
         let mut ids: Vec<NodeId> = Vec::new();
-        match q.pattern.strip_suffix('*') {
-            Some(prefix) => {
-                for r in idx.range(prefix..)? {
-                    let (k, vals) = r?;
-                    if !k.value().starts_with(prefix) {
-                        break;
-                    }
-                    for v in vals {
-                        ids.push(v?.value());
+        if q.pattern.is_empty() {
+            return Err(StoreError::Rejected(
+                "empty symbol pattern (use `*` to list all symbols)".into(),
+            ));
+        }
+        if q.pattern.ends_with("**") {
+            return Err(StoreError::Rejected(
+                "pattern ending in `**` is ambiguous: use `prefix*` for a prefix or `name\\*` for a literal `*`".into(),
+            ));
+        }
+        if let Some(lit) = q.pattern.strip_suffix("\\*") {
+            let name = format!("{lit}*");
+            for v in idx.get(name.as_str())? {
+                ids.push(v?.value());
+            }
+        } else {
+            match q.pattern.strip_suffix('*') {
+                Some(prefix) => {
+                    for r in idx.range(prefix..)? {
+                        let (k, vals) = r?;
+                        if !k.value().starts_with(prefix) {
+                            break;
+                        }
+                        for v in vals {
+                            ids.push(v?.value());
+                        }
                     }
                 }
-            }
-            None => {
-                for v in idx.get(q.pattern.as_str())? {
-                    ids.push(v?.value());
+                None => {
+                    for v in idx.get(q.pattern.as_str())? {
+                        ids.push(v?.value());
+                    }
                 }
             }
         }
         let want_file = q.file.as_deref().map(normalize_path);
         let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
-        let mut out: Vec<SymbolHit> = Vec::new();
+        let mut out: Vec<(NodeId, SymbolHit)> = Vec::new();
         for id in ids {
-            let sym = load(id)?;
+            // A dangling index entry (stale index) is skipped, not an error.
+            let Some(raw) = nodes.get(id)? else { continue };
+            let sym = dec(raw.value())?;
+            drop(raw);
+            if sym.kind != NodeKind::Symbol {
+                continue;
+            }
             if q.kind.as_deref().is_some_and(|k| !kind_matches(&sym, k)) {
                 continue;
             }
@@ -919,25 +1057,30 @@ impl Store {
                 continue;
             }
             quals.reverse();
-            out.push(SymbolHit {
-                org: org.name,
-                repo: repo.name,
-                file: file.name,
-                language: file.language,
-                name: sym.name,
-                qualified: quals.join("::"),
-                kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
-                lang_kind: sym.lang_kind,
-                span: sym.span,
-            });
+            out.push((
+                id,
+                SymbolHit {
+                    org: org.name,
+                    repo: repo.name,
+                    file: file.name,
+                    language: file.language,
+                    name: sym.name,
+                    qualified: quals.join("::"),
+                    kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
+                    lang_kind: sym.lang_kind,
+                    span: sym.span,
+                },
+            ));
         }
-        out.sort_by(|a, b| {
+        // Total order: the node id breaks any remaining tie.
+        out.sort_by(|(ia, a), (ib, b)| {
             (
                 &a.org,
                 &a.repo,
                 &a.file,
                 a.span.map(|s| s.start),
                 &a.qualified,
+                ia,
             )
                 .cmp(&(
                     &b.org,
@@ -945,8 +1088,13 @@ impl Store {
                     &b.file,
                     b.span.map(|s| s.start),
                     &b.qualified,
+                    ib,
                 ))
         });
+        let mut out: Vec<SymbolHit> = out.into_iter().map(|(_, h)| h).collect();
+        if let Some(n) = q.limit {
+            out.truncate(n);
+        }
         Ok(out)
     }
 
@@ -1107,7 +1255,9 @@ impl Store {
             }
             rows.entry(key).and_modify(|h| h.count += 1).or_insert(hit);
         }
-        Ok(rows.into_values().collect())
+        // BTreeMap order: org, repo, file, offset, node id (deterministic).
+        let n = q.limit.unwrap_or(usize::MAX);
+        Ok(rows.into_values().take(n).collect())
     }
 }
 

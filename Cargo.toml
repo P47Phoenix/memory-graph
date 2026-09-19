@@ -17,3 +17,8 @@ anyhow = "1"
 proptest = "1"
 tempfile = "3"
 ignore = "0.4"
+
+# Optimise dependencies (redb, serde_json, ...) in dev/test builds so the
+# corpus test does not spend ~20s in unoptimised storage code.
+[profile.dev.package."*"]
+opt-level = 3

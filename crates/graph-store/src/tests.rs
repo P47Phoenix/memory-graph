@@ -557,3 +557,213 @@ fn describe_polyglot_repo() {
     q.kind = Some("impl".into());
     assert_eq!(s.search_symbols(&q).unwrap().len(), 2);
 }
+
+fn rust_store(dir: &std::path::Path) -> Store {
+    let mut s = Store::open(dir.join("g.redb")).unwrap();
+    s.register(Box::new(graph_lang_rust::RustExtractor));
+    s
+}
+
+#[test]
+fn stale_symbol_index_is_rebuilt_on_version_change() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let s = rust_store(d.path());
+        s.index_bytes("o", "r", "a.rs", b"fn foo() {}\nfn bar() {}\n", None)
+            .unwrap();
+        // Corrupt the derived index and mark it as an older version.
+        let wt = s.db.begin_write().unwrap();
+        {
+            wt.delete_multimap_table(SYMBOLS).unwrap();
+            let mut idx = wt.open_multimap_table(SYMBOLS).unwrap();
+            idx.insert("stale", 999_999u64).unwrap();
+            wt.open_table(META)
+                .unwrap()
+                .insert("symbol_index_version", SYMBOL_INDEX_VERSION - 1)
+                .unwrap();
+        }
+        wt.commit().unwrap();
+    }
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+    assert!(s
+        .search_symbols(&SymbolQuery::new("stale"))
+        .unwrap()
+        .is_empty());
+    let rt = s.db.begin_read().unwrap();
+    let v = rt
+        .open_table(META)
+        .unwrap()
+        .get("symbol_index_version")
+        .unwrap()
+        .unwrap()
+        .value();
+    assert_eq!(v, SYMBOL_INDEX_VERSION);
+}
+
+#[test]
+fn search_symbols_skips_dangling_ids() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    s.index_bytes("o", "r", "a.rs", b"fn foo() {}\n", None)
+        .unwrap();
+    let wt = s.db.begin_write().unwrap();
+    wt.open_multimap_table(SYMBOLS)
+        .unwrap()
+        .insert("foo", 999_999u64)
+        .unwrap();
+    wt.commit().unwrap();
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_database_gives_clear_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("g.redb");
+    drop(Store::open(&p).unwrap());
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new().write(true).open(&p).is_ok() {
+        return; // running as root: permissions do not apply
+    }
+    let msg = Store::open(&p).err().expect("must fail").to_string();
+    assert!(
+        msg.contains("cannot open database") && msg.contains("read-only"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn limit_is_deterministic_for_search_and_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    for f in ["b.rs", "a.rs", "c.rs"] {
+        s.index_bytes("o", "r", f, b"fn foo() { foo(); }\n", None)
+            .unwrap();
+    }
+    let all = s.search_symbols(&SymbolQuery::new("foo")).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].file, "a.rs");
+    let mut q = SymbolQuery::new("foo");
+    q.limit = Some(2);
+    assert_eq!(s.search_symbols(&q).unwrap(), all[..2]);
+    let mut q = Query::new("foo");
+    let full = s.search(&q).unwrap();
+    q.limit = Some(4);
+    assert_eq!(s.search(&q).unwrap(), full[..4]);
+    assert_eq!(full[0].file.as_deref(), Some("a.rs"));
+}
+
+#[test]
+fn symbol_pattern_edge_cases() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    for bad in ["", "**", "a**"] {
+        assert!(
+            matches!(
+                s.search_symbols(&SymbolQuery::new(bad)),
+                Err(StoreError::Rejected(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    let mut q = SymbolQuery::new("S");
+    q.org = Some(String::new());
+    assert!(matches!(s.search_symbols(&q), Err(StoreError::Rejected(_))));
+    // `*` lists everything.
+    assert_eq!(s.search_symbols(&SymbolQuery::new("*")).unwrap().len(), 3);
+    // A symbol whose name is a literal `*` is reachable with `\*`.
+    let src = "fn f() {}\n";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![sym("*", SymbolKind::Function, span_of(src, "fn f() {}", 0))],
+        tokens: tokenize(src),
+    };
+    s.ingest_file("o3", "r3", "star.rs", "rust", &ex).unwrap();
+    let hits = s.search_symbols(&SymbolQuery::new("\\*")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "*");
+}
+
+#[test]
+fn ingest_file_lowercases_language() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![],
+        tokens: tokenize("x"),
+    };
+    let st = s.ingest_file("o", "r", "x.txt", "RuSt", &ex).unwrap();
+    assert_eq!(st.language, "rust");
+    let mut q = Query::new("x");
+    q.language = Some("rust".into());
+    assert_eq!(s.search(&q).unwrap().len(), 1);
+}
+
+#[test]
+fn kind_other_matches_uncategorised_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    let src = "thing\n";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![sym("thing", SymbolKind::Other, span_of(src, "thing", 0))],
+        tokens: tokenize(src),
+    };
+    s.ingest_file("o", "r", "t.zig", "zig", &ex).unwrap();
+    let mut q = SymbolQuery::new("thing");
+    q.kind = Some("other".into());
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 1);
+    let mut sq = Query::new("thing");
+    (sq.grain, sq.symbol_kind) = (Grain::Symbol, Some("other".into()));
+    assert_eq!(sq_symbol(&s, &sq), Some("thing".into()));
+    let info = &s.describe(Some("o"), Some("r")).unwrap()[0];
+    assert!(info.kind_names(None).contains("other"));
+}
+
+fn sq_symbol(s: &Store, q: &Query) -> Option<String> {
+    s.search(q).unwrap()[0].symbol.clone()
+}
+
+#[test]
+fn batch_matches_individual_ingest() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    let files = [
+        BatchFile {
+            path: "./a.rs",
+            bytes: b"fn foo() {}\n",
+            language: None,
+            origin: Some(ORIGIN_DIRECTORY),
+        },
+        BatchFile {
+            path: "bad.txt",
+            bytes: &[0xff, 0xfe],
+            language: None,
+            origin: None,
+        },
+        BatchFile {
+            path: "b.py",
+            bytes: b"x = 1\n",
+            language: Some("PYTHON"),
+            origin: None,
+        },
+    ];
+    let out = s.index_batch("o", "r", &files).unwrap();
+    assert_eq!(out.len(), 3);
+    let a = out[0].as_ref().unwrap();
+    assert_eq!(
+        (a.path.as_str(), a.language.as_str(), a.symbols),
+        ("a.rs", "rust", 1)
+    );
+    assert!(matches!(out[1], Err(StoreError::NotUtf8(_))));
+    assert_eq!(out[2].as_ref().unwrap().language, "python");
+    assert_eq!(s.file_tokens("o", "r", "b.py").unwrap().unwrap().len(), 3);
+    assert!(s.file_tokens("o", "r", "bad.txt").unwrap().is_none());
+    // Re-running replaces, not duplicates.
+    let again = s.index_batch("o", "r", &files).unwrap();
+    assert!(again[0].as_ref().unwrap().replaced);
+    assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
+}

@@ -13,3 +13,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+graph-lang-rust = { path = "../graph-lang-rust" }

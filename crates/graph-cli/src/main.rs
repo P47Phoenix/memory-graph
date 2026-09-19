@@ -2,8 +2,15 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use graph_core::TokenClass;
 use graph_store::{Grain, Query, Store, SymbolQuery, ORIGIN_DIRECTORY};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+
+/// Write a line to stdout, propagating errors (a closed pipe is handled in `main`).
+macro_rules! out {
+    ($($a:tt)*) => {
+        writeln!(std::io::stdout().lock(), $($a)*)?
+    };
+}
 
 #[derive(Parser)]
 #[command(name = "memory-graph", about = "Language-agnostic code memory graph")]
@@ -61,41 +68,57 @@ enum Cmd {
     },
     /// Find symbols (definitions) by name; a trailing `*` matches a prefix
     Symbols {
-        /// Exact name, or `prefix*`
+        /// Exact name, `prefix*` (a prefix), `*` (everything) or `name\*` (a name ending in a literal `*`)
         pattern: String,
-        /// Kind name: generic (function, method, type, ...) or language-specific (struct, trait, impl, ...). Run `describe` to see what exists.
+        /// Only symbols of this kind: generic (module, type, function, method, variable, constant, other)
+        /// or language-specific (struct, trait, impl, ...). `describe` lists the kinds present
         #[arg(long)]
         kind: Option<String>,
+        /// Only files of this language (case-insensitive, e.g. rust); `describe` lists the languages present
         #[arg(long)]
         language: Option<String>,
+        /// Only this organisation (exact name)
         #[arg(long)]
         org: Option<String>,
+        /// Only this repo (exact name)
         #[arg(long)]
         repo: Option<String>,
         /// Restrict to one file path as indexed (relative to the indexed directory)
         #[arg(long)]
         file: Option<String>,
+        /// Show at most this many results (ordered by org, repo, file, position)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Print JSON instead of text
         #[arg(long)]
         json: bool,
     },
     /// Find tokens by exact text
     Search {
+        /// Exact token text
         text: String,
+        /// Only files of this language (case-insensitive); `describe` lists the languages present
         #[arg(long)]
         language: Option<String>,
+        /// Only this organisation (exact name)
         #[arg(long)]
         org: Option<String>,
+        /// Only this repo (exact name)
         #[arg(long)]
         repo: Option<String>,
-        /// Token class: identifier, keyword, literal, operator, punctuation, comment, other
+        /// Token class (NOT a symbol kind; see --symbol-kind): identifier, keyword, literal, operator, punctuation, comment, other
         #[arg(long)]
         kind: Option<TokenClass>,
-        /// token, symbol, file, repo or org
+        /// Level results are rolled up to: token, symbol, file, repo or org
         #[arg(long, default_value = "token")]
         grain: Grain,
         /// With --grain symbol: only symbols of this kind (generic or language-specific; see `describe`)
         #[arg(long)]
         symbol_kind: Option<String>,
+        /// Show at most this many rows (ordered by org, repo, file, position)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Print JSON instead of text
         #[arg(long)]
         json: bool,
     },
@@ -136,10 +159,75 @@ fn is_db_file(
     }
 }
 
+const BATCH_FILES: usize = 256;
+const BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct Tally {
+    files: usize,
+    symbols: usize,
+    tokens: usize,
+    by_lang: std::collections::BTreeMap<String, usize>,
+    seen: std::collections::HashSet<String>,
+    skipped: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Store the pending files in one transaction and fold the outcomes into `t`.
+fn flush_batch(
+    store: &Store,
+    o: &DirOpts,
+    pending: &mut Vec<(String, Vec<u8>)>,
+    t: &mut Tally,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let inputs: Vec<graph_store::BatchFile> = pending
+        .iter()
+        .map(|(p, b)| graph_store::BatchFile {
+            path: p,
+            bytes: b,
+            language: None,
+            origin: Some(ORIGIN_DIRECTORY),
+        })
+        .collect();
+    let outcomes = store.index_batch(o.org, o.repo, &inputs).with_context(|| {
+        format!(
+            "database error while indexing a batch of {} files ({} files were already stored)",
+            inputs.len(),
+            t.files
+        )
+    })?;
+    for ((rel, _), r) in pending.iter().zip(outcomes) {
+        match r {
+            Ok(st) => {
+                t.files += 1;
+                t.symbols += st.symbols;
+                t.tokens += st.tokens;
+                *t.by_lang.entry(st.language).or_default() += 1;
+                t.seen.insert(st.path);
+            }
+            Err(graph_store::StoreError::NotUtf8(_)) => t
+                .skipped
+                .entry("not valid UTF-8".into())
+                .or_default()
+                .push(rel.clone()),
+            Err(graph_store::StoreError::TooLarge(_)) => t
+                .skipped
+                .entry("too large".into())
+                .or_default()
+                .push(rel.clone()),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    pending.clear();
+    Ok(())
+}
+
 /// Index every text file under `dir`. Paths are stored relative to `dir`.
 /// Per-file problems are counted as skips; only database failures abort.
 fn index_dir(o: DirOpts) -> Result<()> {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
     if o.org.is_empty() || o.repo.is_empty() {
         bail!("--org and --repo must not be empty");
     }
@@ -158,10 +246,11 @@ fn index_dir(o: DirOpts) -> Result<()> {
     let db_meta = std::fs::metadata(o.db).ok();
     let db_canon = o.db.canonicalize().ok();
     let db_name = o.db.file_name();
-    let (mut files, mut symbols, mut tokens) = (0usize, 0usize, 0usize);
-    let mut by_lang: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tally = Tally::default();
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    // Files are stored in batches: one write transaction per batch, not per file.
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut pending_bytes = 0usize;
     let mut walk_errors = false;
     // Only the directory's own .gitignore files (and parents') apply: global
     // git config, .git/info/exclude and .ignore files would make results
@@ -252,36 +341,24 @@ fn index_dir(o: DirOpts) -> Result<()> {
             skipped.entry("binary".into()).or_default().push(rel_s);
             continue;
         }
-        match store.index_bytes_with_origin(
-            o.org,
-            o.repo,
-            &rel_s,
-            &bytes,
-            None,
-            Some(ORIGIN_DIRECTORY),
-        ) {
-            Ok(st) => {
-                files += 1;
-                symbols += st.symbols;
-                tokens += st.tokens;
-                *by_lang.entry(st.language).or_default() += 1;
-                seen.insert(st.path);
-            }
-            Err(graph_store::StoreError::NotUtf8(_)) => {
-                skipped
-                    .entry("not valid UTF-8".into())
-                    .or_default()
-                    .push(rel_s);
-            }
-            Err(graph_store::StoreError::TooLarge(_)) => {
-                skipped.entry("too large".into()).or_default().push(rel_s);
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "database error while indexing `{rel_s}` ({files} files were already stored)"
-                )))
-            }
+        pending_bytes += bytes.len();
+        pending.push((rel_s, bytes));
+        if pending.len() >= BATCH_FILES || pending_bytes >= BATCH_BYTES {
+            flush_batch(&store, &o, &mut pending, &mut tally)?;
+            pending_bytes = 0;
         }
+    }
+    flush_batch(&store, &o, &mut pending, &mut tally)?;
+    let Tally {
+        files,
+        symbols,
+        tokens,
+        by_lang,
+        seen,
+        skipped: batch_skipped,
+    } = tally;
+    for (r, v) in batch_skipped {
+        skipped.entry(r).or_default().extend(v);
     }
     let mut pruned = Vec::new();
     if o.prune {
@@ -349,7 +426,7 @@ fn open_existing(db: &std::path::Path) -> Result<Store> {
     if !db.is_file() {
         bail!("database `{}` does not exist", db.display());
     }
-    Ok(Store::open(db)?)
+    Store::open(db).with_context(|| format!("opening database `{}`", db.display()))
 }
 
 /// Filters are checked against what is actually indexed (in the org/repo
@@ -362,6 +439,16 @@ fn validate_filters(
     language: Option<&str>,
     kind: Option<&str>,
 ) -> Result<()> {
+    for (name, v) in [
+        ("--org", org),
+        ("--repo", repo),
+        ("--language", language),
+        ("--kind/--symbol-kind", kind),
+    ] {
+        if v == Some("") {
+            bail!("{name} must not be empty");
+        }
+    }
     let infos = store.describe(org, repo)?;
     if infos.is_empty() {
         if org.is_some() || repo.is_some() {
@@ -382,7 +469,8 @@ fn validate_filters(
     if let Some(k) = kind {
         let kinds: std::collections::BTreeSet<String> =
             infos.iter().flat_map(|i| i.kind_names(language)).collect();
-        if !kinds.contains(k) {
+        // Generic kinds are always valid (`other` covers symbols without a kind).
+        if !kinds.contains(k) && k.parse::<graph_core::SymbolKind>().is_err() {
             bail!(
                 "no symbols of kind `{k}` in scope; kinds present: {}",
                 join(kinds.iter())
@@ -401,7 +489,22 @@ fn join<'a>(it: impl Iterator<Item = &'a String>) -> String {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        // `symbols | head` closes the pipe early: that is not an error.
+        let broken = e
+            .chain()
+            .filter_map(|c| c.downcast_ref::<std::io::Error>())
+            .any(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
+        if broken {
+            std::process::exit(0);
+        }
+        eprintln!("Error: {e:?}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::IndexFile {
@@ -457,20 +560,22 @@ fn main() -> Result<()> {
             let store = open_existing(&cli.db)?;
             let infos = store.describe(org.as_deref(), repo.as_deref())?;
             if json {
-                println!(
+                out!(
                     "{}",
                     serde_json::to_string(&serde_json::json!({ "repos": infos }))?
                 );
             } else {
                 for i in &infos {
-                    println!("{}/{}: {} files", i.org, i.repo, i.files);
+                    out!("{}/{}: {} files", i.org, i.repo, i.files);
                     for (l, li) in &i.languages {
-                        println!(
+                        out!(
                             "  {l}: {} files, {} symbols, {} tokens",
-                            li.files, li.symbols, li.tokens
+                            li.files,
+                            li.symbols,
+                            li.tokens
                         );
                         for (k, n) in &li.symbol_kinds {
-                            println!("    {k}: {n}");
+                            out!("    {k}: {n}");
                         }
                     }
                 }
@@ -483,6 +588,7 @@ fn main() -> Result<()> {
             org,
             repo,
             file,
+            limit,
             json,
         } => {
             let store = open_existing(&cli.db)?;
@@ -495,17 +601,18 @@ fn main() -> Result<()> {
             )?;
             let mut q = SymbolQuery::new(&pattern);
             (q.kind, q.language, q.org, q.repo, q.file) = (kind, language, org, repo, file);
+            q.limit = limit.map(|l| l as usize);
             let hits = store.search_symbols(&q)?;
             if json {
                 let out = serde_json::json!({ "query": pattern, "results": hits });
-                println!("{}", serde_json::to_string(&out)?);
+                out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
                     let loc = h
                         .span
                         .map(|s| format!(":{}:{}", s.start_line, s.start_col))
                         .unwrap_or_default();
-                    println!(
+                    out!(
                         "{}/{}/{}{loc}\t{}\t{} ({})\t{}",
                         h.org,
                         h.repo,
@@ -526,6 +633,7 @@ fn main() -> Result<()> {
             kind,
             grain,
             symbol_kind,
+            limit,
             json,
         } => {
             if symbol_kind.is_some() && grain != Grain::Symbol {
@@ -542,10 +650,11 @@ fn main() -> Result<()> {
             let mut q = Query::new(&text);
             (q.language, q.org, q.repo, q.class, q.grain, q.symbol_kind) =
                 (language, org, repo, kind, grain, symbol_kind);
+            q.limit = limit.map(|l| l as usize);
             let hits = store.search(&q)?;
             if json {
                 let out = serde_json::json!({ "query": text, "grain": grain, "results": hits });
-                println!("{}", serde_json::to_string(&out)?);
+                out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
                     let loc = h
@@ -557,7 +666,7 @@ fn main() -> Result<()> {
                         .flatten()
                         .collect::<Vec<_>>()
                         .join("/");
-                    println!(
+                    out!(
                         "{path}{loc}\t{}\t{}\thits={}{}",
                         h.language.as_deref().unwrap_or("-"),
                         h.symbol.as_deref().unwrap_or("-"),

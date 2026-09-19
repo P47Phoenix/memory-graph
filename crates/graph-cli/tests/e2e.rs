@@ -893,3 +893,71 @@ fn polyglot_repo_is_described_and_filters_are_validated() {
         "{out}"
     );
 }
+
+fn indexed_db(d: &tempfile::TempDir) -> String {
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    for i in 0..30 {
+        std::fs::write(src.join(format!("f{i:02}.rs")), "fn foo() { foo(); }\n").unwrap();
+    }
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("files=30"), "{out}");
+    db
+}
+
+#[test]
+fn limit_flags_and_pattern_errors() {
+    let d = tempfile::tempdir().unwrap();
+    let db = indexed_db(&d);
+    let (ok, out, _) = run(&["--db", &db, "symbols", "foo", "--limit", "3", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let r = v["results"].as_array().unwrap();
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0]["file"], "f00.rs");
+    let (ok, out, _) = run(&["--db", &db, "search", "foo", "--limit", "5", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["results"].as_array().unwrap().len(), 5);
+    let (ok, _, err) = run(&["--db", &db, "symbols", "foo", "--limit", "0"]);
+    assert!(!ok && err.contains("limit"), "{err}");
+    let (ok, _, err) = run(&["--db", &db, "symbols", "**"]);
+    assert!(!ok && err.contains("ambiguous"), "{err}");
+    let (ok, _, err) = run(&["--db", &db, "symbols", ""]);
+    assert!(!ok && err.contains("empty"), "{err}");
+    let (ok, _, err) = run(&["--db", &db, "symbols", "foo", "--org", ""]);
+    assert!(!ok && err.contains("empty"), "{err}");
+    // `other` is a valid generic kind even when nothing of that kind exists.
+    let (ok, _, err) = run(&["--db", &db, "symbols", "foo", "--kind", "other"]);
+    assert!(ok, "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_pipe_is_not_a_panic() {
+    use std::process::Stdio;
+    let d = tempfile::tempdir().unwrap();
+    let db = indexed_db(&d);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+        .args(["--db", &db, "symbols", "*"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(c.stdout.take()); // close the read end immediately
+    let o = c.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(o.status.success(), "{err}");
+}
