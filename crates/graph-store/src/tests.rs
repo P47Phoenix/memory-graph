@@ -268,7 +268,106 @@ fn index_bytes_normalizes() {
     assert_eq!(h[1].span.unwrap().start_col, 1);
     assert!(matches!(
         s.index_bytes("o", "r", "c.bin", &[0xff, 0xfe], None),
-        Err(StoreError::Rejected(_))
+        Err(StoreError::NotUtf8(_))
     ));
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+}
+
+#[test]
+fn prune_removes_unlisted_files_only() {
+    let d = tempfile::tempdir().unwrap();
+    let s = setup(d.path());
+    s.index_bytes_with_origin(
+        "o2",
+        "r2",
+        "extra.zig",
+        b"foo",
+        None,
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    assert_eq!(s.search(&Query::new("foo")).unwrap().len(), 5);
+    let keep = ["main.zig".to_string()].into();
+    let gone = s.prune_files("o2", "r2", &keep, false).unwrap();
+    assert_eq!(gone, ["extra.zig"]);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    // Other repos untouched; pruned file's tokens are gone from the index.
+    assert_eq!(s.search(&Query::new("foo")).unwrap().len(), 4);
+    assert!(s.prune_files("nope", "r", &keep, false).unwrap().is_empty());
+    // Re-adding works (name entry was cleaned).
+    s.index_bytes("o2", "r2", "extra.zig", b"foo", None)
+        .unwrap();
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 3);
+}
+
+#[test]
+fn empty_org_or_repo_rejected() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    assert!(matches!(
+        s.index_bytes("", "r", "a", b"x", None),
+        Err(StoreError::Rejected(_))
+    ));
+}
+
+fn origin_of(s: &Store, org: &str, repo: &str, file: &str) -> Option<String> {
+    let rt = s.db.begin_read().unwrap();
+    let names = rt.open_table(NAMES).unwrap();
+    let o = names
+        .get(name_key(None, NodeKind::Org, org).as_str())
+        .unwrap()
+        .unwrap()
+        .value();
+    let r = names
+        .get(name_key(Some(o), NodeKind::Repo, repo).as_str())
+        .unwrap()
+        .unwrap()
+        .value();
+    let f = names
+        .get(name_key(Some(r), NodeKind::File, file).as_str())
+        .unwrap()
+        .unwrap()
+        .value();
+    s.get(f).unwrap().unwrap().origin
+}
+
+#[test]
+fn origin_marker_last_ingest_wins_and_gates_prune() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let keep = std::collections::HashSet::new();
+    s.index_bytes("o", "r", "a.txt", b"x", None).unwrap();
+    assert_eq!(origin_of(&s, "o", "r", "a.txt"), None);
+    // Unmarked files are never pruned.
+    assert!(s.prune_files("o", "r", &keep, false).unwrap().is_empty());
+    s.index_bytes_with_origin("o", "r", "a.txt", b"x", None, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+    assert_eq!(
+        origin_of(&s, "o", "r", "a.txt").as_deref(),
+        Some(ORIGIN_DIRECTORY)
+    );
+    // Dry run reports but keeps.
+    assert_eq!(s.prune_files("o", "r", &keep, true).unwrap(), ["a.txt"]);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    // A later plain ingest clears the mark.
+    s.index_bytes("o", "r", "a.txt", b"x", None).unwrap();
+    assert_eq!(origin_of(&s, "o", "r", "a.txt"), None);
+    assert!(s.prune_files("o", "r", &keep, false).unwrap().is_empty());
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+}
+
+#[test]
+fn nodes_without_origin_field_still_deserialize() {
+    let old = br#"{"id":1,"parent":null,"kind":"file","name":"a","language":null,"symbol_kind":null,"lang_kind":null,"token_class":null,"has_errors":false,"span":null}"#;
+    assert_eq!(dec(old).unwrap().origin, None);
+    let older = br#"{"id":1,"parent":null,"kind":"file","name":"a","language":null,"symbol_kind":null,"lang_kind":null,"token_class":null,"span":null}"#;
+    assert_eq!(dec(older).unwrap().origin, None);
+}
+
+#[test]
+fn open_in_missing_directory_names_the_path() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("nope").join("g.redb");
+    let e = Store::open(&p).err().unwrap().to_string();
+    assert!(e.contains("nope"), "{e}");
 }

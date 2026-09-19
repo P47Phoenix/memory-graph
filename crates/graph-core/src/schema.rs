@@ -154,6 +154,10 @@ pub struct Node {
     /// File only: the extractor hit a syntax error and fell back to tokens only.
     #[serde(default)]
     pub has_errors: bool,
+    /// File only: how the last ingest was requested (`directory` for a
+    /// directory run). Absent in older databases and for single-file ingests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// Symbol and token.
     pub span: Option<Span>,
 }
@@ -199,6 +203,7 @@ mod tests {
             lang_kind: Some("fn".into()),
             token_class: None,
             has_errors: false,
+            origin: None,
             span: Some(Span {
                 start: 0,
                 end: 5,

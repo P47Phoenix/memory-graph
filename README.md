@@ -5,6 +5,8 @@
 ```sh
 cargo build --release
 memory-graph --db ./g index-file --org acme --repo api src/lib.rs
+memory-graph --db ./g index --org acme --repo api ./api   # whole directory, honors .gitignore
+memory-graph --db ./g index --org acme --repo api ./api --prune   # also drop files a previous directory run indexed that are gone now
 memory-graph --db ./g search foo --language rust --json
 memory-graph --db ./g search foo --grain file      # token|symbol|file|repo|org
 python3 scripts/check-no-c-deps.py                 # pure-Rust gate, same as CI
