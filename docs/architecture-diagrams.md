@@ -4,7 +4,7 @@ Beginner-friendly pictures of how memory-graph is built and how it behaves. Ever
 
 ## Legend
 
-- **"Built today" means `main` as of commit 4ed7f41** (ADR 0001, ADR 0002, the code in `crates/`). Work in an open PR (story 0, PR #12) is shown as a separate step labelled "in PR #12", never as built.
+- **"Built today" means `main` as of commit 4ed7f41** (ADR 0001, ADR 0002, the code in `crates/`). Story 0 (PR #12) merged after that commit; it is shown as a separate step labelled "in PR #12", so the "today" steps describe main at 4ed7f41.
 - **In a diagram with "Proposed" in its title, every line and box is proposed**; line style there only separates different kinds of edge (stated under each diagram). In a mixed diagram, dashed lines / dashed boxes = proposed or not decided. ADR 0003 is **Proposed** (not accepted). Diagram 15's right side comes from the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md), an architect recommendation awaiting a user decision (not an ADR).
 - Sizes: **[M]** measured, **[E]** estimated (same tags as the ADR).
 
@@ -277,9 +277,9 @@ Measured for `(` at 9.9 M tokens [M]: org grain 2,409 ms today versus 6.5 ms wit
 
 ## 9. describe and filter validation
 
-**Today it scans; story 0 (PR #12, open) and v2 avoid the scan.** "Built today" is `main` at 4ed7f41. Every CLI `search` or `symbols` first runs `validate_filters`, which rejects empty `--org`, `--repo`, `--language` and `--kind/--symbol-kind` values, calls `describe`, then checks that org/repo match something indexed, the language is present, and the kind is known. `describe` is O(tokens) today: about 134 ms of the ~215-261 ms per CLI call on the corpus DB [M].
+**Today it scans; story 0 (PR #12, merged after 4ed7f41) and v2 avoid the scan.** "Built today" is `main` at 4ed7f41. Every CLI `search` or `symbols` first runs `validate_filters`, which rejects empty `--org`, `--repo`, `--language` and `--kind/--symbol-kind` values, calls `describe`, then checks that org/repo match something indexed, the language is present, and the kind is known. `describe` is O(tokens) today: about 134 ms of the ~215-261 ms per CLI call on the corpus DB [M].
 
-**How to read it:** three separate steps, not one. (1) today, (2) story 0 in PR #12, not merged, (3) v2, proposed. Story 0's `catalog` table is per repo and language; v2's counters are per file. They are different things.
+**How to read it:** three separate steps, not one. (1) today, (2) story 0 in PR #12, merged after 4ed7f41, (3) v2, proposed. Story 0's `catalog` table is per repo and language; v2's counters are per file. They are different things.
 
 ```mermaid
 sequenceDiagram
@@ -290,7 +290,7 @@ sequenceDiagram
     CLI->>Store: describe(org, repo)
     alt (1) Built today, main at 4ed7f41
         Store->>redb: scan every node of the repo (O(tokens))
-    else (2) Story 0, in PR #12 (open, not merged)
+    else (2) Story 0, in PR #12 (merged after 4ed7f41)
         Store->>redb: read the catalog table, keyed per repo and language
         Note over Store,redb: kept in the same write txn as ingest, rebuilt when catalog_version lags, old scan kept as describe_by_scan, about 200 ms to 2 ms
     else (3) Proposed v2
