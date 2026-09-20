@@ -19,6 +19,9 @@ pub const SYMBOL_INDEX_VERSION: u64 = 1;
 /// Version of the file fingerprint scheme (what goes into `Node::fingerprint`).
 /// Bump it to force every file to re-index once.
 pub const FINGERPRINT_FORMAT_VERSION: u64 = 1;
+/// Version of the derived describe catalog (per-repo/language counts kept in
+/// step with every write). Databases with another value rebuild it on open.
+pub const CATALOG_VERSION: u64 = 1;
 /// `Node::origin` of files written by a directory run; only these are pruned.
 pub const ORIGIN_DIRECTORY: &str = "directory";
 /// Spans are `u32` byte offsets.
@@ -32,6 +35,12 @@ const CHILDREN: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new
 const TOKENS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("tokens_by_text");
 /// Symbol name -> symbol node ids (exact and prefix lookup).
 const SYMBOLS: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("symbols_by_name");
+
+/// Derived counters behind `describe`, so it never decodes nodes. Keys (fields
+/// separated by NUL): `r org repo` (repo exists), `f|s|t org repo lang` (files,
+/// symbols, tokens), `k org repo lang label` (symbols per kind label),
+/// `c org repo class` (tokens per class). Zero counts are absent.
+const CATALOG: TableDefinition<&str, u64> = TableDefinition::new("catalog");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -317,6 +326,68 @@ fn name_key(parent: Option<NodeId>, kind: NodeKind, name: &str) -> String {
     format!("{}\0{:?}\0{}", parent.unwrap_or(0), kind, name)
 }
 
+/// `generic` or `generic/language-specific` label of a symbol node.
+fn kind_label(n: &Node) -> String {
+    let generic = n.symbol_kind.unwrap_or(SymbolKind::Other).as_str();
+    match &n.lang_kind {
+        Some(k) if k != generic => format!("{generic}/{k}"),
+        _ => generic.to_string(),
+    }
+}
+
+/// Where a file lives, for catalog bookkeeping.
+struct Scope<'a> {
+    org: &'a str,
+    repo: &'a str,
+    lang: &'a str,
+}
+
+/// Catalog deltas accumulated during one write transaction and applied to the
+/// table just before commit (so an aborted transaction changes nothing).
+#[derive(Default)]
+struct Tally(BTreeMap<String, i64>);
+
+impl Tally {
+    fn add(&mut self, key: String, d: i64) {
+        *self.0.entry(key).or_default() += d;
+    }
+    fn file(&mut self, s: &Scope, d: i64) {
+        self.add(format!("f\0{}\0{}\0{}", s.org, s.repo, s.lang), d);
+    }
+    /// A symbol or token node appearing (`d` = 1) or disappearing (`d` = -1).
+    fn node(&mut self, s: &Scope, n: &Node, d: i64) {
+        match n.kind {
+            NodeKind::Symbol => {
+                self.add(format!("s\0{}\0{}\0{}", s.org, s.repo, s.lang), d);
+                let label = kind_label(n);
+                self.add(format!("k\0{}\0{}\0{}\0{label}", s.org, s.repo, s.lang), d);
+            }
+            NodeKind::Token => {
+                self.add(format!("t\0{}\0{}\0{}", s.org, s.repo, s.lang), d);
+                if let Some(c) = n.token_class {
+                    self.add(format!("c\0{}\0{}\0{}", s.org, s.repo, c.as_str()), d);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn apply(self, cat: &mut redb::Table<&str, u64>) -> Result<()> {
+        for (k, d) in self.0 {
+            if d == 0 {
+                continue;
+            }
+            let cur = cat.get(k.as_str())?.map_or(0, |v| v.value()) as i64;
+            let new = cur + d;
+            if new > 0 {
+                cat.insert(k.as_str(), new as u64)?;
+            } else {
+                cat.remove(k.as_str())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Delete everything below `root` (not `root` itself), including token postings.
 fn remove_descendants(
     nodes: &mut redb::Table<u64, &[u8]>,
@@ -324,6 +395,7 @@ fn remove_descendants(
     tokens: &mut redb::MultimapTable<&str, u64>,
     symbols: &mut redb::MultimapTable<&str, u64>,
     root: NodeId,
+    (tally, scope): (&mut Tally, &Scope),
 ) -> Result<()> {
     let ids = |it: redb::MultimapValue<u64>| -> Result<Vec<NodeId>> {
         Ok(it
@@ -335,6 +407,7 @@ fn remove_descendants(
         stack.extend(ids(children.remove_all(id)?)?);
         if let Some(old) = nodes.remove(id)? {
             let n = dec(old.value())?;
+            tally.node(scope, &n, -1);
             match n.kind {
                 NodeKind::Token => {
                     tokens.remove(n.name.as_str(), id)?;
@@ -419,6 +492,8 @@ impl Store {
                     m.insert("schema_version", SCHEMA_VERSION)?;
                     m.insert("next_id", 1)?;
                     m.insert("symbol_index_version", SYMBOL_INDEX_VERSION)?;
+                    m.insert("catalog_version", CATALOG_VERSION)?;
+                    wt.open_table(CATALOG)?;
                     wt.open_table(NODES)?;
                     wt.open_table(NAMES)?;
                     wt.open_multimap_table(CHILDREN)?;
@@ -428,10 +503,62 @@ impl Store {
                 wt.commit()?;
             }
         }
-        Ok(Self {
+        let store = Self {
             db,
             registry: Registry::default(),
-        })
+        };
+        store.ensure_catalog()?;
+        Ok(store)
+    }
+
+    /// Rebuild the describe catalog once when it is missing or of another
+    /// version (databases written before it existed). Nothing is written when
+    /// it is current.
+    fn ensure_catalog(&self) -> Result<()> {
+        let current = {
+            let rt = self.db.begin_read()?;
+            let ver = rt
+                .open_table(META)?
+                .get("catalog_version")?
+                .map(|v| v.value());
+            ver == Some(CATALOG_VERSION)
+                && !matches!(
+                    rt.open_table(CATALOG),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                )
+        };
+        if current {
+            return Ok(());
+        }
+        let infos = self.describe_by_scan(None, None)?;
+        let wt = self.db.begin_write()?;
+        {
+            wt.delete_table(CATALOG)?;
+            let mut cat = wt.open_table(CATALOG)?;
+            for i in &infos {
+                let (o, r) = (&i.org, &i.repo);
+                cat.insert(format!("r\0{o}\0{r}").as_str(), 0)?;
+                for (l, li) in &i.languages {
+                    cat.insert(format!("f\0{o}\0{r}\0{l}").as_str(), li.files as u64)?;
+                    if li.symbols > 0 {
+                        cat.insert(format!("s\0{o}\0{r}\0{l}").as_str(), li.symbols as u64)?;
+                    }
+                    if li.tokens > 0 {
+                        cat.insert(format!("t\0{o}\0{r}\0{l}").as_str(), li.tokens as u64)?;
+                    }
+                    for (k, n) in &li.symbol_kinds {
+                        cat.insert(format!("k\0{o}\0{r}\0{l}\0{k}").as_str(), *n as u64)?;
+                    }
+                }
+                for (c, n) in &i.token_classes {
+                    cat.insert(format!("c\0{o}\0{r}\0{c}").as_str(), *n as u64)?;
+                }
+            }
+            wt.open_table(META)?
+                .insert("catalog_version", CATALOG_VERSION)?;
+        }
+        wt.commit()?;
+        Ok(())
     }
 
     /// Remove files of `org/repo` whose (normalized) path is not in `keep`,
@@ -454,6 +581,8 @@ impl Store {
             let mut children = wt.open_multimap_table(CHILDREN)?;
             let mut tokens = wt.open_multimap_table(TOKENS)?;
             let mut sym_idx = wt.open_multimap_table(SYMBOLS)?;
+            let mut cat = wt.open_table(CATALOG)?;
+            let mut tally = Tally::default();
             let org_id = names
                 .get(name_key(None, NodeKind::Org, org).as_str())?
                 .map(|v| v.value());
@@ -480,13 +609,27 @@ impl Store {
                         removed.push(f.name);
                         continue;
                     }
-                    remove_descendants(&mut nodes, &mut children, &mut tokens, &mut sym_idx, fid)?;
+                    let scope = Scope {
+                        org,
+                        repo,
+                        lang: f.language.as_deref().unwrap_or("unknown"),
+                    };
+                    remove_descendants(
+                        &mut nodes,
+                        &mut children,
+                        &mut tokens,
+                        &mut sym_idx,
+                        fid,
+                        (&mut tally, &scope),
+                    )?;
+                    tally.file(&scope, -1);
                     nodes.remove(fid)?;
                     names.remove(name_key(Some(repo_id), NodeKind::File, &f.name).as_str())?;
                     children.remove(repo_id, fid)?;
                     removed.push(f.name);
                 }
             }
+            tally.apply(&mut cat)?;
         }
         if dry_run {
             wt.abort()?;
@@ -787,6 +930,8 @@ impl Store {
             let mut children = wt.open_multimap_table(CHILDREN)?;
             let mut tokens = wt.open_multimap_table(TOKENS)?;
             let mut sym_idx = wt.open_multimap_table(SYMBOLS)?;
+            let mut cat = wt.open_table(CATALOG)?;
+            let mut tally = Tally::default();
             let mut next = meta.get("next_id")?.map(|v| v.value()).unwrap_or(1);
 
             let mut ensure = |parent: Option<NodeId>,
@@ -842,6 +987,13 @@ impl Store {
                 Some(language),
             )?;
             stats.file_id = file_id;
+            cat.insert(format!("r\0{org}\0{repo}").as_str(), 0)?;
+            let scope = Scope {
+                org,
+                repo,
+                lang: language,
+            };
+            tally.file(&scope, 1);
             if !existed {
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
                 f.has_errors = ex.has_errors;
@@ -855,13 +1007,21 @@ impl Store {
             stats.language = language.to_string();
 
             if existed {
-                // Drop the old subtree.
+                // Drop the old subtree (counted under the file's old language).
+                let old = dec(nodes.get(file_id)?.expect("file node").value())?;
+                let old_scope = Scope {
+                    org,
+                    repo,
+                    lang: old.language.as_deref().unwrap_or("unknown"),
+                };
+                tally.file(&old_scope, -1);
                 remove_descendants(
                     &mut nodes,
                     &mut children,
                     &mut tokens,
                     &mut sym_idx,
                     file_id,
+                    (&mut tally, &old_scope),
                 )?;
                 // Refresh language.
                 let mut f = dec(nodes.get(file_id)?.expect("file node").value())?;
@@ -934,24 +1094,22 @@ impl Store {
                     si += 1;
                     check_contains(pkind, NodeKind::Symbol).map_err(StoreError::Schema)?;
                     let id = alloc(&mut next);
-                    insert(
-                        Node {
-                            id,
-                            parent: Some(parent),
-                            kind: NodeKind::Symbol,
-                            name: s.name.clone(),
-                            language: None,
-                            symbol_kind: Some(s.kind),
-                            lang_kind: s.lang_kind.clone(),
-                            token_class: None,
-                            has_errors: false,
-                            origin: None,
-                            fingerprint: None,
-                            span: Some(s.span),
-                        },
-                        &mut nodes,
-                        &mut children,
-                    )?;
+                    let node = Node {
+                        id,
+                        parent: Some(parent),
+                        kind: NodeKind::Symbol,
+                        name: s.name.clone(),
+                        language: None,
+                        symbol_kind: Some(s.kind),
+                        lang_kind: s.lang_kind.clone(),
+                        token_class: None,
+                        has_errors: false,
+                        origin: None,
+                        fingerprint: None,
+                        span: Some(s.span),
+                    };
+                    tally.node(&scope, &node, 1);
+                    insert(node, &mut nodes, &mut children)?;
                     sym_idx.insert(s.name.as_str(), id)?;
                     open.push((id, s.span.end));
                     stats.symbols += 1;
@@ -960,29 +1118,28 @@ impl Store {
                     ti += 1;
                     check_contains(pkind, NodeKind::Token).map_err(StoreError::Schema)?;
                     let id = alloc(&mut next);
-                    insert(
-                        Node {
-                            id,
-                            parent: Some(parent),
-                            kind: NodeKind::Token,
-                            name: t.text.clone(),
-                            language: None,
-                            symbol_kind: None,
-                            lang_kind: None,
-                            token_class: Some(t.class),
-                            has_errors: false,
-                            origin: None,
-                            fingerprint: None,
-                            span: Some(t.span),
-                        },
-                        &mut nodes,
-                        &mut children,
-                    )?;
+                    let node = Node {
+                        id,
+                        parent: Some(parent),
+                        kind: NodeKind::Token,
+                        name: t.text.clone(),
+                        language: None,
+                        symbol_kind: None,
+                        lang_kind: None,
+                        token_class: Some(t.class),
+                        has_errors: false,
+                        origin: None,
+                        fingerprint: None,
+                        span: Some(t.span),
+                    };
+                    tally.node(&scope, &node, 1);
+                    insert(node, &mut nodes, &mut children)?;
                     tokens.insert(t.text.as_str(), id)?;
                     stats.tokens += 1;
                 }
             }
             meta.insert("next_id", next)?;
+            tally.apply(&mut cat)?;
         }
         Ok(stats)
     }
@@ -1033,6 +1190,57 @@ impl Store {
     /// kinds and token counts. Callers use this to discover valid filter
     /// values instead of guessing them; a repo may be polyglot.
     pub fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
+        let rt = self.db.begin_read()?;
+        let cat = rt.open_table(CATALOG)?;
+        let mut infos: BTreeMap<(String, String), RepoInfo> = BTreeMap::new();
+        let corrupt = || StoreError::Corrupt("bad catalog key".into());
+        for r in cat.iter()? {
+            let (k, v) = r?;
+            let (k, v) = (k.value(), v.value() as usize);
+            let f: Vec<&str> = k.split('\0').collect();
+            if f.len() < 3 || org.is_some_and(|o| f[1] != o) || repo.is_some_and(|r| f[2] != r) {
+                if f.len() < 3 {
+                    return Err(corrupt());
+                }
+                continue;
+            }
+            let info = infos
+                .entry((f[1].to_string(), f[2].to_string()))
+                .or_insert_with(|| RepoInfo {
+                    org: f[1].to_string(),
+                    repo: f[2].to_string(),
+                    files: 0,
+                    languages: BTreeMap::new(),
+                    token_classes: BTreeMap::new(),
+                });
+            match (f[0], f.len()) {
+                ("r", 3) => {}
+                ("c", 4) => {
+                    info.token_classes.insert(f[3].to_string(), v);
+                }
+                ("f", 4) => {
+                    info.files += v;
+                    info.languages.entry(f[3].to_string()).or_default().files = v;
+                }
+                ("s", 4) => info.languages.entry(f[3].to_string()).or_default().symbols = v,
+                ("t", 4) => info.languages.entry(f[3].to_string()).or_default().tokens = v,
+                ("k", 5) => {
+                    info.languages
+                        .entry(f[3].to_string())
+                        .or_default()
+                        .symbol_kinds
+                        .insert(f[4].to_string(), v);
+                }
+                _ => return Err(corrupt()),
+            }
+        }
+        Ok(infos.into_values().collect())
+    }
+
+    /// `describe` computed by decoding every node (O(tokens)). Used to build
+    /// the catalog and as the reference the catalog is tested against.
+    #[doc(hidden)]
+    pub fn describe_by_scan(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
         use std::collections::HashMap;
         let rt = self.db.begin_read()?;
         let nodes = rt.open_table(NODES)?;
@@ -1093,12 +1301,7 @@ impl Store {
                     if n.kind == NodeKind::Symbol {
                         file_of.insert(n.id, file);
                         l.symbols += 1;
-                        let generic = n.symbol_kind.unwrap_or(SymbolKind::Other).as_str();
-                        let label = match &n.lang_kind {
-                            Some(k) if k != generic => format!("{generic}/{k}"),
-                            _ => generic.to_string(),
-                        };
-                        *l.symbol_kinds.entry(label).or_default() += 1;
+                        *l.symbol_kinds.entry(kind_label(n)).or_default() += 1;
                     } else {
                         l.tokens += 1;
                         if let Some(c) = n.token_class {

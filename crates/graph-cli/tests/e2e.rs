@@ -1367,3 +1367,42 @@ mod unchanged_files {
         assert!(out.contains("\"a\""), "{out}");
     }
 }
+
+#[test]
+fn filter_validation_follows_the_catalog_across_prune_and_reindex() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("lib.rs"), "struct Widget;\nfn new() {}\n").unwrap();
+    std::fs::write(root.join("tool.py"), "def go():\n    pass\n").unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let r = root.to_str().unwrap();
+    let index = |extra: &[&str]| {
+        let mut a = vec!["--db", &db, "index", "--org", "o", "--repo", "r"];
+        a.extend_from_slice(extra);
+        a.push(r);
+        let (ok, out, err) = run(&a);
+        assert!(ok, "{out}{err}");
+    };
+    index(&[]);
+    // No filters: nothing to validate, queries just run.
+    let (ok, out, _) = run(&["--db", &db, "symbols", "new"]);
+    assert!(ok && out.contains("new"), "{out}");
+    let (ok, _, _) = run(&["--db", &db, "search", "Widget"]);
+    assert!(ok);
+    // With filters: values come from what is indexed.
+    let (ok, _, _) = run(&["--db", &db, "symbols", "*", "--language", "python"]);
+    assert!(ok);
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--kind", "bogus"]);
+    assert!(!ok && err.contains("kind"), "{err}");
+    // Removing the python file (prune) removes the language from validation.
+    std::fs::remove_file(root.join("tool.py")).unwrap();
+    index(&["--prune"]);
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--language", "python"]);
+    assert!(!ok && err.contains("languages present"), "{err}");
+    // Re-index (forced) keeps the counts stable.
+    let (_, before, _) = run(&["--db", &db, "describe", "--json"]);
+    index(&["--reindex"]);
+    let (_, after, _) = run(&["--db", &db, "describe", "--json"]);
+    assert_eq!(before, after);
+}

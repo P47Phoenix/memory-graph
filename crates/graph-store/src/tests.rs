@@ -1397,3 +1397,190 @@ fn language_override_on_indexed_file_changes_fingerprint() {
     assert!(st.replaced && !st.unchanged && st.symbols == 1);
     assert_eq!(file_fingerprint(&s, "a.rs"), before);
 }
+
+// ---- describe catalog (ADR 0003 story 0) ----
+
+fn assert_catalog_matches_scan(s: &Store, ctx: &str) {
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap(),
+        "{ctx}"
+    );
+    assert_eq!(
+        s.describe(Some("o1"), Some("r1")).unwrap(),
+        s.describe_by_scan(Some("o1"), Some("r1")).unwrap(),
+        "{ctx} (scoped)"
+    );
+}
+
+const SRCS: [&str; 5] = [
+    "fn a() { x(); }\nfn b() { y(1); }\n",
+    "struct S;\nimpl S { fn m(&self) { q(); } }\n",
+    "plain text here\n",
+    "# comment\nx = 1\n",
+    "",
+];
+
+#[test]
+fn catalog_equals_scan_after_scripted_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path().join("g.redb")).unwrap();
+    s.register(Box::new(graph_lang_rust::RustExtractor));
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let langs = [None, Some("rust"), Some("python"), Some("zig")];
+    for step in 0..300 {
+        let org = ["o1", "o2"][rnd(2) as usize];
+        let repo = ["r1", "r2"][rnd(2) as usize];
+        let path = format!("f{}.txt", rnd(6));
+        let src = SRCS[rnd(SRCS.len() as u64) as usize];
+        let lang = langs[rnd(4) as usize];
+        let reindex = IndexOptions {
+            reindex: rnd(4) == 0,
+        };
+        match rnd(6) {
+            0 | 1 => {
+                s.index_bytes_opts(
+                    org,
+                    repo,
+                    &path,
+                    src.as_bytes(),
+                    lang,
+                    Some("directory"),
+                    reindex,
+                )
+                .unwrap();
+            }
+            2 => {
+                let files = [
+                    BatchFile {
+                        path: &path,
+                        bytes: src.as_bytes(),
+                        language: lang,
+                        origin: Some("directory"),
+                    },
+                    BatchFile {
+                        path: "bad.bin",
+                        bytes: &[0xff, 0xfe],
+                        language: None,
+                        origin: None,
+                    },
+                    BatchFile {
+                        path: "b2.rs",
+                        bytes: SRCS[0].as_bytes(),
+                        language: Some("rust"),
+                        origin: Some("directory"),
+                    },
+                ];
+                s.index_batch(org, repo, &files, reindex).unwrap();
+            }
+            3 => {
+                let keep: std::collections::HashSet<String> = (0..6)
+                    .filter(|_| rnd(2) == 0)
+                    .map(|i| format!("f{i}.txt"))
+                    .collect();
+                s.prune_files(org, repo, &keep, rnd(3) == 0).unwrap();
+            }
+            _ => {
+                s.index_bytes(org, repo, &path, src.as_bytes(), lang)
+                    .unwrap();
+            }
+        }
+        assert_catalog_matches_scan(&s, &format!("step {step}"));
+    }
+}
+
+#[test]
+fn catalog_unchanged_by_aborted_transactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = setup(dir.path());
+    let before = s.describe(None, None).unwrap();
+    // A span error aborts the batch after earlier files were stored in it.
+    let bad = Extraction {
+        has_errors: false,
+        symbols: vec![sym("x", SymbolKind::Function, span_of(RUST, "fn a()", 0))],
+        tokens: vec![],
+    };
+    let mut bad_span = bad.clone();
+    bad_span.symbols[0].span.end = 0; // start > end
+    assert!(s
+        .ingest_file("o9", "r9", "new.rs", "rust", &bad_span)
+        .is_err());
+    assert!(s
+        .ingest_file("o1", "r1", "lib.rs", "rust", &bad_span)
+        .is_err());
+    assert_eq!(s.describe(None, None).unwrap(), before);
+    assert_catalog_matches_scan(&s, "after aborted ingest");
+    // A dry-run prune aborts its transaction.
+    s.prune_files("o1", "r1", &Default::default(), true)
+        .unwrap();
+    assert_eq!(s.describe(None, None).unwrap(), before);
+}
+
+#[test]
+fn old_db_without_catalog_backfills_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.redb");
+    let expected = {
+        let s = setup(dir.path());
+        let e = s.describe_by_scan(None, None).unwrap();
+        assert!(!e.is_empty());
+        // Simulate a pre-catalog database.
+        let wt = s.db.begin_write().unwrap();
+        wt.delete_table(CATALOG).unwrap();
+        wt.open_table(META)
+            .unwrap()
+            .remove("catalog_version")
+            .unwrap();
+        wt.commit().unwrap();
+        e
+    };
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.describe(None, None).unwrap(), expected);
+    let ver = |s: &Store| {
+        s.db.begin_read()
+            .unwrap()
+            .open_table(META)
+            .unwrap()
+            .get("catalog_version")
+            .unwrap()
+            .map(|v| v.value())
+    };
+    assert_eq!(ver(&s), Some(CATALOG_VERSION));
+    // Current catalog: a second open must not rebuild. Poison a row to prove it.
+    {
+        let wt = s.db.begin_write().unwrap();
+        wt.open_table(CATALOG)
+            .unwrap()
+            .insert("r\0zz\0zz", 0)
+            .unwrap();
+        wt.commit().unwrap();
+    }
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    assert!(
+        s.describe(Some("zz"), None).unwrap().len() == 1,
+        "rebuilt again"
+    );
+}
+
+#[test]
+fn describe_does_not_decode_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = setup(dir.path());
+    // Corrupt a node: a full scan trips over it, the catalog never reads it.
+    let wt = s.db.begin_write().unwrap();
+    wt.open_table(NODES)
+        .unwrap()
+        .insert(u64::MAX, b"not json".as_slice())
+        .unwrap();
+    wt.commit().unwrap();
+    assert!(s.describe_by_scan(None, None).is_err());
+    assert!(s.describe(None, None).is_ok());
+    assert!(s.describe(Some("o1"), Some("r1")).is_ok());
+}
