@@ -4,7 +4,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 
 ## Suggested reading order for a newcomer
 1. [Glossary](glossary.md): plain meanings of every technical word. Skim it, and come back when a word is unclear.
-2. The "In plain words" box at the top of [ADR 0001](adr/0001-storage.md), [ADR 0002](adr/0002-parsing-and-crate-layout.md) and [ADR 0003](adr/0003-data-model.md).
+2. The "In plain words" box at the top of [ADR 0001](adr/0001-storage.md) and [ADR 0002](adr/0002-parsing-and-crate-layout.md). [ADR 0003](adr/0003-data-model.md) gets its plain-words section in the companion PR.
 3. The [epic](epic-code-memory-graph.md), to see the goal and the planned stories.
 4. The technical sections of the ADRs, then the [spikes](#spikes-evidence) for evidence.
 5. [Learnings](learnings.md) as a quick list of key facts and pitfalls.
