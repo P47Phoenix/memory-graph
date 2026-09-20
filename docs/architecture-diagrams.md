@@ -4,8 +4,8 @@ Beginner-friendly pictures of how memory-graph is built and how it behaves. Ever
 
 ## Legend
 
-- **"Built today" means `main` as of commit 4ed7f41** (ADR 0001, ADR 0002, the code in `crates/`). Story 0 (PR #12) merged after that commit; it is shown as a separate step labelled "in PR #12", so the "today" steps describe main at 4ed7f41.
-- **In a diagram with "Proposed" in its title, every line and box is proposed**; line style there only separates different kinds of edge (stated under each diagram). In a mixed diagram, dashed lines / dashed boxes = proposed or not decided. ADR 0003 is **Proposed** (not accepted). Diagram 15's right side comes from the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md), an architect recommendation awaiting a user decision (not an ADR).
+- **"Built today" means `main` as of commit 5bedd03** (ADR 0001, ADR 0002, the code in `crates/`, including story 0: the `describe` catalog and `schema_version` 2). Where a diagram still shows the older behaviour (a `describe` scan of every token), it is labelled as the state before story 0 or as a measured baseline.
+- **In a diagram with "Proposed" in its title, every line and box is proposed**; line style there only separates different kinds of edge (stated under each diagram). In a mixed diagram, dashed lines / dashed boxes = proposed or not decided. ADR 0003 is **Proposed** (not accepted). Diagram 15's right side and diagrams 14 and 17 reflect the user's decisions of 2026-09-20 on Q4 and Q5 (recorded in ADR 0003 and the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md)): the daemon path is **decided, not built**; sharding has a **decided key, build deferred**. The ADR itself is still not accepted.
 - Sizes: **[M]** measured, **[E]** estimated (same tags as the ADR).
 
 ## Index
@@ -25,8 +25,8 @@ Data model first, because it is the heart of the design.
 11. [Chunked ingest with batch_id (proposed)](#11-chunked-ingest-with-batch_id-proposed)
 12. [Crash recovery and manifest states (proposed)](#12-crash-recovery-and-manifest-states-proposed)
 13. [Crash and repair sequence (proposed)](#13-crash-and-repair-sequence-proposed)
-14. [Sharding layout and search fan-out (proposed)](#14-sharding-layout-and-search-fan-out-proposed)
-15. [Q5 options: today versus a daemon (proposed / awaiting decision)](#15-q5-options-today-versus-a-daemon-proposed--awaiting-decision)
+14. [Sharding layout and search fan-out (key decided, build deferred)](#14-sharding-layout-and-search-fan-out-key-decided-build-deferred)
+15. [Cross-process access: today versus the decided daemon](#15-cross-process-access-today-versus-the-decided-daemon)
 16. [Versioning and migration (proposed)](#16-versioning-and-migration-proposed)
 17. [Delivery roadmap: ADR 0003 stories](#17-delivery-roadmap-adr-0003-stories)
 
@@ -151,7 +151,7 @@ flowchart LR
 
 **Built today.** The workspace (ADR 0002) has a core crate with no storage, a store crate on redb, a CLI, and a language extractor. Arrows point from a crate to a crate it depends on (from the `Cargo.toml` files). Everything is pure Rust; CI enforces it.
 
-**How to read it:** follow arrows downward; `graph-core` depends on nothing in the workspace. Dashed items are proposed.
+**How to read it:** follow arrows downward; `graph-core` depends on nothing in the workspace. Dashed items are decided (Q5, 2026-09-20) but not built.
 
 ```mermaid
 flowchart TD
@@ -168,9 +168,9 @@ flowchart TD
         LANG --> CORE
         STORE --> REDB
     end
-    SERVE["memory-graph serve (daemon, MCP): Proposed"]
+    SERVE["memory-graph serve (daemon, MCP): decided (Q5), not built"]
     SERVE -.-> STORE
-    CLI -.->|"RemoteStore over a socket: Proposed"| SERVE
+    CLI -.->|"RemoteStore over a socket: decided, not built"| SERVE
     style SERVE stroke-dasharray: 5 5
 ```
 
@@ -277,9 +277,9 @@ Measured for `(` at 9.9 M tokens [M]: org grain 2,409 ms today versus 6.5 ms wit
 
 ## 9. describe and filter validation
 
-**Today it scans; story 0 (PR #12, merged after 4ed7f41) and v2 avoid the scan.** "Built today" is `main` at 4ed7f41. Every CLI `search` or `symbols` first runs `validate_filters`, which rejects empty `--org`, `--repo`, `--language` and `--kind/--symbol-kind` values, calls `describe`, then checks that org/repo match something indexed, the language is present, and the kind is known. `describe` is O(tokens) today: about 134 ms of the ~215-261 ms per CLI call on the corpus DB [M].
+**Story 0 (PR #12, on main at 5bedd03) removed the scan; v2 keeps it removed.** "Built today" is `main` at 5bedd03. Every CLI `search` or `symbols` first runs `validate_filters`, which rejects empty `--org`, `--repo`, `--language` and `--kind/--symbol-kind` values, calls `describe`, then checks that org/repo match something indexed, the language is present, and the kind is known. Before story 0, `describe` was O(tokens): about 134 ms of the ~215-261 ms per CLI call on the corpus DB [M]. Now it reads the `catalog` table (corpus 241 k tokens, p50: `search '('` 239 to 89 ms, `symbols new` 202 to 2 ms, `describe` 200 to 2 ms [M]).
 
-**How to read it:** three separate steps, not one. (1) today, (2) story 0 in PR #12, merged after 4ed7f41, (3) v2, proposed. Story 0's `catalog` table is per repo and language; v2's counters are per file. They are different things.
+**How to read it:** three separate steps, not one. (1) before story 0 (main at 4ed7f41), (2) today: story 0, on main at 5bedd03, with `schema_version` 2, (3) v2, proposed. Story 0's `catalog` table is per repo and language; v2's counters are per file. They are different things.
 
 ```mermaid
 sequenceDiagram
@@ -288,9 +288,9 @@ sequenceDiagram
     participant redb as redb file
     CLI->>CLI: validate_filters: reject empty --org, --repo, --language, --kind values
     CLI->>Store: describe(org, repo)
-    alt (1) Built today, main at 4ed7f41
+    alt (1) Before story 0, main at 4ed7f41
         Store->>redb: scan every node of the repo (O(tokens))
-    else (2) Story 0, in PR #12 (merged after 4ed7f41)
+    else (2) Built today: story 0, main at 5bedd03
         Store->>redb: read the catalog table, keyed per repo and language
         Note over Store,redb: kept in the same write txn as ingest, rebuilt when catalog_version lags, old scan kept as describe_by_scan, about 200 ms to 2 ms
     else (3) Proposed v2
@@ -426,11 +426,11 @@ sequenceDiagram
 
 ---
 
-## 14. Sharding layout and search fan-out (proposed)
+## 14. Sharding layout and search fan-out (key decided, build deferred)
 
-**Proposed and specified but not built (ADR 0003, stories 13-17).** A shard is one redb file holding whole repos (partition key `(org, repo)`: an org may span shards, a repo never does). Each shard has its own dictionary, streams, postings and rows. A search asks every shard in parallel and merges the answers.
+**Specified; key decided, build deferred (ADR 0003, Q4 decided 2026-09-20; stories 13-17).** The partition key and id layout are fixed now; stories 14-17 are built only after the measured 100 M run (story 6) and the story 13 spike show the single-file ceiling. A shard is one redb file holding whole repos (partition key `(org, repo)`: an org may span shards, a repo never does). Each shard has its own dictionary, streams, postings and rows. A search asks every shard in parallel and merges the answers.
 
-**How to read it:** everything here is proposed, so all lines are solid: the top arrows are routing from the manifest, the lower arrows are the search fan-out and merge. The k-way merge uses the same deterministic key as a single shard, so results are identical.
+**How to read it:** nothing here is built, so all lines are solid: the top arrows are routing from the manifest, the lower arrows are the search fan-out and merge. The k-way merge uses the same deterministic key as a single shard, so results are identical.
 
 ```mermaid
 flowchart TD
@@ -456,15 +456,15 @@ flowchart TD
     MERGE --> LIM["limit applied after the merge, each shard yields at most limit rows"]
 ```
 
-Ids (ADR): entities `tag(1) | shard(10) | local(53)`; tokens `1 | shard(10) | file_local(28) | ordinal(25)`, emitted as JSON strings. Fan-out routes strictly by the manifest routing table, never by presence. Split threshold example: 200 M tokens or 20 GB (Q4, still open). An unavailable shard fails the query unless a partial result is explicitly requested.
+Ids (ADR): entities `tag(1) | shard(10) | local(53)`; tokens `1 | shard(10) | file_local(28) | ordinal(25)`, emitted as JSON strings. Fan-out routes strictly by the manifest routing table, never by presence. Split threshold example: 200 M tokens or 20 GB (Q4 decided: key `(org, repo)`, one file per shard; the threshold stays tunable). An unavailable shard fails the query unless a partial result is explicitly requested.
 
 ---
 
-## 15. Q5 options: today versus a daemon (proposed / awaiting decision)
+## 15. Cross-process access: today versus the decided daemon
 
-**First diagram: built today. Second: Proposed / awaiting decision (Q5 is a blocking user decision).** redb takes an exclusive `flock(LOCK_EX | LOCK_NB)` on open, so a second process cannot even read while another holds the file; it gets `DatabaseAlreadyOpen`, which `graph-store` reports as `StoreError::Locked`. Details for Q5 come from the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md), an architect recommendation awaiting the user's decision (not an ADR): it recommends (a) an owning daemon with (b) retry as the fallback.
+**First diagram: built today. Second: decided by the user on 2026-09-20 (Q5), not built (ADR story 12a).** redb takes an exclusive `flock(LOCK_EX | LOCK_NB)` on open, so a second process cannot even read while another holds the file; it gets `DatabaseAlreadyOpen`, which `graph-store` reports as `StoreError::Locked`. The user chose (a) an owning daemon with (b) retry as the no-daemon fallback; evidence and alternatives are in the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md) and ADR 0003.
 
-**How to read it:** first diagram is today; second is the recommendation, where the CLI talks to one owner process and falls back to opening the file itself if none is running.
+**How to read it:** first diagram is today; second is the decided design, where the CLI talks to one owner process and falls back to opening the file itself if none is running.
 
 Today (built):
 
@@ -483,7 +483,7 @@ sequenceDiagram
     redb-->>Srch: opened
 ```
 
-Proposed / awaiting decision (`memory-graph serve`, socket, `RemoteStore`, fallback):
+Decided, not built (`memory-graph serve`, socket, `RemoteStore`, fallback):
 
 ```mermaid
 sequenceDiagram
@@ -512,7 +512,7 @@ sequenceDiagram
     end
 ```
 
-Details from the [paper](spikes/q4-q5-decision-paper.md): the daemon holds every shard's exclusive lock, does `repair` on start, and would be the MCP server; `RemoteStore` calls the same `Store` trait so the differential oracle stays valid; estimated cost 6-9 days (not in the ADR's current 45-47 day core). Direct-open with retry gives availability between writes only, not a snapshot guarantee.
+Details from the [paper](spikes/q4-q5-decision-paper.md): the daemon holds every shard's exclusive lock, does `repair` on start, and is the MCP server; `RemoteStore` calls the same `Store` trait so the differential oracle stays valid; estimated cost 6-9 days (ADR story 12a, now inside the core total of about 51-56 days). It is revisited only if the daemon adds more than 5 ms at p50 over in-process at 10 M tokens (spike S1), a verified multi-process pure-Rust engine appears (S3), or MCP is dropped. Direct-open with retry gives availability between writes only, not a snapshot guarantee.
 
 ---
 
@@ -520,7 +520,7 @@ Details from the [paper](spikes/q4-q5-decision-paper.md): the daemon holds every
 
 **Proposed (ADR 0003, D2, story 9 and 12).** `schema_version` means the on-disk layout (tables and key encoding) and is checked at open. Components have their own format versions in `meta`. Moving v1 to v2 is `memory-graph migrate`, which writes a new file, verifies it, and only then renames it into place; the source is never modified.
 
-**How to read it:** first the "open" checks, then the migrate run. Any verification failure leaves both source and target untouched. `SCHEMA_VERSION` is 1 in the code today.
+**How to read it:** first the "open" checks, then the migrate run. Any verification failure leaves both source and target untouched. `SCHEMA_VERSION` is 2 in the code today (story 0 added the `describe` catalog; a version-1 file is upgraded in place on open).
 
 ```mermaid
 sequenceDiagram
@@ -558,9 +558,9 @@ Per-component versions in `meta`: `stream_format`, `postings_format`, `dictionar
 
 **Proposed plan (ADR 0003 story table).** Days are ideal developer-days including tests. The ADR gives the milestone order (story 0, then store trait, then the v2 checkpoint, then packed dictionary and postings) but no full dependency list, so the arrows below are the ADR's stated order plus obvious "needs the thing before it" links; treat them as a reading aid, not ADR text. No arrow links core to sharding, because the ADR does not state one.
 
-**How to read it:** two charts. Everything is proposed. Dashed boxes are the only optional stories: 18 and 19. Totals: core (0-12) about 45-47 days, sharding (13-17) 27 days, all together about 78-80 days.
+**How to read it:** two charts. Everything is proposed. Dashed boxes are optional (18, 19) or deferred and gated (14-17). Totals: core (0-12 and 12a) about 51-56 days, sharding (13-17) 27 days deferred, all together about 84-89 days.
 
-Core chart (stories 0-12, plus optional 18 and 19):
+Core chart (stories 0-12 and 12a, plus optional 18 and 19):
 
 ```mermaid
 flowchart TD
@@ -577,6 +577,7 @@ flowchart TD
     S10["10: Snapshots, single shard (3 d)"]
     S11["11: Paging and traversal (2 d)"]
     S12["12: Migration framework, GATE before 1.0 (6 d)"]
+    S12A["12a: Daemon and RemoteStore, decided not built (6-9 d)"]
     S18["18 optional: Content sharing by digest (4 d)"]
     S19["19 optional: Stream checkpoints (2 d)"]
     S0 --> S1 --> S2 --> S3 --> S4
@@ -585,6 +586,8 @@ flowchart TD
     S3 --> S9
     S1 --> S10 --> S11
     S9 --> S12
+    S10 --> S12A
+    S11 --> S12A
     S4 --> S12
     S3 -.-> S18
     S4 -.-> S19
@@ -592,7 +595,7 @@ flowchart TD
     style S19 stroke-dasharray: 5 5
 ```
 
-Sharding chart (stories 13-17, **specified, not built**; no dashed styling because all five are equally unbuilt):
+Sharding chart (stories 13-17, **key decided, build deferred**: 14-17 start only after the story 6 measured 100 M run and story 13 show the single-file ceiling; dashed boxes are the deferred ones):
 
 ```mermaid
 flowchart TD
@@ -602,6 +605,12 @@ flowchart TD
     S16["16: Rebalance: split or move repo (6 d)"]
     S17["17: Cross-shard snapshot tests and soak (3 d)"]
     S13 --> S14 --> S15 --> S16 --> S17
+    S6G["Story 6: measured 100 M run"] -.->|"gate"| S14
+    S13 -.->|"gate"| S14
+    style S14 stroke-dasharray: 5 5
+    style S15 stroke-dasharray: 5 5
+    style S16 stroke-dasharray: 5 5
+    style S17 stroke-dasharray: 5 5
 ```
 
-Totals: core 0-12 about **45-47 d** (the single-shard re-baseline, stories 0-4, 7, 8, is 25-27 d; stories 5, 6, 9-12 add 20 d); sharding 13-17 **27 d**; with everything **about 78-80 d**. Story 10 waits on the Q5 decision. The Q5 daemon (paper estimate 6-9 d) is not in these totals.
+Totals: core 0-12 about 45-47 d (the single-shard re-baseline, stories 0-4, 7, 8, is 25-27 d; stories 5, 6, 9-12 add 20 d) plus the Q5 daemon, story 12a, 6-9 d, gives **51-56 d** (the paper rounds it to about 52-56); sharding 13-17 **27 d**, deferred; with everything (plus 18: 4 d and 19: 2 d) **about 84-89 d**. If the measured 100 M run fits one file, stories 14-17 (25 d) are skipped.

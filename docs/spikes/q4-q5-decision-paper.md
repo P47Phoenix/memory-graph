@@ -1,8 +1,8 @@
-> **Status: architect recommendation awaiting user decision. This is not an ADR.** Nothing here is accepted; Q4 and Q5 in [ADR 0003](../adr/0003-data-model.md) stay open until the user decides. Written against `main` at 4ed7f41.
+> **Status: decided by the user 2026-09-20 (decision record). This paper is not an ADR.** Chosen: **Q5 = option (a), an owning daemon** (`memory-graph serve`, also the MCP server; the CLI talks over a versioned local socket through a `RemoteStore` implementing `Store`; with no daemon the CLI opens the file directly and retries with jittered back-off, default 5 s, with a message pointing at `serve`). **Q4 = option 1 with the build deferred**: shard by `(org, repo)`, one redb file per shard, split at a size threshold; the key and the id layout `tag | shard(10) | local(53)` are fixed now, and sharding stories 14-17 wait for the measured 100 M run (story 6) and the story 13 spike. The decisions are recorded in [ADR 0003](../adr/0003-data-model.md), which itself is still Proposed (not accepted). Not stated by the user yet: the Windows position, the wire encoding, and approval of spikes S1-S3. The text below is the original recommendation, kept as the evidence; its "awaiting decision" wording is superseded by this header. Written against `main` at 4ed7f41.
 
 # Decision paper: ADR 0003 Q5 (cross-process access) and Q4 (shard granularity)
 
-Status: advisory, read-only review of `docs/adr/0003-data-model.md` on main. No files in the repo were changed.
+Status of the original review: advisory, read-only review of `docs/adr/0003-data-model.md` on main.
 
 ## Verified facts
 - redb 2.6.3 `file_backend/unix.rs` L37: `flock(fd, LOCK_EX | LOCK_NB)`; `EWOULDBLOCK` maps to `DatabaseAlreadyOpen`. There is no shared/read mode and no wait. A read-only open still takes `LOCK_EX`, so a second process cannot read while a first holds the file. The lock is per open file description, so even a second `Database::open` in the same process fails.
