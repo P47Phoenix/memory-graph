@@ -31,7 +31,7 @@ Each node stores its parent id. So adding up counts from a token to its ancestor
 
 ## Consequences
 
-- The schema version is stored in a `meta` table and checked before any write.
+- The schema version is stored in a `meta` table and checked before any write (currently 2; version 1 databases are upgraded in place on first open, and older builds refuse version 2).
 - Re-indexing a file replaces its whole subtree (the file's symbols and tokens).
 - Open: the JSON node encoding is large (see the [storage spike](../spikes/storage.md)).
 - Open: a comparison with `fjall` (an LSM-tree database, a different way to lay out data on disk) is pending.

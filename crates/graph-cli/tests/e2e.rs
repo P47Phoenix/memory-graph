@@ -1367,3 +1367,89 @@ mod unchanged_files {
         assert!(out.contains("\"a\""), "{out}");
     }
 }
+
+#[test]
+fn filter_validation_follows_the_catalog_across_prune_and_reindex() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("lib.rs"), "struct Widget;\nfn new() {}\n").unwrap();
+    std::fs::write(root.join("tool.py"), "def go():\n    pass\n").unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let r = root.to_str().unwrap();
+    let index = |extra: &[&str]| {
+        let mut a = vec!["--db", &db, "index", "--org", "o", "--repo", "r"];
+        a.extend_from_slice(extra);
+        a.push(r);
+        let (ok, out, err) = run(&a);
+        assert!(ok, "{out}{err}");
+    };
+    index(&[]);
+    // No filters: nothing to validate, queries just run.
+    let (ok, out, _) = run(&["--db", &db, "symbols", "new"]);
+    assert!(ok && out.contains("new"), "{out}");
+    let (ok, _, _) = run(&["--db", &db, "search", "Widget"]);
+    assert!(ok);
+    // With filters: values come from what is indexed.
+    let (ok, _, _) = run(&["--db", &db, "symbols", "*", "--language", "python"]);
+    assert!(ok);
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--kind", "bogus"]);
+    assert!(!ok && err.contains("kind"), "{err}");
+    // Removing the python file (prune) removes the language from validation.
+    std::fs::remove_file(root.join("tool.py")).unwrap();
+    index(&["--prune"]);
+    let (ok, _, err) = run(&["--db", &db, "symbols", "*", "--language", "python"]);
+    assert!(!ok && err.contains("languages present"), "{err}");
+    // Re-index (forced) keeps the counts stable.
+    let (_, before, _) = run(&["--db", &db, "describe", "--json"]);
+    index(&["--reindex"]);
+    let (_, after, _) = run(&["--db", &db, "describe", "--json"]);
+    assert_eq!(before, after);
+}
+
+#[test]
+fn v1_database_without_catalog_is_upgraded_via_cli() {
+    use redb::{Database, TableDefinition};
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, o, e) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src.to_str().unwrap(),
+    ]);
+    assert!(ok, "{o}{e}");
+    let (_, expected, _) = run(&["--db", &db, "describe", "--json"]);
+    let meta = TableDefinition::<&str, u64>::new("meta");
+    {
+        // Simulate a database written by the previous release.
+        let raw = Database::open(&db).unwrap();
+        let wt = raw.begin_write().unwrap();
+        {
+            let mut m = wt.open_table(meta).unwrap();
+            m.insert("schema_version", 1).unwrap();
+            m.remove("catalog_version").unwrap();
+        }
+        wt.delete_table(TableDefinition::<&str, u64>::new("catalog"))
+            .unwrap();
+        wt.commit().unwrap();
+    }
+    let (ok, out, err) = run(&["--db", &db, "describe", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, expected);
+    let raw = Database::open(&db).unwrap();
+    let v = raw
+        .begin_read()
+        .unwrap()
+        .open_table(meta)
+        .unwrap()
+        .get("schema_version")
+        .unwrap()
+        .map(|v| v.value());
+    assert_eq!(v, Some(graph_store::SCHEMA_VERSION));
+}
