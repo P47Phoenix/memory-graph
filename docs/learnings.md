@@ -11,7 +11,7 @@ Short, durable. Each item links to the detail.
 
 ## Constraints and gates
 - Pure Rust: `python3 scripts/check-no-c-deps.py` gates on native-linking `-sys` crates and C build scripts, not on crate names; pure-Rust `-sys` crates are allowed ([ADR 0002](adr/0002-parsing-and-crate-layout.md)). Stored data must represent any language.
-- redb holds an exclusive file lock; snapshot isolation is in-process only (ADR 0003, Q5, to be verified).
+- redb holds an exclusive file lock; verified in redb 2.6.3 (`flock(LOCK_EX|LOCK_NB)`, immediate `DatabaseAlreadyOpen`, no waiting); snapshot isolation is in-process only and a process holding the file blocks other processes' readers (ADR 0003, Q5, a blocking user decision).
 - Fingerprints are `sha256:<hex>|lang|extractor+tokN|format`; changing extraction semantics must bump the version so unchanged-file skipping cannot serve stale data.
 
 ## Review pitfalls found
@@ -20,7 +20,7 @@ Short, durable. Each item links to the detail.
 - Write amplification via `wchar` is not device I/O.
 - Spans "exactly as given" (overlapping, out of order, zero-length) must round-trip or be rejected before any write.
 - Ids emitted in JSON must be strings above 2^53.
-- Keep spike code outside the workspace build: extra dev-dependencies (`sha2`, `miniz_oxide`) must not enter `Cargo.lock`.
+- Keep spike code outside the workspace build: the spike's extra dev-dependency `miniz_oxide` must not be added to the workspace (`sha2` is already a `graph-store` dependency; `Cargo.lock` is gitignored).
 
 ## Process
 - Every PR: watch CI, and get independent developer and QA reviews.
