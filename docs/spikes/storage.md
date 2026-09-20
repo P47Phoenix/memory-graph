@@ -1,5 +1,7 @@
 # Spike: pure-Rust embedded storage (story 2)
 
+**TL;DR:** `redb` works (0.57 s to index 99 k tokens) at ~690 B/token; `fjall` was not benchmarked. The data-model follow-up is in [data-model.md](data-model.md).
+
 **Scope actually done:** `redb` 2.x only, via the real store (`crates/graph-store`). `fjall` and other stores were **not** benchmarked; that comparison remains open (see ADR 0001).
 
 ## Measurements (release build, one file, 99,000 token nodes, 9,000 lines)

@@ -1,5 +1,7 @@
 # Spike: pure-Rust parsing (story 1)
 
+**TL;DR:** `syn` gives exact symbols but fails hard on syntax errors, so the Rust extractor is hybrid: symbols from `syn`, tokens from the fallback tokenizer. `ruff_python_parser` is blocked by the toolchain (rustc 1.94.1).
+
 Measured on rustc 1.94.1 with a scratch crate (2026-09-19).
 
 | Candidate | Pure Rust | Spans | Error recovery | Notes |

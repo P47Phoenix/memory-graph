@@ -1,0 +1,14 @@
+meta             entries=3         stored=        65 meta=       16 frag=     4015 leaf_pages=1       branch_pages=0      height=1
+nodes            entries=243029    stored=  62149843 meta=  2008624 frag= 53978365 leaf_pages=28399   branch_pages=443    height=4
+names            entries=650       stored=     41058 meta=     4331 frag=    40627 leaf_pages=20      branch_pages=1      height=2
+children         entries=243028    stored=   1944224 meta=    55858 frag=  1817390 leaf_pages=739     branch_pages=193    height=5
+tokens_by_text   entries=241638    stored=   1933104 meta=   631685 frag=  2121035 leaf_pages=1006    branch_pages=138    height=5
+symbols_by_name  entries=741       stored=      5928 meta=     7260 frag=    11388 leaf_pages=5       branch_pages=1      height=2
+nodes[org]: count=1 json_bytes=151 avg=151.0
+nodes[repo]: count=8 json_bytes=1298 avg=162.2
+nodes[file]: count=641 json_bytes=142985 avg=223.1
+nodes[symbol]: count=741 json_bytes=182679 avg=246.5
+nodes[token]: count=241638 json_bytes=59878498 avg=247.8
+token name text (JSON-quoted) share = 3.1% of token json bytes
+compact rounds that changed something: 1
+file bytes: before compact 135278592 after compact 135278592
