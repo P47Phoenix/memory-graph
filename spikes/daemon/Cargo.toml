@@ -1,0 +1,20 @@
+# THROWAWAY spike: deliberately NOT a member of the root cargo workspace (see README.md).
+[package]
+name = "daemon-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# An empty [workspace] table makes this its own workspace root, so cargo never
+# tries to attach it to the repository workspace.
+[workspace]
+
+[dependencies]
+graph-core = { path = "../../crates/graph-core" }
+graph-store = { path = "../../crates/graph-store" }
+graph-lang-rust = { path = "../../crates/graph-lang-rust" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = false
