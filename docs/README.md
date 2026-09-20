@@ -18,6 +18,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 | [Parsing](spikes/parser.md) | `syn` for Rust symbols, fallback tokenizer for tokens. | none |
 | [Storage](spikes/storage.md) | redb works, ~690 B/token. | none |
 | [Data model](spikes/data-model.md) | Token cost is the node envelope, not the text; a stream model measured ~25x smaller. | [spikes/data-model/](../spikes/data-model/README.md) (code, README, logs) |
+| [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md) | Architect recommendation, awaiting user decision (not an ADR): shard granularity and cross-process access. | none |
 
 ## Learnings
 - [learnings.md](learnings.md): durable facts, measured numbers, gate rules and review pitfalls, linking to the details.
