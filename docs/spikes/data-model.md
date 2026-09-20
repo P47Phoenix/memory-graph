@@ -1,4 +1,4 @@
-# Spike: data model (story 18 precursor)
+# Spike: data model (epic story 18 precursor)
 
 Status: measurements for [ADR 0003](../adr/0003-data-model.md) (revised after architecture, dev and QA review). Date 2026-09-19. Author: solution-architect review.
 
@@ -297,4 +297,4 @@ Reading the tables:
 
 ## 10. Decisions taken after this spike (by the user)
 
-Recorded in [ADR 0003](../adr/0003-data-model.md): scale above 100 M tokens and horizontal scaling must be supported (so packed dictionary and block postings are core, and the store must be shardable); pre-1.0 re-index is acceptable but migration must exist and be tested before 1.0; readers get point-in-time snapshots. Consequence for this spike: its [E] estimates for 100 M and for the packed dictionary/block postings are now on the critical path and must be replaced by measurements (ADR stories 3a, 3b).
+Recorded in [ADR 0003](../adr/0003-data-model.md): scale above 100 M tokens and horizontal scaling must be supported (so packed dictionary and block postings are core, and the store must be shardable); pre-1.0 re-index is acceptable but migration must exist and be tested before 1.0; readers get point-in-time snapshots. Consequence for this spike: its [E] estimates for 100 M and for the packed dictionary/block postings are now on the critical path and must be replaced by measurements (ADR stories 5 and 6).

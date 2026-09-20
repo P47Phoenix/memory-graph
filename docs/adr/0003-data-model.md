@@ -7,7 +7,7 @@
 - Today a token costs ~525 B of redb pages, because every occurrence is a ~248 B JSON node plus B-tree slack plus two secondary entries; repeated text is only 2.2% of the node. [M]
 - Proposal: tokens stop being rows. Per file, one compact **stream** (term id, class, exact span deltas); a **dictionary** (text -> id); **count postings** `(term, file) -> count`; symbols stay rows and carry a per-symbol token ordinal range. A prototype with per-occurrence postings measured ~20 B/token (order of magnitude ~25x smaller), ~3-5x faster ingest, 20-370x faster roll-ups of very common terms. [M, prototype; see "Honest numbers"]
 - Decided by the user: the design must support **more than 100 M tokens and scale wide (sharding)**; **migration must exist and be tested before 1.0** (pre-1.0 re-index is fine); readers get **point-in-time snapshots**. These are now core scope (below), including a sharding model that is specified but not built.
-- Status stays Proposed until the v2 checkpoint (story 4) gives a go/no-go on real numbers.
+- Status stays Proposed until the v2 checkpoint (ADR story 4) gives a go/no-go on real numbers.
 
 ## Decisions and open questions
 
@@ -15,9 +15,9 @@
 
 | # | Question | Decision |
 |---|---|---|
-| D1 | Scale target | More than 100 M tokens must be supported and we must be able to scale wide (horizontal). Packed dictionary and block postings are core (stories 5, 6); the store trait must allow partitioning; a sharding model is specified here (stories 14-17). |
+| D1 | Scale target | More than 100 M tokens must be supported and we must be able to scale wide (horizontal). Packed dictionary and block postings are core (ADR stories 5, 6); the store trait must allow partitioning; a sharding model is specified here (stories 14-17). |
 | D2 | Migration | Pre-1.0: re-index is acceptable. From 1.0 on existing data MUST migrate. The versioning and migration framework is designed now and must exist and be tested before 1.0 is tagged (ADR story 12). A v1 structure/NDJSON export path stays for agent-supplied data. |
-| D3 | Reader consistency | Readers (CLI, MCP, long-running agents) see a consistent point-in-time view while ingest writes: redb MVCC within a shard, a manifest version across shards (stories 10, 16). |
+| D3 | Reader consistency | Readers (CLI, MCP, long-running agents) see a consistent point-in-time view while ingest writes: redb MVCC within a shard, a manifest version across shards (ADR stories 10, 16). |
 | D4 | Spikes in repo | Spike code, README and logs are committed under `spikes/data-model/`, outside the workspace build; docs get an index and a learnings page. |
 
 **Still open** (assumed default, pending user confirmation, unless marked blocking):
@@ -27,7 +27,7 @@
 | Q1 | Are token `NodeId`s persisted by any consumer (MCP, epic story 17, traversal epic story 12)? | Defaultable | Token ids are **unstable across re-index** (stable within a snapshot); documented in the API. Consumers hold `(path, ordinal)` + snapshot if they need more. |
 | Q2 | Sharing identical content (vendored deps, forks)? | Defaultable | `content_id` refcounts and a `content_id -> files` multimap exist from day one; fan-out to multiple files is **not** enabled until a real monorepo is measured. Skipped (unchanged) files never touch refcounts. |
 | Q3 | Rollout: v2 default at once or opt-in? | Defaultable | v2 opt-in behind the store trait for one release, then flip the default. |
-| Q4 | Shard granularity and partition key | Blocking for stories 14-17 (not for 0-13) | Shard unit = one redb file; partition key = `(org, repo)` (a repo never spans shards, an org may); default one shard; split at a configured size (e.g. 200 M tokens or 20 GB). |
+| Q4 | Shard granularity and partition key | Blocking for ADR stories 14-17 (not for 0-13) | Shard unit = one redb file; partition key = `(org, repo)` (a repo never spans shards, an org may); default one shard; split at a configured size (e.g. 200 M tokens or 20 GB). |
 | Q5 | Cross-process access: **verified** (redb 2.6.3 `flock(LOCK_EX\|LOCK_NB)`, immediate `DatabaseAlreadyOpen`, no waiting) that a process holding the file blocks readers in other processes; D3 is not met for the separate-process CLI | **BLOCKING user decision** | Options: (a) one owning daemon/MCP process serving reads; (b) CLI retry-with-timeout/back-off; (c) per-shard files with writers on other shards. No default; needed before story 10 is scheduled. |
 | Q6 | Max snapshot age and retained-growth limit | Defaultable | 15 minutes, configurable; expired snapshots return `SnapshotExpired`; a warning is emitted at 50% of the limit. |
 | Q7 | Shard count ceiling (id layout) | Defaultable | 1,024 shards (10 bits) in the id layout, format byte allows widening. |
@@ -93,10 +93,10 @@ Milestone order: **story 0** (describe fix) -> **store trait / port** (v1 adapte
 | `meta` | `schema_version`, per-component format versions (below), `next_id`, `next_term`, `commit_epoch` |
 | `names` | `parent \0 kind \0 name` -> id (org/repo/file) |
 | `ent` | id -> row. File: language, `has_errors`, `origin`, fingerprint (`sha256:<hex>` digest as 32 bytes plus language, extractor+tokenizer version, format: the `sha256:<hex>|lang|extractor+tokN|format` semantics of PR #8), `content_id`, token count, symbol count, per-class token counts, symbol id range. Symbol: symbol kind, lang kind, span, `parent`, first/last token ordinal. |
-| `dict` | term text -> id and id -> text (one packed dictionary after story 5) |
+| `dict` | term text -> id and id -> text (one packed dictionary after ADR story 5) |
 | `stream` | `content_id` -> versioned byte stream (format below) |
 | `refs` | `content_id` -> refcount; `content_files`: `content_id` -> file ids (multimap) |
-| `post` | `(term, content_id)` -> count (block-encoded after story 6) |
+| `post` | `(term, content_id)` -> count (block-encoded after ADR story 6) |
 | `symbols_by_name` | name -> symbol id |
 
 Stream per token (unchanged from the prototype): `varint(term<<4 | class<<1 | irregular)`, `varint(gap<<1 | newline)`, `line_delta` and `col` after a newline, explicit end fields only when `irregular`. A format byte leads every stream.
@@ -140,7 +140,7 @@ v2 stores, per symbol, the **first and last token ordinal it directly contains**
 
 ### Robustness (required)
 
-- **Max term length:** terms longer than 256 bytes are stored as `hash(term)` in the dictionary with the text in a side blob (or not interned and stored inline in the stream); policy fixed in story 3 and covered by tests (e.g. minified single-line files, base64 blobs).
+- **Max term length:** terms longer than 256 bytes are stored as `hash(term)` in the dictionary with the text in a side blob (or not interned and stored inline in the stream); policy fixed in ADR story 3 and covered by tests (e.g. minified single-line files, base64 blobs).
 - **Per-file size cap or chunking:** a stream larger than a configured cap (default 8 MiB, i.e. millions of tokens) is split into chunks keyed `(content_id, chunk)`; ordinals are global across chunks; a file above a hard cap (token count 2^25 = 33.5 M) is rejected with a clear error.
 - **Chunked commits:** ingest commits every N files or M MiB (default 64 MiB) so one transaction never grows unbounded; a crash leaves a whole number of committed files, and the repo/file rows commit last so a half-indexed repo is detected by an `indexing` marker and resumed.
 - **redb cache size** is set explicitly (`Builder::set_cache_size`, default 256 MiB, configurable) instead of the 1 GiB default; RSS is a tuning knob (spike observed 1.2 GB at 9.9 M with defaults).
@@ -163,9 +163,10 @@ v2 stores, per symbol, the **first and last token ordinal it directly contains**
 - **Token ids inside a snapshot** are stable (the embedded ingest generation cannot change within a snapshot); after the snapshot, see D-stability rule above.
 - **Long-lived snapshots vs file growth and vacuum:** an open read transaction prevents reuse of pages freed by later commits, so the file grows while it lives and `vacuum`/compaction cannot reclaim them. Limits (Q6): **max snapshot age 15 min**, configurable; on expiry the next read returns `SnapshotExpired`; `vacuum` refuses (or waits) while snapshots older than a threshold exist. **Observability:** `store.stats()` reports open snapshot count, oldest snapshot age, DB file size versus live size, and pages retained estimate; a warning is logged at 50% of the max age.
 - **Sharded store:** the catalog (manifest) has a monotonically increasing **manifest version**. A writer commits a single shard (a repo never spans shards, so ingest of a repo is atomic within one shard) and then publishes a new manifest version (temp file + fsync + atomic rename) recording each shard's `commit_epoch`. redb can only open a read transaction on the **latest committed** state of a file (no time travel), so a snapshot cannot be reconstructed lazily later. `snapshot()` therefore: (1) reads manifest version V; (2) **eagerly opens a read transaction on every shard in the manifest**, all under the manifest protocol before returning; (3) validates each shard's `commit_epoch` (stored in the shard's `meta`, read inside its read txn) against V's record. If every epoch matches, the handle pins V and the open transactions; if a shard is ahead of V (writer committed but has not yet published) or behind, the snapshot **drops the transactions and retries** (re-read the manifest, reopen). The commit-then-publish window is short but real, so the retry is bounded: **up to 5 s (configurable, jittered backoff from 1 ms), after which `snapshot()` returns `SnapshotUnavailable`**. Writers publish the manifest immediately after commit and must not hold a shard commit unpublished across other work. Consequences: no lazy per-shard open; a snapshot costs one open read txn per shard for its whole life; **reader-held pages block page reuse and vacuum in every shard** the snapshot holds, not only the ones it queries, so the max snapshot age (Q6) matters more with many shards. Operations touching several shards (rebalance, move repo) copy to the target, publish a manifest that switches routing, and only delete from the source after no snapshot pins a manifest that routes to it (bounded by max snapshot age).
+- **Crash recovery for commit-then-publish (roll-forward is THE rule):** if the writer dies after committing shard N but before publishing the manifest, shard N stays permanently ahead of manifest V and every `snapshot()` would burn the 5 s bound and return `SnapshotUnavailable`. redb commits are durable and cannot be undone, so **rollback is impossible; recovery always rolls forward.** Mechanism: (1) **write-ahead intent:** before committing any shard, the writer atomically publishes (temp file + fsync + rename) a manifest version V+1 that keeps V's committed epochs and adds a `pending` record `{shard_id, intended_epoch}` per shard it is about to commit; after the commit it publishes V+2 with the epoch promoted and `pending` cleared. (2) **Reconcile (`repair`)** runs under the exclusive writer lock on writer open, and on demand via `memory-graph repair` (`verify` reports the same findings read-only). For each shard it reads `commit_epoch` from the shard's `meta`: if it equals the manifest's, nothing to do; if it equals the shard's `pending.intended_epoch` (committed, unpublished), it verifies that shard's own consistency (the `verify` checks: counters, refcounts, postings vs streams) and then republishes a manifest with the epoch promoted; if it matches neither the recorded nor the intended epoch, or verification fails, `repair` fails loudly and marks the shard `state = needs_attention` (never guesses). A `pending` record whose shard epoch was not advanced (crash before commit) is simply cleared. Repair is idempotent and crash-safe (it only publishes via the atomic manifest rename). (3) **Readers never repair:** on exhausting the bound `snapshot()` returns `SnapshotUnavailable` with a message naming the shard, its epoch versus the manifest's, and the hint "a writer appears to have crashed between commit and publish; run `memory-graph repair` (or restart the owning daemon, which repairs on open)". A live writer's short window still resolves by retry as before.
 - **Constraint (Q5, VERIFIED in redb 2.6.3):** `src/tree_store/page_store/file_backend/unix.rs` (~L37-41) takes `flock(LOCK_EX | LOCK_NB)` on open; if another handle holds it, open fails **immediately** with `DatabaseAlreadyOpen`. The lock is exclusive and non-blocking, so a process that holds the file blocks even **readers in other processes**, and redb does **not** wait. Snapshot isolation protects only readers inside the owning process. **D3 is NOT satisfied for today's CLI-vs-writer topology** (CLI and MCP/indexer are separate processes on one file). This is a **blocking user decision (Q5)**: options are (a) a single owning daemon/MCP process that serves all reads and writes (CLI talks to it); (b) CLI retry-with-timeout/back-off on `DatabaseAlreadyOpen` (no snapshot guarantee across processes, only availability between writes); (c) per-shard files, with writers on other shards leaving the queried shards openable. `vacuum` (rebuild into a new file, then atomic rename) is compatible with a live handle lock only because the new file is a different inode: the rename does not disturb the old lock holder, snapshots opened on the old file keep the **old inode** and see the pre-vacuum data until dropped, and new opens see the new file; vacuum itself needs the exclusive lock on the source for its read pass, so it is subject to the same topology decision.
 
-## Sharding model (specified, not built; stories 14-17)
+## Sharding model (specified, not built; ADR stories 14-17)
 
 - **Unit:** a shard is one redb file holding whole repos (partition key `(org, repo)`; org spans shards, repo never does), with its own dictionary, streams, postings and entity rows. Shard-local ids.
 - **Catalog:** `manifest` (small file, atomically replaced) lists shards `{shard_id, path, state, repos, commit_epoch, format versions}` and the routing `(org, repo) -> shard_id`. New repos are assigned to the least-loaded shard under the size limit (Q4).
@@ -178,7 +179,7 @@ v2 stores, per symbol, the **first and last token ordinal it directly contains**
 ## Consequences
 
 **Positive**
-- ~25x less disk (order of magnitude, 9.9 M set; target 8-12 B/token [E] after stories 5-6), ingest ~3-5x faster, ingest RSS ~4x lower, re-index ~7x faster, roll-ups of very common terms 20-370x faster, `describe` O(files); CLI calls lose the O(tokens) validation scan.
+- ~25x less disk (order of magnitude, 9.9 M set; target 8-12 B/token [E] after ADR stories 5-6), ingest ~3-5x faster, ingest RSS ~4x lower, re-index ~7x faster, roll-ups of very common terms 20-370x faster, `describe` O(files); CLI calls lose the O(tokens) validation scan.
 - Enables `--limit` push-down, content sharing, snapshots and horizontal scale; cold starts read 15-24 MB instead of 50-500 MB per search.
 
 **Negative / risks**
@@ -206,7 +207,7 @@ v2 stores, per symbol, the **first and last token ordinal it directly contains**
 
 - **Option E** (story 0 + binary nodes, ~6 dev-days, 5.5x smaller) was defended as sufficient **if 10 M tokens is the ceiling**; it is rejected here because D1 sets the ceiling above 100 M.
 - **Migration member** objected to a flag-day cutover; hence v2 opt-in for one release, the v1 adapter behind the trait, and the migration framework as a 1.0 gate (D2).
-- **Storage member** wanted packed dictionary and block postings in core scope; adopted (stories 5, 6) once D1 raised the scale.
+- **Storage member** wanted packed dictionary and block postings in core scope; adopted (ADR stories 5, 6) once D1 raised the scale.
 
 ## Story breakdown and estimates
 
@@ -229,11 +230,11 @@ Ideal developer-days including tests, one developer. The single-shard core re-ba
 | 12 | Migration framework: `migrate` (v1 -> v2), preflight, temp file + verify + atomic rename, differential verification, NDJSON/structure `export` | 6 | Migrating a golden v1 file yields a DB whose query output equals v1's; a failing verification leaves the source and target untouched; export then re-ingest round-trips. **Gate: must exist and be tested before 1.0 is tagged.** |
 | | **Core (0-12)** | **~45-47** | ~25-27 d re-baselined single-shard core (stories 0-4, 7, 8) plus D1/D2/D3 additions (stories 5, 6, 9-12 = 20 d). |
 | 13 | Sharding design spike: measure per-shard dictionaries at real distinct-text ratios; fix key/ids | 2 | Decision on partition key and id layout recorded; Q4/Q7 answered. |
-| 14 | Shard catalog/manifest, id layout, manifest-version snapshots | 5 | Writers publish manifests atomically; `snapshot()` opens read txns on all shards eagerly and validates each `commit_epoch` against the pinned version; a test injects a commit-before-publish window and asserts retry then success, and `SnapshotUnavailable` after the bound; killing a writer mid-publish leaves the previous manifest valid. |
+| 14 | Shard catalog/manifest, id layout, manifest-version snapshots | 5 | Writers publish manifests atomically; `snapshot()` opens read txns on all shards eagerly and validates each `commit_epoch` against the pinned version; a test injects a commit-before-publish window and asserts retry then success, and `SnapshotUnavailable` after the bound; killing a writer mid-publish leaves the previous manifest valid. **Crash recovery:** kill the writer between a shard commit and the manifest publish; assert readers get `SnapshotUnavailable` carrying the repair hint, `repair` republishes a consistent manifest (roll-forward, from the pending intent record), `snapshot()` then succeeds, and no committed data is lost (the killed ingest's data is present and query output equals an uninterrupted run); also kill during repair and re-run to show idempotence. |
 | 15 | Partitioned store: routing, per-shard dictionaries, cross-shard fan-out, deterministic k-way merge, limit early termination | 8 | Sharded results are identical to single-shard results over the differential matrix; ordering deterministic; shard failure reported. |
 | 16 | Rebalance (split/move repo) with cross-shard snapshot consistency | 6 | A concurrent reader during a move sees either the old or the new location, never both or neither; source deleted only after snapshots drain. |
 | 17 | Cross-shard snapshot tests and soak (readers during re-index, delete and move) | 3 | Snapshot repeatability and cross-shard consistency tests pass under concurrent writers; a long snapshot is shown to block vacuum/page reuse on all shards, and expires per Q6. |
-| | **Sharding (13-17)** | **24** | Specified, not built; estimates assume story 0-12 numbers hold. |
+| | **Sharding (13-17)** | **24** | Specified, not built; estimates assume ADR stories 0-12 numbers hold. |
 | 18 | Content sharing by digest (fan-out via `content_files`) | 4 | Only if real corpora are duplicate-heavy (Q2). |
 | 19 | Stream checkpoints for token-grain on huge files | 2 | Only if profiling shows a need. |
 | | **With everything** | **~75-77** | |
