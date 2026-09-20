@@ -12,7 +12,14 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: u64 = 1;
+/// On-disk layout version written by this build. It is 2 because databases
+/// that carry the describe catalog must be refused by builds that predate it
+/// (they would write without maintaining the catalog and silently make
+/// `describe` drift). Builds that predate the catalog only accept 1.
+pub const SCHEMA_VERSION: u64 = 2;
+/// Oldest layout this build still opens; a version-1 database is upgraded in
+/// place on open (catalog backfill, then the version is stamped).
+pub const MIN_SCHEMA_VERSION: u64 = 1;
 /// Version of the derived symbol-name index. Bump it whenever the index
 /// contents or keying change; databases with another value rebuild it on open.
 pub const SYMBOL_INDEX_VERSION: u64 = 1;
@@ -46,7 +53,7 @@ const CATALOG: TableDefinition<&str, u64> = TableDefinition::new("catalog");
 pub enum StoreError {
     #[error("database is locked by another process: {0}")]
     Locked(String),
-    #[error("incompatible schema version {found} (this build supports {SCHEMA_VERSION}); database left unmodified")]
+    #[error("incompatible schema version {found} (this build supports {MIN_SCHEMA_VERSION} to {SCHEMA_VERSION}); database left unmodified")]
     SchemaMismatch { found: u64 },
     #[error("cannot open database {path}: {reason}")]
     OpenFailed { path: String, reason: String },
@@ -427,7 +434,9 @@ impl Store {
     /// no read-only open mode. Fails without modifying the file on a schema
     /// mismatch, on a symbol index newer than this build, or when another
     /// process holds it. A database whose symbol index is missing or older is
-    /// rebuilt once on open.
+    /// rebuilt once on open. A version-1 database (written before the describe
+    /// catalog) is upgraded in place, which writes once: it needs a writable
+    /// file, and afterwards builds that predate the catalog refuse it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::create(path.as_ref()).map_err(|e| match e {
             DatabaseError::DatabaseAlreadyOpen => {
@@ -444,7 +453,9 @@ impl Store {
             }
         };
         match found {
-            Some(v) if v != SCHEMA_VERSION => return Err(StoreError::SchemaMismatch { found: v }),
+            Some(v) if !(MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&v) => {
+                return Err(StoreError::SchemaMismatch { found: v })
+            }
             Some(_) => {
                 // Databases written before the symbol index existed, or with an
                 // older index layout: rebuild it once. Nothing is written when
@@ -521,7 +532,12 @@ impl Store {
                 .open_table(META)?
                 .get("catalog_version")?
                 .map(|v| v.value());
+            let schema = rt
+                .open_table(META)?
+                .get("schema_version")?
+                .map(|v| v.value());
             ver == Some(CATALOG_VERSION)
+                && schema == Some(SCHEMA_VERSION)
                 && !matches!(
                     rt.open_table(CATALOG),
                     Err(redb::TableError::TableDoesNotExist(_))
@@ -554,8 +570,9 @@ impl Store {
                     cat.insert(format!("c\0{o}\0{r}\0{c}").as_str(), *n as u64)?;
                 }
             }
-            wt.open_table(META)?
-                .insert("catalog_version", CATALOG_VERSION)?;
+            let mut m = wt.open_table(META)?;
+            m.insert("catalog_version", CATALOG_VERSION)?;
+            m.insert("schema_version", SCHEMA_VERSION)?;
         }
         wt.commit()?;
         Ok(())
@@ -920,6 +937,24 @@ impl Store {
                 "org and repo must not be empty".into(),
             ));
         }
+        // NUL separates the fields of catalog and name keys.
+        let nul = |what: &str, v: &str| {
+            if v.contains('\0') {
+                Err(StoreError::Rejected(format!(
+                    "{what} must not contain NUL bytes"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        nul("org", org)?;
+        nul("repo", repo)?;
+        nul("language", language)?;
+        for sd in &ex.symbols {
+            if let Some(k) = &sd.lang_kind {
+                nul("symbol lang_kind", k)?;
+            }
+        }
         let language = language.to_ascii_lowercase();
         let language = language.as_str();
         let mut stats = IngestStats::default();
@@ -1194,15 +1229,19 @@ impl Store {
         let cat = rt.open_table(CATALOG)?;
         let mut infos: BTreeMap<(String, String), RepoInfo> = BTreeMap::new();
         let corrupt = || StoreError::Corrupt("bad catalog key".into());
+        let mut seen_repo = std::collections::HashSet::new();
         for r in cat.iter()? {
             let (k, v) = r?;
             let (k, v) = (k.value(), v.value() as usize);
             let f: Vec<&str> = k.split('\0').collect();
-            if f.len() < 3 || org.is_some_and(|o| f[1] != o) || repo.is_some_and(|r| f[2] != r) {
-                if f.len() < 3 {
-                    return Err(corrupt());
-                }
+            if f.len() < 3 {
+                return Err(corrupt());
+            }
+            if org.is_some_and(|o| f[1] != o) || repo.is_some_and(|r| f[2] != r) {
                 continue;
+            }
+            if f[0] == "r" {
+                seen_repo.insert((f[1].to_string(), f[2].to_string()));
             }
             let info = infos
                 .entry((f[1].to_string(), f[2].to_string()))
@@ -1233,6 +1272,11 @@ impl Store {
                 }
                 _ => return Err(corrupt()),
             }
+        }
+        if infos.keys().any(|k| !seen_repo.contains(k)) {
+            return Err(StoreError::Corrupt(
+                "catalog has counters for a repo without its marker row".into(),
+            ));
         }
         Ok(infos.into_values().collect())
     }

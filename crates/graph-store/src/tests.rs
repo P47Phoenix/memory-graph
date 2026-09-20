@@ -1507,7 +1507,8 @@ fn catalog_unchanged_by_aborted_transactions() {
         tokens: vec![],
     };
     let mut bad_span = bad.clone();
-    bad_span.symbols[0].span.end = 0; // start > end
+    bad_span.symbols[0].span.start = 5;
+    bad_span.symbols[0].span.end = 2; // start > end, explicitly
     assert!(s
         .ingest_file("o9", "r9", "new.rs", "rust", &bad_span)
         .is_err());
@@ -1583,4 +1584,88 @@ fn describe_does_not_decode_nodes() {
     assert!(s.describe_by_scan(None, None).is_err());
     assert!(s.describe(None, None).is_ok());
     assert!(s.describe(Some("o1"), Some("r1")).is_ok());
+}
+
+#[test]
+fn nul_bytes_rejected_in_org_repo_language_and_lang_kind() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let ok = Extraction::default();
+    for (o, r, l) in [("a\0b", "r", "x"), ("o", "a\0b", "x"), ("o", "r", "a\0b")] {
+        let e = s.ingest_file(o, r, "f", l, &ok).unwrap_err();
+        assert!(
+            matches!(&e, StoreError::Rejected(m) if m.contains("NUL")),
+            "{e}"
+        );
+    }
+    let mut ex = Extraction::default();
+    let mut d1 = sym("x", SymbolKind::Function, span_of("abcd", "ab", 0));
+    d1.lang_kind = Some("k\0k".into());
+    ex.symbols.push(d1);
+    let e = s.ingest_file("o", "r", "f", "x", &ex).unwrap_err();
+    assert!(
+        matches!(&e, StoreError::Rejected(m) if m.contains("NUL")),
+        "{e}"
+    );
+    assert!(s.describe(None, None).unwrap().is_empty());
+}
+
+#[test]
+fn hard_failure_mid_batch_leaves_catalog_equal_to_scan() {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = setup(d.path());
+    let before = s.describe(None, None).unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    s.register(Box::new(CountingExtractor(calls)));
+    let f = |p, b: &'static [u8]| BatchFile {
+        path: p,
+        bytes: b,
+        language: Some("count"),
+        origin: None,
+    };
+    let files = [f("ok1.c", b"xxxx"), f("bad.c", b"bad-span")];
+    assert!(s
+        .index_batch("o1", "newrepo", &files, IndexOptions::default())
+        .is_err());
+    assert_eq!(s.describe(None, None).unwrap(), before);
+    assert_catalog_matches_scan(&s, "after failed batch");
+}
+
+#[test]
+fn v1_database_upgrades_in_place_and_stamps_schema() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("g.redb");
+    let expected = {
+        let s = setup(d.path());
+        let e = s.describe_by_scan(None, None).unwrap();
+        set_meta(&s, "schema_version", Some(1));
+        set_meta(&s, "catalog_version", None);
+        e
+    };
+    let s = Store::open(&path).unwrap();
+    assert_eq!(meta(&s, "schema_version"), Some(SCHEMA_VERSION));
+    assert_eq!(s.describe(None, None).unwrap(), expected);
+}
+
+#[test]
+fn missing_catalog_table_is_rebuilt_and_partial_rows_are_reported() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("g.redb");
+    let expected = {
+        let s = setup(d.path());
+        let wt = s.db.begin_write().unwrap();
+        wt.delete_table(CATALOG).unwrap();
+        wt.commit().unwrap();
+        s.describe_by_scan(None, None).unwrap()
+    };
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.describe(None, None).unwrap(), expected);
+    // Drop one repo marker row: describe says so instead of returning a wrong answer.
+    {
+        let wt = s.db.begin_write().unwrap();
+        wt.open_table(CATALOG).unwrap().remove("r\0o1\0r1").unwrap();
+        wt.commit().unwrap();
+    }
+    let e = s.describe(None, None).unwrap_err();
+    assert!(matches!(e, StoreError::Corrupt(_)), "{e}");
 }

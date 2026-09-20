@@ -1406,3 +1406,50 @@ fn filter_validation_follows_the_catalog_across_prune_and_reindex() {
     let (_, after, _) = run(&["--db", &db, "describe", "--json"]);
     assert_eq!(before, after);
 }
+
+#[test]
+fn v1_database_without_catalog_is_upgraded_via_cli() {
+    use redb::{Database, TableDefinition};
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, o, e) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src.to_str().unwrap(),
+    ]);
+    assert!(ok, "{o}{e}");
+    let (_, expected, _) = run(&["--db", &db, "describe", "--json"]);
+    let meta = TableDefinition::<&str, u64>::new("meta");
+    {
+        // Simulate a database written by the previous release.
+        let raw = Database::open(&db).unwrap();
+        let wt = raw.begin_write().unwrap();
+        {
+            let mut m = wt.open_table(meta).unwrap();
+            m.insert("schema_version", 1).unwrap();
+            m.remove("catalog_version").unwrap();
+        }
+        wt.delete_table(TableDefinition::<&str, u64>::new("catalog"))
+            .unwrap();
+        wt.commit().unwrap();
+    }
+    let (ok, out, err) = run(&["--db", &db, "describe", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, expected);
+    let raw = Database::open(&db).unwrap();
+    let v = raw
+        .begin_read()
+        .unwrap()
+        .open_table(meta)
+        .unwrap()
+        .get("schema_version")
+        .unwrap()
+        .map(|v| v.value());
+    assert_eq!(v, Some(graph_store::SCHEMA_VERSION));
+}
