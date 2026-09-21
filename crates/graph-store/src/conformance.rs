@@ -60,6 +60,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("order_and_limit_determinism", order_and_limit_determinism),
     ("prune_empty_keep", prune_empty_keep),
     ("nul_handling", nul_handling),
+    ("batch_origin_refresh", batch_origin_refresh),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -552,6 +553,69 @@ fn batch_reindex_and_unchanged(h: &Harness) {
         .is_empty());
 }
 
+/// Every filtered read, rendered as one string so two read views compare
+/// exactly (a dropped filter changes the string).
+fn filtered_probe<R: crate::StoreRead + ?Sized>(r: &R) -> String {
+    let mut out = String::new();
+    let mut add = |label: &str, v: String| out.push_str(&format!("{label}: {v}\n"));
+    let mut qs = Vec::new();
+    for grain in [Grain::Token, Grain::Symbol, Grain::File] {
+        let mut q = Query::new("foo");
+        q.grain = grain;
+        qs.push(q.clone());
+        q.org = Some("o1".into());
+        qs.push(q.clone());
+        q.repo = Some("r1".into());
+        qs.push(q.clone());
+        q.repo = Some("r2".into());
+        qs.push(q.clone());
+        q.org = None;
+        q.repo = None;
+        q.class = Some(graph_core::TokenClass::Identifier);
+        qs.push(q.clone());
+        q.class = Some(graph_core::TokenClass::Keyword);
+        qs.push(q.clone());
+        q.class = None;
+        q.symbol_kind = Some("method".into());
+        qs.push(q.clone());
+        q.symbol_kind = Some("type".into());
+        qs.push(q);
+    }
+    for q in &qs {
+        add(&format!("{q:?}"), format!("{:?}", r.search(q).unwrap()));
+    }
+    let mut sqs = Vec::new();
+    for lang in [None, Some("rust"), Some("zig")] {
+        for file in [None, Some("lib.rs"), Some("main.zig")] {
+            for limit in [None, Some(1)] {
+                let mut q = SymbolQuery::new("*");
+                q.language = lang.map(Into::into);
+                q.file = file.map(Into::into);
+                q.limit = limit;
+                sqs.push(q);
+            }
+        }
+    }
+    for q in &sqs {
+        add(
+            &format!("{q:?}"),
+            format!("{:?}", r.search_symbols(q).unwrap()),
+        );
+    }
+    for (o, rp) in [
+        (None, None),
+        (Some("o1"), None),
+        (Some("o1"), Some("r1")),
+        (None, Some("r2")),
+        (Some("o2"), Some("r1")),
+    ] {
+        let d = r.describe(o, rp).unwrap();
+        assert_eq!(d, r.describe_by_scan(o, rp).unwrap(), "describe vs scan");
+        add(&format!("describe {o:?}/{rp:?}"), format!("{d:?}"));
+    }
+    out
+}
+
 /// The reads not covered by `snapshot_is_frozen`: count_nodes for every kind,
 /// filtered search and the symbol-kind filter, through a snapshot after
 /// writes.
@@ -559,9 +623,21 @@ fn snapshot_filtered_reads(h: &Harness) {
     let s = open(h);
     seed(&*s);
     let snap = s.snapshot().unwrap();
+    let before = filtered_probe(&*s);
+    assert_eq!(
+        filtered_probe(&*snap),
+        before,
+        "snapshot == live, no writes"
+    );
     s.ingest_file("o1", "r1", "lib.rs", "rust", &plain("zzz\n"))
         .unwrap();
     s.index_bytes("o3", "r3", "new.txt", b"foo", None).unwrap();
+    assert_eq!(
+        filtered_probe(&*snap),
+        before,
+        "snapshot == pre-write state"
+    );
+    assert_ne!(filtered_probe(&*s), before, "live store moved on");
     assert_eq!(snap.count_nodes(NodeKind::Symbol).unwrap(), 3);
     assert_eq!(s.count_nodes(NodeKind::Symbol).unwrap(), 0);
     assert_eq!(snap.count_nodes(NodeKind::Org).unwrap(), 2);
@@ -804,8 +880,9 @@ fn order_and_limit_determinism(h: &Harness) {
         q.limit = Some(n);
         assert_eq!(s.search_symbols(&q).unwrap()[..], all[..n]);
     }
-    // Ties on the offset break by ordinal: an enclosing symbol that starts at
-    // the same byte as its child comes first (the outer node is stored first).
+    // `search_symbols` sorts by (org, repo, file, offset, qualified name, node
+    // id), so at a shared offset the shorter qualified name (the enclosing
+    // symbol) comes first; the id only breaks ties beyond that.
     let src = "struct S { x: u8 }\n";
     let inner = Extraction {
         has_errors: false,
@@ -827,7 +904,7 @@ fn order_and_limit_determinism(h: &Harness) {
     assert_eq!(
         names,
         ["S", "S::T"],
-        "outer first, whatever the input order"
+        "enclosing first, whatever the input order"
     );
 }
 
@@ -997,4 +1074,38 @@ fn differential_seed(s: &dyn Store) {
         .unwrap();
     s.index_bytes("o1", "r2", "m.txt", b"foo mfoo m\n", None)
         .unwrap();
+}
+
+/// A batch re-index of unchanged bytes still refreshes the file's origin, in
+/// both directions, and prune follows the origin.
+fn batch_origin_refresh(h: &Harness) {
+    let s = open(h);
+    let origin_of = |s: &dyn Store| {
+        let t = s.file_tokens("o", "r", "a.txt").unwrap().unwrap();
+        s.parent(t[0].id).unwrap().unwrap().origin
+    };
+    let run = |origin| {
+        let f = BatchFile {
+            path: "a.txt",
+            bytes: b"foo bar",
+            language: Some("text"),
+            origin,
+        };
+        s.index_batch("o", "r", &[f], IndexOptions::default())
+            .unwrap()
+            .remove(0)
+            .unwrap()
+    };
+    assert!(!run(None).unchanged);
+    assert_eq!(origin_of(&*s), None);
+    assert!(
+        run(Some(ORIGIN_DIRECTORY)).unchanged,
+        "content skip still applies"
+    );
+    assert_eq!(origin_of(&*s).as_deref(), Some(ORIGIN_DIRECTORY));
+    let none = HashSet::new();
+    assert_eq!(s.prune_files("o", "r", &none, true).unwrap(), ["a.txt"]);
+    assert!(run(None).unchanged);
+    assert_eq!(origin_of(&*s), None, "origin cleared again");
+    assert!(s.prune_files("o", "r", &none, true).unwrap().is_empty());
 }
