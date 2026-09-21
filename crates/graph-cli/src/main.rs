@@ -192,6 +192,8 @@ struct Tally {
     by_lang: std::collections::BTreeMap<String, usize>,
     seen: std::collections::HashSet<String>,
     skipped: std::collections::BTreeMap<String, Vec<String>>,
+    /// Files whose extraction failed span validation: (path, reason). Not stored.
+    failed: Vec<(String, String)>,
 }
 
 /// Store the pending files in one transaction and fold the outcomes into `t`.
@@ -242,6 +244,9 @@ fn flush_batch(
                 .entry("too large".into())
                 .or_default()
                 .push(rel.clone()),
+            Err(graph_store::StoreError::InvalidSpan(why)) => {
+                t.failed.push((rel.clone(), why));
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -381,6 +386,7 @@ fn index_dir(o: DirOpts) -> Result<()> {
         by_lang,
         seen,
         skipped: batch_skipped,
+        failed,
     } = tally;
     for (r, v) in batch_skipped {
         skipped.entry(r).or_default().extend(v);
@@ -389,6 +395,8 @@ fn index_dir(o: DirOpts) -> Result<()> {
     if o.prune {
         if walk_errors {
             eprintln!("warning: --prune skipped because some paths could not be read");
+        } else if !failed.is_empty() {
+            eprintln!("warning: --prune skipped because some files failed to index");
         } else {
             if files == 0 && !o.force {
                 let would = store.prune_files(o.org, o.repo, &seen, true)?;
@@ -412,6 +420,8 @@ fn index_dir(o: DirOpts) -> Result<()> {
             "org": o.org, "repo": o.repo, "files": files, "unchanged": unchanged, "symbols": symbols, "tokens": tokens,
             "languages": by_lang, "skipped": skipped_n, "skipped_by_reason": skipped,
             "pruned": pruned, "elapsed_ms": ms,
+            "failed": failed.len(),
+            "failed_files": failed.iter().map(|(p, r)| serde_json::json!({"path": p, "reason": r})).collect::<Vec<_>>(),
         });
         out!("{}", serde_json::to_string(&out)?);
     } else {
@@ -443,6 +453,18 @@ fn index_dir(o: DirOpts) -> Result<()> {
                 out!("    ... and {} more (use --json for all)", v.len() - 20);
             }
         }
+        for (p, r) in &failed {
+            out!("  failed: {p}: {r}");
+        }
+    }
+    if !failed.is_empty() {
+        for (p, r) in &failed {
+            eprintln!("error: failed to index {p}: {r}");
+        }
+        bail!(
+            "{} file(s) failed to index (all other files were stored)",
+            failed.len()
+        );
     }
     Ok(())
 }
