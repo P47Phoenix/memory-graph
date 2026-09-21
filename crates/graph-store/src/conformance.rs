@@ -56,7 +56,15 @@ pub const CASES: &[(&str, Case)] = &[
 pub fn run_all(make: &dyn Fn() -> Harness) {
     for (name, case) in CASES {
         eprintln!("conformance: {name}");
-        case(&make());
+        let h = make();
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(&h))) {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            panic!("conformance case `{name}` failed: {msg}");
+        }
     }
 }
 
@@ -433,26 +441,38 @@ fn reopen_persists(h: &Harness) {
 fn snapshot_is_frozen(h: &Harness) {
     let s = open(h);
     seed(&*s);
+    let old_toks = s.file_tokens("o2", "r2", "main.zig").unwrap().unwrap();
+    let old_id = old_toks[0].id;
+    let syms_before = s.search_symbols(&SymbolQuery::new("*")).unwrap();
     let snap = s.snapshot().unwrap();
     s.index_bytes("o3", "r3", "new.txt", b"foo", None).unwrap();
     s.ingest_file("o2", "r2", "main.zig", "zig", &plain("gone\n"))
         .unwrap();
+    s.ingest_file("o1", "r1", "lib.rs", "rust", &plain("zzz\n"))
+        .unwrap();
+    // Through the snapshot: exactly the state before the writes.
+    assert!(snap.search(&Query::new("gone")).unwrap().is_empty());
+    let mut zig = Query::new("foo");
+    zig.language = Some("zig".into());
+    assert_eq!(snap.search(&zig).unwrap().len(), 1, "zig foo still present");
+    assert_eq!(snap.search(&Query::new("foo")).unwrap().len(), 4);
+    let toks = snap.file_tokens("o2", "r2", "main.zig").unwrap().unwrap();
+    assert_eq!(toks, old_toks, "file_tokens returns the old tokens");
+    assert_eq!(snap.count_nodes(NodeKind::File).unwrap(), 2);
     assert_eq!(
-        snap.search(&Query::new("foo")).unwrap().len(),
-        4,
-        "snapshot ignores later writes"
+        snap.search_symbols(&SymbolQuery::new("*")).unwrap(),
+        syms_before
     );
-    assert_eq!(snap.describe(None, None).unwrap().len(), 2);
-    assert_eq!(
-        snap.describe(None, None).unwrap(),
-        snap.describe_by_scan(None, None).unwrap()
-    );
-    assert_eq!(
-        s.search(&Query::new("foo")).unwrap().len(),
-        4,
-        "live: 3 rust + o3 foo, zig replaced"
-    );
+    assert_eq!(snap.get(old_id).unwrap().unwrap(), old_toks[0]);
+    assert_eq!(snap.parent(old_id).unwrap().unwrap().kind, NodeKind::File);
+    assert!(snap.file_tokens("o3", "r3", "new.txt").unwrap().is_none());
+    let d = snap.describe(None, None).unwrap();
+    assert_eq!(d.len(), 2);
+    assert!(d.iter().all(|r| r.org != "o3"), "new org not visible");
+    assert_eq!(d, snap.describe_by_scan(None, None).unwrap());
+    // Live store sees the writes.
     assert_eq!(s.describe(None, None).unwrap().len(), 3);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 3);
     drop(snap);
     let fresh = s.snapshot().unwrap();
     assert_eq!(fresh.search(&Query::new("gone")).unwrap().len(), 1);

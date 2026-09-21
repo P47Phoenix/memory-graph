@@ -50,7 +50,10 @@ pub trait StoreRead {
     fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>>;
     /// What is indexed (optionally scoped to an org and/or repo).
     fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>>;
-    /// Reference implementation of `describe` that scans every node. Backends
+    /// Reference implementation of `describe` that scans every node. Kept on
+    /// this trait (not a separate oracle trait) because the conformance suite
+    /// reaches it through `dyn Store` and `dyn StoreRead`; a split needs
+    /// supertrait plumbing for no gain yet. Backends
     /// must return the same as `describe`; the conformance suite checks it.
     #[doc(hidden)]
     fn describe_by_scan(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>>;

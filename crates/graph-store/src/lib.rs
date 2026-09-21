@@ -785,43 +785,6 @@ impl RedbStore {
         self.registry.register(e);
     }
 
-    /// Index raw file bytes: the single entry point shared by the CLI and
-    /// library users. Rejects non-UTF-8 and oversized input (nothing stored),
-    /// normalizes the path, lowercases the language (default: detected from the
-    /// extension) and uses the fallback tokenizer.
-    pub fn index_bytes(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        bytes: &[u8],
-        language: Option<&str>,
-    ) -> Result<IngestStats> {
-        self.index_bytes_with_origin(org, repo, path, bytes, language, None)
-    }
-
-    /// Like `index_bytes`, recording `origin` on the file node (replacing any
-    /// earlier value: the last ingest wins).
-    pub fn index_bytes_with_origin(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        bytes: &[u8],
-        language: Option<&str>,
-        origin: Option<&str>,
-    ) -> Result<IngestStats> {
-        self.index_bytes_opts(
-            org,
-            repo,
-            path,
-            bytes,
-            language,
-            origin,
-            IndexOptions::default(),
-        )
-    }
-
     /// Like `index_bytes_with_origin` with explicit `opts` (e.g. `reindex`).
     #[allow(clippy::too_many_arguments)]
     pub fn index_bytes_opts(
@@ -899,20 +862,6 @@ impl RedbStore {
             }
         }
         Ok(n)
-    }
-
-    /// Index one file (idempotent: re-indexing replaces the file's subtree).
-    /// The extraction's symbols must have spans; parents are derived from
-    /// span containment and tokens attach to their innermost symbol.
-    pub fn ingest_file(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        language: &str,
-        ex: &Extraction,
-    ) -> Result<IngestStats> {
-        self.ingest_file_with_origin(org, repo, path, language, ex, None)
     }
 
     /// `ingest_file` that also sets the file's `origin` (see `Node::origin`).
