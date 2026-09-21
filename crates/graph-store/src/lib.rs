@@ -107,6 +107,48 @@ fn open_failed(path: &Path, e: &DatabaseError) -> StoreError {
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// Check that an extraction's symbols and tokens nest properly (no span starts
+/// after it ends, none partially overlaps an enclosing symbol). The only span
+/// validation: every write path runs it before its first write.
+fn validate_spans(ex: &Extraction) -> Result<()> {
+    let mut syms: Vec<_> = ex.symbols.iter().map(|s| s.span).collect();
+    syms.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+    let mut toks: Vec<_> = ex.tokens.iter().map(|t| t.span).collect();
+    toks.sort_by_key(|t| t.start);
+    let (mut si, mut ti) = (0, 0);
+    let mut open: Vec<u32> = Vec::new();
+    while si < syms.len() || ti < toks.len() {
+        let take_sym = si < syms.len() && (ti >= toks.len() || syms[si].start <= toks[ti].start);
+        let sp = if take_sym { syms[si] } else { toks[ti] };
+        if take_sym {
+            si += 1;
+        } else {
+            ti += 1;
+        }
+        while open.last().is_some_and(|&end| end <= sp.start) {
+            open.pop();
+        }
+        if sp.start > sp.end {
+            return Err(StoreError::InvalidSpan(format!(
+                "start {} > end {}",
+                sp.start, sp.end
+            )));
+        }
+        if let Some(&end) = open.last() {
+            if sp.end > end {
+                return Err(StoreError::InvalidSpan(format!(
+                    "bytes {}..{} partially overlap an enclosing symbol ending at {end}",
+                    sp.start, sp.end
+                )));
+            }
+        }
+        if take_sym {
+            open.push(sp.end);
+        }
+    }
+    Ok(())
+}
+
 pub struct Store {
     db: Database,
     registry: Registry,
@@ -873,9 +915,11 @@ impl Store {
     /// instead of one per file). Each file is extracted just before it is
     /// stored and its extraction dropped right after, so memory use is bounded
     /// by the sources, not by the number of tokens across the batch. Files
-    /// that are not UTF-8 or too large yield a per-file `Err` and are not
-    /// stored; a storage or span error aborts the whole batch (nothing is
-    /// stored, later files are not extracted). Outcomes are in input order.
+    /// that are not UTF-8, too large, or whose extraction has invalid spans
+    /// (`InvalidSpan`, message prefixed with the path) yield a per-file `Err`
+    /// and are not stored (an already-stored version is left untouched); a
+    /// storage error aborts the whole batch (nothing is stored, later files are
+    /// not extracted). Outcomes are in input order.
     pub fn index_batch(
         &self,
         org: &str,
@@ -909,7 +953,13 @@ impl Store {
                 }
             }
             let ex = self.registry.extract(&lang, src);
-            out.push(Ok(Self::ingest_into(
+            // Validate before touching the transaction so a bad file leaves
+            // no partial writes and only fails itself.
+            if let Err(StoreError::InvalidSpan(why)) = validate_spans(&ex) {
+                out.push(Err(StoreError::InvalidSpan(format!("`{path}`: {why}"))));
+                continue;
+            }
+            out.push(Ok(Self::ingest_validated(
                 &wt,
                 org,
                 repo,
@@ -923,7 +973,23 @@ impl Store {
         Ok(out)
     }
 
+    /// Validate spans (the single `validate_spans` check), then write.
     fn ingest_into(
+        wt: &redb::WriteTransaction,
+        org: &str,
+        repo: &str,
+        path: &str,
+        language: &str,
+        ex: &Extraction,
+        meta: (Option<&str>, Option<&str>),
+    ) -> Result<IngestStats> {
+        validate_spans(ex)?;
+        Self::ingest_validated(wt, org, repo, path, language, ex, meta)
+    }
+
+    /// Write an extraction whose spans `validate_spans` accepted (it relies on
+    /// proper nesting when deriving parents).
+    fn ingest_validated(
         wt: &redb::WriteTransaction,
         org: &str,
         repo: &str,
@@ -1107,23 +1173,6 @@ impl Store {
                     Some(&(id, _)) => (id, NodeKind::Symbol),
                     None => (file_id, NodeKind::File),
                 };
-                let (span_start, span_end) = if take_sym {
-                    (syms[si].span.start, syms[si].span.end)
-                } else {
-                    (toks[ti].span.start, toks[ti].span.end)
-                };
-                if span_start > span_end {
-                    return Err(StoreError::InvalidSpan(format!(
-                        "start {span_start} > end {span_end}"
-                    )));
-                }
-                if let Some(&(_, end)) = open.last() {
-                    if span_end > end {
-                        return Err(StoreError::InvalidSpan(format!(
-                            "bytes {span_start}..{span_end} partially overlap an enclosing symbol ending at {end}"
-                        )));
-                    }
-                }
                 if take_sym {
                     let s = syms[si];
                     si += 1;

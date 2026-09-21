@@ -813,7 +813,7 @@ impl Extractor for CountingExtractor {
 }
 
 #[test]
-fn batch_error_rolls_back_everything_and_extracts_lazily() {
+fn batch_invalid_span_fails_only_that_file() {
     let d = tempfile::tempdir().unwrap();
     let mut s = Store::open(d.path().join("g.redb")).unwrap();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -824,22 +824,126 @@ fn batch_error_rolls_back_everything_and_extracts_lazily() {
         language: Some("count"),
         origin: None,
     };
+    // A previously stored version of the file that will now fail.
+    s.index_bytes("o", "r", "old.c", b"xxxx", Some("count"))
+        .unwrap();
     let files = [
         f("ok1.c", b"xxxx"),
         f("bad.c", b"bad-span"),
-        f("never.c", b"xxxx"),
-        f("never2.c", b"xxxx"),
+        f("old.c", b"bad-again"),
+        f("ok2.c", b"xxxx"),
+    ];
+    let out = s
+        .index_batch("o", "r", &files, IndexOptions::default())
+        .unwrap();
+    assert_eq!(out.len(), 4);
+    assert!(out[0].is_ok() && out[3].is_ok());
+    for i in [1, 2] {
+        match &out[i] {
+            Err(StoreError::InvalidSpan(m)) => {
+                assert!(m.contains(files[i].path), "message names the path: {m}")
+            }
+            other => panic!("expected InvalidSpan, got {other:?}"),
+        }
+    }
+    // Every file was extracted (plus the priming call): no early abort.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert!(s.file_tokens("o", "r", "ok1.c").unwrap().is_some());
+    assert!(s.file_tokens("o", "r", "ok2.c").unwrap().is_some());
+    assert!(s.file_tokens("o", "r", "bad.c").unwrap().is_none());
+    // The failing re-index left the old stored version intact.
+    let old = s.file_tokens("o", "r", "old.c").unwrap().unwrap();
+    assert!(old.is_empty());
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 3);
+    assert_catalog_matches_scan(&s, "after per-file failure");
+}
+
+#[test]
+fn batch_hard_error_still_aborts_and_rolls_back() {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = Store::open(d.path().join("g.redb")).unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    s.register(Box::new(CountingExtractor(calls.clone())));
+    let f = |p, l| BatchFile {
+        path: p,
+        bytes: b"xxxx",
+        language: Some(l),
+        origin: None,
+    };
+    // A NUL in the language is rejected as a whole-batch error.
+    let files = [
+        f("ok1.c", "count"),
+        f("nul.c", "a\0b"),
+        f("never.c", "count"),
     ];
     let err = s
         .index_batch("o", "r", &files, IndexOptions::default())
         .unwrap_err();
-    assert!(matches!(err, StoreError::InvalidSpan(_)), "{err}");
-    // The failing file aborted the batch: later files were never extracted...
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-    // ...and the earlier, successfully staged file was rolled back.
-    assert!(s.file_tokens("o", "r", "ok1.c").unwrap().is_none());
+    assert!(matches!(err, StoreError::Rejected(_)), "{err}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
     assert_eq!(s.count_nodes(NodeKind::Org).unwrap(), 0);
+}
+
+#[test]
+fn raw_string_with_inner_quote_indexes_through_rust_extractor() {
+    let d = tempfile::tempdir().unwrap();
+    let s = rust_store(d.path());
+    let src = "const A: &str = r#\"a\"b\"#;\n";
+    let st = s
+        .index_bytes("o", "r", "a.rs", src.as_bytes(), None)
+        .unwrap();
+    assert_eq!(st.symbols, 1);
+    let toks = s.file_tokens("o", "r", "a.rs").unwrap().unwrap();
+    assert!(!toks.is_empty());
+    for t in &toks {
+        let sp = t.span.unwrap();
+        assert_eq!(&src[sp.start as usize..sp.end as usize], t.name);
+    }
+    assert!(toks.iter().any(|t| t.name == "r#\"a\"b\"#"));
+}
+
+struct OldTokenizerRust;
+impl Extractor for OldTokenizerRust {
+    fn language(&self) -> &str {
+        "rust"
+    }
+    fn version(&self) -> String {
+        // What the Rust extractor reported before its raw-string tokens (#16).
+        "rust-syn-1+tok1".to_string()
+    }
+    fn extract(&self, source: &str) -> Extraction {
+        Extraction {
+            has_errors: false,
+            symbols: vec![],
+            tokens: tokenize(source),
+        }
+    }
+}
+
+#[test]
+fn files_indexed_with_previous_tokenizer_version_reindex() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("g.redb");
+    let src = b"const A: &str = r#\"a\"b\"#;\n";
+    {
+        let mut old = Store::open(&path).unwrap();
+        old.register(Box::new(OldTokenizerRust));
+        assert!(
+            !old.index_bytes("o", "r", "a.rs", src, None)
+                .unwrap()
+                .unchanged
+        );
+        assert!(
+            old.index_bytes("o", "r", "a.rs", src, None)
+                .unwrap()
+                .unchanged
+        );
+    }
+    let mut s = Store::open(&path).unwrap();
+    s.register(Box::new(graph_lang_rust::RustExtractor));
+    let st = s.index_bytes("o", "r", "a.rs", src, None).unwrap();
+    assert!(st.replaced && !st.unchanged && st.symbols == 1);
 }
 
 #[test]
@@ -1426,6 +1530,7 @@ fn catalog_equals_scan_after_scripted_mutations() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Store::open(dir.path().join("g.redb")).unwrap();
     s.register(Box::new(graph_lang_rust::RustExtractor));
+    s.register(Box::new(CountingExtractor(Default::default())));
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut rnd = move |n: u64| {
         seed ^= seed << 13;
@@ -1471,13 +1576,21 @@ fn catalog_equals_scan_after_scripted_mutations() {
                         origin: None,
                     },
                     BatchFile {
+                        path: "fail.count",
+                        bytes: b"bad-span",
+                        language: Some("count"),
+                        origin: Some("directory"),
+                    },
+                    BatchFile {
                         path: "b2.rs",
                         bytes: SRCS[0].as_bytes(),
                         language: Some("rust"),
                         origin: Some("directory"),
                     },
                 ];
-                s.index_batch(org, repo, &files, reindex).unwrap();
+                let out = s.index_batch(org, repo, &files, reindex).unwrap();
+                assert!(matches!(out[2], Err(StoreError::InvalidSpan(_))));
+                assert!(out[3].is_ok());
             }
             3 => {
                 let keep: std::collections::HashSet<String> = (0..6)
@@ -1617,13 +1730,13 @@ fn hard_failure_mid_batch_leaves_catalog_equal_to_scan() {
     let before = s.describe(None, None).unwrap();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     s.register(Box::new(CountingExtractor(calls)));
-    let f = |p, b: &'static [u8]| BatchFile {
+    let f = |p, l| BatchFile {
         path: p,
-        bytes: b,
-        language: Some("count"),
+        bytes: b"xxxx",
+        language: Some(l),
         origin: None,
     };
-    let files = [f("ok1.c", b"xxxx"), f("bad.c", b"bad-span")];
+    let files = [f("ok1.c", "count"), f("nul.c", "a\0b")];
     assert!(s
         .index_batch("o1", "newrepo", &files, IndexOptions::default())
         .is_err());

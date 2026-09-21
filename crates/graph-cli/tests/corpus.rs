@@ -1,7 +1,7 @@
 //! Checks over the vendored public test corpus (testdata/corpus): the manifest
 //! is consistent and public-only, cross-repo links resolve, and every token of
 //! every file is parsed with exact spans and stored in the graph.
-use graph_core::tokenizer::tokenize;
+use graph_core::tokenizer::{tokenize, tokenize_with, TokenizerOptions};
 use graph_core::{detect_language_from_content, TokenClass};
 use graph_store::{BatchFile, Query, Store};
 use serde_json::Value;
@@ -316,7 +316,12 @@ fn every_parsed_token_is_stored() {
                 }
                 // Stored tokens are identical to the parser's, in text, class and span.
                 let stored = store.file_tokens(org, repo, rel).unwrap().unwrap();
-                let parsed = tokenize(src);
+                let parsed = tokenize_with(
+                    src,
+                    TokenizerOptions {
+                        rust_literals: lang == "rust",
+                    },
+                );
                 assert_eq!(stored.len(), parsed.len(), "{repo}/{rel}");
                 for (a, b) in stored.iter().zip(&parsed) {
                     assert_eq!(
@@ -452,4 +457,38 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
         }
     }
     assert!(checked > 0);
+}
+
+/// The language-agnostic fallback tokenizer must not change for non-Rust
+/// languages: the Rust-only raw/byte-string forms sit behind
+/// `TokenizerOptions::rust_literals`. Pins a hash of the (text, class, span)
+/// stream of every non-Rust corpus file, computed on the tokenizer before
+/// raw-string support existed. If this fails, either the default tokenizer
+/// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
+#[test]
+fn non_rust_corpus_token_streams_are_unchanged() {
+    const EXPECTED_FILES: usize = 604;
+    const EXPECTED_HASH: u64 = 5439090845201774130;
+    let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
+    for r in manifest()["repos"].as_array().unwrap() {
+        let dir = corpus_dir().join(r["dir"].as_str().unwrap());
+        for rel in files(&dir) {
+            let src = std::fs::read_to_string(dir.join(&rel)).unwrap();
+            if detect_language_from_content(&rel, &src) == "rust" {
+                continue;
+            }
+            n += 1;
+            for t in tokenize(&src) {
+                let line = format!("{:?}|{:?}|{:?}\n", t.text, t.class, t.span);
+                for b in line.bytes() {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (n, h),
+        (EXPECTED_FILES, EXPECTED_HASH),
+        "non-Rust corpus tokens changed"
+    );
 }

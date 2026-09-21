@@ -4,7 +4,7 @@
 //! refuses to lex broken input, so tokens always come from
 //! `graph_core::tokenizer` (exact spans, comments kept). A file that does not
 //! parse yields tokens only and is flagged `has_errors`.
-use graph_core::tokenizer::tokenize;
+use graph_core::tokenizer::{tokenize_with, TokenizerOptions};
 use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -17,11 +17,16 @@ impl Extractor for RustExtractor {
     }
 
     fn version(&self) -> String {
-        format!("rust-syn-1+tok{}", graph_core::tokenizer::TOKENIZER_VERSION)
+        format!("rust-syn-2+tok{}", graph_core::tokenizer::TOKENIZER_VERSION)
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize(source);
+        let tokens = tokenize_with(
+            source,
+            TokenizerOptions {
+                rust_literals: true,
+            },
+        );
         // syn strips a BOM before lexing, so its byte ranges start after it.
         let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
         let file = match syn::parse_file(&source[bom..]) {

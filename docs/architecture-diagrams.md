@@ -236,7 +236,7 @@ sequenceDiagram
     Store-->>CLI: one outcome per file
 ```
 
-Non-UTF-8 or oversized files give a per-file error and are not stored; a storage or span error aborts the whole batch. `index --prune` removes only files marked `origin = directory`; `index-file` files are never pruned unless a directory run re-indexes them.
+Non-UTF-8 or oversized files give a per-file error and are not stored; a file whose extraction fails span validation (`InvalidSpan`) is reported as failed with its path and reason and is not stored (other files in the batch still are; `index` exits non-zero and skips `--prune`); a storage error aborts the whole batch. `index --prune` removes only files marked `origin = directory`; `index-file` files are never pruned unless a directory run re-indexes them.
 
 ---
 
