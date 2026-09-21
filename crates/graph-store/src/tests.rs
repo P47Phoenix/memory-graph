@@ -1800,6 +1800,55 @@ fn redb_passes_conformance_suite() {
 }
 
 #[test]
+fn v2_passes_conformance_suite() {
+    conformance::run_all(&|| {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("g2.redb");
+        conformance::Harness {
+            open: Box::new(move |ex| open_store(Backend::RedbV2, &path, ex)),
+            exclusive: true,
+            guard: Some(Box::new(d)),
+        }
+    });
+}
+
+/// The point of the differential harness: v1 is the oracle for v2.
+#[test]
+fn v1_vs_v2_differential() {
+    let d = tempfile::tempdir().unwrap();
+    let a = open_store(Backend::Redb, &d.path().join("a.redb"), vec![]).unwrap();
+    let b = open_store(Backend::RedbV2, &d.path().join("b.redb"), vec![]).unwrap();
+    conformance::run_differential(&*a, &*b);
+}
+
+#[test]
+fn v1_and_v2_files_refuse_each_other_untouched() {
+    let d = tempfile::tempdir().unwrap();
+    let (p1, p2) = (d.path().join("a.redb"), d.path().join("b.redb"));
+    open_store(Backend::Redb, &p1, vec![])
+        .unwrap()
+        .index_bytes("o", "r", "a.txt", b"foo", None)
+        .unwrap();
+    open_store(Backend::RedbV2, &p2, vec![])
+        .unwrap()
+        .index_bytes("o", "r", "a.txt", b"foo", None)
+        .unwrap();
+    let before = std::fs::read(&p1).unwrap();
+    assert!(matches!(
+        open_store(Backend::RedbV2, &p1, vec![]),
+        Err(StoreError::Rejected(_))
+    ));
+    assert!(matches!(
+        open_store(Backend::Redb, &p2, vec![]),
+        Err(StoreError::SchemaMismatch { found: 3 })
+    ));
+    assert_eq!(std::fs::read(&p1).unwrap(), before, "v1 file untouched");
+    // Reopening v2 keeps its data.
+    let s = open_store(Backend::RedbV2, &p2, vec![]).unwrap();
+    assert_eq!(s.search(&Query::new("foo")).unwrap().len(), 1);
+}
+
+#[test]
 fn redb_differential_against_itself() {
     let mk = || {
         let d = tempfile::tempdir().unwrap();
