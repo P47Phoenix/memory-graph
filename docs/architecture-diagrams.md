@@ -18,7 +18,7 @@ Data model first, because it is the heart of the design.
 4. [Side by side: 525 B versus about 21 B per token](#4-side-by-side-525-b-versus-about-21-b-per-token)
 5. [System overview: crates and dependencies](#5-system-overview-crates-and-dependencies)
 6. [Ingest of one file (today)](#6-ingest-of-one-file-today)
-7. [Re-index with the fingerprint skip (today)](#7-re-index-with-the-fingerprint-skip-today)
+7. [Directory index with the fingerprint skip (today)](#7-directory-index-with-the-fingerprint-skip-today)
 8. [Search with roll-up by grain](#8-search-with-roll-up-by-grain)
 9. [describe and filter validation](#9-describe-and-filter-validation)
 10. [Snapshot open, pin and retry (proposed)](#10-snapshot-open-pin-and-retry-proposed)
@@ -494,7 +494,7 @@ sequenceDiagram
     CLI->>Remote: search(...)
     Remote->>D: try local Unix socket (db path plus .sock)
     alt daemon reachable
-        Remote->>D: length-prefixed request, protocol_version in handshake
+        Remote->>D: framed request (encoding TBD), protocol_version in handshake
         D->>redb: in-process snapshot read
         redb-->>D: rows
         D-->>Remote: response

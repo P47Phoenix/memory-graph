@@ -99,6 +99,9 @@ Rejected: option 2 as the default (snapshot cost scales with the number of shard
 Total new spike effort: about 3-4 d beyond story 13. Net delta to the ADR estimate: Q5(a) adds about 6-9 d (core becomes about 52-56 d); Q4 as recommended adds nothing until story 13's evidence arrives.
 
 ## Decisions requested of the human architects
+
+**Decided 2026-09-20: Q4 shard by (org, repo) with build deferred; Q5 daemon. Still open: Windows/named pipes, wire encoding, spike approval.**
+
 1. Q5: approve (a) daemon in `memory-graph serve` with (b) as the no-daemon fallback; approve a versioned local-socket protocol; state Windows position.
 2. Q4: approve `(org, repo)` partition key and the id layout; agree to defer stories 14-17 until story 6 + 13 evidence.
 3. Approve spikes S1-S3 before story 10 is scheduled.
