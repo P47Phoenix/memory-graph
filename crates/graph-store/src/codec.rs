@@ -364,6 +364,67 @@ mod tests {
         }
     }
 
+    fn put(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    #[test]
+    fn overlong_varint_tenth_byte_is_rejected() {
+        // term = nine 0xff bytes then 0x02 (bit 64 set): overflows u64.
+        let mut b = vec![1, 0, 1];
+        b.extend([0xff; 9]);
+        b.push(0x02);
+        b.extend([0; 8]); // class, parent, six span fields
+        assert!(decode(&b).is_err());
+        // u64::MAX (tenth byte 0x01) is fine.
+        let mut ok = vec![1, 0, 1];
+        put(&mut ok, u64::MAX);
+        ok.extend([0; 8]);
+        assert_eq!(decode(&ok).unwrap().tokens[0].term, u64::MAX);
+    }
+
+    #[test]
+    fn parent_bounds_are_strict() {
+        let base = sample();
+        // Symbol whose parent is itself (must be an earlier symbol).
+        let mut s = base.clone();
+        s.symbols[0].parent = Some(0);
+        assert!(decode(&encode(&s)).is_err());
+        // Symbol 1 with parent 1.
+        let mut s = base.clone();
+        s.symbols[1].parent = Some(1);
+        assert!(decode(&encode(&s)).is_err());
+        // Token parent == number of symbols; symbols themselves valid.
+        let mut s = base.clone();
+        s.tokens[0].parent = Some(2);
+        assert!(decode(&encode(&s)).is_err());
+        // Last valid parents are accepted.
+        let mut s = base;
+        s.tokens[0].parent = Some(1);
+        assert_eq!(decode(&encode(&s)).unwrap(), s);
+    }
+
+    /// An extreme delta after a nonzero base must be an error, not an
+    /// overflow panic (regression for the `checked_add` fix).
+    #[test]
+    fn extreme_delta_after_nonzero_base_is_an_error() {
+        let mut first = tok(0);
+        first.span = sp(5, 5, 1, 1, 1, 1);
+        let mut b = encode(&Stream {
+            symbols: vec![],
+            tokens: vec![first],
+        });
+        b[2] = 2; // two tokens
+        b.extend([0, 0, 0]); // term, class, parent
+        put(&mut b, u64::MAX - 1); // unzigzag = i64::MAX
+        b.extend([0; 5]);
+        assert!(decode(&b).is_err());
+    }
+
     #[test]
     fn corrupt_input_is_an_error_not_a_panic() {
         let good = encode(&sample());

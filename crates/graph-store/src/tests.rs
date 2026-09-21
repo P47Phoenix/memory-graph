@@ -1895,6 +1895,141 @@ fn v1_vs_v2_zero_length_and_equal_span_symbols() {
     assert_eq!(toks(&*a), toks(&*b));
 }
 
+fn v2_ext(tokens: &[&str], syms: &[(&str, Option<&str>)]) -> graph_core::Extraction {
+    use graph_core::{Extraction, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+    let sp = |s: u32, e: u32| Span {
+        start: s,
+        end: e,
+        start_line: 1,
+        start_col: s + 1,
+        end_line: 1,
+        end_col: e + 1,
+    };
+    let n = tokens.len() as u32;
+    Extraction {
+        has_errors: false,
+        symbols: syms
+            .iter()
+            .map(|(name, lk)| SymbolDecl {
+                name: (*name).into(),
+                kind: SymbolKind::Type,
+                lang_kind: lk.map(Into::into),
+                span: sp(0, n * 2),
+            })
+            .collect(),
+        tokens: tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TokenDecl {
+                text: (*t).into(),
+                class: TokenClass::Identifier,
+                span: sp(i as u32 * 2, i as u32 * 2 + 1),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn v2_get_bounds_and_tags() {
+    let d = tempfile::tempdir().unwrap();
+    let s = open_store(Backend::RedbV2, &d.path().join("b.redb"), vec![]).unwrap();
+    // 1 symbol, 4 tokens.
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &v2_ext(&["a", "b", "c", "d"], &[("S", None)]),
+    )
+    .unwrap();
+    let toks = s.file_tokens("o", "r", "x.rs").unwrap().unwrap();
+    let sym = s.parent(toks[0].id).unwrap().unwrap();
+    assert_eq!(sym.kind, NodeKind::Symbol);
+    assert_eq!(s.get(sym.id).unwrap().unwrap(), sym);
+    assert_eq!(s.parent(sym.id).unwrap().unwrap().kind, NodeKind::File);
+    let tag = |id: u64, t: u64, idx: u64| (id & 0x3fff_ffff_0000_0000) | (t << 62) | idx;
+    let any = toks[0].id;
+    // One past the last symbol / token, and a symbol index that is a valid
+    // token index, are all absent.
+    assert!(s.get(tag(any, 1, 1)).unwrap().is_none());
+    assert!(s.get(tag(any, 1, 3)).unwrap().is_none());
+    assert!(s.get(tag(any, 2, 4)).unwrap().is_none());
+    assert!(s.get(tag(any, 2, 3)).unwrap().is_some());
+    assert!(s.get(tag(any, 3, 0)).unwrap().is_none());
+    assert!(s.get(tag(any, 1, 0)).unwrap().is_some());
+    // A token index that is a valid symbol index but wrong tag stays a token.
+    assert_eq!(
+        s.get(tag(any, 2, 0)).unwrap().unwrap().kind,
+        NodeKind::Token
+    );
+}
+
+#[test]
+fn v2_symbol_filters_and_stale_index() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("b.redb");
+    let st = V2Store::open(&path).unwrap();
+    let ex = v2_ext(&["a", "b"], &[("S", None)]);
+    st.ingest_file("o", "r", "one.rs", "rust", &ex).unwrap();
+    st.ingest_file("o", "r", "two.rs", "rust", &ex).unwrap();
+    let mut q = SymbolQuery::new("S");
+    assert_eq!(st.search_symbols(&q).unwrap().len(), 2);
+    q.file = Some("two.rs".into());
+    let hits = st.search_symbols(&q).unwrap();
+    assert_eq!((hits.len(), hits[0].file.as_str()), (1, "two.rs"));
+    q.file = Some("none.rs".into());
+    assert!(st.search_symbols(&q).unwrap().is_empty());
+    // Stale index entries are skipped: index == symbol count, a token id,
+    // a missing file.
+    let sym = st
+        .file_tokens("o", "r", "one.rs")
+        .unwrap()
+        .and_then(|t| st.parent(t[0].id).unwrap())
+        .unwrap();
+    let base = sym.id & 0x3fff_ffff_0000_0000;
+    for id in [
+        (1u64 << 62) | base | 1,
+        (2u64 << 62) | base,
+        (1u64 << 62) | (99 << 32),
+    ] {
+        st.inject_symbol_index("S", id);
+    }
+    assert_eq!(st.search_symbols(&SymbolQuery::new("S")).unwrap().len(), 2);
+}
+
+#[test]
+fn v2_replace_and_prune_clean_symbol_index_and_catalog() {
+    let d = tempfile::tempdir().unwrap();
+    let s = open_store(Backend::RedbV2, &d.path().join("b.redb"), vec![]).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &v2_ext(&["a"], &[("foo", Some("struct"))]),
+    )
+    .unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &v2_ext(&["a"], &[("bar", Some("enum"))]),
+    )
+    .unwrap();
+    // The old name must be gone from the index, not resolve to the new symbol.
+    assert!(s
+        .search_symbols(&SymbolQuery::new("foo"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(s.search_symbols(&SymbolQuery::new("bar")).unwrap().len(), 1);
+    let d1 = s.describe(None, None).unwrap();
+    assert_eq!(d1, s.describe_by_scan(None, None).unwrap());
+    let kinds = &d1[0].languages["rust"].symbol_kinds;
+    assert_eq!(kinds.len(), 1);
+    assert!(kinds.contains_key("type/enum"), "{kinds:?}");
+}
+
 #[test]
 fn v1_and_v2_files_refuse_each_other_untouched() {
     let d = tempfile::tempdir().unwrap();

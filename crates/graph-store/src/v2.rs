@@ -733,6 +733,17 @@ impl<'t> W<'t> {
 }
 
 impl V2Store {
+    /// Test hook: add a raw symbol-index entry (to simulate a stale index).
+    #[cfg(test)]
+    pub(crate) fn inject_symbol_index(&self, name: &str, id: u64) {
+        let wt = self.db.begin_write().unwrap();
+        wt.open_multimap_table(SYMBOLS)
+            .unwrap()
+            .insert(name, id)
+            .unwrap();
+        wt.commit().unwrap();
+    }
+
     /// Open or create a v2 database file. Refuses (without writing) a file
     /// that is not v2: a v1 file must be re-indexed or migrated (ADR story 12).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
