@@ -277,6 +277,45 @@ fn main() {
         })
         .unwrap_or_default();
     println!("\npeak RSS of this process (both stores, queries): {rss}");
+    // Logical bytes of the two v2 tables that hold token data (keys plus
+    // values as redb stores them, before page slack): the file size only
+    // moves in large steps, this shows small layout changes.
+    {
+        use redb::{ReadableTable, ReadableTableMetadata};
+        let db = redb::Database::open(&paths[1].1).unwrap();
+        let rt = db.begin_read().unwrap();
+        let stream: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("stream");
+        let t = rt.open_table(stream).unwrap();
+        let sbytes: usize = t.iter().unwrap().map(|r| r.unwrap().1.value().len()).sum();
+        println!(
+            "\nv2 stream table: {} rows, {} value bytes",
+            t.len().unwrap(),
+            sbytes
+        );
+        // The `post` value type differs between layouts; read it as raw bytes
+        // when it is one, else as u64.
+        let post: redb::TableDefinition<(u64, u64), &[u8]> = redb::TableDefinition::new("post");
+        match rt.open_table(post) {
+            Ok(t) => {
+                let b: usize = t.iter().unwrap().map(|r| r.unwrap().1.value().len()).sum();
+                println!(
+                    "v2 post table: {} rows, {} value bytes",
+                    t.len().unwrap(),
+                    b
+                );
+            }
+            Err(_) => {
+                let post: redb::TableDefinition<(u64, u64), u64> =
+                    redb::TableDefinition::new("post");
+                let t = rt.open_table(post).unwrap();
+                println!(
+                    "v2 post table: {} rows, {} value bytes (u64)",
+                    t.len().unwrap(),
+                    t.len().unwrap() * 8
+                );
+            }
+        }
+    }
     for (name, p) in paths {
         let before = std::fs::metadata(&p).unwrap().len();
         let mut db = redb::Database::open(&p).unwrap();

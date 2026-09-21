@@ -41,7 +41,7 @@ use std::rc::Rc;
 type Result<T> = std::result::Result<T, StoreError>;
 
 /// Layout version of a v2 file (v1 is 1 and 2).
-pub const V2_SCHEMA_VERSION: u64 = 3;
+pub const V2_SCHEMA_VERSION: u64 = 4;
 
 /// term text -> term id.
 const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
@@ -49,8 +49,8 @@ const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
 const DICT_REV: TableDefinition<u64, &str> = TableDefinition::new("dict_rev");
 /// file id -> encoded stream.
 const STREAMS: TableDefinition<u64, &[u8]> = TableDefinition::new("stream");
-/// (term id, file id) -> number of occurrences of the term in the file.
-const POST: TableDefinition<(u64, u64), u64> = TableDefinition::new("post");
+/// (term id, file id) -> occurrence count and token ordinals (see `codec::encode_posting`).
+const POST: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("post");
 
 const TAG_SYM: u64 = 1;
 const TAG_TOK: u64 = 2;
@@ -86,6 +86,13 @@ fn blank(id: NodeId, parent: Option<NodeId>, kind: NodeKind, name: String) -> No
     }
 }
 
+/// Result of [`V2Store::vacuum`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumStats {
+    pub terms_removed: usize,
+    pub terms_kept: usize,
+}
+
 /// The v2 backend: one redb file.
 pub struct V2Store {
     db: Database,
@@ -103,7 +110,7 @@ struct R {
     streams: redb::ReadOnlyTable<u64, &'static [u8]>,
     dict: redb::ReadOnlyTable<&'static str, u64>,
     rev: redb::ReadOnlyTable<u64, &'static str>,
-    post: redb::ReadOnlyTable<(u64, u64), u64>,
+    post: redb::ReadOnlyTable<(u64, u64), &'static [u8]>,
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
     cat: redb::ReadOnlyTable<&'static str, u64>,
     kids: redb::ReadOnlyMultimapTable<u64, u64>,
@@ -641,7 +648,7 @@ impl R {
                 continue;
             };
             // Only the symbol section is decoded, not the tokens.
-            let syms = codec::decode_lazy(raw.value())?.symbols;
+            let syms = codec::decode_lazy(raw.value())?.symbols()?;
             let c = &files[&fid];
             let mut rows: Vec<((u32, String, u64), SymbolHit)> = Vec::new();
             for &i in &by_file[&fid] {
@@ -695,17 +702,17 @@ impl R {
         // Candidate files come from the postings; token, symbol and class
         // reads decode the stream, file/repo/org roll-ups without a class
         // filter use the posting counts alone.
-        let mut cands: Vec<(u64, u64)> = Vec::new();
+        let mut cands: Vec<(u64, Vec<u8>)> = Vec::new();
         for r in self.post.range((term, 0)..=(term, u64::MAX))? {
             let (k, v) = r?;
-            cands.push((k.value().1, v.value()));
+            cands.push((k.value().1, v.value().to_vec()));
         }
         let counts_only =
             q.class.is_none() && matches!(q.grain, Grain::File | Grain::Repo | Grain::Org);
         let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
         let mut files: HashMap<u64, FileCtx> = HashMap::new();
-        let mut order: Vec<(u64, u64)> = Vec::new();
-        for (fid, n_post) in cands {
+        let mut order: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (fid, post) in cands {
             self.ctx(fid, &mut files)?;
             let c = &files[&fid];
             if want_lang
@@ -716,7 +723,7 @@ impl R {
             {
                 continue;
             }
-            order.push((fid, n_post));
+            order.push((fid, post));
         }
         // Sorted-by-path order: every later file sorts after every row of the
         // earlier ones, so once the limit is met at a group boundary the walk
@@ -733,7 +740,7 @@ impl R {
         type Key = (String, String, String, u32, u64);
         let mut rows: BTreeMap<Key, Hit> = BTreeMap::new();
         let mut last_group: Option<(u64, u64, u64)> = None;
-        for (fid, n_post) in order {
+        for (fid, post) in order {
             let c = &files[&fid];
             let group = match q.grain {
                 Grain::Org => (c.org.id, 0, 0),
@@ -780,10 +787,11 @@ impl R {
                 _ => {}
             };
             if counts_only {
-                let mut hit = base_hit(n_post as usize);
+                let n_post = codec::posting_count(&post)?;
+                let mut hit = base_hit(n_post);
                 roll(&mut hit);
                 rows.entry(file_key(q.grain))
-                    .and_modify(|h| h.count += n_post as usize)
+                    .and_modify(|h| h.count += n_post)
                     .or_insert(hit);
                 continue;
             }
@@ -791,17 +799,25 @@ impl R {
                 .streams
                 .get(fid)?
                 .ok_or_else(|| StoreError::Corrupt(format!("file {fid} without stream")))?;
-            let mut lazy = codec::decode_lazy(raw.value())?;
-            // Walk the token section once, keeping only the matches.
+            let lazy = codec::decode_lazy(raw.value())?;
+            // Read only the postings' ordinals through the checkpoints.
             let mut matches: Vec<(usize, TokRec)> = Vec::new();
-            lazy.tokens(|ord, t| {
+            lazy.tokens_at(&codec::posting_ordinals(&post)?, |ord, t| {
                 if t.term == term && q.class.is_none_or(|c| c == t.class) {
                     matches.push((ord, t.clone()));
                 }
-                true
             })?;
-            let syms = &lazy.symbols;
+            if matches.is_empty() {
+                continue;
+            }
+            // Only token and symbol grain read the enclosing symbols.
             let need_chain = matches!(q.grain, Grain::Token | Grain::Symbol);
+            let syms = if need_chain {
+                lazy.symbols()?
+            } else {
+                Vec::new()
+            };
+            let syms = &syms;
             for (ord, t) in matches {
                 // Enclosing symbols, innermost first.
                 let mut chain: Vec<Node> = Vec::new();
@@ -889,7 +905,7 @@ struct W<'t> {
     dict: redb::Table<'t, &'static str, u64>,
     rev: redb::Table<'t, u64, &'static str>,
     streams: redb::Table<'t, u64, &'static [u8]>,
-    post: redb::Table<'t, (u64, u64), u64>,
+    post: redb::Table<'t, (u64, u64), &'static [u8]>,
     sym_idx: redb::MultimapTable<'t, &'static str, u64>,
     cat: redb::Table<'t, &'static str, u64>,
 }
@@ -1043,6 +1059,47 @@ impl V2Store {
             db,
             registry: Registry::default(),
         })
+    }
+
+    /// Garbage-collect the dictionary (ADR story 3): remove every term that
+    /// no posting, symbol name or symbol kind refers to any more. Replacing
+    /// or pruning a file leaves its terms behind; term ids are never reused,
+    /// so removing a dead one cannot change any live id. One write
+    /// transaction; it reads every stream's symbol section and the postings'
+    /// keys, so its cost is linear in the store.
+    pub fn vacuum(&self) -> Result<VacuumStats> {
+        let wt = self.db.begin_write()?;
+        let stats = {
+            let w = W::new(&wt)?;
+            let mut live: HashSet<u64> = HashSet::new();
+            for r in w.post.iter()? {
+                live.insert(r?.0.value().0);
+            }
+            for r in w.streams.iter()? {
+                for s in codec::decode_lazy(r?.1.value())?.symbols()? {
+                    live.insert(s.name);
+                    live.extend(s.lang_kind);
+                }
+            }
+            let mut dead: Vec<(u64, String)> = Vec::new();
+            for r in w.rev.iter()? {
+                let (id, text) = r?;
+                if !live.contains(&id.value()) {
+                    dead.push((id.value(), text.value().to_string()));
+                }
+            }
+            let mut w = w;
+            for (id, text) in &dead {
+                w.dict.remove(text.as_str())?;
+                w.rev.remove(*id)?;
+            }
+            VacuumStats {
+                terms_removed: dead.len(),
+                terms_kept: live.len(),
+            }
+        };
+        wt.commit()?;
+        Ok(stats)
     }
 
     pub fn register(&mut self, e: Box<dyn Extractor>) {
@@ -1383,12 +1440,13 @@ impl V2Store {
                 });
             }
         }
-        let mut counts: HashMap<u64, u64> = HashMap::new();
-        for t in &stream.tokens {
-            *counts.entry(t.term).or_default() += 1;
+        let mut ords: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, t) in stream.tokens.iter().enumerate() {
+            ords.entry(t.term).or_default().push(i);
         }
-        for (term, n) in counts {
-            w.post.insert((term, file_id), n)?;
+        for (term, o) in ords {
+            w.post
+                .insert((term, file_id), codec::encode_posting(&o).as_slice())?;
         }
         w.streams
             .insert(file_id, codec::encode(&stream).as_slice())?;

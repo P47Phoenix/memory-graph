@@ -7,23 +7,35 @@
 //! spans that a source scan could not reproduce (so no `irregular` escape is
 //! needed in this slice). Byte 0 is [`STREAM_FORMAT`].
 //!
-//! Layout (after the format byte): `nsym ntok` as varints, then `nsym`
-//! symbol records, then `ntok` token records:
+//! Layout (after the format byte, format 2): `nsym ntok symlen` as varints,
+//! then `symlen` bytes of symbol records, then `nck` checkpoints, then `ntok`
+//! token records:
 //!
 //! * symbol: `name_id kind lang_kind+1 parent+1 span`
 //! * token: `term_id class parent+1 span`
 //! * span: zigzag deltas `start, len, start_line, start_col, end_line-start_line`
 //!   then `end_col`, where `start`, `start_line` and `start_col` are relative
 //!   to the previous record of the same section and `len = end - start`.
+//! * checkpoint `j` (`nck = (ntok - 1) / CHECKPOINT_EVERY`, not stored) is the
+//!   decoder state before token ordinal `(j + 1) * CHECKPOINT_EVERY`: zigzag
+//!   deltas from checkpoint `j - 1` (zero for `j = 0`) of the byte offset of
+//!   that record in the token section and of the previous record's `start`,
+//!   `start_line` and `start_col`. With it a reader starts at a checkpoint
+//!   and decodes at most `CHECKPOINT_EVERY - 1` records to reach an ordinal,
+//!   instead of walking every record before it (ADR story 19).
 //!
 //! `parent` is the index of the enclosing symbol in the symbol section (0 =
 //! the file itself). Records are in source order, so a token's index is its
-//! ordinal.
+//! ordinal. Format 1 (no `symlen`, no checkpoints) is not read: the v2 layout
+//! is unreleased and the store's schema version was bumped with this change.
 use crate::StoreError;
 use graph_core::{Span, SymbolKind, TokenClass};
 
 /// Version byte of the stream layout. Bump on any layout change.
-pub const STREAM_FORMAT: u8 = 1;
+pub const STREAM_FORMAT: u8 = 2;
+
+/// A checkpoint is written before every this-many-th token record.
+pub const CHECKPOINT_EVERY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymRec {
@@ -105,27 +117,57 @@ const ZERO: Span = Span {
     end_col: 0,
 };
 
+/// Decoder state before a token record.
+#[derive(Clone, Copy, Default)]
+struct Ck {
+    off: usize,
+    start: u32,
+    line: u32,
+    col: u32,
+}
+
 pub fn encode(st: &Stream) -> Vec<u8> {
+    let mut syms = Vec::new();
+    let mut prev = ZERO;
+    for s in &st.symbols {
+        put_varint(&mut syms, s.name);
+        syms.push(KINDS.iter().position(|k| *k == s.kind).unwrap_or(6) as u8);
+        put_varint(&mut syms, s.lang_kind.map_or(0, |k| k + 1));
+        put_varint(&mut syms, s.parent.map_or(0, |p| u64::from(p) + 1));
+        put_span(&mut syms, &s.span, &prev);
+        prev = s.span;
+    }
+    let mut cks = Vec::new();
+    let mut toks = Vec::new();
+    let mut prev = ZERO;
+    let mut last = Ck::default();
+    for (i, t) in st.tokens.iter().enumerate() {
+        if i > 0 && i % CHECKPOINT_EVERY == 0 {
+            let ck = Ck {
+                off: toks.len(),
+                start: prev.start,
+                line: prev.start_line,
+                col: prev.start_col,
+            };
+            put_varint(&mut cks, (ck.off - last.off) as u64);
+            put_varint(&mut cks, diff(ck.start, last.start));
+            put_varint(&mut cks, diff(ck.line, last.line));
+            put_varint(&mut cks, diff(ck.col, last.col));
+            last = ck;
+        }
+        put_varint(&mut toks, t.term);
+        toks.push(CLASSES.iter().position(|c| *c == t.class).unwrap_or(6) as u8);
+        put_varint(&mut toks, t.parent.map_or(0, |p| u64::from(p) + 1));
+        put_span(&mut toks, &t.span, &prev);
+        prev = t.span;
+    }
     let mut out = vec![STREAM_FORMAT];
     put_varint(&mut out, st.symbols.len() as u64);
     put_varint(&mut out, st.tokens.len() as u64);
-    let mut prev = ZERO;
-    for s in &st.symbols {
-        put_varint(&mut out, s.name);
-        out.push(KINDS.iter().position(|k| *k == s.kind).unwrap_or(6) as u8);
-        put_varint(&mut out, s.lang_kind.map_or(0, |k| k + 1));
-        put_varint(&mut out, s.parent.map_or(0, |p| u64::from(p) + 1));
-        put_span(&mut out, &s.span, &prev);
-        prev = s.span;
-    }
-    let mut prev = ZERO;
-    for t in &st.tokens {
-        put_varint(&mut out, t.term);
-        out.push(CLASSES.iter().position(|c| *c == t.class).unwrap_or(6) as u8);
-        put_varint(&mut out, t.parent.map_or(0, |p| u64::from(p) + 1));
-        put_span(&mut out, &t.span, &prev);
-        prev = t.span;
-    }
+    put_varint(&mut out, syms.len() as u64);
+    out.extend_from_slice(&syms);
+    out.extend_from_slice(&cks);
+    out.extend_from_slice(&toks);
     out
 }
 
@@ -199,13 +241,16 @@ impl Reader<'_> {
     }
 }
 
-/// Header and symbol section of a stream; the token section is left
-/// undecoded and [`Lazy::tokens`] walks it record by record. Symbol search and
-/// term search use this to avoid materializing every token record.
+/// A parsed stream header: symbols and tokens are decoded on demand.
+/// [`Lazy::tokens`] walks every token record, [`Lazy::tokens_at`] reads chosen
+/// ordinals through the checkpoints. Symbol search and term search use this to
+/// avoid materializing every record.
 pub struct Lazy<'a> {
-    pub symbols: Vec<SymRec>,
+    nsym: usize,
     ntok: usize,
-    r: Reader<'a>,
+    sym_bytes: &'a [u8],
+    cks: Vec<Ck>,
+    toks: &'a [u8],
 }
 
 pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
@@ -216,62 +261,124 @@ pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
     }
     let nsym = r.varint()? as usize;
     let ntok = r.varint()? as usize;
+    let symlen = r.varint()? as usize;
     // Every record is several bytes, so a count beyond the input is corrupt
     // (and must not drive a huge allocation).
     if nsym.saturating_add(ntok) > b.len() {
         return Err(bad("record count exceeds input"));
     }
-    let mut symbols = Vec::with_capacity(nsym);
-    let mut prev = ZERO;
-    for i in 0..nsym {
-        let name = r.varint()?;
-        let kind = *KINDS
-            .get(usize::from(r.byte()?))
-            .ok_or_else(|| bad("bad symbol kind"))?;
-        let lang_kind = r.varint()?.checked_sub(1);
-        let parent = r.parent()?;
-        // A parent must be an enclosing (earlier) symbol; readers index by it.
-        if parent.is_some_and(|p| p as usize >= i) {
-            return Err(bad("parent index out of range"));
-        }
-        let span = r.span(&prev)?;
-        prev = span;
-        symbols.push(SymRec {
-            name,
-            kind,
-            lang_kind,
-            parent,
-            span,
-        });
+    let sym_end =
+        r.at.checked_add(symlen)
+            .filter(|&e| e <= b.len())
+            .ok_or_else(|| bad("symbol section exceeds input"))?;
+    let sym_bytes = &b[r.at..sym_end];
+    r.at = sym_end;
+    let nck = ntok.saturating_sub(1) / CHECKPOINT_EVERY;
+    if nck > b.len() {
+        return Err(bad("checkpoint count exceeds input"));
     }
-    Ok(Lazy { symbols, ntok, r })
+    let mut cks = Vec::with_capacity(nck);
+    let mut last = Ck::default();
+    for _ in 0..nck {
+        let off = usize::try_from(r.varint()?)
+            .ok()
+            .and_then(|d| last.off.checked_add(d))
+            .ok_or_else(|| bad("checkpoint offset overflow"))?;
+        last = Ck {
+            off,
+            start: r.rel(last.start)?,
+            line: r.rel(last.line)?,
+            col: r.rel(last.col)?,
+        };
+        cks.push(last);
+    }
+    let toks = &b[r.at..];
+    if cks.last().is_some_and(|c| c.off >= toks.len()) {
+        return Err(bad("checkpoint offset out of range"));
+    }
+    Ok(Lazy {
+        nsym,
+        ntok,
+        sym_bytes,
+        cks,
+        toks,
+    })
 }
 
 impl Lazy<'_> {
-    /// Visit every token record in ordinal order without collecting them.
-    /// Stops at the first error or when `f` returns `false`; a full pass also
-    /// checks for trailing bytes.
-    pub fn tokens(&mut self, mut f: impl FnMut(usize, &TokRec) -> bool) -> Result<(), StoreError> {
-        let nsym = self.symbols.len();
-        let r = &mut self.r;
+    /// The symbol section, decoded.
+    pub fn symbols(&self) -> Result<Vec<SymRec>, StoreError> {
+        let mut r = Reader {
+            b: self.sym_bytes,
+            at: 0,
+        };
+        let mut symbols = Vec::with_capacity(self.nsym);
         let mut prev = ZERO;
-        for ord in 0..self.ntok {
-            let term = r.varint()?;
-            let class = *CLASSES
+        for i in 0..self.nsym {
+            let name = r.varint()?;
+            let kind = *KINDS
                 .get(usize::from(r.byte()?))
-                .ok_or_else(|| bad("bad token class"))?;
+                .ok_or_else(|| bad("bad symbol kind"))?;
+            let lang_kind = r.varint()?.checked_sub(1);
             let parent = r.parent()?;
-            if parent.is_some_and(|p| p as usize >= nsym) {
+            // A parent must be an enclosing (earlier) symbol; readers index by it.
+            if parent.is_some_and(|p| p as usize >= i) {
                 return Err(bad("parent index out of range"));
             }
             let span = r.span(&prev)?;
             prev = span;
-            let rec = TokRec {
-                term,
-                class,
+            symbols.push(SymRec {
+                name,
+                kind,
+                lang_kind,
                 parent,
                 span,
-            };
+            });
+        }
+        if r.at != r.b.len() {
+            return Err(bad("trailing bytes in symbol section"));
+        }
+        Ok(symbols)
+    }
+
+    fn record(&self, r: &mut Reader<'_>, prev: &Span) -> Result<TokRec, StoreError> {
+        let term = r.varint()?;
+        let class = *CLASSES
+            .get(usize::from(r.byte()?))
+            .ok_or_else(|| bad("bad token class"))?;
+        let parent = r.parent()?;
+        if parent.is_some_and(|p| p as usize >= self.nsym) {
+            return Err(bad("parent index out of range"));
+        }
+        let span = r.span(prev)?;
+        Ok(TokRec {
+            term,
+            class,
+            parent,
+            span,
+        })
+    }
+
+    /// Visit every token record in ordinal order without collecting them.
+    /// Stops at the first error or when `f` returns `false`; a full pass also
+    /// verifies the checkpoints and checks for trailing bytes.
+    pub fn tokens(&self, mut f: impl FnMut(usize, &TokRec) -> bool) -> Result<(), StoreError> {
+        let mut r = Reader {
+            b: self.toks,
+            at: 0,
+        };
+        let mut prev = ZERO;
+        for ord in 0..self.ntok {
+            if ord > 0 && ord % CHECKPOINT_EVERY == 0 {
+                let c = self.cks[ord / CHECKPOINT_EVERY - 1];
+                if (c.off, c.start, c.line, c.col)
+                    != (r.at, prev.start, prev.start_line, prev.start_col)
+                {
+                    return Err(bad("checkpoint mismatch"));
+                }
+            }
+            let rec = self.record(&mut r, &prev)?;
+            prev = rec.span;
             if !f(ord, &rec) {
                 return Ok(());
             }
@@ -281,19 +388,109 @@ impl Lazy<'_> {
         }
         Ok(())
     }
+
+    /// Visit the token records at the given strictly ascending ordinals. Each
+    /// one starts from the nearest checkpoint at or before it (or continues
+    /// from the previous ordinal when that is closer), so a lookup decodes at
+    /// most `CHECKPOINT_EVERY - 1` records before its target. The checkpoints
+    /// are trusted here; a full [`Lazy::tokens`] pass verifies them. An
+    /// ordinal at or past the token count is an error.
+    pub fn tokens_at(
+        &self,
+        ords: &[usize],
+        mut f: impl FnMut(usize, &TokRec),
+    ) -> Result<(), StoreError> {
+        let mut r = Reader {
+            b: self.toks,
+            at: 0,
+        };
+        let mut prev = ZERO;
+        // Ordinal of the next undecoded record.
+        let mut next = 0usize;
+        let mut last: Option<usize> = None;
+        for &ord in ords {
+            if ord >= self.ntok || last.is_some_and(|l| ord <= l) {
+                return Err(bad("token ordinal out of order or range"));
+            }
+            last = Some(ord);
+            let block = ord / CHECKPOINT_EVERY;
+            if block * CHECKPOINT_EVERY > next {
+                let c = self.cks[block - 1];
+                r.at = c.off;
+                prev = Span {
+                    start: c.start,
+                    start_line: c.line,
+                    start_col: c.col,
+                    ..ZERO
+                };
+                next = block * CHECKPOINT_EVERY;
+            }
+            while next < ord {
+                prev = self.record(&mut r, &prev)?.span;
+                next += 1;
+            }
+            let rec = self.record(&mut r, &prev)?;
+            prev = rec.span;
+            next += 1;
+            f(ord, &rec);
+        }
+        Ok(())
+    }
+}
+
+/// Posting value of `(term, file)`: the number of occurrences, then the
+/// token ordinals in ascending order as gaps (the first is absolute).
+pub fn encode_posting(ords: &[usize]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ords.len() + 2);
+    put_varint(&mut out, ords.len() as u64);
+    let mut prev = 0;
+    for &o in ords {
+        put_varint(&mut out, (o - prev) as u64);
+        prev = o;
+    }
+    out
+}
+
+/// Occurrence count of a posting value.
+pub fn posting_count(b: &[u8]) -> Result<usize, StoreError> {
+    let n = Reader { b, at: 0 }.varint()?;
+    usize::try_from(n).map_err(|_| bad("posting count out of range"))
+}
+
+/// The ordinals of a posting value, strictly ascending.
+pub fn posting_ordinals(b: &[u8]) -> Result<Vec<usize>, StoreError> {
+    let mut r = Reader { b, at: 0 };
+    let n = usize::try_from(r.varint()?).map_err(|_| bad("posting count out of range"))?;
+    if n > b.len() {
+        return Err(bad("posting count exceeds input"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut prev = 0usize;
+    for i in 0..n {
+        let gap = usize::try_from(r.varint()?).map_err(|_| bad("posting gap out of range"))?;
+        if i > 0 && gap == 0 {
+            return Err(bad("posting ordinals not ascending"));
+        }
+        prev = prev
+            .checked_add(gap)
+            .ok_or_else(|| bad("posting ordinal overflow"))?;
+        out.push(prev);
+    }
+    if r.at != b.len() {
+        return Err(bad("trailing bytes in posting"));
+    }
+    Ok(out)
 }
 
 pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
-    let mut lazy = decode_lazy(b)?;
+    let lazy = decode_lazy(b)?;
+    let symbols = lazy.symbols()?;
     let mut tokens = Vec::with_capacity(lazy.ntok);
     lazy.tokens(|_, t| {
         tokens.push(t.clone());
         true
     })?;
-    Ok(Stream {
-        symbols: lazy.symbols,
-        tokens,
-    })
+    Ok(Stream { symbols, tokens })
 }
 
 #[cfg(test)]
@@ -351,7 +548,7 @@ mod tests {
     #[test]
     fn golden_bytes() {
         let want: Vec<u8> = vec![
-            1, 2, 2, // format, nsym, ntok
+            2, 2, 2, 20, // format, nsym, ntok, symlen
             0, 1, 2, 0, 0, 40, 2, 2, 4, 2, // symbol 0
             2, 3, 0, 1, 8, 16, 2, 8, 0, 13, // symbol 1: deltas from symbol 0
             3, 1, 0, 0, 4, 2, 2, 0, 3, // token 0
@@ -416,13 +613,13 @@ mod tests {
     #[test]
     fn overlong_varint_tenth_byte_is_rejected() {
         // term = nine 0xff bytes then 0x02 (bit 64 set): overflows u64.
-        let mut b = vec![1, 0, 1];
+        let mut b = vec![2, 0, 1, 0];
         b.extend([0xff; 9]);
         b.push(0x02);
         b.extend([0; 8]); // class, parent, six span fields
         assert!(decode(&b).is_err());
         // u64::MAX (tenth byte 0x01) is fine.
-        let mut ok = vec![1, 0, 1];
+        let mut ok = vec![2, 0, 1, 0];
         put(&mut ok, u64::MAX);
         ok.extend([0; 8]);
         assert_eq!(decode(&ok).unwrap().tokens[0].term, u64::MAX);
@@ -464,6 +661,121 @@ mod tests {
         put(&mut b, u64::MAX - 1); // unzigzag = i64::MAX
         b.extend([0; 5]);
         assert!(decode(&b).is_err());
+    }
+
+    /// A stream of `n` tokens with irregular spans, a symbol, and some
+    /// terms repeated so postings have several ordinals.
+    fn long(n: usize) -> Stream {
+        let mut s = sample();
+        s.tokens.clear();
+        let mut at = 0u32;
+        for i in 0..n {
+            let len = 1 + (i % 7) as u32;
+            at += 1 + (i % 5) as u32 * 40;
+            s.tokens.push(TokRec {
+                term: (i % 11) as u64,
+                class: CLASSES[i % 7],
+                parent: (i % 3 == 0).then_some((i % 2) as u32),
+                span: sp(
+                    at,
+                    at + len,
+                    1 + at / 80,
+                    at % 80,
+                    1 + at / 80,
+                    at % 80 + len,
+                ),
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn tokens_at_matches_full_decode_across_checkpoints() {
+        for n in [
+            0,
+            1,
+            CHECKPOINT_EVERY - 1,
+            CHECKPOINT_EVERY,
+            CHECKPOINT_EVERY + 1,
+            3 * CHECKPOINT_EVERY,
+            3 * CHECKPOINT_EVERY + 5,
+            500,
+        ] {
+            let s = long(n);
+            let b = encode(&s);
+            assert_eq!(decode(&b).unwrap(), s, "n={n}");
+            let lazy = decode_lazy(&b).unwrap();
+            assert_eq!(lazy.symbols().unwrap(), s.symbols);
+            // Every ordinal alone, and several ascending selections.
+            let all: Vec<usize> = (0..n).collect();
+            let sel: [Vec<usize>; 4] = [
+                all.clone(),
+                all.iter().copied().step_by(7).collect(),
+                all.iter()
+                    .copied()
+                    .filter(|o| o % CHECKPOINT_EVERY == 0)
+                    .collect(),
+                all.iter()
+                    .copied()
+                    .filter(|o| (o + 1) % CHECKPOINT_EVERY == 0)
+                    .collect(),
+            ];
+            for ords in sel
+                .iter()
+                .chain(all.iter().map(|&o| vec![o]).collect::<Vec<_>>().iter())
+            {
+                let mut got = Vec::new();
+                lazy.tokens_at(ords, |o, t| got.push((o, t.clone())))
+                    .unwrap();
+                let want: Vec<_> = ords.iter().map(|&o| (o, s.tokens[o].clone())).collect();
+                assert_eq!(got, want, "n={n} ords={ords:?}");
+            }
+            // Out of range and out of order are errors.
+            assert!(lazy.tokens_at(&[n], |_, _| {}).is_err());
+            if n > 1 {
+                assert!(lazy.tokens_at(&[1, 0], |_, _| {}).is_err());
+                assert!(lazy.tokens_at(&[1, 1], |_, _| {}).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoints_are_written_and_verified() {
+        let s = long(3 * CHECKPOINT_EVERY);
+        let b = encode(&s);
+        // Header: fmt nsym ntok(2 bytes, 192) symlen, symbols, then checkpoints.
+        let lazy = decode_lazy(&b).unwrap();
+        assert_eq!(lazy.cks.len(), 2);
+        // Corrupt one checkpoint field: a full decode must notice.
+        let sym_end = 1 + 1 + 2 + 1 + lazy.sym_bytes.len();
+        let mut bad_b = b.clone();
+        bad_b[sym_end + 1] ^= 1; // first checkpoint's start delta
+        assert!(decode(&bad_b).is_err());
+        // A stream with a single record block has no checkpoints.
+        assert!(decode_lazy(&encode(&long(CHECKPOINT_EVERY)))
+            .unwrap()
+            .cks
+            .is_empty());
+    }
+
+    #[test]
+    fn postings_round_trip() {
+        for ords in [
+            vec![],
+            vec![0],
+            vec![5],
+            vec![0, 1, 2],
+            vec![3, 70, 71, 5000],
+        ] {
+            let b = encode_posting(&ords);
+            assert_eq!(posting_count(&b).unwrap(), ords.len());
+            assert_eq!(posting_ordinals(&b).unwrap(), ords);
+        }
+        // Non-ascending (zero gap after the first), truncated and trailing.
+        assert!(posting_ordinals(&[2, 3, 0]).is_err());
+        assert!(posting_ordinals(&[2, 3]).is_err());
+        assert!(posting_ordinals(&[1, 3, 0]).is_err());
+        assert!(posting_ordinals(&[]).is_err());
     }
 
     #[test]
