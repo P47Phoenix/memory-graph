@@ -156,12 +156,14 @@ flowchart LR
 ```mermaid
 flowchart TD
     subgraph PURE["Pure Rust boundary: scripts/check-no-c-deps.py runs in CI"]
-        CLI["graph-cli: memory-graph binary. Maps file extensions to extractors and registers them on the store"]
+        CLI["graph-cli: memory-graph binary. Holds a Box of dyn Store from open_store; registers extractors when opening"]
         LANG["graph-lang-rust: Rust extractor (syn for symbols, generic tokenizer for tokens)"]
-        STORE["graph-store: redb persistence and search, language-agnostic. Calls language detection when language is None"]
+        TRAIT{{"Store / StoreRead traits (object-safe): the boundary. Built today"}}
+        STORE["graph-store: RedbStore (storage v1 on redb) implements the traits, language-agnostic. Calls language detection when language is None"]
         CORE["graph-core: schema, Extractor trait, fallback tokenizer, language.rs (detect_language, detect_language_from_content)"]
         REDB[("redb: embedded key-value file")]
-        CLI --> STORE
+        CLI --> TRAIT
+        STORE --> TRAIT
         CLI --> LANG
         CLI --> CORE
         STORE --> CORE
@@ -169,12 +171,18 @@ flowchart TD
         STORE --> REDB
     end
     SERVE["memory-graph serve (daemon, MCP): decided (Q5), not built"]
+    REMOTE["RemoteStore implements Store over a socket: decided (Q5), not built"]
+    V2["v2 store (packed dictionary, streams) and partitioned store (Q4): decided, not built"]
     SERVE -.-> STORE
-    CLI -.->|"RemoteStore over a socket: decided, not built"| SERVE
+    REMOTE -.->|"implements"| TRAIT
+    REMOTE -.-> SERVE
+    V2 -.->|"implements"| TRAIT
     style SERVE stroke-dasharray: 5 5
+    style REMOTE stroke-dasharray: 5 5
+    style V2 stroke-dasharray: 5 5
 ```
 
-`graph-store` depends only on `graph-core` (and redb, serde, sha2); `graph-lang-rust` is a dev-dependency of the store, used by its tests only. The CLI creates the `Store` and registers the Rust extractor on it with `Store::register`; languages without an extractor use the fallback tokenizer. Language detection lives in `graph-core/src/language.rs`, not in the CLI: on directory runs the CLI passes `language: None` and the store detects it from path and content.
+`graph-store` depends only on `graph-core` (and redb, serde, sha2); `graph-lang-rust` is a dev-dependency of the store, used by its tests only. **The store trait (ADR 0003 story 1, built):** `Store` (reads, writes, `snapshot()`) extends the read-only `StoreRead`, so a snapshot handle can answer every read and nothing else. Both are object-safe, so the CLI holds a `Box<dyn Store>` picked by `open_store(Backend, path, extractors)` (only `Backend::Redb` exists) and never names the redb type. `Store` is `Send + Sync` (the extractor registry is now `Send + Sync`) so a daemon can share it; snapshots are `Send`. Nothing in the traits names a file or shard, so a v2 store, a partitioned store (Q4) and `RemoteStore` (Q5) can implement them later. The CLI registers the Rust extractor when it opens the store; languages without an extractor use the fallback tokenizer. A reusable conformance suite (`graph_store::conformance`) runs the shared store behaviours against any implementation; it currently runs against redb and is the seed of the differential oracle. Language detection lives in `graph-core/src/language.rs`, not in the CLI: on directory runs the CLI passes `language: None` and the store detects it from path and content.
 
 ---
 

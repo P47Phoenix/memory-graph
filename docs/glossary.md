@@ -30,6 +30,9 @@ The sorted tree structure redb uses to keep data in order on disk, so lookups ar
 ## Commit / transaction
 A **transaction** is a group of changes that either all happen or none happen, like paying at a till: the money and the receipt go together. A **commit** is the moment the group becomes permanent. Used in: [ADR 0003](adr/0003-data-model.md).
 
+## Conformance suite
+A set of tests written once against the `Store` trait and run against every implementation (today the redb one; later the v2 store and `RemoteStore`). If two implementations pass the same suite they behave the same on those cases. It is the seed of the differential test. Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
+
 ## Content hash / fingerprint
 A **content hash** is a short code computed from a file's bytes. Change one letter and the code changes. A **fingerprint** in this project is that hash plus the language, the extractor version and the fingerprint format version, joined in one string. If the stored fingerprint matches the new one, the file has not changed and we skip it. Used in: [ADR 0001](adr/0001-storage.md), [learnings](learnings.md).
 
@@ -110,6 +113,9 @@ The pure-Rust database library we use. It stores data in one file, supports tran
 
 ## RemoteStore
 The piece of the command line that has the same shape as the local database code (the `Store` trait) but sends each request to the daemon over a socket. Because it has the same shape, the same tests can check both. Decided (not built yet). Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
+
+## Store trait
+The list of things any database back end must be able to do (index a file, search, describe, prune, take a snapshot), written as a Rust `trait`. The command line only knows this list, so the back end (today redb) can be swapped. `StoreRead` is the read-only half, which a snapshot also offers. Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
 
 ## SHA-256
 The hashing method we use for content hashes: it turns any bytes into a 32-byte code. It comes from the pure-Rust `sha2` crate. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0003](adr/0003-data-model.md).

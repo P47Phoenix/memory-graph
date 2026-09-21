@@ -4,7 +4,7 @@
 use graph_cli::{index_dir, DirOpts};
 use graph_core::NodeKind;
 use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind};
-use graph_store::Store;
+use graph_store::{open_store, Backend, RedbStore, Store};
 use std::path::Path;
 
 struct Fake;
@@ -35,10 +35,8 @@ impl Extractor for Fake {
     }
 }
 
-fn open(db: &Path) -> anyhow::Result<Store> {
-    let mut s = Store::open(db)?;
-    s.register(Box::new(Fake));
-    Ok(s)
+fn open(db: &Path) -> anyhow::Result<Box<dyn Store>> {
+    Ok(open_store(Backend::Redb, db, vec![Box::new(Fake)])?)
 }
 
 fn run(db: &Path, dir: &Path, json: bool, prune: bool) -> (anyhow::Result<()>, String) {
@@ -89,7 +87,7 @@ fn invalid_span_fails_one_file_and_exits_nonzero() {
         "path is not repeated in the reason: {text}"
     );
 
-    let s = Store::open(&db).unwrap();
+    let s = RedbStore::open(&db).unwrap();
     assert!(s.file_tokens("o", "r", "ok.zig").unwrap().is_some());
     assert!(s.file_tokens("o", "r", "new.zig").unwrap().is_none());
     // Old version preserved, and --prune was skipped so gone.zig remains too.
