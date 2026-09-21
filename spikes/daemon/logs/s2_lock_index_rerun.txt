@@ -1,0 +1,15 @@
+
+== 3. real long index run: hold time + what a retrying reader sees ==
+index process wall (= lock hold): 19668.6 ms; indexed big/big: files=2150 unchanged=0 symbols=46192 tokens=2547216 skipped=0 pruned=0 elapsed=19554ms
+reader (started 1 s in, jittered backoff base 5 ms cap 250 ms): retry_ok_ns=1789941308827400441 attempts=159 waited_ms=18660.9; success 5.3 ms after the indexer exited (negative = before, impossible)
+
+== 6. same 8 readers while one indexer holds the DB (started 1 s earlier, ~real index of bigsrc) ==
+worker pid=226031 n=20 p50=156.6ms p95=3695.5ms max=24092.8ms attempts_total=701 attempts_max=478
+worker pid=226029 n=20 p50=147.6ms p95=3073.1ms max=30767.5ms attempts_total=744 attempts_max=626
+worker pid=226024 n=20 p50=165.8ms p95=5441.8ms max=23731.3ms attempts_total=805 attempts_max=479
+worker pid=226030 n=20 p50=146.8ms p95=4708.6ms max=22440.0ms attempts_total=803 attempts_max=419
+worker pid=226028 n=20 p50=158.9ms p95=6221.9ms max=23326.9ms attempts_total=849 attempts_max=468
+worker pid=226025 n=20 p50=193.7ms p95=7251.4ms max=23535.4ms attempts_total=850 attempts_max=462
+worker pid=226026 n=20 p50=156.2ms p95=6922.3ms max=26222.5ms attempts_total=935 attempts_max=536
+worker pid=226027 n=20 p50=150.3ms p95=8862.9ms max=26845.7ms attempts_total=914 attempts_max=532
+(indexer + readers finished; total wall 47291.7 ms)

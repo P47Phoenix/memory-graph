@@ -29,6 +29,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 | [Storage](spikes/storage.md) | Experiment on the database: redb works, at about 690 bytes per token. | none |
 | [Data model](spikes/data-model.md) | Experiment on size: the cost per token is the record around it, not the text; a stream model measured about 25x smaller. | [spikes/data-model/](../spikes/data-model/README.md) (code, README, logs) |
 | [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md) | Decision record (not an ADR), decided by the user 2026-09-20: a daemon for cross-process access, shard by (org, repo) with the build deferred; keeps the options and evidence. | none |
+| [Daemon and locking](spikes/daemon-and-locking.md) | Experiment on cross-process access: a socket daemon adds under 1 ms per query even at 9.9 M tokens (5 ms trigger not tripped); today's lock is held for a whole index run (20 s per 2.5 M tokens) and retries starve under load. | [spikes/daemon/](../spikes/daemon/README.md) (code, README, logs) |
 
 ## Learnings
 - [learnings.md](learnings.md): a short list of lasting facts, measured numbers, rules and review mistakes to avoid, each linking to the details.

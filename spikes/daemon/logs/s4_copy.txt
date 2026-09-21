@@ -1,0 +1,35 @@
+.017487866 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.010743164 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.010436893 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.009611856 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.009563927 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.010123832 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.836754587 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+.669257474 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+.673341449 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+.664220007 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+.553103268 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+.599159159 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+1.987351983 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb ./c.redb
+1.676569160 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb ./c.redb
+1.587339744 s : cp --reflink=auto /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb ./c.redb
+1.716941473 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb ./c.redb
+1.585901758 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb ./c.redb
+1.657864568 s : cp --reflink=always /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb ./c.redb
+.321384909 s : cp --reflink=never /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.022768748 s : cp --reflink=never /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+.020997129 s : cp --reflink=never /home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb ./c.redb
+3.069540084 s : cp --reflink=never /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+.404674450 s : cp --reflink=never /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+.197141273 s : cp --reflink=never /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb ./c.redb
+4.441474783 s : cp --reflink=never /home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb ./c.redb
+.469104622 s : sync
+syn1G reflink=auto cp=.001761792s sync_after=.003980844s
+syn1G reflink=auto cp=.001342873s sync_after=.003211347s
+syn1G reflink=auto cp=.001217373s sync_after=.003011690s
+syn1G reflink=never cp=.209490852s sync_after=.446863321s
+syn1G reflink=never cp=.217426064s sync_after=.452472307s
+syn1G reflink=never cp=.217802809s sync_after=.481424235s
+/home/meconnelly/.claude/jobs/d472d98c/tmp/new.redb: 2092 extents found
+/home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/e.redb: 140826 extents found
+/home/meconnelly/.claude/jobs/d472d98c/tmp/db10m/a.redb: 362395 extents found
