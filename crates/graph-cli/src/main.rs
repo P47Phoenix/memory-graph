@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use graph_cli::{index_dir, DirOpts};
 use graph_core::TokenClass;
-use graph_store::{open_store, Backend, Grain, IndexOptions, Query, Store, SymbolQuery};
+use graph_store::{
+    detect_backend, open_store, Backend, Grain, IndexOptions, Query, Store, SymbolQuery,
+};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -19,8 +21,18 @@ struct Cli {
     /// Database file
     #[arg(long, global = true, default_value = "./graph.redb")]
     db: PathBuf,
+    /// Storage backend: v1 (default) or v2 (opt-in, much smaller). A database is bound to the backend that
+    /// created it: opening a v2 file without `--backend v2` (or a v1 file with it) is an error
+    #[arg(long, global = true, value_enum)]
+    backend: Option<BackendArg>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BackendArg {
+    V1,
+    V2,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +77,8 @@ enum Cmd {
         reindex: bool,
         dir: PathBuf,
     },
+    /// Drop dictionary terms that no file refers to any more (v2 databases; a no-op for v1)
+    Vacuum,
     /// Show what is indexed: per repo, the languages present and each language's symbol kinds
     Describe {
         #[arg(long)]
@@ -136,22 +150,50 @@ enum Cmd {
     },
 }
 
+/// Choose the backend for `db`. The default is v1. The database's stamped
+/// schema version validates the choice: a file written by the other backend is
+/// refused with a message that says how to open it. A file that cannot be
+/// inspected here (locked, unreadable) is left to the normal open, which
+/// reports its own error, so v1 behaviour is unchanged.
+fn resolve_backend(db: &std::path::Path, requested: Option<BackendArg>) -> Result<Backend> {
+    let want = match requested {
+        Some(BackendArg::V2) => Backend::RedbV2,
+        Some(BackendArg::V1) | None => Backend::Redb,
+    };
+    if let Ok(Some((found, version))) = detect_backend(db) {
+        if found != want {
+            let hint = if requested.is_some() {
+                format!("drop --backend or pass `--backend {}`", found.name())
+            } else {
+                format!("pass `--backend {}`", found.name())
+            };
+            bail!(
+                "database `{}` is a {} database (schema version {version}), but the {} backend was selected; {hint}",
+                db.display(),
+                found.name(),
+                want.name()
+            );
+        }
+    }
+    Ok(want)
+}
+
 /// Open the store for a command that indexes, with every shipped extractor
 /// registered: the extractor version is part of a file's fingerprint, so
 /// indexing without one would downgrade already-indexed files to tokens only.
-fn open_for_indexing(db: &std::path::Path) -> Result<Box<dyn Store>> {
+fn open_for_indexing(db: &std::path::Path, backend: Option<BackendArg>) -> Result<Box<dyn Store>> {
     Ok(open_store(
-        Backend::default(),
+        resolve_backend(db, backend)?,
         db,
         vec![Box::new(graph_lang_rust::RustExtractor)],
     )?)
 }
 
-fn open_existing(db: &std::path::Path) -> Result<Box<dyn Store>> {
+fn open_existing(db: &std::path::Path, backend: Option<BackendArg>) -> Result<Box<dyn Store>> {
     if !db.is_file() {
         bail!("database `{}` does not exist", db.display());
     }
-    open_store(Backend::default(), db, vec![])
+    open_store(resolve_backend(db, backend)?, db, vec![])
         .with_context(|| format!("opening database `{}`", db.display()))
 }
 
@@ -256,7 +298,7 @@ fn run() -> Result<()> {
                     cli.db.display()
                 );
             }
-            let store = open_for_indexing(&cli.db)?;
+            let store = open_for_indexing(&cli.db, cli.backend)?;
             let st = store.index_bytes_opts(
                 &org,
                 &repo,
@@ -299,11 +341,29 @@ fn run() -> Result<()> {
                 force,
                 reindex,
             },
-            open_for_indexing,
+            |db| open_for_indexing(db, cli.backend),
             &mut std::io::stdout().lock(),
         )?,
+        Cmd::Vacuum => {
+            if !cli.db.is_file() {
+                bail!("database `{}` does not exist", cli.db.display());
+            }
+            let backend = resolve_backend(&cli.db, cli.backend)?;
+            let store = open_store(backend, &cli.db, vec![])
+                .with_context(|| format!("opening database `{}`", cli.db.display()))?;
+            let st = store.vacuum()?;
+            if backend == Backend::Redb {
+                out!("vacuum: nothing to do (a v1 database has no dictionary)");
+            } else {
+                out!(
+                    "vacuum: removed {} unused dictionary terms, kept {}",
+                    st.terms_removed,
+                    st.terms_kept
+                );
+            }
+        }
         Cmd::Describe { org, repo, json } => {
-            let store = open_existing(&cli.db)?;
+            let store = open_existing(&cli.db, cli.backend)?;
             let infos = store.describe(org.as_deref(), repo.as_deref())?;
             if json {
                 out!(
@@ -337,7 +397,7 @@ fn run() -> Result<()> {
             limit,
             json,
         } => {
-            let store = open_existing(&cli.db)?;
+            let store = open_existing(&cli.db, cli.backend)?;
             validate_filters(
                 &*store,
                 org.as_deref(),
@@ -385,7 +445,7 @@ fn run() -> Result<()> {
             if symbol_kind.is_some() && grain != Grain::Symbol {
                 bail!("--symbol-kind requires --grain symbol");
             }
-            let store = open_existing(&cli.db)?;
+            let store = open_existing(&cli.db, cli.backend)?;
             validate_filters(
                 &*store,
                 org.as_deref(),

@@ -86,8 +86,8 @@ fn blank(id: NodeId, parent: Option<NodeId>, kind: NodeKind, name: String) -> No
     }
 }
 
-/// Result of [`V2Store::vacuum`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of [`Store::vacuum`] (dictionary terms; a backend without a dictionary reports zeros).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VacuumStats {
     pub terms_removed: usize,
     pub terms_kept: usize,
@@ -1582,5 +1582,8 @@ impl Store for V2Store {
         dry_run: bool,
     ) -> Result<Vec<String>> {
         V2Store::prune_files(self, org, repo, keep, dry_run)
+    }
+    fn vacuum(&self) -> Result<VacuumStats> {
+        V2Store::vacuum(self)
     }
 }

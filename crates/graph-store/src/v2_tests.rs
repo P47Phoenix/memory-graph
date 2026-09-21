@@ -235,3 +235,23 @@ fn vacuum_removes_only_dead_dictionary_terms() {
     assert_eq!(s.vacuum().unwrap().terms_removed, 2, "alpha and beta");
     assert_eq!(s.search(&Query::new("gamma")).unwrap().len(), 1);
 }
+
+#[test]
+fn vacuum_keeps_a_symbol_only_lang_kind_term() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("k.redb")).unwrap();
+    let mut ex = span_ext(&[("Sym", SymbolKind::Type, 0, 9)], &[]);
+    // The kind text is referenced by the symbol record only: no posting, no name.
+    ex.symbols[0].lang_kind = Some("struct_item".into());
+    s.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+    assert_eq!(
+        s.vacuum().unwrap(),
+        VacuumStats {
+            terms_removed: 0,
+            terms_kept: 2
+        }
+    );
+    let hits = s.search_symbols(&SymbolQuery::new("Sym")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].lang_kind.as_deref(), Some("struct_item"));
+}

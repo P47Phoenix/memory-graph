@@ -31,7 +31,7 @@
 //! story will add a wire form for them.
 use crate::{
     BatchFile, Hit, IndexOptions, IngestStats, Query, RedbSnapshot, RedbStore, RepoInfo,
-    StoreError, SymbolHit, SymbolQuery,
+    StoreError, SymbolHit, SymbolQuery, VacuumStats,
 };
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind};
 use std::collections::HashSet;
@@ -157,6 +157,12 @@ pub trait Store: StoreRead + Send + Sync {
         keep: &HashSet<String>,
         dry_run: bool,
     ) -> Result<Vec<String>>;
+
+    /// Reclaim space left behind by replaced and pruned files. v2 removes the
+    /// dictionary terms nothing refers to any more (it does not compact the
+    /// file); v1 has no dictionary, so it is a no-op that reports zeros.
+    /// Never changes what any read returns.
+    fn vacuum(&self) -> Result<VacuumStats>;
 
     fn index_bytes(
         &self,
@@ -286,6 +292,10 @@ impl Store for RedbStore {
     ) -> Result<Vec<String>> {
         RedbStore::prune_files(self, org, repo, keep, dry_run)
     }
+    fn vacuum(&self) -> Result<VacuumStats> {
+        // v1 stores token text inline: there is no dictionary to collect.
+        Ok(VacuumStats::default())
+    }
 }
 
 impl StoreRead for RedbSnapshot {
@@ -328,6 +338,49 @@ pub enum Backend {
     /// interned dictionary, one compact stream per file and count postings.
     /// Opt-in; not the default, and it cannot open a v1 file.
     RedbV2,
+}
+
+impl Backend {
+    /// Short name used on the command line and in messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Redb => "v1",
+            Backend::RedbV2 => "v2",
+        }
+    }
+}
+
+/// Which backend wrote the database file at `path`, from its stamped schema
+/// version, plus that version. `Ok(None)` when there is no file or it holds
+/// no schema yet (empty or freshly created), so any backend may claim it.
+/// Reads only; an unknown version is `SchemaMismatch`. It opens the file, so
+/// it fails with `Locked` while another process holds it.
+pub fn detect_backend(path: &Path) -> Result<Option<(Backend, u64)>> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        _ => return Ok(None),
+    }
+    let db = redb::Database::create(path).map_err(|e| match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => StoreError::Locked(path.display().to_string()),
+        e => StoreError::OpenFailed {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        },
+    })?;
+    let rt = db.begin_read()?;
+    let found = match rt.open_table(crate::META) {
+        Ok(t) => t.get("schema_version")?.map(|v| v.value()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    match found {
+        None => Ok(None),
+        Some(v) if v == crate::v2::V2_SCHEMA_VERSION => Ok(Some((Backend::RedbV2, v))),
+        Some(v) if (crate::MIN_SCHEMA_VERSION..=crate::SCHEMA_VERSION).contains(&v) => {
+            Ok(Some((Backend::Redb, v)))
+        }
+        Some(v) => Err(StoreError::SchemaMismatch { found: v }),
+    }
 }
 
 /// Open (or create) a store of the chosen backend with `extractors`

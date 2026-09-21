@@ -16,7 +16,7 @@ mod api;
 mod codec;
 pub mod conformance;
 mod v2;
-pub use api::{open_store, Backend, Store, StoreRead};
+pub use api::{detect_backend, open_store, Backend, Store, StoreRead};
 pub use v2::{V2Snapshot, V2Store, VacuumStats};
 
 /// On-disk layout version written by this build. It is 2 because databases
