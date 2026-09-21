@@ -5,12 +5,16 @@ use graph_core::{
     NodeId, NodeKind, Registry, Span, SymbolKind, TokenClass,
 };
 use redb::{
-    Database, DatabaseError, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
-    TableDefinition,
+    Database, DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableMultimapTable,
+    ReadableTable, TableDefinition,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+mod api;
+pub mod conformance;
+pub use api::{open_store, Backend, Store, StoreRead};
 
 /// On-disk layout version written by this build. It is 2 because databases
 /// that carry the describe catalog must be refused by builds that predate it
@@ -149,9 +153,15 @@ fn validate_spans(ex: &Extraction) -> Result<()> {
     Ok(())
 }
 
-pub struct Store {
+/// Storage format v1 on one redb file: the first backend behind [`Store`].
+pub struct RedbStore {
     db: Database,
     registry: Registry,
+}
+
+/// A consistent read-only view of a `RedbStore` (one redb read transaction).
+pub struct RedbSnapshot {
+    rt: ReadTransaction,
 }
 
 /// Options for `index_bytes_opts` / `index_batch`.
@@ -161,7 +171,7 @@ pub struct IndexOptions {
     pub reindex: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Grain {
     Token,
@@ -185,7 +195,7 @@ impl std::str::FromStr for Grain {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Query {
     pub text: String,
     pub language: Option<String>,
@@ -218,7 +228,7 @@ impl Query {
 /// Symbol lookup by name: exact, or a prefix with a trailing `*` (`*` alone
 /// lists everything). A trailing `\*` is a literal star (exact match on a name
 /// ending in `*`). Empty patterns and `**` are rejected as ambiguous.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolQuery {
     pub pattern: String,
     /// Generic kind (`method`) or language-specific kind (`struct`, `trait`).
@@ -247,7 +257,7 @@ impl SymbolQuery {
 }
 
 /// A symbol with its containment path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolHit {
     pub org: String,
     pub repo: String,
@@ -264,7 +274,7 @@ pub struct SymbolHit {
 
 /// Per-language contents of a repo. `symbol_kinds` keys are `generic` or
 /// `generic/language-specific` (e.g. `type/struct`, `method/fn`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageInfo {
     pub files: usize,
     pub symbols: usize,
@@ -272,7 +282,7 @@ pub struct LanguageInfo {
     pub symbol_kinds: BTreeMap<String, usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub org: String,
     pub repo: String,
@@ -299,7 +309,7 @@ impl RepoInfo {
 }
 
 /// One result row at the requested grain, with its containment path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hit {
     pub grain: Grain,
     pub org: String,
@@ -332,7 +342,7 @@ pub struct BatchFile<'a> {
     pub origin: Option<&'a str>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestStats {
     pub file_id: NodeId,
     pub symbols: usize,
@@ -471,7 +481,7 @@ fn remove_descendants(
     Ok(())
 }
 
-impl Store {
+impl RedbStore {
     /// Open or create a database file. The file must be writable: redb 2 has
     /// no read-only open mode. Fails without modifying the file on a schema
     /// mismatch, on a symbol index newer than this build, or when another
@@ -775,43 +785,6 @@ impl Store {
         self.registry.register(e);
     }
 
-    /// Index raw file bytes: the single entry point shared by the CLI and
-    /// library users. Rejects non-UTF-8 and oversized input (nothing stored),
-    /// normalizes the path, lowercases the language (default: detected from the
-    /// extension) and uses the fallback tokenizer.
-    pub fn index_bytes(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        bytes: &[u8],
-        language: Option<&str>,
-    ) -> Result<IngestStats> {
-        self.index_bytes_with_origin(org, repo, path, bytes, language, None)
-    }
-
-    /// Like `index_bytes`, recording `origin` on the file node (replacing any
-    /// earlier value: the last ingest wins).
-    pub fn index_bytes_with_origin(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        bytes: &[u8],
-        language: Option<&str>,
-        origin: Option<&str>,
-    ) -> Result<IngestStats> {
-        self.index_bytes_opts(
-            org,
-            repo,
-            path,
-            bytes,
-            language,
-            origin,
-            IndexOptions::default(),
-        )
-    }
-
     /// Like `index_bytes_with_origin` with explicit `opts` (e.g. `reindex`).
     #[allow(clippy::too_many_arguments)]
     pub fn index_bytes_opts(
@@ -853,7 +826,10 @@ impl Store {
     }
 
     pub fn get(&self, id: NodeId) -> Result<Option<Node>> {
-        let rt = self.db.begin_read()?;
+        Self::get_in(&self.db.begin_read()?, id)
+    }
+
+    fn get_in(rt: &ReadTransaction, id: NodeId) -> Result<Option<Node>> {
         let t = rt.open_table(NODES)?;
         let r = t.get(id)?.map(|v| dec(v.value())).transpose();
         r
@@ -861,16 +837,23 @@ impl Store {
 
     /// Parent pointer lookup (one hop).
     pub fn parent(&self, id: NodeId) -> Result<Option<Node>> {
-        match self.get(id)? {
+        Self::parent_in(&self.db.begin_read()?, id)
+    }
+
+    fn parent_in(rt: &ReadTransaction, id: NodeId) -> Result<Option<Node>> {
+        match Self::get_in(rt, id)? {
             Some(Node {
                 parent: Some(p), ..
-            }) => self.get(p),
+            }) => Self::get_in(rt, p),
             _ => Ok(None),
         }
     }
 
     pub fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
-        let rt = self.db.begin_read()?;
+        Self::count_nodes_in(&self.db.begin_read()?, kind)
+    }
+
+    fn count_nodes_in(rt: &ReadTransaction, kind: NodeKind) -> Result<usize> {
         let t = rt.open_table(NODES)?;
         let mut n = 0;
         for r in t.iter()? {
@@ -879,20 +862,6 @@ impl Store {
             }
         }
         Ok(n)
-    }
-
-    /// Index one file (idempotent: re-indexing replaces the file's subtree).
-    /// The extraction's symbols must have spans; parents are derived from
-    /// span containment and tokens attach to their innermost symbol.
-    pub fn ingest_file(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        language: &str,
-        ex: &Extraction,
-    ) -> Result<IngestStats> {
-        self.ingest_file_with_origin(org, repo, path, language, ex, None)
     }
 
     /// `ingest_file` that also sets the file's `origin` (see `Node::origin`).
@@ -1232,6 +1201,15 @@ impl Store {
     /// not indexed. Used to verify that everything parsed was stored.
     pub fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
         let rt = self.db.begin_read()?;
+        Self::file_tokens_in(&rt, org, repo, path)
+    }
+
+    fn file_tokens_in(
+        rt: &ReadTransaction,
+        org: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<Option<Vec<Node>>> {
         let names = rt.open_table(NAMES)?;
         let nodes = rt.open_table(NODES)?;
         let kids = rt.open_multimap_table(CHILDREN)?;
@@ -1275,6 +1253,14 @@ impl Store {
     /// values instead of guessing them; a repo may be polyglot.
     pub fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
         let rt = self.db.begin_read()?;
+        Self::describe_in(&rt, org, repo)
+    }
+
+    fn describe_in(
+        rt: &ReadTransaction,
+        org: Option<&str>,
+        repo: Option<&str>,
+    ) -> Result<Vec<RepoInfo>> {
         let cat = rt.open_table(CATALOG)?;
         let mut infos: BTreeMap<(String, String), RepoInfo> = BTreeMap::new();
         let corrupt = || StoreError::Corrupt("bad catalog key".into());
@@ -1334,8 +1320,16 @@ impl Store {
     /// the catalog and as the reference the catalog is tested against.
     #[doc(hidden)]
     pub fn describe_by_scan(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
-        use std::collections::HashMap;
         let rt = self.db.begin_read()?;
+        Self::describe_by_scan_in(&rt, org, repo)
+    }
+
+    fn describe_by_scan_in(
+        rt: &ReadTransaction,
+        org: Option<&str>,
+        repo: Option<&str>,
+    ) -> Result<Vec<RepoInfo>> {
+        use std::collections::HashMap;
         let nodes = rt.open_table(NODES)?;
         let mut all: Vec<Node> = Vec::new();
         for r in nodes.iter()? {
@@ -1417,6 +1411,10 @@ impl Store {
     /// Results are ordered by org, repo, file and byte offset.
     pub fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
         let rt = self.db.begin_read()?;
+        Self::search_symbols_in(&rt, q)
+    }
+
+    fn search_symbols_in(rt: &ReadTransaction, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
         let nodes = rt.open_table(NODES)?;
         let idx = rt.open_multimap_table(SYMBOLS)?;
         let load = |id: NodeId| -> Result<Node> {
@@ -1562,6 +1560,10 @@ impl Store {
     /// Token-text search with roll-up to the requested grain.
     pub fn search(&self, q: &Query) -> Result<Vec<Hit>> {
         let rt = self.db.begin_read()?;
+        Self::search_in(&rt, q)
+    }
+
+    fn search_in(rt: &ReadTransaction, q: &Query) -> Result<Vec<Hit>> {
         let nodes = rt.open_table(NODES)?;
         let tokens = rt.open_multimap_table(TOKENS)?;
         let kids = rt.open_multimap_table(CHILDREN)?;

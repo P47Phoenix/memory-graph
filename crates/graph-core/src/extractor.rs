@@ -19,7 +19,7 @@ pub struct Extraction {
 }
 
 /// Language support plugs in here. Implementations use only schema types.
-pub trait Extractor {
+pub trait Extractor: Send + Sync {
     /// Language string stored on File nodes.
     fn language(&self) -> &str;
     fn extract(&self, source: &str) -> Extraction;

@@ -155,3 +155,5 @@ Filesystem: btrfs on NVMe (`/var/home`), so `cp --reflink=auto` clones. Files: a
 
 ## Reproduce
 See [spikes/daemon/README.md](../../spikes/daemon/README.md).
+
+**Note (2026-09-21, store trait PR #18):** the `Store` type named above is now `RedbStore` behind the `Store` trait, and `Extractor` requires `Send + Sync`, so `Store` (trait) and `RedbStore` are `Send + Sync`. The threaded-server requirement in section 4 is met; the spike code was updated to `RedbStore` only and its measurements are unchanged.

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use graph_cli::{index_dir, DirOpts};
 use graph_core::TokenClass;
-use graph_store::{Grain, IndexOptions, Query, Store, SymbolQuery};
+use graph_store::{open_store, Backend, Grain, IndexOptions, Query, Store, SymbolQuery};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -139,24 +139,27 @@ enum Cmd {
 /// Open the store for a command that indexes, with every shipped extractor
 /// registered: the extractor version is part of a file's fingerprint, so
 /// indexing without one would downgrade already-indexed files to tokens only.
-fn open_for_indexing(db: &std::path::Path) -> Result<Store> {
-    let mut store = Store::open(db)?;
-    store.register(Box::new(graph_lang_rust::RustExtractor));
-    Ok(store)
+fn open_for_indexing(db: &std::path::Path) -> Result<Box<dyn Store>> {
+    Ok(open_store(
+        Backend::default(),
+        db,
+        vec![Box::new(graph_lang_rust::RustExtractor)],
+    )?)
 }
 
-fn open_existing(db: &std::path::Path) -> Result<Store> {
+fn open_existing(db: &std::path::Path) -> Result<Box<dyn Store>> {
     if !db.is_file() {
         bail!("database `{}` does not exist", db.display());
     }
-    Store::open(db).with_context(|| format!("opening database `{}`", db.display()))
+    open_store(Backend::default(), db, vec![])
+        .with_context(|| format!("opening database `{}`", db.display()))
 }
 
 /// Filters are checked against what is actually indexed (in the org/repo
 /// scope), so a typo fails loudly and lists the valid choices rather than
 /// returning nothing.
 fn validate_filters(
-    store: &Store,
+    store: &dyn Store,
     org: Option<&str>,
     repo: Option<&str>,
     language: Option<&str>,
@@ -336,7 +339,7 @@ fn run() -> Result<()> {
         } => {
             let store = open_existing(&cli.db)?;
             validate_filters(
-                &store,
+                &*store,
                 org.as_deref(),
                 repo.as_deref(),
                 language.as_deref(),
@@ -384,7 +387,7 @@ fn run() -> Result<()> {
             }
             let store = open_existing(&cli.db)?;
             validate_filters(
-                &store,
+                &*store,
                 org.as_deref(),
                 repo.as_deref(),
                 language.as_deref(),

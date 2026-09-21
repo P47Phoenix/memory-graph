@@ -63,7 +63,7 @@ struct Tally {
 
 /// Store the pending files in one transaction and fold the outcomes into `t`.
 fn flush_batch(
-    store: &Store,
+    store: &dyn Store,
     o: &DirOpts,
     pending: &mut Vec<(String, Vec<u8>)>,
     t: &mut Tally,
@@ -129,7 +129,7 @@ fn flush_batch(
 /// Per-file problems are counted as skips; only database failures abort.
 pub fn index_dir(
     o: DirOpts,
-    open: impl FnOnce(&std::path::Path) -> Result<Store>,
+    open: impl FnOnce(&std::path::Path) -> Result<Box<dyn Store>>,
     out: &mut dyn Write,
 ) -> Result<()> {
     use std::collections::BTreeMap;
@@ -248,11 +248,11 @@ pub fn index_dir(
         pending_bytes += bytes.len();
         pending.push((rel_s, bytes));
         if pending.len() >= BATCH_FILES || pending_bytes >= BATCH_BYTES {
-            flush_batch(&store, &o, &mut pending, &mut tally)?;
+            flush_batch(&*store, &o, &mut pending, &mut tally)?;
             pending_bytes = 0;
         }
     }
-    flush_batch(&store, &o, &mut pending, &mut tally)?;
+    flush_batch(&*store, &o, &mut pending, &mut tally)?;
     let Tally {
         files,
         unchanged,

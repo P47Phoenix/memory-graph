@@ -36,8 +36,8 @@ fn sym(name: &str, kind: SymbolKind, span: Span) -> SymbolDecl {
 const RUST: &str = "impl S {\n    fn a() { foo(); foo(); }\n    fn b() { foo(); }\n}\n";
 const ZIG: &str = "pub fn main() void { foo(); }\n";
 
-fn setup(dir: &std::path::Path) -> Store {
-    let s = Store::open(dir.join("g.redb")).unwrap();
+fn setup(dir: &std::path::Path) -> RedbStore {
+    let s = RedbStore::open(dir.join("g.redb")).unwrap();
     let ex = Extraction {
         has_errors: false,
         symbols: vec![
@@ -69,7 +69,7 @@ fn setup(dir: &std::path::Path) -> Store {
 fn reopen_and_language_filter() {
     let d = tempfile::tempdir().unwrap();
     drop(setup(d.path()));
-    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
     let mut q = Query::new("foo");
     assert_eq!(s.search(&q).unwrap().len(), 4);
     q.language = Some("rust".into());
@@ -163,8 +163,8 @@ fn reindex_no_duplicates() {
 fn lock_and_schema_mismatch() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("g.redb");
-    let s = Store::open(&p).unwrap();
-    assert!(matches!(Store::open(&p), Err(StoreError::Locked(_))));
+    let s = RedbStore::open(&p).unwrap();
+    assert!(matches!(RedbStore::open(&p), Err(StoreError::Locked(_))));
     drop(s);
     {
         let db = Database::create(&p).unwrap();
@@ -176,7 +176,7 @@ fn lock_and_schema_mismatch() {
         wt.commit().unwrap();
     }
     assert!(matches!(
-        Store::open(&p),
+        RedbStore::open(&p),
         Err(StoreError::SchemaMismatch { found: 99 })
     ));
 }
@@ -249,7 +249,7 @@ fn no_matching_symbol_is_distinct_from_no_symbols() {
 #[test]
 fn index_bytes_normalizes() {
     let d = tempfile::tempdir().unwrap();
-    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
     s.index_bytes("o", "r", "./a.rs", b"\xEF\xBB\xBFfoo bar", None)
         .unwrap();
     let st = s
@@ -303,14 +303,14 @@ fn prune_removes_unlisted_files_only() {
 #[test]
 fn empty_org_or_repo_rejected() {
     let d = tempfile::tempdir().unwrap();
-    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
     assert!(matches!(
         s.index_bytes("", "r", "a", b"x", None),
         Err(StoreError::Rejected(_))
     ));
 }
 
-fn origin_of(s: &Store, org: &str, repo: &str, file: &str) -> Option<String> {
+fn origin_of(s: &RedbStore, org: &str, repo: &str, file: &str) -> Option<String> {
     let rt = s.db.begin_read().unwrap();
     let names = rt.open_table(NAMES).unwrap();
     let o = names
@@ -334,7 +334,7 @@ fn origin_of(s: &Store, org: &str, repo: &str, file: &str) -> Option<String> {
 #[test]
 fn origin_marker_last_ingest_wins_and_gates_prune() {
     let d = tempfile::tempdir().unwrap();
-    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
     let keep = std::collections::HashSet::new();
     s.index_bytes("o", "r", "a.txt", b"x", None).unwrap();
     assert_eq!(origin_of(&s, "o", "r", "a.txt"), None);
@@ -368,12 +368,12 @@ fn nodes_without_origin_field_still_deserialize() {
 fn open_in_missing_directory_names_the_path() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("nope").join("g.redb");
-    let e = Store::open(&p).err().unwrap().to_string();
+    let e = RedbStore::open(&p).err().unwrap().to_string();
     assert!(e.contains("nope"), "{e}");
 }
 
-fn symbol_fixture(dir: &std::path::Path) -> Store {
-    let s = Store::open(dir.join("g.redb")).unwrap();
+fn symbol_fixture(dir: &std::path::Path) -> RedbStore {
+    let s = RedbStore::open(dir.join("g.redb")).unwrap();
     let src = "fn parse() {}\nstruct S;\nimpl S { fn parse(&self) {} fn parser(&self) {} fn other(&self) {} }\n";
     let ex = Extraction {
         has_errors: false,
@@ -531,7 +531,7 @@ fn symbol_index_backfilled_for_older_databases() {
         wt.delete_multimap_table(SYMBOLS).unwrap();
         wt.commit().unwrap();
     }
-    let s = Store::open(&p).unwrap();
+    let s = RedbStore::open(&p).unwrap();
     assert_eq!(
         s.search_symbols(&SymbolQuery::new("parse")).unwrap().len(),
         5
@@ -558,8 +558,8 @@ fn describe_polyglot_repo() {
     assert_eq!(s.search_symbols(&q).unwrap().len(), 2);
 }
 
-fn rust_store(dir: &std::path::Path) -> Store {
-    let mut s = Store::open(dir.join("g.redb")).unwrap();
+fn rust_store(dir: &std::path::Path) -> RedbStore {
+    let mut s = RedbStore::open(dir.join("g.redb")).unwrap();
     s.register(Box::new(graph_lang_rust::RustExtractor));
     s
 }
@@ -584,7 +584,7 @@ fn stale_symbol_index_is_rebuilt_on_version_change() {
         }
         wt.commit().unwrap();
     }
-    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
     assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
     assert!(s
         .search_symbols(&SymbolQuery::new("stale"))
@@ -633,7 +633,10 @@ fn open_failed_hint_only_for_permission_errors() {
 #[test]
 fn opening_a_directory_has_no_read_only_hint() {
     let d = tempfile::tempdir().unwrap();
-    let msg = Store::open(d.path()).err().expect("must fail").to_string();
+    let msg = RedbStore::open(d.path())
+        .err()
+        .expect("must fail")
+        .to_string();
     assert!(msg.contains("cannot open database"), "{msg}");
     assert!(!msg.contains("writable"), "{msg}");
 }
@@ -644,7 +647,7 @@ fn read_only_database_gives_clear_error() {
     use std::os::unix::fs::PermissionsExt;
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("g.redb");
-    drop(Store::open(&p).unwrap());
+    drop(RedbStore::open(&p).unwrap());
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
     if std::fs::OpenOptions::new().write(true).open(&p).is_ok() {
         // Root ignores file modes; the hint mapping is covered deterministically
@@ -652,14 +655,14 @@ fn read_only_database_gives_clear_error() {
         eprintln!("SKIPPED read_only_database_gives_clear_error: running with write access to 0444 files (root)");
         return;
     }
-    let msg = Store::open(&p).err().expect("must fail").to_string();
+    let msg = RedbStore::open(&p).err().expect("must fail").to_string();
     assert!(
         msg.contains("cannot open database") && msg.contains("must be writable"),
         "{msg}"
     );
 }
 
-fn set_meta(s: &Store, key: &str, v: Option<u64>) {
+fn set_meta(s: &RedbStore, key: &str, v: Option<u64>) {
     let wt = s.db.begin_write().unwrap();
     {
         let mut m = wt.open_table(META).unwrap();
@@ -671,7 +674,7 @@ fn set_meta(s: &Store, key: &str, v: Option<u64>) {
     wt.commit().unwrap();
 }
 
-fn meta(s: &Store, key: &str) -> Option<u64> {
+fn meta(s: &RedbStore, key: &str) -> Option<u64> {
     let rt = s.db.begin_read().unwrap();
     let t = rt.open_table(META).unwrap();
     let v = t.get(key).unwrap().map(|v| v.value());
@@ -688,7 +691,7 @@ fn newer_symbol_index_is_refused_and_untouched() {
             .unwrap();
         set_meta(&s, "symbol_index_version", Some(SYMBOL_INDEX_VERSION + 1));
     }
-    let err = Store::open(&p).err().expect("must refuse");
+    let err = RedbStore::open(&p).err().expect("must refuse");
     assert!(
         matches!(err, StoreError::IndexTooNew { found } if found == SYMBOL_INDEX_VERSION + 1),
         "{err}"
@@ -731,7 +734,7 @@ fn missing_version_key_with_existing_table_is_rebuilt() {
         wt.commit().unwrap();
         assert_eq!(meta(&s, "symbol_index_version"), None);
     }
-    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
     assert_eq!(meta(&s, "symbol_index_version"), Some(SYMBOL_INDEX_VERSION));
     assert_eq!(s.search_symbols(&SymbolQuery::new("foo")).unwrap().len(), 1);
     assert!(s
@@ -767,7 +770,7 @@ fn same_file_and_offset_ties_break_by_node_id() {
     };
     let order = |first: &str, second: &str| {
         let d = tempfile::tempdir().unwrap();
-        let s = Store::open(d.path().join("g.redb")).unwrap();
+        let s = RedbStore::open(d.path().join("g.redb")).unwrap();
         let mk = |k: &str| SymbolDecl {
             lang_kind: Some(k.into()),
             ..sym("dup", SymbolKind::Function, zero)
@@ -815,7 +818,7 @@ impl Extractor for CountingExtractor {
 #[test]
 fn batch_invalid_span_fails_only_that_file() {
     let d = tempfile::tempdir().unwrap();
-    let mut s = Store::open(d.path().join("g.redb")).unwrap();
+    let mut s = RedbStore::open(d.path().join("g.redb")).unwrap();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     s.register(Box::new(CountingExtractor(calls.clone())));
     let f = |p, b: &'static [u8]| BatchFile {
@@ -861,7 +864,7 @@ fn batch_invalid_span_fails_only_that_file() {
 #[test]
 fn batch_hard_error_still_aborts_and_rolls_back() {
     let d = tempfile::tempdir().unwrap();
-    let mut s = Store::open(d.path().join("g.redb")).unwrap();
+    let mut s = RedbStore::open(d.path().join("g.redb")).unwrap();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     s.register(Box::new(CountingExtractor(calls.clone())));
     let f = |p, l| BatchFile {
@@ -927,7 +930,7 @@ fn files_indexed_with_previous_tokenizer_version_reindex() {
     let path = d.path().join("g.redb");
     let src = b"const A: &str = r#\"a\"b\"#;\n";
     {
-        let mut old = Store::open(&path).unwrap();
+        let mut old = RedbStore::open(&path).unwrap();
         old.register(Box::new(OldTokenizerRust));
         assert!(
             !old.index_bytes("o", "r", "a.rs", src, None)
@@ -940,7 +943,7 @@ fn files_indexed_with_previous_tokenizer_version_reindex() {
                 .unchanged
         );
     }
-    let mut s = Store::open(&path).unwrap();
+    let mut s = RedbStore::open(&path).unwrap();
     s.register(Box::new(graph_lang_rust::RustExtractor));
     let st = s.index_bytes("o", "r", "a.rs", src, None).unwrap();
     assert!(st.replaced && !st.unchanged && st.symbols == 1);
@@ -1076,7 +1079,7 @@ fn kind_other_matches_uncategorised_symbols() {
     assert!(info.kind_names(None).contains("other"));
 }
 
-fn sq_symbol(s: &Store, q: &Query) -> Option<String> {
+fn sq_symbol(s: &RedbStore, q: &Query) -> Option<String> {
     s.search(q).unwrap()[0].symbol.clone()
 }
 
@@ -1131,7 +1134,7 @@ fn batch_matches_individual_ingest() {
 
 // --- skip unchanged files -------------------------------------------------
 
-fn file_token_ids(s: &Store, path: &str) -> Vec<NodeId> {
+fn file_token_ids(s: &RedbStore, path: &str) -> Vec<NodeId> {
     s.file_tokens("o", "r", path)
         .unwrap()
         .unwrap()
@@ -1140,7 +1143,7 @@ fn file_token_ids(s: &Store, path: &str) -> Vec<NodeId> {
         .collect()
 }
 
-fn file_fingerprint(s: &Store, path: &str) -> Option<String> {
+fn file_fingerprint(s: &RedbStore, path: &str) -> Option<String> {
     let rt = s.db.begin_read().unwrap();
     let names = rt.open_table(NAMES).unwrap();
     let o = names
@@ -1259,7 +1262,7 @@ fn extractor_version_change_reindexes() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("g.redb");
     let put = |v: &'static str| {
-        let mut s = Store::open(&path).unwrap();
+        let mut s = RedbStore::open(&path).unwrap();
         s.register(Box::new(Versioned(v)));
         s.index_bytes("o", "r", "a.vx", b"a b c\n", Some("vx"))
             .unwrap()
@@ -1269,7 +1272,7 @@ fn extractor_version_change_reindexes() {
     let st = put("2");
     assert!(st.replaced && !st.unchanged);
     assert!(put("2").unchanged);
-    let s = Store::open(&path).unwrap();
+    let s = RedbStore::open(&path).unwrap();
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
     assert_eq!(s.count_nodes(NodeKind::Token).unwrap(), 3);
 }
@@ -1411,8 +1414,8 @@ fn skipped_files_are_still_seen_by_prune() {
 #[test]
 fn extractor_and_tokenizer_versions_participate_in_fingerprint() {
     let d = tempfile::tempdir().unwrap();
-    let s = Store::open(d.path().join("g.redb")).unwrap();
-    let rust = Store::open(d.path().join("h.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
+    let rust = RedbStore::open(d.path().join("h.redb")).unwrap();
     let mut rust = rust;
     rust.register(Box::new(graph_lang_rust::RustExtractor));
     let fp_fallback = s.fingerprint(b"fn f() {}\n", "rust");
@@ -1430,12 +1433,12 @@ fn unregistered_extractor_downgrades_so_callers_must_register() {
     // fingerprint differs, so the file is re-indexed token-only.
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("g.redb");
-    let mut s = Store::open(&path).unwrap();
+    let mut s = RedbStore::open(&path).unwrap();
     s.register(Box::new(graph_lang_rust::RustExtractor));
     s.index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
         .unwrap();
     drop(s);
-    let bare = Store::open(&path).unwrap();
+    let bare = RedbStore::open(&path).unwrap();
     let st = bare
         .index_bytes("o", "r", "a.rs", b"fn f() {}\n", None)
         .unwrap();
@@ -1504,7 +1507,7 @@ fn language_override_on_indexed_file_changes_fingerprint() {
 
 // ---- describe catalog (ADR 0003 story 0) ----
 
-fn assert_catalog_matches_scan(s: &Store, ctx: &str) {
+fn assert_catalog_matches_scan(s: &RedbStore, ctx: &str) {
     assert_eq!(
         s.describe(None, None).unwrap(),
         s.describe_by_scan(None, None).unwrap(),
@@ -1528,7 +1531,7 @@ const SRCS: [&str; 5] = [
 #[test]
 fn catalog_equals_scan_after_scripted_mutations() {
     let dir = tempfile::tempdir().unwrap();
-    let mut s = Store::open(dir.path().join("g.redb")).unwrap();
+    let mut s = RedbStore::open(dir.path().join("g.redb")).unwrap();
     s.register(Box::new(graph_lang_rust::RustExtractor));
     s.register(Box::new(CountingExtractor(Default::default())));
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
@@ -1654,9 +1657,9 @@ fn old_db_without_catalog_backfills_once() {
         wt.commit().unwrap();
         e
     };
-    let s = Store::open(&path).unwrap();
+    let s = RedbStore::open(&path).unwrap();
     assert_eq!(s.describe(None, None).unwrap(), expected);
-    let ver = |s: &Store| {
+    let ver = |s: &RedbStore| {
         s.db.begin_read()
             .unwrap()
             .open_table(META)
@@ -1676,7 +1679,7 @@ fn old_db_without_catalog_backfills_once() {
         wt.commit().unwrap();
     }
     drop(s);
-    let s = Store::open(&path).unwrap();
+    let s = RedbStore::open(&path).unwrap();
     assert!(
         s.describe(Some("zz"), None).unwrap().len() == 1,
         "rebuilt again"
@@ -1702,7 +1705,7 @@ fn describe_does_not_decode_nodes() {
 #[test]
 fn nul_bytes_rejected_in_org_repo_language_and_lang_kind() {
     let d = tempfile::tempdir().unwrap();
-    let s = Store::open(d.path().join("g.redb")).unwrap();
+    let s = RedbStore::open(d.path().join("g.redb")).unwrap();
     let ok = Extraction::default();
     for (o, r, l) in [("a\0b", "r", "x"), ("o", "a\0b", "x"), ("o", "r", "a\0b")] {
         let e = s.ingest_file(o, r, "f", l, &ok).unwrap_err();
@@ -1755,7 +1758,7 @@ fn v1_database_upgrades_in_place_and_stamps_schema() {
         set_meta(&s, "catalog_version", None);
         e
     };
-    let s = Store::open(&path).unwrap();
+    let s = RedbStore::open(&path).unwrap();
     assert_eq!(meta(&s, "schema_version"), Some(SCHEMA_VERSION));
     assert_eq!(s.describe(None, None).unwrap(), expected);
 }
@@ -1771,7 +1774,7 @@ fn missing_catalog_table_is_rebuilt_and_partial_rows_are_reported() {
         wt.commit().unwrap();
         s.describe_by_scan(None, None).unwrap()
     };
-    let s = Store::open(&path).unwrap();
+    let s = RedbStore::open(&path).unwrap();
     assert_eq!(s.describe(None, None).unwrap(), expected);
     // Drop one repo marker row: describe says so instead of returning a wrong answer.
     {
@@ -1781,4 +1784,27 @@ fn missing_catalog_table_is_rebuilt_and_partial_rows_are_reported() {
     }
     let e = s.describe(None, None).unwrap_err();
     assert!(matches!(e, StoreError::Corrupt(_)), "{e}");
+}
+
+#[test]
+fn redb_passes_conformance_suite() {
+    conformance::run_all(&|| {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("g.redb");
+        conformance::Harness {
+            open: Box::new(move |ex| open_store(Backend::Redb, &path, ex)),
+            exclusive: true,
+            guard: Some(Box::new(d)),
+        }
+    });
+}
+
+/// The trait must stay object-safe and shareable across threads.
+#[test]
+fn store_trait_is_object_safe_send_sync() {
+    fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+    assert_send_sync::<dyn Store>();
+    assert_send_sync::<RedbStore>();
+    fn assert_send<T: Send + ?Sized>() {}
+    assert_send::<dyn StoreRead + Send>();
 }

@@ -167,7 +167,7 @@ fn non_utf8_stores_nothing_and_lock_is_reported() {
     let (_, out, _) = run(&["--db", &dbs, "search", "f", "--grain", "file"]);
     assert!(out.is_empty());
     // Held lock -> clear message.
-    let _held = graph_store::Store::open(&db).unwrap();
+    let _held = graph_store::RedbStore::open(&db).unwrap();
     let (ok, _, err) = run(&["--db", &dbs, "search", "x"]);
     assert!(!ok && err.contains("locked"), "{err}");
     // Directory as --db.

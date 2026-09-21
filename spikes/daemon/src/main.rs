@@ -1,6 +1,6 @@
 //! THROWAWAY spike for docs/spikes/daemon-and-locking.md. Not part of the workspace.
 //! Commands: hold | try | retry | storm-worker | search-once | serve | bench
-use graph_store::{Grain, Query, Store, StoreError, SymbolQuery};
+use graph_store::{Grain, Query, RedbStore, StoreError, SymbolQuery};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -74,7 +74,7 @@ fn span_arr(s: &graph_core::schema::Span) -> [u32; 6] {
         s.end_col,
     ]
 }
-fn handle(store: &Store, r: &Req) -> Resp {
+fn handle(store: &RedbStore, r: &Req) -> Resp {
     match r {
         Req::Ping => Resp::Pong,
         Req::Search {
@@ -360,9 +360,9 @@ fn read_frame(s: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 
 // ---------------- commands ----------------
 fn serve(db: &str, sock: &str, enc: Enc) {
-    let mut store = Store::open(db).expect("open");
+    let mut store = RedbStore::open(db).expect("open");
     store.register(Box::new(graph_lang_rust::RustExtractor));
-    // NOTE: graph_store::Store is not Send/Sync today (Registry holds Box<dyn Extractor>), so this
+    // NOTE: graph_store::RedbStore was not Send/Sync when this spike was written (Registry holds Box<dyn Extractor>), so this
     // spike serves one connection at a time on the accept thread. A real daemon needs Send+Sync.
     let _ = std::fs::remove_file(sock);
     let l = UnixListener::bind(sock).unwrap();
@@ -469,7 +469,7 @@ fn iters_for(name: &str, tokens_hint: usize) -> usize {
 fn bench(db: &str, label: &str, sock_json: Option<&str>, sock_bin: Option<&str>) {
     // in-process
     let store =
-        Store::open(db).expect("open (is the daemon holding it? bench inproc needs its own copy)");
+        RedbStore::open(db).expect("open (is the daemon holding it? bench inproc needs its own copy)");
     let mut inproc = std::collections::BTreeMap::new();
     for (name, req) in ops() {
         let n = iters_for(name, if label.contains("10m") { 10_000_000 } else { 0 });
@@ -537,8 +537,8 @@ fn bench(db: &str, label: &str, sock_json: Option<&str>, sock_bin: Option<&str>)
     }
 }
 
-fn try_open(db: &str) -> Result<Store, StoreError> {
-    Store::open(db)
+fn try_open(db: &str) -> Result<RedbStore, StoreError> {
+    RedbStore::open(db)
 }
 
 fn main() {

@@ -22,6 +22,8 @@ Languages are detected per file (extension, filename such as `Makefile`, or a `#
 
 **Tokenizer dialects.** The generic fallback tokenizer (every language without an extractor) is unchanged: its `r"a\"b"` is an identifier `r` and a string (Python-style escapes), `b"y"` is an identifier and a string. The Rust extractor uses the `rust_literals` dialect (`TokenizerOptions`): raw strings `r"..."`, `r#"..."#` (any number of hashes, no escapes), `br#"..."#` and byte literals `b"..."`, `b'x'` are single Literal tokens, and an unterminated raw string runs to end of input. A Rust file indexed without the Rust extractor registered gets the plain fallback tokens and no symbols. The Rust extractor version is `rust-syn-2`, so Rust files re-index; other languages do not.
 
+**Architecture note: the store trait.** The CLI depends on the object-safe `graph_store::Store` / `StoreRead` traits, not on redb: `open_store(Backend::Redb, path, extractors)` returns a `Box<dyn Store>`, and `RedbStore` is the v1 backend (the type formerly called `Store`; on-disk format and CLI output are unchanged). Library users construct `RedbStore::open(path)` or `open_store`, and need the traits in scope (`use graph_store::{Store, StoreRead}`) to call the methods on a boxed store. `Extractor` now requires `Send + Sync`. `graph_store::conformance::run_all` is a reusable test suite for any `Store` implementation. See [architecture diagrams](docs/architecture-diagrams.md) and [ADR 0003](docs/adr/0003-data-model.md).
+
 ## Test corpus
 
 `testdata/corpus/` vendors real public code (MIT/Apache-2.0 only, pinned commits, see each folder's `UPSTREAM.md`) as distinct repos grouped into applications by `corpus.json`:
