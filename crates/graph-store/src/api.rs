@@ -355,6 +355,10 @@ impl Backend {
 /// no schema yet (empty or freshly created), so any backend may claim it.
 /// Reads only; an unknown version is `SchemaMismatch`. It opens the file, so
 /// it fails with `Locked` while another process holds it.
+///
+/// It opens the file with `Database::create`, so it needs write permission on
+/// the file, and it can never be strictly read-only: redb may repair a file
+/// left by a crash when it opens it.
 pub fn detect_backend(path: &Path) -> Result<Option<(Backend, u64)>> {
     match std::fs::metadata(path) {
         Ok(m) if m.is_file() && m.len() > 0 => {}

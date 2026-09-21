@@ -1743,6 +1743,8 @@ impl RedbStore {
 }
 
 #[cfg(test)]
+mod detect_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod v2_random;

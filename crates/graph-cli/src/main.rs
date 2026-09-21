@@ -162,8 +162,9 @@ fn resolve_backend(db: &std::path::Path, requested: Option<BackendArg>) -> Resul
     };
     if let Ok(Some((found, version))) = detect_backend(db) {
         if found != want {
-            let hint = if requested.is_some() {
-                format!("drop --backend or pass `--backend {}`", found.name())
+            // v1 is the default, so "drop --backend" only helps for a v1 file.
+            let hint = if found == Backend::Redb {
+                "drop --backend or pass `--backend v1`".to_string()
             } else {
                 format!("pass `--backend {}`", found.name())
             };

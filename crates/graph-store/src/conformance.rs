@@ -941,7 +941,7 @@ fn vacuum_preserves_reads(h: &Harness) {
     s.index_bytes("o", "r", "a.txt", b"alpha beta", None)
         .unwrap();
     s.index_bytes("o", "r", "b.txt", b"beta", None).unwrap();
-    // Replace a.txt so `alpha` is dead, then prune b.txt away.
+    // Replace a.txt so `alpha` is dead.
     s.index_bytes("o", "r", "a.txt", b"gamma", None).unwrap();
     let before = (
         s.search(&Query::new("gamma")).unwrap(),

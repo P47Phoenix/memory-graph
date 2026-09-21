@@ -192,10 +192,9 @@ fn a_v2_database_needs_the_flag() {
     let (ok, _, err) = run(&["--db", &v2, "--backend", "v1", "describe"]);
     assert!(!ok);
     assert!(err.contains("is a v2 database"), "{err}");
-    assert!(
-        err.contains("drop --backend or pass `--backend v2`"),
-        "{err}"
-    );
+    // Dropping the flag would default to v1 again, so the hint must not say so.
+    assert!(err.contains("pass `--backend v2`"), "{err}");
+    assert!(!err.contains("drop --backend"), "{err}");
     assert_eq!(std::fs::read(&v2).unwrap(), before);
 }
 
@@ -220,7 +219,8 @@ fn a_v1_database_is_refused_by_backend_v2() {
         assert!(!ok, "{args:?}: {out}");
         assert!(
             err.contains("is a v1 database (schema version 2)")
-                && err.contains("the v2 backend was selected"),
+                && err.contains("the v2 backend was selected")
+                && err.contains("drop --backend or pass `--backend v1`"),
             "{args:?}: {err}"
         );
     }
