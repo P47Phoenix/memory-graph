@@ -5,7 +5,7 @@ use crate::schema::{Span, TokenClass, TokenDecl};
 /// tokens `tokenize` returns for any input; it is folded into extractor
 /// versions (and so file fingerprints) so stored files re-index. The golden
 /// test `tokenizer_output_is_pinned` fails when output changes without a bump.
-pub const TOKENIZER_VERSION: u32 = 2;
+pub const TOKENIZER_VERSION: u32 = 1;
 
 const OPERATOR_CHARS: &str = "+-*/%=<>!&|^~?@";
 
@@ -15,6 +15,25 @@ const OPERATOR_CHARS: &str = "+-*/%=<>!&|^~?@";
 /// Unterminated strings and comments
 /// run to end of input (or line, for `//`).
 pub fn tokenize(src: &str) -> Vec<TokenDecl> {
+    tokenize_with(src, TokenizerOptions::default())
+}
+
+/// Dialect switches for `tokenize_with`. The default is the language-agnostic
+/// fallback used for every language without an extractor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenizerOptions {
+    /// Lex Rust literal forms as single Literal tokens: raw strings `r"..."`,
+    /// `r#"..."#` (any number of hashes, no escapes), `br#"..."#`, and byte
+    /// literals `b"..."`, `b'x'`. Off by default because other languages
+    /// disagree (Python's `r"a\"b"` is one string via backslash escapes, shell
+    /// `b"x"` is an identifier followed by a string). The Rust extractor turns
+    /// it on; a Rust file with no extractor registered gets the plain fallback
+    /// tokens (no symbols), deliberately, so its tokens may split raw strings.
+    pub rust_literals: bool,
+}
+
+/// `tokenize` with an explicit dialect.
+pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let (mut i, mut line, mut col) = (0usize, 1u32, 1u32);
@@ -44,7 +63,11 @@ pub fn tokenize(src: &str) -> Vec<TokenDecl> {
                 after.find("*/").map_or(rest.len(), |p| p + 4),
                 TokenClass::Comment,
             )
-        } else if let Some(n) = prefixed_literal_len(rest) {
+        } else if let Some(n) = opts
+            .rust_literals
+            .then(|| prefixed_literal_len(rest))
+            .flatten()
+        {
             (n, TokenClass::Literal)
         } else if c.is_alphabetic() || c == '_' {
             let n = rest
@@ -164,8 +187,9 @@ mod tests {
         tokenize(s).into_iter().map(|t| t.text).collect()
     }
 
-    const GOLDEN: u64 = 0x7f377ab72ee35a84;
-    const GOLDEN_VERSION: u32 = 2;
+    const GOLDEN: u64 = 0x4ee808b12b2ae44e;
+    const RUST_GOLDEN: u64 = 0x9ec89e415b7c7bac;
+    const GOLDEN_VERSION: u32 = 1;
 
     /// Golden test: pins tokenizer output for a fixed source set.
     #[test]
@@ -177,16 +201,32 @@ mod tests {
             "unterminated \"string",
             "/* unterminated",
             "héllo wörld = ünï",
+        ];
+        const RUST_SOURCES: &[&str] = &[
             "const A: &str = r#\"a\"b\"#; let b = br##\"x\"#y\"##; b\"by\\\"te\" b'x' r\"raw\\\"",
             "let r = br + bar; r#type unterminated r#\"never closed",
+            "fn main() { let x = 1 + 2; // hi\n}\n",
         ];
         // FNV-1a 64 over the Debug rendering of every token.
-        let mut h: u64 = 0xcbf29ce484222325;
-        for src in SOURCES {
-            for b in format!("{:?}", tokenize(src)).bytes() {
-                h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        let fnv = |srcs: &[&str], opts: TokenizerOptions| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for src in srcs {
+                for b in format!("{:?}", tokenize_with(src, opts)).bytes() {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                }
             }
-        }
+            h
+        };
+        // The default (fallback) dialect is unchanged since version 1.
+        let h = fnv(SOURCES, TokenizerOptions::default());
+        let rust = TokenizerOptions {
+            rust_literals: true,
+        };
+        let rh = fnv(RUST_SOURCES, rust);
+        assert_eq!(
+            rh, RUST_GOLDEN,
+            "rust-dialect output changed (hash {rh:#x}): bump TOKENIZER_VERSION and update RUST_GOLDEN"
+        );
         assert_eq!(
             h, GOLDEN,
             "tokenizer output changed (hash {h:#x}): bump TOKENIZER_VERSION in \
@@ -227,8 +267,19 @@ mod tests {
         assert_eq!(t[2].span.start, 8);
     }
 
+    const RUST: TokenizerOptions = TokenizerOptions {
+        rust_literals: true,
+    };
+
+    fn rtexts(s: &str) -> Vec<String> {
+        tokenize_with(s, RUST).into_iter().map(|t| t.text).collect()
+    }
+
     fn lit(s: &str) -> Vec<(String, TokenClass)> {
-        tokenize(s).into_iter().map(|t| (t.text, t.class)).collect()
+        tokenize_with(s, RUST)
+            .into_iter()
+            .map(|t| (t.text, t.class))
+            .collect()
     }
 
     #[test]
@@ -243,12 +294,12 @@ mod tests {
         one("b'x'");
         one("b'\\n'");
         // Backslash is not an escape in raw strings.
-        assert_eq!(texts("r\"a\\\" x"), ["r\"a\\\"", "x"]);
+        assert_eq!(rtexts("r\"a\\\" x"), ["r\"a\\\"", "x"]);
         // Closing needs the same number of hashes; a longer run still closes.
-        assert_eq!(texts("r##\"a\"# b\"## c"), ["r##\"a\"# b\"##", "c"]);
+        assert_eq!(rtexts("r##\"a\"# b\"## c"), ["r##\"a\"# b\"##", "c"]);
         // Unterminated raw strings run to end of input.
-        assert_eq!(texts("x r#\"abc\" \"#"), ["x", "r#\"abc\" \"#"]);
-        assert_eq!(texts("r\"abc"), ["r\"abc"]);
+        assert_eq!(rtexts("x r#\"abc\" \"#"), ["x", "r#\"abc\" \"#"]);
+        assert_eq!(rtexts("r\"abc"), ["r\"abc"]);
     }
 
     #[test]
@@ -257,13 +308,23 @@ mod tests {
         for id in ["r", "br", "bar", "b", "rb", "raw", "r_", "brr"] {
             assert_eq!(lit(id), [(id.to_string(), Identifier)], "{id}");
         }
-        assert_eq!(texts("r #\"a\"#")[0], "r");
-        assert_eq!(texts("r#type"), ["r", "#", "type"]);
-        assert_eq!(texts("b 'x'"), ["b", "'x'"]);
-        assert_eq!(texts("br#x"), ["br", "#", "x"]);
+        assert_eq!(rtexts("r #\"a\"#")[0], "r");
+        assert_eq!(rtexts("r#type"), ["r", "#", "type"]);
+        assert_eq!(rtexts("b 'x'"), ["b", "'x'"]);
+        assert_eq!(rtexts("br#x"), ["br", "#", "x"]);
         // Identifier ending in r/b does not start a raw string.
-        assert_eq!(texts("bar\"x\""), ["bar", "\"x\""]);
-        assert_eq!(texts("b'a"), ["b", "'", "a"]);
+        assert_eq!(rtexts("bar\"x\""), ["bar", "\"x\""]);
+        assert_eq!(rtexts("b'a"), ["b", "'", "a"]);
+    }
+
+    #[test]
+    fn default_dialect_ignores_rust_literals() {
+        // Same tokens as version 1 / main: Python raw strings, shell `b"y"`.
+        assert_eq!(texts("r\"a\\\"b\""), ["r", "\"a\\\"b\""]);
+        assert_eq!(texts("r\"\\\"\""), ["r", "\"\\\"\""]);
+        assert_eq!(texts("echo b\"y\""), ["echo", "b", "\"y\""]);
+        assert_eq!(texts("r#\"a\"b\"#"), ["r", "#", "\"a\"", "b", "\"#"]);
+        assert_eq!(texts("b'x'"), ["b", "'x'"]);
     }
 
     proptest! {
@@ -288,8 +349,13 @@ mod tests {
     }
 
     fn check_spans(src: &str) -> Result<(), TestCaseError> {
+        check_spans_with(src, TokenizerOptions::default())?;
+        check_spans_with(src, RUST)
+    }
+
+    fn check_spans_with(src: &str, opts: TokenizerOptions) -> Result<(), TestCaseError> {
         let src = src.to_string();
-        let toks = tokenize(&src);
+        let toks = tokenize_with(&src, opts);
         let mut prev_end = 0usize;
         for t in &toks {
             let (s, e) = (t.span.start as usize, t.span.end as usize);

@@ -909,10 +909,8 @@ impl Extractor for OldTokenizerRust {
         "rust"
     }
     fn version(&self) -> String {
-        format!(
-            "rust-syn-1+tok{}",
-            graph_core::tokenizer::TOKENIZER_VERSION - 1
-        )
+        // What the Rust extractor reported before its raw-string tokens (#16).
+        "rust-syn-1+tok1".to_string()
     }
     fn extract(&self, source: &str) -> Extraction {
         Extraction {
