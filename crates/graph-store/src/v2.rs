@@ -122,12 +122,12 @@ pub struct VacuumStats {
     pub terms_kept: usize,
 }
 
-/// The v2 backend: one redb file.
 /// Default cap on the source bytes one `index_batch` write transaction
 /// takes in before it commits and starts the next (see [`V2Store::index_batch`]
 /// docs on the `Store` impl for the semantics).
 pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
 
+/// The v2 backend: one redb file.
 pub struct V2Store {
     pub(crate) db: Database,
     registry: Registry,
@@ -1255,6 +1255,10 @@ impl V2Store {
                 }
             }
             let mut w = w;
+            // Note: removing a middle key of a `.n` probe chain would leave a
+            // hole that hides later keys from `lookup`. That needs a real
+            // SHA-256 collision, which is practically unreachable, so it is
+            // not handled (no re-keying or tombstone).
             for (id, text) in &dead {
                 let (key, found) = w.dict_key(text, Some(*id))?;
                 if found.is_some() {

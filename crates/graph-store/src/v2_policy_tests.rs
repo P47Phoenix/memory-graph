@@ -409,7 +409,10 @@ mod consistency {
         #![proptest_config(ProptestConfig::with_cases(40))]
         /// After any sequence of ingest, replace, prune, chunked batch and
         /// vacuum, every derived table equals what the streams imply, and a
-        /// vacuum leaves no dead dictionary term.
+        /// vacuum leaves no dead dictionary term. The oracle recomputes
+        /// derived tables from the decoded streams; it does not check the
+        /// streams against the input spec or against v1 (the differential
+        /// tests cover that), and `describe_by_scan` is itself code under test.
         #[test]
         fn derived_tables_always_match_the_streams(ops in prop::collection::vec(op(), 1..10)) {
             let d = tempfile::tempdir().unwrap();
