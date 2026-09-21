@@ -1,8 +1,9 @@
 //! Reusable conformance suite for [`Store`] implementations: the store-level
 //! behaviours every backend must share. It is the seed of the ADR 0003
 //! differential oracle (the same cases run against the redb backend, a future
-//! v2 store and a `RemoteStore`; the full fixed-query differential harness is
-//! ADR story 1's later half).
+//! v2 store and a `RemoteStore`). [`run_differential`] is the fixed-query
+//! differential harness: it runs one query set against two stores and requires
+//! identical results.
 //!
 //! Use: build a [`Harness`] per case with a factory, then call [`run_all`]:
 //!
@@ -50,6 +51,16 @@ pub const CASES: &[(&str, Case)] = &[
     ("reopen_persists", reopen_persists),
     ("snapshot_is_frozen", snapshot_is_frozen),
     ("locking", locking),
+    ("batch_reindex_and_unchanged", batch_reindex_and_unchanged),
+    ("snapshot_filtered_reads", snapshot_filtered_reads),
+    ("symbol_language_filter", symbol_language_filter),
+    ("describe_repo_filter", describe_repo_filter),
+    ("describe_unknown_vs_empty", describe_unknown_vs_empty),
+    ("default_origin", default_origin),
+    ("order_and_limit_determinism", order_and_limit_determinism),
+    ("prune_empty_keep", prune_empty_keep),
+    ("nul_handling", nul_handling),
+    ("batch_origin_refresh", batch_origin_refresh),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -493,4 +504,608 @@ fn locking(h: &Harness) {
         (h.open)(vec![]).is_ok(),
         "open succeeds once the holder is gone"
     );
+}
+
+fn bf<'a>(path: &'a str, bytes: &'a [u8]) -> BatchFile<'a> {
+    BatchFile {
+        path,
+        bytes,
+        language: Some("text"),
+        origin: Some(ORIGIN_DIRECTORY),
+    }
+}
+
+fn batch_reindex_and_unchanged(h: &Harness) {
+    let s = open(h);
+    let files = [bf("a.txt", b"foo bar"), bf("b.txt", b"foo baz")];
+    let ok = |r: &Result<crate::IngestStats, StoreError>| r.as_ref().unwrap().clone();
+    let first = s
+        .index_batch("o", "r", &files, IndexOptions::default())
+        .unwrap();
+    assert!(first.iter().all(|r| !ok(r).unchanged && !ok(r).replaced));
+    let again = s
+        .index_batch("o", "r", &files, IndexOptions::default())
+        .unwrap();
+    for (a, f) in again.iter().zip(&first) {
+        let (a, f) = (ok(a), ok(f));
+        assert!(a.unchanged && !a.replaced);
+        assert_eq!((a.symbols, a.tokens), (0, 0));
+        assert_eq!(a.file_id, f.file_id, "skipped file keeps its node");
+    }
+    let forced = s
+        .index_batch("o", "r", &files, IndexOptions { reindex: true })
+        .unwrap();
+    assert!(forced.iter().all(|r| !ok(r).unchanged && ok(r).replaced));
+    // Mixed: one changed, one unchanged.
+    let mixed = [bf("a.txt", b"foo CHANGED"), bf("b.txt", b"foo baz")];
+    let out = s
+        .index_batch("o", "r", &mixed, IndexOptions::default())
+        .unwrap();
+    assert!(!ok(&out[0]).unchanged && ok(&out[0]).replaced);
+    assert!(ok(&out[1]).unchanged);
+    assert_eq!(s.search(&Query::new("bar")).unwrap().len(), 0);
+    assert_eq!(s.search(&Query::new("CHANGED")).unwrap().len(), 1);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    // An empty batch is a no-op.
+    assert!(s
+        .index_batch("o", "r", &[], IndexOptions::default())
+        .unwrap()
+        .is_empty());
+}
+
+/// Every filtered read, rendered as one string so two read views compare
+/// exactly (a dropped filter changes the string).
+fn filtered_probe<R: crate::StoreRead + ?Sized>(r: &R) -> String {
+    let mut out = String::new();
+    let mut add = |label: &str, v: String| out.push_str(&format!("{label}: {v}\n"));
+    let mut qs = Vec::new();
+    for grain in [Grain::Token, Grain::Symbol, Grain::File] {
+        let mut q = Query::new("foo");
+        q.grain = grain;
+        qs.push(q.clone());
+        q.org = Some("o1".into());
+        qs.push(q.clone());
+        q.repo = Some("r1".into());
+        qs.push(q.clone());
+        q.repo = Some("r2".into());
+        qs.push(q.clone());
+        q.org = None;
+        q.repo = None;
+        q.class = Some(graph_core::TokenClass::Identifier);
+        qs.push(q.clone());
+        q.class = Some(graph_core::TokenClass::Keyword);
+        qs.push(q.clone());
+        q.class = None;
+        q.symbol_kind = Some("method".into());
+        qs.push(q.clone());
+        q.symbol_kind = Some("type".into());
+        qs.push(q);
+    }
+    for q in &qs {
+        add(&format!("{q:?}"), format!("{:?}", r.search(q).unwrap()));
+    }
+    let mut sqs = Vec::new();
+    for lang in [None, Some("rust"), Some("zig")] {
+        for file in [None, Some("lib.rs"), Some("main.zig")] {
+            for limit in [None, Some(1)] {
+                let mut q = SymbolQuery::new("*");
+                q.language = lang.map(Into::into);
+                q.file = file.map(Into::into);
+                q.limit = limit;
+                sqs.push(q);
+            }
+        }
+    }
+    for q in &sqs {
+        add(
+            &format!("{q:?}"),
+            format!("{:?}", r.search_symbols(q).unwrap()),
+        );
+    }
+    for (o, rp) in [
+        (None, None),
+        (Some("o1"), None),
+        (Some("o1"), Some("r1")),
+        (None, Some("r2")),
+        (Some("o2"), Some("r1")),
+    ] {
+        let d = r.describe(o, rp).unwrap();
+        assert_eq!(d, r.describe_by_scan(o, rp).unwrap(), "describe vs scan");
+        add(&format!("describe {o:?}/{rp:?}"), format!("{d:?}"));
+    }
+    out
+}
+
+/// The reads not covered by `snapshot_is_frozen`: count_nodes for every kind,
+/// filtered search and the symbol-kind filter, through a snapshot after
+/// writes.
+fn snapshot_filtered_reads(h: &Harness) {
+    let s = open(h);
+    seed(&*s);
+    let snap = s.snapshot().unwrap();
+    let before = filtered_probe(&*s);
+    assert_eq!(
+        filtered_probe(&*snap),
+        before,
+        "snapshot == live, no writes"
+    );
+    s.ingest_file("o1", "r1", "lib.rs", "rust", &plain("zzz\n"))
+        .unwrap();
+    s.index_bytes("o3", "r3", "new.txt", b"foo", None).unwrap();
+    assert_eq!(
+        filtered_probe(&*snap),
+        before,
+        "snapshot == pre-write state"
+    );
+    assert_ne!(filtered_probe(&*s), before, "live store moved on");
+    assert_eq!(snap.count_nodes(NodeKind::Symbol).unwrap(), 3);
+    assert_eq!(s.count_nodes(NodeKind::Symbol).unwrap(), 0);
+    assert_eq!(snap.count_nodes(NodeKind::Org).unwrap(), 2);
+    assert_eq!(s.count_nodes(NodeKind::Org).unwrap(), 3);
+    assert_eq!(snap.count_nodes(NodeKind::Repo).unwrap(), 2);
+    assert_eq!(s.count_nodes(NodeKind::Repo).unwrap(), 3);
+    assert_eq!(snap.count_nodes(NodeKind::File).unwrap(), 2);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 3);
+    let mut q = Query::new("foo");
+    q.language = Some("rust".into());
+    assert_eq!(snap.search(&q).unwrap().len(), 3);
+    q.org = Some("o1".into());
+    q.repo = Some("r1".into());
+    q.limit = Some(1);
+    assert_eq!(snap.search(&q).unwrap().len(), 1);
+    q.grain = Grain::Symbol;
+    q.symbol_kind = Some("method".into());
+    q.limit = None;
+    let got: Vec<_> = snap
+        .search(&q)
+        .unwrap()
+        .into_iter()
+        .map(|x| (x.symbol, x.count))
+        .collect();
+    assert_eq!(got, [(Some("S::a".into()), 2), (Some("S::b".into()), 1)]);
+    let mut sq = SymbolQuery::new("*");
+    sq.kind = Some("method".into());
+    assert_eq!(snap.search_symbols(&sq).unwrap().len(), 2);
+    assert!(s.search_symbols(&sq).unwrap().is_empty());
+    sq.kind = Some("type".into());
+    assert_eq!(snap.search_symbols(&sq).unwrap().len(), 1);
+}
+
+fn symbol_language_filter(h: &Harness) {
+    let s = open(h);
+    seed(&*s);
+    // A same-named symbol in another language.
+    let src = "fn a() {}\n";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![sym("a", SymbolKind::Function, span_of(src, "fn a() {}"))],
+        tokens: tokenize(src),
+    };
+    s.ingest_file("o1", "r1", "x.py", "python", &ex).unwrap();
+    let mut q = SymbolQuery::new("a");
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 2);
+    q.language = Some("python".into());
+    let hits = s.search_symbols(&q).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].file, "x.py");
+    q.language = Some("RUST".into());
+    let hits = s.search_symbols(&q).unwrap();
+    assert_eq!(hits.len(), 1, "language filter is case-insensitive");
+    assert_eq!(hits[0].qualified, "S::a");
+    q.language = Some("zig".into());
+    assert!(s.search_symbols(&q).unwrap().is_empty());
+    // --file combined with language and kind.
+    let mut q = SymbolQuery::new("*");
+    q.file = Some("x.py".into());
+    q.language = Some("python".into());
+    q.kind = Some("function".into());
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 1);
+    q.file = Some("lib.rs".into());
+    assert!(s.search_symbols(&q).unwrap().is_empty());
+}
+
+fn describe_repo_filter(h: &Harness) {
+    let s = open(h);
+    s.index_bytes("o", "r1", "a.txt", b"foo", None).unwrap();
+    s.index_bytes("o", "r2", "b.txt", b"foo bar", None).unwrap();
+    s.index_bytes("p", "r1", "c.txt", b"foo", None).unwrap();
+    let key = |v: Vec<crate::RepoInfo>| -> Vec<(String, String)> {
+        v.into_iter().map(|r| (r.org, r.repo)).collect()
+    };
+    let pair = |o: &str, r: &str| (o.to_string(), r.to_string());
+    assert_eq!(
+        key(s.describe(Some("o"), Some("r2")).unwrap()),
+        [pair("o", "r2")]
+    );
+    assert_eq!(
+        key(s.describe(None, Some("r1")).unwrap()),
+        [pair("o", "r1"), pair("p", "r1")],
+        "repo filter without org spans orgs"
+    );
+    assert_eq!(
+        key(s.describe(Some("o"), None).unwrap()),
+        [pair("o", "r1"), pair("o", "r2")]
+    );
+    assert!(s.describe(Some("p"), Some("r2")).unwrap().is_empty());
+    for (o, r) in [
+        (Some("o"), Some("r2")),
+        (None, Some("r1")),
+        (Some("p"), Some("r2")),
+    ] {
+        assert_eq!(
+            s.describe(o, r).unwrap(),
+            s.describe_by_scan(o, r).unwrap(),
+            "{o:?}/{r:?}"
+        );
+    }
+}
+
+/// An org that does not exist and an org that exists but has no repo with the
+/// filter both describe as an empty list (not an error); a repo emptied by
+/// prune still exists.
+fn describe_unknown_vs_empty(h: &Harness) {
+    let s = open(h);
+    assert!(s.describe(Some("nope"), None).unwrap().is_empty());
+    s.index_bytes("o", "r", "a.txt", b"foo", None).unwrap();
+    assert!(s.describe(Some("nope"), None).unwrap().is_empty());
+    assert!(s.describe(Some("o"), Some("nope")).unwrap().is_empty());
+    s.index_bytes_with_origin("o", "empty", "d.txt", b"x", None, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+    s.prune_files("o", "empty", &HashSet::new(), false).unwrap();
+    let d = s.describe(Some("o"), Some("empty")).unwrap();
+    assert_eq!(d, s.describe_by_scan(Some("o"), Some("empty")).unwrap());
+    assert!(d.iter().all(|r| r.files == 0));
+    assert_eq!(
+        s.describe(Some("nope"), None).unwrap(),
+        s.describe_by_scan(Some("nope"), None).unwrap()
+    );
+}
+
+fn default_origin(h: &Harness) {
+    let s = open(h);
+    let file_origin = |s: &dyn Store, p: &str| {
+        let t = s.file_tokens("o", "r", p).unwrap().unwrap();
+        s.parent(t[0].id).unwrap().unwrap().origin
+    };
+    s.ingest_file("o", "r", "a.txt", "text", &plain("foo\n"))
+        .unwrap();
+    assert_eq!(
+        file_origin(&*s, "a.txt"),
+        None,
+        "ingest_file sets no origin"
+    );
+    s.index_bytes("o", "r", "b.txt", b"foo", None).unwrap();
+    assert_eq!(
+        file_origin(&*s, "b.txt"),
+        None,
+        "index_bytes sets no origin"
+    );
+    s.ingest_file_with_origin(
+        "o",
+        "r",
+        "a.txt",
+        "text",
+        &plain("foo\n"),
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    assert_eq!(file_origin(&*s, "a.txt").as_deref(), Some(ORIGIN_DIRECTORY));
+    // Re-ingesting with the default origin clears it again.
+    s.ingest_file("o", "r", "a.txt", "text", &plain("foo\n"))
+        .unwrap();
+    assert_eq!(file_origin(&*s, "a.txt"), None);
+    // So neither is ever pruned.
+    let gone = s.prune_files("o", "r", &HashSet::new(), false).unwrap();
+    assert!(gone.is_empty());
+}
+
+/// Rows come back in (org, repo, file, offset) order at every grain, and
+/// `limit` is a prefix of the unlimited result.
+fn order_and_limit_determinism(h: &Harness) {
+    let s = open(h);
+    // Insert out of order on purpose.
+    let src = "fn o() { foo(); }\nfn p() { foo(); foo(); }\n";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![
+            sym("o", SymbolKind::Function, span_of(src, "fn o() { foo(); }")),
+            sym(
+                "p",
+                SymbolKind::Function,
+                span_of(src, "fn p() { foo(); foo(); }"),
+            ),
+        ],
+        tokens: tokenize(src),
+    };
+    for (o, r, f) in [
+        ("b", "r", "z.rs"),
+        ("a", "s", "a.rs"),
+        ("a", "r", "m.rs"),
+        ("a", "r", "b.rs"),
+    ] {
+        s.ingest_file(o, r, f, "rust", &ex).unwrap();
+    }
+    let s2 = s.snapshot().unwrap();
+    for grain in [
+        Grain::Token,
+        Grain::Symbol,
+        Grain::File,
+        Grain::Repo,
+        Grain::Org,
+    ] {
+        let mut q = Query::new("foo");
+        q.grain = grain;
+        let all = s.search(&q).unwrap();
+        assert!(!all.is_empty());
+        let key = |h: &crate::Hit| {
+            (
+                h.org.clone(),
+                h.repo.clone(),
+                h.file.clone(),
+                h.span.map(|x| x.start),
+            )
+        };
+        let keys: Vec<_> = all.iter().map(key).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            keys, sorted,
+            "{grain:?}: ordered by (org, repo, file, offset)"
+        );
+        assert_eq!(s.search(&q).unwrap(), all, "{grain:?}: repeatable");
+        assert_eq!(s2.search(&q).unwrap(), all, "{grain:?}: snapshot agrees");
+        for n in 0..=all.len() + 1 {
+            q.limit = Some(n);
+            let l = s.search(&q).unwrap();
+            assert_eq!(l[..], all[..n.min(all.len())], "{grain:?} limit {n}");
+        }
+    }
+    let mut q = SymbolQuery::new("*");
+    let all = s.search_symbols(&q).unwrap();
+    let keys: Vec<_> = all
+        .iter()
+        .map(|h| {
+            (
+                h.org.clone(),
+                h.repo.clone(),
+                h.file.clone(),
+                h.span.map(|x| x.start),
+            )
+        })
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
+    for n in 0..=all.len() {
+        q.limit = Some(n);
+        assert_eq!(s.search_symbols(&q).unwrap()[..], all[..n]);
+    }
+    // `search_symbols` sorts by (org, repo, file, offset, qualified name, node
+    // id), so at a shared offset the shorter qualified name (the enclosing
+    // symbol) comes first; the id only breaks ties beyond that.
+    let src = "struct S { x: u8 }\n";
+    let inner = Extraction {
+        has_errors: false,
+        symbols: vec![
+            sym("T", SymbolKind::Type, span_of(src, "struct S")),
+            sym("S", SymbolKind::Type, span_of(src, "struct S { x: u8 }")),
+        ],
+        tokens: tokenize(src),
+    };
+    s.ingest_file("t", "r", "n.rs", "rust", &inner).unwrap();
+    let mut q = SymbolQuery::new("*");
+    q.org = Some("t".into());
+    let names: Vec<_> = s
+        .search_symbols(&q)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.qualified)
+        .collect();
+    assert_eq!(
+        names,
+        ["S", "S::T"],
+        "enclosing first, whatever the input order"
+    );
+}
+
+fn prune_empty_keep(h: &Harness) {
+    let s = open(h);
+    for p in ["a.txt", "b.txt"] {
+        s.index_bytes_with_origin("o", "r", p, b"foo", None, Some(ORIGIN_DIRECTORY))
+            .unwrap();
+    }
+    s.index_bytes("o", "r", "manual.txt", b"foo", None).unwrap();
+    let none = HashSet::new();
+    let dry = s.prune_files("o", "r", &none, true).unwrap();
+    assert_eq!(dry, ["a.txt", "b.txt"], "sorted, directory files only");
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 3);
+    let done = s.prune_files("o", "r", &none, false).unwrap();
+    assert_eq!(done, ["a.txt", "b.txt"]);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    assert!(s.file_tokens("o", "r", "manual.txt").unwrap().is_some());
+    assert!(s.prune_files("o", "r", &none, false).unwrap().is_empty());
+    assert!(s.prune_files("o", "nope", &none, false).unwrap().is_empty());
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
+}
+
+/// NUL separates catalog and name key fields, so it is rejected in org, repo
+/// and language (and symbol `lang_kind`), and a rejected write stores nothing.
+fn nul_handling(h: &Harness) {
+    let s = open(h);
+    let rejected = |r: Result<crate::IngestStats, StoreError>| {
+        assert!(matches!(r, Err(StoreError::Rejected(_))), "{r:?}")
+    };
+    rejected(s.index_bytes("o\0x", "r", "a.txt", b"foo", None));
+    rejected(s.index_bytes("o", "r\0x", "a.txt", b"foo", None));
+    rejected(s.index_bytes("o", "r", "a.txt", b"foo", Some("te\0xt")));
+    rejected(s.ingest_file("o", "r", "a.txt", "te\0xt", &plain("foo")));
+    let mut ex = plain("foo");
+    ex.symbols.push(SymbolDecl {
+        lang_kind: Some("k\0".into()),
+        ..sym("f", SymbolKind::Function, span_of("foo", "foo"))
+    });
+    rejected(s.ingest_file("o", "r", "a.txt", "text", &ex));
+    rejected(s.ingest_file("", "r", "a.txt", "text", &plain("foo")));
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
+    assert_eq!(s.count_nodes(NodeKind::Org).unwrap(), 0);
+    assert!(s.describe(None, None).unwrap().is_empty());
+    // NUL in file content is fine (it is text), and NUL in a query matches
+    // nothing rather than erroring.
+    s.index_bytes("o", "r", "n.txt", b"foo\0bar", None).unwrap();
+    assert!(s.search(&Query::new("fo\0o")).unwrap().is_empty());
+    let mut q = Query::new("foo");
+    q.org = Some("o\0".into());
+    assert!(s.search(&q).unwrap().is_empty());
+    assert!(s
+        .search_symbols(&SymbolQuery::new("a\0b"))
+        .unwrap()
+        .is_empty());
+}
+
+/// Fixed-query differential harness: seed two stores with the same fixed
+/// corpus, run a fixed query set at every grain and filter, and require
+/// identical results (rows and order). Point `a` at the reference backend
+/// (redb) and `b` at the candidate (v2, `RemoteStore`). Panics naming the
+/// first differing query.
+pub fn run_differential(a: &dyn Store, b: &dyn Store) {
+    for s in [a, b] {
+        differential_seed(s);
+    }
+    let grains = [
+        Grain::Token,
+        Grain::Symbol,
+        Grain::File,
+        Grain::Repo,
+        Grain::Org,
+    ];
+    for text in ["foo", "bar", "S", "(", "missing", "fn"] {
+        for grain in grains {
+            let mut q = Query::new(text);
+            q.grain = grain;
+            let mut variants = vec![("plain", q.clone())];
+            q.language = Some("rust".into());
+            variants.push(("rust", q.clone()));
+            q.language = None;
+            q.org = Some("o1".into());
+            q.repo = Some("r1".into());
+            q.limit = Some(2);
+            variants.push(("o1/r1/limit2", q.clone()));
+            q.limit = None;
+            q.org = None;
+            q.repo = None;
+            q.symbol_kind = Some("method".into());
+            variants.push(("method", q));
+            for (tag, q) in variants {
+                assert_eq!(
+                    a.search(&q).unwrap(),
+                    b.search(&q).unwrap(),
+                    "search {text}/{grain:?}/{tag}"
+                );
+            }
+        }
+    }
+    for pat in ["*", "a", "S", "m*", "nope"] {
+        let mut q = SymbolQuery::new(pat);
+        let mut variants = vec![q.clone()];
+        q.kind = Some("method".into());
+        variants.push(q.clone());
+        q.kind = None;
+        q.language = Some("rust".into());
+        variants.push(q.clone());
+        q.language = None;
+        q.limit = Some(1);
+        variants.push(q);
+        for q in variants {
+            assert_eq!(
+                a.search_symbols(&q).unwrap(),
+                b.search_symbols(&q).unwrap(),
+                "symbols {q:?}"
+            );
+        }
+    }
+    for (o, r) in [
+        (None, None),
+        (Some("o1"), None),
+        (Some("o1"), Some("r1")),
+        (None, Some("r2")),
+        (Some("zz"), None),
+    ] {
+        assert_eq!(
+            a.describe(o, r).unwrap(),
+            b.describe(o, r).unwrap(),
+            "describe {o:?}/{r:?}"
+        );
+    }
+    for k in [
+        NodeKind::Org,
+        NodeKind::Repo,
+        NodeKind::File,
+        NodeKind::Symbol,
+    ] {
+        assert_eq!(
+            a.count_nodes(k).unwrap(),
+            b.count_nodes(k).unwrap(),
+            "count {k:?}"
+        );
+    }
+    for (o, r, p) in [
+        ("o1", "r1", "lib.rs"),
+        ("o2", "r2", "main.zig"),
+        ("o1", "r1", "none"),
+    ] {
+        // Node ids are opaque, so compare content and spans only.
+        let tok = |s: &dyn Store| {
+            s.file_tokens(o, r, p).unwrap().map(|v| {
+                v.into_iter()
+                    .map(|n| (n.name, n.span, n.token_class))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(tok(a), tok(b), "file_tokens {p}");
+    }
+}
+
+fn differential_seed(s: &dyn Store) {
+    seed(s);
+    s.index_bytes("o1", "r1", "notes.md", b"# foo\nbar (foo)\n", None)
+        .unwrap();
+    s.index_bytes("o1", "r2", "m.txt", b"foo mfoo m\n", None)
+        .unwrap();
+}
+
+/// A batch re-index of unchanged bytes still refreshes the file's origin, in
+/// both directions, and prune follows the origin.
+fn batch_origin_refresh(h: &Harness) {
+    let s = open(h);
+    let origin_of = |s: &dyn Store| {
+        let t = s.file_tokens("o", "r", "a.txt").unwrap().unwrap();
+        s.parent(t[0].id).unwrap().unwrap().origin
+    };
+    let run = |origin| {
+        let f = BatchFile {
+            path: "a.txt",
+            bytes: b"foo bar",
+            language: Some("text"),
+            origin,
+        };
+        s.index_batch("o", "r", &[f], IndexOptions::default())
+            .unwrap()
+            .remove(0)
+            .unwrap()
+    };
+    assert!(!run(None).unchanged);
+    assert_eq!(origin_of(&*s), None);
+    assert!(
+        run(Some(ORIGIN_DIRECTORY)).unchanged,
+        "content skip still applies"
+    );
+    assert_eq!(origin_of(&*s).as_deref(), Some(ORIGIN_DIRECTORY));
+    let none = HashSet::new();
+    assert_eq!(s.prune_files("o", "r", &none, true).unwrap(), ["a.txt"]);
+    assert!(run(None).unchanged);
+    assert_eq!(origin_of(&*s), None, "origin cleared again");
+    assert!(s.prune_files("o", "r", &none, true).unwrap().is_empty());
 }

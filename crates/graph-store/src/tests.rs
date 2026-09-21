@@ -1799,6 +1799,17 @@ fn redb_passes_conformance_suite() {
     });
 }
 
+#[test]
+fn redb_differential_against_itself() {
+    let mk = || {
+        let d = tempfile::tempdir().unwrap();
+        let s = open_store(Backend::Redb, &d.path().join("g.redb"), vec![]).unwrap();
+        (d, s)
+    };
+    let ((_da, a), (_db, b)) = (mk(), mk());
+    conformance::run_differential(&*a, &*b);
+}
+
 /// The trait must stay object-safe and shareable across threads.
 #[test]
 fn store_trait_is_object_safe_send_sync() {
