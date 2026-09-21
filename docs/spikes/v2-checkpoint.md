@@ -85,11 +85,34 @@ Size and ingest are the same before and after (this change does not touch the wr
 3. **`--limit` push-down.** Candidate files are sorted by (org, repo, path); the walk stops at the first file group boundary after the limit is met, because every row of a later group sorts after every row of an earlier one (a group is the file at token and symbol grain, the repo at repo grain, the org at org grain). Result identical to the full walk (differential over limits 0 to 5 at every grain).
 4. **Traversal.** `children`, `descendants` and `ancestors` on `StoreRead` (see the ADR story 4 row for the semantics), v1 and v2 checked against each other.
 
+## Addendum: sparse checkpoints and per-term ordinals (ADR story 19)
+
+The follow-up change (this section was added with it) builds the fix named below. Numbers are from the same harness, before and after, on the `syn` 2.0.119 sources as this invocation loads them (106 files, 478,831 tokens, 8,409 symbols; the 855,726-token run above used a larger file set, so absolute times are not comparable with Result 2, only before against after in this table). 25 repetitions, p50, one run each, other sessions running (treat under 15% as noise). Raw output: `spikes/data-model/logs/v2_checkpoint_syn_story19_before.txt` and `v2_checkpoint_syn_story19.txt`.
+
+**Design.** Stream format 2 stores the symbol-section byte length and, before every 64th token record, a checkpoint (byte offset and the delta-coding state, about 6 bytes per 64 tokens). The postings value changes from a count to `count, ordinal gaps...` (varints). A token, symbol or class-filtered search reads the ordinals of the term in each candidate file and decodes only those records, starting at the nearest checkpoint (at most 63 records of walking per hit, none between hits that share a block). The symbol section is decoded only for token and symbol grain and only when a record matched. Roll-ups without a class filter still read the count alone. The codec format byte is 2 and the store schema version is 4; v2 files of the old layout are refused rather than migrated (the layout is unreleased), and v1 is untouched.
+
+| Query (rows) | v1 ms | v2 before ms (x v1) | v2 after ms (x v1) |
+|---|---|---|---|
+| `new` token (788) | 1.7 | 4.4 (2.61x) | 1.2 (0.70x) |
+| `new` symbol grain (378) | 3.6 | 4.3 (1.18x) | 1.1 (0.29x) |
+| `new` token, class = identifier (788) | 1.6 | 4.4 (2.60x) | 1.2 (0.71x) |
+| `new` file, class = identifier (57 files) | 1.4 | 3.9 (2.78x) | 0.6 (0.44x) |
+| `Result` token (1,130) | 3.2 | 5.3 (1.65x) | 1.7 (0.53x) |
+| `self` token (7,407) | 17.6 | 14.7 (0.76x) | 8.2 (0.47x) |
+| `(` token (41,563) | 87.9 | 39.2 (0.45x) | 40.2 (0.46x) |
+| `symbols *`, `symbols fmt`, roll-ups | | unchanged within noise | |
+
+The goal (selective token search within 2x of v1) is met with margin: the worst ratio among the token-grain searches is 0.71x (`new`, class filter) and the densest term, `(`, is 0.46x. Every query returned identical rows from both backends. v1 times differ slightly between the two runs (for example `self` 19.2 vs 17.6 ms); each ratio uses its own run's v1, the v1 column shows the after run. Both runs: 106 files, 478,831 tokens (the 855,726-token / 162-file figures in Result 2 are a different, earlier run).
+
+**Cost.** Logical bytes (values of the `stream` and `post` tables, before page slack): 4,996,694 + 210,088 = 5,206,782 before; 5,041,544 + 577,675 = 5,619,219 after, so +412,437 bytes, +0.86 B/token, +7.9%. The postings account for +367,587 of it (an ordinal is a varint of about 1 byte; the old value was a fixed 8-byte count per `(term, file)` row) and the checkpoints and header for +44,850 (about 0.09 B/token). The redb file size did not change at the granularity redb grows in (16.6 MiB before and after, 36.3 B/token), so the real page-level effect is under one growth step; expect roughly 37 B/token, still under the 40 limit, but this was **not measured** at page level and **not re-run at 9.9 M tokens**. Ingest time is unchanged (0.47 s). Denser postings (block or bitmap ordinals) would recover part of the postings growth if it matters.
+
+**Limits.** The checkpoint spacing (64) was not tuned; only that value was measured. Ordinal reads trust the checkpoints (a full decode verifies them and reports a mismatch as corruption). A term that occurs in most tokens of a file degrades to the previous sequential walk, as `(` shows (0.45x before, 0.46x after, within noise).
+
 ## What this does not show
 
 - No cold-cache numbers, no concurrent readers, no updates or deletes at scale, and no per-table page accounting.
 - The 9.9 M set is replicated data (see Method). A run on a real corpus of that size has not been done.
-- Selective token-grain queries are still slower than v1 on real data (2.7x to 2.9x on syn, 1.5x on the replicated set). The cause is structural: without an index into a stream, finding one token means walking all tokens before it. The design answer is in the ADR already: sparse stream checkpoints (story 19) plus per-term ordinals in the postings. It costs roughly one more varint per token in the postings and a small checkpoint table; the size impact was not measured.
+- (As measured before the addendum above; the addendum fixes it on syn, not re-run at 9.9 M.) Selective token-grain queries were slower than v1 on real data (2.7x to 2.9x on syn, 1.5x on the replicated set). The cause is structural: without an index into a stream, finding one token means walking all tokens before it. The design answer is in the ADR already: sparse stream checkpoints (story 19) plus per-term ordinals in the postings. It costs roughly one more varint per token in the postings and a small checkpoint table; the size impact was not measured.
 - The `irregular` escape and span derivation (story 2) are not built; sizes here are for the codec that stores all six span fields per record.
 
 ## Recommendation (the decision is yours)
@@ -99,4 +122,4 @@ The data supports proceeding with v2, conditional on the two items below, on the
 1. Treat sparse checkpoints with per-term ordinals (story 19) as required for the checkpoint to pass on real data, not optional: without them a selective token search is 2.7x to 2.9x v1 on `syn`, over the 2x limit. Absolute cost is 8 ms at 855 k tokens and 130 ms at 9.9 M, which may be acceptable for an agent workload, but that is a product call.
 2. Re-measure size on a real corpus of about 10 M tokens before accepting: `syn` alone is at 39.95 B/token (the limit) because a smaller data set has a proportionally larger dictionary and fixed cost, and the replicated set's 27.3 B/token is flattered by repetition.
 
-If the 2x query limit is a hard gate for selective token-grain search on real data today, the honest reading of these numbers is **no-go until story 19 lands**, and go after.
+If the 2x query limit is a hard gate for selective token-grain search on real data today, the honest reading of these numbers is **no-go until story 19 lands**, and go after. (Story 19 has since landed and is measured in the addendum; the decision remains yours.)
