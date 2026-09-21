@@ -55,7 +55,15 @@ pub trait StoreRead {
     fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
         let mut out = Vec::new();
         let mut stack: Vec<Node> = self.children(id)?.into_iter().rev().collect();
+        let mut seen = HashSet::new();
         while let Some(n) = stack.pop() {
+            // A corrupt cyclic parent link must not loop forever.
+            if !seen.insert(n.id) {
+                return Err(StoreError::Corrupt(format!(
+                    "containment cycle at {}",
+                    n.id
+                )));
+            }
             if n.kind != NodeKind::Token {
                 stack.extend(self.children(n.id)?.into_iter().rev());
             }
@@ -68,7 +76,11 @@ pub trait StoreRead {
     fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
         let mut out = Vec::new();
         let mut cur = self.parent(id)?;
+        let mut seen = HashSet::new();
         while let Some(n) = cur {
+            if !seen.insert(n.id) {
+                return Err(StoreError::Corrupt(format!("parent cycle at {}", n.id)));
+            }
             cur = self.parent(n.id)?;
             out.push(n);
         }
@@ -342,5 +354,64 @@ pub fn open_store(
             }
             Ok(Box::new(s))
         }
+    }
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use super::*;
+
+    /// Two nodes that name each other as parent and child.
+    struct Loop;
+    fn node(id: u64, parent: u64) -> Node {
+        Node {
+            id,
+            parent: Some(parent),
+            kind: NodeKind::Symbol,
+            name: id.to_string(),
+            language: None,
+            symbol_kind: None,
+            lang_kind: None,
+            token_class: None,
+            has_errors: false,
+            origin: None,
+            fingerprint: None,
+            span: None,
+        }
+    }
+    impl StoreRead for Loop {
+        fn get(&self, id: NodeId) -> Result<Option<Node>> {
+            Ok(Some(node(id, 3 - id)))
+        }
+        fn parent(&self, id: NodeId) -> Result<Option<Node>> {
+            self.get(3 - id)
+        }
+        fn count_nodes(&self, _: NodeKind) -> Result<usize> {
+            Ok(0)
+        }
+        fn children(&self, id: NodeId) -> Result<Vec<Node>> {
+            Ok(vec![node(3 - id, id)])
+        }
+        fn file_tokens(&self, _: &str, _: &str, _: &str) -> Result<Option<Vec<Node>>> {
+            Ok(None)
+        }
+        fn describe(&self, _: Option<&str>, _: Option<&str>) -> Result<Vec<RepoInfo>> {
+            Ok(vec![])
+        }
+        fn describe_by_scan(&self, _: Option<&str>, _: Option<&str>) -> Result<Vec<RepoInfo>> {
+            Ok(vec![])
+        }
+        fn search_symbols(&self, _: &SymbolQuery) -> Result<Vec<SymbolHit>> {
+            Ok(vec![])
+        }
+        fn search(&self, _: &crate::Query) -> Result<Vec<crate::Hit>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn cyclic_containment_is_an_error_not_a_hang() {
+        assert!(matches!(Loop.descendants(1), Err(StoreError::Corrupt(_))));
+        assert!(matches!(Loop.ancestors(1), Err(StoreError::Corrupt(_))));
     }
 }
