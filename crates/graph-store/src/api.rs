@@ -277,6 +277,10 @@ pub enum Backend {
     /// Storage format v1 on redb, one file (today's format).
     #[default]
     Redb,
+    /// Storage format v2 on redb (ADR 0003 stories 2-4, first slice): an
+    /// interned dictionary, one compact stream per file and count postings.
+    /// Opt-in; not the default, and it cannot open a v1 file.
+    RedbV2,
 }
 
 /// Open (or create) a store of the chosen backend with `extractors`
@@ -291,6 +295,13 @@ pub fn open_store(
     match backend {
         Backend::Redb => {
             let mut s = RedbStore::open(path)?;
+            for e in extractors {
+                s.register(e);
+            }
+            Ok(Box::new(s))
+        }
+        Backend::RedbV2 => {
+            let mut s = crate::V2Store::open(path)?;
             for e in extractors {
                 s.register(e);
             }
