@@ -19,7 +19,7 @@ use crate::{
     BatchFile, Grain, IndexOptions, Query, Store, StoreError, SymbolQuery, ORIGIN_DIRECTORY,
 };
 use graph_core::tokenizer::tokenize;
-use graph_core::{Extraction, Extractor, NodeKind, Span, SymbolDecl, SymbolKind};
+use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind, Span, SymbolDecl, SymbolKind};
 use std::collections::HashSet;
 
 type Opened = Result<Box<dyn Store>, StoreError>;
@@ -61,6 +61,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("prune_empty_keep", prune_empty_keep),
     ("nul_handling", nul_handling),
     ("batch_origin_refresh", batch_origin_refresh),
+    ("traversal", traversal),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -973,6 +974,7 @@ fn nul_handling(h: &Harness) {
 pub fn run_differential(a: &dyn Store, b: &dyn Store) {
     for s in [a, b] {
         differential_seed(s);
+        matrix_seed(s);
     }
     let grains = [
         Grain::Token,
@@ -981,7 +983,20 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         Grain::Repo,
         Grain::Org,
     ];
-    for text in ["foo", "bar", "S", "(", "missing", "fn"] {
+    for text in [
+        "foo",
+        "bar",
+        "S",
+        "(",
+        "missing",
+        "fn",
+        "a",
+        "dup",
+        "z",
+        "x",
+        "\u{1F600}",
+        "let",
+    ] {
         for grain in grains {
             let mut q = Query::new(text);
             q.grain = grain;
@@ -996,8 +1011,18 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
             q.limit = None;
             q.org = None;
             q.repo = None;
+            for n in [0, 1, 3, 5] {
+                q.limit = Some(n);
+                variants.push(("limit", q.clone()));
+            }
+            q.limit = None;
+            q.class = Some(graph_core::TokenClass::Identifier);
+            variants.push(("class", q.clone()));
+            q.class = None;
             q.symbol_kind = Some("method".into());
-            variants.push(("method", q));
+            variants.push(("method", q.clone()));
+            q.symbol_kind = Some("function".into());
+            variants.push(("function", q));
             for (tag, q) in variants {
                 assert_eq!(
                     a.search(&q).unwrap(),
@@ -1007,9 +1032,17 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
             }
         }
     }
-    for pat in ["*", "a", "S", "m*", "nope"] {
+    for pat in ["*", "a", "S", "m*", "nope", "dup", "dup*", "z", "q", "b"] {
         let mut q = SymbolQuery::new(pat);
         let mut variants = vec![q.clone()];
+        for n in [0, 2, 4] {
+            q.limit = Some(n);
+            variants.push(q.clone());
+        }
+        q.limit = None;
+        q.file = Some("eq.rs".into());
+        variants.push(q.clone());
+        q.file = None;
         q.kind = Some("method".into());
         variants.push(q.clone());
         q.kind = None;
@@ -1051,10 +1084,16 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
             "count {k:?}"
         );
     }
+    differential_traversal(a, b);
     for (o, r, p) in [
         ("o1", "r1", "lib.rs"),
         ("o2", "r2", "main.zig"),
         ("o1", "r1", "none"),
+        ("o1", "r3", "bom_crlf.rs"),
+        ("o1", "r3", "cr.rs"),
+        ("o1", "r3", "eq.rs"),
+        ("o2", "r3", "astral.txt"),
+        ("o2", "r3", "empty.txt"),
     ] {
         // Node ids are opaque, so compare content and spans only.
         let tok = |s: &dyn Store| {
@@ -1108,4 +1147,265 @@ fn batch_origin_refresh(h: &Harness) {
     assert!(run(None).unchanged);
     assert_eq!(origin_of(&*s), None, "origin cleared again");
     assert!(s.prune_files("o", "r", &none, true).unwrap().is_empty());
+}
+
+/// Stable projection of a node (ids are opaque per store).
+type Proj = (
+    String,
+    String,
+    Option<Span>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn proj(n: &Node) -> Proj {
+    (
+        format!("{:?}", n.kind),
+        n.name.clone(),
+        n.span,
+        n.token_class.map(|c| format!("{c:?}")),
+        n.symbol_kind.map(|k| format!("{k:?}")),
+        n.lang_kind.clone(),
+    )
+}
+
+fn projs(v: &[Node]) -> Vec<Proj> {
+    v.iter().map(proj).collect()
+}
+
+fn names(v: &[Node]) -> Vec<&str> {
+    v.iter().map(|n| n.name.as_str()).collect()
+}
+
+/// The org id of a file, found from its first token.
+fn org_of_file(s: &dyn Store, org: &str, repo: &str, path: &str) -> NodeId {
+    let t = s.file_tokens(org, repo, path).unwrap().unwrap();
+    s.ancestors(t[0].id).unwrap().last().unwrap().id
+}
+
+/// Containment invariants for every node under `root`: a node's children are
+/// exactly the nodes of `descendants(root)` whose parent it is, in the same
+/// order, and each child names it as its parent.
+fn check_tree(s: &dyn Store, root: NodeId) {
+    let all = s.descendants(root).unwrap();
+    let mut ids = vec![root];
+    ids.extend(all.iter().map(|n| n.id));
+    for id in ids {
+        let kids = s.children(id).unwrap();
+        let want: Vec<&Node> = all.iter().filter(|n| n.parent == Some(id)).collect();
+        assert_eq!(
+            kids.iter().map(|k| k.id).collect::<Vec<_>>(),
+            want.iter().map(|k| k.id).collect::<Vec<_>>(),
+            "children of {id}"
+        );
+        // Descendants are depth first: a node comes before its children.
+        let pos = |x: NodeId| all.iter().position(|n| n.id == x);
+        for k in &kids {
+            assert_eq!(k.parent, Some(id));
+            if let Some(p) = pos(id) {
+                assert!(p < pos(k.id).unwrap(), "parent before child");
+            }
+        }
+        if let Some(n) = all.iter().find(|n| n.id == id) {
+            let anc = s.ancestors(id).unwrap();
+            assert_eq!(
+                anc.first().map(|a| a.id),
+                n.parent,
+                "ancestors start at the parent"
+            );
+            assert_eq!(anc.last().map(|a| a.kind), Some(NodeKind::Org));
+        }
+    }
+}
+
+/// children / descendants / ancestors: containment, order, leaf and unknown ids.
+fn traversal(h: &Harness) {
+    let s = open(h);
+    seed(&*s);
+    // Symbols with tokens before, between and after them.
+    let src = "x y\nfn a() { foo(); }\nz\n";
+    let mut ex = plain(src);
+    ex.symbols.push(sym(
+        "a",
+        SymbolKind::Function,
+        span_of(src, "fn a() { foo(); }"),
+    ));
+    s.ingest_file("o1", "r1", "mixed.rs", "rust", &ex).unwrap();
+    let org = org_of_file(&*s, "o1", "r1", "lib.rs");
+
+    // Org -> repo -> file -> top-level symbol; one top-level symbol in lib.rs.
+    let repos = s.children(org).unwrap();
+    assert_eq!(names(&repos), ["r1"]);
+    let files = s.children(repos[0].id).unwrap();
+    assert_eq!(names(&files), ["lib.rs", "mixed.rs"]);
+    let top = s.children(files[0].id).unwrap();
+    assert_eq!(names(&top), ["S"]);
+    assert_eq!(top[0].kind, NodeKind::Symbol);
+
+    // S holds its own tokens and the two methods, in source order.
+    let in_s = s.children(top[0].id).unwrap();
+    assert_eq!(names(&in_s), ["impl", "S", "{", "a", "b", "}"]);
+    assert_eq!(in_s[3].kind, NodeKind::Symbol);
+    let in_a = s.children(in_s[3].id).unwrap();
+    assert_eq!(names(&in_a).join(" "), "fn a ( ) { foo ( ) ; foo ( ) ; }");
+    assert!(in_a.iter().all(|n| n.kind == NodeKind::Token));
+
+    // Tokens outside any symbol are children of the file, in source order.
+    let mixed = s.children(files[1].id).unwrap();
+    assert_eq!(names(&mixed), ["x", "y", "a", "z"]);
+    assert_eq!(
+        mixed.iter().map(|n| n.kind).collect::<Vec<_>>(),
+        [
+            NodeKind::Token,
+            NodeKind::Token,
+            NodeKind::Symbol,
+            NodeKind::Token
+        ]
+    );
+    let d = s.descendants(files[1].id).unwrap();
+    assert_eq!(
+        names(&d).join(" "),
+        "x y a fn a ( ) { foo ( ) ; } z",
+        "depth first, a symbol before its tokens"
+    );
+
+    // A file without symbols lists all its tokens.
+    let zig_org = org_of_file(&*s, "o2", "r2", "main.zig");
+    let zig_file = s.descendants(zig_org).unwrap();
+    let zig_file_id = zig_file
+        .iter()
+        .find(|n| n.kind == NodeKind::File)
+        .unwrap()
+        .id;
+    assert_eq!(
+        s.children(zig_file_id).unwrap().len(),
+        s.file_tokens("o2", "r2", "main.zig")
+            .unwrap()
+            .unwrap()
+            .len()
+    );
+
+    // descendants of the org: repo, files, symbols and tokens, each once.
+    let all = s.descendants(org).unwrap();
+    let toks = ["lib.rs", "mixed.rs"]
+        .iter()
+        .map(|p| s.file_tokens("o1", "r1", p).unwrap().unwrap().len())
+        .sum::<usize>();
+    assert_eq!(all.len(), 1 + 2 + 4 + toks);
+    let ids: HashSet<NodeId> = all.iter().map(|n| n.id).collect();
+    assert_eq!(ids.len(), all.len(), "no node twice");
+    check_tree(&*s, org);
+    check_tree(&*s, zig_org);
+
+    // Ancestors, nearest first: a token in `a`, then S, the file, repo, org.
+    let t = s.file_tokens("o1", "r1", "lib.rs").unwrap().unwrap();
+    let leaf = t.iter().find(|n| n.name == "foo").unwrap();
+    let anc = s.ancestors(leaf.id).unwrap();
+    assert_eq!(names(&anc), ["a", "S", "lib.rs", "r1", "o1"]);
+    assert_eq!(
+        anc.iter().map(|n| n.kind).collect::<Vec<_>>(),
+        [
+            NodeKind::Symbol,
+            NodeKind::Symbol,
+            NodeKind::File,
+            NodeKind::Repo,
+            NodeKind::Org
+        ]
+    );
+    assert!(s.ancestors(org).unwrap().is_empty());
+
+    // Leaves and unknown ids have no children or descendants.
+    assert!(s.children(leaf.id).unwrap().is_empty());
+    assert!(s.descendants(leaf.id).unwrap().is_empty());
+    for bogus in [0, u64::MAX, u64::MAX / 3] {
+        assert!(s.children(bogus).unwrap().is_empty(), "children {bogus}");
+        assert!(s.descendants(bogus).unwrap().is_empty());
+        assert!(s.ancestors(bogus).unwrap().is_empty());
+    }
+
+    // The same answers through a snapshot.
+    let snap = s.snapshot().unwrap();
+    assert_eq!(projs(&snap.descendants(org).unwrap()), projs(&all));
+}
+
+/// More shapes for the differential: BOM, CRLF, bare CR, astral text, equal-span
+/// and zero-length symbols, tokens outside symbols, an empty file.
+fn matrix_seed(s: &dyn Store) {
+    let src =
+        "\u{feff}fn a() {\r\n    foo();\r\n}\r\nfn b() {\r    foo();\r}\rlet \u{1F600} = 1;\n";
+    let mut ex = plain(src);
+    ex.symbols.push(sym(
+        "a",
+        SymbolKind::Function,
+        span_of(src, "fn a() {\r\n    foo();\r\n}"),
+    ));
+    ex.symbols.push(sym(
+        "b",
+        SymbolKind::Function,
+        span_of(src, "fn b() {\r    foo();\r}"),
+    ));
+    s.ingest_file("o1", "r3", "bom_crlf.rs", "rust", &ex)
+        .unwrap();
+    let src = "fn a() {\rfoo();\r}\r";
+    let mut ex = plain(src);
+    ex.symbols.push(sym(
+        "a",
+        SymbolKind::Function,
+        span_of(src, "fn a() {\rfoo();\r}"),
+    ));
+    s.ingest_file("o1", "r3", "cr.rs", "rust", &ex).unwrap();
+    // Three symbols with one span (two share a name), a zero-length symbol,
+    // and a token outside every symbol.
+    let src = "fn q() { bar(); }\nfoo();\n";
+    let whole = span_of(src, "fn q() { bar(); }");
+    let mut zero = span_of(src, "foo();");
+    zero.end = zero.start;
+    zero.end_line = zero.start_line;
+    zero.end_col = zero.start_col;
+    let mut ex = plain(src);
+    ex.symbols.push(sym("dup", SymbolKind::Function, whole));
+    ex.symbols.push(sym("dup", SymbolKind::Method, whole));
+    ex.symbols.push(sym("dup2", SymbolKind::Type, whole));
+    ex.symbols.push(sym("z", SymbolKind::Other, zero));
+    s.ingest_file("o1", "r3", "eq.rs", "rust", &ex).unwrap();
+    s.index_bytes(
+        "o2",
+        "r3",
+        "astral.txt",
+        "foo \u{1F600} foo\r\nx\r".as_bytes(),
+        None,
+    )
+    .unwrap();
+    s.index_bytes("o2", "r3", "empty.txt", b"", None).unwrap();
+}
+
+/// Compare children, descendants and ancestors of two stores through stable
+/// projections, from every org that holds a probe file.
+fn differential_traversal(a: &dyn Store, b: &dyn Store) {
+    for (o, r, p) in [
+        ("o1", "r1", "lib.rs"),
+        ("o2", "r2", "main.zig"),
+        ("o1", "r3", "eq.rs"),
+    ] {
+        let (ra, rb) = (org_of_file(a, o, r, p), org_of_file(b, o, r, p));
+        let (da, db) = (a.descendants(ra).unwrap(), b.descendants(rb).unwrap());
+        assert_eq!(projs(&da), projs(&db), "descendants of {o}");
+        for (na, nb) in da.iter().zip(&db) {
+            assert_eq!(
+                projs(&a.children(na.id).unwrap()),
+                projs(&b.children(nb.id).unwrap()),
+                "children of {}",
+                na.name
+            );
+            assert_eq!(
+                projs(&a.ancestors(na.id).unwrap()),
+                projs(&b.ancestors(nb.id).unwrap()),
+                "ancestors of {}",
+                na.name
+            );
+        }
+        check_tree(a, ra);
+        check_tree(b, rb);
+    }
 }

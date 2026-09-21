@@ -33,8 +33,10 @@ use graph_core::{
 use redb::{
     Database, DatabaseError, ReadTransaction, ReadableMultimapTable, ReadableTable, TableDefinition,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, StoreError>;
 
@@ -104,18 +106,63 @@ struct R {
     post: redb::ReadOnlyTable<(u64, u64), u64>,
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
     cat: redb::ReadOnlyTable<&'static str, u64>,
+    kids: redb::ReadOnlyMultimapTable<u64, u64>,
+    /// Per-query caches: dictionary texts and org/repo rows are read once.
+    texts: RefCell<HashMap<u64, Rc<str>>>,
+    ents: RefCell<HashMap<u64, Rc<Node>>>,
 }
 
-/// One file with its containment path and decoded stream.
+/// One file with its containment path.
 struct FileCtx {
-    org: Node,
-    repo: Node,
+    org: Rc<Node>,
+    repo: Rc<Node>,
     file: Node,
+}
+
+/// A symbol or token of one stream, by index.
+#[derive(Clone, Copy)]
+enum Item {
+    Sym(usize),
+    Tok(usize),
+}
+
+/// Containment inside one stream: top-level items and the children of each
+/// symbol, both in creation (source) order, symbols first on equal starts.
+struct Tree {
+    top: Vec<Item>,
+    kids: Vec<Vec<Item>>,
+}
+
+fn stream_tree(s: &Stream) -> Tree {
+    let mut t = Tree {
+        top: Vec::new(),
+        kids: vec![Vec::new(); s.symbols.len()],
+    };
+    let (mut si, mut ti) = (0, 0);
+    while si < s.symbols.len() || ti < s.tokens.len() {
+        let take_sym = si < s.symbols.len()
+            && (ti >= s.tokens.len() || s.symbols[si].span.start <= s.tokens[ti].span.start);
+        let (item, parent) = if take_sym {
+            si += 1;
+            (Item::Sym(si - 1), s.symbols[si - 1].parent)
+        } else {
+            ti += 1;
+            (Item::Tok(ti - 1), s.tokens[ti - 1].parent)
+        };
+        match parent {
+            Some(p) => t.kids[p as usize].push(item),
+            None => t.top.push(item),
+        }
+    }
+    t
 }
 
 impl R {
     fn new(rt: &ReadTransaction) -> Result<Self> {
         Ok(Self {
+            kids: rt.open_multimap_table(CHILDREN)?,
+            texts: RefCell::default(),
+            ents: RefCell::default(),
             nodes: rt.open_table(NODES)?,
             names: rt.open_table(NAMES)?,
             streams: rt.open_table(STREAMS)?,
@@ -153,42 +200,68 @@ impl R {
         }
     }
 
-    fn text(&self, term: u64) -> Result<String> {
-        Ok(self
+    /// A dictionary text, cached for the life of this query.
+    fn text(&self, term: u64) -> Result<Rc<str>> {
+        if let Some(t) = self.texts.borrow().get(&term) {
+            return Ok(Rc::clone(t));
+        }
+        let t: Rc<str> = self
             .rev
             .get(term)?
             .ok_or_else(|| StoreError::Corrupt(format!("dangling term {term}")))?
             .value()
-            .to_string())
+            .into();
+        self.texts.borrow_mut().insert(term, Rc::clone(&t));
+        Ok(t)
     }
 
-    fn sym_node(&self, file: u64, i: usize, s: &Stream) -> Result<Node> {
-        let r = &s.symbols[i];
+    /// An org or repo row, cached for the life of this query.
+    fn entity(&self, id: u64) -> Result<Rc<Node>> {
+        if let Some(n) = self.ents.borrow().get(&id) {
+            return Ok(Rc::clone(n));
+        }
+        let n = Rc::new(self.need(id)?);
+        self.ents.borrow_mut().insert(id, Rc::clone(&n));
+        Ok(n)
+    }
+
+    fn sym_node(&self, file: u64, i: usize, syms: &[SymRec]) -> Result<Node> {
+        let r = &syms[i];
         let parent = r.parent.map_or(file, |p| sub_id(TAG_SYM, file, p as usize));
         let mut n = blank(
             sub_id(TAG_SYM, file, i),
             Some(parent),
             NodeKind::Symbol,
-            self.text(r.name)?,
+            self.text(r.name)?.to_string(),
         );
         n.symbol_kind = Some(r.kind);
-        n.lang_kind = r.lang_kind.map(|k| self.text(k)).transpose()?;
+        n.lang_kind = r
+            .lang_kind
+            .map(|k| self.text(k))
+            .transpose()?
+            .map(|t| t.to_string());
         n.span = Some(r.span);
         Ok(n)
     }
 
-    fn tok_node(&self, file: u64, i: usize, s: &Stream) -> Result<Node> {
-        let r = &s.tokens[i];
+    fn tok_node(&self, file: u64, i: usize, r: &TokRec) -> Result<Node> {
         let parent = r.parent.map_or(file, |p| sub_id(TAG_SYM, file, p as usize));
         let mut n = blank(
             sub_id(TAG_TOK, file, i),
             Some(parent),
             NodeKind::Token,
-            self.text(r.term)?,
+            self.text(r.term)?.to_string(),
         );
         n.token_class = Some(r.class);
         n.span = Some(r.span);
         Ok(n)
+    }
+
+    fn item_node(&self, file: u64, s: &Stream, it: Item) -> Result<Node> {
+        match it {
+            Item::Sym(i) => self.sym_node(file, i, &s.symbols),
+            Item::Tok(i) => self.tok_node(file, i, &s.tokens[i]),
+        }
     }
 
     fn get(&self, id: NodeId) -> Result<Option<Node>> {
@@ -200,9 +273,9 @@ impl R {
             return Ok(None);
         };
         if tag == TAG_SYM && i < s.symbols.len() {
-            Ok(Some(self.sym_node(file, i, &s)?))
+            Ok(Some(self.sym_node(file, i, &s.symbols)?))
         } else if tag == TAG_TOK && i < s.tokens.len() {
-            Ok(Some(self.tok_node(file, i, &s)?))
+            Ok(Some(self.tok_node(file, i, &s.tokens[i])?))
         } else {
             Ok(None)
         }
@@ -213,6 +286,131 @@ impl R {
             Some(p) => self.get(p),
             None => Ok(None),
         }
+    }
+
+    /// Direct children in creation order: for org and repo the entity rows,
+    /// for a file its top-level symbols and tokens outside symbols, for a
+    /// symbol its child symbols and direct tokens. Unknown ids and tokens
+    /// have none.
+    fn children(&self, id: NodeId) -> Result<Vec<Node>> {
+        let (tag, file, i) = split_id(id);
+        if tag == 0 {
+            let Some(n) = self.node(id)? else {
+                return Ok(Vec::new());
+            };
+            if n.kind == NodeKind::File {
+                let Some(s) = self.stream(id)? else {
+                    return Ok(Vec::new());
+                };
+                let tree = stream_tree(&s);
+                return tree
+                    .top
+                    .iter()
+                    .map(|&it| self.item_node(id, &s, it))
+                    .collect();
+            }
+            let mut out = Vec::new();
+            for k in self.kids.get(id)? {
+                out.push(self.need(k?.value())?);
+            }
+            return Ok(out);
+        }
+        if tag != TAG_SYM {
+            return Ok(Vec::new());
+        }
+        let Some(s) = self.stream(file)? else {
+            return Ok(Vec::new());
+        };
+        if i >= s.symbols.len() {
+            return Ok(Vec::new());
+        }
+        let tree = stream_tree(&s);
+        tree.kids[i]
+            .iter()
+            .map(|&it| self.item_node(file, &s, it))
+            .collect()
+    }
+
+    /// Everything below `id`, depth first in source order, parents before
+    /// their children. Decodes each stream once.
+    fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
+        let (tag, file, i) = split_id(id);
+        let mut out = Vec::new();
+        if tag == 0 {
+            let Some(n) = self.node(id)? else {
+                return Ok(out);
+            };
+            if n.kind == NodeKind::File {
+                self.file_walk(id, None, &mut out)?;
+            } else {
+                for k in self.kids.get(id)? {
+                    let c = self.need(k?.value())?;
+                    let (cid, kind) = (c.id, c.kind);
+                    out.push(c);
+                    if kind == NodeKind::File {
+                        self.file_walk(cid, None, &mut out)?;
+                    } else {
+                        out.extend(self.descendants(cid)?);
+                    }
+                }
+            }
+        } else if tag == TAG_SYM {
+            self.file_walk(file, Some(i), &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Depth-first walk of one stream from the file (`None`) or from a symbol.
+    fn file_walk(&self, file: u64, from: Option<usize>, out: &mut Vec<Node>) -> Result<()> {
+        let Some(s) = self.stream(file)? else {
+            return Ok(());
+        };
+        if from.is_some_and(|i| i >= s.symbols.len()) {
+            return Ok(());
+        }
+        let tree = stream_tree(&s);
+        let start = match from {
+            Some(i) => &tree.kids[i],
+            None => &tree.top,
+        };
+        let mut stack: Vec<Item> = start.iter().rev().copied().collect();
+        while let Some(it) = stack.pop() {
+            out.push(self.item_node(file, &s, it)?);
+            if let Item::Sym(i) = it {
+                stack.extend(tree.kids[i].iter().rev().copied());
+            }
+        }
+        Ok(())
+    }
+
+    /// Parent, grandparent, ... up to the org (nearest first). Decodes the
+    /// stream once.
+    fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
+        let (tag, file, i) = split_id(id);
+        let mut out = Vec::new();
+        let mut up = if tag == 0 {
+            self.node(id)?.and_then(|n| n.parent)
+        } else {
+            let Some(s) = self.stream(file)? else {
+                return Ok(out);
+            };
+            let mut cur = match tag {
+                TAG_SYM if i < s.symbols.len() => s.symbols[i].parent,
+                TAG_TOK if i < s.tokens.len() => s.tokens[i].parent,
+                _ => return Ok(out),
+            };
+            while let Some(p) = cur {
+                out.push(self.sym_node(file, p as usize, &s.symbols)?);
+                cur = s.symbols[p as usize].parent;
+            }
+            Some(file)
+        };
+        while let Some(p) = up {
+            let n = self.need(p)?;
+            up = n.parent;
+            out.push(n);
+        }
+        Ok(out)
     }
 
     fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
@@ -247,11 +445,11 @@ impl R {
             return Ok(());
         }
         let file = self.need(file_id)?;
-        let repo = self.need(
+        let repo = self.entity(
             file.parent
                 .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?,
         )?;
-        let org = self.need(
+        let org = self.entity(
             repo.parent
                 .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
         )?;
@@ -273,8 +471,8 @@ impl R {
             .stream(f)?
             .ok_or_else(|| StoreError::Corrupt(format!("file {f} without stream")))?;
         let mut out = Vec::with_capacity(s.tokens.len());
-        for i in 0..s.tokens.len() {
-            out.push(self.tok_node(f, i, &s)?);
+        for (i, t) in s.tokens.iter().enumerate() {
+            out.push(self.tok_node(f, i, t)?);
         }
         Ok(Some(out))
     }
@@ -325,7 +523,7 @@ impl R {
                     for i in 0..s.symbols.len() {
                         l.symbols += 1;
                         *l.symbol_kinds
-                            .entry(kind_label(&self.sym_node(n.id, i, &s)?))
+                            .entry(kind_label(&self.sym_node(n.id, i, &s.symbols)?))
                             .or_default() += 1;
                     }
                     l.tokens += s.tokens.len();
@@ -395,27 +593,24 @@ impl R {
         }
         let want_file = q.file.as_deref().map(normalize_path);
         let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
-        let mut streams: HashMap<u64, Option<Stream>> = HashMap::new();
-        let mut files: HashMap<u64, FileCtx> = HashMap::new();
-        let mut out: Vec<(u64, SymbolHit)> = Vec::new();
+        // Group the index hits by file and apply the file-level filters
+        // before any stream is read. A dangling entry (stale index) is
+        // skipped, not an error.
+        let mut by_file: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for id in ids {
             let (tag, file, i) = split_id(id);
-            if tag != TAG_SYM {
+            if tag == TAG_SYM {
+                by_file.entry(file).or_default().push(i);
+            }
+        }
+        let mut files: HashMap<u64, FileCtx> = HashMap::new();
+        let mut order: Vec<u64> = Vec::new();
+        for &fid in by_file.keys() {
+            if self.node(fid)?.is_none_or(|n| n.kind != NodeKind::File) {
                 continue;
             }
-            if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(file) {
-                e.insert(self.stream(file)?);
-            }
-            // A dangling index entry (stale index) is skipped, not an error.
-            let Some(s) = streams[&file].as_ref().filter(|s| i < s.symbols.len()) else {
-                continue;
-            };
-            let sym = self.sym_node(file, i, s)?;
-            if q.kind.as_deref().is_some_and(|k| !kind_matches(&sym, k)) {
-                continue;
-            }
-            self.ctx(file, &mut files)?;
-            let c = &files[&file];
+            self.ctx(fid, &mut files)?;
+            let c = &files[&fid];
             if want_lang
                 .as_ref()
                 .is_some_and(|l| c.file.language.as_ref() != Some(l))
@@ -425,52 +620,71 @@ impl R {
             {
                 continue;
             }
-            let mut quals = vec![sym.name.clone()];
-            let mut cur = s.symbols[i].parent;
-            while let Some(p) = cur {
-                // In range: `codec::decode` checks a parent is an earlier symbol.
-                let r = &s.symbols[p as usize];
-                quals.push(self.text(r.name)?);
-                cur = r.parent;
-            }
-            quals.reverse();
-            out.push((
-                id,
-                SymbolHit {
-                    org: c.org.name.clone(),
-                    repo: c.repo.name.clone(),
-                    file: c.file.name.clone(),
-                    language: c.file.language.clone(),
-                    name: sym.name,
-                    qualified: quals.join("::"),
-                    kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
-                    lang_kind: sym.lang_kind,
-                    span: sym.span,
-                },
-            ));
+            order.push(fid);
         }
-        out.sort_by(|(ia, a), (ib, b)| {
-            (
-                &a.org,
-                &a.repo,
-                &a.file,
-                a.span.map(|s| s.start),
-                &a.qualified,
-                ia,
-            )
-                .cmp(&(
-                    &b.org,
-                    &b.repo,
-                    &b.file,
-                    b.span.map(|s| s.start),
-                    &b.qualified,
-                    ib,
-                ))
+        // Files in sorted-by-path order, so the limit can stop the walk.
+        order.sort_by(|a, b| {
+            let (a, b) = (&files[a], &files[b]);
+            (&a.org.name, &a.repo.name, &a.file.name).cmp(&(
+                &b.org.name,
+                &b.repo.name,
+                &b.file.name,
+            ))
         });
-        let mut out: Vec<SymbolHit> = out.into_iter().map(|(_, h)| h).collect();
-        if let Some(n) = q.limit {
-            out.truncate(n);
+        let n = q.limit.unwrap_or(usize::MAX);
+        let mut out: Vec<SymbolHit> = Vec::new();
+        for fid in order {
+            if out.len() >= n {
+                break;
+            }
+            let Some(raw) = self.streams.get(fid)? else {
+                continue;
+            };
+            // Only the symbol section is decoded, not the tokens.
+            let syms = codec::decode_lazy(raw.value())?.symbols;
+            let c = &files[&fid];
+            let mut rows: Vec<((u32, String, u64), SymbolHit)> = Vec::new();
+            for &i in &by_file[&fid] {
+                if i >= syms.len() {
+                    continue;
+                }
+                let sym = self.sym_node(fid, i, &syms)?;
+                if q.kind.as_deref().is_some_and(|k| !kind_matches(&sym, k)) {
+                    continue;
+                }
+                let mut quals = vec![sym.name.clone()];
+                let mut cur = syms[i].parent;
+                while let Some(p) = cur {
+                    // In range: `codec::decode_lazy` checks a parent is an earlier symbol.
+                    let r = &syms[p as usize];
+                    quals.push(self.text(r.name)?.to_string());
+                    cur = r.parent;
+                }
+                quals.reverse();
+                let qualified = quals.join("::");
+                rows.push((
+                    (
+                        syms[i].span.start,
+                        qualified.clone(),
+                        sub_id(TAG_SYM, fid, i),
+                    ),
+                    SymbolHit {
+                        org: c.org.name.clone(),
+                        repo: c.repo.name.clone(),
+                        file: c.file.name.clone(),
+                        language: c.file.language.clone(),
+                        name: sym.name,
+                        qualified,
+                        kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
+                        lang_kind: sym.lang_kind,
+                        span: sym.span,
+                    },
+                ));
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.extend(rows.into_iter().map(|(_, h)| h));
         }
+        out.truncate(n);
         Ok(out)
     }
 
@@ -490,8 +704,7 @@ impl R {
             q.class.is_none() && matches!(q.grain, Grain::File | Grain::Repo | Grain::Org);
         let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
         let mut files: HashMap<u64, FileCtx> = HashMap::new();
-        type Key = (String, String, String, u32, u64);
-        let mut rows: BTreeMap<Key, Hit> = BTreeMap::new();
+        let mut order: Vec<(u64, u64)> = Vec::new();
         for (fid, n_post) in cands {
             self.ctx(fid, &mut files)?;
             let c = &files[&fid];
@@ -503,6 +716,34 @@ impl R {
             {
                 continue;
             }
+            order.push((fid, n_post));
+        }
+        // Sorted-by-path order: every later file sorts after every row of the
+        // earlier ones, so once the limit is met at a group boundary the walk
+        // can stop without reading the remaining streams.
+        order.sort_by(|(a, _), (b, _)| {
+            let (a, b) = (&files[a], &files[b]);
+            (&a.org.name, &a.repo.name, &a.file.name).cmp(&(
+                &b.org.name,
+                &b.repo.name,
+                &b.file.name,
+            ))
+        });
+        let n = q.limit.unwrap_or(usize::MAX);
+        type Key = (String, String, String, u32, u64);
+        let mut rows: BTreeMap<Key, Hit> = BTreeMap::new();
+        let mut last_group: Option<(u64, u64, u64)> = None;
+        for (fid, n_post) in order {
+            let c = &files[&fid];
+            let group = match q.grain {
+                Grain::Org => (c.org.id, 0, 0),
+                Grain::Repo => (c.org.id, c.repo.id, 0),
+                _ => (c.org.id, c.repo.id, fid),
+            };
+            if rows.len() >= n && last_group != Some(group) {
+                break;
+            }
+            last_group = Some(group);
             let base_hit = |count: usize| Hit {
                 grain: q.grain,
                 org: c.org.name.clone(),
@@ -546,25 +787,32 @@ impl R {
                     .or_insert(hit);
                 continue;
             }
-            let s = self
-                .stream(fid)?
+            let raw = self
+                .streams
+                .get(fid)?
                 .ok_or_else(|| StoreError::Corrupt(format!("file {fid} without stream")))?;
-            for (ord, t) in s.tokens.iter().enumerate() {
-                if t.term != term || q.class.is_some_and(|c| c != t.class) {
-                    continue;
+            let mut lazy = codec::decode_lazy(raw.value())?;
+            // Walk the token section once, keeping only the matches.
+            let mut matches: Vec<(usize, TokRec)> = Vec::new();
+            lazy.tokens(|ord, t| {
+                if t.term == term && q.class.is_none_or(|c| c == t.class) {
+                    matches.push((ord, t.clone()));
                 }
+                true
+            })?;
+            let syms = &lazy.symbols;
+            let need_chain = matches!(q.grain, Grain::Token | Grain::Symbol);
+            for (ord, t) in matches {
                 // Enclosing symbols, innermost first.
-                let mut chain: Vec<usize> = Vec::new();
-                let mut cur = t.parent;
-                while let Some(p) = cur {
-                    chain.push(p as usize);
-                    // In range: `codec::decode` checks a parent is an earlier symbol.
-                    cur = s.symbols[p as usize].parent;
+                let mut chain: Vec<Node> = Vec::new();
+                if need_chain {
+                    let mut cur = t.parent;
+                    while let Some(p) = cur {
+                        chain.push(self.sym_node(fid, p as usize, syms)?);
+                        // In range: `codec::decode_lazy` checks a parent is an earlier symbol.
+                        cur = syms[p as usize].parent;
+                    }
                 }
-                let syms: Vec<Node> = chain
-                    .iter()
-                    .map(|&i| self.sym_node(fid, i, &s))
-                    .collect::<Result<_>>()?;
                 let qual = |syms: &[Node]| {
                     (!syms.is_empty()).then(|| {
                         syms.iter()
@@ -578,9 +826,9 @@ impl R {
                 let key: Key;
                 match q.grain {
                     Grain::Token => {
-                        hit.symbol = qual(&syms);
-                        hit.symbol_kind = syms.first().and_then(|s| s.symbol_kind);
-                        hit.lang_kind = syms.first().and_then(|s| s.lang_kind.clone());
+                        hit.symbol = qual(&chain);
+                        hit.symbol_kind = chain.first().and_then(|s| s.symbol_kind);
+                        hit.lang_kind = chain.first().and_then(|s| s.lang_kind.clone());
                         hit.token_class = Some(t.class);
                         hit.span = Some(t.span);
                         key = (
@@ -592,13 +840,13 @@ impl R {
                         );
                     }
                     Grain::Symbol => {
-                        let pick = syms.iter().position(|s| {
+                        let pick = chain.iter().position(|s| {
                             q.symbol_kind.as_deref().is_none_or(|k| kind_matches(s, k))
                         });
                         match pick {
                             Some(i) => {
-                                let s = &syms[i];
-                                hit.symbol = qual(&syms[i..]);
+                                let s = &chain[i];
+                                hit.symbol = qual(&chain[i..]);
                                 hit.symbol_kind = s.symbol_kind;
                                 hit.lang_kind = s.lang_kind.clone();
                                 hit.span = s.span;
@@ -611,7 +859,7 @@ impl R {
                                 );
                             }
                             None => {
-                                if s.symbols.is_empty() {
+                                if syms.is_empty() {
                                     hit.no_symbols = true;
                                 } else {
                                     hit.no_matching_symbol = true;
@@ -628,7 +876,6 @@ impl R {
                 rows.entry(key).and_modify(|h| h.count += 1).or_insert(hit);
             }
         }
-        let n = q.limit.unwrap_or(usize::MAX);
         Ok(rows.into_values().take(n).collect())
     }
 }
@@ -1179,6 +1426,21 @@ macro_rules! store_read {
                 let $s = self;
                 let g = $rt;
                 R::new(&g)?.count_nodes(kind)
+            }
+            fn children(&self, id: NodeId) -> Result<Vec<Node>> {
+                let $s = self;
+                let g = $rt;
+                R::new(&g)?.children(id)
+            }
+            fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
+                let $s = self;
+                let g = $rt;
+                R::new(&g)?.descendants(id)
+            }
+            fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
+                let $s = self;
+                let g = $rt;
+                R::new(&g)?.ancestors(id)
             }
             fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
                 let $s = self;

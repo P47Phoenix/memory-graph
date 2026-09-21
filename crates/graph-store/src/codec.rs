@@ -144,7 +144,15 @@ impl Reader<'_> {
         self.at += 1;
         Ok(v)
     }
+    #[inline]
     fn varint(&mut self) -> Result<u64, StoreError> {
+        // Most values fit one byte.
+        if let Some(&b) = self.b.get(self.at) {
+            if b < 0x80 {
+                self.at += 1;
+                return Ok(u64::from(b));
+            }
+        }
         let (mut v, mut shift) = (0u64, 0u32);
         loop {
             let b = self.byte()?;
@@ -191,7 +199,16 @@ impl Reader<'_> {
     }
 }
 
-pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
+/// Header and symbol section of a stream; the token section is left
+/// undecoded and [`Lazy::tokens`] walks it record by record. Symbol search and
+/// term search use this to avoid materializing every token record.
+pub struct Lazy<'a> {
+    pub symbols: Vec<SymRec>,
+    ntok: usize,
+    r: Reader<'a>,
+}
+
+pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
     let mut r = Reader { b, at: 0 };
     let fmt = r.byte()?;
     if fmt != STREAM_FORMAT {
@@ -204,21 +221,22 @@ pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
     if nsym.saturating_add(ntok) > b.len() {
         return Err(bad("record count exceeds input"));
     }
-    let mut st = Stream {
-        symbols: Vec::with_capacity(nsym),
-        tokens: Vec::with_capacity(ntok),
-    };
+    let mut symbols = Vec::with_capacity(nsym);
     let mut prev = ZERO;
-    for _ in 0..nsym {
+    for i in 0..nsym {
         let name = r.varint()?;
         let kind = *KINDS
             .get(usize::from(r.byte()?))
             .ok_or_else(|| bad("bad symbol kind"))?;
         let lang_kind = r.varint()?.checked_sub(1);
         let parent = r.parent()?;
+        // A parent must be an enclosing (earlier) symbol; readers index by it.
+        if parent.is_some_and(|p| p as usize >= i) {
+            return Err(bad("parent index out of range"));
+        }
         let span = r.span(&prev)?;
         prev = span;
-        st.symbols.push(SymRec {
+        symbols.push(SymRec {
             name,
             kind,
             lang_kind,
@@ -226,33 +244,56 @@ pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
             span,
         });
     }
-    let mut prev = ZERO;
-    for _ in 0..ntok {
-        let term = r.varint()?;
-        let class = *CLASSES
-            .get(usize::from(r.byte()?))
-            .ok_or_else(|| bad("bad token class"))?;
-        let parent = r.parent()?;
-        let span = r.span(&prev)?;
-        prev = span;
-        st.tokens.push(TokRec {
-            term,
-            class,
-            parent,
-            span,
-        });
+    Ok(Lazy { symbols, ntok, r })
+}
+
+impl Lazy<'_> {
+    /// Visit every token record in ordinal order without collecting them.
+    /// Stops at the first error or when `f` returns `false`; a full pass also
+    /// checks for trailing bytes.
+    pub fn tokens(&mut self, mut f: impl FnMut(usize, &TokRec) -> bool) -> Result<(), StoreError> {
+        let nsym = self.symbols.len();
+        let r = &mut self.r;
+        let mut prev = ZERO;
+        for ord in 0..self.ntok {
+            let term = r.varint()?;
+            let class = *CLASSES
+                .get(usize::from(r.byte()?))
+                .ok_or_else(|| bad("bad token class"))?;
+            let parent = r.parent()?;
+            if parent.is_some_and(|p| p as usize >= nsym) {
+                return Err(bad("parent index out of range"));
+            }
+            let span = r.span(&prev)?;
+            prev = span;
+            let rec = TokRec {
+                term,
+                class,
+                parent,
+                span,
+            };
+            if !f(ord, &rec) {
+                return Ok(());
+            }
+        }
+        if r.at != r.b.len() {
+            return Err(bad("trailing bytes"));
+        }
+        Ok(())
     }
-    if r.at != b.len() {
-        return Err(bad("trailing bytes"));
-    }
-    // A parent must be an enclosing (earlier) symbol; readers index by it.
-    let ok = |p: Option<u32>, limit: usize| p.is_none_or(|p| (p as usize) < limit);
-    if st.symbols.iter().enumerate().any(|(i, s)| !ok(s.parent, i))
-        || st.tokens.iter().any(|t| !ok(t.parent, nsym))
-    {
-        return Err(bad("parent index out of range"));
-    }
-    Ok(st)
+}
+
+pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
+    let mut lazy = decode_lazy(b)?;
+    let mut tokens = Vec::with_capacity(lazy.ntok);
+    lazy.tokens(|_, t| {
+        tokens.push(t.clone());
+        true
+    })?;
+    Ok(Stream {
+        symbols: lazy.symbols,
+        tokens,
+    })
 }
 
 #[cfg(test)]
@@ -457,5 +498,167 @@ mod tests {
                 .collect::<Vec<_>>()
         )
         .is_err());
+    }
+}
+
+/// Property tests over source-text shapes (ADR 0003 story 2). The codec stores
+/// every span field, so there is no `irregular` escape to exercise yet; these
+/// tests pin the contract such an escape must keep: whatever the text (CRLF,
+/// lone CR, BOM, combining marks, astral code points, tabs, multi-line
+/// tokens), every span field survives encode/decode exactly.
+#[cfg(test)]
+mod props {
+    use super::*;
+    use graph_core::tokenizer::tokenize;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    fn stream_of(src: &str) -> (Stream, Vec<String>) {
+        let mut ids: HashMap<String, u64> = HashMap::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut st = Stream::default();
+        for t in tokenize(src) {
+            let next = ids.len() as u64;
+            let term = *ids.entry(t.text.clone()).or_insert_with(|| {
+                texts.push(t.text.clone());
+                next
+            });
+            st.tokens.push(TokRec {
+                term,
+                class: t.class,
+                parent: None,
+                span: t.span,
+            });
+        }
+        (st, texts)
+    }
+
+    /// Round trip, and the spans still describe the source they came from.
+    fn check(src: &str) {
+        let (st, texts) = stream_of(src);
+        let back = decode(&encode(&st)).unwrap();
+        assert_eq!(back, st, "round trip of {src:?}");
+        let toks = tokenize(src);
+        for (r, t) in back.tokens.iter().zip(&toks) {
+            assert_eq!(texts[r.term as usize], t.text);
+            assert!(src.is_char_boundary(r.span.start as usize));
+            assert!(src.is_char_boundary(r.span.end as usize));
+            assert_eq!(&src[r.span.start as usize..r.span.end as usize], t.text);
+        }
+    }
+
+    #[test]
+    fn named_text_shapes_round_trip() {
+        for src in [
+            "fn a() {\r\n    foo();\r\n}\r\n",
+            "fn a() {\rfoo();\r}\r",
+            "\u{feff}fn a() {}\n",
+            "\u{feff}\r\nfn a() {}\r\n",
+            "let e\u{301}t\u{e9} = 1;\n",
+            "let \u{1F600} = \"\u{1F600}\u{1F600}\";\r\n",
+            "\tif x {\t\ty }\n",
+            "/* multi\r\nline\rcomment\n*/ x // tail\r\n",
+            "\"unterminated\r\nstring",
+            "/* unterminated",
+            "",
+            "\r",
+            "\r\n\r\n",
+            "\u{feff}",
+        ] {
+            check(src);
+        }
+    }
+
+    fn piece() -> impl Strategy<Value = &'static str> {
+        prop::sample::select(vec![
+            "fn",
+            "foo",
+            "x1",
+            "_",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "\r",
+            "\r\n",
+            "\u{feff}",
+            "\u{1F600}",
+            "\u{e9}",
+            "e\u{301}",
+            "(",
+            ")",
+            "{",
+            "}",
+            ";",
+            "\"a\nb\"",
+            "\"q\"",
+            "/* c\r\nd */",
+            "// c\r",
+            "// c\n",
+            "0x1F",
+            "1.5e3",
+            "'",
+            "\"",
+        ])
+    }
+
+    type SpanFields = (u32, u32, u32, u32, u32, u32);
+
+    fn span_of((a, b, c, d, e, f): SpanFields) -> Span {
+        Span {
+            start: a,
+            end: b,
+            start_line: c,
+            start_col: d,
+            end_line: e,
+            end_col: f,
+        }
+    }
+
+    fn fields() -> impl Strategy<Value = SpanFields> {
+        (
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn generated_text_round_trips(pieces in prop::collection::vec(piece(), 0..60)) {
+            check(&pieces.concat());
+        }
+
+        /// Any `u32` span fields, including inverted and overlapping ones
+        /// (which `validate_spans` rejects before a write but the codec can
+        /// still represent), survive exactly.
+        #[test]
+        fn arbitrary_spans_round_trip(
+            syms in prop::collection::vec((any::<u64>(), 0usize..7, prop::option::of(any::<u64>()), fields(), any::<prop::sample::Index>(), any::<bool>()), 0..8),
+            toks in prop::collection::vec((any::<u64>(), 0usize..7, fields(), any::<prop::sample::Index>(), any::<bool>()), 0..8),
+        ) {
+            let mut st = Stream::default();
+            for (i, (name, kind, lang_kind, f, pidx, has_parent)) in syms.iter().enumerate() {
+                st.symbols.push(SymRec {
+                    name: *name,
+                    kind: KINDS[*kind],
+                    lang_kind: *lang_kind,
+                    parent: (i > 0 && *has_parent).then(|| pidx.index(i) as u32),
+                    span: span_of(*f),
+                });
+            }
+            for (term, class, f, pidx, has_parent) in &toks {
+                st.tokens.push(TokRec {
+                    term: *term,
+                    class: CLASSES[*class],
+                    parent: (!syms.is_empty() && *has_parent).then(|| pidx.index(syms.len()) as u32),
+                    span: span_of(*f),
+                });
+            }
+            prop_assert_eq!(decode(&encode(&st)).unwrap(), st);
+        }
     }
 }

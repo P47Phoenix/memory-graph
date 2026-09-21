@@ -45,6 +45,35 @@ pub trait StoreRead {
     /// Parent pointer lookup (one hop).
     fn parent(&self, id: NodeId) -> Result<Option<Node>>;
     fn count_nodes(&self, kind: NodeKind) -> Result<usize>;
+    /// Direct children in creation order: an org's repos, a repo's files, a
+    /// file's top-level symbols and tokens outside any symbol (source order),
+    /// a symbol's child symbols and direct tokens. Unknown ids and tokens have
+    /// none. Files without symbols (fallback tokenizer) list all their tokens.
+    fn children(&self, id: NodeId) -> Result<Vec<Node>>;
+    /// Everything below `id`: depth first, source order, a node before its
+    /// children. Backends may override this to avoid re-reading per level.
+    fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
+        let mut out = Vec::new();
+        let mut stack: Vec<Node> = self.children(id)?.into_iter().rev().collect();
+        while let Some(n) = stack.pop() {
+            if n.kind != NodeKind::Token {
+                stack.extend(self.children(n.id)?.into_iter().rev());
+            }
+            out.push(n);
+        }
+        Ok(out)
+    }
+    /// Parent, grandparent, ... up to the org, nearest first; empty for an
+    /// org or an unknown id.
+    fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
+        let mut out = Vec::new();
+        let mut cur = self.parent(id)?;
+        while let Some(n) = cur {
+            cur = self.parent(n.id)?;
+            out.push(n);
+        }
+        Ok(out)
+    }
     /// All tokens stored for one file, in source order; `None` if the file is
     /// not indexed.
     fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>>;
@@ -178,6 +207,9 @@ impl StoreRead for RedbStore {
     fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
         RedbStore::count_nodes(self, kind)
     }
+    fn children(&self, id: NodeId) -> Result<Vec<Node>> {
+        RedbStore::children_in(&self.db.begin_read()?, id)
+    }
     fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
         RedbStore::file_tokens(self, org, repo, path)
     }
@@ -253,6 +285,9 @@ impl StoreRead for RedbSnapshot {
     }
     fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
         RedbStore::count_nodes_in(&self.rt, kind)
+    }
+    fn children(&self, id: NodeId) -> Result<Vec<Node>> {
+        RedbStore::children_in(&self.rt, id)
     }
     fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
         RedbStore::file_tokens_in(&self.rt, org, repo, path)
