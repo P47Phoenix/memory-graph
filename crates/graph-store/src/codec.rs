@@ -766,34 +766,42 @@ mod tests {
             .is_empty());
     }
 
-    fn decoded_by(lazy: &Lazy<'_>, ords: &[usize]) -> usize {
+    /// Records decoded to visit `ords`; also asserts that exactly those
+    /// ordinals came back, in order, with the records of the source stream.
+    fn decoded_by(lazy: &Lazy<'_>, want: &Stream, ords: &[usize]) -> usize {
         RECORDS_DECODED.with(|c| c.set(0));
-        lazy.tokens_at(ords, |_, _| {}).unwrap();
-        RECORDS_DECODED.with(|c| c.get())
+        let mut got = Vec::new();
+        lazy.tokens_at(ords, |o, t| got.push((o, t.clone())))
+            .unwrap();
+        let n = RECORDS_DECODED.with(|c| c.get());
+        let exp: Vec<_> = ords.iter().map(|&o| (o, want.tokens[o].clone())).collect();
+        assert_eq!(got, exp, "records returned for {ords:?}");
+        n
     }
 
     /// `tokens_at` must use the checkpoints (bounded work per lookup) and
     /// must not re-decode when continuing forward.
     #[test]
     fn tokens_at_decodes_a_bounded_number_of_records() {
-        let b = encode(&long(3 * CHECKPOINT_EVERY + 5));
+        let src = long(3 * CHECKPOINT_EVERY + 5);
+        let b = encode(&src);
         let lazy = decode_lazy(&b).unwrap();
         let ce = CHECKPOINT_EVERY;
         // One lookup: jump to its checkpoint, decode the gap plus the target.
-        assert_eq!(decoded_by(&lazy, &[2 * ce + 10]), 11);
-        assert_eq!(decoded_by(&lazy, &[2 * ce]), 1);
-        assert_eq!(decoded_by(&lazy, &[2 * ce - 1]), ce);
-        assert_eq!(decoded_by(&lazy, &[3 * ce + 4]), 5);
+        assert_eq!(decoded_by(&lazy, &src, &[2 * ce + 10]), 11);
+        assert_eq!(decoded_by(&lazy, &src, &[2 * ce]), 1);
+        assert_eq!(decoded_by(&lazy, &src, &[2 * ce - 1]), ce);
+        assert_eq!(decoded_by(&lazy, &src, &[3 * ce + 4]), 5);
         for o in 0..3 * ce + 5 {
-            assert!(decoded_by(&lazy, &[o]) <= ce, "ordinal {o}");
+            assert!(decoded_by(&lazy, &src, &[o]) <= ce, "ordinal {o}");
         }
         // Ascending lookups in one block continue: no re-decode, no jump back.
-        assert_eq!(decoded_by(&lazy, &[ce + 3, ce + 4, ce + 9]), 10);
+        assert_eq!(decoded_by(&lazy, &src, &[ce + 3, ce + 4, ce + 9]), 10);
         // A far second lookup jumps instead of walking the gap.
-        assert_eq!(decoded_by(&lazy, &[1, 3 * ce + 2]), 2 + 3);
+        assert_eq!(decoded_by(&lazy, &src, &[1, 3 * ce + 2]), 2 + 3);
         // A full ascending pass decodes each record exactly once.
         let all: Vec<usize> = (0..3 * ce + 5).collect();
-        assert_eq!(decoded_by(&lazy, &all), 3 * ce + 5);
+        assert_eq!(decoded_by(&lazy, &src, &all), 3 * ce + 5);
     }
 
     /// Every checkpoint field (offset, start, line, column) is verified by a
@@ -813,6 +821,37 @@ mod tests {
         assert!(run(&|c| c.start += 1).is_err(), "start");
         assert!(run(&|c| c.line += 1).is_err(), "line");
         assert!(run(&|c| c.col += 1).is_err(), "col");
+    }
+
+    /// A checkpoint stands before a token that exists, so its offset must lie
+    /// strictly inside the token section: `off == toks.len()` is corrupt
+    /// (kills `>=` -> `>`), `off == toks.len() - 1` is not rejected by the
+    /// bound itself.
+    #[test]
+    fn checkpoint_offset_must_be_strictly_inside_the_token_section() {
+        let b = encode(&long(CHECKPOINT_EVERY + 1));
+        let lazy = decode_lazy(&b).unwrap();
+        assert_eq!(lazy.cks.len(), 1);
+        let toks_len = lazy.toks.len();
+        let sym_end = 4 + lazy.sym_bytes.len(); // fmt, nsym, ntok, symlen (1 byte each)
+                                                // Skip the original first varint (the offset) of the only checkpoint.
+        let mut skip = sym_end;
+        while b[skip] & 0x80 != 0 {
+            skip += 1;
+        }
+        skip += 1;
+        let forged = |off: usize| {
+            let mut v = b[..sym_end].to_vec();
+            put_varint(&mut v, off as u64);
+            v.extend_from_slice(&b[skip..]);
+            v
+        };
+        let bad_bytes = forged(toks_len);
+        let at_end = decode_lazy(&bad_bytes);
+        assert!(at_end.is_err(), "offset == section length must be rejected");
+        // Just inside passes the bound (a full pass would still catch it).
+        let ok_bytes = forged(toks_len - 1);
+        assert!(decode_lazy(&ok_bytes).is_ok());
     }
 
     /// The checkpoint interval is part of the on-disk layout: pin it.

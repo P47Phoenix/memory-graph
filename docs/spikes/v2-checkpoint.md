@@ -108,6 +108,28 @@ The goal (selective token search within 2x of v1) is met with margin: the worst 
 
 **Limits.** The checkpoint spacing (64) was not tuned; only that value was measured. Ordinal reads trust the checkpoints (a full decode verifies them and reports a mismatch as corruption). A term that occurs in most tokens of a file degrades to the previous sequential walk, as `(` shows (0.45x before, 0.46x after, within noise).
 
+## Addendum: churn and vacuum (ADR story 3)
+
+Harness: `crates/graph-store/examples/churn.rs` (`cargo run --release -p graph-store --example churn -- <dir> [rounds]`). It indexes every `.rs` file under a directory with the fallback tokenizer (19 files, 97,993 tokens: this repo's `crates/`), then repeats: replace every file with slightly different content (`reindex`), run `vacuum`, print the file size. One machine, release build; small, so read it as a shape, not a benchmark.
+
+| Round | File before vacuum | After vacuum | Terms removed by vacuum |
+|---|---|---|---|
+| 0 (first index) | 2.52 MiB | 2.52 MiB | 0 |
+| 1 (replace all) | 4.53 MiB | 4.53 MiB | 1 |
+| 2 to 8 (replace all, each) | 4.53 MiB | 4.53 MiB | 1 |
+
+What it shows:
+- **Steady state, no growth.** After the first full replacement the file stays at 4.53 MiB through seven more full replacements. redb reuses the pages a finished replacement frees, so repeated churn does not grow the file.
+- **The one-time step is 1.8x.** Replacing every file in a single write transaction needs the old and the new pages at the same time, so the file grows to about old plus new once and stays there. That is a peak of the transaction size, not a leak. Chunked commits (below) bound it: a smaller cap frees pages between chunks. The step was measured with one chunk per batch (the batch fits under the default 64 MiB cap); it was not re-measured with small caps.
+- **`vacuum` does not shrink the file.** It removes dead dictionary terms (here one term per round: the churn marker) but the file stays the same size, as documented. Returning space to the operating system needs a compaction (copy to a new file), which is not built; the ADR gate "soak keeps the file within 1.5x after vacuum" (story 7) is not met by this measurement (1.8x at the peak, then flat) and is not claimed.
+- **Not measured:** deleting most of a large store (prune) and vacuuming, and churn with symbol-bearing (extracted) files.
+
+## Addendum: term-length policy and chunked commits (ADR story 3)
+
+- **Term-length policy.** The dictionary keeps a term inline as its own key while it is at most `MAX_INLINE_TERM` (256) bytes and does not start with NUL. A longer term, or one starting with NUL, is keyed by `"\0"` plus its SHA-256 (hex), so B-tree keys stay small. The term's full text is stored once, whole, in the reverse table, and spans live in the stream, so no text or span is lost. Every lookup compares the stored text, so a digest collision is probed to the next key (`.n`) and can never merge two terms; the inline and hashed key spaces cannot overlap because inline keys never start with NUL. Symbol names are **not** capped: the symbol index is range-scanned by prefix and needs the text as the key. Tested: terms of 255, 256 and 257 bytes, 300 bytes, 100,000 bytes, multi-byte text, NUL-leading text, a short term shaped like a hashed key, a forged collision, and a 1,024-byte symbol name, all with exact search, symbol search, describe and file-token results equal to v1, plus the fixed-query differential; replace and vacuum of long terms leave no orphan.
+- **Chunked commits.** `index_batch` on v2 commits when the source bytes in the current write transaction reach a cap (default 64 MiB, `V2Store::set_chunk_bytes`) and at the end. Atomicity is **per chunk**: a storage error rolls back only the chunk in progress; earlier chunks stay committed and visible; per-file failures never abort a chunk; a batch under the cap is one transaction, all or nothing, as before. A file is never split, so one file above the cap is a chunk of its own. Re-running a failed batch skips stored files by fingerprint. v1 is unchanged (one transaction per batch). Not yet wired to a CLI flag or the `Store` trait, and the "in progress" flag of ADR decision D3 (readers seeing a repo marked in progress between chunks) is not built.
+- **Consistency proptest.** After every step of random sequences of ingest (replace), prune, chunked batch and vacuum, an oracle recomputes postings, the symbol index, the dictionary (both directions) and the describe catalog from the streams and requires them to match exactly; after a vacuum the dictionary holds no dead term.
+
 ## What this does not show
 
 - No cold-cache numbers, no concurrent readers, no updates or deletes at scale, and no per-table page accounting.
