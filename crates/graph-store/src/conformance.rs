@@ -62,6 +62,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("nul_handling", nul_handling),
     ("batch_origin_refresh", batch_origin_refresh),
     ("traversal", traversal),
+    ("vacuum_preserves_reads", vacuum_preserves_reads),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -930,6 +931,38 @@ fn prune_empty_keep(h: &Harness) {
         s.describe(None, None).unwrap(),
         s.describe_by_scan(None, None).unwrap()
     );
+}
+
+/// `vacuum` succeeds on an empty store and after churn, never changes what a
+/// read returns, and is idempotent (a second run frees nothing more).
+fn vacuum_preserves_reads(h: &Harness) {
+    let s = open(h);
+    s.vacuum().unwrap();
+    s.index_bytes("o", "r", "a.txt", b"alpha beta", None)
+        .unwrap();
+    s.index_bytes("o", "r", "b.txt", b"beta", None).unwrap();
+    // Replace a.txt so `alpha` is dead.
+    s.index_bytes("o", "r", "a.txt", b"gamma", None).unwrap();
+    let before = (
+        s.search(&Query::new("gamma")).unwrap(),
+        s.search(&Query::new("alpha")).unwrap(),
+        s.describe(None, None).unwrap(),
+    );
+    assert_eq!(before.0.len(), 1);
+    assert!(before.1.is_empty());
+    s.vacuum().unwrap();
+    let again = s.vacuum().unwrap();
+    assert_eq!(again.terms_removed, 0, "second vacuum has nothing to free");
+    let after = (
+        s.search(&Query::new("gamma")).unwrap(),
+        s.search(&Query::new("alpha")).unwrap(),
+        s.describe(None, None).unwrap(),
+    );
+    assert_eq!(before, after);
+    assert_eq!(s.search(&Query::new("beta")).unwrap().len(), 1);
+    // Still writable afterwards, and a dead term can return.
+    s.index_bytes("o", "r", "c.txt", b"alpha", None).unwrap();
+    assert_eq!(s.search(&Query::new("alpha")).unwrap().len(), 1);
 }
 
 /// NUL separates catalog and name key fields, so it is rejected in org, repo

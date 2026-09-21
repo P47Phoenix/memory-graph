@@ -117,6 +117,12 @@ const ZERO: Span = Span {
     end_col: 0,
 };
 
+#[cfg(test)]
+thread_local! {
+    /// Token records decoded on this thread (test instrumentation).
+    static RECORDS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decoder state before a token record.
 #[derive(Clone, Copy, Default)]
 struct Ck {
@@ -342,6 +348,8 @@ impl Lazy<'_> {
     }
 
     fn record(&self, r: &mut Reader<'_>, prev: &Span) -> Result<TokRec, StoreError> {
+        #[cfg(test)]
+        RECORDS_DECODED.with(|c| c.set(c.get() + 1));
         let term = r.varint()?;
         let class = *CLASSES
             .get(usize::from(r.byte()?))
@@ -756,6 +764,90 @@ mod tests {
             .unwrap()
             .cks
             .is_empty());
+    }
+
+    fn decoded_by(lazy: &Lazy<'_>, ords: &[usize]) -> usize {
+        RECORDS_DECODED.with(|c| c.set(0));
+        lazy.tokens_at(ords, |_, _| {}).unwrap();
+        RECORDS_DECODED.with(|c| c.get())
+    }
+
+    /// `tokens_at` must use the checkpoints (bounded work per lookup) and
+    /// must not re-decode when continuing forward.
+    #[test]
+    fn tokens_at_decodes_a_bounded_number_of_records() {
+        let b = encode(&long(3 * CHECKPOINT_EVERY + 5));
+        let lazy = decode_lazy(&b).unwrap();
+        let ce = CHECKPOINT_EVERY;
+        // One lookup: jump to its checkpoint, decode the gap plus the target.
+        assert_eq!(decoded_by(&lazy, &[2 * ce + 10]), 11);
+        assert_eq!(decoded_by(&lazy, &[2 * ce]), 1);
+        assert_eq!(decoded_by(&lazy, &[2 * ce - 1]), ce);
+        assert_eq!(decoded_by(&lazy, &[3 * ce + 4]), 5);
+        for o in 0..3 * ce + 5 {
+            assert!(decoded_by(&lazy, &[o]) <= ce, "ordinal {o}");
+        }
+        // Ascending lookups in one block continue: no re-decode, no jump back.
+        assert_eq!(decoded_by(&lazy, &[ce + 3, ce + 4, ce + 9]), 10);
+        // A far second lookup jumps instead of walking the gap.
+        assert_eq!(decoded_by(&lazy, &[1, 3 * ce + 2]), 2 + 3);
+        // A full ascending pass decodes each record exactly once.
+        let all: Vec<usize> = (0..3 * ce + 5).collect();
+        assert_eq!(decoded_by(&lazy, &all), 3 * ce + 5);
+    }
+
+    /// Every checkpoint field (offset, start, line, column) is verified by a
+    /// full pass, each on its own.
+    #[test]
+    fn every_checkpoint_field_is_verified() {
+        let b = encode(&long(2 * CHECKPOINT_EVERY));
+        let good = decode_lazy(&b).unwrap();
+        assert_eq!(good.cks.len(), 1);
+        let run = |f: &dyn Fn(&mut Ck)| {
+            let mut l = decode_lazy(&b).unwrap();
+            f(&mut l.cks[0]);
+            l.tokens(|_, _| true)
+        };
+        assert!(run(&|_| {}).is_ok());
+        assert!(run(&|c| c.off -= 1).is_err(), "off");
+        assert!(run(&|c| c.start += 1).is_err(), "start");
+        assert!(run(&|c| c.line += 1).is_err(), "line");
+        assert!(run(&|c| c.col += 1).is_err(), "col");
+    }
+
+    /// The checkpoint interval is part of the on-disk layout: pin it.
+    #[test]
+    fn checkpoint_interval_is_pinned() {
+        assert_eq!(CHECKPOINT_EVERY, 64);
+        for (n, nck) in [(1, 0), (64, 0), (65, 1), (128, 1), (129, 2), (193, 3)] {
+            let b = encode(&long(n));
+            assert_eq!(decode_lazy(&b).unwrap().cks.len(), nck, "n={n}");
+        }
+        // The first checkpoint sits exactly after the 64th record.
+        let first_64 = encode(&long(64));
+        let l64 = decode_lazy(&first_64).unwrap();
+        let b65 = encode(&long(65));
+        let l65 = decode_lazy(&b65).unwrap();
+        assert_eq!(l65.cks[0].off, l64.toks.len());
+    }
+
+    /// A posting count larger than the input is rejected up front (no huge
+    /// allocation, no panic), whatever the count.
+    #[test]
+    fn posting_ordinals_rejects_huge_counts() {
+        let mut b = Vec::new();
+        put(&mut b, u64::MAX >> 1);
+        b.push(1);
+        let e = posting_ordinals(&b).unwrap_err().to_string();
+        assert!(e.contains("count exceeds input"), "{e}");
+        // A count above the input length is caught by the guard; at the
+        // length it passes the guard and fails on the truncated read.
+        let e = posting_ordinals(&[5, 1, 1, 1]).unwrap_err().to_string();
+        assert!(e.contains("count exceeds input"), "{e}");
+        let e = posting_ordinals(&[4, 1, 1, 1]).unwrap_err().to_string();
+        assert!(e.contains("truncated"), "{e}");
+        // Exactly as many entries as bytes after the count is fine.
+        assert_eq!(posting_ordinals(&[3, 1, 1, 1]).unwrap(), [1, 2, 3]);
     }
 
     #[test]
