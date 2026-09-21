@@ -160,7 +160,9 @@ impl Reader<'_> {
     }
     /// `base + zigzag delta`, which must be a `u32`.
     fn rel(&mut self, base: u32) -> Result<u32, StoreError> {
-        let v = i64::from(base) + unzigzag(self.varint()?);
+        let v = i64::from(base)
+            .checked_add(unzigzag(self.varint()?))
+            .ok_or_else(|| bad("span delta overflow"))?;
         u32::try_from(v).map_err(|_| bad("span field out of range"))
     }
     fn span(&mut self, prev: &Span) -> Result<Span, StoreError> {
@@ -353,6 +355,15 @@ mod tests {
         assert_eq!(decode(&encode(&s)).unwrap(), s);
     }
 
+    fn tok(term: u64) -> TokRec {
+        TokRec {
+            term,
+            class: TokenClass::Other,
+            parent: None,
+            span: sp(0, 0, 0, 0, 0, 0),
+        }
+    }
+
     #[test]
     fn corrupt_input_is_an_error_not_a_panic() {
         let good = encode(&sample());
@@ -366,6 +377,17 @@ mod tests {
         fmt[0] = 9;
         assert!(decode(&fmt).is_err());
         assert!(decode(&[1, 0xff, 0xff, 0xff, 0xff, 0x0f, 0]).is_err());
+        // Crafted delta 2^64-2 (unzigzag = i64::MAX) must not overflow.
+        let mut evil = encode(&Stream {
+            symbols: vec![],
+            tokens: vec![tok(0), tok(0)],
+        });
+        let n = evil.len();
+        // Second token: term, class, parent, then the start delta.
+        evil.truncate(n - 6);
+        evil.extend_from_slice(&[0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        evil.extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert!(decode(&evil).is_err());
         assert!(decode(
             &[1; 1]
                 .iter()

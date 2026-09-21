@@ -1821,6 +1821,80 @@ fn v1_vs_v2_differential() {
     conformance::run_differential(&*a, &*b);
 }
 
+/// Zero-length and equal-span symbols: v1 is the oracle for v2.
+#[test]
+fn v1_vs_v2_zero_length_and_equal_span_symbols() {
+    use graph_core::{Extraction, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+    let sp = |s: u32, e: u32| Span {
+        start: s,
+        end: e,
+        start_line: 1,
+        start_col: s + 1,
+        end_line: 1,
+        end_col: e + 1,
+    };
+    let sym = |n: &str, k, s, e| SymbolDecl {
+        name: n.into(),
+        kind: k,
+        lang_kind: None,
+        span: sp(s, e),
+    };
+    let tok = |t: &str, s, e| TokenDecl {
+        text: t.into(),
+        class: TokenClass::Identifier,
+        span: sp(s, e),
+    };
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![
+            sym("z", SymbolKind::Function, 4, 4),
+            sym("a", SymbolKind::Type, 0, 10),
+            sym("b", SymbolKind::Method, 0, 10),
+            sym("c", SymbolKind::Method, 4, 8),
+            sym("d", SymbolKind::Variable, 4, 8),
+        ],
+        tokens: vec![
+            tok("foo", 0, 3),
+            tok("foo", 4, 7),
+            tok("foo", 4, 4),
+            tok("foo", 8, 10),
+        ],
+    };
+    let d = tempfile::tempdir().unwrap();
+    let a = open_store(Backend::Redb, &d.path().join("a.redb"), vec![]).unwrap();
+    let b = open_store(Backend::RedbV2, &d.path().join("b.redb"), vec![]).unwrap();
+    for s in [&a, &b] {
+        s.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+    }
+    for grain in [Grain::Token, Grain::Symbol, Grain::File] {
+        for kind in [None, Some("method"), Some("function")] {
+            let mut q = Query::new("foo");
+            q.grain = grain;
+            q.symbol_kind = kind.map(Into::into);
+            assert_eq!(
+                a.search(&q).unwrap(),
+                b.search(&q).unwrap(),
+                "{grain:?} {kind:?}"
+            );
+        }
+    }
+    let q = SymbolQuery::new("*");
+    assert_eq!(a.search_symbols(&q).unwrap(), b.search_symbols(&q).unwrap());
+    assert_eq!(
+        a.describe(None, None).unwrap(),
+        b.describe(None, None).unwrap()
+    );
+    let toks = |s: &dyn Store| {
+        s.file_tokens("o", "r", "x.rs")
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name, n.span))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(toks(&*a), toks(&*b));
+}
+
 #[test]
 fn v1_and_v2_files_refuse_each_other_untouched() {
     let d = tempfile::tempdir().unwrap();

@@ -428,6 +428,7 @@ impl R {
             let mut quals = vec![sym.name.clone()];
             let mut cur = s.symbols[i].parent;
             while let Some(p) = cur {
+                // In range: `codec::decode` checks a parent is an earlier symbol.
                 let r = &s.symbols[p as usize];
                 quals.push(self.text(r.name)?);
                 cur = r.parent;
@@ -557,6 +558,7 @@ impl R {
                 let mut cur = t.parent;
                 while let Some(p) = cur {
                     chain.push(p as usize);
+                    // In range: `codec::decode` checks a parent is an earlier symbol.
                     cur = s.symbols[p as usize].parent;
                 }
                 let syms: Vec<Node> = chain
