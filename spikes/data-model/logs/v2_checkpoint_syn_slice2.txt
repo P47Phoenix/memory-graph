@@ -1,0 +1,37 @@
+v1: files=162 tokens=855726 symbols=14888 ingest_s=5.61 db_MiB=514.5 B/token=630.5
+v2: files=162 tokens=855726 symbols=14888 ingest_s=0.82 db_MiB=32.6 B/token=40.0
+
+| query | v1 p50 ms | v2 p50 ms | v2/v1 | rows equal |
+|---|---|---|---|---|
+| common punct `(` token (74673 rows) | 166.3 | 76.3 | 0.46x | true |
+| common punct `(` symbol (13229 rows) | 174.4 | 49.9 | 0.29x | true |
+| common punct `(` file (159 rows) | 122.4 | 0.2 | 0.00x | true |
+| common punct `(` repo (2 rows) | 113.6 | 0.1 | 0.00x | true |
+| common punct `(` org (1 rows) | 116.1 | 0.1 | 0.00x | true |
+| keyword `self` token (13512 rows) | 35.0 | 25.3 | 0.72x | true |
+| keyword `self` symbol (4502 rows) | 50.2 | 22.0 | 0.44x | true |
+| keyword `self` file (111 rows) | 28.2 | 0.1 | 0.00x | true |
+| keyword `self` repo (2 rows) | 27.2 | 0.1 | 0.00x | true |
+| keyword `self` org (1 rows) | 30.0 | 0.1 | 0.00x | true |
+| ident `new` token (1237 rows) | 3.0 | 8.1 | 2.71x | true |
+| ident `new` symbol (674 rows) | 6.5 | 7.9 | 1.22x | true |
+| ident `new` file (88 rows) | 2.5 | 0.1 | 0.03x | true |
+| ident `new` repo (2 rows) | 2.3 | 0.1 | 0.03x | true |
+| ident `new` org (1 rows) | 2.3 | 0.1 | 0.03x | true |
+| ident `Result` token (1834 rows) | 6.7 | 9.4 | 1.40x | true |
+| ident `Result` symbol (1802 rows) | 21.0 | 9.4 | 0.45x | true |
+| ident `Result` file (84 rows) | 4.7 | 0.1 | 0.02x | true |
+| ident `Result` repo (2 rows) | 4.5 | 0.1 | 0.01x | true |
+| ident `Result` org (1 rows) | 4.7 | 0.1 | 0.01x | true |
+| `new` token +class=identifier (1237 rows) | 2.9 | 8.1 | 2.83x | true |
+| `new` file +class=identifier (stream walk, no rows) (88 rows) | 2.4 | 7.2 | 2.96x | true |
+| `(` token --limit 100 (100 rows) | 162.3 | 0.4 | 0.00x | true |
+| symbols `new` (42 rows) | 0.1 | 0.1 | 0.86x | true |
+| symbols `new*` (66 rows) | 0.2 | 0.1 | 0.69x | true |
+| symbols `*` (14888 rows) | 49.5 | 6.9 | 0.14x | true |
+| symbols `fmt` (793 rows) | 2.2 | 0.5 | 0.23x | true |
+| symbols `*` --limit 100 (100 rows) | 48.9 | 1.0 | 0.02x | true |
+
+peak RSS of this process (both stores, queries): VmHWM:	  513276 kB
+v1: file 514.5 MiB, after redb compaction 514.5 MiB
+v2: file 32.6 MiB, after redb compaction 24.6 MiB

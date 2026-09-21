@@ -327,6 +327,7 @@ version = "0.1.0"
 dependencies = [
  "graph-core",
  "graph-lang-rust",
+ "proptest",
  "redb",
  "serde",
  "serde_json",

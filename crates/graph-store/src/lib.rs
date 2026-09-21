@@ -838,6 +838,21 @@ impl RedbStore {
         r
     }
 
+    /// Direct children in creation order (see `StoreRead::children`).
+    fn children_in(rt: &ReadTransaction, id: NodeId) -> Result<Vec<Node>> {
+        let kids = rt.open_multimap_table(CHILDREN)?;
+        let nodes = rt.open_table(NODES)?;
+        let mut out = Vec::new();
+        for k in kids.get(id)? {
+            let k = k?.value();
+            let n = nodes
+                .get(k)?
+                .ok_or_else(|| StoreError::Corrupt(format!("dangling child {k}")))?;
+            out.push(dec(n.value())?);
+        }
+        Ok(out)
+    }
+
     /// Parent pointer lookup (one hop).
     pub fn parent(&self, id: NodeId) -> Result<Option<Node>> {
         Self::parent_in(&self.db.begin_read()?, id)

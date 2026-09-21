@@ -29,6 +29,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 | [Storage](spikes/storage.md) | Experiment on the database: redb works, at about 690 bytes per token. | none |
 | [Data model](spikes/data-model.md) | Experiment on size: the cost per token is the record around it, not the text; a stream model measured about 25x smaller. | [spikes/data-model/](../spikes/data-model/README.md) (code, README, logs) |
 | [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md) | Decision record (not an ADR), decided by the user 2026-09-20: a daemon for cross-process access, shard by (org, repo) with the build deferred; keeps the options and evidence. | none |
+| [v2 store checkpoint](spikes/v2-checkpoint.md) | ADR story 4 go/no-go input at 9.9 M tokens (not a decision): v2 is 24x smaller and 5.1x faster to ingest, no query worse than 1.51x v1; on real `syn` alone selective token search is 2.7x v1 and size is 39.95 B/token. Includes the fixed `search_symbols` regression (#22). | [spikes/data-model/logs/](../spikes/data-model/README.md) (`v2_checkpoint_*`), harness `crates/graph-store/examples/v2bench.rs` |
 | [Daemon and locking](spikes/daemon-and-locking.md) | Experiment on cross-process access: a socket daemon adds under 1 ms per query even at 9.9 M tokens (5 ms trigger not tripped); today's lock is held for a whole index run (20 s per 2.5 M tokens) and retries starve under load. | [spikes/daemon/](../spikes/daemon/README.md) (code, README, logs) |
 
 ## Learnings
