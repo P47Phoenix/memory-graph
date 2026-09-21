@@ -1,0 +1,27 @@
+dataset=10m
+op                            rows   inp_p50   inp_p95 |  json_p50  json_p95  json_d50 |   bin_p50   bin_p95   bin_d50 |   jsonB    binB
+ping                             0    0.0000    0.0000 |    0.0033    0.0037    0.0033 |    0.0036    0.0038    0.0036 |       6       1
+search_rare_tok                 22    0.0423    0.0464 |    0.0591    0.0712    0.0167 |    0.0611    0.0675    0.0188 |    3857    1707
+search_common_tok_lim100       100   30.1582   31.0066 |   32.3901   35.0751    2.2319 |   31.5721   32.4826    1.4139 |   17728    8016
+search_common_sym_lim100       100  231.5066  251.8416 |  229.7064  242.0724   -1.8002 |  228.8107  240.6851   -2.6959 |   17432    7912
+search_common_tok_lim2000     2000   28.3297   28.5993 |   29.3505   31.2262    1.0207 |   30.9810   37.7359    2.6513 |  350602  155287
+symbols_exact                  100    1.0782    1.1073 |    1.3747    1.6087    0.2965 |    1.2530    1.5234    0.1748 |   16815    7386
+symbols_prefix_lim100          100    4.3819    4.4579 |    4.4586    4.8326    0.0767 |    4.4690    4.7323    0.0871 |   17768    8264
+describe                         0    1.3533    1.3933 |    1.7970    1.9168    0.4437 |    1.4291    1.5704    0.0757 |  164100  142437
+--- server-side handle() time (same store, no socket/codec) ---
+server_handle enc=bin n=20 p50=1.3678ms p95=1.4215ms Describe
+server_handle enc=bin n=105 p50=0.0001ms p95=0.0001ms Ping
+server_handle enc=bin n=105 p50=0.0528ms p95=0.0580ms Search { text: "Backtrace", limit: 100, symbol_grain: false }
+server_handle enc=bin n=105 p50=31.3377ms p95=34.6990ms Search { text: "self", limit: 100, symbol_grain: false }
+server_handle enc=bin n=105 p50=228.5859ms p95=240.7099ms Search { text: "self", limit: 100, symbol_grain: true }
+server_handle enc=bin n=105 p50=30.9087ms p95=37.2338ms Search { text: "self", limit: 2000, symbol_grain: false }
+server_handle enc=bin n=105 p50=4.2965ms p95=4.4985ms Symbols { pattern: "f*", limit: 100 }
+server_handle enc=bin n=105 p50=1.1125ms p95=1.2412ms Symbols { pattern: "new", limit: 100 }
+server_handle enc=json n=20 p50=1.3982ms p95=1.4631ms Describe
+server_handle enc=json n=105 p50=0.0001ms p95=0.0001ms Ping
+server_handle enc=json n=105 p50=0.0432ms p95=0.0481ms Search { text: "Backtrace", limit: 100, symbol_grain: false }
+server_handle enc=json n=105 p50=32.1215ms p95=36.0720ms Search { text: "self", limit: 100, symbol_grain: false }
+server_handle enc=json n=105 p50=229.3327ms p95=242.2089ms Search { text: "self", limit: 100, symbol_grain: true }
+server_handle enc=json n=105 p50=27.9986ms p95=29.9996ms Search { text: "self", limit: 2000, symbol_grain: false }
+server_handle enc=json n=105 p50=4.2340ms p95=4.6179ms Symbols { pattern: "f*", limit: 100 }
+server_handle enc=json n=105 p50=1.1686ms p95=1.2303ms Symbols { pattern: "new", limit: 100 }

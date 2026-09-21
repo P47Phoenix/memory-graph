@@ -1,0 +1,10 @@
+  unknown: 3
+  unknown: 1
+  xml: 11
+  unknown: 1
+  unknown: 3
+  md: 3
+  md: 3
+  md: 3
+fresh index of 8 repos, 8 processes, wall 1.758529880s
+reindex all wall 3.067000231s

@@ -1,0 +1,144 @@
+== 1. lock hold time of one short process (open + search + close), by DB size ==
+-- d1x
+open=5.8ms search=48.54ms close=3.2ms hits=100 (lock held 57.5ms)
+open=2.4ms search=1.97ms close=3.1ms hits=100 (lock held 7.4ms)
+open=1.4ms search=1.80ms close=2.7ms hits=100 (lock held 5.8ms)
+open=1.3ms search=1.91ms close=2.8ms hits=100 (lock held 6.0ms)
+open=1.3ms search=1.76ms close=2.9ms hits=100 (lock held 5.9ms)
+-- d1m
+open=7.0ms search=175.82ms close=3.4ms hits=100 (lock held 186.2ms)
+open=1.5ms search=7.32ms close=3.7ms hits=100 (lock held 12.5ms)
+open=1.3ms search=7.40ms close=3.1ms hits=100 (lock held 11.8ms)
+open=1.4ms search=7.40ms close=3.2ms hits=100 (lock held 12.0ms)
+open=1.4ms search=7.32ms close=3.4ms hits=100 (lock held 12.1ms)
+-- d10m
+open=93.6ms search=1915.90ms close=6.4ms hits=100 (lock held 2015.9ms)
+open=1.9ms search=71.59ms close=11.1ms hits=100 (lock held 84.5ms)
+open=1.9ms search=70.78ms close=6.3ms hits=100 (lock held 78.9ms)
+open=1.8ms search=72.37ms close=9.3ms hits=100 (lock held 83.5ms)
+open=1.9ms search=72.11ms close=11.2ms hits=100 (lock held 85.3ms)
+
+== 2. what a second process sees ==
+-- library:
+try: FAILED after 0.025 ms: Locked("/home/meconnelly/.claude/jobs/d472d98c/tmp/daemon-work/s2.redb") | display: database is locked by another process: /home/meconnelly/.claude/jobs/d472d98c/tmp/daemon-work/s2.redb
+-- CLI search:
+Error: opening database `/home/meconnelly/.claude/jobs/d472d98c/tmp/daemon-work/s2.redb`
+
+Caused by:
+    database is locked by another process: /home/meconnelly/.claude/jobs/d472d98c/tmp/daemon-work/s2.redb
+exit=1 in 2.7 ms
+-- CLI index-file:
+Error: database is locked by another process: /home/meconnelly/.claude/jobs/d472d98c/tmp/daemon-work/s2.redb
+exit=1 in 1.5 ms
+
+== 3. real long index run: hold time + what a retrying reader sees ==
+index process wall (= lock hold): 8540.2 ms; 
+reader (started 1 s in, jittered backoff base 5 ms cap 250 ms): retry_ok_ns=1789940848176081893 attempts=58 waited_ms=7530.7; success 7.6 ms after the indexer exited (negative = before, impossible)
+
+== 4. retry policy vs holder duration (holder = open then sleep; overshoot = success - release) ==
+holder_s  policy                      trial  attempts  waited_ms  overshoot_ms
+0.25  5 250 120 jitter  1  9  254.4  53.1
+0.25  5 250 120 jitter  2  8  307.3  106.7
+0.25  5 250 120 jitter  3  8  257.0  56.7
+0.25  5 250 120 jitter  4  8  217.0  15.3
+0.25  5 250 120 jitter  5  8  355.5  155.6
+0.25  5 250 120 jitter  6  8  303.4  102.3
+0.25  5 250 120 jitter  7  8  312.6  112.6
+0.25  5 250 120 jitter  8  7  221.5  21.2
+0.25  5 250 120 jitter  9  8  270.0  69.8
+0.25  5 250 120 jitter  10  8  383.6  183.1
+0.25  100 100 120 fixed  1  4  305.8  105.2
+0.25  100 100 120 fixed  2  4  308.0  107.7
+0.25  100 100 120 fixed  3  4  308.1  107.9
+0.25  100 100 120 fixed  4  4  308.0  106.8
+0.25  100 100 120 fixed  5  4  307.3  107.0
+0.25  100 100 120 fixed  6  4  306.9  106.4
+0.25  100 100 120 fixed  7  4  307.4  107.1
+0.25  100 100 120 fixed  8  4  306.6  106.1
+0.25  100 100 120 fixed  9  4  308.3  107.9
+0.25  100 100 120 fixed  10  4  307.1  106.7
+0.25  20 1000 120 jitter  1  5  218.5  17.6
+0.25  20 1000 120 jitter  2  6  459.0  258.7
+0.25  20 1000 120 jitter  3  6  295.4  95.2
+0.25  20 1000 120 jitter  4  7  497.5  297.2
+0.25  20 1000 120 jitter  5  6  320.4  119.1
+0.25  20 1000 120 jitter  6  6  426.2  225.5
+0.25  20 1000 120 jitter  7  6  500.6  300.2
+0.25  20 1000 120 jitter  8  7  776.9  576.3
+0.25  20 1000 120 jitter  9  5  218.9  18.5
+0.25  20 1000 120 jitter  10  6  368.9  168.5
+1  5 250 120 jitter  1  16  1015.8  65.4
+1  5 250 120 jitter  2  14  1043.0  91.7
+1  5 250 120 jitter  3  16  1150.1  199.9
+1  5 250 120 jitter  4  14  1172.1  221.4
+1  5 250 120 jitter  5  13  1030.3  80.0
+1  5 250 120 jitter  6  14  1154.5  203.9
+1  5 250 120 jitter  7  15  982.3  32.0
+1  5 250 120 jitter  8  16  1133.9  183.4
+1  5 250 120 jitter  9  14  1045.5  95.1
+1  5 250 120 jitter  10  16  994.5  43.9
+1  100 100 120 fixed  1  11  1003.4  53.1
+1  100 100 120 fixed  2  11  1002.8  52.6
+1  100 100 120 fixed  3  11  1003.0  52.4
+1  100 100 120 fixed  4  11  1002.8  52.4
+1  100 100 120 fixed  5  11  1002.7  52.2
+1  100 100 120 fixed  6  11  1003.6  53.5
+1  100 100 120 fixed  7  11  1002.8  53.3
+1  100 100 120 fixed  8  11  1003.2  52.7
+1  100 100 120 fixed  9  11  1003.6  53.3
+1  100 100 120 fixed  10  11  1003.4  53.5
+1  20 1000 120 jitter  1  8  1530.8  580.5
+1  20 1000 120 jitter  2  8  1437.5  487.2
+1  20 1000 120 jitter  3  8  1433.6  483.6
+1  20 1000 120 jitter  4  10  970.3  19.6
+1  20 1000 120 jitter  5  8  1315.7  365.1
+1  20 1000 120 jitter  6  9  1246.9  295.2
+1  20 1000 120 jitter  7  9  1212.4  261.3
+1  20 1000 120 jitter  8  8  1411.2  460.9
+1  20 1000 120 jitter  9  8  1254.2  303.9
+1  20 1000 120 jitter  10  8  1651.5  701.1
+5  5 250 120 jitter  1  48  5034.4  84.5
+5  5 250 120 jitter  2  43  4991.1  40.6
+5  5 250 120 jitter  3  51  5123.0  172.9
+5  5 250 120 jitter  4  47  5067.1  117.0
+5  5 250 120 jitter  5  41  5153.5  203.4
+5  5 250 120 jitter  6  46  5024.7  74.4
+5  100 100 120 fixed  1  51  5007.0  56.3
+5  100 100 120 fixed  2  51  5008.7  58.2
+5  100 100 120 fixed  3  51  5007.0  57.2
+5  100 100 120 fixed  4  51  5007.8  57.5
+5  100 100 120 fixed  5  51  5009.7  59.0
+5  100 100 120 fixed  6  51  5008.4  58.1
+5  20 1000 120 jitter  1  14  5526.9  576.2
+5  20 1000 120 jitter  2  14  5247.3  296.7
+5  20 1000 120 jitter  3  17  5151.2  200.8
+5  20 1000 120 jitter  4  16  5510.8  560.2
+5  20 1000 120 jitter  5  15  4978.7  28.4
+5  20 1000 120 jitter  6  17  5706.9  756.7
+30  5 250 120 jitter  1  232  30173.7  223.3
+30  5 250 120 jitter  2  241  29990.1  39.8
+30  100 100 120 fixed  1  301  30051.7  101.3
+30  100 100 120 fixed  2  301  30043.1  92.8
+30  20 1000 120 jitter  1  63  30184.3  233.3
+30  20 1000 120 jitter  2  70  30036.2  86.0
+
+== 5. contention: 8 short-lived reader processes x 100 open+search+close, no long holder ==
+worker pid=224585 n=100 p50=4.7ms p95=5.6ms max=468.8ms attempts_total=112 attempts_max=13
+worker pid=224584 n=100 p50=4.7ms p95=5.8ms max=952.0ms attempts_total=125 attempts_max=22
+worker pid=224579 n=100 p50=4.8ms p95=6.6ms max=1147.8ms attempts_total=137 attempts_max=27
+worker pid=224582 n=100 p50=4.9ms p95=6.6ms max=2226.8ms attempts_total=147 attempts_max=48
+worker pid=224580 n=100 p50=4.8ms p95=6.0ms max=1451.3ms attempts_total=155 attempts_max=31
+worker pid=224583 n=100 p50=4.7ms p95=5.6ms max=3001.6ms attempts_total=166 attempts_max=67
+worker pid=224581 n=100 p50=4.7ms p95=5.9ms max=3054.8ms attempts_total=182 attempts_max=71
+worker pid=224586 n=100 p50=4.7ms p95=6.4ms max=1797.2ms attempts_total=188 attempts_max=41
+
+== 6. same 8 readers while one indexer holds the DB (started 1 s earlier, ~real index of bigsrc) ==
+worker pid=224682 n=20 p50=38.3ms p95=42.6ms max=8147.8ms attempts_total=180 attempts_max=161
+worker pid=224680 n=20 p50=43.4ms p95=2161.3ms max=8016.0ms attempts_total=275 attempts_max=167
+worker pid=224683 n=20 p50=43.8ms p95=2533.2ms max=8938.1ms attempts_total=288 attempts_max=192
+worker pid=224679 n=20 p50=42.6ms p95=1933.6ms max=7837.9ms attempts_total=281 attempts_max=154
+worker pid=224684 n=20 p50=41.8ms p95=2204.6ms max=10545.1ms attempts_total=293 attempts_max=215
+worker pid=224686 n=20 p50=44.1ms p95=1077.3ms max=11067.6ms attempts_total=309 attempts_max=230
+worker pid=224685 n=20 p50=40.8ms p95=3331.3ms max=9037.7ms attempts_total=308 attempts_max=184
+worker pid=224681 n=20 p50=40.6ms p95=3735.7ms max=9534.7ms attempts_total=298 attempts_max=182
+(indexer + readers finished; total wall 15115.0 ms)
