@@ -4,7 +4,7 @@ use super::*;
 
 /// Build an extraction from `(name, kind, start, end)` symbols and
 /// `(text, start, end)` tokens (one line, so columns follow bytes).
-fn span_ext(
+pub(crate) fn span_ext(
     syms: &[(&str, SymbolKind, u32, u32)],
     toks: &[(&str, u32, u32)],
 ) -> graph_core::Extraction {
@@ -39,7 +39,7 @@ fn span_ext(
     }
 }
 
-fn both_backends() -> (tempfile::TempDir, Box<dyn Store>, Box<dyn Store>) {
+pub(crate) fn both_backends() -> (tempfile::TempDir, Box<dyn Store>, Box<dyn Store>) {
     let d = tempfile::tempdir().unwrap();
     let a = open_store(Backend::Redb, &d.path().join("a.redb"), vec![]).unwrap();
     let b = open_store(Backend::RedbV2, &d.path().join("b.redb"), vec![]).unwrap();
@@ -234,98 +234,4 @@ fn vacuum_removes_only_dead_dictionary_terms() {
     s.prune_files("o", "r", &keep, false).unwrap();
     assert_eq!(s.vacuum().unwrap().terms_removed, 2, "alpha and beta");
     assert_eq!(s.search(&Query::new("gamma")).unwrap().len(), 1);
-}
-
-mod random {
-    use super::*;
-    use proptest::prelude::*;
-
-    const VOCAB: [&str; 4] = ["new", "a", "b", "("];
-    const KINDS: [SymbolKind; 3] = [SymbolKind::Function, SymbolKind::Method, SymbolKind::Type];
-    const NAMES: [&str; 4] = ["new", "a", "ab", "x"];
-
-    type Sym = (usize, usize, usize, usize);
-    type FileSpec = (usize, usize, Vec<usize>, Vec<Sym>);
-
-    fn file_spec() -> impl Strategy<Value = FileSpec> {
-        (
-            0usize..2, // repo
-            0usize..2, // org
-            prop::collection::vec(0usize..VOCAB.len(), 0..10),
-            prop::collection::vec(
-                (0usize..NAMES.len(), 0usize..3, 0usize..11, 0usize..11),
-                0..4,
-            ),
-        )
-    }
-
-    fn extraction(toks: &[usize], syms: &[Sym]) -> graph_core::Extraction {
-        let t: Vec<(&str, u32, u32)> = toks
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (VOCAB[v], i as u32 * 4, i as u32 * 4 + 2))
-            .collect();
-        let s: Vec<(&str, SymbolKind, u32, u32)> = syms
-            .iter()
-            .map(|&(n, k, a, b)| {
-                (
-                    NAMES[n],
-                    KINDS[k],
-                    a.min(b) as u32 * 4,
-                    a.max(b) as u32 * 4 + 3,
-                )
-            })
-            .collect();
-        span_ext(&s, &t)
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(40))]
-        #[test]
-        fn v1_and_v2_agree_on_random_corpora(files in prop::collection::vec(file_spec(), 1..5)) {
-            let (_d, a, b) = both_backends();
-            let mut ingested = 0;
-            for (i, (repo, org, toks, syms)) in files.iter().enumerate() {
-                let ex = extraction(toks, syms);
-                let (o, r, p) = (format!("o{org}"), format!("r{repo}"), format!("f{i}.rs"));
-                // Partially overlapping symbols are rejected by both.
-                if a.ingest_file(&o, &r, &p, "rust", &ex).is_ok() {
-                    b.ingest_file(&o, &r, &p, "rust", &ex).unwrap();
-                    ingested += 1;
-                } else {
-                    prop_assert!(b.ingest_file(&o, &r, &p, "rust", &ex).is_err());
-                }
-            }
-            prop_assume!(ingested > 0);
-            for text in VOCAB {
-                for grain in [Grain::Token, Grain::Symbol, Grain::File, Grain::Repo, Grain::Org] {
-                    for limit in [None, Some(0), Some(1), Some(2), Some(5)] {
-                        for (org, repo) in [(None, None), (Some("o0"), None), (Some("o1"), Some("r0"))] {
-                            for kind in [None, Some("method")] {
-                                let mut q = Query::new(text);
-                                q.grain = grain;
-                                q.limit = limit;
-                                q.org = org.map(Into::into);
-                                q.repo = repo.map(Into::into);
-                                q.symbol_kind = kind.map(Into::into);
-                                prop_assert_eq!(a.search(&q).unwrap(), b.search(&q).unwrap(), "{:?}", q);
-                            }
-                        }
-                    }
-                }
-            }
-            for pat in ["*", "new", "a*", "ab", "x*", "a\\*", "nope"] {
-                for limit in [None, Some(1), Some(3)] {
-                    for (repo, kind) in [(None, None), (Some("r1"), None), (None, Some("type"))] {
-                        let mut q = SymbolQuery::new(pat);
-                        q.limit = limit;
-                        q.repo = repo.map(Into::into);
-                        q.kind = kind.map(Into::into);
-                        prop_assert_eq!(a.search_symbols(&q).unwrap(), b.search_symbols(&q).unwrap(), "{:?}", q);
-                    }
-                }
-            }
-            prop_assert_eq!(a.describe(None, None).unwrap(), b.describe(None, None).unwrap());
-        }
-    }
 }

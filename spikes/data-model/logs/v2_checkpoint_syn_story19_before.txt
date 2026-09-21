@@ -35,3 +35,5 @@ v2: files=106 tokens=478831 symbols=8409 ingest_s=0.47 db_MiB=16.6 B/token=36.3
 peak RSS of this process (both stores, queries): VmHWM:	  300384 kB
 v1: file 257.5 MiB, after redb compaction 257.5 MiB
 v2: file 16.6 MiB, after redb compaction 16.6 MiB
+
+(Table-size lines added afterwards: the before run predates the accounting code in v2bench. Measured separately on a detached worktree of origin/main with the same bench file: v2 stream table: 106 rows, 4996694 value bytes; v2 post table: 26261 rows, 210088 value bytes (u64).)

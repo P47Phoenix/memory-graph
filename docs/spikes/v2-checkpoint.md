@@ -98,15 +98,15 @@ The follow-up change (this section was added with it) builds the fix named below
 | `new` token, class = identifier (788) | 1.6 | 4.4 (2.60x) | 1.2 (0.71x) |
 | `new` file, class = identifier (57 files) | 1.4 | 3.9 (2.78x) | 0.6 (0.44x) |
 | `Result` token (1,130) | 3.2 | 5.3 (1.65x) | 1.7 (0.53x) |
-| `self` token (7,407) | 18.3 | 14.7 (0.76x) | 8.2 (0.47x) |
-| `(` token (41,563) | 86.7 | 39.2 (0.45x) | 42.6 (0.49x) |
+| `self` token (7,407) | 17.6 | 14.7 (0.76x) | 8.2 (0.47x) |
+| `(` token (41,563) | 87.9 | 39.2 (0.45x) | 40.2 (0.46x) |
 | `symbols *`, `symbols fmt`, roll-ups | | unchanged within noise | |
 
-The goal (selective token search within 2x of v1) is met with margin: the worst measured ratio over the query set is now 0.71x for selective terms and 0.49x for the densest term. Every query returned identical rows from both backends.
+The goal (selective token search within 2x of v1) is met with margin: the worst ratio among the token-grain searches is 0.71x (`new`, class filter) and the densest term, `(`, is 0.46x. Every query returned identical rows from both backends. v1 times differ slightly between the two runs (for example `self` 19.2 vs 17.6 ms); each ratio uses its own run's v1, the v1 column shows the after run. Both runs: 106 files, 478,831 tokens (the 855,726-token / 162-file figures in Result 2 are a different, earlier run).
 
 **Cost.** Logical bytes (values of the `stream` and `post` tables, before page slack): 4,996,694 + 210,088 = 5,206,782 before; 5,041,544 + 577,675 = 5,619,219 after, so +412,437 bytes, +0.86 B/token, +7.9%. The postings account for +367,587 of it (an ordinal is a varint of about 1 byte; the old value was a fixed 8-byte count per `(term, file)` row) and the checkpoints and header for +44,850 (about 0.09 B/token). The redb file size did not change at the granularity redb grows in (16.6 MiB before and after, 36.3 B/token), so the real page-level effect is under one growth step; expect roughly 37 B/token, still under the 40 limit, but this was **not measured** at page level and **not re-run at 9.9 M tokens**. Ingest time is unchanged (0.47 s). Denser postings (block or bitmap ordinals) would recover part of the postings growth if it matters.
 
-**Limits.** The checkpoint spacing (64) was not tuned; only that value was measured. Ordinal reads trust the checkpoints (a full decode verifies them and reports a mismatch as corruption). A term that occurs in most tokens of a file degrades to the previous sequential walk, as `(` shows (0.45x before, 0.49x after, within noise).
+**Limits.** The checkpoint spacing (64) was not tuned; only that value was measured. Ordinal reads trust the checkpoints (a full decode verifies them and reports a mismatch as corruption). A term that occurs in most tokens of a file degrades to the previous sequential walk, as `(` shows (0.45x before, 0.46x after, within noise).
 
 ## What this does not show
 

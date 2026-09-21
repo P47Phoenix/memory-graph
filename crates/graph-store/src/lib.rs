@@ -1745,4 +1745,6 @@ impl RedbStore {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod v2_random;
+#[cfg(test)]
 mod v2_tests;
