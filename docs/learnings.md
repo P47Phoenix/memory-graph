@@ -11,7 +11,7 @@ Short, durable. Each item links to the detail.
 
 ## Constraints and gates
 - [Pure Rust](glossary.md#c-dependency--pure-rust): `python3 scripts/check-no-c-deps.py` gates on native-linking `-sys` crates and C build scripts, not on crate names; pure-Rust `-sys` crates are allowed ([ADR 0002](adr/0002-parsing-and-crate-layout.md)). Stored data must represent any language.
-- [redb](glossary.md#redb) holds an exclusive file lock (only one process can open the file); verified in redb 2.6.3 (`flock(LOCK_EX|LOCK_NB)`, immediate `DatabaseAlreadyOpen`, no waiting); [snapshot isolation](glossary.md#snapshot--snapshot-isolation) is in-process only and a process holding the file blocks other processes' readers (ADR 0003, Q5, a blocking user decision).
+- [redb](glossary.md#redb) holds an exclusive file lock (only one process can open the file); verified in redb 2.6.3 (`flock(LOCK_EX|LOCK_NB)`, immediate `DatabaseAlreadyOpen`, no waiting); [snapshot isolation](glossary.md#snapshot--snapshot-isolation) is in-process only and a process holding the file blocks other processes' readers (ADR 0003, Q5; decided 2026-09-20: an owning daemon, `memory-graph serve`, with direct-open and jittered retry as the fallback).
 - [Fingerprints](glossary.md#content-hash--fingerprint) are `sha256:<hex>|lang|extractor+tokN|format`; changing extraction semantics must bump the version so unchanged-file skipping cannot serve stale data.
 
 ## Review pitfalls found

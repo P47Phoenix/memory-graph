@@ -2,7 +2,7 @@
 
 Plain-language meanings for the words used in the docs. Terms are in alphabetical order. Each entry ends with links to where the term is used.
 
-New here? Read the "In plain words" box at the top of ADR 0001 and ADR 0002 first (ADR 0003 gets one in a companion PR), and come back to this page when a word is unclear.
+New here? Read the "In plain words" box at the top of ADR 0001 and ADR 0002 first (ADR 0003 has one too), and come back to this page when a word is unclear.
 
 
 ## ADR
@@ -35,6 +35,9 @@ A **content hash** is a short code computed from a file's bytes. Change one lett
 
 ## Crate
 Rust's word for a package of code. Think of it as one box of a bigger toy set. Used in: [ADR 0002](adr/0002-parsing-and-crate-layout.md).
+
+## Daemon
+A program that keeps running in the background and does work for other programs. Here, `memory-graph serve` is the daemon: it is the only program that opens the database file, and it also acts as the MCP server. The command line asks it instead of opening the file itself. Decided (not built yet). Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
 
 ## Dictionary
 A table that gives each distinct piece of text one small number (its id). Like a school register: instead of writing "Alexandra Petrovna" everywhere, you write "17". Used in: [ADR 0003](adr/0003-data-model.md).
@@ -105,6 +108,9 @@ A test that makes many random inputs and checks that a rule always holds (for ex
 ## redb
 The pure-Rust database library we use. It stores data in one file, supports transactions, and lets only one process open the file at a time (an exclusive lock). Used in: [ADR 0001](adr/0001-storage.md), [learnings](learnings.md).
 
+## RemoteStore
+The piece of the command line that has the same shape as the local database code (the `Store` trait) but sends each request to the daemon over a socket. Because it has the same shape, the same tests can check both. Decided (not built yet). Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
+
 ## SHA-256
 The hashing method we use for content hashes: it turns any bytes into a 32-byte code. It comes from the pure-Rust `sha2` crate. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0003](adr/0003-data-model.md).
 
@@ -112,7 +118,10 @@ The hashing method we use for content hashes: it turns any bytes into a 32-byte 
 One slice of a database that is split up so it can grow bigger. Like several filing cabinets instead of one. In this project one shard is one redb file. Used in: [ADR 0003](adr/0003-data-model.md).
 
 ## Snapshot / snapshot isolation
-A **snapshot** is a frozen view of the data at one moment. **Snapshot isolation** means a reader keeps seeing that frozen view even while a writer changes the database. This holds within one process only: another process holding the file blocks other processes' readers (see ADR 0003 Q5). Used in: [ADR 0003](adr/0003-data-model.md), [learnings](learnings.md).
+A **snapshot** is a frozen view of the data at one moment. **Snapshot isolation** means a reader keeps seeing that frozen view even while a writer changes the database. This holds within one process only: another process holding the file blocks other processes' readers (see ADR 0003 Q5; the decided fix is the daemon). Used in: [ADR 0003](adr/0003-data-model.md), [learnings](learnings.md).
+
+## Socket (local socket)
+A private channel between two programs on the same computer, here a Unix socket file next to the database (for example `<db>.sock`). Like an internal phone line: nothing goes over the network. The messages carry a `protocol_version` so old and new programs can tell whether they understand each other. Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
 
 ## Span
 The exact place in a file where something sits: start and end byte offsets, plus line and column. Like "page 3, line 5, letters 2 to 9". Used in: [ADR 0002](adr/0002-parsing-and-crate-layout.md), [ADR 0003](adr/0003-data-model.md).
