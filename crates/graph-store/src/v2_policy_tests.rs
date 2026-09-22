@@ -650,3 +650,18 @@ fn compact_after_vacuum_on_a_pruned_store_shrinks_the_file() {
 fn sha_len(p: &std::path::Path) -> u64 {
     std::fs::metadata(p).unwrap().len()
 }
+
+/// `compact` reopens the store internally; `chunk_bytes` and `cache_bytes`
+/// must survive that reopen unchanged, not silently reset to defaults.
+#[test]
+fn compact_preserves_chunk_and_cache_bytes() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let mut s = V2Store::open_with_cache_bytes(&p, Some(123_456)).unwrap();
+    s.set_chunk_bytes(789);
+    compact_fixture(&s);
+
+    let (s, _) = s.compact().unwrap();
+    assert_eq!(s.chunk_bytes, 789);
+    assert_eq!(s.cache_bytes, Some(123_456));
+}

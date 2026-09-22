@@ -138,8 +138,8 @@ pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
 pub struct V2Store {
     pub(crate) db: Database,
     registry: Registry,
-    chunk_bytes: usize,
-    cache_bytes: Option<usize>,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) cache_bytes: Option<usize>,
     path: PathBuf,
 }
 
@@ -1322,10 +1322,19 @@ impl V2Store {
     /// redb's exclusive file lock). No daemon exists yet (ADR story 12a).
     ///
     /// Consumes `self` (rather than taking `&mut self`) so the old
-    /// `Database` handle is dropped by ordinary ownership before the rename:
-    /// on Windows, a `Database` still open on `path` would make the rename
-    /// fail. Returns a fresh `V2Store` reopened from the renamed file, with
-    /// this store's `chunk_bytes` and extractor registry carried over.
+    /// `Database` handle is dropped by ordinary ownership before the rename,
+    /// as defense in depth against a platform or redb version where a
+    /// `Database` still open on `path` would make the rename fail (not
+    /// reproduced as a failure on this repo's current dev/CI platforms, but
+    /// cheap to guarantee by construction rather than assume away). Returns
+    /// a fresh `V2Store` reopened from the renamed file, with this store's
+    /// `chunk_bytes` and extractor registry carried over.
+    ///
+    /// On `Err`, `self` is gone (consumed) but the original file at `path`
+    /// is untouched and safely reopenable with [`V2Store::open`]: every
+    /// failure path removes the temp file and returns before the old handle
+    /// is dropped or the rename is attempted, so nothing is ever renamed
+    /// over `path` unless the whole copy already committed.
     pub fn compact(self) -> Result<(Self, CompactStats)> {
         let io = |e: std::io::Error| StoreError::Storage(e.to_string());
         let V2Store {
@@ -1337,7 +1346,15 @@ impl V2Store {
         } = self;
 
         let before_bytes = std::fs::metadata(&path).map_err(io)?.len();
-        let tmp = path.with_extension(format!("compact-{}.redb.tmp", std::process::id()));
+        // PID alone collides if `compact` is ever called more than once
+        // concurrently in one process (not today's one-shot CLI, but a
+        // future embedder might); the nanosecond timestamp is cheap,
+        // dependency-free insurance against that.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp = path.with_extension(format!("compact-{}-{unique}.redb.tmp", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let build = || -> Result<()> {
