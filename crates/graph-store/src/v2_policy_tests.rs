@@ -665,3 +665,329 @@ fn compact_preserves_chunk_and_cache_bytes() {
     assert_eq!(s.chunk_bytes, 789);
     assert_eq!(s.cache_bytes, Some(123_456));
 }
+
+// --- ADR 0003 story 3, slice 3l: refs/content_files refcount bookkeeping --
+
+fn refs_snapshot(
+    s: &V2Store,
+) -> (
+    std::collections::BTreeMap<u64, u64>,
+    std::collections::BTreeSet<(u64, u64)>,
+) {
+    let rt = s.db.begin_read().unwrap();
+    let mut refs = std::collections::BTreeMap::new();
+    for row in rt.open_table(crate::v2::REFS).unwrap().iter().unwrap() {
+        let (k, v) = row.unwrap();
+        refs.insert(k.value(), v.value());
+    }
+    let mut content_files = std::collections::BTreeSet::new();
+    for row in rt
+        .open_multimap_table(crate::v2::CONTENT_FILES)
+        .unwrap()
+        .iter()
+        .unwrap()
+    {
+        let (k, vals) = row.unwrap();
+        for v in vals {
+            content_files.insert((k.value(), v.unwrap().value()));
+        }
+    }
+    (refs, content_files)
+}
+
+/// The core refcount invariant (ADR 0003 story 3, Q2 / slice 3l): after
+/// ingest, replace, prune and re-ingest of a small corpus, `refs` and
+/// `content_files` exactly match the live file set -- every live file has
+/// `refs[content_id(file)] == 1` and a matching `content_files` entry, and
+/// there is no entry left over for a deleted file. Content sharing is off
+/// today (`content_id` is the identity), so this is a 1:1:1 correspondence,
+/// not a real fan-out test; that is exactly the seam story 18 will exercise.
+#[test]
+fn refs_and_content_files_match_the_live_file_set_after_ingest_replace_prune_and_reingest() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+
+    // `prune_files` only prunes files ingested with `ORIGIN_DIRECTORY`
+    // (see its origin check), so this fixture uses that origin throughout.
+    s.ingest_file_with_origin(
+        "o",
+        "r",
+        "a.rs",
+        "rust",
+        &span_ext(&[], &[("alpha", 0, 5)]),
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    s.ingest_file_with_origin(
+        "o",
+        "r",
+        "b.rs",
+        "rust",
+        &span_ext(&[], &[("beta", 0, 4)]),
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    s.ingest_file_with_origin(
+        "o",
+        "r",
+        "c.rs",
+        "rust",
+        &span_ext(&[], &[("gamma", 0, 5)]),
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    // Replace: same path, different content -- old content's rows must go.
+    s.ingest_file_with_origin(
+        "o",
+        "r",
+        "b.rs",
+        "rust",
+        &span_ext(&[], &[("delta", 0, 5)]),
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    // Prune: drop c.rs entirely.
+    let keep: std::collections::HashSet<String> = ["a.rs".to_string(), "b.rs".to_string()]
+        .into_iter()
+        .collect();
+    s.prune_files("o", "r", &keep, false).unwrap();
+    // Re-ingest a fresh file.
+    s.ingest_file(
+        "o",
+        "r",
+        "d.rs",
+        "rust",
+        &span_ext(&[], &[("epsilon", 0, 7)]),
+    )
+    .unwrap();
+
+    // No orphaned entries and no missing ones: refs/content_files as seen
+    // through the store equal exactly what `check_consistency` (extended for
+    // this slice) already recomputes from the streams -- assert both here,
+    // directly, so this test carries its own signal independent of that helper.
+    let (refs, content_files) = refs_snapshot(&s);
+    assert_eq!(refs.len(), 3, "one live content id per live file: {refs:?}");
+    assert_eq!(
+        content_files.len(),
+        3,
+        "one content_files entry per live file: {content_files:?}"
+    );
+    for &v in refs.values() {
+        assert_eq!(v, 1, "refcount is always 1 while content sharing is off");
+    }
+    // Every content_files value is a file that is still searchable.
+    for &(cid, file) in &content_files {
+        assert_eq!(cid, file, "content_id is the identity while sharing is off");
+    }
+    assert_eq!(
+        s.search(&Query::new("delta")).unwrap().len(),
+        1,
+        "b.rs's replacement content must be live"
+    );
+    assert!(
+        s.search(&Query::new("beta")).unwrap().is_empty(),
+        "b.rs's replaced content must be gone"
+    );
+    assert!(
+        s.search(&Query::new("gamma")).unwrap().is_empty(),
+        "c.rs's content must be gone after prune"
+    );
+    assert_eq!(s.search(&Query::new("epsilon")).unwrap().len(), 1);
+
+    s.check_consistency(false);
+}
+
+/// A skip-unchanged (fingerprint-matched) file must not touch `refs` or
+/// `content_files` at all -- the skip check runs before any write, so the
+/// whole file is byte-identical, not just those two tables (same style as
+/// `a_no_op_vacuum_leaves_the_file_byte_identical`: hashed only while no
+/// handle is open, since redb holds a Windows file lock for the handle's life).
+#[test]
+fn skip_unchanged_file_leaves_refs_and_content_files_untouched() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    s.index_bytes("o", "r", "a.rs", b"fn f() { f(); }\n", None)
+        .unwrap();
+    drop(s);
+    let before = std::fs::read(&p).unwrap();
+
+    let s = V2Store::open(&p).unwrap();
+    let st = s
+        .index_bytes("o", "r", "a.rs", b"fn f() { f(); }\n", None)
+        .unwrap();
+    assert!(
+        st.unchanged,
+        "second ingest of identical bytes must be a skip"
+    );
+    drop(s);
+    let after = std::fs::read(&p).unwrap();
+    assert_eq!(before, after, "a skipped file must write nothing at all");
+}
+
+/// `compact` round-trips `refs` and `content_files` (ADR 0003 story 3, slice
+/// 3l): indexing a corpus, pruning some files so both tables have real
+/// content, compacting, and comparing table contents before/after --
+/// mirrors `compact_does_not_change_query_results`' method but is a
+/// dedicated check because `compact`'s table copy list is hand-maintained
+/// (the single highest-risk detail in this slice: forgetting to add these
+/// two tables there would silently drop refcounts on every compaction).
+#[test]
+fn compact_round_trips_refs_and_content_files() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    compact_fixture(&s);
+    // Prune one file so refs/content_files reflect real churn, not just a
+    // freshly-ingested 1:1:1 set.
+    let keep: std::collections::HashSet<String> = ["a.rs".to_string()].into_iter().collect();
+    s.prune_files("o", "r1", &keep, false).unwrap();
+
+    let before = refs_snapshot(&s);
+    assert!(
+        !before.0.is_empty(),
+        "fixture must leave live refs to round-trip"
+    );
+
+    let (s, _) = s.compact().unwrap();
+    let after = refs_snapshot(&s);
+    assert_eq!(
+        before, after,
+        "compact must copy refs/content_files verbatim"
+    );
+    s.check_consistency(false);
+}
+
+/// Pins the chunked-batch case: a chunked `index_batch` (several commits, not
+/// one) must leave the same refcount invariant as an unchunked run -- every
+/// live file has refcount exactly 1 with a matching `content_files` entry.
+#[test]
+fn chunked_batch_ingest_holds_the_refcount_invariant() {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = V2Store::open(d.path().join("v.redb")).unwrap();
+    s.set_chunk_bytes(1); // every file is its own commit chunk
+
+    let files: Vec<BatchFile<'_>> = (0..12)
+        .map(|i| BatchFile {
+            path: Box::leak(format!("f{i}.txt").into_boxed_str()),
+            bytes: Box::leak(format!("word{i} other{}", i % 3).into_boxed_str().into()),
+            language: Some("text"),
+            origin: None,
+        })
+        .collect();
+    V2Store::index_batch(&s, "o", "r", &files, IndexOptions { reindex: false }).unwrap();
+
+    let (refs, content_files) = refs_snapshot(&s);
+    assert_eq!(refs.len(), 12);
+    assert_eq!(content_files.len(), 12);
+    for &v in refs.values() {
+        assert_eq!(v, 1);
+    }
+    s.check_consistency(false);
+}
+
+/// <0.5% storage-growth gate for this slice's two new tables (following the
+/// ADR 0003 story 3 board's slice-3h precedent of a real, measured CI gate
+/// rather than a claimed number). Two identically-indexed stores over this
+/// repo's own `crates/` tree, compacted so both sizes reflect only live
+/// data: one keeps its real `refs`/`content_files` rows, the other has them
+/// cleared (but the tables still exist, so table-creation overhead is
+/// common to both and only the row data differs) before compacting --
+/// isolating exactly the bytes this slice's bookkeeping adds.
+#[test]
+fn refs_and_content_files_grow_store_size_by_under_half_a_percent_on_this_repos_corpus() {
+    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(p) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if !path.ends_with("target") && !path.ends_with(".git") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new("../../crates"), &mut files);
+    assert!(
+        files.len() > 10,
+        "expected this repo's own .rs corpus, found {}",
+        files.len()
+    );
+    files.sort();
+
+    use graph_core::Extractor;
+    let extractor = graph_lang_rust::RustExtractor;
+
+    fn build_store(path: &std::path::Path, files: &[std::path::PathBuf]) -> V2Store {
+        let s = V2Store::open(path).unwrap();
+        let extractor = graph_lang_rust::RustExtractor;
+        for path in files {
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let rel = path.to_string_lossy().replace('\\', "/");
+            let ex = extractor.extract(&src);
+            let _ = s.ingest_file("o", "r", &rel, "rust", &ex);
+        }
+        s
+    }
+    let _ = &extractor; // silence unused-in-outer-scope lint; used inside build_store
+
+    let d = tempfile::tempdir().unwrap();
+    let new_path = d.path().join("new.redb");
+    let s = build_store(&new_path, &files);
+    let (s, _) = s.compact().unwrap();
+    drop(s);
+    let new_bytes = std::fs::metadata(&new_path).unwrap().len();
+
+    let old_path = d.path().join("old.redb");
+    let s = build_store(&old_path, &files);
+    {
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut refs = wt.open_table(crate::v2::REFS).unwrap();
+            let keys: Vec<u64> = refs.iter().unwrap().map(|r| r.unwrap().0.value()).collect();
+            for k in keys {
+                refs.remove(k).unwrap();
+            }
+        }
+        {
+            let mut cf = wt.open_multimap_table(crate::v2::CONTENT_FILES).unwrap();
+            let pairs: Vec<(u64, u64)> = cf
+                .iter()
+                .unwrap()
+                .flat_map(|r| {
+                    let (k, vals) = r.unwrap();
+                    let k = k.value();
+                    vals.map(move |v| (k, v.unwrap().value()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for (k, v) in pairs {
+                cf.remove(k, v).unwrap();
+            }
+        }
+        wt.commit().unwrap();
+    }
+    let (s, _) = s.compact().unwrap();
+    drop(s);
+    let old_bytes = std::fs::metadata(&old_path).unwrap().len();
+
+    let delta_pct = (new_bytes as f64 - old_bytes as f64) / old_bytes as f64 * 100.0;
+    println!(
+        "refs/content_files growth over {} files: without {old_bytes} B, with {new_bytes} B, \
+         delta {delta_pct:.4}%",
+        files.len()
+    );
+    assert!(
+        delta_pct < 0.5,
+        "refs/content_files grew store size {delta_pct:.4}% (without {old_bytes} B -> with \
+         {new_bytes} B over {} files); must stay under 0.5% (slice 3l gate)",
+        files.len()
+    );
+}
