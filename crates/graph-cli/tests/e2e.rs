@@ -314,6 +314,75 @@ fn index_directory() {
     assert!(!ok && err.contains("not a directory"));
 }
 
+/// `--v2-chunk-bytes` forces `index_batch` to commit many small chunks
+/// (one file per chunk here); the indexed result must be the same as an
+/// unchunked run, and the flag must be accepted (and ignored) on v1.
+#[test]
+fn v2_chunk_bytes_flag() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..5 {
+        std::fs::write(root.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+    }
+    let r = root.to_str().unwrap();
+
+    let db_chunked = d.path().join("chunked").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db_chunked,
+        "--backend",
+        "v2",
+        "--v2-chunk-bytes",
+        "1",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+
+    let db_unchunked = d.path().join("unchunked").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db_unchunked,
+        "--backend",
+        "v2",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+
+    for db in [&db_chunked, &db_unchunked] {
+        let (ok, out, _) = run(&["--db", db, "--backend", "v2", "search", "f3", "--json"]);
+        assert!(ok);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 1, "db={db}");
+    }
+
+    // Ignored (not an error) on v1.
+    let db_v1 = d.path().join("v1").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db_v1,
+        "--v2-chunk-bytes",
+        "1",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+}
+
 #[cfg(unix)]
 mod dir_edge_cases {
     use super::run;
