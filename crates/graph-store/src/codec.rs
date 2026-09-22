@@ -120,7 +120,7 @@ const ZERO: Span = Span {
 #[cfg(test)]
 thread_local! {
     /// Token records decoded on this thread (test instrumentation).
-    static RECORDS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static RECORDS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Decoder state before a token record.
@@ -312,6 +312,16 @@ pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
 }
 
 impl Lazy<'_> {
+    /// Number of symbol records, without decoding them.
+    pub fn nsym(&self) -> usize {
+        self.nsym
+    }
+
+    /// Number of token records, without decoding them.
+    pub fn ntok(&self) -> usize {
+        self.ntok
+    }
+
     /// The symbol section, decoded.
     pub fn symbols(&self) -> Result<Vec<SymRec>, StoreError> {
         let mut r = Reader {

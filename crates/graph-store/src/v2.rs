@@ -18,7 +18,7 @@
 //!
 //! The on-disk file is stamped `schema_version` 3, so v1 builds refuse it and
 //! this backend refuses a v1 file, in both cases before writing anything.
-use crate::codec::{self, Stream, SymRec, TokRec, STREAM_FORMAT};
+use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
 use crate::{dec, enc, RedbStore, Store, StoreRead};
 use crate::{
     kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile, Grain, Hit,
@@ -251,6 +251,19 @@ impl R {
         }
     }
 
+    /// Runs `f` against the header of one file's stream, with symbols and
+    /// tokens decoded on demand (see [`Lazy`]) instead of eagerly, for
+    /// callers that need only a small piece of a possibly large file.
+    /// `Ok(None)` when the file has no stream row. The [`Lazy`] borrows the
+    /// raw bytes for the life of this call only (redb's `AccessGuard` does
+    /// not outlive it), so it cannot be returned on its own.
+    fn with_lazy<T>(&self, file: u64, f: impl FnOnce(&Lazy) -> Result<T>) -> Result<Option<T>> {
+        match self.streams.get(file)? {
+            Some(v) => Ok(Some(f(&codec::decode_lazy(v.value())?)?)),
+            None => Ok(None),
+        }
+    }
+
     /// The term id of `text`, if it is in the dictionary.
     fn lookup(&self, text: &str) -> Result<Option<u64>> {
         if !is_hashed(text) {
@@ -335,21 +348,30 @@ impl R {
         }
     }
 
+    /// A single node by id. For a symbol or token this decodes only what is
+    /// needed to answer for `id` (the symbol section, or one token record
+    /// reached through the nearest checkpoint), not the whole stream.
     fn get(&self, id: NodeId) -> Result<Option<Node>> {
         let (tag, file, i) = split_id(id);
         if tag == 0 {
             return self.node(id);
         }
-        let Some(s) = self.stream(file)? else {
-            return Ok(None);
-        };
-        if tag == TAG_SYM && i < s.symbols.len() {
-            Ok(Some(self.sym_node(file, i, &s.symbols)?))
-        } else if tag == TAG_TOK && i < s.tokens.len() {
-            Ok(Some(self.tok_node(file, i, &s.tokens[i])?))
-        } else {
-            Ok(None)
-        }
+        let found = self.with_lazy(file, |lz| {
+            if tag == TAG_SYM && i < lz.nsym() {
+                let syms = lz.symbols()?;
+                Ok(Some(self.sym_node(file, i, &syms)?))
+            } else if tag == TAG_TOK && i < lz.ntok() {
+                let mut rec: Option<TokRec> = None;
+                lz.tokens_at(&[i], |_, t| rec = Some(t.clone()))?;
+                match rec {
+                    Some(t) => Ok(Some(self.tok_node(file, i, &t)?)),
+                    None => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        })?;
+        Ok(found.flatten())
     }
 
     fn parent(&self, id: NodeId) -> Result<Option<Node>> {
@@ -454,27 +476,37 @@ impl R {
         Ok(())
     }
 
-    /// Parent, grandparent, ... up to the org (nearest first). Decodes the
-    /// stream once.
+    /// Parent, grandparent, ... up to the org (nearest first). For a symbol
+    /// or token this decodes only the symbol section (plus, for a token, one
+    /// token record through the nearest checkpoint), never the token section
+    /// in full.
     fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
         let (tag, file, i) = split_id(id);
         let mut out = Vec::new();
         let mut up = if tag == 0 {
             self.node(id)?.and_then(|n| n.parent)
         } else {
-            let Some(s) = self.stream(file)? else {
-                return Ok(out);
-            };
-            let mut cur = match tag {
-                TAG_SYM if i < s.symbols.len() => s.symbols[i].parent,
-                TAG_TOK if i < s.tokens.len() => s.tokens[i].parent,
-                _ => return Ok(out),
-            };
-            while let Some(p) = cur {
-                out.push(self.sym_node(file, p as usize, &s.symbols)?);
-                cur = s.symbols[p as usize].parent;
+            let done = self.with_lazy(file, |lz| {
+                let syms = lz.symbols()?;
+                let mut cur = match tag {
+                    TAG_SYM if i < syms.len() => syms[i].parent,
+                    TAG_TOK if i < lz.ntok() => {
+                        let mut parent = None;
+                        lz.tokens_at(&[i], |_, t| parent = t.parent)?;
+                        parent
+                    }
+                    _ => return Ok(None),
+                };
+                while let Some(p) = cur {
+                    out.push(self.sym_node(file, p as usize, &syms)?);
+                    cur = syms[p as usize].parent;
+                }
+                Ok(Some(file))
+            })?;
+            match done.flatten() {
+                Some(f) => Some(f),
+                None => return Ok(out),
             }
-            Some(file)
         };
         while let Some(p) = up {
             let n = self.need(p)?;
