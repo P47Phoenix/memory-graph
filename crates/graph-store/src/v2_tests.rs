@@ -858,6 +858,32 @@ fn children_of_a_file_does_not_decode_the_whole_file() {
     );
 }
 
+/// File-level analog of `a_zero_width_symbol_beats_a_token_at_the_same_start`:
+/// locks in the symbol-vs-token tie-break rule ("symbols before tokens on a
+/// tie") for `children_ranged_file`'s merge loop specifically. QA review (PR
+/// #38) found this exact bug class was only caught incidentally by an
+/// unrelated fixture (`tests::v1_vs_v2_differential`'s `eq.rs`), which would
+/// silently stop covering it if that fixture is ever edited -- a dedicated,
+/// intention-revealing test closes that gap, matching slice 3i's precedent.
+#[test]
+fn a_zero_width_top_level_symbol_beats_a_top_level_token_at_the_same_start() {
+    let ex = span_ext(
+        &[("Z", SymbolKind::Type, 10, 10)],
+        &[("t0", 5, 6), ("t1", 10, 11)],
+    );
+    let d = tempfile::tempdir().unwrap();
+    let v = V2Store::open(d.path().join("tie.redb")).unwrap();
+    v.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+    let toks = v.file_tokens("o", "r", "x.rs").unwrap().unwrap();
+    let file = (toks[0].id >> 32) & 0x3fff_ffff;
+    // "Z" and "t1" both start at byte 10: the symbol must win the tie.
+    assert_eq!(names(v.children(file).unwrap()), ["t0", "Z", "t1"]);
+    assert_eq!(
+        v.children(file).unwrap(),
+        v.children_via_fallback_file(file).unwrap()
+    );
+}
+
 #[test]
 fn vacuum_keeps_a_symbol_only_lang_kind_term() {
     let d = tempfile::tempdir().unwrap();
