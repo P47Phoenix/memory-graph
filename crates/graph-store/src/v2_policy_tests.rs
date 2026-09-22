@@ -11,6 +11,10 @@ fn sha(p: &std::path::Path) -> Vec<u8> {
 
 #[test]
 fn a_no_op_vacuum_leaves_the_file_byte_identical() {
+    // The file is hashed only while no `V2Store` handle is open on it: on
+    // Windows, redb holds a lock on the file for the life of the handle,
+    // and a bare `fs::read` while that handle is live hits a sharing
+    // violation (the store itself has no such restriction otherwise).
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("v.redb");
     let s = V2Store::open(&p).unwrap();
@@ -22,17 +26,32 @@ fn a_no_op_vacuum_leaves_the_file_byte_identical() {
         &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
     )
     .unwrap();
+    drop(s);
     let before = sha(&p);
+
+    let s = V2Store::open(&p).unwrap();
     assert_eq!(s.vacuum().unwrap().terms_removed, 0);
+    drop(s);
     assert_eq!(sha(&p), before, "no-op vacuum must not write");
+
+    let s = V2Store::open(&p).unwrap();
     assert_eq!(s.vacuum().unwrap().terms_removed, 0);
+    drop(s);
     assert_eq!(sha(&p), before);
+
     // Sanity: a vacuum that does remove something does write.
+    let s = V2Store::open(&p).unwrap();
     s.ingest_file("o", "r", "x.rs", "rust", &span_ext(&[], &[("beta", 1, 2)]))
         .unwrap();
+    drop(s);
     let mid = sha(&p);
+
+    let s = V2Store::open(&p).unwrap();
     assert_eq!(s.vacuum().unwrap().terms_removed, 2, "S and alpha");
+    drop(s);
     assert_ne!(sha(&p), mid);
+
+    let s = V2Store::open(&p).unwrap();
     assert_eq!(s.search(&Query::new("beta")).unwrap().len(), 1);
 }
 
