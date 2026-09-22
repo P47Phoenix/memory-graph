@@ -903,3 +903,348 @@ fn vacuum_keeps_a_symbol_only_lang_kind_term() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].lang_kind.as_deref(), Some("struct_item"));
 }
+
+/// ADR 0003 story 3, slice 3k (closing benchmark for slices 3g-3j): measures
+/// `children`/`descendants`/`ancestors` latency for v1, "v2-before" (the
+/// eager full-stream-decode path every one of these operations used before
+/// slice 3g) and "v2-after" (today's default, range-based where dense), over
+/// this repo's own `crates/` tree with the real `RustExtractor` -- the same
+/// corpus every prior slice in this story measured on.
+///
+/// "v2-before" is measured via the `#[cfg(test)]` fallback hooks that already
+/// exist on `V2Store` for exactly this purpose (`children_via_fallback[_file]`,
+/// `descendants_via_fallback[_file]`, and `ancestors_via_fallback` added for
+/// this slice): each is the literal pre-optimization body, called directly on
+/// the *same* indexed store and the *same* ids as "v2-after", so this is an
+/// apples-to-apples before/after on identical data, not a separate build.
+/// That is simpler and just as representative as checking out the pre-3g
+/// commit into a second binary, and it is what the task scoping explicitly
+/// allowed as option (b).
+///
+/// Per-id timings are p50 over 15 repetitions (matching the existing spike
+/// doc's convention for a corpus this size, `docs/spikes/v2-checkpoint.md`),
+/// then summed per operation across the sampled ids to report one aggregate
+/// number per operation (the same aggregation slice 3j's own decode-cost
+/// measurement used).
+#[test]
+fn traversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus() {
+    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(p).unwrap().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if !path.ends_with("target") && !path.ends_with(".git") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new("../../crates"), &mut files);
+    assert!(
+        !files.is_empty(),
+        "expected to find this repo's own .rs files"
+    );
+    files.sort();
+
+    use graph_core::Extractor;
+    let extractor = graph_lang_rust::RustExtractor;
+
+    let d = tempfile::tempdir().unwrap();
+    let v1 = open_store(Backend::Redb, &d.path().join("v1.redb"), vec![]).unwrap();
+    let v2 = V2Store::open(d.path().join("v2.redb")).unwrap();
+
+    let mut n_files = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let ex = extractor.extract(&src);
+        if v1.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
+            continue;
+        }
+        if v2.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
+            continue;
+        }
+        n_files += 1;
+    }
+    assert!(n_files > 10, "expected a substantial corpus, got {n_files}");
+
+    // Pick a representative sample of real ids from one store: file ids
+    // (file-level calls), plus symbols with the largest subtree (worst case
+    // for the old eager decode), the smallest subtree (leaves), and the
+    // deepest nesting (longest ancestor chain). Applied identically to each
+    // backend's own store and ids (backends assign different ids over the
+    // same source, so the sample is chosen independently per backend, not
+    // id-for-id).
+    struct Sample {
+        files: Vec<NodeId>,
+        largest: Vec<NodeId>,
+        smallest: Vec<NodeId>,
+        deepest: Vec<NodeId>,
+    }
+    fn sample(s: &dyn Store, rel_paths: &[String]) -> Sample {
+        let mut files = Vec::new();
+        let mut by_size: Vec<(usize, NodeId)> = Vec::new();
+        let mut by_depth: Vec<(usize, NodeId)> = Vec::new();
+        for rel in rel_paths {
+            let Some(toks) = s.file_tokens("o", "r", rel).unwrap() else {
+                continue;
+            };
+            let Some(first) = toks.first() else { continue };
+            // The file id is the topmost ancestor of any token in it.
+            let anc = s.ancestors(first.id).unwrap();
+            let Some(file) = anc.last().map(|n| n.id).or(Some(first.id)) else {
+                continue;
+            };
+            files.push(file);
+            for sym in s
+                .descendants(file)
+                .unwrap()
+                .into_iter()
+                .filter(|n| n.kind == graph_core::NodeKind::Symbol)
+            {
+                let nsub = s.descendants(sym.id).unwrap().len();
+                let depth = s.ancestors(sym.id).unwrap().len();
+                by_size.push((nsub, sym.id));
+                by_depth.push((depth, sym.id));
+            }
+        }
+        by_size.sort_by_key(|a| std::cmp::Reverse(a.0));
+        by_depth.sort_by_key(|a| std::cmp::Reverse(a.0));
+        let largest = by_size.iter().take(5).map(|&(_, id)| id).collect();
+        let smallest = by_size.iter().rev().take(5).map(|&(_, id)| id).collect();
+        let deepest = by_depth.iter().take(5).map(|&(_, id)| id).collect();
+        // Cap the file sample: every file plus every symbol category would
+        // dominate the file-level aggregate otherwise.
+        files.truncate(10);
+        Sample {
+            files,
+            largest,
+            smallest,
+            deepest,
+        }
+    }
+    let rel_paths: Vec<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let s1 = sample(&*v1, &rel_paths);
+    let s2 = sample(&v2, &rel_paths);
+
+    const REPS: usize = 15;
+    fn p50_ms(reps: usize, mut f: impl FnMut()) -> f64 {
+        let mut v = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            f();
+            v.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    // v1 and v2-after: the ordinary `Store`/`StoreRead` trait methods, which
+    // is exactly what a caller gets today.
+    let sum_children_v1: f64 = s1
+        .files
+        .iter()
+        .chain(&s1.largest)
+        .chain(&s1.smallest)
+        .chain(&s1.deepest)
+        .map(|&id| {
+            p50_ms(REPS, || {
+                v1.children(id).unwrap();
+            })
+        })
+        .sum();
+    let sum_descendants_v1: f64 = s1
+        .files
+        .iter()
+        .chain(&s1.largest)
+        .chain(&s1.smallest)
+        .chain(&s1.deepest)
+        .map(|&id| {
+            p50_ms(REPS, || {
+                v1.descendants(id).unwrap();
+            })
+        })
+        .sum();
+    let sum_ancestors_v1: f64 = s1
+        .files
+        .iter()
+        .chain(&s1.largest)
+        .chain(&s1.smallest)
+        .chain(&s1.deepest)
+        .map(|&id| {
+            p50_ms(REPS, || {
+                v1.ancestors(id).unwrap();
+            })
+        })
+        .sum();
+
+    let sum_children_after: f64 = s2
+        .files
+        .iter()
+        .chain(&s2.largest)
+        .chain(&s2.smallest)
+        .chain(&s2.deepest)
+        .map(|&id| {
+            p50_ms(REPS, || {
+                v2.children(id).unwrap();
+            })
+        })
+        .sum();
+    let sum_descendants_after: f64 = s2
+        .files
+        .iter()
+        .chain(&s2.largest)
+        .chain(&s2.smallest)
+        .chain(&s2.deepest)
+        .map(|&id| {
+            p50_ms(REPS, || {
+                v2.descendants(id).unwrap();
+            })
+        })
+        .sum();
+    let sum_ancestors_after: f64 = s2
+        .files
+        .iter()
+        .chain(&s2.largest)
+        .chain(&s2.smallest)
+        .chain(&s2.deepest)
+        .map(|&id| {
+            p50_ms(REPS, || {
+                v2.ancestors(id).unwrap();
+            })
+        })
+        .sum();
+
+    // v2-before: the pre-3g/3i/3j eager fallback hooks, called directly on
+    // the same store and ids. `children_via_fallback`/`descendants_via_fallback`
+    // only answer for a symbol id (empty for a file/entity id), so file ids
+    // use the `_file` variants instead.
+    let sum_children_before: f64 = {
+        let files: f64 = s2
+            .files
+            .iter()
+            .map(|&id| {
+                p50_ms(REPS, || {
+                    v2.children_via_fallback_file(id).unwrap();
+                })
+            })
+            .sum();
+        let syms: f64 = s2
+            .largest
+            .iter()
+            .chain(&s2.smallest)
+            .chain(&s2.deepest)
+            .map(|&id| {
+                p50_ms(REPS, || {
+                    v2.children_via_fallback(id).unwrap();
+                })
+            })
+            .sum();
+        files + syms
+    };
+    let sum_descendants_before: f64 = {
+        let files: f64 = s2
+            .files
+            .iter()
+            .map(|&id| {
+                p50_ms(REPS, || {
+                    v2.descendants_via_fallback_file(id).unwrap();
+                })
+            })
+            .sum();
+        let syms: f64 = s2
+            .largest
+            .iter()
+            .chain(&s2.smallest)
+            .chain(&s2.deepest)
+            .map(|&id| {
+                p50_ms(REPS, || {
+                    v2.descendants_via_fallback(id).unwrap();
+                })
+            })
+            .sum();
+        files + syms
+    };
+    let sum_ancestors_before: f64 = s2
+        .files
+        .iter()
+        .chain(&s2.largest)
+        .chain(&s2.smallest)
+        .chain(&s2.deepest)
+        .map(|&id| {
+            p50_ms(REPS, || {
+                v2.ancestors_via_fallback(id).unwrap();
+            })
+        })
+        .sum();
+
+    println!(
+        "\ntraversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus \
+         ({n_files} files, {} v1 ids, {} v2 ids sampled: files + largest/smallest/deepest symbols)",
+        s1.files.len() + s1.largest.len() + s1.smallest.len() + s1.deepest.len(),
+        s2.files.len() + s2.largest.len() + s2.smallest.len() + s2.deepest.len(),
+    );
+    println!("| operation | v1 ms | v2-before ms | v2-after ms | v2-after/v1 |");
+    println!("|---|---|---|---|---|");
+    for (label, v1_ms, before_ms, after_ms) in [
+        (
+            "children",
+            sum_children_v1,
+            sum_children_before,
+            sum_children_after,
+        ),
+        (
+            "descendants",
+            sum_descendants_v1,
+            sum_descendants_before,
+            sum_descendants_after,
+        ),
+        (
+            "ancestors",
+            sum_ancestors_v1,
+            sum_ancestors_before,
+            sum_ancestors_after,
+        ),
+    ] {
+        println!(
+            "| {label} | {v1_ms:.3} | {before_ms:.3} | {after_ms:.3} | {:.2}x |",
+            after_ms / v1_ms
+        );
+    }
+
+    // Sanity bound for `children` and `ancestors`, not the go/no-go call:
+    // v2-after must not cost more than v2-before on the same ids for these
+    // two operations (the range-based path decodes a strict subset of what
+    // the eager path decodes whenever a range is usable, and falls back
+    // verbatim otherwise), so a regression that silently stopped using the
+    // range would still show up here even if the v1 comparison is noisy.
+    //
+    // `descendants` is deliberately NOT held to the same bound here: measured
+    // on this corpus, v2-after `descendants` on a file can cost MORE than
+    // v2-before (see the printed table and the ADR row for the named cause --
+    // `descendants_ranged_file` calls `descendants_ranged` once per top-level
+    // symbol, and each call independently rebuilds the whole file's
+    // symbol-to-children map via `with_lazy`, so the cost is quadratic in the
+    // file's top-level symbol count; the eager `file_walk` fallback builds
+    // that tree once for the whole file). That is a real, honestly-reported
+    // regression for some shapes of file, not a measurement bug -- asserting
+    // it away here would hide exactly the kind of finding this benchmark
+    // exists to surface.
+    assert!(
+        sum_children_after <= sum_children_before * 1.5,
+        "v2-after children ({sum_children_after:.3} ms) regressed past v2-before \
+         ({sum_children_before:.3} ms) by more than the 1.5x noise allowance"
+    );
+    assert!(
+        sum_ancestors_after <= sum_ancestors_before * 1.5,
+        "v2-after ancestors ({sum_ancestors_after:.3} ms) regressed past v2-before \
+         ({sum_ancestors_before:.3} ms) by more than the 1.5x noise allowance"
+    );
+}
