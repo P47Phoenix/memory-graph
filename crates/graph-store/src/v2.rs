@@ -371,6 +371,8 @@ impl R {
                 Ok(None)
             }
         })?;
+        // Outer None: no stream row for `file`. Inner None: `id` is out of
+        // the symbol/token range. Both mean "not found".
         Ok(found.flatten())
     }
 
@@ -503,6 +505,8 @@ impl R {
                 }
                 Ok(Some(file))
             })?;
+            // Outer None: no stream row for `file`. Inner None: `id` is out
+            // of the symbol/token range. Both mean "no more ancestors".
             match done.flatten() {
                 Some(f) => Some(f),
                 None => return Ok(out),
