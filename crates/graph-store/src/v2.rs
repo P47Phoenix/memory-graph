@@ -1167,7 +1167,21 @@ impl V2Store {
     /// Open or create a v2 database file. Refuses (without writing) a file
     /// that is not v2: a v1 file must be re-indexed or migrated (ADR story 12).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Database::create(path.as_ref()).map_err(|e| match e {
+        Self::open_with_cache_bytes(path, None)
+    }
+
+    /// `open`, with an explicit cache size in bytes (redb's default is 1
+    /// GiB, split 9:1 between its read and write caches). `None` keeps
+    /// redb's default.
+    pub fn open_with_cache_bytes(
+        path: impl AsRef<Path>,
+        cache_bytes: Option<usize>,
+    ) -> Result<Self> {
+        let mut builder = Database::builder();
+        if let Some(bytes) = cache_bytes {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder.create(path.as_ref()).map_err(|e| match e {
             DatabaseError::DatabaseAlreadyOpen => {
                 StoreError::Locked(path.as_ref().display().to_string())
             }

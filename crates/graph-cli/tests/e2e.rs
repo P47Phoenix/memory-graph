@@ -383,6 +383,83 @@ fn v2_chunk_bytes_flag() {
     assert!(ok, "{out}{err}");
 }
 
+/// `--v2-cache-bytes` sets redb's cache size; it must not change results
+/// (indexing, describe, search, vacuum), must work at any open (not just
+/// indexing), and must be accepted (and ignored) on v1.
+#[test]
+fn v2_cache_bytes_flag() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..3 {
+        std::fs::write(root.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+    }
+    let r = root.to_str().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+
+    // A small cache is still correct at index time.
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "--backend",
+        "v2",
+        "--v2-cache-bytes",
+        "65536",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+
+    // And at every later open, including a different cache size than the one used to index.
+    for cache_bytes in ["1048576", "65536"] {
+        let (ok, out, _) = run(&[
+            "--db",
+            &db,
+            "--backend",
+            "v2",
+            "--v2-cache-bytes",
+            cache_bytes,
+            "search",
+            "f1",
+            "--json",
+        ]);
+        assert!(ok, "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 1);
+
+        let (ok, out, err) = run(&[
+            "--db",
+            &db,
+            "--backend",
+            "v2",
+            "--v2-cache-bytes",
+            cache_bytes,
+            "vacuum",
+        ]);
+        assert!(ok, "{out}{err}");
+    }
+
+    // Ignored (not an error) on v1.
+    let db_v1 = d.path().join("v1").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db_v1,
+        "--v2-cache-bytes",
+        "65536",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+}
+
 #[cfg(unix)]
 mod dir_edge_cases {
     use super::run;
