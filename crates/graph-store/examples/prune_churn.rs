@@ -5,7 +5,7 @@
 //! `churn.rs` (which only replaces files, never removes most of the store).
 //!
 //! `cargo run --release -p graph-store --example prune_churn -- <dir> [rounds]`
-use graph_core::FallbackExtractor;
+use graph_core::{normalize_path, FallbackExtractor};
 use graph_store::{BatchFile, IndexOptions, Store, V2Store, ORIGIN_DIRECTORY};
 use std::collections::HashSet;
 use std::path::Path;
@@ -56,7 +56,13 @@ fn main() {
 
     for round in 1..=rounds {
         // Prune down to one file (the sharpest case: delete almost everything).
-        let keep_one: HashSet<String> = files.first().map(|(p, _)| p.clone()).into_iter().collect();
+        // `prune_files` compares against the normalized name stored at ingest
+        // (v2.rs), so `keep` must be normalized too, not the raw walked path.
+        let keep_one: HashSet<String> = files
+            .first()
+            .map(|(p, _)| normalize_path(p))
+            .into_iter()
+            .collect();
         let removed = s.prune_files("o", "r", &keep_one, false).unwrap();
         let before_vacuum = size();
         let v = s.vacuum().unwrap();

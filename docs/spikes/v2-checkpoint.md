@@ -124,13 +124,13 @@ What it shows:
 - **`vacuum` does not shrink the file.** It removes dead dictionary terms (here one term per round: the churn marker) but the file stays the same size, as documented. Returning space to the operating system needs a compaction (copy to a new file), which is not built; the ADR gate "soak keeps the file within 1.5x after vacuum" (story 7) is not met by this measurement (1.8x at the peak, then flat) and is not claimed.
 - **Not measured:** churn with symbol-bearing (extracted) files.
 
-**Prune-then-vacuum.** Harness: `crates/graph-store/examples/prune_churn.rs` (`cargo run --release -p graph-store --example prune_churn -- <dir> [rounds]`). Same 26-file corpus; each round prunes down to one file (removing 25 of 26, `Store::prune_files` with a one-file `keep` set and the `ORIGIN_DIRECTORY` origin `prune_files` requires), vacuums, restores the full set, vacuums again.
+**Prune-then-vacuum.** Harness: `crates/graph-store/examples/prune_churn.rs` (`cargo run --release -p graph-store --example prune_churn -- <dir> [rounds]`). Same corpus source as `churn.rs` above (this repo's `crates/`), re-walked at measurement time: 26 files now vs. 19 when `churn.rs` was first measured, since the tree has grown across the intervening PRs. Each round prunes down to one file (removing 25 of 26, `Store::prune_files` with a one-file `keep` set and the `ORIGIN_DIRECTORY` origin `prune_files` requires), vacuums, restores the full set, vacuums again.
 
 | Round | After prune, before vacuum | After vacuum (pruned) | Terms removed | After restore + vacuum |
 |---|---|---|---|---|
-| 1 to 4 (each) | 4.53 MiB | 4.53 MiB | 3,692 (of 3,993) | 4.53 MiB |
+| 1 to 4 (each) | 4.53 MiB | 4.53 MiB | ~3,690 (of ~3,990) | 4.53 MiB |
 
-What it shows: pruning 25 of 26 files removes 3,692 of 3,993 dictionary terms (92%), and `vacuum` correctly drops every one of them (`check_consistency`-style: no orphan rows, confirmed separately by the consistency proptest) — but the file stays at 4.53 MiB regardless, the same non-shrinking behavior `churn.rs` already showed for replace. Repeating the prune/restore cycle four times shows no growth and no shrink either way: steady state, not a leak, but confirms **compaction (not vacuum) is the only way to reclaim space after a prune**, even in the extreme case of removing almost the whole store.
+What it shows: pruning 25 of 26 files removes about 92% of the dictionary's terms (exact counts drift slightly run to run: the corpus is this repo's own `crates/` tree, so it includes the harness's own source), and `vacuum` correctly drops every one of them (`check_consistency`-style: no orphan rows, confirmed separately by the consistency proptest) — but the file stays at 4.53 MiB regardless, the same non-shrinking behavior `churn.rs` already showed for replace. Repeating the prune/restore cycle four times shows no growth and no shrink either way: steady state, not a leak, but confirms **compaction (not vacuum) is the only way to reclaim space after a prune**, even in the extreme case of removing almost the whole store.
 
 ## Addendum: term-length policy and chunked commits (ADR story 3)
 
