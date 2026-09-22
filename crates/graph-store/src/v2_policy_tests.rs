@@ -9,6 +9,34 @@ fn sha(p: &std::path::Path) -> Vec<u8> {
     Sha256::digest(std::fs::read(p).unwrap()).to_vec()
 }
 
+/// `open_with_cache_bytes` is `open` with an explicit redb cache size; a
+/// tiny cache must not change what is stored or read back, and `None`
+/// (redb's default) must behave exactly like `open`.
+#[test]
+fn open_with_cache_bytes_does_not_change_results() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open_with_cache_bytes(&p, Some(1)).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+    assert_eq!(s.search(&Query::new("alpha")).unwrap().len(), 1);
+    drop(s);
+
+    // Reopening with a different (or no) cache size sees the same data.
+    let s = V2Store::open_with_cache_bytes(&p, Some(1024 * 1024)).unwrap();
+    assert_eq!(s.search(&Query::new("alpha")).unwrap().len(), 1);
+    drop(s);
+
+    let s = V2Store::open_with_cache_bytes(&p, None).unwrap();
+    assert_eq!(s.search(&Query::new("alpha")).unwrap().len(), 1);
+}
+
 #[test]
 fn a_no_op_vacuum_leaves_the_file_byte_identical() {
     // The file is hashed only while no `V2Store` handle is open on it: on

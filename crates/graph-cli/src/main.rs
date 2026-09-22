@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use graph_cli::{index_dir, DirOpts};
-use graph_core::TokenClass;
+use graph_core::{Extractor, TokenClass};
 use graph_store::{
     detect_backend, open_store, Backend, Grain, IndexOptions, Query, Store, SymbolQuery,
 };
@@ -30,8 +30,21 @@ struct Cli {
     /// with `--backend v1` (or no `--backend`)
     #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
     v2_chunk_bytes: Option<u64>,
+    /// v2 only: cache size in bytes for the database (redb's default is 1 GiB, split 9:1 between its read
+    /// and write caches). Ignored with `--backend v1` (or no `--backend`)
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    v2_cache_bytes: Option<u64>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+impl Cli {
+    fn v2_overrides(&self) -> V2Overrides {
+        V2Overrides {
+            chunk_bytes: self.v2_chunk_bytes,
+            cache_bytes: self.v2_cache_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -184,40 +197,69 @@ fn resolve_backend(db: &std::path::Path, requested: Option<BackendArg>) -> Resul
     Ok(want)
 }
 
+/// v2-only overrides taken from CLI flags. Both default to redb/`V2Store`
+/// defaults (`None`) and are ignored on v1.
+#[derive(Clone, Copy, Default)]
+struct V2Overrides {
+    chunk_bytes: Option<u64>,
+    cache_bytes: Option<u64>,
+}
+
+/// Open a store of `backend` at `db` with `extractors` registered, applying
+/// `overrides` when `backend` is v2. Goes through `open_store` whenever no
+/// override applies, so it only diverges from `open_store`'s construction
+/// path (`V2Store::open` + register) when an override needs a `V2Store`
+/// method (`open_with_cache_bytes`, `set_chunk_bytes`) that isn't on the
+/// `Store` trait; mirror any future change to `open_store`'s v2 arm here too.
+fn open_with_overrides(
+    backend: Backend,
+    db: &std::path::Path,
+    extractors: Vec<Box<dyn Extractor>>,
+    overrides: V2Overrides,
+) -> Result<Box<dyn Store>> {
+    if backend == Backend::RedbV2
+        && (overrides.chunk_bytes.is_some() || overrides.cache_bytes.is_some())
+    {
+        let mut s = graph_store::V2Store::open_with_cache_bytes(
+            db,
+            overrides.cache_bytes.map(|b| b as usize),
+        )?;
+        if let Some(bytes) = overrides.chunk_bytes {
+            s.set_chunk_bytes(bytes as usize);
+        }
+        for e in extractors {
+            s.register(e);
+        }
+        return Ok(Box::new(s));
+    }
+    Ok(open_store(backend, db, extractors)?)
+}
+
 /// Open the store for a command that indexes, with every shipped extractor
 /// registered: the extractor version is part of a file's fingerprint, so
 /// indexing without one would downgrade already-indexed files to tokens only.
-/// `v2_chunk_bytes` overrides the default chunk cap of `index_batch` (v2
-/// only; ignored on v1).
 fn open_for_indexing(
     db: &std::path::Path,
     backend: Option<BackendArg>,
-    v2_chunk_bytes: Option<u64>,
+    overrides: V2Overrides,
 ) -> Result<Box<dyn Store>> {
-    let backend = resolve_backend(db, backend)?;
-    if backend == Backend::RedbV2 {
-        if let Some(bytes) = v2_chunk_bytes {
-            // Bypasses `open_store`'s `Backend::RedbV2` arm to reach
-            // `set_chunk_bytes` (not on the `Store` trait); mirror any future
-            // change there (extra setup, validation, config) here too.
-            let mut s = graph_store::V2Store::open(db)?;
-            s.set_chunk_bytes(bytes as usize);
-            s.register(Box::new(graph_lang_rust::RustExtractor));
-            return Ok(Box::new(s));
-        }
-    }
-    Ok(open_store(
-        backend,
+    open_with_overrides(
+        resolve_backend(db, backend)?,
         db,
         vec![Box::new(graph_lang_rust::RustExtractor)],
-    )?)
+        overrides,
+    )
 }
 
-fn open_existing(db: &std::path::Path, backend: Option<BackendArg>) -> Result<Box<dyn Store>> {
+fn open_existing(
+    db: &std::path::Path,
+    backend: Option<BackendArg>,
+    overrides: V2Overrides,
+) -> Result<Box<dyn Store>> {
     if !db.is_file() {
         bail!("database `{}` does not exist", db.display());
     }
-    open_store(resolve_backend(db, backend)?, db, vec![])
+    open_with_overrides(resolve_backend(db, backend)?, db, vec![], overrides)
         .with_context(|| format!("opening database `{}`", db.display()))
 }
 
@@ -303,6 +345,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let v2_overrides = cli.v2_overrides();
     match cli.cmd {
         Cmd::IndexFile {
             org,
@@ -322,7 +365,7 @@ fn run() -> Result<()> {
                     cli.db.display()
                 );
             }
-            let store = open_for_indexing(&cli.db, cli.backend, cli.v2_chunk_bytes)?;
+            let store = open_for_indexing(&cli.db, cli.backend, v2_overrides)?;
             let st = store.index_bytes_opts(
                 &org,
                 &repo,
@@ -365,7 +408,7 @@ fn run() -> Result<()> {
                 force,
                 reindex,
             },
-            |db| open_for_indexing(db, cli.backend, cli.v2_chunk_bytes),
+            |db| open_for_indexing(db, cli.backend, v2_overrides),
             &mut std::io::stdout().lock(),
         )?,
         Cmd::Vacuum => {
@@ -373,7 +416,7 @@ fn run() -> Result<()> {
                 bail!("database `{}` does not exist", cli.db.display());
             }
             let backend = resolve_backend(&cli.db, cli.backend)?;
-            let store = open_store(backend, &cli.db, vec![])
+            let store = open_with_overrides(backend, &cli.db, vec![], v2_overrides)
                 .with_context(|| format!("opening database `{}`", cli.db.display()))?;
             let st = store.vacuum()?;
             if backend == Backend::Redb {
@@ -387,7 +430,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Describe { org, repo, json } => {
-            let store = open_existing(&cli.db, cli.backend)?;
+            let store = open_existing(&cli.db, cli.backend, v2_overrides)?;
             let infos = store.describe(org.as_deref(), repo.as_deref())?;
             if json {
                 out!(
@@ -421,7 +464,7 @@ fn run() -> Result<()> {
             limit,
             json,
         } => {
-            let store = open_existing(&cli.db, cli.backend)?;
+            let store = open_existing(&cli.db, cli.backend, v2_overrides)?;
             validate_filters(
                 &*store,
                 org.as_deref(),
@@ -469,7 +512,7 @@ fn run() -> Result<()> {
             if symbol_kind.is_some() && grain != Grain::Symbol {
                 bail!("--symbol-kind requires --grain symbol");
             }
-            let store = open_existing(&cli.db, cli.backend)?;
+            let store = open_existing(&cli.db, cli.backend, v2_overrides)?;
             validate_filters(
                 &*store,
                 org.as_deref(),
