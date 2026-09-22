@@ -479,6 +479,39 @@ mod ranged_children {
         assert_eq!(names(v.children(outer).unwrap()), ["t0", "Inner", "t2"]);
     }
 
+    /// Locks in the symbol-vs-token tie-break rule ("symbols before tokens
+    /// on a tie") for `children_ranged`'s merge loop. The differential
+    /// proptest above cannot reach this case: its `corpus()` strategy
+    /// filters out zero-width symbol spans, and a *nonzero*-width symbol at
+    /// the same start as a token necessarily contains that token as a
+    /// descendant rather than sitting beside it as a sibling -- so a
+    /// zero-width symbol is the only way to construct a genuine sibling tie.
+    /// QA review (PR #37) confirmed this gap by mutation: swapping the
+    /// merge loop's `<=` for `<` was not caught by 2000 proptest cases but
+    /// is caught here.
+    #[test]
+    fn a_zero_width_symbol_beats_a_token_at_the_same_start() {
+        let ex = span_ext(
+            &[
+                ("Outer", SymbolKind::Type, 0, 20),
+                ("Inner", SymbolKind::Function, 10, 10),
+            ],
+            &[("t0", 5, 6), ("t1", 10, 11)],
+        );
+        let d = tempfile::tempdir().unwrap();
+        let v = V2Store::open(d.path().join("tie.redb")).unwrap();
+        v.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+        for id in symbol_ids(&v, "x.rs") {
+            assert_same(&v, id);
+        }
+        let outer = symbol_ids(&v, "x.rs")
+            .into_iter()
+            .find(|&id| v.get(id).unwrap().unwrap().name == "Outer")
+            .unwrap();
+        // "Inner" and "t1" both start at byte 10: the symbol must win the tie.
+        assert_eq!(names(v.children(outer).unwrap()), ["t0", "Inner", "t1"]);
+    }
+
     /// Decode-cost regression (mirrors `ancestors_does_not_decode_the_whole_stream`):
     /// `children` on a small symbol deep in a file with many tokens outside
     /// it decodes far fewer token records than the file's total, bounded by

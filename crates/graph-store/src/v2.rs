@@ -449,6 +449,15 @@ impl R {
         if let Some(out) = self.children_ranged(file, i)? {
             return Ok(out);
         }
+        self.children_fallback(file, i)
+    }
+
+    /// The pre-slice-3i path: decode the whole stream and walk the full
+    /// `stream_tree`. What `children` falls back to when a range is not
+    /// usable, and (via [`V2Store::children_via_fallback`]) what the slice-3i
+    /// differential test compares the range-based result against -- sharing
+    /// this function keeps the two from silently diverging.
+    fn children_fallback(&self, file: u64, i: usize) -> Result<Vec<Node>> {
         let Some(s) = self.stream(file)? else {
             return Ok(Vec::new());
         };
@@ -1369,9 +1378,10 @@ impl V2Store {
 
     /// Test hook (ADR 0003 story 3, slice 3i differential test): `children`
     /// through the pre-3i eager `stream()` + `stream_tree` path, unconditionally
-    /// -- the same code `R::children` falls back to when a range is not
-    /// usable, called directly here so the differential test can compare it
-    /// against the range-based result on the same (dense) data.
+    /// -- calls [`R::children_fallback`] directly (the same function
+    /// `R::children` falls back to when a range is not usable), so the
+    /// differential test can compare it against the range-based result on
+    /// the same (dense) data without risking drift from a duplicated body.
     #[cfg(test)]
     pub(crate) fn children_via_fallback(&self, id: NodeId) -> Result<Vec<Node>> {
         let rt = self.db.begin_read()?;
@@ -1380,17 +1390,7 @@ impl V2Store {
         if tag != TAG_SYM {
             return Ok(Vec::new());
         }
-        let Some(s) = r.stream(file)? else {
-            return Ok(Vec::new());
-        };
-        if i >= s.symbols.len() {
-            return Ok(Vec::new());
-        }
-        let tree = stream_tree(&s);
-        tree.kids[i]
-            .iter()
-            .map(|&it| r.item_node(file, &s, it))
-            .collect()
+        r.children_fallback(file, i)
     }
 
     /// Test hook, `descendants`' analog of [`V2Store::children_via_fallback`]:
