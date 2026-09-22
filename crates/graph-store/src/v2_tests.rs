@@ -163,6 +163,64 @@ fn traversal_by_symbol_id_and_out_of_range_boundaries() {
     assert!(snap.descendants(id(1, 2)).unwrap().is_empty());
 }
 
+/// A file with `n` tokens, all nested in one symbol spanning the whole file
+/// (one byte per token so `n` fits comfortably in a `u32` span).
+fn many_tokens_ext(n: usize) -> graph_core::Extraction {
+    let toks: Vec<(String, u32, u32)> = (0..n)
+        .map(|i| (format!("t{i}"), i as u32, i as u32 + 1))
+        .collect();
+    span_ext(
+        &[("S", SymbolKind::Function, 0, n as u32)],
+        &toks
+            .iter()
+            .map(|(t, s, e)| (t.as_str(), *s, *e))
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[test]
+fn ancestors_does_not_decode_the_whole_stream() {
+    let n = 20 * codec::CHECKPOINT_EVERY;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("b.redb")).unwrap();
+    s.ingest_file("o", "r", "x.rs", "rust", &many_tokens_ext(n))
+        .unwrap();
+    let last = s.file_tokens("o", "r", "x.rs").unwrap().unwrap()[n - 1].id;
+
+    codec::RECORDS_DECODED.with(|c| c.set(0));
+    let anc = s.ancestors(last).unwrap();
+    let decoded = codec::RECORDS_DECODED.with(|c| c.get());
+
+    assert_eq!(names(anc), ["S", "x.rs", "r", "o"]);
+    // A single `tokens_at` lookup decodes at most `CHECKPOINT_EVERY - 1`
+    // token records to reach its target from the nearest checkpoint,
+    // regardless of how many tokens the file has (here `n`).
+    assert!(
+        decoded <= codec::CHECKPOINT_EVERY,
+        "decoded {decoded} of {n} token records"
+    );
+}
+
+#[test]
+fn get_does_not_decode_the_whole_stream() {
+    let n = 20 * codec::CHECKPOINT_EVERY;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("b.redb")).unwrap();
+    s.ingest_file("o", "r", "x.rs", "rust", &many_tokens_ext(n))
+        .unwrap();
+    let last = s.file_tokens("o", "r", "x.rs").unwrap().unwrap()[n - 1].id;
+
+    codec::RECORDS_DECODED.with(|c| c.set(0));
+    let node = s.get(last).unwrap().unwrap();
+    let decoded = codec::RECORDS_DECODED.with(|c| c.get());
+
+    assert_eq!(node.name, format!("t{}", n - 1));
+    assert!(
+        decoded <= codec::CHECKPOINT_EVERY,
+        "decoded {decoded} of {n} token records"
+    );
+}
+
 #[test]
 fn vacuum_removes_only_dead_dictionary_terms() {
     let f = SymbolKind::Function;
