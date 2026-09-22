@@ -104,8 +104,9 @@ pub trait StoreRead {
     fn search(&self, q: &Query) -> Result<Vec<Hit>>;
 }
 
-/// A read-write store. Writers are serialized by the backend; every write is
-/// atomic per call (per file, or per batch).
+/// A read-write store. Writers are serialized by the backend. A single-file
+/// write is atomic. A batch is atomic per backend-defined transaction: v1 uses
+/// one transaction per batch; v2 commits per chunk (see `index_batch`).
 pub trait Store: StoreRead + Send + Sync {
     /// A consistent, read-only view: everything read through it sees one
     /// committed state, whatever writers do meanwhile. Released on drop.
@@ -138,8 +139,14 @@ pub trait Store: StoreRead + Send + Sync {
         origin: Option<&str>,
     ) -> Result<IngestStats>;
 
-    /// Index many files of one repo in one atomic write; per-file failures
-    /// are reported in their slot, storage errors abort the batch.
+    /// Index many files of one repo. Per-file failures are reported in their
+    /// slot. A storage error makes the whole call return `Err`, and then the
+    /// per-file results of any chunks that did commit are lost (only the
+    /// error is returned). v1 uses one transaction per batch, so an error
+    /// leaves nothing stored; v2 commits per chunk, so an error may leave
+    /// earlier chunks committed. Either way what is stored is complete and
+    /// consistent (whole files only), and re-running the batch skips stored
+    /// files by fingerprint and stores the rest.
     fn index_batch(
         &self,
         org: &str,

@@ -1747,6 +1747,8 @@ mod detect_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod v2_policy_tests;
+#[cfg(test)]
 mod v2_random;
 #[cfg(test)]
 mod v2_tests;

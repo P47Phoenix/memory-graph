@@ -44,13 +44,42 @@ type Result<T> = std::result::Result<T, StoreError>;
 pub const V2_SCHEMA_VERSION: u64 = 4;
 
 /// term text -> term id.
-const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
+pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
 /// term id -> term text.
 const DICT_REV: TableDefinition<u64, &str> = TableDefinition::new("dict_rev");
 /// file id -> encoded stream.
 const STREAMS: TableDefinition<u64, &[u8]> = TableDefinition::new("stream");
 /// (term id, file id) -> occurrence count and token ordinals (see `codec::encode_posting`).
 const POST: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("post");
+
+/// Term-length policy (ADR 0003 story 3). The dictionary keeps a term inline
+/// as its own key while it is at most this many bytes and does not start
+/// with NUL. Any other term (very long, or NUL-leading) is keyed by
+/// `"\0" + sha256 hex` (plus `.n` when two different texts ever share a
+/// digest), so the B-tree keys stay small and a term's text is stored once,
+/// in `dict_rev`, whole and exact. Inline keys never start with NUL and
+/// hashed keys always do, so the two key spaces cannot collide. Every lookup
+/// verifies the stored text, so a digest collision cannot merge two terms.
+/// Spans are unaffected (they are stored in the stream). Symbol names are
+/// not capped: `sym_idx` is range-scanned by prefix and needs the text.
+pub const MAX_INLINE_TERM: usize = 256;
+
+pub(crate) fn hashed_key(text: &str, n: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let mut k = String::with_capacity(70);
+    k.push('\0');
+    for b in Sha256::digest(text.as_bytes()) {
+        k.push_str(&format!("{b:02x}"));
+    }
+    if n > 0 {
+        k.push_str(&format!(".{n}"));
+    }
+    k
+}
+
+fn is_hashed(text: &str) -> bool {
+    text.len() > MAX_INLINE_TERM || text.starts_with('\0')
+}
 
 const TAG_SYM: u64 = 1;
 const TAG_TOK: u64 = 2;
@@ -93,10 +122,16 @@ pub struct VacuumStats {
     pub terms_kept: usize,
 }
 
+/// Default cap on the source bytes one `index_batch` write transaction
+/// takes in before it commits and starts the next (see [`V2Store::index_batch`]
+/// docs on the `Store` impl for the semantics).
+pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
+
 /// The v2 backend: one redb file.
 pub struct V2Store {
-    db: Database,
+    pub(crate) db: Database,
     registry: Registry,
+    chunk_bytes: usize,
 }
 
 pub struct V2Snapshot {
@@ -104,11 +139,11 @@ pub struct V2Snapshot {
 }
 
 /// Read side over one read transaction.
-struct R {
+pub(crate) struct R {
     nodes: redb::ReadOnlyTable<u64, &'static [u8]>,
     names: redb::ReadOnlyTable<&'static str, u64>,
     streams: redb::ReadOnlyTable<u64, &'static [u8]>,
-    dict: redb::ReadOnlyTable<&'static str, u64>,
+    pub(crate) dict: redb::ReadOnlyTable<&'static str, u64>,
     rev: redb::ReadOnlyTable<u64, &'static str>,
     post: redb::ReadOnlyTable<(u64, u64), &'static [u8]>,
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
@@ -165,7 +200,7 @@ fn stream_tree(s: &Stream) -> Tree {
 }
 
 impl R {
-    fn new(rt: &ReadTransaction) -> Result<Self> {
+    pub(crate) fn new(rt: &ReadTransaction) -> Result<Self> {
         Ok(Self {
             kids: rt.open_multimap_table(CHILDREN)?,
             texts: RefCell::default(),
@@ -205,6 +240,26 @@ impl R {
             Some(v) => Ok(Some(codec::decode(v.value())?)),
             None => Ok(None),
         }
+    }
+
+    /// The term id of `text`, if it is in the dictionary.
+    fn lookup(&self, text: &str) -> Result<Option<u64>> {
+        if !is_hashed(text) {
+            return Ok(self.dict.get(text)?.map(|v| v.value()));
+        }
+        for n in 0.. {
+            let Some(id) = self
+                .dict
+                .get(hashed_key(text, n).as_str())?
+                .map(|v| v.value())
+            else {
+                return Ok(None);
+            };
+            if self.rev.get(id)?.is_some_and(|t| t.value() == text) {
+                return Ok(Some(id));
+            }
+        }
+        unreachable!()
     }
 
     /// A dictionary text, cached for the life of this query.
@@ -696,7 +751,7 @@ impl R {
     }
 
     fn search(&self, q: &Query) -> Result<Vec<Hit>> {
-        let Some(term) = self.dict.get(q.text.as_str())?.map(|v| v.value()) else {
+        let Some(term) = self.lookup(q.text.as_str())? else {
             return Ok(Vec::new());
         };
         // Candidate files come from the postings; token, symbol and class
@@ -935,13 +990,38 @@ impl<'t> W<'t> {
             .to_string())
     }
 
+    /// The dictionary key holding `text` (the entry for `id` when given, else
+    /// any entry with that exact text) and its id, or the first free key it
+    /// would take and `None`.
+    fn dict_key(&self, text: &str, id: Option<u64>) -> Result<(String, Option<u64>)> {
+        if !is_hashed(text) {
+            let found = self.dict.get(text)?.map(|v| v.value());
+            return Ok((text.to_string(), found));
+        }
+        for n in 0.. {
+            let key = hashed_key(text, n);
+            let Some(found) = self.dict.get(key.as_str())?.map(|v| v.value()) else {
+                return Ok((key, None));
+            };
+            let same = match id {
+                Some(i) => i == found,
+                None => self.rev.get(found)?.is_some_and(|t| t.value() == text),
+            };
+            if same {
+                return Ok((key, Some(found)));
+            }
+        }
+        unreachable!()
+    }
+
     fn intern(&mut self, text: &str, next_term: &mut u64) -> Result<u64> {
-        if let Some(v) = self.dict.get(text)? {
-            return Ok(v.value());
+        let (key, found) = self.dict_key(text, None)?;
+        if let Some(v) = found {
+            return Ok(v);
         }
         let id = *next_term;
         *next_term += 1;
-        self.dict.insert(text, id)?;
+        self.dict.insert(key.as_str(), id)?;
         self.rev.insert(id, text)?;
         Ok(id)
     }
@@ -996,6 +1076,83 @@ impl<'t> W<'t> {
 }
 
 impl V2Store {
+    /// Test oracle: recompute every derived table from the streams (the source
+    /// of truth) and require the stored ones to match exactly: postings, the
+    /// symbol index, the dictionary in both directions, and the describe
+    /// catalog against a full scan. With `after_vacuum` the dictionary must
+    /// also hold no dead term.
+    #[cfg(test)]
+    pub(crate) fn check_consistency(&self, after_vacuum: bool) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let rt = self.db.begin_read().unwrap();
+        let r = R::new(&rt).unwrap();
+        let mut want_post: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+        let mut want_sym: BTreeSet<(String, u64)> = BTreeSet::new();
+        let mut used: HashSet<u64> = HashSet::new();
+        for row in r.streams.iter().unwrap() {
+            let (file, bytes) = row.unwrap();
+            let file = file.value();
+            let st = codec::decode(bytes.value()).unwrap();
+            let node = r.node(file).unwrap().expect("stream without a file row");
+            assert_eq!(node.kind, NodeKind::File);
+            for (i, t) in st.tokens.iter().enumerate() {
+                want_post.entry((t.term, file)).or_default().push(i);
+                used.insert(t.term);
+            }
+            for (i, sy) in st.symbols.iter().enumerate() {
+                want_sym.insert((
+                    r.text(sy.name).unwrap().to_string(),
+                    sub_id(TAG_SYM, file, i),
+                ));
+                used.insert(sy.name);
+                used.extend(sy.lang_kind);
+            }
+        }
+        let mut got_post = BTreeMap::new();
+        for row in r.post.iter().unwrap() {
+            let (k, v) = row.unwrap();
+            got_post.insert(k.value(), codec::posting_ordinals(v.value()).unwrap());
+        }
+        assert_eq!(got_post, want_post, "postings");
+        let mut got_sym = BTreeSet::new();
+        for row in r.sym_idx.iter().unwrap() {
+            let (k, vals) = row.unwrap();
+            for v in vals {
+                got_sym.insert((k.value().to_string(), v.unwrap().value()));
+            }
+        }
+        assert_eq!(got_sym, want_sym, "symbol index");
+        let (mut ndict, mut nrev) = (0, 0);
+        for row in r.dict.iter().unwrap() {
+            let (k, id) = row.unwrap();
+            ndict += 1;
+            let text = r.text(id.value()).unwrap();
+            assert_eq!(r.lookup(&text).unwrap(), Some(id.value()), "dict->rev");
+            assert_eq!(is_hashed(k.value()), k.value().starts_with('\0'));
+        }
+        for row in r.rev.iter().unwrap() {
+            let (id, text) = row.unwrap();
+            nrev += 1;
+            assert_eq!(
+                r.lookup(text.value()).unwrap(),
+                Some(id.value()),
+                "rev->dict"
+            );
+            if after_vacuum {
+                assert!(used.contains(&id.value()), "dead term {}", id.value());
+            }
+        }
+        assert_eq!(ndict, nrev, "dictionary directions");
+        for t in &used {
+            assert!(r.text(*t).is_ok(), "dangling term {t}");
+        }
+        assert_eq!(
+            StoreRead::describe(self, None, None).unwrap(),
+            r.describe_by_scan(None, None).unwrap(),
+            "catalog"
+        );
+    }
+
     /// Test hook: add a raw symbol-index entry (to simulate a stale index).
     #[cfg(test)]
     pub(crate) fn inject_symbol_index(&self, name: &str, id: u64) {
@@ -1058,7 +1215,16 @@ impl V2Store {
         Ok(Self {
             db,
             registry: Registry::default(),
+            chunk_bytes: DEFAULT_CHUNK_BYTES,
         })
+    }
+
+    /// Set the chunk cap of `index_batch`: the write transaction commits once
+    /// the source bytes it has ingested reach `bytes` (at least 1), and the
+    /// batch continues in a new one. The cap is soft: a file is never split,
+    /// so one file larger than the cap is a chunk of its own.
+    pub fn set_chunk_bytes(&mut self, bytes: usize) {
+        self.chunk_bytes = bytes.max(1);
     }
 
     /// Garbage-collect the dictionary (ADR story 3): remove every term that
@@ -1089,16 +1255,31 @@ impl V2Store {
                 }
             }
             let mut w = w;
+            // Note: removing a middle key of a `.n` probe chain would leave a
+            // hole that hides later keys from `lookup`. That needs a real
+            // SHA-256 collision, which is practically unreachable, so it is
+            // not handled (no re-keying or tombstone).
             for (id, text) in &dead {
-                w.dict.remove(text.as_str())?;
+                let (key, found) = w.dict_key(text, Some(*id))?;
+                if found.is_some() {
+                    w.dict.remove(key.as_str())?;
+                }
                 w.rev.remove(*id)?;
             }
-            VacuumStats {
+            let stats = VacuumStats {
                 terms_removed: dead.len(),
                 terms_kept: live.len(),
-            }
+            };
+            (stats, dead.is_empty())
         };
-        wt.commit()?;
+        let (stats, nothing) = stats;
+        if nothing {
+            // Nothing to remove: abandon the transaction so the file is
+            // byte-for-byte unchanged (a commit would rewrite its header).
+            wt.abort()?;
+        } else {
+            wt.commit()?;
+        }
         Ok(stats)
     }
 
@@ -1175,6 +1356,18 @@ impl V2Store {
         Ok(stats)
     }
 
+    /// Index many files of one repo in chunked write transactions.
+    ///
+    /// Atomicity: a batch is atomic **per chunk**, not as a whole. A chunk
+    /// commits when the source bytes it took in reach the chunk cap
+    /// ([`DEFAULT_CHUNK_BYTES`], see [`V2Store::set_chunk_bytes`]) and at the
+    /// end of the batch. A storage error aborts only the chunk in progress:
+    /// earlier chunks stay committed and visible, the current chunk leaves
+    /// nothing behind, and later files are not extracted. Per-file failures
+    /// (not UTF-8, too large, invalid spans) yield a per-file `Err` and never
+    /// abort a chunk. A batch smaller than the cap is one transaction, so it
+    /// is all-or-nothing, as before. Re-running the batch after a failure
+    /// skips the files already stored (unchanged fingerprint).
     fn index_batch(
         &self,
         org: &str,
@@ -1182,7 +1375,8 @@ impl V2Store {
         files: &[BatchFile<'_>],
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
-        let wt = self.db.begin_write()?;
+        let mut wt = self.db.begin_write()?;
+        let mut in_txn = 0usize;
         let mut out = Vec::with_capacity(files.len());
         for f in files {
             if f.bytes.len() > MAX_SOURCE_BYTES {
@@ -1221,6 +1415,13 @@ impl V2Store {
                 &ex,
                 (f.origin, Some(&fp)),
             )?));
+            // Chunked commit: bound the size of one write transaction.
+            in_txn += f.bytes.len();
+            if in_txn >= self.chunk_bytes {
+                wt.commit()?;
+                wt = self.db.begin_write()?;
+                in_txn = 0;
+            }
         }
         wt.commit()?;
         Ok(out)

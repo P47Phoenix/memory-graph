@@ -492,3 +492,33 @@ fn run() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    /// A file `detect_backend` cannot classify (garbage, or locked by another
+    /// handle) is not an error here: the requested backend is used and the
+    /// real open reports its own error. Propagating would change v1's messages.
+    #[test]
+    fn resolve_backend_swallows_a_detect_error() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("garbage.redb");
+        std::fs::write(&g, vec![0x5a; 4096]).unwrap();
+        assert!(graph_store::detect_backend(&g).is_err(), "premise");
+        assert_eq!(
+            resolve_backend(&g, Some(BackendArg::V2)).unwrap(),
+            Backend::RedbV2
+        );
+        assert_eq!(resolve_backend(&g, None).unwrap(), Backend::Redb);
+
+        let l = d.path().join("locked.redb");
+        let held = graph_store::open_store(Backend::Redb, &l, vec![]).unwrap();
+        assert!(graph_store::detect_backend(&l).is_err(), "premise");
+        assert_eq!(
+            resolve_backend(&l, Some(BackendArg::V2)).unwrap(),
+            Backend::RedbV2
+        );
+        drop(held);
+    }
+}

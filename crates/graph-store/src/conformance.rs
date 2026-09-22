@@ -52,6 +52,10 @@ pub const CASES: &[(&str, Case)] = &[
     ("snapshot_is_frozen", snapshot_is_frozen),
     ("locking", locking),
     ("batch_reindex_and_unchanged", batch_reindex_and_unchanged),
+    (
+        "failed_batch_leaves_consistent_state",
+        failed_batch_leaves_consistent_state,
+    ),
     ("snapshot_filtered_reads", snapshot_filtered_reads),
     ("symbol_language_filter", symbol_language_filter),
     ("describe_repo_filter", describe_repo_filter),
@@ -515,6 +519,60 @@ fn bf<'a>(path: &'a str, bytes: &'a [u8]) -> BatchFile<'a> {
         language: Some("text"),
         origin: Some(ORIGIN_DIRECTORY),
     }
+}
+
+/// Contract common to v1 (one transaction per batch) and v2 (per chunk): after
+/// a batch that fails with a storage error, whatever is stored is complete and
+/// consistent, and a re-run stores the rest and skips what is stored.
+fn failed_batch_leaves_consistent_state(h: &Harness) {
+    let s = open(h);
+    let bad = BatchFile {
+        path: "nul.txt",
+        bytes: b"foo bar",
+        language: Some("a\0b"), // NUL in the language: a whole-batch error
+        origin: Some(ORIGIN_DIRECTORY),
+    };
+    let names = ["a.txt", "b.txt", "c.txt"];
+    let bytes: [&[u8]; 3] = [b"foo bar", b"foo baz", b"foo qux"];
+    let mut files: Vec<BatchFile<'_>> = vec![bf(names[0], bytes[0]), bf(names[1], bytes[1])];
+    files.push(bad);
+    files.push(bf(names[2], bytes[2]));
+    assert!(s
+        .index_batch("o", "r", &files, IndexOptions::default())
+        .is_err());
+    // Stored files are whole and the catalog agrees with a full scan.
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
+    let mut stored = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        if let Some(toks) = s.file_tokens("o", "r", n).unwrap() {
+            assert_eq!(toks.len(), 2, "{n} is complete, never partial");
+            assert_eq!(toks[0].name, "foo");
+            let _ = i;
+            stored.push(*n);
+        }
+    }
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), stored.len());
+    assert!(!stored.contains(&"c.txt"), "later files are never reached");
+    // Re-run without the bad file: stored files are skipped, the rest stored.
+    let rerun: Vec<BatchFile<'_>> = names.iter().zip(bytes).map(|(n, b)| bf(n, b)).collect();
+    let out = s
+        .index_batch("o", "r", &rerun, IndexOptions::default())
+        .unwrap();
+    for (n, r) in names.iter().zip(&out) {
+        assert_eq!(
+            r.as_ref().unwrap().unchanged,
+            stored.contains(n),
+            "{n}: skipped iff already stored"
+        );
+    }
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 3);
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
 }
 
 fn batch_reindex_and_unchanged(h: &Harness) {
