@@ -197,6 +197,9 @@ fn open_for_indexing(
     let backend = resolve_backend(db, backend)?;
     if backend == Backend::RedbV2 {
         if let Some(bytes) = v2_chunk_bytes {
+            // Bypasses `open_store`'s `Backend::RedbV2` arm to reach
+            // `set_chunk_bytes` (not on the `Store` trait); mirror any future
+            // change there (extra setup, validation, config) here too.
             let mut s = graph_store::V2Store::open(db)?;
             s.set_chunk_bytes(bytes as usize);
             s.register(Box::new(graph_lang_rust::RustExtractor));
