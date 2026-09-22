@@ -41,7 +41,7 @@ use std::rc::Rc;
 type Result<T> = std::result::Result<T, StoreError>;
 
 /// Layout version of a v2 file (v1 is 1 and 2).
-pub const V2_SCHEMA_VERSION: u64 = 4;
+pub const V2_SCHEMA_VERSION: u64 = 5;
 
 /// term text -> term id.
 pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
@@ -1846,6 +1846,9 @@ impl V2Store {
                     lang_kind,
                     parent,
                     span: s.span,
+                    // `codec::encode` derives the real transitive range from
+                    // `stream.tokens`' parent chains; this value is ignored.
+                    toks: None,
                 });
                 w.sym_idx
                     .insert(s.name.as_str(), sub_id(TAG_SYM, file_id, idx))?;
