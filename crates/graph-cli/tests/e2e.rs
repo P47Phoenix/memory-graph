@@ -460,6 +460,52 @@ fn v2_cache_bytes_flag() {
     assert!(ok, "{out}{err}");
 }
 
+/// `vacuum --compact` (ADR 0003 story 3, slice 3f): works end to end on v2,
+/// does not change query results, and is a no-op (not an error) on v1.
+#[test]
+fn vacuum_compact_flag() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..5 {
+        std::fs::write(root.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+    }
+    let r = root.to_str().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "--backend",
+        "v2",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+
+    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "vacuum", "--compact"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("vacuum:"), "{out}");
+    assert!(out.contains("compact:"), "{out}");
+
+    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "search", "f3", "--json"]);
+    assert!(ok, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["results"].as_array().unwrap().len(), 1);
+
+    // No-op (not an error) on v1.
+    let db_v1 = d.path().join("v1").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&["--db", &db_v1, "index", "--org", "o", "--repo", "p", r]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = run(&["--db", &db_v1, "vacuum", "--compact"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("nothing to do"), "{out}");
+}
+
 #[cfg(unix)]
 mod dir_edge_cases {
     use super::run;
