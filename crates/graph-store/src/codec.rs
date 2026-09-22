@@ -802,6 +802,10 @@ mod tests {
 
     #[test]
     fn parent_bounds_are_strict() {
+        // Also the regression test for compute_ranges's bounded ascent: a
+        // self-/forward-referencing parent would otherwise loop forever
+        // while summing transitive ranges during encode(), before decode()
+        // ever gets a chance to reject it below.
         let base = sample();
         // Symbol whose parent is itself (must be an earlier symbol).
         let mut s = base.clone();
