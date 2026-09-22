@@ -1,3 +1,56 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A pure-Rust, embedded graph database for source code: org → repo → file → symbol → token, stored in a single [redb](https://github.com/cberner/redb) file. It is language-agnostic by design — the schema, storage and query layers know nothing about any specific language. Every language gets exact-span tokens from a generic fallback tokenizer; languages with an extractor (currently Rust, via `syn`) additionally get symbols (functions, types, methods, ...). See `README.md` for the CLI walkthrough and `docs/epic-code-memory-graph.md` / `docs/adr/` for the design rationale.
+
+## Commands
+
+```sh
+cargo build --release                                    # build the memory-graph CLI
+cargo fmt --all --check                                  # formatting (CI-enforced)
+cargo clippy --workspace --all-targets -- -D warnings     # lints (CI-enforced, zero warnings)
+cargo test --workspace                                    # all unit + integration tests
+cargo test -p graph-store <test_name>                     # a single test in one crate
+cargo test -p graph-cli --test corpus                      # public-repo corpus test (parses testdata/corpus, checks exact spans + cross-repo links)
+cargo test -p graph-cli --test e2e                          # CLI end-to-end tests
+python3 scripts/test_gate.py                               # CI's own extra gate
+python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any -sys crate or C build script (see below)
+python3 scripts/vendor-corpus.py                            # re-vendor testdata/corpus/ (pinned commits, license-checked)
+```
+
+CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test --workspace`, `test_gate.py`, `check-no-c-deps.py`) on every push/PR. A PR is not done until all of these pass on its head SHA.
+
+## Architecture
+
+### Crate layout (`Cargo.toml` workspace)
+
+- **graph-core**: language-agnostic types only — the schema (`Node`, `NodeKind`, spans), the `Extractor` trait, the generic fallback tokenizer (`tokenizer.rs`, with a `TokenizerOptions` dialect switch used by extractors), and `language.rs` (extension/shebang → language name detection). No storage, no CLI, no language-specific parsing.
+- **graph-lang-rust**: the one concrete `Extractor` implementation today, built on `syn` + `proc-macro2`. Produces symbols (functions, methods, types, ...) for Rust files; every other language falls back to graph-core's generic tokenizer with no symbols.
+- **graph-store**: the storage engine and query layer. This is the largest and most architecturally important crate:
+  - `api.rs` defines the object-safe `Store` / `StoreRead` traits. The CLI and library consumers depend on these traits, never on a concrete backend. `open_store(Backend, path, extractors) -> Box<dyn Store>` is the entry point; `Backend::Redb` (v1, the original format) and `Backend::RedbV2` (v2, in progress) are the two implementations.
+  - `lib.rs` is the v1 (`RedbStore`) backend: one redb table per node kind plus a catalog table (language/symbol-kind counts per repo, kept in step with every write so `describe` and filter validation are O(repos) not O(tokens)). Schema-versioned; old databases upgrade in place on first open.
+  - `v2.rs` / `codec.rs`: the v2 backend (ADR 0003) — an interned dictionary, one compact per-file token/symbol stream (with sparse checkpoints for fast random access), and count/ordinal postings, instead of v1's per-node redb rows. Roughly an order of magnitude smaller on disk and faster to ingest; some query shapes are still being brought to parity with v1 (see `docs/spikes/v2-checkpoint.md` and ADR 0003's story table for current numbers). Selected via `--backend v2` in the CLI; v1 stays the default and is unaffected by any v2 change.
+  - `conformance.rs`: a single black-box test suite (`run_all`) that both backends must pass, plus `run_differential` to assert two backends agree on the same inputs. **Any change to store behavior should have a conformance case**, not just a backend-specific unit test — that's what keeps v1 and v2 (and any future backend) provably equivalent.
+  - Detecting a database's backend/schema version from its file (without a full open) lives in `detect_backend` (`api.rs`) — used by the CLI to give a clear error on a `--backend` mismatch instead of silently misinterpreting the file.
+- **graph-cli**: the `memory-graph` binary. `lib.rs` holds the testable logic (`index_dir`, etc.); `main.rs` is argument parsing (clap) and wiring. Depends only on the `graph-store` traits, not on redb directly.
+
+### Core data model
+
+Nodes: `Org → Repo → File → Symbol → Token`, each with an exact byte/line/col span. A File's identity is a fingerprint (SHA-256 of source bytes + language + extractor version + store format version) — re-indexing an unchanged file is a no-op except for refreshing `origin`. Search supports a `--grain` roll-up (`token|symbol|file|repo|org`) with language/kind filters and `--json` output; `describe` reports which languages and symbol kinds are actually present per repo.
+
+### Key invariants to preserve
+
+- **Language-agnosticism**: no language-specific types or logic outside an `Extractor` implementation (currently only `graph-lang-rust`). The fallback tokenizer must keep working for any language with no extractor registered.
+- **Exact spans**: every token/symbol's text, byte range, line and column must match the source exactly — this is property-tested and is the basis of the corpus test.
+- **Pure Rust**: `scripts/check-no-c-deps.py` fails CI on any dependency with a `links` key or a C/C++ build script. A `-sys` crate is fine as long as it's pure Rust (it keys on build mechanism, not crate naming).
+- **v1 is frozen**: v2 development must never change v1's on-disk format, behavior, or CLI output. The differential harness in `conformance.rs` (`run_differential`) is what enforces this — it should keep passing as v2 evolves.
+- **Backend equivalence**: any query-visible behavior added to one backend needs either a conformance case proving both backends agree, or an explicit, documented reason they diverge (e.g. node ids are backend-specific and must never be treated as portable by callers).
+
+---
+
 # Standing PR process for this repo
 
 For every PR in this repo:
