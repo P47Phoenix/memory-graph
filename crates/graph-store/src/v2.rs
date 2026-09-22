@@ -35,7 +35,7 @@ use redb::{
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -122,6 +122,13 @@ pub struct VacuumStats {
     pub terms_kept: usize,
 }
 
+/// Result of [`V2Store::compact`]: the file size before and after the rebuild.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactStats {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+}
+
 /// Default cap on the source bytes one `index_batch` write transaction
 /// takes in before it commits and starts the next (see [`V2Store::index_batch`]
 /// docs on the `Store` impl for the semantics).
@@ -131,7 +138,9 @@ pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
 pub struct V2Store {
     pub(crate) db: Database,
     registry: Registry,
-    chunk_bytes: usize,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) cache_bytes: Option<usize>,
+    path: PathBuf,
 }
 
 pub struct V2Snapshot {
@@ -1230,6 +1239,8 @@ impl V2Store {
             db,
             registry: Registry::default(),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
+            cache_bytes,
+            path: path.as_ref().to_path_buf(),
         })
     }
 
@@ -1295,6 +1306,166 @@ impl V2Store {
             wt.commit()?;
         }
         Ok(stats)
+    }
+
+    /// Rebuild the store into a brand-new file by copying every row of every
+    /// table verbatim (no liveness decisions here: run [`V2Store::vacuum`]
+    /// first to drop dead dictionary terms), then atomically rename the new
+    /// file over the original path (ADR 0003, "Snapshot isolation (decision
+    /// D3)": rebuild into a new file, then atomic rename). Closes the gap
+    /// measured by the `churn`/`prune_churn` harnesses: redb never shrinks a
+    /// file on its own, even after `vacuum`; `compact` is the only way to
+    /// reclaim the freed pages.
+    ///
+    /// Single-process only: this claims no cross-process safety guarantee
+    /// beyond what today's CLI already has (one process at a time holds
+    /// redb's exclusive file lock). No daemon exists yet (ADR story 12a).
+    ///
+    /// Consumes `self` (rather than taking `&mut self`) so the old
+    /// `Database` handle is dropped by ordinary ownership before the rename,
+    /// as defense in depth against a platform or redb version where a
+    /// `Database` still open on `path` would make the rename fail (not
+    /// reproduced as a failure on this repo's current dev/CI platforms, but
+    /// cheap to guarantee by construction rather than assume away). Returns
+    /// a fresh `V2Store` reopened from the renamed file, with this store's
+    /// `chunk_bytes` and extractor registry carried over.
+    ///
+    /// On `Err`, `self` is gone (consumed) but the original file at `path`
+    /// is untouched and safely reopenable with [`V2Store::open`]: every
+    /// failure path removes the temp file and returns before the old handle
+    /// is dropped or the rename is attempted, so nothing is ever renamed
+    /// over `path` unless the whole copy already committed.
+    pub fn compact(self) -> Result<(Self, CompactStats)> {
+        let io = |e: std::io::Error| StoreError::Storage(e.to_string());
+        let V2Store {
+            db,
+            registry,
+            chunk_bytes,
+            cache_bytes,
+            path,
+        } = self;
+
+        let before_bytes = std::fs::metadata(&path).map_err(io)?.len();
+        // PID alone collides if `compact` is ever called more than once
+        // concurrently in one process (not today's one-shot CLI, but a
+        // future embedder might); the nanosecond timestamp is cheap,
+        // dependency-free insurance against that.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp = path.with_extension(format!("compact-{}-{unique}.redb.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+
+        let build = || -> Result<()> {
+            let new_db = Database::create(&tmp)?;
+            {
+                let rt = db.begin_read()?;
+                let wt = new_db.begin_write()?;
+                {
+                    let mut w = wt.open_table(META)?;
+                    for row in rt.open_table(META)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_table(CATALOG)?;
+                    for row in rt.open_table(CATALOG)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_table(NODES)?;
+                    for row in rt.open_table(NODES)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_table(NAMES)?;
+                    for row in rt.open_table(NAMES)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_multimap_table(CHILDREN)?;
+                    for row in rt.open_multimap_table(CHILDREN)?.iter()? {
+                        let (k, vals) = row?;
+                        for v in vals {
+                            w.insert(k.value(), v?.value())?;
+                        }
+                    }
+                }
+                {
+                    let mut w = wt.open_multimap_table(SYMBOLS)?;
+                    for row in rt.open_multimap_table(SYMBOLS)?.iter()? {
+                        let (k, vals) = row?;
+                        for v in vals {
+                            w.insert(k.value(), v?.value())?;
+                        }
+                    }
+                }
+                {
+                    let mut w = wt.open_table(DICT)?;
+                    for row in rt.open_table(DICT)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_table(DICT_REV)?;
+                    for row in rt.open_table(DICT_REV)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_table(STREAMS)?;
+                    for row in rt.open_table(STREAMS)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_table(POST)?;
+                    for row in rt.open_table(POST)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                wt.commit()?;
+            }
+            drop(new_db);
+            Ok(())
+        };
+
+        if let Err(e) = build() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+
+        // Drop the old handle before renaming over its path (Windows will
+        // not allow the rename while any `Database` still has it open).
+        drop(db);
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
+        }
+
+        let mut reopened = Self::open_with_cache_bytes(&path, cache_bytes)?;
+        reopened.chunk_bytes = chunk_bytes;
+        reopened.registry = registry;
+        let after_bytes = std::fs::metadata(&path).map_err(io)?.len();
+        Ok((
+            reopened,
+            CompactStats {
+                before_bytes,
+                after_bytes,
+            },
+        ))
     }
 
     pub fn register(&mut self, e: Box<dyn Extractor>) {

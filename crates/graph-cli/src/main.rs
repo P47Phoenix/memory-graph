@@ -96,7 +96,12 @@ enum Cmd {
         dir: PathBuf,
     },
     /// Drop dictionary terms that no file refers to any more (v2 databases; a no-op for v1)
-    Vacuum,
+    Vacuum {
+        /// v2 only: also rebuild the file to reclaim the space `vacuum` frees but redb does not
+        /// return on its own (single-process rebuild-then-rename). Ignored (not an error) on v1
+        #[arg(long)]
+        compact: bool,
+    },
     /// Show what is indexed: per repo, the languages present and each language's symbol kinds
     Describe {
         #[arg(long)]
@@ -411,22 +416,49 @@ fn run() -> Result<()> {
             |db| open_for_indexing(db, cli.backend, v2_overrides),
             &mut std::io::stdout().lock(),
         )?,
-        Cmd::Vacuum => {
+        Cmd::Vacuum { compact } => {
             if !cli.db.is_file() {
                 bail!("database `{}` does not exist", cli.db.display());
             }
             let backend = resolve_backend(&cli.db, cli.backend)?;
-            let store = open_with_overrides(backend, &cli.db, vec![], v2_overrides)
+            if backend == Backend::RedbV2 && compact {
+                // `compact` is `V2Store`-only (it consumes and replaces
+                // `self`, which `Store`'s `&self`-only shape can't express),
+                // so this needs a concrete, owned `V2Store` rather than the
+                // `Box<dyn Store>` the other arms use.
+                let mut s = graph_store::V2Store::open_with_cache_bytes(
+                    &cli.db,
+                    v2_overrides.cache_bytes.map(|b| b as usize),
+                )
                 .with_context(|| format!("opening database `{}`", cli.db.display()))?;
-            let st = store.vacuum()?;
-            if backend == Backend::Redb {
-                out!("vacuum: nothing to do (a v1 database has no dictionary)");
-            } else {
+                if let Some(bytes) = v2_overrides.chunk_bytes {
+                    s.set_chunk_bytes(bytes as usize);
+                }
+                let st = s.vacuum()?;
+                let (_, cst) = s.compact()?;
                 out!(
                     "vacuum: removed {} unused dictionary terms, kept {}",
                     st.terms_removed,
                     st.terms_kept
                 );
+                out!(
+                    "compact: {} bytes -> {} bytes",
+                    cst.before_bytes,
+                    cst.after_bytes
+                );
+            } else {
+                let store = open_with_overrides(backend, &cli.db, vec![], v2_overrides)
+                    .with_context(|| format!("opening database `{}`", cli.db.display()))?;
+                let st = store.vacuum()?;
+                if backend == Backend::Redb {
+                    out!("vacuum: nothing to do (a v1 database has no dictionary)");
+                } else {
+                    out!(
+                        "vacuum: removed {} unused dictionary terms, kept {}",
+                        st.terms_removed,
+                        st.terms_kept
+                    );
+                }
             }
         }
         Cmd::Describe { org, repo, json } => {

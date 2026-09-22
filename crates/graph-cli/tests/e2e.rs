@@ -460,6 +460,106 @@ fn v2_cache_bytes_flag() {
     assert!(ok, "{out}{err}");
 }
 
+/// `vacuum --compact` (ADR 0003 story 3, slice 3f): works end to end on v2,
+/// does not change query results, and is a no-op (not an error) on v1.
+#[test]
+fn vacuum_compact_flag() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    // Enough distinct, sizeable tokens per file that pruning almost all of
+    // them frees whole pages, not just a handful of table rows (a handful
+    // of dead rows can still fit in already-allocated pages, so the file
+    // would not visibly shrink even though `compact` worked).
+    for i in 0..60 {
+        let body: String = (0..40)
+            .map(|j| format!("fn f{i}_{j}_{}() {{}}\n", "x".repeat(20)))
+            .collect();
+        std::fs::write(root.join(format!("f{i}.rs")), body).unwrap();
+    }
+    let r = root.to_str().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "--backend",
+        "v2",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+
+    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "vacuum", "--compact"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("vacuum:"), "{out}");
+    assert!(out.contains("compact:"), "{out}");
+
+    let f3_tok = format!("f3_0_{}", "x".repeat(20));
+    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "search", &f3_tok, "--json"]);
+    assert!(ok, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["results"].as_array().unwrap().len(), 1);
+
+    // `--compact` after a real prune actually shrinks the file on disk, not
+    // just runs without error: this is the property the whole feature
+    // exists for, and a CLI-level assertion on it (not just a library-level
+    // one) catches a future regression that silently reorders vacuum and
+    // compact, or breaks the CLI's own stats reporting.
+    for i in 1..60 {
+        std::fs::remove_file(root.join(format!("f{i}.rs"))).unwrap();
+    }
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "--backend",
+        "v2",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "p",
+        "--prune",
+        r,
+    ]);
+    assert!(ok, "{out}{err}");
+    let before = std::fs::metadata(&db).unwrap().len();
+    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "vacuum", "--compact"]);
+    assert!(ok, "{out}{err}");
+    let after = std::fs::metadata(&db).unwrap().len();
+    assert!(after < before, "before={before} after={after} {out}");
+
+    let f0_tok = format!("f0_0_{}", "x".repeat(20));
+    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "search", &f0_tok, "--json"]);
+    assert!(ok, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["results"].as_array().unwrap().len(),
+        1,
+        "surviving file still searchable"
+    );
+    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "search", &f3_tok, "--json"]);
+    assert!(ok, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["results"].as_array().unwrap().len(),
+        0,
+        "pruned file's data is gone"
+    );
+
+    // No-op (not an error) on v1.
+    let db_v1 = d.path().join("v1").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&["--db", &db_v1, "index", "--org", "o", "--repo", "p", r]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = run(&["--db", &db_v1, "vacuum", "--compact"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("nothing to do"), "{out}");
+}
+
 #[cfg(unix)]
 mod dir_edge_cases {
     use super::run;

@@ -506,3 +506,162 @@ mod consistency {
         }
     }
 }
+
+/// A rich fixture: several files across two repos, symbols, and one file
+/// using every interesting term length (short, at/over the inline cap,
+/// NUL-leading, multi-byte), so `compact`'s table-by-table copy is exercised
+/// against both the small inline dictionary keys and the hashed ones.
+fn compact_fixture(s: &V2Store) {
+    s.ingest_file(
+        "o",
+        "r1",
+        "a.rs",
+        "rust",
+        &span_ext(
+            &[
+                ("Outer", SymbolKind::Type, 0, 40),
+                ("inner", SymbolKind::Method, 5, 20),
+            ],
+            &[("alpha", 21, 26), ("beta", 27, 31)],
+        ),
+    )
+    .unwrap();
+    s.ingest_file(
+        "o",
+        "r1",
+        "b.rs",
+        "rust",
+        &span_ext(
+            &[("Gamma", SymbolKind::Function, 0, 10)],
+            &[("gamma", 1, 6)],
+        ),
+    )
+    .unwrap();
+    let texts = long_term_texts();
+    let sym = "S".repeat(MAX_INLINE_TERM * 2);
+    s.ingest_file(
+        "o2",
+        "r2",
+        "long.rs",
+        "rust",
+        &long_term_extraction(&texts, &sym),
+    )
+    .unwrap();
+}
+
+/// Every query surface (`search`, `search_symbols`, `describe`, `file_tokens`)
+/// returns exactly what it returned before compaction.
+#[test]
+fn compact_does_not_change_query_results() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    compact_fixture(&s);
+
+    let before_search = s.search(&Query::new("alpha")).unwrap();
+    let before_long = s.search(&Query::new("d".repeat(100_000))).unwrap();
+    let before_symbols = s.search_symbols(&SymbolQuery::new("*")).unwrap();
+    let before_describe = s.describe(None, None).unwrap();
+    let before_tokens = s.file_tokens("o", "r1", "a.rs").unwrap();
+    s.check_consistency(false);
+
+    let (s, stats) = s.compact().unwrap();
+    assert!(stats.before_bytes > 0);
+    assert!(stats.after_bytes > 0);
+
+    assert_eq!(s.search(&Query::new("alpha")).unwrap(), before_search);
+    assert_eq!(
+        s.search(&Query::new("d".repeat(100_000))).unwrap(),
+        before_long
+    );
+    assert_eq!(
+        s.search_symbols(&SymbolQuery::new("*")).unwrap(),
+        before_symbols
+    );
+    assert_eq!(s.describe(None, None).unwrap(), before_describe);
+    assert_eq!(s.file_tokens("o", "r1", "a.rs").unwrap(), before_tokens);
+    s.check_consistency(false);
+}
+
+/// The core story-3 gate: after pruning most of a store down to one file and
+/// vacuuming (which drops the dead dictionary terms but, per the `churn` and
+/// `prune_churn` measurements, never shrinks the file on its own), `compact`
+/// actually shrinks it.
+#[test]
+fn compact_after_vacuum_on_a_pruned_store_shrinks_the_file() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    for i in 0..200 {
+        // Enough distinct, sizeable tokens per file that pruning almost all
+        // of them frees whole pages, not just a handful of table rows (a
+        // handful of dead rows can still fit in already-allocated pages, so
+        // the file would not visibly shrink even though `compact` worked).
+        let toks: Vec<(String, u32, u32)> = (0..40)
+            .map(|j| {
+                let text = format!("token_{i}_{j}_{}", "x".repeat(20));
+                let start = j * 30;
+                (text, start, start + 25)
+            })
+            .collect();
+        let tok_refs: Vec<(&str, u32, u32)> =
+            toks.iter().map(|(t, s, e)| (t.as_str(), *s, *e)).collect();
+        s.ingest_file_with_origin(
+            "o",
+            "r",
+            &format!("f{i}.rs"),
+            "rust",
+            &span_ext(
+                &[(&format!("Sym{i}"), SymbolKind::Function, 0, 1200)],
+                &tok_refs,
+            ),
+            Some(ORIGIN_DIRECTORY),
+        )
+        .unwrap();
+    }
+    let keep: std::collections::HashSet<String> = ["f0.rs".to_string()].into_iter().collect();
+    s.prune_files("o", "r", &keep, false).unwrap();
+    s.vacuum().unwrap();
+    drop(s);
+    let before_bytes = std::fs::metadata(&p).unwrap().len();
+
+    let s = V2Store::open(&p).unwrap();
+    let (s, stats) = s.compact().unwrap();
+    assert_eq!(stats.before_bytes, before_bytes);
+    assert!(
+        stats.after_bytes < stats.before_bytes,
+        "compact must shrink a heavily pruned, vacuumed file: {} -> {}",
+        stats.before_bytes,
+        stats.after_bytes
+    );
+    let after_bytes = sha_len(&p);
+    assert_eq!(after_bytes, stats.after_bytes);
+
+    // Compaction did not lose the surviving file's data.
+    assert_eq!(
+        s.search(&Query::new(format!("token_0_0_{}", "x".repeat(20))))
+            .unwrap()
+            .len(),
+        1
+    );
+    s.check_consistency(true);
+}
+
+fn sha_len(p: &std::path::Path) -> u64 {
+    std::fs::metadata(p).unwrap().len()
+}
+
+/// `compact` reopens the store internally; `chunk_bytes` and `cache_bytes`
+/// must survive that reopen unchanged, not silently reset to defaults.
+#[test]
+fn compact_preserves_chunk_and_cache_bytes() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let mut s = V2Store::open_with_cache_bytes(&p, Some(123_456)).unwrap();
+    s.set_chunk_bytes(789);
+    compact_fixture(&s);
+
+    let (s, _) = s.compact().unwrap();
+    assert_eq!(s.chunk_bytes, 789);
+    assert_eq!(s.cache_bytes, Some(123_456));
+}
