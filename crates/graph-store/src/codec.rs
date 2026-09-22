@@ -1,4 +1,5 @@
-//! Compact per-file stream codec for the v2 store (ADR 0003 story 2).
+//! Compact per-file stream codec for the v2 store (ADR 0003 story 2, and story
+//! 3's per-symbol token ranges).
 //!
 //! One file's symbols and tokens become one byte string. Texts are dictionary
 //! ids (the store interns them), spans are delta-coded against the previous
@@ -7,11 +8,24 @@
 //! spans that a source scan could not reproduce (so no `irregular` escape is
 //! needed in this slice). Byte 0 is [`STREAM_FORMAT`].
 //!
-//! Layout (after the format byte, format 2): `nsym ntok symlen` as varints,
-//! then `symlen` bytes of symbol records, then `nck` checkpoints, then `ntok`
-//! token records:
+//! Layout (after the format byte, format 3): `nsym ntok symlen` as varints,
+//! then one flag byte, then `symlen` bytes of symbol records, then `nck`
+//! checkpoints, then `ntok` token records:
 //!
-//! * symbol: `name_id kind lang_kind+1 parent+1 span`
+//! * flag byte: bit 0 is `ranges_dense` (see [`Lazy::ranges_dense`]); the
+//!   other bits are reserved and must be zero.
+//! * symbol: `name_id kind lang_kind+1 parent+1 span tok_len_plus1
+//!   [tok_first_delta]`. `tok_len_plus1` is a varint: `0` means the symbol
+//!   transitively contains no tokens (no `tok_first_delta` follows, and the
+//!   delta base below is left unchanged by this record); otherwise
+//!   `last = first + (tok_len_plus1 - 1)` and `tok_first_delta` is a zigzag
+//!   varint of `first - prev_first`, delta-coded against the `first` of the
+//!   most recent symbol record that had a nonempty range (zero for the first
+//!   one). `tok_len_plus1` is read before `tok_first_delta` (not the field
+//!   order named above) because the decoder must know whether a delta
+//!   follows before it can read one. The range is TRANSITIVE: every token
+//!   ordinal under the symbol or any of its nested descendant symbols, not
+//!   just its direct tokens (deriving direct-only ranges is slice 3i's job).
 //! * token: `term_id class parent+1 span`
 //! * span: zigzag deltas `start, len, start_line, start_col, end_line-start_line`
 //!   then `end_col`, where `start`, `start_line` and `start_col` are relative
@@ -26,13 +40,27 @@
 //!
 //! `parent` is the index of the enclosing symbol in the symbol section (0 =
 //! the file itself). Records are in source order, so a token's index is its
-//! ordinal. Format 1 (no `symlen`, no checkpoints) is not read: the v2 layout
-//! is unreleased and the store's schema version was bumped with this change.
+//! ordinal. Format 2 (no flag byte, no per-symbol token range) is not read:
+//! the v2 layout is unreleased and the store's schema version was bumped with
+//! this change (ADR 0003 story 3, "Scoping decision (architecture board,
+//! 2026-09-22)"; re-verified before this change via `gh release list` and
+//! `git tag -l`, both empty, and no CHANGELOG exists -- v2 remains
+//! unreleased).
+//!
+//! **Narrow-scope rule for embedding a derived field in this stream format**
+//! (ADR 0003 story 3 scoping decision, condition 4/5): the per-symbol token
+//! range below was embedded here, instead of a separate `derived_version`
+//! table, because its access pattern (one field read alongside every
+//! already-decoded symbol record) matches this format's existing per-record
+//! layout. This is NOT a precedent: a future derived structure must
+//! independently justify codec-embedding vs. a separate table on its own
+//! access pattern, not cite this decision. See the story 3 row for the full
+//! scoping decision and its five conditions.
 use crate::StoreError;
 use graph_core::{Span, SymbolKind, TokenClass};
 
 /// Version byte of the stream layout. Bump on any layout change.
-pub const STREAM_FORMAT: u8 = 2;
+pub const STREAM_FORMAT: u8 = 3;
 
 /// A checkpoint is written before every this-many-th token record.
 pub const CHECKPOINT_EVERY: usize = 64;
@@ -44,6 +72,13 @@ pub struct SymRec {
     pub lang_kind: Option<u64>,
     pub parent: Option<u32>,
     pub span: Span,
+    /// Inclusive `(first, last)` token ordinal transitively under this
+    /// symbol, or `None` if it transitively contains no tokens. On
+    /// [`encode`], this field is ignored -- the true range is always
+    /// recomputed from `Stream::tokens`' `parent` chains (one O(ntok) pass,
+    /// see [`compute_ranges`]) -- so callers building a `Stream` to encode
+    /// need not set it. On decode it carries the value actually stored.
+    pub toks: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +158,52 @@ thread_local! {
     pub(crate) static RECORDS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The true `(first, last)` inclusive token-ordinal range transitively under
+/// each symbol (by index), and whether every symbol's actual transitive
+/// token set is exactly the contiguous range `[first, last]` (`false` when
+/// out-of-order or agent-supplied tokens break contiguity; see the codec's
+/// module docs). One pass over `tokens`, walking each token's `parent` chain
+/// up through `symbols[..].parent` to update every enclosing ancestor: O(ntok)
+/// for typical (shallow) nesting, O(ntok * depth) in the worst case.
+fn compute_ranges(symbols: &[SymRec], tokens: &[TokRec]) -> (Vec<Option<(u32, u32)>>, bool) {
+    let n = symbols.len();
+    let mut first: Vec<Option<u32>> = vec![None; n];
+    let mut last: Vec<Option<u32>> = vec![None; n];
+    let mut count: Vec<u64> = vec![0; n];
+    for (ord, t) in tokens.iter().enumerate() {
+        let ord = ord as u32;
+        let mut cur = t.parent;
+        // A well-formed tree has each `parent` an earlier (lower-index)
+        // symbol, so at most `n` ancestors. `encode` is also called on
+        // deliberately malformed test fixtures (self- or forward-referencing
+        // parents) that `decode` later rejects; bound the ascent by `n`
+        // steps so a parent cycle can never spin this loop forever.
+        for _ in 0..n {
+            let Some(idx) = cur else { break };
+            let i = idx as usize;
+            let Some(sym) = symbols.get(i) else { break };
+            first[i] = Some(first[i].map_or(ord, |f| f.min(ord)));
+            last[i] = Some(last[i].map_or(ord, |l| l.max(ord)));
+            count[i] += 1;
+            cur = sym.parent;
+        }
+    }
+    let mut dense = true;
+    let mut ranges = Vec::with_capacity(n);
+    for i in 0..n {
+        match (first[i], last[i]) {
+            (Some(f), Some(l)) => {
+                if count[i] != u64::from(l - f) + 1 {
+                    dense = false;
+                }
+                ranges.push(Some((f, l)));
+            }
+            _ => ranges.push(None),
+        }
+    }
+    (ranges, dense)
+}
+
 /// Decoder state before a token record.
 #[derive(Clone, Copy, Default)]
 struct Ck {
@@ -133,15 +214,25 @@ struct Ck {
 }
 
 pub fn encode(st: &Stream) -> Vec<u8> {
+    let (ranges, ranges_dense) = compute_ranges(&st.symbols, &st.tokens);
     let mut syms = Vec::new();
     let mut prev = ZERO;
-    for s in &st.symbols {
+    let mut prev_first = 0u32;
+    for (s, range) in st.symbols.iter().zip(&ranges) {
         put_varint(&mut syms, s.name);
         syms.push(KINDS.iter().position(|k| *k == s.kind).unwrap_or(6) as u8);
         put_varint(&mut syms, s.lang_kind.map_or(0, |k| k + 1));
         put_varint(&mut syms, s.parent.map_or(0, |p| u64::from(p) + 1));
         put_span(&mut syms, &s.span, &prev);
         prev = s.span;
+        match *range {
+            None => put_varint(&mut syms, 0),
+            Some((first, last)) => {
+                put_varint(&mut syms, u64::from(last - first) + 1);
+                put_varint(&mut syms, diff(first, prev_first));
+                prev_first = first;
+            }
+        }
     }
     let mut cks = Vec::new();
     let mut toks = Vec::new();
@@ -171,6 +262,7 @@ pub fn encode(st: &Stream) -> Vec<u8> {
     put_varint(&mut out, st.symbols.len() as u64);
     put_varint(&mut out, st.tokens.len() as u64);
     put_varint(&mut out, syms.len() as u64);
+    out.push(u8::from(ranges_dense));
     out.extend_from_slice(&syms);
     out.extend_from_slice(&cks);
     out.extend_from_slice(&toks);
@@ -254,6 +346,7 @@ impl Reader<'_> {
 pub struct Lazy<'a> {
     nsym: usize,
     ntok: usize,
+    ranges_dense: bool,
     sym_bytes: &'a [u8],
     cks: Vec<Ck>,
     toks: &'a [u8],
@@ -263,11 +356,15 @@ pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
     let mut r = Reader { b, at: 0 };
     let fmt = r.byte()?;
     if fmt != STREAM_FORMAT {
-        return Err(bad(&format!("unknown format byte {fmt}")));
+        return Err(bad(&format!(
+            "unknown or old stream format byte {fmt} (expected {STREAM_FORMAT}); \
+             the v2 store's on-disk layout changed and old v2 files must be re-indexed"
+        )));
     }
     let nsym = r.varint()? as usize;
     let ntok = r.varint()? as usize;
     let symlen = r.varint()? as usize;
+    let ranges_dense = r.byte()? & 1 != 0;
     // Every record is several bytes, so a count beyond the input is corrupt
     // (and must not drive a huge allocation).
     if nsym.saturating_add(ntok) > b.len() {
@@ -305,6 +402,7 @@ pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
     Ok(Lazy {
         nsym,
         ntok,
+        ranges_dense,
         sym_bytes,
         cks,
         toks,
@@ -322,6 +420,16 @@ impl Lazy<'_> {
         self.ntok
     }
 
+    /// Whether every symbol's stored `toks` range is exactly the contiguous
+    /// set of token ordinals transitively under it (set at encode time; see
+    /// [`compute_ranges`]). When `false`, `toks` on every symbol is still the
+    /// true min/max ordinal, not garbage, but a reader that needs the exact
+    /// set must fall back to a full scan (not built in this slice -- ADR 0003
+    /// story 3, slice 3i).
+    pub fn ranges_dense(&self) -> bool {
+        self.ranges_dense
+    }
+
     /// The symbol section, decoded.
     pub fn symbols(&self) -> Result<Vec<SymRec>, StoreError> {
         let mut r = Reader {
@@ -330,6 +438,7 @@ impl Lazy<'_> {
         };
         let mut symbols = Vec::with_capacity(self.nsym);
         let mut prev = ZERO;
+        let mut prev_first = 0u32;
         for i in 0..self.nsym {
             let name = r.varint()?;
             let kind = *KINDS
@@ -343,12 +452,26 @@ impl Lazy<'_> {
             }
             let span = r.span(&prev)?;
             prev = span;
+            let tok_len_plus1 = r.varint()?;
+            let toks = if tok_len_plus1 == 0 {
+                None
+            } else {
+                let first = r.rel(prev_first)?;
+                prev_first = first;
+                let len_minus1 = u32::try_from(tok_len_plus1 - 1)
+                    .map_err(|_| bad("token range length out of range"))?;
+                let last = first
+                    .checked_add(len_minus1)
+                    .ok_or_else(|| bad("token range overflow"))?;
+                Some((first, last))
+            };
             symbols.push(SymRec {
                 name,
                 kind,
                 lang_kind,
                 parent,
                 span,
+                toks,
             });
         }
         if r.at != r.b.len() {
@@ -508,6 +631,25 @@ pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
         tokens.push(t.clone());
         true
     })?;
+    // Independent check (ADR 0003 story 3 slice 3h, board condition 2): when
+    // the stream claims its ranges are dense, re-derive every symbol's range
+    // from the tokens actually decoded above and confirm it matches what was
+    // stored, instead of trusting the encode-time gate alone. Debug-only: a
+    // full re-derivation on every decode is not something a release build
+    // should pay for, and a mismatch here is a codec bug, not bad input, so
+    // it belongs behind `debug_assert!`, not a returned `StoreError`.
+    #[cfg(debug_assertions)]
+    if lazy.ranges_dense() {
+        let (want, _) = compute_ranges(&symbols, &tokens);
+        for (i, (sym, w)) in symbols.iter().zip(&want).enumerate() {
+            debug_assert_eq!(
+                sym.toks, *w,
+                "symbol {i}: stored dense range {:?} does not match the range \
+                 re-derived from the decoded tokens {:?}",
+                sym.toks, w
+            );
+        }
+    }
     Ok(Stream { symbols, tokens })
 }
 
@@ -526,8 +668,19 @@ mod tests {
         }
     }
 
+    /// Fills every symbol's `toks` with the range [`compute_ranges`] derives
+    /// from `s.tokens`, so `s` is a valid expected value to compare a decoded
+    /// stream against (`encode` ignores whatever `toks` was set to on input).
+    fn with_ranges(mut s: Stream) -> Stream {
+        let (ranges, _) = compute_ranges(&s.symbols, &s.tokens);
+        for (sym, r) in s.symbols.iter_mut().zip(ranges) {
+            sym.toks = r;
+        }
+        s
+    }
+
     fn sample() -> Stream {
-        Stream {
+        with_ranges(Stream {
             symbols: vec![
                 SymRec {
                     name: 0,
@@ -535,6 +688,7 @@ mod tests {
                     lang_kind: Some(1),
                     parent: None,
                     span: sp(0, 20, 1, 1, 3, 2),
+                    toks: None,
                 },
                 SymRec {
                     name: 2,
@@ -542,6 +696,7 @@ mod tests {
                     lang_kind: None,
                     parent: Some(0),
                     span: sp(4, 12, 2, 5, 2, 13),
+                    toks: None,
                 },
             ],
             tokens: vec![
@@ -558,7 +713,7 @@ mod tests {
                     span: sp(5, 6, 2, 6, 2, 7),
                 },
             ],
-        }
+        })
     }
 
     /// Golden bytes: a change here is a format change and needs a bumped
@@ -566,13 +721,15 @@ mod tests {
     #[test]
     fn golden_bytes() {
         let want: Vec<u8> = vec![
-            2, 2, 2, 20, // format, nsym, ntok, symlen
-            0, 1, 2, 0, 0, 40, 2, 2, 4, 2, // symbol 0
-            2, 3, 0, 1, 8, 16, 2, 8, 0, 13, // symbol 1: deltas from symbol 0
+            3, 2, 2, 24, 1, // format, nsym, ntok, symlen, flag (ranges_dense)
+            0, 1, 2, 0, 0, 40, 2, 2, 4, 2, 1,
+            2, // symbol 0 (+ tok_len_plus1, tok_first_delta)
+            2, 3, 0, 1, 8, 16, 2, 8, 0, 13, 1, 0, // symbol 1: deltas from symbol 0
             3, 1, 0, 0, 4, 2, 2, 0, 3, // token 0
             4, 0, 2, 10, 2, 2, 10, 0, 7, // token 1: deltas from token 0
         ];
         assert_eq!(encode(&sample()), want);
+        assert!(decode_lazy(&want).unwrap().ranges_dense());
     }
 
     #[test]
@@ -631,13 +788,13 @@ mod tests {
     #[test]
     fn overlong_varint_tenth_byte_is_rejected() {
         // term = nine 0xff bytes then 0x02 (bit 64 set): overflows u64.
-        let mut b = vec![2, 0, 1, 0];
+        let mut b = vec![3, 0, 1, 0, 0]; // format, nsym, ntok, symlen, flag
         b.extend([0xff; 9]);
         b.push(0x02);
         b.extend([0; 8]); // class, parent, six span fields
         assert!(decode(&b).is_err());
         // u64::MAX (tenth byte 0x01) is fine.
-        let mut ok = vec![2, 0, 1, 0];
+        let mut ok = vec![3, 0, 1, 0, 0];
         put(&mut ok, u64::MAX);
         ok.extend([0; 8]);
         assert_eq!(decode(&ok).unwrap().tokens[0].term, u64::MAX);
@@ -661,7 +818,8 @@ mod tests {
         // Last valid parents are accepted.
         let mut s = base;
         s.tokens[0].parent = Some(1);
-        assert_eq!(decode(&encode(&s)).unwrap(), s);
+        let want = with_ranges(s.clone());
+        assert_eq!(decode(&encode(&s)).unwrap(), want);
     }
 
     /// An extreme delta after a nonzero base must be an error, not an
@@ -704,7 +862,7 @@ mod tests {
                 ),
             });
         }
-        s
+        with_ranges(s)
     }
 
     #[test]
@@ -761,11 +919,11 @@ mod tests {
     fn checkpoints_are_written_and_verified() {
         let s = long(3 * CHECKPOINT_EVERY);
         let b = encode(&s);
-        // Header: fmt nsym ntok(2 bytes, 192) symlen, symbols, then checkpoints.
+        // Header: fmt nsym ntok(2 bytes, 192) symlen flag, symbols, then checkpoints.
         let lazy = decode_lazy(&b).unwrap();
         assert_eq!(lazy.cks.len(), 2);
         // Corrupt one checkpoint field: a full decode must notice.
-        let sym_end = 1 + 1 + 2 + 1 + lazy.sym_bytes.len();
+        let sym_end = 1 + 1 + 2 + 1 + 1 + lazy.sym_bytes.len();
         let mut bad_b = b.clone();
         bad_b[sym_end + 1] ^= 1; // first checkpoint's start delta
         assert!(decode(&bad_b).is_err());
@@ -843,7 +1001,7 @@ mod tests {
         let lazy = decode_lazy(&b).unwrap();
         assert_eq!(lazy.cks.len(), 1);
         let toks_len = lazy.toks.len();
-        let sym_end = 4 + lazy.sym_bytes.len(); // fmt, nsym, ntok, symlen (1 byte each)
+        let sym_end = 5 + lazy.sym_bytes.len(); // fmt, nsym, ntok, symlen, flag (1 byte each)
                                                 // Skip the original first varint (the offset) of the only checkpoint.
         let mut skip = sym_end;
         while b[skip] & 0x80 != 0 {
@@ -951,6 +1109,261 @@ mod tests {
                 .collect::<Vec<_>>()
         )
         .is_err());
+    }
+
+    /// A hand-built format-2 (pre-slice-3h) byte string -- no flag byte, no
+    /// per-symbol token range -- must be refused with a clear error, never
+    /// silently misread as format 3 (ADR 0003 story 3 board condition 1: v2
+    /// is unreleased, so this is a refuse-and-reindex bump, not a migration).
+    #[test]
+    fn old_format_2_streams_are_rejected_not_misread() {
+        let old_format_2: Vec<u8> = vec![2, 0, 0, 0]; // fmt, nsym, ntok, symlen
+        let err = decode(&old_format_2).unwrap_err().to_string();
+        assert!(err.contains("format"), "{err}");
+        let err = match decode_lazy(&old_format_2) {
+            Ok(_) => panic!("old format-2 bytes must not decode"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("format"), "{err}");
+    }
+
+    /// The stored dense range is not the only thing correctness rests on:
+    /// [`decode`]'s independent `debug_assert` re-derives every symbol's
+    /// range from the tokens it just decoded and must fire when the stored
+    /// range is wrong, proving the check is load-bearing, not decorative
+    /// (ADR 0003 story 3 board condition 2). Debug builds only, since
+    /// `debug_assert!` is a no-op in release.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "does not match")]
+    fn debug_assert_catches_a_corrupted_dense_range() {
+        let mut b = encode(&sample());
+        // Byte 15 is symbol 0's `tok_len_plus1` (see `golden_bytes`'s layout);
+        // corrupting it to a still-decodable-but-wrong length (1 -> 3) must
+        // trip the independent decode-time check, not decode silently.
+        assert_eq!(b[15], 1, "test assumes golden_bytes' byte layout");
+        b[15] = 3;
+        let _ = decode(&b);
+    }
+
+    /// <2% storage-growth gate (ADR 0003 story 3 board condition 3, test
+    /// requirement 5): encodes this repo's own `crates/` corpus (the same
+    /// corpus choice as `examples/churn.rs` and `examples/compact_churn.rs`)
+    /// through the real Rust extractor and the v2 store's own
+    /// symbol/token-merge logic (mirroring `V2Store::index_batch`'s
+    /// open-symbol stack in `v2.rs`), then compares the new encoder's real
+    /// byte count against a frozen replica of the pre-slice-3h (format 2)
+    /// encoder on the identical streams. A real measurement, not a reported
+    /// number: this `assert!` fails CI if the range fields blow the budget.
+    #[test]
+    fn range_fields_grow_encoded_size_by_under_two_percent_on_this_repos_corpus() {
+        use graph_core::Extractor;
+        use graph_lang_rust::RustExtractor;
+
+        fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(p) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    if !path.ends_with("target") && !path.ends_with(".git") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        /// Format-2 replica (pre-slice-3h): frozen copy of `encode` before
+        /// the flag byte and per-symbol `tok_len_plus1`/`tok_first_delta`
+        /// fields existed, so the delta below is real bytes, not a guess.
+        fn old_encode(st: &Stream) -> Vec<u8> {
+            let mut syms = Vec::new();
+            let mut prev = ZERO;
+            for s in &st.symbols {
+                put_varint(&mut syms, s.name);
+                syms.push(KINDS.iter().position(|k| *k == s.kind).unwrap_or(6) as u8);
+                put_varint(&mut syms, s.lang_kind.map_or(0, |k| k + 1));
+                put_varint(&mut syms, s.parent.map_or(0, |p| u64::from(p) + 1));
+                put_span(&mut syms, &s.span, &prev);
+                prev = s.span;
+            }
+            let mut cks = Vec::new();
+            let mut toks = Vec::new();
+            let mut prev = ZERO;
+            let mut last = Ck::default();
+            for (i, t) in st.tokens.iter().enumerate() {
+                if i > 0 && i % CHECKPOINT_EVERY == 0 {
+                    let ck = Ck {
+                        off: toks.len(),
+                        start: prev.start,
+                        line: prev.start_line,
+                        col: prev.start_col,
+                    };
+                    put_varint(&mut cks, (ck.off - last.off) as u64);
+                    put_varint(&mut cks, diff(ck.start, last.start));
+                    put_varint(&mut cks, diff(ck.line, last.line));
+                    put_varint(&mut cks, diff(ck.col, last.col));
+                    last = ck;
+                }
+                put_varint(&mut toks, t.term);
+                toks.push(CLASSES.iter().position(|c| *c == t.class).unwrap_or(6) as u8);
+                put_varint(&mut toks, t.parent.map_or(0, |p| u64::from(p) + 1));
+                put_span(&mut toks, &t.span, &prev);
+                prev = t.span;
+            }
+            let mut out = vec![2u8]; // old STREAM_FORMAT, frozen
+            put_varint(&mut out, st.symbols.len() as u64);
+            put_varint(&mut out, st.tokens.len() as u64);
+            put_varint(&mut out, syms.len() as u64);
+            out.extend_from_slice(&syms);
+            out.extend_from_slice(&cks);
+            out.extend_from_slice(&toks);
+            out
+        }
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_crates = manifest
+            .parent()
+            .expect("graph-store's parent is crates/")
+            .to_path_buf();
+        let mut files = Vec::new();
+        walk(&repo_crates, &mut files);
+        assert!(
+            files.len() > 10,
+            "expected a real multi-file corpus under {}, found {}",
+            repo_crates.display(),
+            files.len()
+        );
+
+        let extractor = RustExtractor;
+        let (mut old_total, mut new_total) = (0u64, 0u64);
+        for path in &files {
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let ex = extractor.extract(&src);
+            // Mirror `V2Store::index_batch`'s open-symbol stack (v2.rs): sort
+            // symbols and tokens by position, then merge them, deriving each
+            // record's `parent` from span containment.
+            let mut syms: Vec<_> = ex.symbols.iter().collect();
+            syms.sort_by_key(|s| (s.span.start, std::cmp::Reverse(s.span.end)));
+            let mut toks: Vec<_> = ex.tokens.iter().collect();
+            toks.sort_by_key(|t| t.span.start);
+            let mut stream = Stream::default();
+            let mut open: Vec<(u32, u32)> = Vec::new();
+            let (mut si, mut ti) = (0, 0);
+            while si < syms.len() || ti < toks.len() {
+                let take_sym = si < syms.len()
+                    && (ti >= toks.len() || syms[si].span.start <= toks[ti].span.start);
+                let pos = if take_sym {
+                    syms[si].span.start
+                } else {
+                    toks[ti].span.start
+                };
+                while open.last().is_some_and(|&(_, end)| end <= pos) {
+                    open.pop();
+                }
+                let parent = open.last().map(|&(i, _)| i);
+                if take_sym {
+                    let s = syms[si];
+                    si += 1;
+                    let idx = stream.symbols.len();
+                    stream.symbols.push(SymRec {
+                        name: idx as u64,
+                        kind: s.kind,
+                        lang_kind: None,
+                        parent,
+                        span: s.span,
+                        toks: None,
+                    });
+                    open.push((idx as u32, s.span.end));
+                } else {
+                    let t = toks[ti];
+                    ti += 1;
+                    stream.tokens.push(TokRec {
+                        term: stream.tokens.len() as u64,
+                        class: t.class,
+                        parent,
+                        span: t.span,
+                    });
+                }
+            }
+            old_total += old_encode(&stream).len() as u64;
+            new_total += encode(&stream).len() as u64;
+        }
+        assert!(old_total > 0, "corpus produced no encoded bytes");
+        let delta_pct = (new_total as f64 - old_total as f64) / old_total as f64 * 100.0;
+        println!(
+            "range-codec growth over {} files: old {old_total} B, new {new_total} B, \
+             delta {delta_pct:.3}%",
+            files.len()
+        );
+        assert!(
+            delta_pct < 2.0,
+            "encoded size grew {delta_pct:.3}% (old {old_total} B -> new {new_total} B \
+             over {} files); must stay under 2% (ADR 0003 story 3 board condition 3)",
+            files.len()
+        );
+    }
+
+    /// A symbol with an empty transitive range (`tok_len_plus1 == 0`) has no
+    /// token transitively under it, and a stream whose out-of-order/agent-
+    /// supplied tokens break contiguity for a symbol is stored with
+    /// `ranges_dense == false` but still the true min/max, not garbage.
+    #[test]
+    fn non_contiguous_ranges_are_flagged_not_dense_with_true_min_max() {
+        // Symbol 0 spans tokens 0 and 2 (parent Some(0)); token 1 sits
+        // between them but is NOT under symbol 0 (parent None), so symbol
+        // 0's actual transitive set is {0, 2}, not the contiguous [0, 2].
+        let mut s = Stream {
+            symbols: vec![SymRec {
+                name: 0,
+                kind: SymbolKind::Function,
+                lang_kind: None,
+                parent: None,
+                span: sp(0, 10, 1, 1, 1, 10),
+                toks: None,
+            }],
+            tokens: vec![
+                TokRec {
+                    term: 0,
+                    class: TokenClass::Identifier,
+                    parent: Some(0),
+                    span: sp(0, 1, 1, 1, 1, 2),
+                },
+                TokRec {
+                    term: 1,
+                    class: TokenClass::Identifier,
+                    parent: None,
+                    span: sp(2, 3, 1, 3, 1, 4),
+                },
+                TokRec {
+                    term: 2,
+                    class: TokenClass::Identifier,
+                    parent: Some(0),
+                    span: sp(4, 5, 1, 5, 1, 6),
+                },
+            ],
+        };
+        let b = encode(&s);
+        let lazy = decode_lazy(&b).unwrap();
+        assert!(!lazy.ranges_dense());
+        let decoded = decode(&b).unwrap();
+        assert_eq!(
+            decoded.symbols[0].toks,
+            Some((0, 2)),
+            "true min/max, not garbage"
+        );
+
+        // A symbol whose `tok_len_plus1 == 0` (empty range) has no token
+        // transitively under it: give symbol 0 no tokens at all.
+        s.tokens.iter_mut().for_each(|t| t.parent = None);
+        let b = encode(&s);
+        assert!(decode_lazy(&b).unwrap().ranges_dense(), "vacuously dense");
+        assert_eq!(decode(&b).unwrap().symbols[0].toks, None);
     }
 }
 
@@ -1087,7 +1500,13 @@ mod props {
 
         /// Any `u32` span fields, including inverted and overlapping ones
         /// (which `validate_spans` rejects before a write but the codec can
-        /// still represent), survive exactly.
+        /// still represent), survive exactly. Token parents are arbitrary
+        /// indices (not built by any nesting stack), so this also exercises
+        /// out-of-order and overlapping *token ranges*: whatever the actual
+        /// transitive set under a symbol is, [`compute_ranges`] gives its
+        /// true min/max and correctly flags `ranges_dense` when that set
+        /// isn't the exact contiguous range -- checked here against the
+        /// decoded stream, independently of whatever `encode` did internally.
         #[test]
         fn arbitrary_spans_round_trip(
             syms in prop::collection::vec((any::<u64>(), 0usize..7, prop::option::of(any::<u64>()), fields(), any::<prop::sample::Index>(), any::<bool>()), 0..8),
@@ -1101,6 +1520,7 @@ mod props {
                     lang_kind: *lang_kind,
                     parent: (i > 0 && *has_parent).then(|| pidx.index(i) as u32),
                     span: span_of(*f),
+                    toks: None,
                 });
             }
             for (term, class, f, pidx, has_parent) in &toks {
@@ -1111,7 +1531,94 @@ mod props {
                     span: span_of(*f),
                 });
             }
-            prop_assert_eq!(decode(&encode(&st)).unwrap(), st);
+            let (want_ranges, want_dense) = compute_ranges(&st.symbols, &st.tokens);
+            let b = encode(&st);
+            let lazy = decode_lazy(&b).unwrap();
+            prop_assert_eq!(lazy.ranges_dense(), want_dense);
+            let decoded = decode(&b).unwrap();
+            let mut want = st;
+            for (sym, r) in want.symbols.iter_mut().zip(&want_ranges) {
+                sym.toks = *r;
+            }
+            prop_assert_eq!(&decoded, &want);
+            // Range invariants (ADR 0003 story 3 slice 3h test requirement 2):
+            // a symbol's range contains every ancestor's range, and an empty
+            // range (`toks == None`) means no token is transitively under it.
+            for (i, sym) in decoded.symbols.iter().enumerate() {
+                prop_assert_eq!(sym.toks, want_ranges[i]);
+                if let (Some(p), Some((f, l))) = (sym.parent, sym.toks) {
+                    let (pf, pl) = decoded.symbols[p as usize]
+                        .toks
+                        .expect("a symbol with a nonempty range makes its parent's nonempty too");
+                    prop_assert!(f >= pf && l <= pl);
+                }
+            }
+        }
+
+        /// A tree built by a nesting stack (mirroring how the v2 store's
+        /// ingest builds `parent` links from span containment) always
+        /// produces token ordinals that are contiguous under every symbol,
+        /// so `ranges_dense` must be true and sibling ranges must be disjoint.
+        #[test]
+        fn well_nested_streams_are_dense_with_disjoint_sibling_ranges(
+            instrs in prop::collection::vec(0u8..3, 0..80),
+        ) {
+            let mut st = Stream::default();
+            let mut stack: Vec<u32> = Vec::new();
+            for (k, instr) in instrs.iter().enumerate() {
+                match instr % 3 {
+                    0 => {
+                        let idx = st.symbols.len() as u32;
+                        st.symbols.push(SymRec {
+                            name: idx as u64,
+                            kind: SymbolKind::Other,
+                            lang_kind: None,
+                            parent: stack.last().copied(),
+                            span: ZERO,
+                            toks: None,
+                        });
+                        stack.push(idx);
+                    }
+                    1 => st.tokens.push(TokRec {
+                        term: k as u64,
+                        class: TokenClass::Other,
+                        parent: stack.last().copied(),
+                        span: ZERO,
+                    }),
+                    _ => {
+                        stack.pop();
+                    }
+                }
+            }
+            let b = encode(&st);
+            let lazy = decode_lazy(&b).unwrap();
+            prop_assert!(lazy.ranges_dense());
+            let decoded = decode(&b).unwrap();
+            // Every pair of symbols is either ancestor/descendant (nested
+            // stack) or unrelated; unrelated ranges (including siblings)
+            // must not overlap.
+            let is_ancestor = |mut i: usize, j: usize| -> bool {
+                loop {
+                    match decoded.symbols[i].parent {
+                        Some(p) if p as usize == j => return true,
+                        Some(p) => i = p as usize,
+                        None => return false,
+                    }
+                }
+            };
+            for i in 0..decoded.symbols.len() {
+                for j in (i + 1)..decoded.symbols.len() {
+                    let (Some((fi, li)), Some((fj, lj))) =
+                        (decoded.symbols[i].toks, decoded.symbols[j].toks)
+                    else {
+                        continue;
+                    };
+                    if is_ancestor(i, j) || is_ancestor(j, i) {
+                        continue;
+                    }
+                    prop_assert!(li < fj || lj < fi, "unrelated symbols {i}, {j} overlap");
+                }
+            }
         }
     }
 }
