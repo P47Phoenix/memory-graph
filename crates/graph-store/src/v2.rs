@@ -1566,6 +1566,45 @@ impl V2Store {
         Ok(out)
     }
 
+    /// Test hook (ADR 0003 story 3, slice 3k benchmark): `ancestors` through
+    /// the pre-3g eager `codec::decode` of the whole stream, unconditionally
+    /// -- the same body `ancestors` had before slice 3g (PR #34) switched it
+    /// to `Lazy`/`with_lazy`. Slice 3g removed the eager path outright (no
+    /// fallback was kept, unlike `children`/`descendants`), so this hook
+    /// re-adds it, test-only, purely to measure "v2-before" against
+    /// "v2-after" on the same corpus; it is not reachable from any
+    /// non-test code and changes no production behavior.
+    #[cfg(test)]
+    pub(crate) fn ancestors_via_fallback(&self, id: NodeId) -> Result<Vec<Node>> {
+        let rt = self.db.begin_read()?;
+        let r = R::new(&rt)?;
+        let (tag, file, i) = split_id(id);
+        let mut out = Vec::new();
+        let mut up = if tag == 0 {
+            r.node(id)?.and_then(|n| n.parent)
+        } else {
+            let Some(s) = r.stream(file)? else {
+                return Ok(out);
+            };
+            let mut cur = match tag {
+                TAG_SYM if i < s.symbols.len() => s.symbols[i].parent,
+                TAG_TOK if i < s.tokens.len() => s.tokens[i].parent,
+                _ => return Ok(out),
+            };
+            while let Some(p) = cur {
+                out.push(r.sym_node(file, p as usize, &s.symbols)?);
+                cur = s.symbols[p as usize].parent;
+            }
+            Some(file)
+        };
+        while let Some(p) = up {
+            let n = r.need(p)?;
+            up = n.parent;
+            out.push(n);
+        }
+        Ok(out)
+    }
+
     /// Measurement hook (ADR 0003 story 3, slice 3j spike): compares the
     /// token records the eager `stream()` decode reads against what the
     /// range-based `children_ranged_file`/`descendants_ranged_file` path
