@@ -208,6 +208,27 @@ fn stream_tree(s: &Stream) -> Tree {
     t
 }
 
+/// The ordinals in `first..=last` NOT covered by any of the given (disjoint,
+/// start-sorted) `(first, last)` child ranges, in ascending order: the gaps
+/// between consecutive child ranges plus the two ends. Shared by
+/// [`direct_token_ordinals`] (children of a symbol, range is the symbol's
+/// own `toks`) and [`top_level_ordinals`] (children of a file, range is the
+/// whole `0..ntok`).
+fn range_gaps(first: u32, last: u32, child_ranges: impl Iterator<Item = (u32, u32)>) -> Vec<usize> {
+    let mut ords = Vec::new();
+    let mut cur = first;
+    for (cf, cl) in child_ranges {
+        if cf > cur {
+            ords.extend((cur..cf).map(|o| o as usize));
+        }
+        cur = cl + 1;
+    }
+    if cur <= last {
+        ords.extend((cur..=last).map(|o| o as usize));
+    }
+    ords
+}
+
 /// The ordinals directly under symbol `i` (not under any of its listed
 /// direct children `child_idxs`, which must be sorted ascending -- true of
 /// any direct-child list taken from a start-sorted symbol section), in
@@ -218,20 +239,33 @@ fn direct_token_ordinals(syms: &[SymRec], i: usize, child_idxs: &[usize]) -> Vec
     let Some((first, last)) = syms[i].toks else {
         return Vec::new();
     };
-    let mut ords = Vec::new();
-    let mut cur = first;
-    for &c in child_idxs {
-        if let Some((cf, cl)) = syms[c].toks {
-            if cf > cur {
-                ords.extend((cur..cf).map(|o| o as usize));
-            }
-            cur = cl + 1;
-        }
+    range_gaps(first, last, child_idxs.iter().filter_map(|&c| syms[c].toks))
+}
+
+/// The ordinals in `0..ntok` NOT covered by any of the given (disjoint,
+/// start-sorted) top-level symbol index ranges `top_idxs` -- the file-level
+/// (root) analog of [`direct_token_ordinals`], used by `children`/
+/// `descendants` on a file (ADR 0003 story 3, slice 3j; measured as a >30%
+/// decoded-record reduction on this repo's own `crates/` tree -- see
+/// `file_level_complement_decode_cost_measured_on_this_repos_own_corpus` --
+/// which met the scoping plan's build gate).
+fn top_level_ordinals(syms: &[SymRec], top_idxs: &[usize], ntok: usize) -> Vec<usize> {
+    if ntok == 0 {
+        return Vec::new();
     }
-    if cur <= last {
-        ords.extend((cur..=last).map(|o| o as usize));
-    }
-    ords
+    range_gaps(
+        0,
+        (ntok - 1) as u32,
+        top_idxs.iter().filter_map(|&j| syms[j].toks),
+    )
+}
+
+/// Top-level symbol indexes of `syms` (no parent), in the start-sorted order
+/// the (start-sorted) symbol section already stores them in.
+fn top_level_idxs(syms: &[SymRec]) -> Vec<usize> {
+    (0..syms.len())
+        .filter(|&j| syms[j].parent.is_none())
+        .collect()
 }
 
 impl R {
@@ -414,12 +448,12 @@ impl R {
     /// symbol its child symbols and direct tokens. Unknown ids and tokens
     /// have none.
     ///
-    /// `children(file)` stays on the eager full-decode path (ADR 0003 story
-    /// 3, slice 3i scope: only the through-a-symbol case is range-based here;
-    /// the top-level case is slice 3j, gated on its own measurement). For a
-    /// symbol, [`R::children_ranged`] is tried first when the file's stored
-    /// ranges are exact; `None` (not dense, or no range data) falls back to
-    /// the same eager decode used before this slice, verbatim.
+    /// Both the file (top-level) and symbol cases try a range-based path
+    /// first when the file's stored ranges are exact (ADR 0003 story 3:
+    /// slice 3i for a symbol via [`R::children_ranged`], slice 3j for a file
+    /// via [`R::children_ranged_file`]); `None` (not dense, or no range
+    /// data) falls back to the same eager decode used before those slices,
+    /// verbatim.
     fn children(&self, id: NodeId) -> Result<Vec<Node>> {
         let (tag, file, i) = split_id(id);
         if tag == 0 {
@@ -427,6 +461,9 @@ impl R {
                 return Ok(Vec::new());
             };
             if n.kind == NodeKind::File {
+                if let Some(out) = self.children_ranged_file(id)? {
+                    return Ok(out);
+                }
                 let Some(s) = self.stream(id)? else {
                     return Ok(Vec::new());
                 };
@@ -525,6 +562,61 @@ impl R {
         Ok(res.flatten())
     }
 
+    /// Top-level (not through any symbol) direct children of file `file`,
+    /// computed from the stored per-symbol transitive token ranges (ADR 0003
+    /// story 3, slice 3j) instead of decoding the whole stream. `Ok(None)`
+    /// means "cannot answer this way" (no stream row, or `ranges_dense()` is
+    /// false) and the caller must fall back to the eager `stream()` +
+    /// `stream_tree` path, exactly as [`R::children_ranged`] falls back for
+    /// a symbol.
+    ///
+    /// Top-level symbols (no parent) come from the already-decoded symbol
+    /// section, no token decoding. Top-level direct tokens are the ordinals
+    /// in `0..ntok` minus the union of top-level symbols' ranges (the gaps
+    /// between consecutive, start-sorted top-level ranges), fetched with one
+    /// `Lazy::tokens_at` call -- the file-level analog of `children_ranged`'s
+    /// own-range-minus-children computation, using [`top_level_ordinals`]
+    /// instead of [`direct_token_ordinals`]. Merged with the top-level
+    /// symbols in `stream_tree`'s order, so this is byte-for-byte the same
+    /// as the fallback.
+    ///
+    /// **Measured** (ADR 0003 story 3, slice 3j spike, this repo's own
+    /// `crates/` tree, real `RustExtractor`): this cuts decoded token
+    /// records by 97.78% versus the eager path (133,772 to 2,970 records
+    /// across 27 files), well past the scoping plan's 30% build gate --
+    /// `tokens_at`'s checkpoint jump pays off here because the *complement*
+    /// of well-covered symbol ranges tends to sit near a stream's few
+    /// existing checkpoints, not because the gaps themselves are large.
+    fn children_ranged_file(&self, file: u64) -> Result<Option<Vec<Node>>> {
+        let res = self.with_lazy(file, |lz| {
+            if !lz.ranges_dense() {
+                return Ok(None);
+            }
+            let syms = lz.symbols()?;
+            let top_idxs = top_level_idxs(&syms);
+            let ords = top_level_ordinals(&syms, &top_idxs, lz.ntok());
+            let mut toks: Vec<(usize, TokRec)> = Vec::with_capacity(ords.len());
+            if !ords.is_empty() {
+                lz.tokens_at(&ords, |ord, t| toks.push((ord, t.clone())))?;
+            }
+            let mut out = Vec::with_capacity(top_idxs.len() + toks.len());
+            let (mut si, mut ti) = (0, 0);
+            while si < top_idxs.len() || ti < toks.len() {
+                let take_sym = si < top_idxs.len()
+                    && (ti >= toks.len() || syms[top_idxs[si]].span.start <= toks[ti].1.span.start);
+                if take_sym {
+                    out.push(self.sym_node(file, top_idxs[si], &syms)?);
+                    si += 1;
+                } else {
+                    out.push(self.tok_node(file, toks[ti].0, &toks[ti].1)?);
+                    ti += 1;
+                }
+            }
+            Ok(Some(out))
+        })?;
+        Ok(res.flatten())
+    }
+
     /// Everything below `id`, depth first in source order, parents before
     /// their children. Decodes each stream once.
     fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
@@ -535,6 +627,9 @@ impl R {
                 return Ok(out);
             };
             if n.kind == NodeKind::File {
+                if let Some(v) = self.descendants_ranged_file(id)? {
+                    return Ok(v);
+                }
                 self.file_walk(id, None, &mut out)?;
             } else {
                 for k in self.kids.get(id)? {
@@ -542,7 +637,11 @@ impl R {
                     let (cid, kind) = (c.id, c.kind);
                     out.push(c);
                     if kind == NodeKind::File {
-                        self.file_walk(cid, None, &mut out)?;
+                        if let Some(v) = self.descendants_ranged_file(cid)? {
+                            out.extend(v);
+                        } else {
+                            self.file_walk(cid, None, &mut out)?;
+                        }
                     } else {
                         out.extend(self.descendants(cid)?);
                     }
@@ -631,6 +730,37 @@ impl R {
             Ok(Some(out))
         })?;
         Ok(res.flatten())
+    }
+
+    /// Everything below file `file`, depth first, matching `file_walk`'s
+    /// output exactly, computed from the top-level ranged children (ADR 0003
+    /// story 3, slice 3j) plus, for each top-level symbol, its own
+    /// [`R::descendants_ranged`] subtree -- reusing the slice-3i per-symbol
+    /// walk rather than duplicating it, so a file's `descendants` cannot
+    /// silently diverge from a symbol's. `Ok(None)` means "cannot answer
+    /// this way", same conditions as [`R::children_ranged_file`].
+    fn descendants_ranged_file(&self, file: u64) -> Result<Option<Vec<Node>>> {
+        let Some(top) = self.children_ranged_file(file)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(top.len());
+        for n in top {
+            let is_symbol = n.kind == NodeKind::Symbol;
+            let id = n.id;
+            out.push(n);
+            if is_symbol {
+                let (_, _, i) = split_id(id);
+                let Some(sub) = self.descendants_ranged(file, i)? else {
+                    // `children_ranged_file` already required `ranges_dense()`
+                    // true for this file, so every symbol in it has an exact
+                    // range too and this branch is unreachable; fall back to
+                    // the whole-file eager walk defensively rather than panic.
+                    return Ok(None);
+                };
+                out.extend(sub);
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Depth-first walk of one stream from the file (`None`) or from a symbol.
@@ -1405,6 +1535,65 @@ impl V2Store {
             r.file_walk(file, Some(i), &mut out)?;
         }
         Ok(out)
+    }
+
+    /// Test hook, the file-level (slice 3j) analog of
+    /// [`V2Store::children_via_fallback`]: `children` on a file through the
+    /// pre-3j eager `stream()` + `stream_tree` path, unconditionally.
+    #[cfg(test)]
+    pub(crate) fn children_via_fallback_file(&self, file: NodeId) -> Result<Vec<Node>> {
+        let rt = self.db.begin_read()?;
+        let r = R::new(&rt)?;
+        let Some(s) = r.stream(file)? else {
+            return Ok(Vec::new());
+        };
+        let tree = stream_tree(&s);
+        tree.top
+            .iter()
+            .map(|&it| r.item_node(file, &s, it))
+            .collect()
+    }
+
+    /// Test hook, the file-level (slice 3j) analog of
+    /// [`V2Store::descendants_via_fallback`]: `descendants` on a file through
+    /// the pre-3j `file_walk` path, unconditionally.
+    #[cfg(test)]
+    pub(crate) fn descendants_via_fallback_file(&self, file: NodeId) -> Result<Vec<Node>> {
+        let rt = self.db.begin_read()?;
+        let r = R::new(&rt)?;
+        let mut out = Vec::new();
+        r.file_walk(file, None, &mut out)?;
+        Ok(out)
+    }
+
+    /// Measurement hook (ADR 0003 story 3, slice 3j spike): compares the
+    /// token records the eager `stream()` decode reads against what the
+    /// range-based `children_ranged_file`/`descendants_ranged_file` path
+    /// (now wired into `children`/`descendants`, see
+    /// `file_level_complement_decode_cost_measured_on_this_repos_own_corpus`)
+    /// actually costs, for one file entity id. `Ok(None)` when the file has
+    /// no stream row or its ranges are not dense. Returns `(ntok,
+    /// eager_decoded, ranged_decoded)`.
+    #[cfg(test)]
+    pub(crate) fn measure_file_level_complement(
+        &self,
+        file: NodeId,
+    ) -> Result<Option<(usize, usize, usize)>> {
+        let rt = self.db.begin_read()?;
+        let r = R::new(&rt)?;
+
+        codec::RECORDS_DECODED.with(|c| c.set(0));
+        let Some(s) = r.stream(file)? else {
+            return Ok(None);
+        };
+        let eager_decoded = codec::RECORDS_DECODED.with(|c| c.get());
+        let ntok = s.tokens.len();
+
+        codec::RECORDS_DECODED.with(|c| c.set(0));
+        let ranged = r.children_ranged_file(file)?;
+        let ranged_decoded = codec::RECORDS_DECODED.with(|c| c.get());
+
+        Ok(ranged.map(|_| (ntok, eager_decoded, ranged_decoded)))
     }
 
     /// Test hook: add a raw symbol-index entry (to simulate a stale index).
