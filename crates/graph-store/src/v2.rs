@@ -49,7 +49,7 @@ pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict")
 /// term id -> term text.
 const DICT_REV: TableDefinition<u64, &str> = TableDefinition::new("dict_rev");
 /// file id -> encoded stream.
-const STREAMS: TableDefinition<u64, &[u8]> = TableDefinition::new("stream");
+pub(crate) const STREAMS: TableDefinition<u64, &[u8]> = TableDefinition::new("stream");
 /// (term id, file id) -> occurrence count and token ordinals (see `codec::encode_posting`).
 const POST: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("post");
 /// content id -> refcount (ADR 0003 story 3, Q2). While content sharing
@@ -1724,6 +1724,32 @@ impl V2Store {
             .unwrap()
             .insert(name, id)
             .unwrap();
+        wt.commit().unwrap();
+    }
+
+    /// Test hook: make `file`'s content id an *extra* reference on
+    /// `sharing_file`'s already-ingested content (bumping `refs[content_id
+    /// (sharing_file)]` and adding a `content_files` entry for `file`),
+    /// without actually re-ingesting `file`'s stream under that id. This is
+    /// the only way to exercise `remove_content`'s refcount-gated (not
+    /// immediate) delete branch before story 18's real content-sharing
+    /// fan-out exists: today `content_id(file) == file` always, so every
+    /// real refcount is always exactly 1 and "decrement then delete only at
+    /// zero" is otherwise indistinguishable from "always delete" (found by
+    /// QA review, PR #42).
+    #[cfg(test)]
+    pub(crate) fn inject_extra_content_ref(&self, file: u64, sharing_file: u64) {
+        let cid = content_id(sharing_file);
+        let wt = self.db.begin_write().unwrap();
+        {
+            let mut refs = wt.open_table(REFS).unwrap();
+            let count = refs.get(cid).unwrap().map(|v| v.value()).unwrap_or(0);
+            refs.insert(cid, count + 1).unwrap();
+            wt.open_multimap_table(CONTENT_FILES)
+                .unwrap()
+                .insert(cid, file)
+                .unwrap();
+        }
         wt.commit().unwrap();
     }
 

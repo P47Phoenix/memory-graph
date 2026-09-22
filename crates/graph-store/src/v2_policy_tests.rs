@@ -797,6 +797,67 @@ fn refs_and_content_files_match_the_live_file_set_after_ingest_replace_prune_and
     s.check_consistency(false);
 }
 
+/// Exercises `remove_content`'s refcount-gated delete branch (decrement,
+/// don't delete, unless the count reaches zero) -- otherwise unreachable
+/// before story 18's real content-sharing fan-out exists, since
+/// `content_id(file) == file` always makes every real refcount exactly 1,
+/// making a gated delete indistinguishable from an unconditional one (found
+/// by QA review, PR #42: an "always delete" mutation was not caught by any
+/// other test). Simulates two files sharing one content id via the
+/// `inject_extra_content_ref` test hook, without a real story-18 dedup path.
+#[test]
+fn remove_content_only_deletes_at_a_zero_refcount() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    s.ingest_file_with_origin(
+        "o",
+        "r",
+        "shared.rs",
+        "rust",
+        &span_ext(&[], &[("onlyhere", 0, 8)]),
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    let toks = s.file_tokens("o", "r", "shared.rs").unwrap().unwrap();
+    let shared_file = (toks[0].id >> 32) & 0x3fff_ffff;
+    // No file "999" is ever really ingested under this content id; the hook
+    // only adds the bookkeeping a real second reference would leave, so
+    // `refs[content_id(shared.rs)]` goes from 1 to 2.
+    s.inject_extra_content_ref(999, shared_file);
+
+    // Pruning "shared.rs" alone must decrement, not delete: the content is
+    // still referenced (by the injected extra reference). An "always
+    // delete" bug (QA's mutation, PR #42) would delete the stream row here
+    // regardless. (Not checked via `search`: prune legitimately removes
+    // "shared.rs"'s own file entity row regardless of content refcount --
+    // resolving a query hit through a *different*, still-live referencing
+    // file's entity is real content-sharing fan-out, story 18's job, not
+    // this bookkeeping-only slice's. The stream row itself is the thing
+    // `remove_content` decides whether to delete, so check that directly.)
+    let keep = std::collections::HashSet::new();
+    s.prune_files("o", "r", &keep, false).unwrap();
+    let rt = s.db.begin_read().unwrap();
+    assert!(
+        rt.open_table(crate::v2::STREAMS)
+            .unwrap()
+            .get(shared_file)
+            .unwrap()
+            .is_some(),
+        "stream row must survive while a second reference exists"
+    );
+    let refs = rt.open_table(crate::v2::REFS).unwrap();
+    assert_eq!(
+        refs.get(shared_file).unwrap().map(|v| v.value()),
+        Some(1),
+        "refcount must have decremented from 2 to 1, not stayed at 2 or hit 0"
+    );
+    // Reaching zero and actually deleting is already covered extensively by
+    // every other test in this file (every real refcount is 1, so an
+    // ordinary prune/replace already exercises "decrement to zero, delete"
+    // end to end); this test's job is only the previously-uncovered
+    // "decrement, don't delete" branch above.
+}
+
 /// A skip-unchanged (fingerprint-matched) file must not touch `refs` or
 /// `content_files` at all -- the skip check runs before any write, so the
 /// whole file is byte-identical, not just those two tables (same style as
