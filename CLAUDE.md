@@ -22,3 +22,5 @@ For every PR in this repo:
 - Log deferred/follow-up findings as GitHub issues (not just chat) so they survive a session or machine change — see issue #19 for the ADR 0003 store-trait/v2 backlog.
 
 **Why:** user asked for this on 2026-09-19 after PR #2, where independent reviews caught real bugs (overlapping spans, path duplicates, BOM, misleading `no_symbols`). The standing-merge authorization followed on 2026-09-20 once the review pattern proved reliable.
+
+**Source memory:** this process was originally recorded as a Claude memory entry and is preserved verbatim, with its full history, at [docs/memory/pr-workflow-ci-and-reviews.md](docs/memory/pr-workflow-ci-and-reviews.md).
