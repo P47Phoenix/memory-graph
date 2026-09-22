@@ -25,6 +25,11 @@ struct Cli {
     /// created it: opening a v2 file without `--backend v2` (or a v1 file with it) is an error
     #[arg(long, global = true, value_enum)]
     backend: Option<BackendArg>,
+    /// v2 only: commit a write transaction every this many source bytes ingested, continuing the batch in a
+    /// new one (default 64 MiB). A soft cap: one file larger than it is still a chunk of its own. Ignored
+    /// with `--backend v1` (or no `--backend`)
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    v2_chunk_bytes: Option<u64>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -182,9 +187,27 @@ fn resolve_backend(db: &std::path::Path, requested: Option<BackendArg>) -> Resul
 /// Open the store for a command that indexes, with every shipped extractor
 /// registered: the extractor version is part of a file's fingerprint, so
 /// indexing without one would downgrade already-indexed files to tokens only.
-fn open_for_indexing(db: &std::path::Path, backend: Option<BackendArg>) -> Result<Box<dyn Store>> {
+/// `v2_chunk_bytes` overrides the default chunk cap of `index_batch` (v2
+/// only; ignored on v1).
+fn open_for_indexing(
+    db: &std::path::Path,
+    backend: Option<BackendArg>,
+    v2_chunk_bytes: Option<u64>,
+) -> Result<Box<dyn Store>> {
+    let backend = resolve_backend(db, backend)?;
+    if backend == Backend::RedbV2 {
+        if let Some(bytes) = v2_chunk_bytes {
+            // Bypasses `open_store`'s `Backend::RedbV2` arm to reach
+            // `set_chunk_bytes` (not on the `Store` trait); mirror any future
+            // change there (extra setup, validation, config) here too.
+            let mut s = graph_store::V2Store::open(db)?;
+            s.set_chunk_bytes(bytes as usize);
+            s.register(Box::new(graph_lang_rust::RustExtractor));
+            return Ok(Box::new(s));
+        }
+    }
     Ok(open_store(
-        resolve_backend(db, backend)?,
+        backend,
         db,
         vec![Box::new(graph_lang_rust::RustExtractor)],
     )?)
@@ -299,7 +322,7 @@ fn run() -> Result<()> {
                     cli.db.display()
                 );
             }
-            let store = open_for_indexing(&cli.db, cli.backend)?;
+            let store = open_for_indexing(&cli.db, cli.backend, cli.v2_chunk_bytes)?;
             let st = store.index_bytes_opts(
                 &org,
                 &repo,
@@ -342,7 +365,7 @@ fn run() -> Result<()> {
                 force,
                 reindex,
             },
-            |db| open_for_indexing(db, cli.backend),
+            |db| open_for_indexing(db, cli.backend, cli.v2_chunk_bytes),
             &mut std::io::stdout().lock(),
         )?,
         Cmd::Vacuum => {
