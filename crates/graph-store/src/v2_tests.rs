@@ -633,6 +633,257 @@ fn ranged_children_match_fallback_on_this_repos_own_corpus() {
     );
 }
 
+/// ADR 0003 story 3, slice 3j spike measurement (gated on its own number,
+/// per the scoping plan): for every file in this repo's own `crates/` tree,
+/// compares the token records the pre-3j eager `stream()` decode reads
+/// against what the range-based top-level path (`children_ranged_file`,
+/// now wired into `children`/`descendants` on a file) actually decodes via
+/// `Lazy::tokens_at`. Committed so the number is reproducible, not just
+/// quoted in a PR description.
+///
+/// **Measured 97.78% reduction** (133,772 eager vs. 2,970 ranged token
+/// records across 27 files), well past the scoping plan's 30% build gate,
+/// so this slice wires the optimization in for real (see
+/// `ranged_children_match_fallback_on_this_repos_own_corpus_at_file_level`
+/// and `children_of_a_file_does_not_decode_the_whole_file` below).
+#[test]
+fn file_level_complement_decode_cost_measured_on_this_repos_own_corpus() {
+    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(p).unwrap().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if !path.ends_with("target") && !path.ends_with(".git") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new("../../crates"), &mut files);
+    assert!(
+        !files.is_empty(),
+        "expected to find this repo's own .rs files"
+    );
+    files.sort();
+
+    use graph_core::Extractor;
+    let d = tempfile::tempdir().unwrap();
+    let v = V2Store::open(d.path().join("corpus.redb")).unwrap();
+    let extractor = graph_lang_rust::RustExtractor;
+    let (mut total_eager, mut total_complement, mut total_ntok) = (0usize, 0usize, 0usize);
+    let mut files_measured = 0usize;
+    let mut files_not_dense = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let ex = extractor.extract(&src);
+        if v.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
+            continue;
+        }
+        let Some(toks) = v.file_tokens("o", "r", &rel).unwrap() else {
+            continue;
+        };
+        let Some(any) = toks.first().map(|n| n.id) else {
+            continue;
+        };
+        let file = (any >> 32) & 0x3fff_ffff;
+        match v.measure_file_level_complement(file).unwrap() {
+            Some((ntok, eager, complement)) => {
+                total_ntok += ntok;
+                total_eager += eager;
+                total_complement += complement;
+                files_measured += 1;
+            }
+            None => files_not_dense += 1,
+        }
+    }
+    assert!(
+        files_measured > 10,
+        "expected a substantial number of real files measured, got {files_measured}"
+    );
+    assert_eq!(
+        total_eager, total_ntok,
+        "eager children(file)/descendants(file) decodes every token record"
+    );
+    let reduction_pct = 100.0 * (1.0 - total_complement as f64 / total_eager as f64);
+    println!(
+        "file_level_complement_decode_cost_measured_on_this_repos_own_corpus: \
+         {files_measured} files ({files_not_dense} not dense/skipped), \
+         eager {total_eager} vs complement {total_complement} token records \
+         decoded ({reduction_pct:.2}% reduction)"
+    );
+    // The scoping plan's own build gate: only worth wiring in if it beats a
+    // 30% reduction in decoded-record count on this repo's own corpus. This
+    // assertion is NOT that go/no-go call -- it is a sanity bound on the
+    // measurement itself (the complement can never cost more than the
+    // eager path, since it decodes a subset of the same records), left here
+    // so a future regression in the measurement code fails loudly.
+    assert!(
+        total_complement <= total_eager,
+        "complement decode ({total_complement}) exceeded the eager baseline ({total_eager})"
+    );
+    // The scoping plan's actual go/no-go gate, now that the optimization is
+    // built: fails loudly if a future change to this repo's corpus or the
+    // codec regresses the win below the threshold that justified building it.
+    assert!(
+        reduction_pct > 30.0,
+        "file-level complement reduction {reduction_pct:.2}% no longer clears the 30% build gate"
+    );
+}
+
+/// ADR 0003 story 3, slice 3j real-corpus differential, file-level analog of
+/// `ranged_children_match_fallback_on_this_repos_own_corpus`: `children`/
+/// `descendants` on every file of this repo's own `crates/` tree, range-based
+/// vs. the literal pre-3j fallback.
+#[test]
+fn ranged_children_match_fallback_on_this_repos_own_corpus_at_file_level() {
+    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(p).unwrap().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if !path.ends_with("target") && !path.ends_with(".git") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new("../../crates"), &mut files);
+    assert!(
+        !files.is_empty(),
+        "expected to find this repo's own .rs files"
+    );
+    files.sort();
+
+    use graph_core::Extractor;
+    let d = tempfile::tempdir().unwrap();
+    let v = V2Store::open(d.path().join("corpus.redb")).unwrap();
+    let extractor = graph_lang_rust::RustExtractor;
+    let mut checked_files = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let ex = extractor.extract(&src);
+        if v.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
+            continue;
+        }
+        let Some(toks) = v.file_tokens("o", "r", &rel).unwrap() else {
+            continue;
+        };
+        let Some(any) = toks.first().map(|n| n.id) else {
+            continue;
+        };
+        let file = (any >> 32) & 0x3fff_ffff;
+        assert_eq!(
+            v.children(file).unwrap(),
+            v.children_via_fallback_file(file).unwrap(),
+            "children(file) differ for {rel}"
+        );
+        assert_eq!(
+            v.descendants(file).unwrap(),
+            v.descendants_via_fallback_file(file).unwrap(),
+            "descendants(file) differ for {rel}"
+        );
+        checked_files += 1;
+    }
+    assert!(
+        checked_files > 10,
+        "expected a substantial number of real files checked, got {checked_files}"
+    );
+}
+
+/// Decode-cost regression (mirrors `children_of_a_small_symbol_does_not_decode_the_whole_file`):
+/// `children(file)`/`descendants(file)` on a file whose tokens are almost
+/// entirely covered by one top-level symbol decode far fewer token records
+/// than the file's total, bounded by roughly the uncovered gap plus
+/// checkpoint overhead, not the whole file.
+#[test]
+fn children_of_a_file_does_not_decode_the_whole_file() {
+    let n = 20 * codec::CHECKPOINT_EVERY;
+    let d = tempfile::tempdir().unwrap();
+    let v = V2Store::open(d.path().join("f.redb")).unwrap();
+    // One top-level symbol covering all but the last 3 tokens, which sit
+    // outside any symbol (the top-level "gap" `children`/`descendants` must
+    // still find).
+    let toks: Vec<(String, u32, u32)> = (0..n)
+        .map(|i| (format!("t{i}"), i as u32, i as u32 + 1))
+        .collect();
+    let sym_end = n - 3;
+    let tok_refs: Vec<(&str, u32, u32)> =
+        toks.iter().map(|(t, s, e)| (t.as_str(), *s, *e)).collect();
+    let ex = span_ext(
+        &[("Big", SymbolKind::Function, 0, sym_end as u32)],
+        &tok_refs,
+    );
+    v.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+    let toks = v.file_tokens("o", "r", "x.rs").unwrap().unwrap();
+    let file = (toks[0].id >> 32) & 0x3fff_ffff;
+
+    codec::RECORDS_DECODED.with(|c| c.set(0));
+    let kids = v.children(file).unwrap();
+    let decoded = codec::RECORDS_DECODED.with(|c| c.get());
+
+    // One symbol plus the three top-level tokens outside it.
+    assert_eq!(kids.len(), 4);
+    let ratio = decoded as f64 / n as f64;
+    println!(
+        "children_of_a_file_does_not_decode_the_whole_file: \
+         decoded {decoded} of {n} token records ({ratio:.5}x)"
+    );
+    assert!(
+        decoded <= 3 + codec::CHECKPOINT_EVERY,
+        "decoded {decoded} of {n} token records"
+    );
+
+    codec::RECORDS_DECODED.with(|c| c.set(0));
+    let desc = v.descendants(file).unwrap();
+    let desc_decoded = codec::RECORDS_DECODED.with(|c| c.get());
+    // Symbol + its n-3 direct tokens + 3 top-level gap tokens = n + 1 nodes,
+    // but `descendants_ranged_file` decodes the symbol's own subtree (all
+    // n - 3 tokens under it) plus the 3-token gap: bounded by the file's
+    // token count here (the symbol covers almost everything), unlike
+    // `children`, which only needs the gap.
+    assert_eq!(desc.len(), n + 1);
+    assert!(
+        desc_decoded <= n + codec::CHECKPOINT_EVERY,
+        "decoded {desc_decoded} of {n} token records"
+    );
+}
+
+/// File-level analog of `a_zero_width_symbol_beats_a_token_at_the_same_start`:
+/// locks in the symbol-vs-token tie-break rule ("symbols before tokens on a
+/// tie") for `children_ranged_file`'s merge loop specifically. QA review (PR
+/// #38) found this exact bug class was only caught incidentally by an
+/// unrelated fixture (`tests::v1_vs_v2_differential`'s `eq.rs`), which would
+/// silently stop covering it if that fixture is ever edited -- a dedicated,
+/// intention-revealing test closes that gap, matching slice 3i's precedent.
+#[test]
+fn a_zero_width_top_level_symbol_beats_a_top_level_token_at_the_same_start() {
+    let ex = span_ext(
+        &[("Z", SymbolKind::Type, 10, 10)],
+        &[("t0", 5, 6), ("t1", 10, 11)],
+    );
+    let d = tempfile::tempdir().unwrap();
+    let v = V2Store::open(d.path().join("tie.redb")).unwrap();
+    v.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+    let toks = v.file_tokens("o", "r", "x.rs").unwrap().unwrap();
+    let file = (toks[0].id >> 32) & 0x3fff_ffff;
+    // "Z" and "t1" both start at byte 10: the symbol must win the tie.
+    assert_eq!(names(v.children(file).unwrap()), ["t0", "Z", "t1"]);
+    assert_eq!(
+        v.children(file).unwrap(),
+        v.children_via_fallback_file(file).unwrap()
+    );
+}
+
 #[test]
 fn vacuum_keeps_a_symbol_only_lang_kind_term() {
     let d = tempfile::tempdir().unwrap();
