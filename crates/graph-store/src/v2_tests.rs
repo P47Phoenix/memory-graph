@@ -221,6 +221,101 @@ fn get_does_not_decode_the_whole_stream() {
     );
 }
 
+/// Issue #35 (mutation testing, PR #34 QA review): `with_lazy`'s
+/// `Ok(Some(f(&codec::decode_lazy(v.value())?)?))` must surface a corrupt or
+/// truncated stream row as an error through every caller that goes through
+/// it -- `get`, `ancestors` and `parent` -- never swallow it into `Ok(None)`
+/// or a silently wrong result. No prior test constructed a corrupt stream
+/// row and called any of the three through it, so a mutant that changed
+/// `with_lazy` to `Err(_) => Ok(None)` went undetected.
+#[test]
+fn with_lazy_propagates_decode_errors_through_get_ancestors_parent() {
+    let n = 2 * codec::CHECKPOINT_EVERY + 3;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("b.redb")).unwrap();
+    s.ingest_file("o", "r", "x.rs", "rust", &many_tokens_ext(n))
+        .unwrap();
+    let last_tok = s.file_tokens("o", "r", "x.rs").unwrap().unwrap()[n - 1].id;
+    // Same `(tag, file, index)` bit layout as `v2::split_id`/`sub_id`
+    // (private to that module; reconstructed here, as `ranged_children_file_
+    // level::file_id` already does elsewhere in this file).
+    let file = (last_tok >> 32) & 0x3fff_ffff;
+    let sym_id = (1u64 << 62) | (file << 32); // the file's only symbol, "S"
+    let tok_id = (2u64 << 62) | (file << 32); // its first token, "t0"
+
+    let good = {
+        let rt = s.db.begin_read().unwrap();
+        let t = rt.open_table(crate::v2::STREAMS).unwrap();
+        t.get(file).unwrap().unwrap().value().to_vec()
+    };
+    assert!(!good.is_empty());
+
+    let set_stream = |bytes: &[u8]| {
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut t = wt.open_table(crate::v2::STREAMS).unwrap();
+            t.insert(file, bytes).unwrap();
+        }
+        wt.commit().unwrap();
+    };
+
+    // Every prefix truncation of a genuine, multi-checkpoint stream is
+    // corrupt for a query that must decode all the way to its end: reaching
+    // the *last* token forces `Lazy::tokens_at` through to the final byte,
+    // so any missing suffix -- whether it lands in the header, the
+    // checkpoint table or deep in the token payload -- must surface as
+    // `StoreError`, never `Ok(None)`/a panic (mirrors codec.rs's own
+    // `corrupt_input_is_an_error_not_a_panic` prefix-truncation idiom, but
+    // exercised through the store's `get`/`ancestors`/`parent`).
+    for cut in 0..good.len() {
+        set_stream(&good[..cut]);
+        assert!(s.get(last_tok).is_err(), "get(last_tok) at prefix {cut}");
+        assert!(
+            s.ancestors(last_tok).is_err(),
+            "ancestors(last_tok) at prefix {cut}"
+        );
+        assert!(
+            s.parent(last_tok).is_err(),
+            "parent(last_tok) at prefix {cut}"
+        );
+    }
+
+    // Truncated to nothing, and to just the format byte: `decode_lazy`'s own
+    // header parse must fail before any symbol- or token-specific logic
+    // runs, so every one of get/ancestors/parent errors for *either* kind of
+    // id (a symbol and a token needing no more than the header to exist).
+    for cut in [0usize, 1] {
+        set_stream(&good[..cut]);
+        for id in [sym_id, tok_id] {
+            assert!(s.get(id).is_err(), "get id={id} at prefix {cut}");
+            assert!(
+                s.ancestors(id).is_err(),
+                "ancestors id={id} at prefix {cut}"
+            );
+            assert!(s.parent(id).is_err(), "parent id={id} at prefix {cut}");
+        }
+    }
+
+    // An invalid format byte is rejected outright (mirrors
+    // `codec::old_format_2_streams_are_rejected_not_misread`).
+    let mut bad_fmt = good.clone();
+    bad_fmt[0] = 0xff;
+    set_stream(&bad_fmt);
+    assert!(s.get(sym_id).is_err());
+    assert!(s.ancestors(tok_id).is_err());
+    assert!(s.parent(tok_id).is_err());
+
+    // Sanity: restoring the original bytes makes the store healthy again,
+    // proving the corruption above -- not some unrelated breakage -- is what
+    // drove every assertion above.
+    set_stream(&good);
+    assert!(s.get(last_tok).unwrap().is_some());
+    assert_eq!(
+        names(s.ancestors(last_tok).unwrap()),
+        ["S", "x.rs", "r", "o"]
+    );
+}
+
 #[test]
 fn vacuum_removes_only_dead_dictionary_terms() {
     let f = SymbolKind::Function;
