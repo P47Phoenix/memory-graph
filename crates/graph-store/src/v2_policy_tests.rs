@@ -1965,3 +1965,139 @@ fn dict_rev_packed_bytes_do_not_exceed_pre_story5_layout_on_this_repos_own_corpu
         terms.len()
     );
 }
+
+// --- ADR 0003 story 10: snapshot max age / SnapshotExpired / observability ---
+
+/// A snapshot within its max age behaves exactly as before: reads succeed
+/// and see the frozen state, matching the pre-existing
+/// `snapshot_is_frozen`/`snapshot_filtered_reads` conformance cases (which
+/// this test does not touch or duplicate -- it only adds the max-age angle
+/// they don't cover).
+#[test]
+fn a_snapshot_well_within_max_age_reads_normally() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let mut s = V2Store::open(&p).unwrap();
+    s.set_max_snapshot_age(std::time::Duration::from_secs(3600));
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+    let snap = s.snapshot().unwrap();
+    assert_eq!(snap.search(&Query::new("alpha")).unwrap().len(), 1);
+    assert_eq!(snap.count_nodes(NodeKind::Token).unwrap(), 1);
+}
+
+/// A snapshot older than its configured max age refuses every read
+/// (`StoreRead` method) through the handle with `SnapshotExpired`, rather
+/// than only at issuance -- exercised here on `search`, `get`, `children`
+/// and `describe` as representative of the read surface the `store_read!`
+/// macro instruments.
+#[test]
+fn a_snapshot_past_max_age_returns_snapshot_expired() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let mut s = V2Store::open(&p).unwrap();
+    s.set_max_snapshot_age(std::time::Duration::from_millis(1));
+    let stats = s
+        .ingest_file(
+            "o",
+            "r",
+            "x.rs",
+            "rust",
+            &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+        )
+        .unwrap();
+    let snap = s.snapshot().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    assert!(matches!(
+        snap.search(&Query::new("alpha")),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+    assert!(matches!(
+        snap.get(stats.file_id),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+    assert!(matches!(
+        snap.children(stats.file_id),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+    assert!(matches!(
+        snap.describe(None, None),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+}
+
+/// Snapshot count/age observability: opening N handles reports count == N,
+/// dropping some updates the count, and the oldest-age reading only grows
+/// (monotonically, with generous tolerance to avoid CI flakiness) while at
+/// least one handle of that generation stays open.
+#[test]
+fn snapshot_stats_reports_count_and_monotonic_age() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+
+    let stats0 = s.snapshot_stats();
+    assert_eq!(stats0.open_count, 0);
+    assert!(stats0.oldest_age.is_none());
+
+    let snap_a = s.snapshot().unwrap();
+    let stats1 = s.snapshot_stats();
+    assert_eq!(stats1.open_count, 1);
+    let age1 = stats1.oldest_age.expect("one snapshot open");
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let snap_b = s.snapshot().unwrap();
+    let stats2 = s.snapshot_stats();
+    assert_eq!(stats2.open_count, 2);
+    let age2 = stats2.oldest_age.expect("two snapshots open");
+    // The oldest handle (`snap_a`) is still open, so its age only grows.
+    assert!(
+        age2 >= age1,
+        "oldest snapshot age must be monotonically non-decreasing while the oldest handle \
+         stays open: {age2:?} < {age1:?}"
+    );
+
+    drop(snap_a);
+    let stats3 = s.snapshot_stats();
+    assert_eq!(stats3.open_count, 1);
+
+    drop(snap_b);
+    let stats4 = s.snapshot_stats();
+    assert_eq!(stats4.open_count, 0);
+    assert!(stats4.oldest_age.is_none());
+
+    // `store_size_bytes` reports the backing file's on-disk size, not a
+    // per-snapshot number (documented on `SnapshotStats`); it must at least
+    // be nonzero once data has been ingested.
+    assert!(stats4.store_size_bytes > 0);
+}
+
+/// v1's default `Store::snapshot_stats()` (unimplemented by `RedbStore`, per
+/// the "v1 is frozen" invariant) honestly reports zero snapshots and no
+/// oldest age -- it tracks none of this, rather than approximating it.
+#[test]
+fn v1_snapshot_stats_defaults_to_zero() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = crate::RedbStore::open(&p).unwrap();
+    let _snap = s.snapshot().unwrap();
+    let stats = s.snapshot_stats();
+    assert_eq!(stats.open_count, 0);
+    assert!(stats.oldest_age.is_none());
+    assert_eq!(stats.store_size_bytes, 0);
+}

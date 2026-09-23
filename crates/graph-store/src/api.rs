@@ -110,6 +110,25 @@ pub trait StoreRead {
     fn search(&self, q: &Query) -> Result<Vec<Hit>>;
 }
 
+/// Snapshot observability (ADR 0003 story 10, [`Store::snapshot_stats`]):
+/// how many snapshot handles this store currently has alive, and the age of
+/// the oldest one. `store_size_bytes` is the backing store's on-disk size,
+/// not a size specific to any one snapshot -- an in-process redb snapshot is
+/// a read transaction over the same file the store already has open, not a
+/// separate copy, so there is no snapshot-specific size to report; a future
+/// backend that did materialize a distinct snapshot copy would report that
+/// copy's size here instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotStats {
+    /// Snapshot handles created by `snapshot()` and not yet dropped.
+    pub open_count: usize,
+    /// Age of the oldest currently open snapshot, if any are open.
+    pub oldest_age: Option<std::time::Duration>,
+    /// The backing store's on-disk file size (not snapshot-specific; see
+    /// the struct doc comment).
+    pub store_size_bytes: u64,
+}
+
 /// A read-write store. Writers are serialized by the backend. A single-file
 /// write is atomic. A batch is atomic per backend-defined transaction: v1 uses
 /// one transaction per batch; v2 commits per chunk (see `index_batch`).
@@ -118,7 +137,27 @@ pub trait Store: StoreRead + Send + Sync {
     /// committed state, whatever writers do meanwhile. Released on drop.
     /// (redb backend: one read transaction, so a long-lived snapshot delays
     /// page reuse; keep snapshots short-lived.)
+    ///
+    /// ADR 0003 story 10 (max age/`SnapshotExpired`): a backend may refuse
+    /// reads through a handle once it has lived past a configured max age
+    /// (default 15 minutes, matching ADR 0003 Q6's decision), returning
+    /// [`StoreError::SnapshotExpired`] from that read rather than from this
+    /// call -- `snapshot()` itself never fails because the *previous*
+    /// snapshot aged out. The v1 (`RedbStore`) backend does not implement
+    /// aging: its snapshot handles never expire, predating this mechanism
+    /// and kept frozen rather than retrofitted (see the crate's "v1 is
+    /// frozen" invariant). `snapshot_stats()`'s default return (all zero,
+    /// no oldest age) is the honest v1 answer too: v1 tracks no snapshot
+    /// count or age at all.
     fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>>;
+
+    /// Snapshot observability (ADR 0003 story 10): count, oldest age and
+    /// store size. The default (all zero, `oldest_age: None`) is what v1
+    /// reports, since v1 tracks none of this; a backend that does (today,
+    /// v2's `V2Store`) overrides it.
+    fn snapshot_stats(&self) -> SnapshotStats {
+        SnapshotStats::default()
+    }
 
     /// Index raw bytes with an explicit `origin` and options; the primary
     /// single-file entry point. See `RedbStore::index_bytes_opts`.
