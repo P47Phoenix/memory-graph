@@ -1597,3 +1597,184 @@ fn a_term_repeated_across_many_posting_blocks_matches_v1() {
     assert_eq!(ha, hb);
     crate::conformance::run_differential(&*a, &*b);
 }
+
+// --- ADR 0003 story 9: generic derived_version + refs/content_files
+// rebuild-on-open ---
+
+/// Directly clears the stored `derived_version_refs_content_files` marker
+/// (the same direct-table-write technique as slice 3l/3m's
+/// `inject_extra_content_ref`/direct-corruption tests) and corrupts
+/// `refs`/`content_files` to something a fresh ingest would never produce.
+/// A plain `V2Store::open` (no manual `rebuild_refs()` call) must detect the
+/// stale/missing marker and self-heal both tables back to what a fresh
+/// ingest of the same corpus produces.
+#[test]
+fn a_missing_derived_version_self_heals_refs_on_plain_open() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    compact_fixture(&s);
+    drop(s);
+
+    // Oracle: what a fresh ingest of the identical corpus produces.
+    let fresh = V2Store::open(d.path().join("fresh.redb")).unwrap();
+    compact_fixture(&fresh);
+    let want = refs_snapshot(&fresh);
+
+    // Reopen, corrupt refs/content_files and clear the derived_version
+    // marker directly, then close the handle so the next `open` starts
+    // fresh (as a real "written by an older build" file would).
+    {
+        let s = V2Store::open(&p).unwrap();
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut meta = wt.open_table(crate::META).unwrap();
+            meta.remove(crate::v2::DERIVED_VERSION_REFS_KEY).unwrap();
+        }
+        {
+            let mut refs = wt.open_table(crate::v2::REFS).unwrap();
+            let keys: Vec<u64> = refs.iter().unwrap().map(|r| r.unwrap().0.value()).collect();
+            if let Some(&k) = keys.first() {
+                refs.remove(k).unwrap();
+            }
+            refs.insert(999_999_999u64, 7u64).unwrap();
+        }
+        {
+            let mut cf = wt.open_multimap_table(crate::v2::CONTENT_FILES).unwrap();
+            cf.insert(999_999_999u64, 424_242u64).unwrap();
+        }
+        wt.commit().unwrap();
+        drop(s);
+    }
+
+    // Plain open -- no manual rebuild_refs() call anywhere in this test.
+    let s = V2Store::open(&p).unwrap();
+    let healed = refs_snapshot(&s);
+    assert_eq!(
+        healed, want,
+        "a plain open() must self-heal refs/content_files when derived_version is missing"
+    );
+    s.check_consistency(false);
+
+    // The marker itself must now read as current.
+    let rt = s.db.begin_read().unwrap();
+    let stamped = rt
+        .open_table(crate::META)
+        .unwrap()
+        .get(crate::v2::DERIVED_VERSION_REFS_KEY)
+        .unwrap()
+        .map(|v| v.value());
+    assert_eq!(stamped, Some(crate::v2::REFS_DERIVED_VERSION));
+}
+
+/// Same self-heal, but the marker is stamped to an explicit stale value
+/// (rather than missing entirely) -- both "absent" and "lower than current"
+/// must be treated as stale.
+#[test]
+fn a_stale_derived_version_self_heals_refs_on_plain_open() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    compact_fixture(&s);
+
+    let wt = s.db.begin_write().unwrap();
+    {
+        let mut meta = wt.open_table(crate::META).unwrap();
+        meta.insert(crate::v2::DERIVED_VERSION_REFS_KEY, 0u64)
+            .unwrap();
+        let mut refs = wt.open_table(crate::v2::REFS).unwrap();
+        refs.insert(999_999_999u64, 7u64).unwrap();
+    }
+    wt.commit().unwrap();
+    drop(s);
+
+    let s = V2Store::open(&p).unwrap();
+    let rt = s.db.begin_read().unwrap();
+    let stamped = rt
+        .open_table(crate::META)
+        .unwrap()
+        .get(crate::v2::DERIVED_VERSION_REFS_KEY)
+        .unwrap()
+        .map(|v| v.value());
+    assert_eq!(stamped, Some(crate::v2::REFS_DERIVED_VERSION));
+    let refs = rt.open_table(crate::v2::REFS).unwrap();
+    assert!(
+        refs.get(999_999_999u64).unwrap().is_none(),
+        "the bogus refs row must be gone after self-heal"
+    );
+    drop(rt);
+    s.check_consistency(false);
+}
+
+/// A store already stamped at the current `REFS_DERIVED_VERSION` must not
+/// write anything on a plain reopen -- the file stays byte-for-byte
+/// identical, same convention as `a_no_op_vacuum_leaves_the_file_byte_identical`.
+#[test]
+fn a_current_derived_version_does_not_rewrite_the_file_on_reopen() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+    drop(s);
+    let before = sha(&p);
+
+    // Reopening at the already-current derived_version must not write.
+    let s = V2Store::open(&p).unwrap();
+    assert_eq!(s.search(&Query::new("alpha")).unwrap().len(), 1);
+    drop(s);
+    assert_eq!(
+        sha(&p),
+        before,
+        "reopening a store already at the current derived_version must not write"
+    );
+
+    // And again, for good measure.
+    let s = V2Store::open(&p).unwrap();
+    drop(s);
+    assert_eq!(sha(&p), before);
+}
+
+/// `V2_SCHEMA_VERSION` stays a hard gate: a mismatched layout is still
+/// refused (unmodified) rather than silently self-healed. No regression
+/// from the soft `derived_version` mechanism added above.
+#[test]
+fn schema_version_mismatch_still_hard_refuses() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+    let wt = s.db.begin_write().unwrap();
+    {
+        let mut meta = wt.open_table(crate::META).unwrap();
+        meta.insert("schema_version", crate::v2::V2_SCHEMA_VERSION - 1)
+            .unwrap();
+    }
+    wt.commit().unwrap();
+    drop(s);
+    let before = sha(&p);
+
+    match V2Store::open(&p) {
+        Err(StoreError::Rejected(_)) => {}
+        Err(other) => panic!("expected StoreError::Rejected, got a different error: {other}"),
+        Ok(_) => panic!("expected a hard refusal, got Ok"),
+    }
+    assert_eq!(
+        sha(&p),
+        before,
+        "a schema mismatch must leave the file untouched, not attempt any self-heal"
+    );
+}
