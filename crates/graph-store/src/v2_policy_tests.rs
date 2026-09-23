@@ -2180,22 +2180,6 @@ fn v1_snapshot_stats_defaults_to_zero() {
 // the default test suite by the 3l gate (0.8s including compilation-free
 // re-run), and it grows over time along with the codebase instead of going
 // stale like a frozen fixture would.
-fn walk_rs(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(p) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let path = e.path();
-        if path.is_dir() {
-            if !path.ends_with("target") && !path.ends_with(".git") {
-                walk_rs(&path, out);
-            }
-        } else if path.extension().is_some_and(|x| x == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// Holistic size/throughput gate (ADR 0003 story 7): ingest this repo's own
 /// `crates/` corpus into v2, compact, and require both the overall
 /// bytes-per-token and the ingest wall time to stay within generous,
@@ -2225,7 +2209,7 @@ fn walk_rs(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 #[test]
 fn overall_store_size_and_ingest_throughput_stay_within_generous_bounds_on_this_repos_corpus() {
     let mut files = Vec::new();
-    walk_rs(std::path::Path::new("../../crates"), &mut files);
+    walk_rs_files(std::path::Path::new("../../crates"), &mut files);
     assert!(
         files.len() > 10,
         "expected this repo's own .rs corpus, found {}",
@@ -2279,10 +2263,16 @@ fn overall_store_size_and_ingest_throughput_stay_within_generous_bounds_on_this_
     );
 
     assert!(
-        bytes_per_token < 200.0,
-        "v2 store grew to {bytes_per_token:.2} B/token (must stay under 200.0 B/token, story 7 \
-         holistic gate; see docs/spikes/v2-checkpoint.md for the 27.3-39.95 B/token measured \
-         baseline)"
+        // 120.0, not a looser round number: the ADR's story 7 acceptance
+        // line is literally ">2x regression in pages/token" against this
+        // test's own measured baseline (53.92 B/token on this corpus), so
+        // the threshold must sit under 2x that (107.84) to actually trip on
+        // exactly the regression the ADR names, with a little headroom for
+        // ordinary corpus growth over time.
+        bytes_per_token < 120.0,
+        "v2 store grew to {bytes_per_token:.2} B/token (must stay under 120.0 B/token -- a >2x \
+         regression from this test's own measured baseline, per story 7's acceptance line; see \
+         docs/spikes/v2-checkpoint.md for the original 27.3-39.95 B/token spike baseline)"
     );
     assert!(
         ingest_secs < 30.0,
@@ -2320,7 +2310,7 @@ fn overall_store_size_and_ingest_throughput_stay_within_generous_bounds_on_this_
 #[test]
 fn store_size_stays_within_1_5x_after_vacuum_and_compact_across_churn_rounds() {
     let mut files = Vec::new();
-    walk_rs(std::path::Path::new("../../crates"), &mut files);
+    walk_rs_files(std::path::Path::new("../../crates"), &mut files);
     files.sort();
     let sources: Vec<(String, String)> = files
         .iter()
