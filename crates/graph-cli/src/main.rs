@@ -705,3 +705,141 @@ mod resolve_tests {
         drop(held);
     }
 }
+
+#[cfg(test)]
+mod chunk_bytes_flag_tests {
+    use super::*;
+    use graph_core::{Extraction, Span, SymbolDecl, SymbolKind};
+    use graph_store::BatchFile;
+
+    /// Same technique as `chunked_batches_are_atomic_per_chunk`
+    /// (`crates/graph-store/src/v2_policy_tests.rs`): a symbol `lang_kind`
+    /// containing a NUL makes storage reject that one file, poisoning
+    /// whichever chunk it lands in.
+    struct Poison;
+    impl Extractor for Poison {
+        fn language(&self) -> &str {
+            "poison"
+        }
+        fn extract(&self, source: &str) -> Extraction {
+            let span = Span {
+                start: 0,
+                end: source.len() as u32,
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: source.len() as u32 + 1,
+            };
+            let mut ex = Extraction {
+                has_errors: false,
+                symbols: vec![SymbolDecl {
+                    name: "S".into(),
+                    kind: SymbolKind::Function,
+                    lang_kind: None,
+                    span,
+                }],
+                tokens: vec![],
+            };
+            if source.contains("BAD") {
+                ex.symbols[0].lang_kind = Some("nul\0".into());
+            }
+            ex
+        }
+    }
+
+    fn batch<'a>(srcs: &'a [String], paths: &'a [String]) -> Vec<BatchFile<'a>> {
+        srcs.iter()
+            .zip(paths)
+            .map(|(s, p)| BatchFile {
+                path: p,
+                bytes: s.as_bytes(),
+                language: Some("poison"),
+                origin: None,
+            })
+            .collect()
+    }
+
+    /// Issue #28: `--v2-chunk-bytes` is plumbed through `open_with_overrides`
+    /// (the function `open_for_indexing` calls for `index`/`index-file`) into
+    /// `V2Store::set_chunk_bytes`. A prior e2e test only checked that search
+    /// results were identical chunked vs. unchunked, which is true by design
+    /// regardless of whether chunking actually happened -- QA confirmed by
+    /// mutation that silently dropping the `set_chunk_bytes` call left the
+    /// suite green.
+    ///
+    /// This test calls `open_with_overrides` directly -- the exact function
+    /// the CLI's flag parsing invokes once `--v2-chunk-bytes` is parsed into
+    /// `V2Overrides` -- then runs a batch with one poisoned file through it
+    /// (mirroring `chunked_batches_are_atomic_per_chunk`): a small chunk cap
+    /// must commit the chunks before the failure, while the default
+    /// (unchunked) cap commits nothing, since the whole batch is one
+    /// transaction. If the override became a no-op, both runs would behave
+    /// like the default cap and report the same file count.
+    #[test]
+    fn v2_chunk_bytes_override_changes_commit_granularity() {
+        let d = tempfile::tempdir().unwrap();
+        // Each source is 10 bytes; f2 is poisoned.
+        let srcs: Vec<String> = ["aaaaaaaaaa", "bbbbbbbbbb", "BADcccccc!", "dddddddddd"]
+            .map(String::from)
+            .to_vec();
+        let paths: Vec<String> = (0..4).map(|i| format!("f{i}.p")).collect();
+        let opts = graph_store::IndexOptions::default();
+
+        // Cap of 20 bytes: {f0, f1} commit as one chunk, then f2 fails and
+        // only its own chunk is lost; f3 is never reached.
+        let small = open_with_overrides(
+            Backend::RedbV2,
+            &d.path().join("small.redb"),
+            vec![Box::new(Poison)],
+            V2Overrides {
+                chunk_bytes: Some(20),
+                cache_bytes: None,
+            },
+        )
+        .unwrap();
+        assert!(small
+            .index_batch("o", "r", &batch(&srcs, &paths), opts)
+            .is_err());
+        let files_small: usize = small
+            .describe(None, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.files)
+            .sum();
+        assert_eq!(
+            files_small, 2,
+            "small --v2-chunk-bytes: earlier chunks stay committed"
+        );
+
+        // No override: the whole batch is one transaction, all or nothing.
+        let big = open_with_overrides(
+            Backend::RedbV2,
+            &d.path().join("big.redb"),
+            vec![Box::new(Poison)],
+            V2Overrides {
+                chunk_bytes: None,
+                cache_bytes: None,
+            },
+        )
+        .unwrap();
+        assert!(big
+            .index_batch("o", "r", &batch(&srcs, &paths), opts)
+            .is_err());
+        let files_big: usize = big
+            .describe(None, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.files)
+            .sum();
+        assert_eq!(
+            files_big, 0,
+            "no --v2-chunk-bytes override: one chunk, nothing stored"
+        );
+
+        assert_ne!(
+            files_small, files_big,
+            "the --v2-chunk-bytes override must change commit granularity, \
+             or the flag has become a silent no-op (issue #28)"
+        );
+    }
+}
