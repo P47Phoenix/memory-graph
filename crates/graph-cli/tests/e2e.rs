@@ -1699,3 +1699,71 @@ fn v1_database_without_catalog_is_upgraded_via_cli() {
         .map(|v| v.value());
     assert_eq!(v, Some(graph_store::SCHEMA_VERSION));
 }
+
+/// Slice 3o: `describe --json` surfaces a v2 repo's crashed/in-progress
+/// chunked-ingest batch (ADR 0003 story 3, decision D3, `RepoInfo::open_batch`).
+/// A real mid-batch process crash is impractical to script reliably in an
+/// e2e test, so this stamps the `open_batch`/`meta.open_batch_id` marker
+/// directly on a v2 database via redb, the same direct-table-write technique
+/// `v1_database_without_catalog_is_upgraded_via_cli` above already uses --
+/// exercising exactly what a reader observes on disk after a crash, without
+/// depending on a specific crash-timing mechanism.
+#[test]
+fn describe_json_surfaces_a_crashed_v2_batch() {
+    use redb::{Database, TableDefinition};
+    let d = tempfile::tempdir().unwrap();
+    let src = write_rust_repo(&d);
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, o, e) = run(&[
+        "--db",
+        &db,
+        "--backend",
+        "v2",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src.to_str().unwrap(),
+    ]);
+    assert!(ok, "{o}{e}");
+
+    // Before corruption: no open batch.
+    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "describe", "--json"]);
+    assert!(ok);
+    let before: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(before["repos"][0]["open_batch"], false);
+    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "describe"]);
+    assert!(ok && !out.contains("WARNING"), "{out}");
+
+    // Stamp the marker directly, as if a chunk committed mid-batch and the
+    // process died before the final, marker-clearing chunk.
+    let meta = TableDefinition::<&str, u64>::new("meta");
+    let open_batch = TableDefinition::<&str, &str>::new("open_batch");
+    {
+        let raw = Database::open(&db).unwrap();
+        let wt = raw.begin_write().unwrap();
+        {
+            wt.open_table(meta)
+                .unwrap()
+                .insert("open_batch_id", 0)
+                .unwrap();
+            let mut ob = wt.open_table(open_batch).unwrap();
+            ob.insert("org", "o").unwrap();
+            ob.insert("repo", "r").unwrap();
+        }
+        wt.commit().unwrap();
+    }
+
+    // After corruption: describe --json reports it, and human-readable
+    // describe prints the warning.
+    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "describe", "--json"]);
+    assert!(ok, "{err}");
+    let after: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(after["repos"][0]["open_batch"], true, "{after}");
+    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "describe"]);
+    assert!(
+        ok && out.contains("WARNING") && out.contains("o/r") && out.contains("incomplete ingest"),
+        "{out}{err}"
+    );
+}

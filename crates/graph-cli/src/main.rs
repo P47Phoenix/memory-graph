@@ -472,6 +472,14 @@ fn run() -> Result<()> {
             } else {
                 for i in &infos {
                     out!("{}/{}: {} files", i.org, i.repo, i.files);
+                    if i.open_batch {
+                        out!(
+                            "  WARNING: repo {}/{} has an incomplete ingest batch \
+                             (crashed or in-progress); re-index to repair",
+                            i.org,
+                            i.repo
+                        );
+                    }
                     for (l, li) in &i.languages {
                         out!(
                             "  {l}: {} files, {} symbols, {} tokens",

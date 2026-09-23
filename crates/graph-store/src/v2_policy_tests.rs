@@ -530,6 +530,74 @@ fn open_batch_marker_survives_a_mid_batch_abort() {
     );
 }
 
+/// Slice 3o: `describe`'s `RepoInfo::open_batch` reader surface for the D3
+/// marker. A batch killed mid-way (same poisoned-extractor technique as
+/// `open_batch_marker_survives_a_mid_batch_abort`) makes `describe` report
+/// `open_batch: true` for that org/repo, and self-heals -- a normal
+/// completing batch for the same org/repo afterward clears it again, with no
+/// repair command needed, matching the ADR's "self-healing" description.
+#[test]
+fn describe_reports_open_batch_after_a_crash_and_clears_it_after_a_completed_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("s.redb");
+    let srcs: Vec<String> = ["aaaaaaaaaa", "bbbbbbbbbb", "BADcccccc!", "dddddddddd"]
+        .map(String::from)
+        .to_vec();
+    let ps = paths(4, "p");
+    let mut s = V2Store::open(&p).unwrap();
+    s.register(Box::new(Poison));
+    s.set_chunk_bytes(20);
+    assert!(
+        V2Store::index_batch(&s, "o", "r", &batch(&srcs, &ps), IndexOptions::default()).is_err()
+    );
+    drop(s);
+
+    let reopened = V2Store::open(&p).unwrap();
+    let infos = reopened.describe(None, None).unwrap();
+    let r = infos.iter().find(|i| i.org == "o" && i.repo == "r");
+    assert!(
+        r.is_some_and(|r| r.open_batch),
+        "describe should report the crashed batch's repo as open_batch: true"
+    );
+
+    // Self-healing: a normal batch for the SAME org/repo (not a repair
+    // command) clears the marker on its own completion.
+    drop(reopened);
+    let mut healer = V2Store::open(&p).unwrap();
+    healer.register(Box::new(Poison));
+    V2Store::index_batch(
+        &healer,
+        "o",
+        "r",
+        &batch(&[srcs[0].clone()], &[ps[0].clone()]),
+        IndexOptions::default(),
+    )
+    .unwrap()
+    .into_iter()
+    .for_each(|r| {
+        r.unwrap();
+    });
+    let infos = healer.describe(None, None).unwrap();
+    let r = infos.iter().find(|i| i.org == "o" && i.repo == "r");
+    assert!(
+        r.is_some_and(|r| !r.open_batch),
+        "a completed batch for the same org/repo self-heals the marker"
+    );
+}
+
+/// v1 has no chunked-batch marker at all: `describe` must unconditionally
+/// report `open_batch: false`, never error looking for a table that does not
+/// exist in the v1 layout.
+#[test]
+fn v1_describe_always_reports_open_batch_false() {
+    let d = tempfile::tempdir().unwrap();
+    let s = crate::RedbStore::open(d.path().join("v1.redb")).unwrap();
+    s.index_bytes("o", "r", "x.p", b"aaa", None).unwrap();
+    let infos = s.describe(None, None).unwrap();
+    assert_eq!(infos.len(), 1);
+    assert!(!infos[0].open_batch, "v1 never reports an open batch");
+}
+
 mod consistency {
     use super::*;
     use graph_core::{Span, SymbolDecl, TokenClass, TokenDecl};
