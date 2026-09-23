@@ -323,7 +323,7 @@ mod ranged_children {
     /// deduplicated and sorted so overlapping/duplicate spans (which
     /// `ingest_file` rejects, changing nothing) are rare, keeping most cases
     /// dense and worth differentially checking.
-    fn corpus() -> impl Strategy<Value = (usize, Vec<(usize, usize)>)> {
+    pub(super) fn corpus() -> impl Strategy<Value = (usize, Vec<(usize, usize)>)> {
         (1usize..60).prop_flat_map(|n| {
             (
                 Just(n),
@@ -332,7 +332,7 @@ mod ranged_children {
         })
     }
 
-    fn build(n: usize, syms: &[(usize, usize)]) -> graph_core::Extraction {
+    pub(super) fn build(n: usize, syms: &[(usize, usize)]) -> graph_core::Extraction {
         let tokens: Vec<TokenDecl> = (0..n)
             .map(|i| TokenDecl {
                 text: format!("t{i}"),
@@ -882,6 +882,56 @@ fn a_zero_width_top_level_symbol_beats_a_top_level_token_at_the_same_start() {
         v.children(file).unwrap(),
         v.children_via_fallback_file(file).unwrap()
     );
+}
+
+/// Issue #39: slice 3j (file-level `children`/`descendants`) relied solely
+/// on this repo's own 27-file corpus (`ranged_children_match_fallback_on_this_repos_own_corpus_at_file_level`)
+/// for its differential coverage, unlike slice 3i's symbol-level equivalent
+/// (`ranged_children::range_based_and_fallback_agree_on_every_symbol`),
+/// which additionally runs a 200-case generated-corpus proptest. This is the
+/// file-level analog of that proptest: generates the same kind of
+/// nested/disjoint symbol+token corpora (via `ranged_children`'s own
+/// `corpus`/`build` helpers, so both levels are checked against exactly the
+/// same distribution of shapes) and compares `children(file)`/
+/// `descendants(file)` (the range-based `children_ranged_file`/
+/// `descendants_ranged_file` path) against the literal pre-3j fallback.
+mod ranged_children_file_level {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn file_id(v: &V2Store, path: &str) -> Option<NodeId> {
+        let toks = v.file_tokens("o", "r", path).unwrap()?;
+        let any = toks.first()?.id;
+        Some((any >> 32) & 0x3fff_ffff)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+        /// For every generated file, the range-based `children(file)`/
+        /// `descendants(file)` and the literal pre-3j fallback return
+        /// identical `Vec<Node>` (same ids, order and spans) -- including
+        /// when the file has no top-level symbols at all (an all-tokens
+        /// file, or an empty one), which exercises the pure-gap path.
+        #[test]
+        fn range_based_and_fallback_agree_on_every_file(
+            (n, syms) in super::ranged_children::corpus()
+        ) {
+            let d = tempfile::tempdir().unwrap();
+            let v = V2Store::open(d.path().join("r.redb")).unwrap();
+            let ex = super::ranged_children::build(n, &syms);
+            v.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+            if let Some(file) = file_id(&v, "x.rs") {
+                prop_assert_eq!(
+                    v.children(file).unwrap(),
+                    v.children_via_fallback_file(file).unwrap()
+                );
+                prop_assert_eq!(
+                    v.descendants(file).unwrap(),
+                    v.descendants_via_fallback_file(file).unwrap()
+                );
+            }
+        }
+    }
 }
 
 #[test]
