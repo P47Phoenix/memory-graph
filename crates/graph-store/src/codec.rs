@@ -1988,5 +1988,52 @@ mod props {
             let decoded = decode(&b).unwrap();
             prop_assert_eq!(&decoded, &stream);
         }
+
+        /// Issue #51 (story 6 follow-up): `posting_ordinals` must never panic
+        /// or read out of bounds on arbitrary/corrupted bytes -- only ever
+        /// return valid, ascending ordinals or a clean `StoreError`. This
+        /// covers the case the golden round-trip test
+        /// (`posting_block_format_is_pinned`) and the differential harness
+        /// don't: bytes that were never produced by `encode_posting` at all.
+        #[test]
+        fn posting_ordinals_never_panics_on_arbitrary_bytes(b in prop::collection::vec(any::<u8>(), 0..256)) {
+            match posting_ordinals(&b) {
+                Ok(ords) => {
+                    // Whatever it decoded, it must be a well-formed posting:
+                    // strictly ascending ordinals.
+                    for w in ords.windows(2) {
+                        prop_assert!(w[1] > w[0]);
+                    }
+                }
+                Err(_) => {
+                    // A clean, typed error is fine -- that's the point.
+                }
+            }
+        }
+
+        /// Same property, but biased toward bytes that *look* like a posting
+        /// (small varints, plausible block-length/byte-length pairs) rather
+        /// than fully random noise, to more often reach the deeper block-body
+        /// parsing paths instead of failing on the first varint.
+        #[test]
+        fn posting_ordinals_never_panics_on_posting_shaped_bytes(
+            n_field in 0u8..10,
+            blocks in prop::collection::vec(
+                (0u8..10, 0u8..40, prop::collection::vec(any::<u8>(), 0..20)),
+                0..5,
+            ),
+        ) {
+            let mut b = vec![n_field];
+            for (block_len, block_bytes, body) in blocks {
+                b.push(block_len);
+                b.push(block_bytes);
+                b.extend_from_slice(&body);
+            }
+            if let Ok(ords) = posting_ordinals(&b) {
+                for w in ords.windows(2) {
+                    prop_assert!(w[1] > w[0]);
+                }
+            }
+        }
     }
 }

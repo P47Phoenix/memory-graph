@@ -13,7 +13,7 @@
 //! `cargo run --release -p graph-store --example block_postings_100m [-- <target_tokens>]`
 //! Default target is 100_000_000.
 
-use graph_store::codec::{encode_posting, POSTING_BLOCK};
+use graph_store::{encode_posting, POSTING_BLOCK};
 
 /// Frozen copy of the pre-story-6 flat delta-varint posting encoding (one
 /// running delta chain across the whole posting, no blocks), for comparison.
