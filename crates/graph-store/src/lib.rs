@@ -15,6 +15,7 @@ use std::path::Path;
 mod api;
 mod codec;
 pub mod conformance;
+pub mod migrate;
 mod v2;
 pub use api::{detect_backend, open_store, Backend, Store, StoreRead};
 pub use v2::{CompactStats, V2Snapshot, V2Store, VacuumStats};
@@ -80,6 +81,12 @@ pub enum StoreError {
     Schema(graph_core::SchemaError),
     #[error("storage error: {0}")]
     Storage(String),
+    /// `migrate`'s differential verification (ADR 0003 story 12) found the
+    /// candidate store disagreeing with the source on some query; the
+    /// message names the query. The candidate is never renamed into place
+    /// when this is returned.
+    #[error("migration verification failed: {0}")]
+    VerificationFailed(String),
 }
 
 impl<E: Into<redb::Error>> From<E> for StoreError {
@@ -888,6 +895,21 @@ impl RedbStore {
             }
         }
         Ok(n)
+    }
+
+    /// Every top-level (parent-less) node: one per org. See
+    /// `StoreRead::roots` (ADR 0003 story 12).
+    fn roots_in(rt: &ReadTransaction) -> Result<Vec<Node>> {
+        let t = rt.open_table(NODES)?;
+        let mut out = Vec::new();
+        for r in t.iter()? {
+            let n = dec(r?.1.value())?;
+            if n.kind == NodeKind::Org && n.parent.is_none() {
+                out.push(n);
+            }
+        }
+        out.sort_by_key(|n| n.id);
+        Ok(out)
     }
 
     /// `ingest_file` that also sets the file's `origin` (see `Node::origin`).
