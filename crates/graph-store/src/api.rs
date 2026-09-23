@@ -125,7 +125,9 @@ pub trait StoreRead {
     /// handle as earlier pages reads the same frozen transaction, so a writer
     /// running concurrently cannot change, add to or shrink a page already
     /// handed out or one fetched later in the same paging sequence -- proven
-    /// by `conformance::paging_is_snapshot_consistent`. The default
+    /// by `v2_tests::paging_is_snapshot_consistent_across_concurrent_writes`
+    /// (run against both backends via `both_backends()`, despite the v2-only
+    /// module it lives in). The default
     /// implementation is built on `children`, which is in-memory per backend
     /// today (see the crate's `CLAUDE.md` v1/v2 notes); it is still snapshot-
     /// correct, just not yet lazy/streaming -- a future backend may override

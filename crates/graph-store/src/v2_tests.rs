@@ -1301,6 +1301,15 @@ fn paging_children_covers_every_item_once_in_order() {
         // Past the end: empty, has_more false.
         let past = s.children_page(file, 10_000, 10).unwrap();
         assert!(past.items.is_empty() && !past.has_more);
+
+        // limit:0 mid-list: empty items, but has_more is true -- it still
+        // reflects whether more data exists behind this (empty) page, not
+        // whether this call returned anything.
+        let zero = s.children_page(file, 0, 0).unwrap();
+        assert!(zero.items.is_empty() && zero.has_more);
+        // limit:0 past the end: empty items, has_more false (no data left).
+        let zero_past = s.children_page(file, 10_000, 0).unwrap();
+        assert!(zero_past.items.is_empty() && !zero_past.has_more);
     }
 }
 
