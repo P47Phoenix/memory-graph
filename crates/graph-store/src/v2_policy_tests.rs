@@ -531,6 +531,65 @@ fn open_batch_marker_survives_a_mid_batch_abort() {
     );
 }
 
+/// Reads `meta.next_batch_id` directly, bypassing any store API -- the same
+/// technique as `open_batch_marker` -- so the test observes the raw counter
+/// a batch's id was allocated from (see `V2Store::next_batch_id`).
+fn next_batch_id_counter(s: &V2Store) -> u64 {
+    let rt = s.db.begin_read().unwrap();
+    let meta = rt.open_table(META).unwrap();
+    meta.get("next_batch_id").unwrap().map_or(0, |v| v.value())
+}
+
+/// Issue #46: `batch_id` (`meta.next_batch_id`, ADR 0003 story 3 slice 3n)
+/// must be monotonic and non-colliding across a store *reopen*, not just
+/// within one process's lifetime -- a gap a PR #45 QA mutation test found
+/// (hardcoding batch_id to a static value passes every pre-existing test).
+/// This writes a batch, closes and reopens the store, then writes a second
+/// batch, and asserts the counter strictly increased and the two batches'
+/// ids don't collide: exactly the scenario slice 3o's future
+/// open-batch-vs-new-batch reader will need to be able to trust.
+#[test]
+fn batch_id_is_monotonic_and_does_not_collide_across_a_store_reopen() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("s.redb");
+
+    let srcs: Vec<String> = (0..3).map(|i| format!("aaa{i}")).collect();
+    let ps = paths(3, "p");
+
+    let s1 = V2Store::open(&p).unwrap();
+    V2Store::index_batch(&s1, "o", "r", &batch(&srcs, &ps), IndexOptions::default()).unwrap();
+    let id_after_first = next_batch_id_counter(&s1);
+    assert_eq!(
+        id_after_first, 1,
+        "first batch in a fresh store is allocated id 0, so the counter is 1 after it completes"
+    );
+    drop(s1);
+
+    let s2 = V2Store::open(&p).unwrap();
+    assert_eq!(
+        next_batch_id_counter(&s2),
+        id_after_first,
+        "reopening a store must not reset the batch id counter"
+    );
+    let srcs2: Vec<String> = (0..3).map(|i| format!("bbb{i}")).collect();
+    let ps2 = paths(3, "q");
+    V2Store::index_batch(&s2, "o", "r", &batch(&srcs2, &ps2), IndexOptions::default()).unwrap();
+    let id_after_second = next_batch_id_counter(&s2);
+
+    assert!(
+        id_after_second > id_after_first,
+        "batch id counter must strictly increase across a reopen: {id_after_first} -> {id_after_second}"
+    );
+    // The id actually allocated to each batch is (counter after it) - 1;
+    // assert those two allocated ids don't collide.
+    let first_batch_id = id_after_first - 1;
+    let second_batch_id = id_after_second - 1;
+    assert_ne!(
+        first_batch_id, second_batch_id,
+        "the second batch must not reuse the first batch's id after a reopen"
+    );
+}
+
 /// Slice 3o: `describe`'s `RepoInfo::open_batch` reader surface for the D3
 /// marker. A batch killed mid-way (same poisoned-extractor technique as
 /// `open_batch_marker_survives_a_mid_batch_abort`) makes `describe` report

@@ -13,15 +13,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 mod api;
-/// Block/varint stream and posting codec. Public so benchmarks (e.g.
-/// `examples/block_postings_100m.rs`, ADR 0003 story 6) can measure
-/// `encode_posting`/`POSTING_BLOCK` directly without going through a full
-/// store; not part of the store's query API.
-pub mod codec;
+/// Block/varint stream and posting codec. Crate-internal implementation
+/// detail of the v2 backend (ADR 0003), not part of the store's query API
+/// (issue #50: this was `pub mod codec` until pre-1.0 cleanup narrowed it).
+/// The few items benchmarks genuinely need (`encode_posting`, `POSTING_BLOCK`,
+/// ADR 0003 story 6) are re-exported individually below instead.
+pub(crate) mod codec;
 pub mod conformance;
 pub mod migrate;
 mod v2;
 pub use api::{detect_backend, open_store, Backend, Page, SnapshotStats, Store, StoreRead};
+pub use codec::{encode_posting, POSTING_BLOCK};
 pub use v2::{CompactStats, V2Snapshot, V2Store, VacuumStats};
 
 /// On-disk layout version written by this build. It is 2 because databases
