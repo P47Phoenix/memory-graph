@@ -2049,7 +2049,7 @@ fn v1_and_v2_files_refuse_each_other_untouched() {
     ));
     assert!(matches!(
         open_store(Backend::Redb, &p2, vec![]),
-        Err(StoreError::SchemaMismatch { found: 5 })
+        Err(StoreError::SchemaMismatch { found: 6 })
     ));
     assert_eq!(std::fs::read(&p1).unwrap(), before, "v1 file untouched");
     // Reopening v2 keeps its data.

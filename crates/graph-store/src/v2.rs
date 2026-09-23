@@ -31,7 +31,8 @@ use graph_core::{
     Registry, SymbolKind,
 };
 use redb::{
-    Database, DatabaseError, ReadTransaction, ReadableMultimapTable, ReadableTable, TableDefinition,
+    Database, DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableMultimapTable,
+    ReadableTable, TableDefinition,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -41,16 +42,36 @@ use std::rc::Rc;
 type Result<T> = std::result::Result<T, StoreError>;
 
 /// Layout version of a v2 file (v1 is 1 and 2).
-pub const V2_SCHEMA_VERSION: u64 = 5;
+pub const V2_SCHEMA_VERSION: u64 = 6;
 
 /// term text -> term id.
 pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
 /// term id -> term text.
 const DICT_REV: TableDefinition<u64, &str> = TableDefinition::new("dict_rev");
 /// file id -> encoded stream.
-const STREAMS: TableDefinition<u64, &[u8]> = TableDefinition::new("stream");
+pub(crate) const STREAMS: TableDefinition<u64, &[u8]> = TableDefinition::new("stream");
 /// (term id, file id) -> occurrence count and token ordinals (see `codec::encode_posting`).
 const POST: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("post");
+/// content id -> refcount (ADR 0003 story 3, Q2). While content sharing
+/// (story 18) is off, `content_id == file id` (see [`content_id`]), so a live
+/// file's refcount is always exactly 1; this table and `CONTENT_FILES` exist
+/// from day one so enabling fan-out later is not a format change.
+pub(crate) const REFS: TableDefinition<u64, u64> = TableDefinition::new("refs");
+/// content id -> the file ids currently sharing that content.
+pub(crate) const CONTENT_FILES: MultimapTableDefinition<u64, u64> =
+    MultimapTableDefinition::new("content_files");
+
+/// The content id backing `file`'s stream/postings/symbol-index rows. Today
+/// this is the identity (content sharing is off, ADR 0003 story 3 Q2: "skipped
+/// unchanged files never touch refcounts", and every ingested file owns its
+/// content alone), so a file's refcount is always exactly 1. This function is
+/// the seam for story 18's future content-sharing fan-out (dedup by digest):
+/// when that lands, only this function's body changes -- every refs/
+/// content_files caller already goes through it instead of using `file`
+/// directly as the content key.
+fn content_id(file: u64) -> u64 {
+    file
+}
 
 /// Term-length policy (ADR 0003 story 3). The dictionary keeps a term inline
 /// as its own key while it is at most this many bytes and does not start
@@ -158,6 +179,13 @@ pub(crate) struct R {
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
     cat: redb::ReadOnlyTable<&'static str, u64>,
     kids: redb::ReadOnlyMultimapTable<u64, u64>,
+    // Read only by `check_consistency` today (no read-path query needs
+    // per-content refcounts yet); kept on `R` rather than opened ad hoc so
+    // that seam stays in one place alongside the other derived tables.
+    #[allow(dead_code)]
+    pub(crate) refs: redb::ReadOnlyTable<u64, u64>,
+    #[allow(dead_code)]
+    pub(crate) content_files: redb::ReadOnlyMultimapTable<u64, u64>,
     /// Per-query caches: dictionary texts and org/repo rows are read once.
     texts: RefCell<HashMap<u64, Rc<str>>>,
     ents: RefCell<HashMap<u64, Rc<Node>>>,
@@ -282,6 +310,8 @@ impl R {
             post: rt.open_table(POST)?,
             sym_idx: rt.open_multimap_table(SYMBOLS)?,
             cat: rt.open_table(CATALOG)?,
+            refs: rt.open_table(REFS)?,
+            content_files: rt.open_multimap_table(CONTENT_FILES)?,
         })
     }
 
@@ -1316,6 +1346,8 @@ struct W<'t> {
     post: redb::Table<'t, (u64, u64), &'static [u8]>,
     sym_idx: redb::MultimapTable<'t, &'static str, u64>,
     cat: redb::Table<'t, &'static str, u64>,
+    refs: redb::Table<'t, u64, u64>,
+    content_files: redb::MultimapTable<'t, u64, u64>,
 }
 
 impl<'t> W<'t> {
@@ -1331,6 +1363,8 @@ impl<'t> W<'t> {
             post: wt.open_table(POST)?,
             sym_idx: wt.open_multimap_table(SYMBOLS)?,
             cat: wt.open_table(CATALOG)?,
+            refs: wt.open_table(REFS)?,
+            content_files: wt.open_multimap_table(CONTENT_FILES)?,
         })
     }
 
@@ -1403,14 +1437,40 @@ impl<'t> W<'t> {
         Ok(())
     }
 
-    /// Delete a file's stream, postings and symbol index entries (not its
-    /// entity row, name or catalog file count).
+    /// Decrement `file`'s content refcount and drop its `content_files`
+    /// entry; delete its stream, postings and symbol index entries (not its
+    /// entity row, name or catalog file count) only once the refcount
+    /// reaches zero. Today `content_id(file) == file`, so the refcount is
+    /// always exactly 1 before this call and the delete always happens
+    /// immediately -- this is the seam for story 18's future
+    /// content-sharing fan-out, not a functional change yet.
     fn remove_content(&mut self, file: u64, scope: &Scope, tally: &mut Tally) -> Result<()> {
-        let Some(raw) = self.streams.remove(file)? else {
+        let Some(raw) = self.streams.get(file)? else {
             return Ok(());
         };
         let s = codec::decode(raw.value())?;
         drop(raw);
+
+        let cid = content_id(file);
+        self.content_files.remove(cid, file)?;
+        let count = self.refs.get(cid)?.map(|v| v.value()).unwrap_or(0);
+        // A stream row implies a live refs entry (both are written together
+        // in `ingest_validated`); an underflow here would mean the two
+        // tables have already drifted apart, which is a bug, not a runtime
+        // condition to handle -- `saturating_sub` still keeps release builds
+        // safe if it ever does.
+        debug_assert!(
+            count > 0,
+            "refs underflow: content id {cid} (file {file}) had refcount 0 before decrement"
+        );
+        let remaining = count.saturating_sub(1);
+        if remaining > 0 {
+            self.refs.insert(cid, remaining)?;
+            return Ok(());
+        }
+        self.refs.remove(cid)?;
+
+        self.streams.remove(file)?;
         self.tally_stream(tally, scope, file, &s, -1)?;
         let mut terms: HashSet<u64> = HashSet::new();
         for t in &s.tokens {
@@ -1442,6 +1502,8 @@ impl V2Store {
         let mut want_post: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
         let mut want_sym: BTreeSet<(String, u64)> = BTreeSet::new();
         let mut used: HashSet<u64> = HashSet::new();
+        let mut want_refs: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut want_content_files: BTreeSet<(u64, u64)> = BTreeSet::new();
         for row in r.streams.iter().unwrap() {
             let (file, bytes) = row.unwrap();
             let file = file.value();
@@ -1460,7 +1522,26 @@ impl V2Store {
                 used.insert(sy.name);
                 used.extend(sy.lang_kind);
             }
+            // Every live stream owns exactly one refcount (content sharing
+            // is off, so `content_id(file) == file`) and one `content_files`
+            // entry pointing back at it.
+            *want_refs.entry(content_id(file)).or_default() += 1;
+            want_content_files.insert((content_id(file), file));
         }
+        let mut got_refs: BTreeMap<u64, u64> = BTreeMap::new();
+        for row in r.refs.iter().unwrap() {
+            let (k, v) = row.unwrap();
+            got_refs.insert(k.value(), v.value());
+        }
+        assert_eq!(got_refs, want_refs, "refs");
+        let mut got_content_files: BTreeSet<(u64, u64)> = BTreeSet::new();
+        for row in r.content_files.iter().unwrap() {
+            let (k, vals) = row.unwrap();
+            for v in vals {
+                got_content_files.insert((k.value(), v.unwrap().value()));
+            }
+        }
+        assert_eq!(got_content_files, want_content_files, "content_files");
         let mut got_post = BTreeMap::new();
         for row in r.post.iter().unwrap() {
             let (k, v) = row.unwrap();
@@ -1646,6 +1727,32 @@ impl V2Store {
         wt.commit().unwrap();
     }
 
+    /// Test hook: make `file`'s content id an *extra* reference on
+    /// `sharing_file`'s already-ingested content (bumping `refs[content_id
+    /// (sharing_file)]` and adding a `content_files` entry for `file`),
+    /// without actually re-ingesting `file`'s stream under that id. This is
+    /// the only way to exercise `remove_content`'s refcount-gated (not
+    /// immediate) delete branch before story 18's real content-sharing
+    /// fan-out exists: today `content_id(file) == file` always, so every
+    /// real refcount is always exactly 1 and "decrement then delete only at
+    /// zero" is otherwise indistinguishable from "always delete" (found by
+    /// QA review, PR #42).
+    #[cfg(test)]
+    pub(crate) fn inject_extra_content_ref(&self, file: u64, sharing_file: u64) {
+        let cid = content_id(sharing_file);
+        let wt = self.db.begin_write().unwrap();
+        {
+            let mut refs = wt.open_table(REFS).unwrap();
+            let count = refs.get(cid).unwrap().map(|v| v.value()).unwrap_or(0);
+            refs.insert(cid, count + 1).unwrap();
+            wt.open_multimap_table(CONTENT_FILES)
+                .unwrap()
+                .insert(cid, file)
+                .unwrap();
+        }
+        wt.commit().unwrap();
+    }
+
     /// Open or create a v2 database file. Refuses (without writing) a file
     /// that is not v2: a v1 file must be re-indexed or migrated (ADR story 12).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -1704,6 +1811,8 @@ impl V2Store {
                     wt.open_table(POST)?;
                     wt.open_multimap_table(CHILDREN)?;
                     wt.open_multimap_table(SYMBOLS)?;
+                    wt.open_table(REFS)?;
+                    wt.open_multimap_table(CONTENT_FILES)?;
                 }
                 wt.commit()?;
             }
@@ -1907,6 +2016,22 @@ impl V2Store {
                     for row in rt.open_table(POST)?.iter()? {
                         let (k, v) = row?;
                         w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_table(REFS)?;
+                    for row in rt.open_table(REFS)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
+                {
+                    let mut w = wt.open_multimap_table(CONTENT_FILES)?;
+                    for row in rt.open_multimap_table(CONTENT_FILES)?.iter()? {
+                        let (k, vals) = row?;
+                        for v in vals {
+                            w.insert(k.value(), v?.value())?;
+                        }
                     }
                 }
                 wt.commit()?;
@@ -2312,6 +2437,14 @@ impl V2Store {
         }
         w.streams
             .insert(file_id, codec::encode(&stream).as_slice())?;
+        // Install the refcount/content_files seam (ADR 0003 story 3, Q2): the
+        // count is always 1 today because `content_id` is the identity while
+        // content sharing (story 18) is off, but every write goes through
+        // these two tables now so enabling fan-out later needs no format
+        // change here.
+        let cid = content_id(file_id);
+        w.refs.insert(cid, 1)?;
+        w.content_files.insert(cid, file_id)?;
         w.tally_stream(&mut tally, &scope, file_id, &stream, 1)?;
         w.meta.insert("next_id", next)?;
         w.meta.insert("next_term", next_term)?;

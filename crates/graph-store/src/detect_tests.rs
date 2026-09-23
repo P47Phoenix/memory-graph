@@ -59,14 +59,14 @@ fn held_lock_is_locked() {
 #[test]
 fn schema_versions_map_to_backends() {
     let d = tempfile::tempdir().unwrap();
-    for (v, want) in [(1, Backend::Redb), (2, Backend::Redb), (5, Backend::RedbV2)] {
+    for (v, want) in [(1, Backend::Redb), (2, Backend::Redb), (6, Backend::RedbV2)] {
         let p = d.path().join(format!("v{v}"));
         make(&p, Some(v));
         let before = digest(&p);
         assert_eq!(detect_backend(&p).unwrap(), Some((want, v)), "v{v}");
         assert_eq!(digest(&p), before, "v{v} bytes");
     }
-    for v in [0, 3, 4] {
+    for v in [0, 3, 4, 5] {
         let p = d.path().join(format!("bad{v}"));
         make(&p, Some(v));
         let before = digest(&p);
