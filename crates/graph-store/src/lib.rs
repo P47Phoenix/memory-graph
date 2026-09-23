@@ -21,7 +21,7 @@ pub mod codec;
 pub mod conformance;
 pub mod migrate;
 mod v2;
-pub use api::{detect_backend, open_store, Backend, Store, StoreRead};
+pub use api::{detect_backend, open_store, Backend, SnapshotStats, Store, StoreRead};
 pub use v2::{CompactStats, V2Snapshot, V2Store, VacuumStats};
 
 /// On-disk layout version written by this build. It is 2 because databases
@@ -91,6 +91,17 @@ pub enum StoreError {
     /// when this is returned.
     #[error("migration verification failed: {0}")]
     VerificationFailed(String),
+    /// A snapshot handle (ADR 0003 story 10, [`Store::snapshot`]) was used
+    /// past its configured max age. Returned by every read made through an
+    /// expired handle (checked on each call, not only when the snapshot was
+    /// issued -- see the doc comment on [`Store::snapshot`]), never by a
+    /// fresh call to `snapshot()` itself. Only backends that track snapshot
+    /// age return this; a backend whose `Store::snapshot_stats` stays at its
+    /// default (v1 today) never does.
+    #[error(
+        "snapshot expired after {age_secs}s (max age {max_age_secs}s); open a new snapshot with Store::snapshot"
+    )]
+    SnapshotExpired { age_secs: u64, max_age_secs: u64 },
 }
 
 impl<E: Into<redb::Error>> From<E> for StoreError {

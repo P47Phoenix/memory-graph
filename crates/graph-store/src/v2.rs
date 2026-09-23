@@ -19,7 +19,7 @@
 //! The on-disk file is stamped `schema_version` 3, so v1 builds refuse it and
 //! this backend refuses a v1 file, in both cases before writing anything.
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
-use crate::{dec, enc, RedbStore, Store, StoreRead};
+use crate::{dec, enc, RedbStore, SnapshotStats, Store, StoreRead};
 use crate::{
     kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile, Grain, Hit,
     IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit, SymbolQuery, Tally,
@@ -34,10 +34,12 @@ use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableMultimapTable,
     ReadableTable, ReadableTableMetadata, TableDefinition,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, StoreError>;
 
@@ -265,6 +267,29 @@ pub struct CompactStats {
 /// docs on the `Store` impl for the semantics).
 pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
 
+/// Default max snapshot age (ADR 0003 story 10, Q6's decision): a snapshot
+/// handle older than this refuses reads with `StoreError::SnapshotExpired`.
+/// Configurable per store via [`V2Store::set_max_snapshot_age`].
+pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Fraction of the max age at which a snapshot logs one age warning to
+/// stderr (ADR 0003 Q6: "a warning is emitted at 50% of the limit"), the
+/// same `eprintln!` convention `V2Store::open`'s self-heal notice already
+/// uses -- this crate has no logging dependency.
+const SNAPSHOT_WARN_FRACTION: f64 = 0.5;
+
+/// Per-store bookkeeping for currently open snapshot handles (ADR 0003
+/// story 10 observability): every `V2Snapshot` registers itself here on
+/// creation and deregisters on drop, so `V2Store::snapshot_stats` can report
+/// the live count and the oldest handle's age without scanning anything.
+#[derive(Default)]
+struct SnapshotTracker {
+    next_id: u64,
+    open: HashMap<u64, Instant>,
+}
+
+type SharedSnapshotTracker = Arc<Mutex<SnapshotTracker>>;
+
 /// The v2 backend: one redb file.
 pub struct V2Store {
     pub(crate) db: Database,
@@ -272,10 +297,76 @@ pub struct V2Store {
     pub(crate) chunk_bytes: usize,
     pub(crate) cache_bytes: Option<usize>,
     path: PathBuf,
+    max_snapshot_age: Duration,
+    snapshot_tracker: SharedSnapshotTracker,
 }
 
 pub struct V2Snapshot {
     rt: ReadTransaction,
+    tracker: SharedSnapshotTracker,
+    tracker_id: u64,
+    created_at: Instant,
+    max_age: Duration,
+    /// Set once the 50%-of-max-age warning has fired for this handle, so it
+    /// logs at most once per snapshot rather than once per read.
+    warned: Cell<bool>,
+}
+
+impl Drop for V2Snapshot {
+    fn drop(&mut self) {
+        // A poisoned lock still lets us recover the map and finish the
+        // deregistration; a snapshot's own read transaction is unaffected
+        // by a panic in some other thread's snapshot bookkeeping.
+        let mut t = self
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.open.remove(&self.tracker_id);
+    }
+}
+
+impl V2Snapshot {
+    /// Checked at the top of every `StoreRead` method (see the
+    /// `store_read!` macro): a snapshot past `max_age` refuses the read with
+    /// `SnapshotExpired` rather than only checking once, at `snapshot()`
+    /// time. This matters because a snapshot is meant to be held across
+    /// multiple calls (ADR 0003 story 11, paging/traversal); checking only
+    /// at issuance would let a long-held handle silently keep reading a
+    /// frozen view well past the configured limit, defeating the point of
+    /// having one. A snapshot that has passed 50% of its max age (but not
+    /// yet expired) logs one warning, per ADR 0003 Q6.
+    fn check_not_expired(&self) -> Result<()> {
+        let age = self.created_at.elapsed();
+        if age >= self.max_age {
+            return Err(StoreError::SnapshotExpired {
+                age_secs: age.as_secs(),
+                max_age_secs: self.max_age.as_secs(),
+            });
+        }
+        if !self.warned.get()
+            && age.as_secs_f64() >= self.max_age.as_secs_f64() * SNAPSHOT_WARN_FRACTION
+        {
+            self.warned.set(true);
+            eprintln!(
+                "memory-graph: v2 snapshot age {}s has passed {:.0}% of its {}s max age; \
+                 it will start refusing reads with SnapshotExpired once it reaches the limit",
+                age.as_secs(),
+                SNAPSHOT_WARN_FRACTION * 100.0,
+                self.max_age.as_secs(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl V2Store {
+    /// No-op: only snapshot *handles* age out, not the store's own
+    /// always-current read path. Same name and signature as
+    /// `V2Snapshot::check_not_expired` so the `store_read!` macro can call
+    /// `$s.check_not_expired()` on either type.
+    fn check_not_expired(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Read side over one read transaction.
@@ -2052,6 +2143,8 @@ impl V2Store {
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             cache_bytes,
             path: path.as_ref().to_path_buf(),
+            max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
+            snapshot_tracker: Arc::new(Mutex::new(SnapshotTracker::default())),
         })
     }
 
@@ -2061,6 +2154,15 @@ impl V2Store {
     /// so one file larger than the cap is a chunk of its own.
     pub fn set_chunk_bytes(&mut self, bytes: usize) {
         self.chunk_bytes = bytes.max(1);
+    }
+
+    /// Set the max age (ADR 0003 story 10, Q6) a snapshot handle from
+    /// `snapshot()` may live before reads through it start returning
+    /// `StoreError::SnapshotExpired`. Applies only to snapshots taken after
+    /// this call; already-open handles keep the max age they were created
+    /// with. Default [`DEFAULT_MAX_SNAPSHOT_AGE`] (15 minutes).
+    pub fn set_max_snapshot_age(&mut self, max_age: Duration) {
+        self.max_snapshot_age = max_age;
     }
 
     /// Garbage-collect the dictionary (ADR story 3): remove every term that
@@ -2198,6 +2300,8 @@ impl V2Store {
             chunk_bytes,
             cache_bytes,
             path,
+            max_snapshot_age,
+            snapshot_tracker: _,
         } = self;
 
         let before_bytes = std::fs::metadata(&path).map_err(io)?.len();
@@ -2336,6 +2440,11 @@ impl V2Store {
         let mut reopened = Self::open_with_cache_bytes(&path, cache_bytes)?;
         reopened.chunk_bytes = chunk_bytes;
         reopened.registry = registry;
+        // Any snapshot handles taken on the pre-compaction store are already
+        // invalidated by construction (`compact` consumes `self`, so no
+        // caller can still hold one); the reopened store's tracker starts
+        // empty and carries over only the configured max age.
+        reopened.max_snapshot_age = max_snapshot_age;
         let after_bytes = std::fs::metadata(&path).map_err(io)?.len();
         Ok((
             reopened,
@@ -2796,46 +2905,55 @@ macro_rules! store_read {
         impl StoreRead for $ty {
             fn get(&self, id: NodeId) -> Result<Option<Node>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.get(id)
             }
             fn parent(&self, id: NodeId) -> Result<Option<Node>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.parent(id)
             }
             fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.count_nodes(kind)
             }
             fn roots(&self) -> Result<Vec<Node>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.roots()
             }
             fn children(&self, id: NodeId) -> Result<Vec<Node>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.children(id)
             }
             fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.descendants(id)
             }
             fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.ancestors(id)
             }
             fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.file_tokens(org, repo, path)
             }
             fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 RedbStore::describe_in(&g, org, repo)
             }
@@ -2845,16 +2963,19 @@ macro_rules! store_read {
                 repo: Option<&str>,
             ) -> Result<Vec<RepoInfo>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.describe_by_scan(org, repo)
             }
             fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.search_symbols(q)
             }
             fn search(&self, q: &Query) -> Result<Vec<Hit>> {
                 let $s = self;
+                $s.check_not_expired()?;
                 let g = $rt;
                 R::new(&g)?.search(q)
             }
@@ -2867,9 +2988,38 @@ store_read!(V2Snapshot, |s| &s.rt);
 
 impl Store for V2Store {
     fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>> {
+        let rt = self.db.begin_read()?;
+        let created_at = Instant::now();
+        let tracker_id = {
+            let mut t = self
+                .snapshot_tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let id = t.next_id;
+            t.next_id += 1;
+            t.open.insert(id, created_at);
+            id
+        };
         Ok(Box::new(V2Snapshot {
-            rt: self.db.begin_read()?,
+            rt,
+            tracker: Arc::clone(&self.snapshot_tracker),
+            tracker_id,
+            created_at,
+            max_age: self.max_snapshot_age,
+            warned: Cell::new(false),
         }))
+    }
+
+    fn snapshot_stats(&self) -> SnapshotStats {
+        let t = self
+            .snapshot_tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SnapshotStats {
+            open_count: t.open.len(),
+            oldest_age: t.open.values().min().map(|created| created.elapsed()),
+            store_size_bytes: std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0),
+        }
     }
     fn index_bytes_opts(
         &self,
