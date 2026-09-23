@@ -468,6 +468,18 @@ fn range_gaps(first: u32, last: u32, child_ranges: impl Iterator<Item = (u32, u3
 /// ascending order: the gaps between `syms[i]`'s own range and the union of
 /// its children's ranges. Empty when `syms[i].toks` is `None` (no tokens
 /// transitively under it, so none directly under it either).
+/// Symbol-to-direct-children index built once per file and reused across
+/// every top-level symbol's subtree walk (see issue #40).
+fn sym_kids_map(syms: &[SymRec]) -> Vec<Vec<usize>> {
+    let mut sym_kids: Vec<Vec<usize>> = vec![Vec::new(); syms.len()];
+    for (j, s) in syms.iter().enumerate() {
+        if let Some(p) = s.parent {
+            sym_kids[p as usize].push(j);
+        }
+    }
+    sym_kids
+}
+
 fn direct_token_ordinals(syms: &[SymRec], i: usize, child_idxs: &[usize]) -> Vec<usize> {
     let Some((first, last)) = syms[i].toks else {
         return Vec::new();
@@ -921,56 +933,72 @@ impl R {
             if i >= syms.len() {
                 return Ok(None);
             }
-            let mut sym_kids: Vec<Vec<usize>> = vec![Vec::new(); syms.len()];
-            for (j, s) in syms.iter().enumerate() {
-                if let Some(p) = s.parent {
-                    sym_kids[p as usize].push(j);
-                }
-            }
-            let mut tok_map: HashMap<usize, TokRec> = HashMap::new();
-            if let Some((first, last)) = syms[i].toks {
-                let ords: Vec<usize> = (first as usize..=last as usize).collect();
-                lz.tokens_at(&ords, |ord, t| {
-                    tok_map.insert(ord, t.clone());
-                })?;
-            }
-            // Merged (symbols + direct tokens) children of symbol `j`, in
-            // `stream_tree`'s (start, symbols-before-tokens-on-a-tie) order.
-            let item_children = |j: usize| -> Vec<Item> {
-                let kids = &sym_kids[j];
-                let ords = direct_token_ordinals(&syms, j, kids);
-                let mut merged = Vec::with_capacity(kids.len() + ords.len());
-                let (mut si, mut ti) = (0, 0);
-                while si < kids.len() || ti < ords.len() {
-                    let take_sym = si < kids.len()
-                        && (ti >= ords.len()
-                            || syms[kids[si]].span.start <= tok_map[&ords[ti]].span.start);
-                    if take_sym {
-                        merged.push(Item::Sym(kids[si]));
-                        si += 1;
-                    } else {
-                        merged.push(Item::Tok(ords[ti]));
-                        ti += 1;
-                    }
-                }
-                merged
-            };
-            let mut out = Vec::new();
-            let mut stack: Vec<Item> = item_children(i).into_iter().rev().collect();
-            while let Some(it) = stack.pop() {
-                match it {
-                    Item::Sym(j) => {
-                        out.push(self.sym_node(file, j, &syms)?);
-                        stack.extend(item_children(j).into_iter().rev());
-                    }
-                    Item::Tok(ord) => {
-                        out.push(self.tok_node(file, ord, &tok_map[&ord])?);
-                    }
-                }
-            }
-            Ok(Some(out))
+            let sym_kids = sym_kids_map(&syms);
+            Ok(Some(
+                self.descendants_ranged_one(lz, &syms, &sym_kids, file, i)?,
+            ))
         })?;
         Ok(res.flatten())
+    }
+
+    /// The walk shared by [`R::descendants_ranged`] and
+    /// [`R::descendants_ranged_file`]: everything below symbol `i`, given a
+    /// symbol table and symbol-to-direct-children map the caller has already
+    /// built (once) for this file. Pulled out so `descendants_ranged_file`
+    /// can build that map a single time and reuse it across every top-level
+    /// symbol's subtree walk, instead of each call rebuilding it from
+    /// scratch -- see issue #40 (this used to be O(N) rebuilds of an
+    /// O(nsym) map for a file with N top-level symbols).
+    fn descendants_ranged_one(
+        &self,
+        lz: &Lazy,
+        syms: &[SymRec],
+        sym_kids: &[Vec<usize>],
+        file: u64,
+        i: usize,
+    ) -> Result<Vec<Node>> {
+        let mut tok_map: HashMap<usize, TokRec> = HashMap::new();
+        if let Some((first, last)) = syms[i].toks {
+            let ords: Vec<usize> = (first as usize..=last as usize).collect();
+            lz.tokens_at(&ords, |ord, t| {
+                tok_map.insert(ord, t.clone());
+            })?;
+        }
+        // Merged (symbols + direct tokens) children of symbol `j`, in
+        // `stream_tree`'s (start, symbols-before-tokens-on-a-tie) order.
+        let item_children = |j: usize| -> Vec<Item> {
+            let kids = &sym_kids[j];
+            let ords = direct_token_ordinals(syms, j, kids);
+            let mut merged = Vec::with_capacity(kids.len() + ords.len());
+            let (mut si, mut ti) = (0, 0);
+            while si < kids.len() || ti < ords.len() {
+                let take_sym = si < kids.len()
+                    && (ti >= ords.len()
+                        || syms[kids[si]].span.start <= tok_map[&ords[ti]].span.start);
+                if take_sym {
+                    merged.push(Item::Sym(kids[si]));
+                    si += 1;
+                } else {
+                    merged.push(Item::Tok(ords[ti]));
+                    ti += 1;
+                }
+            }
+            merged
+        };
+        let mut out = Vec::new();
+        let mut stack: Vec<Item> = item_children(i).into_iter().rev().collect();
+        while let Some(it) = stack.pop() {
+            match it {
+                Item::Sym(j) => {
+                    out.push(self.sym_node(file, j, syms)?);
+                    stack.extend(item_children(j).into_iter().rev());
+                }
+                Item::Tok(ord) => {
+                    out.push(self.tok_node(file, ord, &tok_map[&ord])?);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Everything below file `file`, depth first, matching `file_walk`'s
@@ -984,24 +1012,41 @@ impl R {
         let Some(top) = self.children_ranged_file(file)? else {
             return Ok(None);
         };
-        let mut out = Vec::with_capacity(top.len());
-        for n in top {
-            let is_symbol = n.kind == NodeKind::Symbol;
-            let id = n.id;
-            out.push(n);
-            if is_symbol {
-                let (_, _, i) = split_id(id);
-                let Some(sub) = self.descendants_ranged(file, i)? else {
-                    // `children_ranged_file` already required `ranges_dense()`
-                    // true for this file, so every symbol in it has an exact
-                    // range too and this branch is unreachable; fall back to
-                    // the whole-file eager walk defensively rather than panic.
-                    return Ok(None);
-                };
-                out.extend(sub);
+        // Single `with_lazy` call for the whole file: the symbol table and
+        // its symbol-to-direct-children map are decoded/built once here and
+        // shared across every top-level symbol's subtree walk below, rather
+        // than each `descendants_ranged_one` call rebuilding them from
+        // scratch -- see issue #40 (this used to be O(N) rebuilds of an
+        // O(nsym) map for a file with N top-level symbols).
+        let res = self.with_lazy(file, |lz| {
+            if !lz.ranges_dense() {
+                return Ok(None);
             }
-        }
-        Ok(Some(out))
+            let syms = lz.symbols()?;
+            let sym_kids = sym_kids_map(&syms);
+            let mut out = Vec::with_capacity(top.len());
+            for n in top {
+                let is_symbol = n.kind == NodeKind::Symbol;
+                let id = n.id;
+                out.push(n);
+                if is_symbol {
+                    let (_, _, i) = split_id(id);
+                    if i >= syms.len() {
+                        // `children_ranged_file` already required
+                        // `ranges_dense()` true for this file, so every
+                        // symbol in it has an exact range too and this
+                        // branch is unreachable; fall back to the
+                        // whole-file eager walk defensively rather than
+                        // panic.
+                        return Ok(None);
+                    }
+                    let sub = self.descendants_ranged_one(lz, &syms, &sym_kids, file, i)?;
+                    out.extend(sub);
+                }
+            }
+            Ok(Some(out))
+        })?;
+        Ok(res.flatten())
     }
 
     /// Depth-first walk of one stream from the file (`None`) or from a symbol.
@@ -2335,6 +2380,33 @@ impl V2Store {
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let tmp = path.with_extension(format!("compact-{}-{unique}.redb.tmp", std::process::id()));
+        // Best-effort cleanup of a leftover temp file from a prior crashed run
+        // at this exact (pid, nanos) pair: vanishingly unlikely to collide,
+        // but free to guard. A process that is hard-killed (SIGKILL /
+        // `Stop-Process -Force`) mid-`compact` never reaches the `Err`
+        // cleanup below, so it can leave its own `.compact-<pid>-<nanos>.tmp`
+        // file behind under a *different* pid/nanos than any later run --
+        // this is disk clutter only (see issue #32). `path` itself is never
+        // touched until the rename below succeeds, so a subsequent `compact`
+        // is unaffected and always produces a correct result; it just does
+        // not reclaim orphans from earlier kills. Actively globbing the
+        // directory for stale `*.compact-*.tmp` files and deleting them was
+        // considered and rejected: this backend does not track which other
+        // OS processes may have `--db` pointed at the same file mid-compact
+        // (the CLI is one-shot per invocation, but nothing prevents two
+        // processes from being pointed at the same path), and the encoded
+        // pid alone cannot distinguish "a live compact in another process on
+        // this pid" from "a dead pid that has since been recycled by the OS"
+        // without external liveness infrastructure this crate does not have.
+        // Deleting a temp file out from under a concurrently-running compact
+        // (same or other process) would be a correctness bug, which is worse
+        // than the disk clutter it would fix. This is the same tradeoff
+        // documented in `migrate` (see its doc comment on the leftover-temp-
+        // file cleanup above), accepted there for the same reason. Follow-up
+        // if orphan accumulation becomes an operational concern: a
+        // `repair`/`vacuum` CLI step that globs and removes stale
+        // `*.compact-*.tmp` files with a human confirming no other process
+        // has the store open (see issue #32).
         let _ = std::fs::remove_file(&tmp);
 
         let build = || -> Result<()> {
