@@ -59,7 +59,7 @@ fn held_lock_is_locked() {
 #[test]
 fn schema_versions_map_to_backends() {
     let d = tempfile::tempdir().unwrap();
-    for (v, want) in [(1, Backend::Redb), (2, Backend::Redb), (8, Backend::RedbV2)] {
+    for (v, want) in [(1, Backend::Redb), (2, Backend::Redb), (9, Backend::RedbV2)] {
         let p = d.path().join(format!("v{v}"));
         make(&p, Some(v));
         let before = digest(&p);

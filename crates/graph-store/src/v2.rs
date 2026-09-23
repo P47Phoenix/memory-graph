@@ -32,7 +32,7 @@ use graph_core::{
 };
 use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableMultimapTable,
-    ReadableTable, TableDefinition,
+    ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -47,7 +47,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// block-encoded (`codec::POSTING_BLOCK`-sized, self-contained blocks)
 /// instead of one flat delta-varint run, so old v2 files are refused rather
 /// than misread (v2 is unreleased; no migration is attempted).
-pub const V2_SCHEMA_VERSION: u64 = 8;
+pub const V2_SCHEMA_VERSION: u64 = 9;
 
 /// Version of the `refs`/`content_files` derived tables (ADR 0003 story 9).
 /// Unlike `V2_SCHEMA_VERSION` (a hard gate on the on-disk *layout*), this is
@@ -68,8 +68,20 @@ pub(crate) const DERIVED_VERSION_REFS_KEY: &str = "derived_version_refs_content_
 
 /// term text -> term id.
 pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
-/// term id -> term text.
-const DICT_REV: TableDefinition<u64, &str> = TableDefinition::new("dict_rev");
+/// term id -> term text, packed (ADR 0003 story 5, decision D1: "packed
+/// single sorted dictionary"). One row per up-to-[`codec::DICT_BLOCK`]
+/// entries (`block index -> codec::encode_dict_block` bytes) instead of one
+/// row per term; blocks are always in ascending-id order (row 0 holds the
+/// smallest ids), so a point lookup binary-searches block indexes by each
+/// candidate block's first id ([`codec::dict_block_first_id`]) and then
+/// linearly scans the found block. Term ids are assigned by a monotonic
+/// counter and never reused, so `intern` always appends the newest id to the
+/// last (possibly partial) block -- no reordering, no rewrite of any other
+/// block. `vacuum` repacks the whole table densely when it removes a dead
+/// term, which is also when block boundaries stop lining up with
+/// `id / DICT_BLOCK` (dead ids leave gaps); the binary search does not
+/// assume dense boundaries, so it is correct either way.
+pub(crate) const DICT_REV: TableDefinition<u64, &[u8]> = TableDefinition::new("dict_rev_blocks");
 /// file id -> encoded stream.
 pub(crate) const STREAMS: TableDefinition<u64, &[u8]> = TableDefinition::new("stream");
 /// (term id, file id) -> occurrence count and token ordinals (see `codec::encode_posting`).
@@ -138,6 +150,66 @@ pub(crate) fn hashed_key(text: &str, n: u32) -> String {
 
 fn is_hashed(text: &str) -> bool {
     text.len() > MAX_INLINE_TERM || text.starts_with('\0')
+}
+
+/// Point lookup of `id`'s text in the packed reverse dictionary (ADR 0003
+/// story 5): binary-search the block whose first id is the largest one
+/// `<= id` (a "floor" search over `dict_block_first_id`, which is a
+/// one-varint peek and does not decode a candidate block's other entries),
+/// then linearly scan that one block (at most `codec::DICT_BLOCK` entries)
+/// for the exact id. `Ok(None)` for an id that was never assigned, or was
+/// removed by `vacuum`. Generic over `redb::Table`/`redb::ReadOnlyTable`
+/// (both implement `ReadableTable`) so the read (`R`) and write (`W`) sides
+/// share one implementation.
+fn dict_rev_lookup<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
+    t: &T,
+    id: u64,
+) -> Result<Option<String>> {
+    let n = t.len()?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let (mut lo, mut hi) = (0u64, n); // half-open [lo, hi)
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let block = t
+            .get(mid)?
+            .ok_or_else(|| StoreError::Corrupt(format!("missing dict block {mid}")))?;
+        let first = codec::dict_block_first_id(block.value())?
+            .ok_or_else(|| StoreError::Corrupt(format!("empty dict block {mid}")))?;
+        if first <= id {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return Ok(None);
+    }
+    let block = t.get(lo - 1)?.unwrap();
+    let entries = codec::decode_dict_block(block.value())?;
+    Ok(entries.into_iter().find(|(i, _)| *i == id).map(|(_, t)| t))
+}
+
+/// Append `(id, text)` to the packed reverse dictionary (ADR 0003 story 5):
+/// `id` must be larger than every id already stored (true of every call from
+/// `intern`, since term ids come from a monotonic counter). Extends the last
+/// block in place while it has room for another entry, otherwise starts a
+/// new block -- so this touches exactly one row, not the whole table.
+fn dict_rev_append(rev: &mut redb::Table<u64, &'static [u8]>, id: u64, text: &str) -> Result<()> {
+    let n = rev.len()?;
+    if n > 0 {
+        let last = n - 1;
+        let mut entries = codec::decode_dict_block(rev.get(last)?.unwrap().value())?;
+        if entries.len() < codec::DICT_BLOCK {
+            entries.push((id, text.to_string()));
+            let refs: Vec<(u64, &str)> = entries.iter().map(|(i, t)| (*i, t.as_str())).collect();
+            rev.insert(last, codec::encode_dict_block(&refs).as_slice())?;
+            return Ok(());
+        }
+    }
+    rev.insert(n, codec::encode_dict_block(&[(id, text)]).as_slice())?;
+    Ok(())
 }
 
 const TAG_SYM: u64 = 1;
@@ -212,7 +284,7 @@ pub(crate) struct R {
     names: redb::ReadOnlyTable<&'static str, u64>,
     pub(crate) streams: redb::ReadOnlyTable<u64, &'static [u8]>,
     pub(crate) dict: redb::ReadOnlyTable<&'static str, u64>,
-    rev: redb::ReadOnlyTable<u64, &'static str>,
+    pub(crate) rev: redb::ReadOnlyTable<u64, &'static [u8]>,
     pub(crate) post: redb::ReadOnlyTable<(u64, u64), &'static [u8]>,
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
     cat: redb::ReadOnlyTable<&'static str, u64>,
@@ -418,7 +490,7 @@ impl R {
             else {
                 return Ok(None);
             };
-            if self.rev.get(id)?.is_some_and(|t| t.value() == text) {
+            if dict_rev_lookup(&self.rev, id)?.is_some_and(|t| t == text) {
                 return Ok(Some(id));
             }
         }
@@ -430,11 +502,8 @@ impl R {
         if let Some(t) = self.texts.borrow().get(&term) {
             return Ok(Rc::clone(t));
         }
-        let t: Rc<str> = self
-            .rev
-            .get(term)?
+        let t: Rc<str> = dict_rev_lookup(&self.rev, term)?
             .ok_or_else(|| StoreError::Corrupt(format!("dangling term {term}")))?
-            .value()
             .into();
         self.texts.borrow_mut().insert(term, Rc::clone(&t));
         Ok(t)
@@ -1420,7 +1489,7 @@ struct W<'t> {
     names: redb::Table<'t, &'static str, u64>,
     children: redb::MultimapTable<'t, u64, u64>,
     dict: redb::Table<'t, &'static str, u64>,
-    rev: redb::Table<'t, u64, &'static str>,
+    rev: redb::Table<'t, u64, &'static [u8]>,
     streams: redb::Table<'t, u64, &'static [u8]>,
     post: redb::Table<'t, (u64, u64), &'static [u8]>,
     sym_idx: redb::MultimapTable<'t, &'static str, u64>,
@@ -1448,12 +1517,8 @@ impl<'t> W<'t> {
     }
 
     fn text(&self, term: u64) -> Result<String> {
-        Ok(self
-            .rev
-            .get(term)?
-            .ok_or_else(|| StoreError::Corrupt(format!("dangling term {term}")))?
-            .value()
-            .to_string())
+        dict_rev_lookup(&self.rev, term)?
+            .ok_or_else(|| StoreError::Corrupt(format!("dangling term {term}")))
     }
 
     /// The dictionary key holding `text` (the entry for `id` when given, else
@@ -1471,7 +1536,7 @@ impl<'t> W<'t> {
             };
             let same = match id {
                 Some(i) => i == found,
-                None => self.rev.get(found)?.is_some_and(|t| t.value() == text),
+                None => dict_rev_lookup(&self.rev, found)?.is_some_and(|t| t == text),
             };
             if same {
                 return Ok((key, Some(found)));
@@ -1488,7 +1553,7 @@ impl<'t> W<'t> {
         let id = *next_term;
         *next_term += 1;
         self.dict.insert(key.as_str(), id)?;
-        self.rev.insert(id, text)?;
+        dict_rev_append(&mut self.rev, id, text)?;
         Ok(id)
     }
 
@@ -1699,15 +1764,13 @@ impl V2Store {
             assert_eq!(is_hashed(k.value()), k.value().starts_with('\0'));
         }
         for row in r.rev.iter().unwrap() {
-            let (id, text) = row.unwrap();
-            nrev += 1;
-            assert_eq!(
-                r.lookup(text.value()).unwrap(),
-                Some(id.value()),
-                "rev->dict"
-            );
-            if after_vacuum {
-                assert!(used.contains(&id.value()), "dead term {}", id.value());
+            let (_, block) = row.unwrap();
+            for (id, text) in codec::decode_dict_block(block.value()).unwrap() {
+                nrev += 1;
+                assert_eq!(r.lookup(&text).unwrap(), Some(id), "rev->dict");
+                if after_vacuum {
+                    assert!(used.contains(&id), "dead term {id}");
+                }
             }
         }
         assert_eq!(ndict, nrev, "dictionary directions");
@@ -2020,11 +2083,18 @@ impl V2Store {
                     live.extend(s.lang_kind);
                 }
             }
-            let mut dead: Vec<(u64, String)> = Vec::new();
+            let mut all: Vec<(u64, String)> = Vec::new();
             for r in w.rev.iter()? {
-                let (id, text) = r?;
-                if !live.contains(&id.value()) {
-                    dead.push((id.value(), text.value().to_string()));
+                let (_, block) = r?;
+                all.extend(codec::decode_dict_block(block.value())?);
+            }
+            let mut dead: Vec<(u64, String)> = Vec::new();
+            let mut kept: Vec<(u64, String)> = Vec::new();
+            for (id, text) in all {
+                if live.contains(&id) {
+                    kept.push((id, text));
+                } else {
+                    dead.push((id, text));
                 }
             }
             let mut w = w;
@@ -2037,11 +2107,27 @@ impl V2Store {
                 if found.is_some() {
                     w.dict.remove(key.as_str())?;
                 }
-                w.rev.remove(*id)?;
+            }
+            if !dead.is_empty() {
+                // Repack the reverse dictionary densely from `kept` (ADR
+                // 0003 story 5): after this, block boundaries no longer
+                // line up with `id / DICT_BLOCK` since dead ids leave gaps,
+                // which is why lookups always binary-search by each block's
+                // first id instead of assuming that arithmetic.
+                let old_blocks = w.rev.len()?;
+                for i in 0..old_blocks {
+                    w.rev.remove(i)?;
+                }
+                for (i, chunk) in kept.chunks(codec::DICT_BLOCK).enumerate() {
+                    let refs: Vec<(u64, &str)> =
+                        chunk.iter().map(|(id, t)| (*id, t.as_str())).collect();
+                    w.rev
+                        .insert(i as u64, codec::encode_dict_block(&refs).as_slice())?;
+                }
             }
             let stats = VacuumStats {
                 terms_removed: dead.len(),
-                terms_kept: live.len(),
+                terms_kept: kept.len(),
             };
             (stats, dead.is_empty())
         };

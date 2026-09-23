@@ -686,6 +686,74 @@ pub fn posting_ordinals(b: &[u8]) -> Result<Vec<usize>, StoreError> {
     Ok(out)
 }
 
+/// Number of `(term id, text)` entries packed per row of the v2 dictionary's
+/// reverse (id -> text) direction (ADR 0003 story 5, decision D1: "packed
+/// single sorted dictionary"). Term ids are assigned by a monotonic counter
+/// and never reused, so a fresh entry always has the largest id seen so far:
+/// appending one just extends the current row's block (re-encoding at most
+/// [`DICT_BLOCK`] entries) instead of the one-row-per-term cost `dict_rev`
+/// paid before story 5. Reuses [`POSTING_BLOCK`]'s size so the block-size
+/// mental model stays shared across the codec.
+pub const DICT_BLOCK: usize = POSTING_BLOCK;
+
+/// Encode one packed dictionary block: `varint(n)` then, for each of the `n`
+/// entries in order, `varint(id) + varint(text_len) + text_bytes`. Ids are
+/// stored absolute (not delta-encoded): a block holds at most [`DICT_BLOCK`]
+/// entries, so the extra bytes versus a delta scheme are small, and it keeps
+/// [`dict_block_first_id`] a one-varint peek with no per-entry decoding.
+pub fn encode_dict_block(entries: &[(u64, &str)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entries.len() * 4);
+    put_varint(&mut out, entries.len() as u64);
+    for (id, text) in entries {
+        put_varint(&mut out, *id);
+        let bytes = text.as_bytes();
+        put_varint(&mut out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+/// Decode a block written by [`encode_dict_block`] into its `(id, text)`
+/// entries, in the stored (ascending id) order.
+pub fn decode_dict_block(b: &[u8]) -> Result<Vec<(u64, String)>, StoreError> {
+    let mut r = Reader { b, at: 0 };
+    let n = usize::try_from(r.varint()?).map_err(|_| bad("dict block count out of range"))?;
+    if n > b.len() {
+        return Err(bad("dict block count exceeds input"));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = r.varint()?;
+        let len =
+            usize::try_from(r.varint()?).map_err(|_| bad("dict entry length out of range"))?;
+        let end =
+            r.at.checked_add(len)
+                .filter(|&e| e <= b.len())
+                .ok_or_else(|| bad("dict entry exceeds input"))?;
+        let text = std::str::from_utf8(&b[r.at..end])
+            .map_err(|_| bad("dict entry is not valid UTF-8"))?
+            .to_string();
+        r.at = end;
+        out.push((id, text));
+    }
+    if r.at != b.len() {
+        return Err(bad("trailing bytes in dict block"));
+    }
+    Ok(out)
+}
+
+/// The id of a block's first entry, without decoding the rest of the block
+/// (used to binary-search across blocks by id). `None` for an empty block
+/// (never written by [`encode_dict_block`], but accepted defensively).
+pub fn dict_block_first_id(b: &[u8]) -> Result<Option<u64>, StoreError> {
+    let mut r = Reader { b, at: 0 };
+    let n = r.varint()?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(r.varint()?))
+}
+
 pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
     let lazy = decode_lazy(b)?;
     let symbols = lazy.symbols()?;
@@ -1553,6 +1621,64 @@ mod tests {
         let b = encode(&s);
         assert!(decode_lazy(&b).unwrap().ranges_dense(), "vacuously dense");
         assert_eq!(decode(&b).unwrap().symbols[0].toks, None);
+    }
+
+    /// Golden-bytes / round-trip for the packed dictionary block format (ADR
+    /// 0003 story 5, decision D1): encode then decode must reproduce the
+    /// exact `(id, text)` pairs, in order, and the byte layout is pinned so a
+    /// future accidental format change is caught here rather than only as a
+    /// v2 differential failure.
+    #[test]
+    fn dict_block_format_is_pinned_and_round_trips() {
+        let entries: Vec<(u64, &str)> = vec![(0, "alpha"), (1, "b"), (1000, "gamma_delta")];
+        let b = encode_dict_block(&entries);
+        // varint(3) + [varint(0)+varint(5)+"alpha"] + [varint(1)+varint(1)+"b"]
+        // + [varint(1000, 2 bytes)+varint(11)+"gamma_delta"].
+        let mut want = vec![3u8, 0, 5];
+        want.extend_from_slice(b"alpha");
+        want.extend_from_slice(&[1, 1]);
+        want.extend_from_slice(b"b");
+        put_varint(&mut want, 1000);
+        want.push(11);
+        want.extend_from_slice(b"gamma_delta");
+        assert_eq!(b, want);
+
+        let decoded = decode_dict_block(&b).unwrap();
+        assert_eq!(
+            decoded,
+            entries
+                .iter()
+                .map(|(i, t)| (*i, t.to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(dict_block_first_id(&b).unwrap(), Some(0));
+    }
+
+    /// An empty block (never written by `encode_dict_block` itself, but
+    /// accepted defensively by the decoder/peek) round-trips to no entries
+    /// and no first id.
+    #[test]
+    fn dict_block_empty_round_trips() {
+        let b = encode_dict_block(&[]);
+        assert_eq!(decode_dict_block(&b).unwrap(), Vec::new());
+        assert_eq!(dict_block_first_id(&b).unwrap(), None);
+    }
+
+    /// A full [`DICT_BLOCK`]-sized block round-trips every entry in order,
+    /// exercising the same block boundary `v2::dict_rev_append` uses.
+    #[test]
+    fn dict_block_full_size_round_trips() {
+        let owned: Vec<(u64, String)> = (0..DICT_BLOCK as u64)
+            .map(|i| (i, format!("t{i}")))
+            .collect();
+        let entries: Vec<(u64, &str)> = owned.iter().map(|(i, t)| (*i, t.as_str())).collect();
+        let b = encode_dict_block(&entries);
+        assert_eq!(dict_block_first_id(&b).unwrap(), Some(0));
+        assert_eq!(
+            decode_dict_block(&b).unwrap(),
+            owned,
+            "every entry survives a full-size block"
+        );
     }
 }
 
