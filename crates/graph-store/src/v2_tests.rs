@@ -1276,17 +1276,22 @@ fn traversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus() {
     // verbatim otherwise), so a regression that silently stopped using the
     // range would still show up here even if the v1 comparison is noisy.
     //
-    // `descendants` is deliberately NOT held to the same bound here: measured
-    // on this corpus, v2-after `descendants` on a file can cost MORE than
-    // v2-before (see the printed table and the ADR row for the named cause --
-    // `descendants_ranged_file` calls `descendants_ranged` once per top-level
-    // symbol, and each call independently rebuilds the whole file's
-    // symbol-to-children map via `with_lazy`, so the cost is quadratic in the
-    // file's top-level symbol count; the eager `file_walk` fallback builds
-    // that tree once for the whole file). That is a real, honestly-reported
-    // regression for some shapes of file, not a measurement bug -- asserting
-    // it away here would hide exactly the kind of finding this benchmark
-    // exists to surface.
+    // `descendants` is deliberately NOT held to the same bound here. The
+    // quadratic cause this comment used to describe -- `descendants_ranged_file`
+    // rebuilding the whole file's symbol-to-children map once per top-level
+    // symbol via `with_lazy` -- is fixed (issue #40): the map is now built
+    // once per `descendants_ranged_file` call and shared across every
+    // top-level symbol's subtree walk (see
+    // `descendants_ranged_file_symbol_decode_cost_is_linear_not_quadratic`,
+    // which proves the decoded-symbol-record count now scales linearly, not
+    // quadratically, in the file's top-level symbol count). What is left
+    // unbounded here is real, not overhead: the range-based path decodes
+    // each top-level symbol's own transitive token range in full, which for
+    // a file dominated by one or few huge top-level symbols can still cost
+    // more wall-clock than the eager `file_walk` fallback walking the same
+    // stream once. That is a legitimate, honestly-reported tradeoff for some
+    // shapes of file, not a measurement bug -- asserting it away here would
+    // hide exactly the kind of finding this benchmark exists to surface.
     assert!(
         sum_children_after <= sum_children_before * 1.5,
         "v2-after children ({sum_children_after:.3} ms) regressed past v2-before \
@@ -1720,4 +1725,105 @@ fn tokenize_words(src: &str) -> Vec<(&str, u32, u32)> {
         pos = start + w.len() as u32;
     }
     out
+}
+
+// --- issue #40: descendants_ranged_file quadratic symbol-map-rebuild cost ---
+
+/// Builds a synthetic single-file extraction with `n` disjoint top-level
+/// symbols, each covering one token, so every top-level symbol's own subtree
+/// walk is O(1) work and the only thing that can scale worse than linearly
+/// in `n` is the symbol-to-children map itself.
+fn many_top_level_symbols_ext(n: usize) -> graph_core::Extraction {
+    let syms: Vec<(String, SymbolKind, u32, u32)> = (0..n)
+        .map(|i| {
+            let base = (i * 10) as u32;
+            (format!("Sym{i}"), SymbolKind::Function, base, base + 1)
+        })
+        .collect();
+    let sym_refs: Vec<(&str, SymbolKind, u32, u32)> = syms
+        .iter()
+        .map(|(n, k, s, e)| (n.as_str(), *k, *s, *e))
+        .collect();
+    let toks: Vec<(String, u32, u32)> = (0..n)
+        .map(|i| {
+            let base = (i * 10) as u32;
+            (format!("t{i}"), base, base + 1)
+        })
+        .collect();
+    let tok_refs: Vec<(&str, u32, u32)> =
+        toks.iter().map(|(t, s, e)| (t.as_str(), *s, *e)).collect();
+    span_ext(&sym_refs, &tok_refs)
+}
+
+/// Differential: `descendants_ranged_file`'s output for a file with many
+/// disjoint top-level symbols is identical to the pre-optimization eager
+/// fallback walk (`descendants_via_fallback_file`), both before and after
+/// sharing the symbol-to-children map across top-level symbols (issue #40).
+/// This is the correctness half of the fix -- the perf half is
+/// `descendants_ranged_file_symbol_decode_cost_is_linear_not_quadratic`
+/// below.
+#[test]
+fn descendants_ranged_file_matches_fallback_for_many_top_level_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let v = V2Store::open(d.path().join("many.redb")).unwrap();
+    let ex = many_top_level_symbols_ext(60);
+    v.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+    let toks = v.file_tokens("o", "r", "x.rs").unwrap().unwrap();
+    let file = (toks[0].id >> 32) & 0x3fff_ffff;
+
+    let ranged = v.descendants(file).unwrap();
+    let fallback = v.descendants_via_fallback_file(file).unwrap();
+    assert_eq!(
+        ranged, fallback,
+        "descendants_ranged_file diverges from the eager fallback for a \
+         file with many top-level symbols"
+    );
+    // 60 symbols + 60 tokens, one token directly under each symbol.
+    assert_eq!(ranged.len(), 120);
+}
+
+/// Performance regression guard for issue #40: before the fix,
+/// `descendants_ranged_file` rebuilt the whole file's symbol table (via
+/// `Lazy::symbols()`) once per top-level symbol, so the number of symbol
+/// records decoded scaled with `n^2` for a file with `n` top-level symbols
+/// (`n` rebuilds x `n` symbols each). After the fix it is built once per
+/// call to `descendants_ranged_file`, so the count scales with `n` (one
+/// rebuild x `n` symbols).
+///
+/// This asserts the *ratio* of decoded symbol records between a 3x-larger
+/// file and a smaller one stays close to linear (~3x), not the ~9x a
+/// quadratic rebuild would produce.
+#[test]
+fn descendants_ranged_file_symbol_decode_cost_is_linear_not_quadratic() {
+    fn decoded_symbol_records(n: usize) -> usize {
+        let d = tempfile::tempdir().unwrap();
+        let v = V2Store::open(d.path().join("n.redb")).unwrap();
+        let ex = many_top_level_symbols_ext(n);
+        v.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
+        let toks = v.file_tokens("o", "r", "x.rs").unwrap().unwrap();
+        let file = (toks[0].id >> 32) & 0x3fff_ffff;
+
+        codec::SYM_RECORDS_DECODED.with(|c| c.set(0));
+        let out = v.descendants(file).unwrap();
+        assert_eq!(out.len(), 2 * n);
+        codec::SYM_RECORDS_DECODED.with(|c| c.get())
+    }
+
+    let small = decoded_symbol_records(25);
+    let large = decoded_symbol_records(75);
+    let ratio = large as f64 / small as f64;
+    println!(
+        "descendants_ranged_file_symbol_decode_cost_is_linear_not_quadratic: \
+         n=25 -> {small} symbol records decoded, n=75 -> {large} \
+         ({ratio:.2}x for a 3x larger file)"
+    );
+    // Linear scaling (one symbol-table decode per call, `nsym` records each)
+    // gives ~3x. Quadratic (pre-fix: one decode per top-level symbol) would
+    // give ~9x. 5x is a generous cutoff that still clearly separates the two.
+    assert!(
+        ratio <= 5.0,
+        "decoded symbol record count scaled {ratio:.2}x for a 3x larger \
+         file (small={small}, large={large}); expected close to linear \
+         (~3x), not quadratic (~9x) -- issue #40 regressed"
+    );
 }

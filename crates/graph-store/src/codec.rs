@@ -174,6 +174,12 @@ const ZERO: Span = Span {
 thread_local! {
     /// Token records decoded on this thread (test instrumentation).
     pub(crate) static RECORDS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Symbol records decoded on this thread (test instrumentation, issue
+    /// #40): `Lazy::symbols()` decodes the whole symbol section on every
+    /// call, so a caller that rebuilds a file's symbol-to-children map once
+    /// per top-level symbol (the pre-fix `descendants_ranged_file` bug)
+    /// shows up here as O(top-level symbols x nsym) instead of O(nsym).
+    pub(crate) static SYM_RECORDS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The true `(first, last)` inclusive token-ordinal range transitively under
@@ -458,6 +464,8 @@ impl Lazy<'_> {
         let mut prev = ZERO;
         let mut prev_first = 0u32;
         for i in 0..self.nsym {
+            #[cfg(test)]
+            SYM_RECORDS_DECODED.with(|c| c.set(c.get() + 1));
             let name = r.varint()?;
             let kind = *KINDS
                 .get(usize::from(r.byte()?))
