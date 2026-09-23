@@ -299,6 +299,10 @@ pub fn verify(source: &dyn Store, target: &dyn Store) -> Result<()> {
     Ok(())
 }
 
+// `verify` calls these per file, each re-listing roots/children and scanning
+// linearly by name -- O(files x repos) rather than O(files) for a source with
+// many repos per org. Fine for `migrate`'s single offline-operation scale;
+// worth revisiting if this is ever run against a very large multi-repo store.
 fn find_root(store: &dyn Store, name: &str) -> Result<Option<Node>> {
     Ok(store.roots()?.into_iter().find(|n| n.name == name))
 }
@@ -350,6 +354,15 @@ pub fn migrate_file(source_path: &Path, dest_path: &Path, force: bool) -> Result
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let tmp = dest_path.with_extension(format!("migrate-{}-{unique}.redb.tmp", std::process::id()));
+    // Best-effort cleanup of a leftover temp file from a prior crashed run:
+    // a collision here would require two `migrate` invocations landing on the
+    // same PID and the same nanosecond timestamp, which is not reasoned about
+    // further. A process that is hard-killed (SIGKILL/`Stop-Process -Force`)
+    // never reaches the `Err` cleanup below, so it can leave its own
+    // `.migrate-*.tmp` file behind; this is disk clutter only -- `dest_path`
+    // itself is never touched until the rename below succeeds, and a
+    // subsequent `migrate --force` is unaffected. QA-verified (PR #53) across
+    // 9 kill points spanning the full migration timeline.
     let _ = std::fs::remove_file(&tmp);
 
     let outcome = (|| -> Result<MigrateStats> {
