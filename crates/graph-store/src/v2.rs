@@ -49,6 +49,23 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// than misread (v2 is unreleased; no migration is attempted).
 pub const V2_SCHEMA_VERSION: u64 = 8;
 
+/// Version of the `refs`/`content_files` derived tables (ADR 0003 story 9).
+/// Unlike `V2_SCHEMA_VERSION` (a hard gate on the on-disk *layout*), this is
+/// a soft, self-healing counter stored in `meta` under
+/// [`DERIVED_VERSION_REFS_KEY`]: it does not change what tables exist or how
+/// they are keyed, only whether their *contents* are known-fresh. A file
+/// whose stored value is absent (pre-story-9 v2 file) or lower than this
+/// constant is never refused -- `V2Store::open`/`open_with_cache_bytes`
+/// silently calls `rebuild_refs` and stamps the current value in the same
+/// write transaction. Bump it whenever `rebuild_refs`'s output would change
+/// for existing data (i.e. whenever the refs/content_files derivation rule
+/// itself changes), the same trigger v1's `SYMBOL_INDEX_VERSION` uses for
+/// `symbols_by_name`/per-class counters.
+pub const REFS_DERIVED_VERSION: u64 = 1;
+/// `meta` key holding the stored [`REFS_DERIVED_VERSION`] a file was last
+/// rebuilt/stamped at.
+pub(crate) const DERIVED_VERSION_REFS_KEY: &str = "derived_version_refs_content_files";
+
 /// term text -> term id.
 pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
 /// term id -> term text.
@@ -1550,6 +1567,61 @@ impl<'t> W<'t> {
     }
 }
 
+/// Recompute `refs`/`content_files` from scratch by scanning every live
+/// file's stream row (the source of truth: a stream row exists iff its file
+/// is live, see `W::remove_content`) and rewriting both tables to match,
+/// stamping `derived_version_refs_content_files` to [`REFS_DERIVED_VERSION`]
+/// in the same write transaction. Shared by [`V2Store::rebuild_refs`] (manual
+/// call) and the self-heal check in `open`/`open_with_cache_bytes`.
+fn rebuild_refs_in(db: &Database) -> Result<()> {
+    let wt = db.begin_write()?;
+    {
+        let mut w = W::new(&wt)?;
+        let mut want: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut files_by_cid: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for row in w.streams.iter()? {
+            let (file, _) = row?;
+            let file = file.value();
+            let cid = content_id(file);
+            *want.entry(cid).or_default() += 1;
+            files_by_cid.entry(cid).or_default().push(file);
+        }
+
+        let mut stale_refs: Vec<u64> = Vec::new();
+        for row in w.refs.iter()? {
+            stale_refs.push(row?.0.value());
+        }
+        for k in stale_refs {
+            w.refs.remove(k)?;
+        }
+        let mut stale_cf: Vec<(u64, u64)> = Vec::new();
+        for row in w.content_files.iter()? {
+            let (k, vals) = row?;
+            let k = k.value();
+            for v in vals {
+                stale_cf.push((k, v?.value()));
+            }
+        }
+        for (k, v) in stale_cf {
+            w.content_files.remove(k, v)?;
+        }
+
+        for (cid, count) in want {
+            w.refs.insert(cid, count)?;
+        }
+        for (cid, files) in files_by_cid {
+            for file in files {
+                w.content_files.insert(cid, file)?;
+            }
+        }
+
+        w.meta
+            .insert(DERIVED_VERSION_REFS_KEY, REFS_DERIVED_VERSION)?;
+    }
+    wt.commit()?;
+    Ok(())
+}
+
 impl V2Store {
     /// Test oracle: recompute every derived table from the streams (the source
     /// of truth) and require the stored ones to match exactly: postings, the
@@ -1865,6 +1937,11 @@ impl V2Store {
                     m.insert("next_batch_id", 0)?;
                     m.insert("stream_format", u64::from(STREAM_FORMAT))?;
                     m.insert("catalog_version", CATALOG_VERSION)?;
+                    // A brand-new file has no streams yet, so empty
+                    // refs/content_files are already correct; stamp the
+                    // current derived_version directly instead of running
+                    // rebuild_refs on nothing.
+                    m.insert(DERIVED_VERSION_REFS_KEY, REFS_DERIVED_VERSION)?;
                     wt.open_table(CATALOG)?;
                     wt.open_table(NODES)?;
                     wt.open_table(NAMES)?;
@@ -1881,6 +1958,31 @@ impl V2Store {
                 wt.commit()?;
             }
         }
+
+        // Soft self-heal (ADR 0003 story 9): an existing file whose
+        // derived_version lags or is missing (any v2 file written before
+        // this mechanism existed) gets refs/content_files rebuilt
+        // automatically, silently -- this is not an error, and never
+        // refuses the open. A file already at the current version does not
+        // write at all, so a plain reopen stays byte-identical.
+        let derived_refs_version = {
+            let rt = db.begin_read()?;
+            match rt.open_table(META) {
+                Ok(t) => t.get(DERIVED_VERSION_REFS_KEY)?.map(|v| v.value()),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if derived_refs_version != Some(REFS_DERIVED_VERSION) {
+            eprintln!(
+                "memory-graph: v2 store {}: refs/content_files derived_version \
+                 {derived_refs_version:?} != current {REFS_DERIVED_VERSION}; \
+                 self-healing (rebuilding) on open",
+                path.as_ref().display()
+            );
+            rebuild_refs_in(&db)?;
+        }
+
         Ok(Self {
             db,
             registry: Registry::default(),
@@ -1966,56 +2068,13 @@ impl V2Store {
     /// `content_files` entry per live file; the loop is written in terms of
     /// `content_id` so it stays correct once fan-out lands.
     ///
-    /// Not wired into [`V2Store::open`]: there is no `derived_version`
-    /// mechanism in v2's `meta` table for any table yet (see the ADR's
-    /// "What `SCHEMA_VERSION` means" note), so there is no cheap way to tell
-    /// whether a rebuild is even needed on open. This method is a callable,
-    /// tested building block for that future automatic rebuild, not the
-    /// rebuild-on-open mechanism itself.
+    /// Wired into [`V2Store::open`]/[`V2Store::open_with_cache_bytes`]
+    /// (ADR 0003 story 9): a file whose `derived_version_refs_content_files`
+    /// (see [`REFS_DERIVED_VERSION`]) lags or is missing is rebuilt
+    /// automatically on open, so calling this method by hand is normally
+    /// only needed for diagnostics or a manual repair.
     pub fn rebuild_refs(&self) -> Result<()> {
-        let wt = self.db.begin_write()?;
-        {
-            let mut w = W::new(&wt)?;
-            let mut want: BTreeMap<u64, u64> = BTreeMap::new();
-            let mut files_by_cid: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-            for row in w.streams.iter()? {
-                let (file, _) = row?;
-                let file = file.value();
-                let cid = content_id(file);
-                *want.entry(cid).or_default() += 1;
-                files_by_cid.entry(cid).or_default().push(file);
-            }
-
-            let mut stale_refs: Vec<u64> = Vec::new();
-            for row in w.refs.iter()? {
-                stale_refs.push(row?.0.value());
-            }
-            for k in stale_refs {
-                w.refs.remove(k)?;
-            }
-            let mut stale_cf: Vec<(u64, u64)> = Vec::new();
-            for row in w.content_files.iter()? {
-                let (k, vals) = row?;
-                let k = k.value();
-                for v in vals {
-                    stale_cf.push((k, v?.value()));
-                }
-            }
-            for (k, v) in stale_cf {
-                w.content_files.remove(k, v)?;
-            }
-
-            for (cid, count) in want {
-                w.refs.insert(cid, count)?;
-            }
-            for (cid, files) in files_by_cid {
-                for file in files {
-                    w.content_files.insert(cid, file)?;
-                }
-            }
-        }
-        wt.commit()?;
-        Ok(())
+        rebuild_refs_in(&self.db)
     }
 
     /// Rebuild the store into a brand-new file by copying every row of every
