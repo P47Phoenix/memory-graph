@@ -39,6 +39,31 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// One offset/limit page of a paged traversal (ADR 0003 story 11:
+/// [`StoreRead::children_page`], [`StoreRead::descendants_page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Whether `offset + items.len()` would return a non-empty page from the
+    /// same call, on the same snapshot.
+    pub has_more: bool,
+}
+
+fn page_slice<T>(mut all: Vec<T>, offset: usize, limit: usize) -> Result<Page<T>> {
+    let total = all.len();
+    if offset >= total {
+        return Ok(Page {
+            items: Vec::new(),
+            has_more: false,
+        });
+    }
+    let end = offset.saturating_add(limit).min(total);
+    let has_more = end < total;
+    // Drain instead of clone: `Node` isn't required to be `Copy`/cheap.
+    let items = all.drain(offset..end).collect();
+    Ok(Page { items, has_more })
+}
+
 /// Read operations. All results are plain data.
 pub trait StoreRead {
     fn get(&self, id: NodeId) -> Result<Option<Node>>;
@@ -92,6 +117,37 @@ pub trait StoreRead {
         }
         Ok(out)
     }
+    /// A page of `children(id)`, ADR 0003 story 11: `offset`/`limit` over the
+    /// same deterministic (creation) order `children` already documents.
+    /// `has_more` says whether a further page (same `id`, `offset + limit`)
+    /// would be non-empty, so a caller can loop without an extra empty call.
+    /// A page fetched through the same [`Store::snapshot`](crate::Store::snapshot)
+    /// handle as earlier pages reads the same frozen transaction, so a writer
+    /// running concurrently cannot change, add to or shrink a page already
+    /// handed out or one fetched later in the same paging sequence -- proven
+    /// by `v2_tests::paging_is_snapshot_consistent_across_concurrent_writes`
+    /// (run against both backends via `both_backends()`, despite the v2-only
+    /// module it lives in). The default
+    /// implementation is built on `children`, which is in-memory per backend
+    /// today (see the crate's `CLAUDE.md` v1/v2 notes); it is still snapshot-
+    /// correct, just not yet lazy/streaming -- a future backend may override
+    /// this to avoid materializing the full child list per page.
+    fn children_page(&self, id: NodeId, offset: usize, limit: usize) -> Result<Page<Node>> {
+        page_slice(self.children(id)?, offset, limit)
+    }
+
+    /// A page of `descendants(id)` (depth-first, source order): same
+    /// offset/limit and snapshot-consistency contract as [`children_page`].
+    /// Includes the "fallback files" case the epic's hierarchy-traversal
+    /// story (story 12) calls out: a File indexed by the generic fallback
+    /// tokenizer (no language extractor, so no Symbol nodes) has Tokens as
+    /// its direct children, and paging its descendants yields those Tokens
+    /// in source order with no error, the same as `descendants` does for one
+    /// unpaged call.
+    fn descendants_page(&self, id: NodeId, offset: usize, limit: usize) -> Result<Page<Node>> {
+        page_slice(self.descendants(id)?, offset, limit)
+    }
+
     /// All tokens stored for one file, in source order; `None` if the file is
     /// not indexed.
     fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>>;

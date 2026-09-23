@@ -2087,6 +2087,66 @@ fn snapshot_stats_reports_count_and_monotonic_age() {
     assert!(stats4.store_size_bytes > 0);
 }
 
+// --- ADR 0003 story 11: paging vs. snapshot expiry (v2 only; v1 never expires) ---
+
+/// A page fetched after the snapshot's max age has elapsed returns
+/// `SnapshotExpired`, not stale or partial data and not a panic -- checked on
+/// `children_page`, `descendants_page` and paged `search`/`search_symbols`
+/// (`offset`/`limit`), mid-sequence: the first page succeeds while the
+/// snapshot is still fresh, and only a later page, fetched after it ages out,
+/// fails.
+#[test]
+fn a_page_fetched_after_snapshot_expiry_returns_snapshot_expired() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let mut s = V2Store::open(&p).unwrap();
+    s.set_max_snapshot_age(std::time::Duration::from_millis(30));
+    for i in 0..6 {
+        s.ingest_file(
+            "o",
+            "r",
+            &format!("f{i}.rs"),
+            "rust",
+            &span_ext(&[("S", SymbolKind::Function, 0, 4)], &[("alpha", 0, 4)]),
+        )
+        .unwrap();
+    }
+    let snap = s.snapshot().unwrap();
+    let org = snap.roots().unwrap()[0].id;
+    let repo = snap.children(org).unwrap()[0].id;
+
+    // First page, still within the max age: succeeds normally.
+    let page1 = snap.children_page(repo, 0, 3).unwrap();
+    assert_eq!(page1.items.len(), 3);
+    assert!(page1.has_more);
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+
+    // Later page, fetched after expiry: SnapshotExpired, not a short page.
+    assert!(matches!(
+        snap.children_page(repo, 3, 3),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+    assert!(matches!(
+        snap.descendants_page(org, 0, 3),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+    let mut q = Query::new("alpha");
+    q.offset = Some(1);
+    q.limit = Some(2);
+    assert!(matches!(
+        snap.search(&q),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+    let mut sq = SymbolQuery::new("S");
+    sq.offset = Some(1);
+    sq.limit = Some(2);
+    assert!(matches!(
+        snap.search_symbols(&sq),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+}
+
 /// v1's default `Store::snapshot_stats()` (unimplemented by `RedbStore`, per
 /// the "v1 is frozen" invariant) honestly reports zero snapshots and no
 /// oldest age -- it tracks none of this, rather than approximating it.

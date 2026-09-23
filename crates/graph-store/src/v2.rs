@@ -1315,10 +1315,16 @@ impl R {
                 &b.file.name,
             ))
         });
-        let n = q.limit.unwrap_or(usize::MAX);
+        // `want` is offset+limit: the early-termination threshold below must
+        // account for rows that will be skipped as `offset` at the end, or a
+        // page beyond the first would come back short/empty.
+        let want = q
+            .offset
+            .unwrap_or(0)
+            .saturating_add(q.limit.unwrap_or(usize::MAX));
         let mut out: Vec<SymbolHit> = Vec::new();
         for fid in order {
-            if out.len() >= n {
+            if out.len() >= want {
                 break;
             }
             let Some(raw) = self.streams.get(fid)? else {
@@ -1368,7 +1374,13 @@ impl R {
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             out.extend(rows.into_iter().map(|(_, h)| h));
         }
-        out.truncate(n);
+        out.truncate(want);
+        if let Some(off) = q.offset {
+            out.drain(0..off.min(out.len()));
+        }
+        if let Some(n) = q.limit {
+            out.truncate(n);
+        }
         Ok(out)
     }
 
@@ -1413,7 +1425,12 @@ impl R {
                 &b.file.name,
             ))
         });
-        let n = q.limit.unwrap_or(usize::MAX);
+        // See `search_symbols`'s `want` comment: the stop threshold must
+        // include rows that `offset` will later skip.
+        let want = q
+            .offset
+            .unwrap_or(0)
+            .saturating_add(q.limit.unwrap_or(usize::MAX));
         type Key = (String, String, String, u32, u64);
         let mut rows: BTreeMap<Key, Hit> = BTreeMap::new();
         let mut last_group: Option<(u64, u64, u64)> = None;
@@ -1424,7 +1441,7 @@ impl R {
                 Grain::Repo => (c.org.id, c.repo.id, 0),
                 _ => (c.org.id, c.repo.id, fid),
             };
-            if rows.len() >= n && last_group != Some(group) {
+            if rows.len() >= want && last_group != Some(group) {
                 break;
             }
             last_group = Some(group);
@@ -1569,7 +1586,11 @@ impl R {
                 rows.entry(key).and_modify(|h| h.count += 1).or_insert(hit);
             }
         }
-        Ok(rows.into_values().take(n).collect())
+        Ok(rows
+            .into_values()
+            .skip(q.offset.unwrap_or(0))
+            .take(q.limit.unwrap_or(usize::MAX))
+            .collect())
     }
 }
 

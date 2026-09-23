@@ -21,7 +21,7 @@ pub mod codec;
 pub mod conformance;
 pub mod migrate;
 mod v2;
-pub use api::{detect_backend, open_store, Backend, SnapshotStats, Store, StoreRead};
+pub use api::{detect_backend, open_store, Backend, Page, SnapshotStats, Store, StoreRead};
 pub use v2::{CompactStats, V2Snapshot, V2Store, VacuumStats};
 
 /// On-disk layout version written by this build. It is 2 because databases
@@ -233,6 +233,13 @@ pub struct Query {
     pub symbol_kind: Option<String>,
     /// Keep at most this many rows (after deterministic ordering).
     pub limit: Option<usize>,
+    /// Skip this many rows (after the same deterministic ordering `limit`
+    /// truncates) before collecting `limit` rows. ADR 0003 story 11: paired
+    /// with `limit`, this is the offset half of offset/limit paging over a
+    /// [`Store::snapshot`](crate::Store::snapshot) handle -- call `search`
+    /// again on the same snapshot with `offset` advanced by the previous
+    /// page's `limit` to fetch the next page of a frozen, consistent view.
+    pub offset: Option<usize>,
 }
 
 impl Query {
@@ -246,6 +253,7 @@ impl Query {
             grain: Grain::Token,
             symbol_kind: None,
             limit: None,
+            offset: None,
         }
     }
 }
@@ -265,6 +273,9 @@ pub struct SymbolQuery {
     pub file: Option<String>,
     /// Keep at most this many rows (after deterministic ordering).
     pub limit: Option<usize>,
+    /// Skip this many rows before collecting `limit` rows; see
+    /// [`Query::offset`] for the paging convention this mirrors.
+    pub offset: Option<usize>,
 }
 
 impl SymbolQuery {
@@ -277,6 +288,7 @@ impl SymbolQuery {
             repo: None,
             file: None,
             limit: None,
+            offset: None,
         }
     }
 }
@@ -1643,7 +1655,11 @@ impl RedbStore {
                     ib,
                 ))
         });
-        let mut out: Vec<SymbolHit> = out.into_iter().map(|(_, h)| h).collect();
+        let mut out: Vec<SymbolHit> = out
+            .into_iter()
+            .map(|(_, h)| h)
+            .skip(q.offset.unwrap_or(0))
+            .collect();
         if let Some(n) = q.limit {
             out.truncate(n);
         }
@@ -1813,7 +1829,11 @@ impl RedbStore {
         }
         // BTreeMap order: org, repo, file, offset, node id (deterministic).
         let n = q.limit.unwrap_or(usize::MAX);
-        Ok(rows.into_values().take(n).collect())
+        Ok(rows
+            .into_values()
+            .skip(q.offset.unwrap_or(0))
+            .take(n)
+            .collect())
     }
 }
 

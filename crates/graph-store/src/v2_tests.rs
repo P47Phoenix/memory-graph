@@ -1248,3 +1248,270 @@ fn traversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus() {
          ({sum_ancestors_before:.3} ms) by more than the 1.5x noise allowance"
     );
 }
+
+// --- ADR 0003 story 11: paging (Store::children_page/descendants_page, Query/SymbolQuery::offset) ---
+
+/// Paging through a result set larger than one page (`children_page` on a
+/// fallback file with many direct token children -- the epic's story 12
+/// "fallback files" case: a File with no language extractor, so no Symbol
+/// nodes, lists every Token as a direct child) returns every item exactly
+/// once, in the same order `children` returns them, across every page, on
+/// both backends.
+#[test]
+fn paging_children_covers_every_item_once_in_order() {
+    let (_d, a, b) = both_backends();
+    // "text" has no registered extractor: a fallback file, tokens only.
+    let src: String = (0..250).map(|i| format!("t{i} ")).collect();
+    let words = tokenize_words(&src);
+    for s in [&a, &b] {
+        s.ingest_file("o", "r", "big.txt", "text", &span_ext(&[], &words))
+            .unwrap();
+    }
+    for s in [&a, &b] {
+        let org = s.roots().unwrap()[0].id;
+        let repo = s.children(org).unwrap()[0].id;
+        let file = s.children(repo).unwrap()[0].id;
+        let full = s.children(file).unwrap();
+        assert_eq!(
+            full.len(),
+            250,
+            "every token is a direct child of a fallback file"
+        );
+
+        let mut paged = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = s.children_page(file, offset, 32).unwrap();
+            assert!(page.items.len() <= 32);
+            let more = page.has_more;
+            let got = page.items.len();
+            paged.extend(page.items);
+            if !more {
+                break;
+            }
+            offset += got;
+        }
+        assert_eq!(
+            paged, full,
+            "paged union equals the unpaged list, same order"
+        );
+        let ids: std::collections::HashSet<_> = paged.iter().map(|n| n.id).collect();
+        assert_eq!(ids.len(), paged.len(), "no id twice across pages");
+
+        // Past the end: empty, has_more false.
+        let past = s.children_page(file, 10_000, 10).unwrap();
+        assert!(past.items.is_empty() && !past.has_more);
+
+        // limit:0 mid-list: empty items, but has_more is true -- it still
+        // reflects whether more data exists behind this (empty) page, not
+        // whether this call returned anything.
+        let zero = s.children_page(file, 0, 0).unwrap();
+        assert!(zero.items.is_empty() && zero.has_more);
+        // limit:0 past the end: empty items, has_more false (no data left).
+        let zero_past = s.children_page(file, 10_000, 0).unwrap();
+        assert!(zero_past.items.is_empty() && !zero_past.has_more);
+    }
+}
+
+/// Same coverage guarantee for `descendants_page` over a whole org (mixed
+/// repo/file/symbol/token levels), on both backends.
+#[test]
+fn paging_descendants_covers_every_item_once_in_order() {
+    let (_d, a, b) = both_backends();
+    for s in [&a, &b] {
+        for i in 0..8 {
+            s.ingest_file(
+                "o",
+                "r",
+                &format!("f{i}.rs"),
+                "rust",
+                &span_ext(
+                    &[("S", SymbolKind::Function, 0, 4)],
+                    &[("alpha", 0, 4), ("beta", 5, 9)],
+                ),
+            )
+            .unwrap();
+        }
+    }
+    for s in [&a, &b] {
+        let org = s.roots().unwrap()[0].id;
+        let full = s.descendants(org).unwrap();
+        assert!(full.len() > 10, "enough nodes to span multiple pages");
+
+        let mut paged = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = s.descendants_page(org, offset, 7).unwrap();
+            let more = page.has_more;
+            let got = page.items.len();
+            paged.extend(page.items);
+            if !more {
+                break;
+            }
+            offset += got.max(1);
+        }
+        assert_eq!(paged, full);
+    }
+}
+
+/// Paged `search` (`Query::offset` + `Query::limit`) reconstructs exactly the
+/// same rows, in the same order, as one unpaged call, on both backends.
+#[test]
+fn paging_search_offset_limit_matches_full_results() {
+    let (_d, a, b) = both_backends();
+    for s in [&a, &b] {
+        for i in 0..12 {
+            s.ingest_file(
+                "o",
+                "r",
+                &format!("f{i}.rs"),
+                "rust",
+                &span_ext(&[], &[("needle", 0, 6)]),
+            )
+            .unwrap();
+        }
+    }
+    for s in [&a, &b] {
+        let full = s.search(&Query::new("needle")).unwrap();
+        assert_eq!(full.len(), 12);
+        let mut paged = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut q = Query::new("needle");
+            q.offset = Some(offset);
+            q.limit = Some(5);
+            let page = s.search(&q).unwrap();
+            let got = page.len();
+            paged.extend(page);
+            if got < 5 {
+                break;
+            }
+            offset += got;
+        }
+        assert_eq!(paged, full, "paged search equals the unpaged list");
+    }
+}
+
+/// Paged `search_symbols` (`SymbolQuery::offset` + `limit`) likewise
+/// reconstructs the unpaged result, on both backends.
+#[test]
+fn paging_search_symbols_offset_limit_matches_full_results() {
+    let (_d, a, b) = both_backends();
+    for s in [&a, &b] {
+        for i in 0..9 {
+            s.ingest_file(
+                "o",
+                "r",
+                &format!("f{i}.rs"),
+                "rust",
+                &span_ext(&[("S", SymbolKind::Function, 0, 4)], &[]),
+            )
+            .unwrap();
+        }
+    }
+    for s in [&a, &b] {
+        let full = s.search_symbols(&SymbolQuery::new("S")).unwrap();
+        assert_eq!(full.len(), 9);
+        let mut paged = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut q = SymbolQuery::new("S");
+            q.offset = Some(offset);
+            q.limit = Some(4);
+            let page = s.search_symbols(&q).unwrap();
+            let got = page.len();
+            paged.extend(page);
+            if got < 4 {
+                break;
+            }
+            offset += got;
+        }
+        assert_eq!(paged, full);
+    }
+}
+
+/// Paging is snapshot-consistent: pages already fetched, and pages fetched
+/// later in the same sequence, come from the one frozen read the snapshot
+/// took, not from a concurrent writer's changes -- on both backends (v1's
+/// `snapshot()` freezes too; only max-age expiry is v2-only, story 10).
+#[test]
+fn paging_is_snapshot_consistent_across_concurrent_writes() {
+    let (_d, a, b) = both_backends();
+    for s in [&a, &b] {
+        for i in 0..6 {
+            s.ingest_file(
+                "o",
+                "r",
+                &format!("f{i}.rs"),
+                "rust",
+                &span_ext(&[], &[("orig", 0, 4)]),
+            )
+            .unwrap();
+        }
+        let snap = s.snapshot().unwrap();
+        let org = snap.roots().unwrap()[0].id;
+        let repo = snap.children(org).unwrap()[0].id;
+
+        // First page from the snapshot.
+        let page1 = snap.children_page(repo, 0, 3).unwrap();
+        assert_eq!(page1.items.len(), 3);
+        assert!(page1.has_more);
+
+        // Mutate the live store: ingest a new file, replace an existing one.
+        s.ingest_file(
+            "o",
+            "r",
+            "new.rs",
+            "rust",
+            &span_ext(&[], &[("orig", 0, 4)]),
+        )
+        .unwrap();
+        s.ingest_file(
+            "o",
+            "r",
+            "f0.rs",
+            "rust",
+            &span_ext(&[], &[("changed", 0, 7)]),
+        )
+        .unwrap();
+
+        // Second page, fetched AFTER the mutation, still comes from the
+        // frozen snapshot: total children of the repo is still 6, not 7,
+        // and the two pages together equal the pre-mutation full list.
+        let page2 = snap.children_page(repo, 3, 3).unwrap();
+        assert_eq!(page2.items.len(), 3);
+        assert!(
+            !page2.has_more,
+            "still 6 files, not 7, through the frozen snapshot"
+        );
+        let mut all: Vec<_> = page1
+            .items
+            .iter()
+            .chain(&page2.items)
+            .map(|n| n.name.clone())
+            .collect();
+        all.sort();
+        let mut want: Vec<String> = (0..6).map(|i| format!("f{i}.rs")).collect();
+        want.sort();
+        assert_eq!(
+            all, want,
+            "snapshot paging sees none of the concurrent writes"
+        );
+
+        // A fresh snapshot after the writes does see them.
+        let fresh = s.snapshot().unwrap();
+        let fresh_repo = fresh.children(fresh.roots().unwrap()[0].id).unwrap()[0].id;
+        assert_eq!(fresh.children(fresh_repo).unwrap().len(), 7);
+    }
+}
+
+fn tokenize_words(src: &str) -> Vec<(&str, u32, u32)> {
+    let mut out = Vec::new();
+    let mut pos = 0u32;
+    for w in src.split_whitespace() {
+        let start = src[pos as usize..].find(w).unwrap() as u32 + pos;
+        out.push((w, start, start + w.len() as u32));
+        pos = start + w.len() as u32;
+    }
+    out
+}
