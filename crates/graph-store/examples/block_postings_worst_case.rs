@@ -88,10 +88,11 @@ fn main() {
     let mut new_bytes: u64 = 0;
     let mut n_postings: u64 = 0;
 
-    // Lengths chosen to land one entry past a multiple of POSTING_BLOCK, so
-    // each posting's last block is a single-entry straggler: the worst ratio
-    // of per-block overhead to block content. Mixed with a few in-block
-    // lengths so not every posting is maximally fragmented.
+    // Every posting uses length POSTING_BLOCK + 1: one full block plus a
+    // single-entry straggler block, so each posting's last block is a
+    // single-entry straggler -- the worst ratio of per-block overhead to
+    // block content, since it maximizes the fixed per-block overhead
+    // relative to content for any posting length (see module doc).
     let b = POSTING_BLOCK;
     let lengths: &[usize] = &[b + 1];
 
