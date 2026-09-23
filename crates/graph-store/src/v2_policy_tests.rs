@@ -3,6 +3,7 @@
 use super::*;
 use crate::v2::{content_id, hashed_key, MAX_INLINE_TERM, OPEN_BATCH, R};
 use crate::v2_tests::{both_backends, span_ext};
+use redb::{ReadableTableMetadata, TableDefinition};
 
 fn sha(p: &std::path::Path) -> Vec<u8> {
     use sha2::{Digest, Sha256};
@@ -1776,5 +1777,191 @@ fn schema_version_mismatch_still_hard_refuses() {
         sha(&p),
         before,
         "a schema mismatch must leave the file untouched, not attempt any self-heal"
+    );
+}
+
+// --- ADR 0003 story 5: packed single sorted dictionary (D1) ---
+
+/// Interning more than a few [`crate::codec::DICT_BLOCK`]-sized worths of
+/// distinct terms packs them into far fewer `dict_rev` rows than terms
+/// (one row per up to `DICT_BLOCK` terms, not one row per term), and every
+/// one of them is still findable by [`crate::v2::R::text`]/`lookup` via
+/// `search`.
+#[test]
+fn dict_rev_packs_many_terms_into_few_blocks() {
+    use crate::v2::DICT_REV;
+    let n = crate::codec::DICT_BLOCK * 3 + 5;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    let owned: Vec<String> = (0..n).map(|i| format!("term{i}")).collect();
+    let toks: Vec<(&str, u32, u32)> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i as u32, i as u32 + 1))
+        .collect();
+    s.ingest_file("o", "r", "x.txt", "text", &span_ext(&[], &toks))
+        .unwrap();
+    s.check_consistency(false);
+
+    let rt = s.db.begin_read().unwrap();
+    let blocks = rt.open_table(DICT_REV).unwrap().len().unwrap();
+    let want_blocks = (n as u64).div_ceil(crate::codec::DICT_BLOCK as u64);
+    assert_eq!(
+        blocks,
+        want_blocks,
+        "{n} terms should pack into {want_blocks} rows of up to {} each, not one row per term",
+        crate::codec::DICT_BLOCK
+    );
+    assert!(
+        blocks < n as u64,
+        "packing must use far fewer rows than terms"
+    );
+    for t in &owned {
+        assert_eq!(s.search(&Query::new(t)).unwrap().len(), 1, "term {t}");
+    }
+}
+
+/// `vacuum` repacks `dict_rev` densely (ADR 0003 story 5): after removing
+/// terms scattered across several blocks, block boundaries no longer line up
+/// with `id / DICT_BLOCK` (dead ids leave gaps), and lookups must still find
+/// every surviving term by the binary-search-over-blocks path, not the
+/// (no longer valid) dense addressing.
+#[test]
+fn vacuum_repacks_dict_rev_blocks_and_lookups_stay_correct() {
+    use crate::v2::DICT_REV;
+    let n = crate::codec::DICT_BLOCK * 2 + 10;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    let owned: Vec<String> = (0..n).map(|i| format!("term{i}")).collect();
+    let toks: Vec<(&str, u32, u32)> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i as u32, i as u32 + 1))
+        .collect();
+    s.ingest_file("o", "r", "x.txt", "text", &span_ext(&[], &toks))
+        .unwrap();
+    s.check_consistency(false);
+    let before_blocks = {
+        let rt = s.db.begin_read().unwrap();
+        rt.open_table(DICT_REV).unwrap().len().unwrap()
+    };
+
+    // Replace the file with only every third term: two-thirds of the
+    // original terms die, scattered across every original block.
+    let kept: Vec<String> = owned.iter().step_by(3).cloned().collect();
+    let kept_toks: Vec<(&str, u32, u32)> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i as u32, i as u32 + 1))
+        .collect();
+    s.ingest_file("o", "r", "x.txt", "text", &span_ext(&[], &kept_toks))
+        .unwrap();
+    s.check_consistency(false);
+    let stats = s.vacuum().unwrap();
+    assert_eq!(stats.terms_removed, n - kept.len());
+    s.check_consistency(true);
+
+    let after_blocks = {
+        let rt = s.db.begin_read().unwrap();
+        rt.open_table(DICT_REV).unwrap().len().unwrap()
+    };
+    assert!(
+        after_blocks <= before_blocks,
+        "repacking after vacuum must not use more blocks"
+    );
+    for t in &kept {
+        assert_eq!(
+            s.search(&Query::new(t.as_str())).unwrap().len(),
+            1,
+            "term {t}"
+        );
+    }
+    for (i, t) in owned.iter().enumerate() {
+        if i % 3 != 0 {
+            assert_eq!(s.search(&Query::new(t)).unwrap().len(), 0, "dead term {t}");
+        }
+    }
+}
+
+/// Size gate (ADR 0003 story 5, decision D1: "Dictionary <= 15% of pages at
+/// 9.9 M; lookups unchanged"): on a term set derived from this repo's own
+/// source (`v2.rs`/`codec.rs`, tokenized crudely by splitting on
+/// non-identifier bytes, deduplicated), the packed `dict_rev` table's total
+/// on-disk bytes must not exceed the pre-story-5 one-row-per-term layout's,
+/// measured empirically (two real redb files, `Database::compact`ed so
+/// redb's own free-page slack does not swamp the row-format difference) --
+/// not estimated. Fast (runs in the default `cargo test`, not `--release`
+/// only): the term set here is a few thousand terms, not the ADR spike's
+/// synthetic 9.9 M-token corpus (that scale is a `--release` `cargo run
+/// --example`, matching story 6's `block_postings_100m` precedent, not a
+/// unit test).
+#[test]
+fn dict_rev_packed_bytes_do_not_exceed_pre_story5_layout_on_this_repos_own_corpus() {
+    use crate::v2::DICT_REV;
+    let mut terms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for src in [
+        include_str!("v2.rs"),
+        include_str!("codec.rs"),
+        include_str!("v2_policy_tests.rs"),
+    ] {
+        for word in src.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if word.len() >= 2 {
+                terms.insert(word.to_string());
+            }
+        }
+    }
+    let terms: Vec<String> = terms.into_iter().collect();
+    assert!(
+        terms.len() > 4 * crate::codec::DICT_BLOCK,
+        "sanity: {}",
+        terms.len()
+    );
+
+    let d = tempfile::tempdir().unwrap();
+
+    // Pre-story-5 layout: one row per term, id -> text.
+    let old_path = d.path().join("old.redb");
+    {
+        const OLD: TableDefinition<u64, &str> = TableDefinition::new("dict_rev");
+        let mut db = redb::Database::create(&old_path).unwrap();
+        let wt = db.begin_write().unwrap();
+        {
+            let mut t = wt.open_table(OLD).unwrap();
+            for (id, text) in terms.iter().enumerate() {
+                t.insert(id as u64, text.as_str()).unwrap();
+            }
+        }
+        wt.commit().unwrap();
+        db.compact().unwrap();
+    }
+
+    // Story-5 packed layout: block index -> encode_dict_block bytes.
+    let new_path = d.path().join("new.redb");
+    {
+        let mut db = redb::Database::create(&new_path).unwrap();
+        let wt = db.begin_write().unwrap();
+        {
+            let mut t = wt.open_table(DICT_REV).unwrap();
+            for (i, chunk) in terms.chunks(crate::codec::DICT_BLOCK).enumerate() {
+                let refs: Vec<(u64, &str)> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(j, text)| ((i * crate::codec::DICT_BLOCK + j) as u64, text.as_str()))
+                    .collect();
+                t.insert(i as u64, crate::codec::encode_dict_block(&refs).as_slice())
+                    .unwrap();
+            }
+        }
+        wt.commit().unwrap();
+        db.compact().unwrap();
+    }
+
+    let old_bytes = std::fs::metadata(&old_path).unwrap().len();
+    let new_bytes = std::fs::metadata(&new_path).unwrap().len();
+    assert!(
+        new_bytes <= old_bytes,
+        "packed dict_rev ({new_bytes} B) must not exceed the pre-story-5 one-row-per-term \
+         layout ({old_bytes} B) on {} terms from this repo's own source",
+        terms.len()
     );
 }
