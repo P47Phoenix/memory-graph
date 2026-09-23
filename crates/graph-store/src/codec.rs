@@ -5,8 +5,26 @@
 //! ids (the store interns them), spans are delta-coded against the previous
 //! record, integers are LEB128 varints, signed deltas are zigzag. Every span
 //! field is stored, so any `u32` span survives exactly, including agent-supplied
-//! spans that a source scan could not reproduce (so no `irregular` escape is
-//! needed in this slice). Byte 0 is [`STREAM_FORMAT`].
+//! spans that a source scan could not reproduce.
+//!
+//! **`irregular` escape (ADR 0003 story 2), resolved:** the story's own text
+//! names an `irregular` escape as a hedge against spans a source scan could
+//! not reproduce -- inverted (`end < start`, `end_line < start_line`),
+//! overlapping, zero-length, or otherwise not fitting the fast-path
+//! assumption that a source scan's spans are small, forward, well-formed
+//! deltas. Because every span field here is stored explicitly rather than
+//! derived from source text, `rel` (`base + zigzag delta`, both checked
+//! against `u32`) reconstructs the exact original field regardless of
+//! whether the delta is small/forward or an inverted/extreme jump -- the
+//! record layout has no notion of "regular" to escape from. So no separate
+//! escape record or flag was added: it would be a second way to encode data
+//! the existing layout already encodes exactly, which is the narrow-scope
+//! rule below applied to this case too. `golden_bytes_irregular_spans` and
+//! `regular_and_irregular_spans_round_trip_at_every_boundary` (in
+//! `codec::props`) pin this: an inverted/extreme span costs a longer varint
+//! (up to 5 bytes vs. 1 for a small delta), never a different record shape,
+//! and a stream mixing regular and irregular spans at every boundary
+//! round-trips exactly with no panic. Byte 0 is [`STREAM_FORMAT`].
 //!
 //! Layout (after the format byte, format 3): `nsym ntok symlen` as varints,
 //! then one flag byte, then `symlen` bytes of symbol records, then `nck`
@@ -777,6 +795,50 @@ mod tests {
         assert!(decode_lazy(&want).unwrap().ranges_dense());
     }
 
+    /// Golden bytes for the `irregular`-span case named in ADR 0003 story 2:
+    /// a token whose span is inverted (`end < start`, `end_line < start_line`)
+    /// and one whose fields are all `u32::MAX`. Per the module doc, there is
+    /// no separate escape record: an irregular span is encoded on the exact
+    /// same record layout as a regular one (`term class parent+1 span`), just
+    /// with a larger zigzag delta. A change to these bytes is a format change
+    /// and needs a bumped `STREAM_FORMAT` plus a migration story, same as
+    /// `golden_bytes` above.
+    #[test]
+    fn golden_bytes_irregular_spans() {
+        let s = Stream {
+            symbols: vec![],
+            tokens: vec![
+                TokRec {
+                    term: 1,
+                    class: TokenClass::Literal,
+                    parent: None,
+                    span: sp(5, 2, 9, 9, 3, 1), // inverted: end < start, end_line < start_line
+                },
+                TokRec {
+                    term: 2,
+                    class: TokenClass::Other,
+                    parent: None,
+                    span: sp(u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+                },
+            ],
+        };
+        let want: Vec<u8> = vec![
+            3, 0, 2, 0,
+            1, // format, nsym=0, ntok=2, symlen=0, flag (ranges_dense; vacuous, no symbols)
+            1, 2, 0, 10, 5, 18, 18, 11,
+            1, // token 0: term=1, class=Literal(2), parent=0, span deltas
+            2, 6, 0, // token 1: term delta=1 (zigzag), class=Other(6), parent=0
+            244, 255, 255, 255, 31, // start: zigzag(u32::MAX - 5)
+            0,  // len: end - start = 0 (both u32::MAX)
+            236, 255, 255, 255, 31, // start_line: zigzag(u32::MAX - 9)
+            236, 255, 255, 255, 31, // start_col: zigzag(u32::MAX - 9)
+            0,  // end_line delta from start_line: 0
+            255, 255, 255, 255, 15, // end_col: varint(u32::MAX)
+        ];
+        assert_eq!(encode(&s), want);
+        assert_eq!(decode(&encode(&s)).unwrap(), s);
+    }
+
     #[test]
     fn round_trip_and_extremes() {
         let s = sample();
@@ -1495,10 +1557,13 @@ mod tests {
 }
 
 /// Property tests over source-text shapes (ADR 0003 story 2). The codec stores
-/// every span field, so there is no `irregular` escape to exercise yet; these
-/// tests pin the contract such an escape must keep: whatever the text (CRLF,
-/// lone CR, BOM, combining marks, astral code points, tabs, multi-line
-/// tokens), every span field survives encode/decode exactly.
+/// every span field, so there is no separate `irregular` escape record (see
+/// the module doc); these tests pin the contract that resolution relies on:
+/// whatever the text (CRLF, lone CR, BOM, combining marks, astral code
+/// points, tabs, multi-line tokens), every span field survives encode/decode
+/// exactly. `regular_and_irregular_spans_round_trip_at_every_boundary` below
+/// covers the `irregular`-span case specifically (inverted/extreme spans,
+/// not source-derived ones).
 #[cfg(test)]
 mod props {
     use super::*;
@@ -1746,6 +1811,56 @@ mod props {
                     prop_assert!(li < fj || lj < fi, "unrelated symbols {i}, {j} overlap");
                 }
             }
+        }
+
+        /// ADR 0003 story 2's `irregular`-span boundary: a stream of tokens
+        /// whose spans are deliberately a mix of "regular" (small, in-order,
+        /// as a real tokenizer would produce: start increases by a small
+        /// step, `end >= start`, `end_line >= start_line`) and "irregular"
+        /// (inverted `end < start`, inverted `end_line < start_line`, or an
+        /// extreme jump to/from `u32::MAX`) must round trip exactly and must
+        /// never panic -- on the same record layout, whichever kind of span
+        /// comes before or after which. This is the property the module doc
+        /// says an `irregular` escape would have to preserve; per that doc,
+        /// no escape is needed because every span field is already stored,
+        /// so this test pins that the boundary between the two kinds (in
+        /// either order, adjacent in the delta chain) is not special-cased
+        /// or lossy.
+        #[test]
+        fn regular_and_irregular_spans_round_trip_at_every_boundary(
+            kinds in prop::collection::vec(0u8..4, 1..20),
+        ) {
+            fn mk(start: u32, end: u32, start_line: u32, start_col: u32, end_line: u32, end_col: u32) -> Span {
+                Span { start, end, start_line, start_col, end_line, end_col }
+            }
+            let mut stream = Stream::default();
+            let mut at = 0u32;
+            let mut line = 0u32;
+            for (i, k) in kinds.iter().enumerate() {
+                let span = match k % 4 {
+                    // Regular: small forward step, well-formed end >= start.
+                    0 => {
+                        at += 1 + (i as u32 % 5);
+                        line += i as u32 % 2;
+                        mk(at, at + 3, line, 0, line, 3)
+                    }
+                    // Irregular: inverted byte range.
+                    1 => mk(at, at.saturating_sub(3), line, 0, line, 0),
+                    // Irregular: inverted line range.
+                    2 => mk(at, at + 1, line + 5, 0, line.saturating_sub(2), 0),
+                    // Irregular: extreme jump to u32::MAX and back.
+                    _ => mk(u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+                };
+                stream.tokens.push(TokRec {
+                    term: i as u64,
+                    class: TokenClass::Other,
+                    parent: None,
+                    span,
+                });
+            }
+            let b = encode(&stream);
+            let decoded = decode(&b).unwrap();
+            prop_assert_eq!(&decoded, &stream);
         }
     }
 }
