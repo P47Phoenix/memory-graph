@@ -2441,6 +2441,13 @@ fn set_max_snapshot_age_does_not_retroactively_affect_open_handles() {
     // config change on the *same* live store) is real and worth testing, so
     // the lifetime is erased with `transmute` -- sound because, as above,
     // nothing about a `V2Snapshot` actually borrows `V2Store`'s data.
+    // SAFETY: `V2Snapshot`'s fields are all owned data -- an owned
+    // `ReadTransaction`, an owned `Arc<Mutex<SnapshotTracker>>` clone,
+    // plus `tracker_id`, `created_at`, `max_age` and `warned` -- none of
+    // which borrows from `&V2Store`. The `'_` lifetime tying the returned
+    // `Box` to `&self` comes only from `StoreRead`'s trait signature, an
+    // API constraint, not a real borrow, so erasing it to `'static` here
+    // does not extend any actual borrow's lifetime and is sound.
     let old_snap: Box<dyn StoreRead + Send + 'static> = unsafe {
         std::mem::transmute::<Box<dyn StoreRead + Send + '_>, Box<dyn StoreRead + Send + 'static>>(
             s.snapshot().unwrap(),
