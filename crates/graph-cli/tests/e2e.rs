@@ -1767,3 +1767,188 @@ fn describe_json_surfaces_a_crashed_v2_batch() {
         "{out}{err}"
     );
 }
+
+/// ADR 0003 story 12: index a small corpus into v1, migrate to v2, and
+/// confirm `search`/`describe`/`symbols` output is identical between the two
+/// (only stable, backend-agnostic fields: v2's own `open_batch` differs in
+/// kind from v1's, but both report `false` here).
+#[test]
+fn migrate_v1_to_v2_matches_on_search_describe_and_symbols() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("lib.rs"),
+        "fn foo() { bar(); }
+struct S;
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.zig"),
+        "pub fn foo() void {}
+",
+    )
+    .unwrap();
+    let v1_db = d.path().join("v1.redb").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &v1_db,
+        "index",
+        "--org",
+        "acme",
+        "--repo",
+        "widgets",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+
+    let v2_db = d.path().join("v2.redb");
+    let (ok, out, err) = run(&["--db", &v1_db, "migrate", v2_db.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("files=2"), "{out}");
+    assert!(v2_db.is_file());
+
+    for args in [
+        vec!["search", "foo", "--json"],
+        vec!["search", "foo", "--grain", "file", "--json"],
+        vec!["search", "foo", "--grain", "symbol", "--json"],
+        vec!["symbols", "*", "--json"],
+        vec!["describe", "--json"],
+    ] {
+        let mut v1_args = vec!["--db", v1_db.as_str()];
+        v1_args.extend(args.iter().copied());
+        let mut v2_args = vec!["--db", v2_db.to_str().unwrap(), "--backend", "v2"];
+        v2_args.extend(args.iter().copied());
+        let (ok1, out1, err1) = run(&v1_args);
+        let (ok2, out2, err2) = run(&v2_args);
+        assert!(ok1 && ok2, "{args:?}: {err1}{err2}");
+        let mut a: serde_json::Value = serde_json::from_str(out1.trim()).unwrap();
+        let mut b: serde_json::Value = serde_json::from_str(out2.trim()).unwrap();
+        // `open_batch` is a v2-only concept (D3); both report `false` on
+        // this freshly migrated, uncorrupted store, but strip it so a
+        // future field there does not make an otherwise-identical
+        // `describe` fail this comparison for the wrong reason.
+        if let Some(repos) = a.get_mut("repos").and_then(|r| r.as_array_mut()) {
+            for r in repos {
+                r.as_object_mut().unwrap().remove("open_batch");
+            }
+        }
+        if let Some(repos) = b.get_mut("repos").and_then(|r| r.as_array_mut()) {
+            for r in repos {
+                r.as_object_mut().unwrap().remove("open_batch");
+            }
+        }
+        assert_eq!(a, b, "{args:?}");
+    }
+}
+
+/// A destination that already exists is refused without `--force`, and left
+/// untouched.
+#[test]
+fn migrate_refuses_an_existing_destination_without_force() {
+    let d = tempfile::tempdir().unwrap();
+    let v1_db = d.path().join("v1.redb").to_string_lossy().into_owned();
+    let f = d.path().join("a.rs");
+    std::fs::write(
+        &f,
+        "fn foo() {}
+",
+    )
+    .unwrap();
+    let (ok, _, err) = run(&[
+        "--db",
+        &v1_db,
+        "index-file",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        f.to_str().unwrap(),
+    ]);
+    assert!(ok, "{err}");
+
+    let dest = d.path().join("v2.redb");
+    std::fs::write(&dest, b"pre-existing").unwrap();
+    let (ok, _, err) = run(&["--db", &v1_db, "migrate", dest.to_str().unwrap()]);
+    assert!(!ok, "expected failure without --force");
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"pre-existing");
+
+    let (ok, out, err) = run(&["--db", &v1_db, "migrate", dest.to_str().unwrap(), "--force"]);
+    assert!(ok, "{out}{err}");
+    assert_ne!(std::fs::read(&dest).unwrap(), b"pre-existing");
+}
+
+/// `export` produces one well-formed JSON line per node and works on both
+/// backends through the `Store` trait (not backend-specific).
+#[test]
+fn export_ndjson_round_trips_node_counts() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.rs");
+    std::fs::write(
+        &f,
+        "fn foo() { bar(); }
+",
+    )
+    .unwrap();
+    for backend in ["v1", "v2"] {
+        let db = d.path().join(format!("{backend}.redb"));
+        let (ok, out, err) = run(&[
+            "--db",
+            db.to_str().unwrap(),
+            "--backend",
+            backend,
+            "index-file",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            f.to_str().unwrap(),
+        ]);
+        assert!(ok, "{out}{err}");
+
+        let out_path = d.path().join(format!("{backend}.ndjson"));
+        let (ok, _, err) = run(&[
+            "--db",
+            db.to_str().unwrap(),
+            "--backend",
+            backend,
+            "export",
+            "--out",
+            out_path.to_str().unwrap(),
+        ]);
+        assert!(ok, "{err}");
+        let text = std::fs::read_to_string(&out_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines.is_empty());
+        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("line is not well-formed JSON: {e}: {line}");
+            });
+            *kinds
+                .entry(v["kind"].as_str().unwrap().to_string())
+                .or_default() += 1;
+        }
+        assert_eq!(
+            kinds.get("org").copied().unwrap_or(0),
+            1,
+            "{backend}: {kinds:?}"
+        );
+        assert_eq!(
+            kinds.get("repo").copied().unwrap_or(0),
+            1,
+            "{backend}: {kinds:?}"
+        );
+        assert_eq!(
+            kinds.get("file").copied().unwrap_or(0),
+            1,
+            "{backend}: {kinds:?}"
+        );
+        assert!(
+            kinds.get("token").copied().unwrap_or(0) > 0,
+            "{backend}: {kinds:?}"
+        );
+    }
+}

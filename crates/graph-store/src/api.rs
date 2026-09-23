@@ -45,6 +45,12 @@ pub trait StoreRead {
     /// Parent pointer lookup (one hop).
     fn parent(&self, id: NodeId) -> Result<Option<Node>>;
     fn count_nodes(&self, kind: NodeKind) -> Result<usize>;
+    /// Every top-level (parent-less) node: one per org, in creation order.
+    /// Used by `migrate` (v1 -> v2) and `export` (ADR 0003 story 12) to walk
+    /// the whole graph through this trait alone, with no backend-specific
+    /// access: `roots()` plus `children`/`descendants` reaches every org,
+    /// repo, file, symbol and token.
+    fn roots(&self) -> Result<Vec<Node>>;
     /// Direct children in creation order: an org's repos, a repo's files, a
     /// file's top-level symbols and tokens outside any symbol (source order),
     /// a symbol's child symbols and direct tokens. Unknown ids and tokens have
@@ -232,6 +238,9 @@ impl StoreRead for RedbStore {
     fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
         RedbStore::count_nodes(self, kind)
     }
+    fn roots(&self) -> Result<Vec<Node>> {
+        RedbStore::roots_in(&self.db.begin_read()?)
+    }
     fn children(&self, id: NodeId) -> Result<Vec<Node>> {
         RedbStore::children_in(&self.db.begin_read()?, id)
     }
@@ -314,6 +323,9 @@ impl StoreRead for RedbSnapshot {
     }
     fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
         RedbStore::count_nodes_in(&self.rt, kind)
+    }
+    fn roots(&self) -> Result<Vec<Node>> {
+        RedbStore::roots_in(&self.rt)
     }
     fn children(&self, id: NodeId) -> Result<Vec<Node>> {
         RedbStore::children_in(&self.rt, id)
@@ -452,6 +464,9 @@ mod cycle_tests {
         }
         fn count_nodes(&self, _: NodeKind) -> Result<usize> {
             Ok(0)
+        }
+        fn roots(&self) -> Result<Vec<Node>> {
+            Ok(vec![])
         }
         fn children(&self, id: NodeId) -> Result<Vec<Node>> {
             Ok(vec![node(3 - id, id)])

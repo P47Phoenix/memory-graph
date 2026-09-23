@@ -141,6 +141,30 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Migrate a v1 database (`--db`) to a brand-new v2 database at `dest`
+    /// (ADR 0003 story 12): preflight (the source must be an openable v1
+    /// database; `dest` must not already exist unless `--force`), write into
+    /// a temp file next to `dest`, run differential verification against the
+    /// source, and only then atomically rename the temp file over `dest`. A
+    /// failing verification removes the temp file and leaves both the source
+    /// and `dest` untouched. `--backend`/`--v2-*` flags do not apply (the
+    /// source is always read as v1, the destination is always written as v2)
+    Migrate {
+        /// Destination v2 database path (must not already exist, unless --force)
+        dest: PathBuf,
+        /// Overwrite an existing destination file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Dump the database's full node graph as newline-delimited JSON, one
+    /// JSON object per node (org, repo, file, symbol, token, each with its
+    /// span): a portable escape hatch (works on either backend), not an
+    /// importer -- there is no `import` command yet
+    Export {
+        /// Write to this file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Find tokens by exact text
     Search {
         /// Exact token text
@@ -536,6 +560,47 @@ fn run() -> Result<()> {
                         h.qualified
                     );
                 }
+            }
+        }
+        Cmd::Migrate { dest, force } => {
+            if !cli.db.is_file() {
+                bail!("database `{}` does not exist", cli.db.display());
+            }
+            let stats =
+                graph_store::migrate::migrate_file(&cli.db, &dest, force).with_context(|| {
+                    format!("migrating `{}` to `{}`", cli.db.display(), dest.display())
+                })?;
+            out!(
+                "migrated {} -> {}: orgs={} repos={} files={} symbols={} tokens={}",
+                cli.db.display(),
+                dest.display(),
+                stats.orgs,
+                stats.repos,
+                stats.files,
+                stats.symbols,
+                stats.tokens
+            );
+        }
+        Cmd::Export { out } => {
+            let store = open_existing(&cli.db, cli.backend, v2_overrides)?;
+            let mut file_writer;
+            let mut stdout_writer;
+            let writer: &mut dyn std::io::Write = match &out {
+                Some(p) => {
+                    file_writer = std::io::BufWriter::new(
+                        std::fs::File::create(p)
+                            .with_context(|| format!("creating `{}`", p.display()))?,
+                    );
+                    &mut file_writer
+                }
+                None => {
+                    stdout_writer = std::io::stdout().lock();
+                    &mut stdout_writer
+                }
+            };
+            let n = graph_store::migrate::export_ndjson(store.as_ref(), writer)?;
+            if out.is_some() {
+                out!("exported {n} nodes");
             }
         }
         Cmd::Search {

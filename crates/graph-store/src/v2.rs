@@ -919,6 +919,25 @@ impl R {
         Ok(n)
     }
 
+    /// Every top-level (parent-less) node: one per org. Used by `migrate`/
+    /// `export` (ADR 0003 story 12) to enumerate the whole graph through the
+    /// `Store`/`StoreRead` trait alone, without backend-specific access; org
+    /// and repo entity rows live in the `nodes` table (unlike symbols/tokens,
+    /// which are stream-encoded), so this is the same one-table scan
+    /// `count_nodes`/`describe_by_scan` already do, filtered to `Org` with no
+    /// parent.
+    fn roots(&self) -> Result<Vec<Node>> {
+        let mut out = Vec::new();
+        for r in self.nodes.iter()? {
+            let n = dec(r?.1.value())?;
+            if n.kind == NodeKind::Org && n.parent.is_none() {
+                out.push(n);
+            }
+        }
+        out.sort_by_key(|n| n.id);
+        Ok(out)
+    }
+
     fn ctx(&self, file_id: u64, cache: &mut HashMap<u64, FileCtx>) -> Result<()> {
         if cache.contains_key(&file_id) {
             return Ok(());
@@ -2644,6 +2663,11 @@ macro_rules! store_read {
                 let $s = self;
                 let g = $rt;
                 R::new(&g)?.count_nodes(kind)
+            }
+            fn roots(&self) -> Result<Vec<Node>> {
+                let $s = self;
+                let g = $rt;
+                R::new(&g)?.roots()
             }
             fn children(&self, id: NodeId) -> Result<Vec<Node>> {
                 let $s = self;
