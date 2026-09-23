@@ -292,6 +292,14 @@ pub struct RepoInfo {
     pub files: usize,
     pub languages: BTreeMap<String, LanguageInfo>,
     pub token_classes: BTreeMap<String, usize>,
+    /// `true` if this repo currently has an open (in-progress or crashed)
+    /// chunked ingest batch (ADR 0003 story 3, decision D3). v2 only: read
+    /// from the `open_batch` marker table inside the same read transaction
+    /// that builds this `RepoInfo`, so the flag is snapshot-consistent with
+    /// the rest of the struct. v1 has no chunked-batch marker and always
+    /// reports `false`.
+    #[serde(default)]
+    pub open_batch: bool,
 }
 
 impl RepoInfo {
@@ -1304,6 +1312,7 @@ impl RedbStore {
                     files: 0,
                     languages: BTreeMap::new(),
                     token_classes: BTreeMap::new(),
+                    open_batch: false,
                 });
             match (f[0], f.len()) {
                 ("r", 3) => {}
@@ -1330,6 +1339,27 @@ impl RedbStore {
             return Err(StoreError::Corrupt(
                 "catalog has counters for a repo without its marker row".into(),
             ));
+        }
+        // ADR 0003 story 3, decision D3: read the `open_batch` marker inside
+        // this same read transaction (never a second one), so the flag is
+        // snapshot-consistent with the rest of `describe`. v1 files never
+        // create the `open_batch` table, so `TableDoesNotExist` here just
+        // means "not v2" and every repo reports `false`, matching v1's
+        // documented always-closed behavior; any other error is real and
+        // propagated.
+        let open_batch: Option<(String, String)> = match rt.open_table(crate::v2::OPEN_BATCH) {
+            Ok(t) => {
+                let org = t.get("org")?.map(|v| v.value().to_string());
+                let repo = t.get("repo")?.map(|v| v.value().to_string());
+                org.zip(repo)
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(key) = &open_batch {
+            if let Some(info) = infos.get_mut(key) {
+                info.open_batch = true;
+            }
         }
         Ok(infos.into_values().collect())
     }
@@ -1378,6 +1408,14 @@ impl RedbStore {
                         files: 0,
                         languages: BTreeMap::new(),
                         token_classes: BTreeMap::new(),
+                        // This is v1's `describe_by_scan`: v1 has no
+                        // `open_batch` marker table at all (ADR 0003 decision
+                        // D3 is v2-only), so it always reports `false` here.
+                        // v2's own `R::describe_by_scan` (v2.rs) is a
+                        // separate implementation that DOES read the marker,
+                        // so it agrees with `describe_in` even while a batch
+                        // is open.
+                        open_batch: false,
                     });
                     repo_key.insert(n.id, key);
                 }

@@ -202,6 +202,10 @@ pub(crate) struct R {
     pub(crate) refs: redb::ReadOnlyTable<u64, u64>,
     #[allow(dead_code)]
     pub(crate) content_files: redb::ReadOnlyMultimapTable<u64, u64>,
+    /// The D3 chunked-ingest marker (ADR 0003 story 3), read by
+    /// `describe_by_scan` alongside `describe_in`, from this same read
+    /// transaction, so the reference scan agrees with the fast catalog path.
+    open_batch: redb::ReadOnlyTable<&'static str, &'static str>,
     /// Per-query caches: dictionary texts and org/repo rows are read once.
     texts: RefCell<HashMap<u64, Rc<str>>>,
     ents: RefCell<HashMap<u64, Rc<Node>>>,
@@ -328,7 +332,16 @@ impl R {
             cat: rt.open_table(CATALOG)?,
             refs: rt.open_table(REFS)?,
             content_files: rt.open_multimap_table(CONTENT_FILES)?,
+            open_batch: rt.open_table(OPEN_BATCH)?,
         })
+    }
+
+    /// The D3 marker's org/repo, if a chunked batch is currently open
+    /// (crashed or in-progress), read from this `R`'s own transaction.
+    fn open_batch_marker(&self) -> Result<Option<(String, String)>> {
+        let org = self.open_batch.get("org")?.map(|v| v.value().to_string());
+        let repo = self.open_batch.get("repo")?.map(|v| v.value().to_string());
+        Ok(org.zip(repo))
     }
 
     fn node(&self, id: u64) -> Result<Option<Node>> {
@@ -966,6 +979,9 @@ impl R {
                         files: 0,
                         languages: BTreeMap::new(),
                         token_classes: BTreeMap::new(),
+                        // Default; set to the marker's value (if any) below,
+                        // after every repo has been discovered by the scan.
+                        open_batch: false,
                     });
                     repo_key.insert(n.id, key);
                 }
@@ -996,6 +1012,12 @@ impl R {
                     }
                 }
                 _ => {}
+            }
+        }
+        let marker = self.open_batch_marker()?;
+        if let Some(key) = &marker {
+            if let Some(info) = infos.get_mut(key) {
+                info.open_batch = true;
             }
         }
         Ok(infos
