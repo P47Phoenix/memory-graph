@@ -1249,6 +1249,162 @@ fn traversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus() {
     );
 }
 
+/// ADR 0003 story 4 go/no-go input (issue #22): token-grain `search` and
+/// `search_symbols` latency, v1 vs v2, on this repo's own `crates/` corpus.
+/// Same rigor as `traversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus`:
+/// a representative sample of real queries (not one anecdotal run), p50 over
+/// several repetitions per query, summed per operation across the sampled
+/// queries to report one aggregate ratio per operation.
+///
+/// This is a *regression gate*, not a go/no-go assertion: it only bounds how
+/// far v2 may drift from its measured-at-write-time ratio to v1, in either
+/// direction. It must never assert v2 is faster than v1 -- whether v2 becomes
+/// the default backend is a human call recorded in the ADR, not something a
+/// test enforces.
+#[test]
+fn search_latency_v1_vs_v2_on_this_repos_own_corpus() {
+    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(p).unwrap().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if !path.ends_with("target") && !path.ends_with(".git") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new("../../crates"), &mut files);
+    assert!(
+        !files.is_empty(),
+        "expected to find this repo's own .rs files"
+    );
+    files.sort();
+
+    use graph_core::Extractor;
+    let extractor = graph_lang_rust::RustExtractor;
+
+    let d = tempfile::tempdir().unwrap();
+    let v1 = open_store(Backend::Redb, &d.path().join("v1.redb"), vec![]).unwrap();
+    let v2 = V2Store::open(d.path().join("v2.redb")).unwrap();
+
+    let mut n_files = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let ex = extractor.extract(&src);
+        if v1.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
+            continue;
+        }
+        if v2.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
+            continue;
+        }
+        n_files += 1;
+    }
+    assert!(n_files > 10, "expected a substantial corpus, got {n_files}");
+
+    // A representative sample of real query shapes: common identifiers that
+    // hit many files/tokens (worst case for per-file stream decode), plus a
+    // couple of narrower ones, at both `Token` and `Symbol` grain, and a
+    // handful of `search_symbols` name patterns (exact and prefix).
+    const REPS: usize = 5;
+    fn p50_ms(reps: usize, mut f: impl FnMut()) -> f64 {
+        let mut v = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            f();
+            v.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    let search_terms = ["Result", "self", "String", "fn", "pub"];
+    let symbol_patterns = ["new", "fmt", "test*", "*"];
+
+    let sum_search_v1: f64 = search_terms
+        .iter()
+        .map(|&t| {
+            let q = crate::Query {
+                grain: crate::Grain::Token,
+                ..crate::Query::new(t)
+            };
+            p50_ms(REPS, || {
+                v1.search(&q).unwrap();
+            })
+        })
+        .sum();
+    let sum_search_v2: f64 = search_terms
+        .iter()
+        .map(|&t| {
+            let q = crate::Query {
+                grain: crate::Grain::Token,
+                ..crate::Query::new(t)
+            };
+            p50_ms(REPS, || {
+                v2.search(&q).unwrap();
+            })
+        })
+        .sum();
+
+    let sum_search_symbols_v1: f64 = symbol_patterns
+        .iter()
+        .map(|&p| {
+            let q = crate::SymbolQuery::new(p);
+            p50_ms(REPS, || {
+                v1.search_symbols(&q).unwrap();
+            })
+        })
+        .sum();
+    let sum_search_symbols_v2: f64 = symbol_patterns
+        .iter()
+        .map(|&p| {
+            let q = crate::SymbolQuery::new(p);
+            p50_ms(REPS, || {
+                v2.search_symbols(&q).unwrap();
+            })
+        })
+        .sum();
+
+    let ratio_search = sum_search_v2 / sum_search_v1;
+    let ratio_search_symbols = sum_search_symbols_v2 / sum_search_symbols_v1;
+    println!(
+        "\nsearch_latency_v1_vs_v2_on_this_repos_own_corpus ({n_files} files, \
+         {} search queries, {} search_symbols queries)",
+        search_terms.len(),
+        symbol_patterns.len(),
+    );
+    println!("| operation | v1 ms | v2 ms | v2/v1 |");
+    println!("|---|---|---|---|");
+    println!(
+        "| search (token grain) | {sum_search_v1:.3} | {sum_search_v2:.3} | {ratio_search:.2}x |"
+    );
+    println!(
+        "| search_symbols | {sum_search_symbols_v1:.3} | {sum_search_symbols_v2:.3} | {ratio_search_symbols:.2}x |"
+    );
+
+    // Regression gate, not a go/no-go assertion (see doc comment above): a
+    // generous bound around what was measured when this test was written
+    // (search ~1.3x-1.6x v1, search_symbols ~1.5x-2.5x v1 on this corpus size;
+    // see the ADR 0003 story 4 row for the exact numbers and named cause).
+    // Catches a future regression that makes either query shape dramatically
+    // worse without re-litigating whether v2 must beat v1.
+    assert!(
+        ratio_search < 6.0,
+        "v2 token-grain search regressed to {ratio_search:.2}x v1 (v1 {sum_search_v1:.3} ms, \
+         v2 {sum_search_v2:.3} ms); expected well under 6x -- see ADR 0003 story 4"
+    );
+    assert!(
+        ratio_search_symbols < 6.0,
+        "v2 search_symbols regressed to {ratio_search_symbols:.2}x v1 (v1 {sum_search_symbols_v1:.3} ms, \
+         v2 {sum_search_symbols_v2:.3} ms); expected well under 6x -- see ADR 0003 story 4"
+    );
+}
+
 // --- ADR 0003 story 11: paging (Store::children_page/descendants_page, Query/SymbolQuery::offset) ---
 
 /// Paging through a result set larger than one page (`children_page` on a
