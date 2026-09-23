@@ -1,7 +1,7 @@
 //! ADR 0003 story 3 leftovers on v2: no-op vacuum, term-length policy,
 //! chunked commits and the consistency proptest.
 use super::*;
-use crate::v2::{content_id, hashed_key, MAX_INLINE_TERM, R};
+use crate::v2::{content_id, hashed_key, MAX_INLINE_TERM, OPEN_BATCH, R};
 use crate::v2_tests::{both_backends, span_ext};
 
 fn sha(p: &std::path::Path) -> Vec<u8> {
@@ -367,6 +367,167 @@ fn chunked_and_unchunked_batches_store_the_same_data() {
     assert_eq!(toks(&r1), toks(&r2));
     crate::conformance::run_differential(&one, &many);
     many.check_consistency(false);
+}
+
+/// Reads the open-batch marker directly out of the raw `meta`/`open_batch`
+/// tables, bypassing any store API, so the test observes exactly what a
+/// slice-3o reader would see on disk (`None` when fully cleared).
+fn open_batch_marker(s: &V2Store) -> Option<(u64, String, String)> {
+    let rt = s.db.begin_read().unwrap();
+    let meta = rt.open_table(META).unwrap();
+    let id = meta.get("open_batch_id").unwrap().map(|v| v.value());
+    let ob = rt.open_table(OPEN_BATCH).unwrap();
+    let org = ob.get("org").unwrap().map(|v| v.value().to_string());
+    let repo = ob.get("repo").unwrap().map(|v| v.value().to_string());
+    match (id, org, repo) {
+        (Some(id), Some(org), Some(repo)) => Some((id, org, repo)),
+        (None, None, None) => None,
+        other => panic!("open-batch marker partially set: {other:?}"),
+    }
+}
+
+/// After a completed `index_batch` -- chunked (a small chunk cap forces
+/// several chunk commits) or unchunked (the default cap, one transaction) --
+/// the open-batch marker (ADR 0003 story 3, decision D3) must be absent: the
+/// final chunk's transaction cleared it.
+#[test]
+fn open_batch_marker_is_cleared_after_a_completed_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let srcs: Vec<String> = (0..6).map(|i| format!("aaa{i}")).collect();
+    let ps = paths(6, "p");
+
+    let mut chunked = V2Store::open(d.path().join("chunked.redb")).unwrap();
+    chunked.set_chunk_bytes(5); // several chunk commits for 6 tiny files
+    V2Store::index_batch(
+        &chunked,
+        "o",
+        "r",
+        &batch(&srcs, &ps),
+        IndexOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        open_batch_marker(&chunked),
+        None,
+        "chunked batch clears the marker"
+    );
+
+    let unchunked = V2Store::open(d.path().join("unchunked.redb")).unwrap();
+    V2Store::index_batch(
+        &unchunked,
+        "o",
+        "r",
+        &batch(&srcs, &ps),
+        IndexOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        open_batch_marker(&unchunked),
+        None,
+        "unchunked batch clears the marker"
+    );
+
+    // Single-file ingest paths never touch chunking, so the marker never
+    // appears on them at all.
+    let single = V2Store::open(d.path().join("single.redb")).unwrap();
+    single
+        .index_bytes("o", "r", "x.p", b"aaa", Some("poison"))
+        .unwrap();
+    assert_eq!(
+        open_batch_marker(&single),
+        None,
+        "single-file ingest never sets the marker"
+    );
+}
+
+/// Ingest-cost sanity check for the open-batch marker (ADR 0003 story 3,
+/// slice 3n): the marker adds one small `meta`/`open_batch` write per chunk
+/// commit, so unlike slice 3h/3l's byte-growth gates there is no separate
+/// "before" binary to diff against in this same test process -- instead this
+/// asserts a generous wall-clock ceiling on indexing this repo's own
+/// `crates/` tree (27 files) chunked finely enough that nearly every file is
+/// its own chunk (worst case for marker-write overhead), so a real
+/// regression in the marker bookkeeping would blow well past it.
+#[test]
+fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_own_corpus() {
+    let files = this_repos_rust_corpus();
+    assert!(
+        files.len() > 10,
+        "expected this repo's own .rs corpus, found {}",
+        files.len()
+    );
+    let srcs: Vec<String> = files
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    let ps: Vec<String> = files
+        .iter()
+        .take(srcs.len())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let bf: Vec<BatchFile<'_>> = srcs
+        .iter()
+        .zip(&ps)
+        .map(|(s, p)| BatchFile {
+            path: p,
+            bytes: s.as_bytes(),
+            language: Some("rust"),
+            origin: None,
+        })
+        .collect();
+
+    let d = tempfile::tempdir().unwrap();
+    let mut s = V2Store::open(d.path().join("v.redb")).unwrap();
+    s.register(Box::new(graph_lang_rust::RustExtractor));
+    s.set_chunk_bytes(1); // every file its own chunk: worst case for marker overhead
+    let t = std::time::Instant::now();
+    let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
+    let elapsed = t.elapsed();
+    assert!(results.iter().all(|r| r.is_ok()));
+    eprintln!(
+        "chunked ingest with open-batch marker, {} files, one chunk each: {:.1} ms total",
+        bf.len(),
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed.as_secs_f64() < 5.0,
+        "indexing this repo's own corpus, one file per chunk, took {:.1} ms; expected well under \
+         5 s even with the added marker write per chunk",
+        elapsed.as_secs_f64() * 1000.0
+    );
+}
+
+/// A batch that dies before its final chunk commits (mirroring
+/// `chunked_batches_are_atomic_per_chunk`'s technique: an extractor that
+/// poisons one file's chunk) leaves the marker present after reopening, and
+/// it correctly names the batch id, org and repo of the batch that never
+/// finished.
+#[test]
+fn open_batch_marker_survives_a_mid_batch_abort() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("s.redb");
+    // f2 is poisoned; cap of 20 bytes commits {f0, f1} as chunk 0, then f2's
+    // own chunk fails and is never committed, so the batch never reaches its
+    // final, marker-clearing transaction.
+    let srcs: Vec<String> = ["aaaaaaaaaa", "bbbbbbbbbb", "BADcccccc!", "dddddddddd"]
+        .map(String::from)
+        .to_vec();
+    let ps = paths(4, "p");
+    let mut s = V2Store::open(&p).unwrap();
+    s.register(Box::new(Poison));
+    s.set_chunk_bytes(20);
+    assert!(
+        V2Store::index_batch(&s, "o", "r", &batch(&srcs, &ps), IndexOptions::default()).is_err()
+    );
+    drop(s);
+
+    let reopened = V2Store::open(&p).unwrap();
+    let marker = open_batch_marker(&reopened);
+    assert_eq!(
+        marker,
+        Some((0, "o".to_string(), "r".to_string())),
+        "the marker names the batch that never finalized"
+    );
 }
 
 mod consistency {

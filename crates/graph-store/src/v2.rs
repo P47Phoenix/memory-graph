@@ -42,7 +42,7 @@ use std::rc::Rc;
 type Result<T> = std::result::Result<T, StoreError>;
 
 /// Layout version of a v2 file (v1 is 1 and 2).
-pub const V2_SCHEMA_VERSION: u64 = 6;
+pub const V2_SCHEMA_VERSION: u64 = 7;
 
 /// term text -> term id.
 pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
@@ -60,6 +60,22 @@ pub(crate) const REFS: TableDefinition<u64, u64> = TableDefinition::new("refs");
 /// content id -> the file ids currently sharing that content.
 pub(crate) const CONTENT_FILES: MultimapTableDefinition<u64, u64> =
     MultimapTableDefinition::new("content_files");
+
+/// The in-progress chunked-ingest marker (ADR 0003 story 3, decision D3,
+/// "Chunked-ingest visibility"): `"org"`/`"repo"` are present iff a chunked
+/// `index_batch` currently has an open, not-yet-finalized batch. The numeric
+/// `batch_id` lives in `META` (`"open_batch_id"`), since `META`'s value type
+/// is `u64` and org/repo are strings, hence this second, string-valued table
+/// rather than shoehorning them into `META`. `META.next_batch_id` is the
+/// monotonic counter that stamps each batch, mirroring `next_id`/`next_term`.
+/// Every chunk-commit transaction of `index_batch` (re)writes both this table
+/// and `META.open_batch_id` in the same transaction as the chunk's data; the
+/// final chunk's transaction clears both instead. This slice is write-path
+/// only -- no reader (`describe`/search) surfaces this yet (slice 3o) -- and
+/// deliberately does not build a `commit_epoch` counter, which only matters
+/// once a manifest/sharding protocol (stories 14-17) exists; "is a batch
+/// open" is fully answerable from this marker alone.
+pub(crate) const OPEN_BATCH: TableDefinition<&str, &str> = TableDefinition::new("open_batch");
 
 /// The content id backing `file`'s stream/postings/symbol-index rows. Today
 /// this is the identity (content sharing is off, ADR 0003 story 3 Q2: "skipped
@@ -1800,6 +1816,7 @@ impl V2Store {
                     m.insert("schema_version", V2_SCHEMA_VERSION)?;
                     m.insert("next_id", 1)?;
                     m.insert("next_term", 0)?;
+                    m.insert("next_batch_id", 0)?;
                     m.insert("stream_format", u64::from(STREAM_FORMAT))?;
                     m.insert("catalog_version", CATALOG_VERSION)?;
                     wt.open_table(CATALOG)?;
@@ -1813,6 +1830,7 @@ impl V2Store {
                     wt.open_multimap_table(SYMBOLS)?;
                     wt.open_table(REFS)?;
                     wt.open_multimap_table(CONTENT_FILES)?;
+                    wt.open_table(OPEN_BATCH)?;
                 }
                 wt.commit()?;
             }
@@ -2098,6 +2116,13 @@ impl V2Store {
                         }
                     }
                 }
+                {
+                    let mut w = wt.open_table(OPEN_BATCH)?;
+                    for row in rt.open_table(OPEN_BATCH)?.iter()? {
+                        let (k, v) = row?;
+                        w.insert(k.value(), v.value())?;
+                    }
+                }
                 wt.commit()?;
             }
             drop(new_db);
@@ -2223,6 +2248,8 @@ impl V2Store {
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
         let mut wt = self.db.begin_write()?;
+        let batch_id = Self::next_batch_id(&wt)?;
+        Self::mark_open_batch(&wt, batch_id, org, repo)?;
         let mut in_txn = 0usize;
         let mut out = Vec::with_capacity(files.len());
         for f in files {
@@ -2267,11 +2294,58 @@ impl V2Store {
             if in_txn >= self.chunk_bytes {
                 wt.commit()?;
                 wt = self.db.begin_write()?;
+                // This chunk is not (yet) known to be the batch's last, so
+                // re-stamp the marker in the new transaction; if it turns out
+                // to be the last, the clear below overwrites it in that same
+                // transaction before it ever commits.
+                Self::mark_open_batch(&wt, batch_id, org, repo)?;
                 in_txn = 0;
             }
         }
+        // The batch completed: clear the marker in this final transaction,
+        // atomically with (or, if the last data chunk just committed above,
+        // immediately after) the last chunk's data.
+        Self::clear_open_batch(&wt)?;
         wt.commit()?;
         Ok(out)
+    }
+
+    /// Allocate the next monotonic batch id from `meta.next_batch_id`,
+    /// mirroring the existing `next_id`/`next_term` counters' read-then-bump
+    /// shape. A monotonic counter (rather than a random id) is simpler to
+    /// assert on in tests.
+    fn next_batch_id(wt: &redb::WriteTransaction) -> Result<u64> {
+        let mut m = wt.open_table(META)?;
+        let id = m.get("next_batch_id")?.map_or(0, |v| v.value());
+        m.insert("next_batch_id", id + 1)?;
+        Ok(id)
+    }
+
+    /// Stamp `wt` with the open-batch marker (`OPEN_BATCH` org/repo plus
+    /// `meta.open_batch_id`). Called at the start of `index_batch` and again
+    /// in every subsequent chunk transaction, so a reader mid-batch (slice
+    /// 3o) always finds it in whichever transaction it observes.
+    fn mark_open_batch(
+        wt: &redb::WriteTransaction,
+        batch_id: u64,
+        org: &str,
+        repo: &str,
+    ) -> Result<()> {
+        wt.open_table(META)?.insert("open_batch_id", batch_id)?;
+        let mut ob = wt.open_table(OPEN_BATCH)?;
+        ob.insert("org", org)?;
+        ob.insert("repo", repo)?;
+        Ok(())
+    }
+
+    /// Clear the open-batch marker. Called in the transaction that commits
+    /// the batch's final chunk.
+    fn clear_open_batch(wt: &redb::WriteTransaction) -> Result<()> {
+        wt.open_table(META)?.remove("open_batch_id")?;
+        let mut ob = wt.open_table(OPEN_BATCH)?;
+        ob.remove("org")?;
+        ob.remove("repo")?;
+        Ok(())
     }
 
     fn prune_files(
