@@ -598,6 +598,63 @@ fn v1_describe_always_reports_open_batch_false() {
     assert!(!infos[0].open_batch, "v1 never reports an open batch");
 }
 
+/// The marker names exactly one org/repo (redb allows only one writer
+/// transaction at a time, so only one batch can ever be open). A crashed
+/// batch for `o/r` must not leak `open_batch: true` onto an unrelated,
+/// cleanly-indexed `o2/r2` in the same store, in either direction: neither an
+/// unfiltered `describe` nor a `describe` filtered to the other repo.
+#[test]
+fn open_batch_does_not_leak_across_repos() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("s.redb");
+    let srcs: Vec<String> = ["aaaaaaaaaa", "bbbbbbbbbb", "BADcccccc!", "dddddddddd"]
+        .map(String::from)
+        .to_vec();
+    let ps = paths(4, "p");
+    let mut s = V2Store::open(&p).unwrap();
+    s.register(Box::new(Poison));
+    s.set_chunk_bytes(20);
+    assert!(
+        V2Store::index_batch(&s, "o", "r", &batch(&srcs, &ps), IndexOptions::default()).is_err()
+    );
+    s.index_bytes("o2", "r2", "clean.p", b"aaa", Some("poison"))
+        .unwrap();
+
+    let by_org_repo = |infos: &[crate::RepoInfo], org: &str, repo: &str| -> bool {
+        infos
+            .iter()
+            .find(|i| i.org == org && i.repo == repo)
+            .is_some_and(|i| i.open_batch)
+    };
+
+    let all = s.describe(None, None).unwrap();
+    assert!(by_org_repo(&all, "o", "r"), "crashed repo reports open");
+    assert!(
+        !by_org_repo(&all, "o2", "r2"),
+        "unrelated repo must not leak open_batch: true"
+    );
+
+    let scoped_clean = s.describe(Some("o2"), Some("r2")).unwrap();
+    assert!(
+        scoped_clean.iter().all(|i| !i.open_batch),
+        "filtering to the clean repo must not surface the marker"
+    );
+    let scoped_crashed = s.describe(Some("o"), Some("r")).unwrap();
+    assert!(
+        scoped_crashed.iter().all(|i| i.open_batch),
+        "filtering to the crashed repo must still surface the marker"
+    );
+
+    // The reference scan (`R::describe_by_scan`, used by `check_consistency`
+    // and the conformance suite) must agree with `describe` while the batch
+    // is genuinely open, not just after it clears.
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap(),
+        "describe and describe_by_scan must agree while a batch is open"
+    );
+}
+
 mod consistency {
     use super::*;
     use graph_core::{Span, SymbolDecl, TokenClass, TokenDecl};

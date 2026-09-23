@@ -1408,11 +1408,13 @@ impl RedbStore {
                         files: 0,
                         languages: BTreeMap::new(),
                         token_classes: BTreeMap::new(),
-                        // `describe_by_scan` is the O(tokens) reference scan
-                        // used to validate the catalog-backed `describe`; it
-                        // never reads the `open_batch` marker (that's the
-                        // fast, transaction-scoped path's job per ADR 0003
-                        // decision D3), so it always reports `false` here.
+                        // This is v1's `describe_by_scan`: v1 has no
+                        // `open_batch` marker table at all (ADR 0003 decision
+                        // D3 is v2-only), so it always reports `false` here.
+                        // v2's own `R::describe_by_scan` (v2.rs) is a
+                        // separate implementation that DOES read the marker,
+                        // so it agrees with `describe_in` even while a batch
+                        // is open.
                         open_batch: false,
                     });
                     repo_key.insert(n.id, key);
