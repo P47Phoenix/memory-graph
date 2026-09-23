@@ -1569,3 +1569,31 @@ fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
     s1.check_consistency(false);
     s2.check_consistency(false);
 }
+
+/// A single term occurring far more than `codec::POSTING_BLOCK` times in one
+/// file, so its `POST` value spans several block-encoded blocks (story 6,
+/// ADR 0003, D1). Search results must be byte-for-byte identical to v1,
+/// which has no block concept at all.
+#[test]
+fn a_term_repeated_across_many_posting_blocks_matches_v1() {
+    let (_d, a, b) = both_backends();
+    let n = crate::codec::POSTING_BLOCK * 3 + 7;
+    let mut toks: Vec<(String, u32, u32)> = Vec::with_capacity(n);
+    let mut at = 0u32;
+    for _ in 0..n {
+        toks.push(("hot".to_string(), at, at + 3));
+        at += 4;
+    }
+    let tok_refs: Vec<(&str, u32, u32)> =
+        toks.iter().map(|(s, a, b)| (s.as_str(), *a, *b)).collect();
+    let ex = span_ext(&[("S", SymbolKind::Function, 0, at)], &tok_refs);
+    for s in [&a, &b] {
+        s.ingest_file("o", "r", "hot.rs", "rust", &ex).unwrap();
+    }
+    let mut q = Query::new("hot");
+    q.grain = Grain::Token;
+    let (ha, hb) = (a.search(&q).unwrap(), b.search(&q).unwrap());
+    assert_eq!(ha.len(), n, "expected {n} occurrences");
+    assert_eq!(ha, hb);
+    crate::conformance::run_differential(&*a, &*b);
+}

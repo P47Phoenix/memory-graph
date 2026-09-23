@@ -579,20 +579,43 @@ impl Lazy<'_> {
     }
 }
 
+/// Number of ordinals packed per block in a block-encoded posting (story 6,
+/// ADR 0003 decision D1). Each block is self-contained: its gap deltas reset
+/// to a base of 0 at the block's start rather than continuing from the
+/// previous block's last ordinal. That costs one larger (non-delta) varint
+/// per block versus a single running delta chain, but it means a block can
+/// be decoded (or, later, skipped past) without first decoding every prior
+/// block — the property D1's "scale wide" requirement needs once postings
+/// for a hot term span many blocks at 100 M-token scale. 128 matches this
+/// repo's other fixed block size (`CHECKPOINT_EVERY`, sparse per-file token
+/// checkpoints) so the two mechanisms share one mental model.
+pub const POSTING_BLOCK: usize = 128;
+
 /// Posting value of `(term, file)`: the number of occurrences, then the
-/// token ordinals in ascending order as gaps (the first is absolute).
+/// token ordinals in ascending order, packed into fixed-size blocks of up
+/// to [`POSTING_BLOCK`] ordinals. Within a block, ordinals are delta/varint
+/// encoded from a block-local base of 0 (the first entry's "gap" is its
+/// absolute value); each block also carries its own byte length so a reader
+/// can skip a block's body without decoding it.
 pub fn encode_posting(ords: &[usize]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ords.len() + 2);
     put_varint(&mut out, ords.len() as u64);
-    let mut prev = 0;
-    for &o in ords {
-        put_varint(&mut out, (o - prev) as u64);
-        prev = o;
+    for chunk in ords.chunks(POSTING_BLOCK) {
+        let mut body = Vec::with_capacity(chunk.len() * 2);
+        let mut prev = 0usize;
+        for &o in chunk {
+            put_varint(&mut body, (o - prev) as u64);
+            prev = o;
+        }
+        put_varint(&mut out, chunk.len() as u64);
+        put_varint(&mut out, body.len() as u64);
+        out.extend_from_slice(&body);
     }
     out
 }
 
-/// Occurrence count of a posting value.
+/// Occurrence count of a posting value. Unchanged by block encoding: the
+/// total count is still the first varint in the value.
 pub fn posting_count(b: &[u8]) -> Result<usize, StoreError> {
     let n = Reader { b, at: 0 }.varint()?;
     usize::try_from(n).map_err(|_| bad("posting count out of range"))
@@ -606,19 +629,41 @@ pub fn posting_ordinals(b: &[u8]) -> Result<Vec<usize>, StoreError> {
         return Err(bad("posting count exceeds input"));
     }
     let mut out = Vec::with_capacity(n);
-    let mut prev = 0usize;
-    for i in 0..n {
-        let gap = usize::try_from(r.varint()?).map_err(|_| bad("posting gap out of range"))?;
-        if i > 0 && gap == 0 {
-            return Err(bad("posting ordinals not ascending"));
+    let mut remaining = n;
+    while remaining > 0 {
+        let block_len =
+            usize::try_from(r.varint()?).map_err(|_| bad("posting block length out of range"))?;
+        if block_len == 0 || block_len > remaining {
+            return Err(bad("posting block length invalid"));
         }
-        prev = prev
-            .checked_add(gap)
-            .ok_or_else(|| bad("posting ordinal overflow"))?;
-        out.push(prev);
+        let block_bytes = usize::try_from(r.varint()?)
+            .map_err(|_| bad("posting block byte length out of range"))?;
+        let block_end =
+            r.at.checked_add(block_bytes)
+                .ok_or_else(|| bad("posting block overflow"))?;
+        if block_end > b.len() {
+            return Err(bad("posting block exceeds input"));
+        }
+        let mut prev = 0usize;
+        for _ in 0..block_len {
+            let gap = usize::try_from(r.varint()?).map_err(|_| bad("posting gap out of range"))?;
+            prev = prev
+                .checked_add(gap)
+                .ok_or_else(|| bad("posting ordinal overflow"))?;
+            out.push(prev);
+        }
+        if r.at != block_end {
+            return Err(bad("trailing bytes in posting block"));
+        }
+        remaining -= block_len;
     }
     if r.at != b.len() {
         return Err(bad("trailing bytes in posting"));
+    }
+    for w in out.windows(2) {
+        if w[1] <= w[0] {
+            return Err(bad("posting ordinals not ascending"));
+        }
     }
     Ok(out)
 }
@@ -1057,8 +1102,30 @@ mod tests {
         assert!(e.contains("count exceeds input"), "{e}");
         let e = posting_ordinals(&[4, 1, 1, 1]).unwrap_err().to_string();
         assert!(e.contains("truncated"), "{e}");
-        // Exactly as many entries as bytes after the count is fine.
-        assert_eq!(posting_ordinals(&[3, 1, 1, 1]).unwrap(), [1, 2, 3]);
+        // A single well-formed block: count=3, block_len=3, block_bytes=3,
+        // gaps=[1,1,1] -> ordinals [1,2,3].
+        assert_eq!(posting_ordinals(&[3, 3, 3, 1, 1, 1]).unwrap(), [1, 2, 3]);
+    }
+
+    /// Golden bytes for the block-encoded format (story 6, ADR 0003): count,
+    /// then per block (block_len, block_byte_len, block-local delta varints).
+    #[test]
+    fn posting_block_format_is_pinned() {
+        assert_eq!(POSTING_BLOCK, 128);
+        // One block: count=3, block_len=3, block_bytes=3, gaps 1,1,1.
+        assert_eq!(encode_posting(&[1, 2, 3]), vec![3, 3, 3, 1, 1, 1]);
+        // Exactly POSTING_BLOCK ordinals stay in a single block.
+        let ords: Vec<usize> = (1..=POSTING_BLOCK).collect();
+        let b = encode_posting(&ords);
+        // count varint (1 byte, since POSTING_BLOCK=128 needs 2 bytes) +
+        // block_len + block_bytes + POSTING_BLOCK gap-varints of 1 byte each.
+        assert_eq!(posting_ordinals(&b).unwrap(), ords);
+        // One more ordinal spills into a second, self-contained block.
+        let mut ords2 = ords.clone();
+        ords2.push(POSTING_BLOCK + 1);
+        let b2 = encode_posting(&ords2);
+        assert_eq!(posting_ordinals(&b2).unwrap(), ords2);
+        assert_ne!(b, b2);
     }
 
     #[test]
@@ -1074,11 +1141,67 @@ mod tests {
             assert_eq!(posting_count(&b).unwrap(), ords.len());
             assert_eq!(posting_ordinals(&b).unwrap(), ords);
         }
-        // Non-ascending (zero gap after the first), truncated and trailing.
-        assert!(posting_ordinals(&[2, 3, 0]).is_err());
-        assert!(posting_ordinals(&[2, 3]).is_err());
-        assert!(posting_ordinals(&[1, 3, 0]).is_err());
+        // Non-ascending (duplicate ordinal within a block), truncated and
+        // trailing, hand-crafted in the block format: count, then per block
+        // (block_len, block_byte_len, gap-varints...).
+        // count=2, block_len=2, block_bytes=2, gaps=[3,0] -> 3, 3 (not ascending).
+        assert!(posting_ordinals(&[2, 2, 2, 3, 0]).is_err());
+        // count=2, block_len=2, block_bytes=2, but only one gap byte present.
+        assert!(posting_ordinals(&[2, 2, 2, 3]).is_err());
+        // count=1, block_len=3 exceeds the declared total count of 1.
+        assert!(posting_ordinals(&[1, 3, 1, 1, 1, 1]).is_err());
         assert!(posting_ordinals(&[]).is_err());
+    }
+
+    /// Block encoding's overhead over a flat delta-varint run (2 extra
+    /// varints per `POSTING_BLOCK` ordinals: block_len, block_byte_len) on a
+    /// realistic term-frequency-ish distribution. Frozen copy of
+    /// `encode_posting` before story 6 (ADR 0003, D1), so the delta below is
+    /// real measured bytes, not a guess. Fast CI gate; the 100 M-token
+    /// measurement lives only in `examples/block_postings_100m.rs`.
+    fn old_encode_posting(ords: &[usize]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ords.len() + 2);
+        put_varint(&mut out, ords.len() as u64);
+        let mut prev = 0;
+        for &o in ords {
+            put_varint(&mut out, (o - prev) as u64);
+            prev = o;
+        }
+        out
+    }
+
+    #[test]
+    fn block_encoding_grows_posting_bytes_by_under_five_percent_on_realistic_lists() {
+        // Zipf-ish term-frequency distribution: most terms occur once per
+        // file, a few occur hundreds to thousands of times (a very common
+        // identifier repeated across a large file).
+        let mut rng_state = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+        let mut old_total = 0usize;
+        let mut new_total = 0usize;
+        for shape in [1usize, 2, 5, 20, 100, 500, 2_000, 10_000] {
+            for _ in 0..50 {
+                let mut ords = Vec::with_capacity(shape);
+                let mut at = 0usize;
+                for _ in 0..shape {
+                    at += 1 + (next() % 7) as usize;
+                    ords.push(at);
+                }
+                old_total += old_encode_posting(&ords).len();
+                new_total += encode_posting(&ords).len();
+            }
+        }
+        let growth = (new_total as f64 - old_total as f64) / old_total as f64;
+        assert!(
+            growth < 0.05,
+            "block encoding grew posting bytes by {:.2}% (old {old_total}, new {new_total})",
+            growth * 100.0
+        );
     }
 
     #[test]
