@@ -1,7 +1,7 @@
 //! ADR 0003 story 3 leftovers on v2: no-op vacuum, term-length policy,
 //! chunked commits and the consistency proptest.
 use super::*;
-use crate::v2::{hashed_key, MAX_INLINE_TERM, R};
+use crate::v2::{content_id, hashed_key, MAX_INLINE_TERM, R};
 use crate::v2_tests::{both_backends, span_ext};
 
 fn sha(p: &std::path::Path) -> Vec<u8> {
@@ -452,8 +452,86 @@ mod consistency {
         ]
     }
 
+    /// The refcount invariant (ADR 0003 story 3, slice 3m), checked
+    /// independently of `check_consistency`'s own refs/content_files
+    /// recomputation so this test carries its own signal: for every content
+    /// id, `refs[cid]` equals the number of `content_files[cid]` entries,
+    /// which equals the number of live file rows whose content is `cid`; and
+    /// no stream or posting exists for a `cid` with refcount zero (i.e.
+    /// every `cid` that owns a stream or posting appears in `refs` with a
+    /// nonzero count).
+    fn assert_refcount_invariant(s: &V2Store) {
+        let rt = s.db.begin_read().unwrap();
+        let r = R::new(&rt).unwrap();
+
+        let mut refs: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        for row in r.refs.iter().unwrap() {
+            let (k, v) = row.unwrap();
+            refs.insert(k.value(), v.value());
+        }
+        let mut content_files: std::collections::BTreeMap<u64, usize> =
+            std::collections::BTreeMap::new();
+        let mut live_files_by_cid: std::collections::BTreeMap<u64, usize> =
+            std::collections::BTreeMap::new();
+        for row in r.content_files.iter().unwrap() {
+            let (k, vals) = row.unwrap();
+            let k = k.value();
+            let mut n = 0;
+            for v in vals {
+                let file = v.unwrap().value();
+                n += 1;
+                // A `content_files` entry for a file that no longer has a
+                // stream would be an orphan (dangling pointer to dead
+                // content); every entry's file must be live.
+                assert!(
+                    r.streams.get(file).unwrap().is_some(),
+                    "content_files[{k}] points at file {file}, which has no live stream"
+                );
+            }
+            content_files.insert(k, n);
+        }
+        let mut cids_with_data: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for row in r.streams.iter().unwrap() {
+            let (file, _) = row.unwrap();
+            *live_files_by_cid
+                .entry(content_id(file.value()))
+                .or_default() += 1;
+            cids_with_data.insert(content_id(file.value()));
+        }
+        for row in r.post.iter().unwrap() {
+            let (k, _) = row.unwrap();
+            let (_, file) = k.value();
+            cids_with_data.insert(content_id(file));
+        }
+
+        for (&cid, &want) in &live_files_by_cid {
+            assert_eq!(
+                refs.get(&cid).copied().unwrap_or(0),
+                want as u64,
+                "refs[{cid}] must equal the live file count for that content id"
+            );
+            assert_eq!(
+                content_files.get(&cid).copied().unwrap_or(0),
+                want,
+                "content_files[{cid}] must have one entry per live file of that content id"
+            );
+        }
+        for &cid in refs.keys() {
+            assert!(
+                live_files_by_cid.contains_key(&cid),
+                "refs has an entry for content id {cid} with no live file"
+            );
+        }
+        for cid in cids_with_data {
+            assert!(
+                refs.get(&cid).copied().unwrap_or(0) > 0,
+                "content id {cid} has a stream or posting but refcount zero (or missing)"
+            );
+        }
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(40))]
+        #![proptest_config(ProptestConfig::with_cases(200))]
         /// After any sequence of ingest, replace, prune, chunked batch and
         /// vacuum, every derived table equals what the streams imply, and a
         /// vacuum leaves no dead dictionary term. The oracle recomputes
@@ -500,9 +578,11 @@ mod consistency {
                     }
                 }
                 s.check_consistency(vacuumed);
+                assert_refcount_invariant(&s);
             }
             s.vacuum().unwrap();
             s.check_consistency(true);
+            assert_refcount_invariant(&s);
         }
     }
 }
@@ -1051,4 +1131,155 @@ fn refs_and_content_files_grow_store_size_by_under_half_a_percent_on_this_repos_
          {new_bytes} B over {} files); must stay under 0.5% (slice 3l gate)",
         files.len()
     );
+}
+
+// --- ADR 0003 story 3, slice 3m: rebuild_refs ------------------------------
+
+fn walk_rs_files(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(p) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            if !path.ends_with("target") && !path.ends_with(".git") {
+                walk_rs_files(&path, out);
+            }
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// This repo's own `crates/` tree (27 Rust files at the time this slice was
+/// written), the same corpus the story-3 size and decode-cost gates already
+/// measure against (slices 3h, 3j, 3k, 3l).
+fn this_repos_rust_corpus() -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    walk_rs_files(std::path::Path::new("../../crates"), &mut files);
+    files.sort();
+    files
+}
+
+/// Corrupts `refs`/`content_files` directly (bypassing ingest/replace/prune
+/// entirely, the way `inject_extra_content_ref` bypasses it for slice 3l's
+/// test) and confirms `rebuild_refs` restores them to exactly what a fresh
+/// ingest of the same corpus would produce.
+#[test]
+fn rebuild_refs_restores_refs_and_content_files_after_direct_corruption() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    compact_fixture(&s);
+    // A second store over the identical corpus is the "what a fresh ingest
+    // would produce" oracle this test checks `rebuild_refs`'s output against.
+    let fresh = V2Store::open(d.path().join("fresh.redb")).unwrap();
+    compact_fixture(&fresh);
+    let want = refs_snapshot(&fresh);
+
+    {
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut refs = wt.open_table(crate::v2::REFS).unwrap();
+            let keys: Vec<u64> = refs.iter().unwrap().map(|r| r.unwrap().0.value()).collect();
+            // Drop one live entry and plant a bogus one -- both a missing row
+            // and an orphaned row are corruption `rebuild_refs` must fix.
+            if let Some(&k) = keys.first() {
+                refs.remove(k).unwrap();
+            }
+            refs.insert(999_999_999u64, 7u64).unwrap();
+        }
+        {
+            let mut cf = wt.open_multimap_table(crate::v2::CONTENT_FILES).unwrap();
+            cf.insert(999_999_999u64, 424_242u64).unwrap();
+        }
+        wt.commit().unwrap();
+    }
+    let corrupted = refs_snapshot(&s);
+    assert_ne!(
+        corrupted, want,
+        "the direct corruption above must actually change the stored tables"
+    );
+
+    s.rebuild_refs().unwrap();
+    let rebuilt = refs_snapshot(&s);
+    assert_eq!(
+        rebuilt, want,
+        "rebuild_refs must restore refs/content_files to exactly what a fresh ingest of the \
+         same corpus produces"
+    );
+    s.check_consistency(false);
+}
+
+/// Wall-clock cost of `rebuild_refs` (ADR 0003 story 3, slice 3m gate):
+/// under 50 ms on this repo's own `crates/` tree, and the cost ratio between
+/// a 2x-corpus run (the same files ingested twice, under a second org) and
+/// the 1x run stays under 2.5x -- not e.g. 4x+, which would indicate
+/// quadratic behavior.
+#[test]
+fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
+    use graph_core::Extractor;
+    let files = this_repos_rust_corpus();
+    assert!(
+        files.len() > 10,
+        "expected this repo's own .rs corpus, found {}",
+        files.len()
+    );
+    let extractor = graph_lang_rust::RustExtractor;
+
+    let d = tempfile::tempdir().unwrap();
+    let s1 = V2Store::open(d.path().join("1x.redb")).unwrap();
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let ex = extractor.extract(&src);
+        let _ = s1.ingest_file("o", "r", &rel, "rust", &ex);
+    }
+
+    let s2 = V2Store::open(d.path().join("2x.redb")).unwrap();
+    for org in ["o1", "o2"] {
+        for path in &files {
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let rel = path.to_string_lossy().replace('\\', "/");
+            let ex = extractor.extract(&src);
+            let _ = s2.ingest_file(org, "r", &rel, "rust", &ex);
+        }
+    }
+
+    // Averages several reps (with one untimed warm-up call first, so the
+    // first-call allocator/page-cache cost does not skew a single sample) to
+    // damp scheduler noise on a shared CI box.
+    fn avg_ms(s: &V2Store, reps: usize) -> f64 {
+        s.rebuild_refs().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            s.rebuild_refs().unwrap();
+        }
+        t.elapsed().as_secs_f64() * 1000.0 / reps as f64
+    }
+
+    let reps = 10;
+    let ms1 = avg_ms(&s1, reps);
+    let ms2 = avg_ms(&s2, reps);
+    let ratio = ms2 / ms1.max(0.001);
+    eprintln!(
+        "rebuild_refs cost: 1x corpus ({} files) {ms1:.3} ms/call, 2x corpus {ms2:.3} ms/call, \
+         ratio {ratio:.2}x",
+        files.len()
+    );
+    assert!(
+        ms1 < 50.0,
+        "rebuild_refs on the 1x corpus took {ms1:.3} ms, expected < 50 ms"
+    );
+    assert!(
+        ratio < 2.5,
+        "rebuild_refs cost ratio (2x/1x) was {ratio:.2}x, expected < 2.5x (a quadratic-behavior \
+         gate, not a tight bound)"
+    );
+
+    s1.check_consistency(false);
+    s2.check_consistency(false);
 }

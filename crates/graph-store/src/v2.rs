@@ -69,7 +69,7 @@ pub(crate) const CONTENT_FILES: MultimapTableDefinition<u64, u64> =
 /// when that lands, only this function's body changes -- every refs/
 /// content_files caller already goes through it instead of using `file`
 /// directly as the content key.
-fn content_id(file: u64) -> u64 {
+pub(crate) fn content_id(file: u64) -> u64 {
     file
 }
 
@@ -172,10 +172,10 @@ pub struct V2Snapshot {
 pub(crate) struct R {
     nodes: redb::ReadOnlyTable<u64, &'static [u8]>,
     names: redb::ReadOnlyTable<&'static str, u64>,
-    streams: redb::ReadOnlyTable<u64, &'static [u8]>,
+    pub(crate) streams: redb::ReadOnlyTable<u64, &'static [u8]>,
     pub(crate) dict: redb::ReadOnlyTable<&'static str, u64>,
     rev: redb::ReadOnlyTable<u64, &'static str>,
-    post: redb::ReadOnlyTable<(u64, u64), &'static [u8]>,
+    pub(crate) post: redb::ReadOnlyTable<(u64, u64), &'static [u8]>,
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
     cat: redb::ReadOnlyTable<&'static str, u64>,
     kids: redb::ReadOnlyMultimapTable<u64, u64>,
@@ -1888,6 +1888,70 @@ impl V2Store {
             wt.commit()?;
         }
         Ok(stats)
+    }
+
+    /// Recompute `refs` and `content_files` from scratch by scanning every
+    /// live file's stream row (the source of truth: a stream row exists iff
+    /// its file is live, see `remove_content`) and rewriting both tables to
+    /// match, in one write transaction. Mirrors the oracle already used by
+    /// `check_consistency` (ADR 0003 story 3, slice 3l), so this method and
+    /// that test-only oracle agree on what "correct" means by construction.
+    ///
+    /// Today `content_id(file) == file` always (content sharing, story 18, is
+    /// off), so the rebuilt state is simply refcount 1 and one
+    /// `content_files` entry per live file; the loop is written in terms of
+    /// `content_id` so it stays correct once fan-out lands.
+    ///
+    /// Not wired into [`V2Store::open`]: there is no `derived_version`
+    /// mechanism in v2's `meta` table for any table yet (see the ADR's
+    /// "What `SCHEMA_VERSION` means" note), so there is no cheap way to tell
+    /// whether a rebuild is even needed on open. This method is a callable,
+    /// tested building block for that future automatic rebuild, not the
+    /// rebuild-on-open mechanism itself.
+    pub fn rebuild_refs(&self) -> Result<()> {
+        let wt = self.db.begin_write()?;
+        {
+            let mut w = W::new(&wt)?;
+            let mut want: BTreeMap<u64, u64> = BTreeMap::new();
+            let mut files_by_cid: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+            for row in w.streams.iter()? {
+                let (file, _) = row?;
+                let file = file.value();
+                let cid = content_id(file);
+                *want.entry(cid).or_default() += 1;
+                files_by_cid.entry(cid).or_default().push(file);
+            }
+
+            let mut stale_refs: Vec<u64> = Vec::new();
+            for row in w.refs.iter()? {
+                stale_refs.push(row?.0.value());
+            }
+            for k in stale_refs {
+                w.refs.remove(k)?;
+            }
+            let mut stale_cf: Vec<(u64, u64)> = Vec::new();
+            for row in w.content_files.iter()? {
+                let (k, vals) = row?;
+                let k = k.value();
+                for v in vals {
+                    stale_cf.push((k, v?.value()));
+                }
+            }
+            for (k, v) in stale_cf {
+                w.content_files.remove(k, v)?;
+            }
+
+            for (cid, count) in want {
+                w.refs.insert(cid, count)?;
+            }
+            for (cid, files) in files_by_cid {
+                for file in files {
+                    w.content_files.insert(cid, file)?;
+                }
+            }
+        }
+        wt.commit()?;
+        Ok(())
     }
 
     /// Rebuild the store into a brand-new file by copying every row of every
