@@ -13,7 +13,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 mod api;
-mod codec;
+/// Block/varint stream and posting codec. Public so benchmarks (e.g.
+/// `examples/block_postings_100m.rs`, ADR 0003 story 6) can measure
+/// `encode_posting`/`POSTING_BLOCK` directly without going through a full
+/// store; not part of the store's query API.
+pub mod codec;
 pub mod conformance;
 mod v2;
 pub use api::{detect_backend, open_store, Backend, Store, StoreRead};

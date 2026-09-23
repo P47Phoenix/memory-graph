@@ -42,7 +42,12 @@ use std::rc::Rc;
 type Result<T> = std::result::Result<T, StoreError>;
 
 /// Layout version of a v2 file (v1 is 1 and 2).
-pub const V2_SCHEMA_VERSION: u64 = 7;
+///
+/// Bumped to 8 for story 6 (ADR 0003, D1): `POST` values are now
+/// block-encoded (`codec::POSTING_BLOCK`-sized, self-contained blocks)
+/// instead of one flat delta-varint run, so old v2 files are refused rather
+/// than misread (v2 is unreleased; no migration is attempted).
+pub const V2_SCHEMA_VERSION: u64 = 8;
 
 /// term text -> term id.
 pub(crate) const DICT: TableDefinition<&str, u64> = TableDefinition::new("dict");
