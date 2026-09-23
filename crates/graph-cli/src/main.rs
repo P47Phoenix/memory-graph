@@ -137,6 +137,10 @@ enum Cmd {
         /// Show at most this many results (ordered by org, repo, file, position)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         limit: Option<u64>,
+        /// Skip this many results (same order as --limit) before collecting --limit of them;
+        /// paired with --limit to page through a large result set (ADR 0003 story 11)
+        #[arg(long)]
+        offset: Option<u64>,
         /// Print JSON instead of text
         #[arg(long)]
         json: bool,
@@ -191,6 +195,10 @@ enum Cmd {
         /// Show at most this many rows (ordered by org, repo, file, position)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         limit: Option<u64>,
+        /// Skip this many rows (same order as --limit) before collecting --limit of them;
+        /// paired with --limit to page through a large result set (ADR 0003 story 11)
+        #[arg(long)]
+        offset: Option<u64>,
         /// Print JSON instead of text
         #[arg(long)]
         json: bool,
@@ -526,6 +534,7 @@ fn run() -> Result<()> {
             repo,
             file,
             limit,
+            offset,
             json,
         } => {
             let store = open_existing(&cli.db, cli.backend, v2_overrides)?;
@@ -539,6 +548,7 @@ fn run() -> Result<()> {
             let mut q = SymbolQuery::new(&pattern);
             (q.kind, q.language, q.org, q.repo, q.file) = (kind, language, org, repo, file);
             q.limit = limit.map(|l| l as usize);
+            q.offset = offset.map(|o| o as usize);
             let hits = store.search_symbols(&q)?;
             if json {
                 let out = serde_json::json!({ "query": pattern, "results": hits });
@@ -612,6 +622,7 @@ fn run() -> Result<()> {
             grain,
             symbol_kind,
             limit,
+            offset,
             json,
         } => {
             if symbol_kind.is_some() && grain != Grain::Symbol {
@@ -629,6 +640,7 @@ fn run() -> Result<()> {
             (q.language, q.org, q.repo, q.class, q.grain, q.symbol_kind) =
                 (language, org, repo, kind, grain, symbol_kind);
             q.limit = limit.map(|l| l as usize);
+            q.offset = offset.map(|o| o as usize);
             let hits = store.search(&q)?;
             if json {
                 let out = serde_json::json!({ "query": text, "grain": grain, "results": hits });
