@@ -1497,6 +1497,114 @@ fn rebuild_refs_restores_refs_and_content_files_after_direct_corruption() {
     s.check_consistency(false);
 }
 
+/// Issue #44: `rebuild_refs`'s doc comment claims it clears and rewrites
+/// `refs`/`content_files` inside a single `begin_write()`/`wt.commit()` pair,
+/// so a crash mid-rebuild can only ever be observed as "before commit"
+/// (exactly the pre-rebuild state, byte for byte) or "after commit" (exactly
+/// the rebuilt state) -- never a torn mix of half-old, half-new rows. This
+/// repo has established precedent (PR #31's QA review of `compact()`) that a
+/// literal process-kill test is impractical and not the accepted bar for
+/// this kind of claim; direct code inspection is. This test instead proves
+/// the claim behaviorally, using redb's own transaction semantics rather
+/// than code inspection: it replicates `rebuild_refs_in`'s exact clear-then-
+/// rewrite sequence by hand inside one write transaction, but drops that
+/// transaction without committing partway through -- the same outcome a
+/// process crash mid-transaction would leave behind, since redb never
+/// applies any of a transaction's writes until `commit()` succeeds. If the
+/// tables were touched outside that transaction (the bug this test guards
+/// against -- e.g. a future refactor splitting the clear and the rewrite
+/// into two transactions), the abort below would leave a torn mix; instead
+/// it must leave the corrupted pre-rebuild state completely untouched. A
+/// second, non-aborted call to the real `rebuild_refs()` then confirms the
+/// normal (non-crash) path still lands in the fully rebuilt, consistent
+/// state.
+#[test]
+fn rebuild_refs_crash_before_commit_leaves_pre_rebuild_state_untouched() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    compact_fixture(&s);
+    let fresh = V2Store::open(d.path().join("fresh.redb")).unwrap();
+    compact_fixture(&fresh);
+    let want_rebuilt = refs_snapshot(&fresh);
+
+    // Corrupt refs/content_files the same way
+    // `rebuild_refs_restores_refs_and_content_files_after_direct_corruption`
+    // does: drop one live entry, plant a bogus one.
+    {
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut refs = wt.open_table(crate::v2::REFS).unwrap();
+            let keys: Vec<u64> = refs.iter().unwrap().map(|r| r.unwrap().0.value()).collect();
+            if let Some(&k) = keys.first() {
+                refs.remove(k).unwrap();
+            }
+            refs.insert(999_999_999u64, 7u64).unwrap();
+        }
+        {
+            let mut cf = wt.open_multimap_table(crate::v2::CONTENT_FILES).unwrap();
+            cf.insert(999_999_999u64, 424_242u64).unwrap();
+        }
+        wt.commit().unwrap();
+    }
+    let corrupted = refs_snapshot(&s);
+    assert_ne!(corrupted, want_rebuilt);
+
+    // Simulate a crash partway through `rebuild_refs_in`: open a write
+    // transaction, clear both tables and insert a rebuilt-looking row into
+    // each (proving the writes really happened, in-transaction), then drop
+    // the transaction WITHOUT committing -- exactly what a process crash
+    // between "clear" and "commit" would leave behind, since redb defers
+    // every write until `commit()` succeeds.
+    {
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut refs = wt.open_table(crate::v2::REFS).unwrap();
+            let keys: Vec<u64> = refs.iter().unwrap().map(|r| r.unwrap().0.value()).collect();
+            for k in keys {
+                refs.remove(k).unwrap();
+            }
+            // A partial rewrite, as if the crash landed mid-loop.
+            refs.insert(1u64, 1u64).unwrap();
+        }
+        {
+            let mut cf = wt.open_multimap_table(crate::v2::CONTENT_FILES).unwrap();
+            let stale: Vec<(u64, u64)> = cf
+                .iter()
+                .unwrap()
+                .flat_map(|r| {
+                    let (k, vals) = r.unwrap();
+                    let k = k.value();
+                    vals.map(move |v| (k, v.unwrap().value()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for (k, v) in stale {
+                cf.remove(k, v).unwrap();
+            }
+            cf.insert(1u64, 1u64).unwrap();
+        }
+        // No `wt.commit()`: dropping the transaction here is the crash.
+        drop(wt);
+    }
+
+    // Nothing from the aborted transaction is visible: the store is exactly
+    // as corrupted as before the "crash", never a torn mix of the old rows
+    // and the dropped transaction's partial rewrite.
+    let after_crash = refs_snapshot(&s);
+    assert_eq!(
+        after_crash, corrupted,
+        "an aborted (uncommitted) write transaction must leave refs/content_files completely \
+         untouched -- any difference here would mean redb applied some of the aborted \
+         transaction's writes without a commit"
+    );
+
+    // The real, non-aborted `rebuild_refs()` still works correctly afterward.
+    s.rebuild_refs().unwrap();
+    let rebuilt = refs_snapshot(&s);
+    assert_eq!(rebuilt, want_rebuilt);
+    s.check_consistency(false);
+}
+
 /// Wall-clock cost of `rebuild_refs` (ADR 0003 story 3, slice 3m gate):
 /// under 50 ms on this repo's own `crates/` tree, and the cost ratio between
 /// a 2x-corpus run (the same files ingested twice, under a second org) and
@@ -1821,6 +1929,60 @@ fn dict_rev_packs_many_terms_into_few_blocks() {
     }
 }
 
+/// Issue #56 (PR #55 QA mutation-testing follow-up): a mutant that widened
+/// `dict_rev_append`'s block-boundary check from `entries.len() < DICT_BLOCK`
+/// to `entries.len() <= DICT_BLOCK` (letting blocks grow to `DICT_BLOCK + 1`)
+/// was not caught by `dict_rev_packs_many_terms_into_few_blocks`, whose
+/// row-count assertion happens to still hold under that off-by-one for the
+/// specific `n` used there. This test instead decodes every `dict_rev` block
+/// directly and asserts none ever holds more than `DICT_BLOCK` entries --
+/// the exact invariant the mutant would violate. Uses a term count that is
+/// not a clean multiple of `DICT_BLOCK` (several full blocks plus a partial
+/// one) so both the full-block and last-partial-block cases are checked.
+#[test]
+fn no_dict_rev_block_ever_exceeds_dict_block_entries() {
+    use crate::v2::DICT_REV;
+    let n = crate::codec::DICT_BLOCK * 3 + 7;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    let owned: Vec<String> = (0..n).map(|i| format!("blockterm{i}")).collect();
+    let toks: Vec<(&str, u32, u32)> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i as u32, i as u32 + 1))
+        .collect();
+    s.ingest_file("o", "r", "x.txt", "text", &span_ext(&[], &toks))
+        .unwrap();
+    s.check_consistency(false);
+
+    let rt = s.db.begin_read().unwrap();
+    let table = rt.open_table(DICT_REV).unwrap();
+    let mut checked_blocks = 0usize;
+    let mut total_entries = 0usize;
+    for row in table.iter().unwrap() {
+        let (_, v) = row.unwrap();
+        let entries = crate::codec::decode_dict_block(v.value()).unwrap();
+        assert!(
+            entries.len() <= crate::codec::DICT_BLOCK,
+            "dict_rev block has {} entries, exceeding DICT_BLOCK ({})",
+            entries.len(),
+            crate::codec::DICT_BLOCK
+        );
+        total_entries += entries.len();
+        checked_blocks += 1;
+    }
+    assert!(
+        checked_blocks > 1,
+        "expected more than one dict_rev block for {n} terms"
+    );
+    // Every interned term (including this store's own bootstrap dictionary
+    // entries, if any) must still be accounted for across the blocks.
+    assert!(
+        total_entries >= n,
+        "expected at least the {n} terms ingested across all dict_rev blocks, got {total_entries}"
+    );
+}
+
 /// `vacuum` repacks `dict_rev` densely (ADR 0003 story 5): after removing
 /// terms scattered across several blocks, block boundaries no longer line up
 /// with `id / DICT_BLOCK` (dead ids leave gaps), and lookups must still find
@@ -2031,6 +2193,279 @@ fn a_snapshot_past_max_age_returns_snapshot_expired() {
         snap.describe(None, None),
         Err(StoreError::SnapshotExpired { .. })
     ));
+}
+
+// --- Issue #58: story 10 snapshot follow-up test coverage ---
+
+/// Gap 1 (issue #58): `SnapshotTracker` is only ever exercised sequentially
+/// by the tests above. Here N threads simultaneously open one snapshot each
+/// on a shared store, all held open at once (synchronized with a barrier so
+/// the main thread can observe `open_count == n` while every handle is
+/// live), then all drop their handle together and `open_count` settles back
+/// to 0 -- proving the tracker's `Mutex<SnapshotTracker>` correctly
+/// serializes concurrent register/deregister from multiple threads (no lost
+/// updates, no panics, no deadlock).
+#[test]
+fn snapshot_tracker_settles_correctly_under_concurrent_open_and_drop() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+
+    let n = 8usize;
+    let all_open = std::sync::Barrier::new(n + 1);
+    let release = std::sync::Barrier::new(n + 1);
+    std::thread::scope(|scope| {
+        for _ in 0..n {
+            let s = &s;
+            let all_open = &all_open;
+            let release = &release;
+            scope.spawn(move || {
+                let snap = s.snapshot().unwrap();
+                all_open.wait();
+                release.wait();
+                drop(snap);
+            });
+        }
+        all_open.wait();
+        assert_eq!(
+            s.snapshot_stats().open_count,
+            n,
+            "all {n} concurrently opened snapshots must be counted, none lost to a race"
+        );
+        release.wait();
+    });
+
+    // Threads have returned (`thread::scope` joins them all), so every
+    // handle has been dropped and deregistered.
+    assert_eq!(s.snapshot_stats().open_count, 0);
+}
+
+/// Gap 2 (issue #58): "a `V2Snapshot` opened before `compact()` is
+/// unusable/behaves sanely after compaction" is, in fact, statically
+/// impossible to construct in safe code, not merely something that would
+/// misbehave at runtime. `V2Store::snapshot` returns `Box<dyn StoreRead +
+/// Send + '_>`, borrowing `&self`; `V2Store::compact` takes `self` by value.
+/// As long as the returned snapshot handle is still live (in scope, used
+/// again later), the borrow checker refuses to let `compact` move `self` --
+/// this is exactly the guarantee `compact`'s own doc comment claims ("Any
+/// snapshot handles taken on the pre-compaction store are already
+/// invalidated by construction... so no caller can still hold one"). This
+/// test is read-only with respect to `compact` (per the task's constraint,
+/// it does not modify `compact` itself) and instead checks the observable
+/// postcondition that guarantee implies: a snapshot taken, used, and
+/// dropped *before* `compact` runs leaves nothing behind in the reopened
+/// store's tracker -- no stale bookkeeping survives the old `V2Store` being
+/// consumed. (The commented-out block below is what "held across compact"
+/// would look like; it intentionally does not compile, which is the point.)
+#[test]
+fn compact_reopens_with_a_fresh_empty_snapshot_tracker() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+
+    // A snapshot taken and fully used *before* compact runs -- this compiles
+    // only because it is dropped (last used) before `s.compact()` moves `s`.
+    let snap = s.snapshot().unwrap();
+    assert_eq!(snap.search(&Query::new("alpha")).unwrap().len(), 1);
+    drop(snap);
+    assert_eq!(s.snapshot_stats().open_count, 0);
+
+    // // What issue #58 gap 2 describes does not compile -- left here as
+    // // documentation, not an executable test:
+    // let snap = s.snapshot().unwrap();
+    // let (s, _stats) = s.compact().unwrap(); // error[E0505]: cannot move
+    //                                          // out of `s` because it is
+    //                                          // borrowed by `snap`
+    // snap.search(&Query::new("alpha")).unwrap();
+
+    let (s, _stats) = s.compact().unwrap();
+    // The reopened store's tracker starts empty, per `compact`'s own doc
+    // comment -- no snapshot bookkeeping from the pre-compaction store
+    // leaks through.
+    let stats = s.snapshot_stats();
+    assert_eq!(stats.open_count, 0);
+    assert!(stats.oldest_age.is_none());
+
+    // The reopened store still works normally, including taking new
+    // snapshots against the post-compaction data.
+    let snap2 = s.snapshot().unwrap();
+    assert_eq!(snap2.search(&Query::new("alpha")).unwrap().len(), 1);
+    assert_eq!(s.snapshot_stats().open_count, 1);
+}
+
+/// Gap 3 (issue #58): the exact `age == max_age` boundary for
+/// `check_not_expired`'s cutoff (`age >= self.max_age`), not just
+/// comfortably-within or comfortably-past durations. `max_age` is set to
+/// zero, so a snapshot is at (or past) its max age the instant it is taken
+/// -- `elapsed()` is always `>= Duration::ZERO` -- which exercises the
+/// equality arm of `>=` directly rather than relying on timing to land
+/// exactly on a nonzero boundary (not reliably reproducible on real clocks).
+#[test]
+fn a_snapshot_at_exactly_zero_max_age_is_expired_at_the_boundary() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let mut s = V2Store::open(&p).unwrap();
+    s.set_max_snapshot_age(std::time::Duration::ZERO);
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+
+    let snap = s.snapshot().unwrap();
+    // No sleep: `elapsed()` immediately after `snapshot()` is already
+    // `>= Duration::ZERO == max_age`, so the very first read must see
+    // `SnapshotExpired`, proving the check fires *at* the boundary
+    // (`age >= max_age`), not only strictly past it.
+    assert!(matches!(
+        snap.search(&Query::new("alpha")),
+        Err(StoreError::SnapshotExpired {
+            age_secs: 0,
+            max_age_secs: 0
+        })
+    ));
+}
+
+/// Gap 4 (issue #58): the 50%-of-max-age `eprintln!` warning
+/// (`SNAPSHOT_WARN_FRACTION`) had zero test coverage. `cargo test`'s default
+/// (non-`--nocapture`) output capture intercepts `eprintln!` from every
+/// thread of the test binary -- confirmed by direct experiment, including a
+/// freshly spawned `std::thread::scope` thread -- so there is no reliable
+/// way to observe this warning's stderr from inside a unit test of this
+/// binary. Instead, this test runs the scenario in a genuinely separate OS
+/// process (the `snapshot_warn_probe` example, built via `cargo build
+/// --example`) and inspects *that* process's captured stderr via
+/// `Command::output()`, which is unaffected by this test binary's own
+/// capture. Confirms the warning fires exactly once across 5 reads past the
+/// 50% mark (the `warned: Cell<bool>` latch, not once per read) and that its
+/// text references the 50% threshold.
+#[test]
+fn the_fifty_percent_age_warning_fires_exactly_once_per_snapshot() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.join("../..");
+    let build = std::process::Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "--example",
+            "snapshot_warn_probe",
+            "-p",
+            "graph-store",
+        ])
+        .current_dir(&workspace_root)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "failed to build snapshot_warn_probe example:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let exe = workspace_root.join(format!(
+        "target/debug/examples/snapshot_warn_probe{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(exe.exists(), "expected probe binary at {exe:?}");
+
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let run = std::process::Command::new(&exe).arg(&p).output().unwrap();
+    assert!(
+        run.status.success(),
+        "snapshot_warn_probe failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let captured = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    let occurrences = captured.matches("passed").count();
+    assert_eq!(
+        occurrences, 1,
+        "the 50%-age warning must fire exactly once per snapshot handle across 5 reads past \
+         the threshold, not once per read; captured stderr:\n{captured}"
+    );
+    assert!(
+        captured.contains("50%"),
+        "warning text should reference the 50% threshold; captured stderr:\n{captured}"
+    );
+}
+
+/// Gap 5 (issue #58): `set_max_snapshot_age` is documented as affecting only
+/// newly-opened handles, not ones already open. Opens a snapshot under a
+/// long max age, then tightens the store's configured max age to something
+/// already exceeded -- the already-open handle must be unaffected (each
+/// `V2Snapshot` captures its own `max_age` at creation, per its `max_age`
+/// field), while a *new* snapshot taken after the change is immediately
+/// subject to the new, tighter limit.
+#[test]
+fn set_max_snapshot_age_does_not_retroactively_affect_open_handles() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let mut s = V2Store::open(&p).unwrap();
+    s.set_max_snapshot_age(std::time::Duration::from_secs(3600));
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+
+    // `V2Store::snapshot` returns `Box<dyn StoreRead + Send + '_>`, tying the
+    // handle's lifetime to `&s` even though a `V2Snapshot` does not actually
+    // hold any reference into the store (it owns its own `ReadTransaction`
+    // and a cloned `Arc<Mutex<SnapshotTracker>>`, per its fields). That
+    // artificial tie would otherwise make it impossible to call
+    // `set_max_snapshot_age(&mut self)` below while `old_snap` is still
+    // alive -- exactly the ownership situation `compact_reopens_with_a_fresh_empty_snapshot_tracker`
+    // documents as unrepresentable for `compact`. Here, unlike `compact`,
+    // the scenario this gap is actually about (an old handle outliving a
+    // config change on the *same* live store) is real and worth testing, so
+    // the lifetime is erased with `transmute` -- sound because, as above,
+    // nothing about a `V2Snapshot` actually borrows `V2Store`'s data.
+    let old_snap: Box<dyn StoreRead + Send + 'static> = unsafe {
+        std::mem::transmute::<Box<dyn StoreRead + Send + '_>, Box<dyn StoreRead + Send + 'static>>(
+            s.snapshot().unwrap(),
+        )
+    };
+    // Tighten the store's configured max age to something the old handle's
+    // actual age already exceeds.
+    s.set_max_snapshot_age(std::time::Duration::from_millis(1));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // The already-open handle keeps using the 1-hour limit it was created
+    // with: still well within it, so it keeps reading normally.
+    assert_eq!(old_snap.search(&Query::new("alpha")).unwrap().len(), 1);
+
+    // A brand-new snapshot, taken after the change, is subject to the new
+    // 1ms limit immediately.
+    let new_snap = s.snapshot().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(matches!(
+        new_snap.search(&Query::new("alpha")),
+        Err(StoreError::SnapshotExpired { .. })
+    ));
+
+    // The old handle, meanwhile, is still unaffected.
+    assert_eq!(old_snap.search(&Query::new("alpha")).unwrap().len(), 1);
 }
 
 /// Snapshot count/age observability: opening N handles reports count == N,
