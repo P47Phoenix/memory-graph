@@ -58,9 +58,21 @@ pub struct TokenizerOptions {
     /// between `<%` and `%>` the markup rules are off (C#-like code: `//`
     /// comments, normal strings, no name joining), and a quoted attribute
     /// value stops before a `<%` and resumes after the matching `%>`, so
-    /// `Text='<%# Eval("x") %>'` exposes its server tag. A server tag inside
-    /// an HTML `<!-- -->` comment stays part of the comment.
+    /// `Text='<%# Eval("x") %>'` exposes its server tag. A `//` comment in
+    /// server code ends before `%>`; a string literal in server code does not
+    /// (`<%= "a%>b" %>` keeps `"a%>b"` whole). A server tag inside an HTML
+    /// `<!-- -->` comment stays part of the comment. Heuristic limit: in a
+    /// `<script>` body, `a<b` opens a "tag" until the next `>`.
     pub aspx: bool,
+    /// JavaScript regex literals: a `/` that cannot end an operand (at the
+    /// start of input, or after `(` `,` `=` `:` `[` `!` `&` `|` `?` `{` `}`
+    /// `;` `+` `-` `*` `%` `~` `^` or `return`/`typeof`/`case`/...; never
+    /// after `<` or `>`, so JSX `</div>` is not a regex)
+    /// starts one Literal running to the next unescaped `/` outside a `[...]`
+    /// class, plus trailing flag letters. A regex never spans lines: without
+    /// a closing `/` on its line the `/` stays an operator. This keeps quotes
+    /// and braces inside regexes (`/'/g`, `/[{]/`) from derailing scanners.
+    pub regex_literals: bool,
 }
 
 /// Lexing context for the `markup`/`aspx` dialects; unused otherwise.
@@ -118,7 +130,12 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
                 TokenClass::Comment,
             )
         } else if !markup && rest.starts_with("//") {
-            (rest.find('\n').unwrap_or(rest.len()), TokenClass::Comment)
+            let mut n = rest.find('\n').unwrap_or(rest.len());
+            // ASP.NET ends a server block at `%>` even inside a `//` comment.
+            if m.code {
+                n = rest[..n].find("%>").unwrap_or(n);
+            }
+            (n, TokenClass::Comment)
         } else if let Some(after) = rest.strip_prefix("/*").filter(|_| !markup) {
             (
                 after.find("*/").map_or(rest.len(), |p| p + 4),
@@ -161,6 +178,11 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
             (single_quoted_len(rest), TokenClass::Literal)
         } else if c == '"' || c == '`' || (c == '\'' && is_char_literal(rest)) {
             (quoted_len(rest, c), TokenClass::Literal)
+        } else if let Some(n) = (opts.regex_literals && c == '/' && regex_allowed(out.last()))
+            .then(|| regex_len(rest))
+            .flatten()
+        {
+            (n, TokenClass::Literal)
         } else if OPERATOR_CHARS.contains(c) {
             (c.len_utf8(), TokenClass::Operator)
         } else {
@@ -263,6 +285,64 @@ fn csharp_literal_len(rest: &str) -> Option<usize> {
         p += 1;
     }
     Some(rest.len())
+}
+
+/// Whether a `/` after `prev` (the last token) starts a regex rather than
+/// dividing: true when `prev` cannot end an operand.
+fn regex_allowed(prev: Option<&TokenDecl>) -> bool {
+    let Some(p) = prev else {
+        return true;
+    };
+    match p.class {
+        TokenClass::Identifier => matches!(
+            p.text.as_str(),
+            "return"
+                | "typeof"
+                | "case"
+                | "do"
+                | "else"
+                | "in"
+                | "of"
+                | "new"
+                | "delete"
+                | "void"
+                | "throw"
+                | "instanceof"
+                | "yield"
+                | "await"
+        ),
+        TokenClass::Literal => false,
+        // Not after `<` or `>`: JSX closing tags (`</div>`) and self-closing
+        // runs (`<br/>`) are not regexes.
+        _ => !matches!(p.text.as_str(), ")" | "]" | "}" | "<" | ">"),
+    }
+}
+
+/// Length of a regex literal `/.../flags` at the start of `rest`, if it closes
+/// on the same line.
+fn regex_len(rest: &str) -> Option<usize> {
+    if rest.starts_with("//") || rest.starts_with("/*") {
+        return None;
+    }
+    let (mut esc, mut class) = (false, false);
+    for (p, ch) in rest.char_indices().skip(1) {
+        match ch {
+            '\n' | '\r' => return None,
+            _ if esc => esc = false,
+            '\\' => esc = true,
+            '[' => class = true,
+            ']' => class = false,
+            '/' if !class => {
+                let end = p + 1;
+                let flags = rest[end..]
+                    .find(|c: char| !c.is_ascii_alphabetic())
+                    .unwrap_or(rest.len() - end);
+                return Some(end + flags);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// ASP.NET server-tag delimiters and `<%-- --%>` comments.
@@ -413,19 +493,21 @@ mod tests {
 
     /// One golden per non-default dialect over `DIALECT_SOURCES`.
     const DIALECT_GOLDENS: &[(&str, u64)] = &[
-        ("single_quote_strings", 0x9261c81518b47bfe),
-        ("csharp_strings", 0xd738673d9e7ecb1f),
-        ("markup", 0xe3a43ed7688ec442),
-        ("aspx", 0x5a827fb7e21ee243),
-        ("aspx_only", 0xe399a6c0b514361d),
+        ("single_quote_strings", 0x4e1b76e132514c29),
+        ("csharp_strings", 0x40f802a4cf0ec6de),
+        ("markup", 0x7e72042f258818fc),
+        ("aspx", 0xced497dbf0743215),
+        ("aspx_only", 0xbc7b0d641a1bf8a5),
+        ("regex_literals", 0x8ffed24f2f0ed634),
     ];
 
     const DIALECT_SOURCES: &[&str] = &[
         "const s = 'it\\'s'; // c\nlet t = 'open\r\nx",
+        "s.replace(/'/g, '').split(/[{\"]/); x = a / b / c; return /\\//i.test(q); y = /open\nz",
         r#"var a = @"C:\x ""q"""; var b = $"{n}\""; var c = $@"{d}"""; @$"z" @x"#,
         "<div data-id=\"a\" class='b'><!-- note --> http://x/*y*/ a: b- 27\" <!--> <!-- open",
         r#"<asp:Label Text='<%# Eval("x") %> of' /><% s = @"a""b"; // c
-%><style>p{color:red}</style>"#,
+%><style>p{color:red}</style><% // t %><b id="z">"#,
         r#"<%@ Page Language="C#" %><%-- hidden --%><asp:Button id="b1" runat="server" /><%= x %><%# Eval("y") %><%: z %><%$ r %><% if (a) { %> <%-- open"#,
     ];
 
@@ -441,6 +523,10 @@ mod tests {
                 o.csharp_strings = true;
             }
             "aspx_only" => o.aspx = true,
+            "regex_literals" => {
+                o.regex_literals = true;
+                o.single_quote_strings = true;
+            }
             _ => unreachable!("{name}"),
         }
         o
@@ -594,6 +680,22 @@ mod tests {
             dtexts("aspx", "<%= ok?a:b %><%= n-1 %>"),
             ["<%=", "ok", "?", "a", ":", "b", "%>", "<%=", "n", "-", "1", "%>"]
         );
+        // A `//` comment ends at `%>`; markup rules resume after it.
+        let t = dtexts("aspx", "<% // TODO %>\n<asp:Label id=\"a\">");
+        assert_eq!(
+            t,
+            [
+                "<%",
+                "// TODO ",
+                "%>",
+                "<",
+                "asp:Label",
+                "id",
+                "=",
+                "\"a\"",
+                ">"
+            ]
+        );
         let t = dtoks("aspx", "<% // c\n s = \"<p>\"; %>");
         assert_eq!(t[1], ("// c".to_string(), Comment));
         assert_eq!(t[4], ("\"<p>\"".to_string(), Literal));
@@ -612,6 +714,35 @@ mod tests {
         assert_eq!(t[14], lit("\"server\""));
         // A server tag inside an HTML comment stays in the comment.
         assert_eq!(dtoks("aspx", "<!-- <%= s %> -->")[0].1, Comment);
+    }
+
+    #[test]
+    fn regex_literals_dialect() {
+        let d = |s: &str| dtoks("regex_literals", s);
+        let lit = |s: &str| (s.to_string(), TokenClass::Literal);
+        // Quotes and braces inside a regex stay inside it.
+        let t = d("s.replace(/'/g, ''); f()");
+        assert_eq!(t[4], lit("/'/g"));
+        assert_eq!(d("x = /[{/]\\//i;")[2], lit("/[{/]\\//i"));
+        assert_eq!(d("/a/")[0], lit("/a/"));
+        assert_eq!(d("return /a/.test(s)")[1], lit("/a/"));
+        // Division after an operand.
+        let texts = |s: &str| -> Vec<String> { d(s).into_iter().map(|t| t.0).collect() };
+        assert_eq!(texts("a / b / c"), ["a", "/", "b", "/", "c"]);
+        assert_eq!(
+            texts("f(x) / 2 / y"),
+            ["f", "(", "x", ")", "/", "2", "/", "y"]
+        );
+        // No closing `/` on the line: an operator.
+        assert_eq!(texts("= /a\nb/"), ["=", "/", "a", "b", "/"]);
+        // Comments still win.
+        assert_eq!(d("x = // c")[2].1, TokenClass::Comment);
+        // Off by default.
+        assert_eq!(texts_default("= /a/"), ["=", "/", "a", "/"]);
+    }
+
+    fn texts_default(s: &str) -> Vec<String> {
+        texts(s)
     }
 
     #[test]
@@ -708,6 +839,7 @@ mod tests {
         csharp_strings: false,
         markup: false,
         aspx: false,
+        regex_literals: false,
     };
 
     fn rtexts(s: &str) -> Vec<String> {
@@ -809,6 +941,7 @@ mod tests {
                 csharp_strings: true,
                 markup: true,
                 aspx: true,
+                regex_literals: true,
             },
         )
     }

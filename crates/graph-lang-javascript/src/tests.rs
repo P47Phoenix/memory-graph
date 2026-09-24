@@ -100,6 +100,38 @@ fn arrow_in_call_arguments() {
 }
 
 #[test]
+fn review_regressions() {
+    // Declarations in an arrow body stay inside the arrow (was a partial overlap).
+    let s = syms("const f = () => function\n g(){ }\n");
+    assert_eq!(find(&s, "f").3, "const f = () => function");
+    assert!(s.iter().all(|x| x.0 != "g"));
+    // Empty arrow bodies are not symbols (was a partial overlap).
+    syms("const g = (x) =>const g = (x) =>,");
+    syms("f(a => , b => ; c => ) d => ]");
+    // A quote inside a regex does not hide later symbols.
+    let s = syms("const s = x => x.replace(/'/g, ''); function c(){}\nconst q = s.split(/\"/); function after2(){}");
+    find(&s, "c");
+    find(&s, "after2");
+    // Heritage clauses are not the class body.
+    let s = syms("class A extends mix({a(){}}) { m(){} }");
+    assert_eq!(find(&s, "A").3, "class A extends mix({a(){}}) { m(){} }");
+    find(&s, "m");
+    assert!(s.iter().all(|x| x.0 != "a"));
+    // Chained / continued expression bodies span lines.
+    let s = syms("const f = async () =>\n  fetch(u)\n  .then(r => r.json())\n  .catch(e => e);\nconst n = x =>\n  x ? 1\n  : 2;\n");
+    assert!(find(&s, "f").3.ends_with(".catch(e => e);"));
+    assert!(find(&s, "n").3.ends_with(": 2;"));
+    // JSX closing tags are not regex literals.
+    let s = syms("const App = () => (\n  <div onClick={() => { go() }}>{items.map(i => <li>{i}</li>)}</div>\n);\nfunction z(){}");
+    assert!(find(&s, "App").3.ends_with(");"));
+    find(&s, "z");
+    // Private members keep `#`.
+    let s = syms("class P { #p() {} p() {} }");
+    find(&s, "#p");
+    find(&s, "p");
+}
+
+#[test]
 fn bom_and_non_ascii_positions() {
     let src = "\u{feff}const é = () => 1;\nfunction ü() {}";
     let ex = JavaScriptExtractor.extract(src);
@@ -135,7 +167,7 @@ proptest! {
                 Just("b"), Just("{"), Just("}"), Just("("), Just(")"), Just("["), Just("]"),
                 Just(";"), Just("="), Just("=>"), Just(","), Just("async"), Just("export"),
                 Just("get"), Just("static"), Just("*"), Just("\n"), Just("'s'"), Just("//c\n"),
-                Just("/"),
+                Just("/"), Just("=> ,"), Just("=> )"), Just("=> ;"), Just("function\n"), Just("#"), Just("extends"), Just(".then"), Just("/x/"),
             ],
             0..40,
         )
@@ -145,6 +177,9 @@ proptest! {
         prop_assert!(!ex.has_errors);
         for s in &ex.symbols {
             prop_assert!(s.span.start < s.span.end && s.span.end as usize <= src.len());
+            prop_assert!(ex.tokens.iter().any(|t| t.span.start == s.span.start));
+            prop_assert!(ex.tokens.iter().any(|t| t.span.end == s.span.end));
+            prop_assert!(!s.name.is_empty());
         }
         assert_nested(&ex);
     }
