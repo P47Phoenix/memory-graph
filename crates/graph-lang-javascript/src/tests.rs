@@ -121,6 +121,10 @@ fn review_regressions() {
     let s = syms("const f = async () =>\n  fetch(u)\n  .then(r => r.json())\n  .catch(e => e);\nconst n = x =>\n  x ? 1\n  : 2;\n");
     assert!(find(&s, "f").3.ends_with(".catch(e => e);"));
     assert!(find(&s, "n").3.ends_with(": 2;"));
+    // JSX closing tags are not regex literals.
+    let s = syms("const App = () => (\n  <div onClick={() => { go() }}>{items.map(i => <li>{i}</li>)}</div>\n);\nfunction z(){}");
+    assert!(find(&s, "App").3.ends_with(");"));
+    find(&s, "z");
     // Private members keep `#`.
     let s = syms("class P { #p() {} p() {} }");
     find(&s, "#p");

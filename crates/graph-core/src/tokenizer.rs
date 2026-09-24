@@ -66,7 +66,8 @@ pub struct TokenizerOptions {
     pub aspx: bool,
     /// JavaScript regex literals: a `/` that cannot end an operand (at the
     /// start of input, or after `(` `,` `=` `:` `[` `!` `&` `|` `?` `{` `}`
-    /// `;` `+` `-` `*` `%` `<` `>` `~` `^` or `return`/`typeof`/`case`/...)
+    /// `;` `+` `-` `*` `%` `~` `^` or `return`/`typeof`/`case`/...; never
+    /// after `<` or `>`, so JSX `</div>` is not a regex)
     /// starts one Literal running to the next unescaped `/` outside a `[...]`
     /// class, plus trailing flag letters. A regex never spans lines: without
     /// a closing `/` on its line the `/` stays an operator. This keeps quotes
@@ -311,7 +312,9 @@ fn regex_allowed(prev: Option<&TokenDecl>) -> bool {
                 | "await"
         ),
         TokenClass::Literal => false,
-        _ => !matches!(p.text.as_str(), ")" | "]" | "}"),
+        // Not after `<` or `>`: JSX closing tags (`</div>`) and self-closing
+        // runs (`<br/>`) are not regexes.
+        _ => !matches!(p.text.as_str(), ")" | "]" | "}" | "<" | ">"),
     }
 }
 
@@ -495,7 +498,7 @@ mod tests {
         ("markup", 0x7e72042f258818fc),
         ("aspx", 0xced497dbf0743215),
         ("aspx_only", 0xbc7b0d641a1bf8a5),
-        ("regex_literals", 0x13805101b4576708),
+        ("regex_literals", 0x8ffed24f2f0ed634),
     ];
 
     const DIALECT_SOURCES: &[&str] = &[
