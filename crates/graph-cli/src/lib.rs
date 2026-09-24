@@ -15,6 +15,10 @@ pub fn shipped_extractors() -> Vec<Box<dyn graph_core::Extractor>> {
     v.push(Box::new(graph_lang_csharp::CSharpExtractor));
     #[cfg(feature = "lang-javascript")]
     v.push(Box::new(graph_lang_javascript::JavaScriptExtractor));
+    #[cfg(feature = "lang-aspx")]
+    v.push(Box::new(graph_lang_aspx::AspxExtractor));
+    #[cfg(feature = "lang-html")]
+    v.push(Box::new(graph_lang_html::HtmlExtractor));
     v
 }
 

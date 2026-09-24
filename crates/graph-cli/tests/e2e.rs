@@ -12,6 +12,72 @@ fn run(args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// Issue #69: a small ASP.NET Web Forms site indexes with symbols for every
+/// shipped language, on both backends.
+#[test]
+fn aspnet_site_symbols() {
+    for backend in ["v1", "v2"] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("site");
+        std::fs::create_dir_all(root.join("Scripts")).unwrap();
+        let files = [
+            (
+                "Default.aspx",
+                "<%@ Page Language=\"C#\" CodeBehind=\"Default.aspx.cs\" %>\n<form id=\"f\" runat=\"server\"><asp:Button ID=\"btnGo\" runat=\"server\" /></form>\n",
+            ),
+            (
+                "Default.aspx.cs",
+                "namespace Site { public partial class DefaultPage : Page { protected void Go_Click(object s, EventArgs e) { } } }\n",
+            ),
+            ("Scripts/app.js", "function initApp() {}\nconst go = () => 1;\n"),
+            ("about.html", "<div id=\"about\"></div>\n"),
+        ];
+        for (path, src) in files {
+            std::fs::write(root.join(path), src).unwrap();
+        }
+        let db = d.path().join("g").to_string_lossy().into_owned();
+        let (ok, out, err) = run(&[
+            "--db",
+            &db,
+            "--backend",
+            backend,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            root.to_str().unwrap(),
+        ]);
+        assert!(ok, "{out}{err}");
+        let (ok, out, err) = run(&["--db", &db, "--backend", backend, "describe", "--json"]);
+        assert!(ok, "{err}");
+        for lang in ["aspx", "csharp", "javascript", "html"] {
+            assert!(
+                out.contains(&format!("\"{lang}\"")),
+                "{backend}: {lang} missing: {out}"
+            );
+        }
+        for (name, lang_kind) in [
+            ("btnGo", "control"),
+            ("DefaultPage", "class"),
+            ("Go_Click", "method"),
+            ("initApp", "function"),
+            ("go", "arrow_fn"),
+            ("about", "element"),
+        ] {
+            let (ok, out, err) =
+                run(&["--db", &db, "--backend", backend, "symbols", "--json", name]);
+            assert!(ok, "{err}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            let hits = v["results"].as_array().unwrap();
+            assert!(
+                hits.iter().any(|h| h["lang_kind"] == lang_kind),
+                "{backend}: {name}/{lang_kind} not in {out}"
+            );
+        }
+    }
+}
+
 #[test]
 fn index_reopen_search() {
     let d = tempfile::tempdir().unwrap();
