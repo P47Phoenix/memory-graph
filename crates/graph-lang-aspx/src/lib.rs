@@ -29,6 +29,7 @@ pub const ASPX_TOKENIZER: TokenizerOptions = TokenizerOptions {
     csharp_strings: true,
     markup: true,
     aspx: true,
+    regex_literals: false,
 };
 
 impl Extractor for AspxExtractor {

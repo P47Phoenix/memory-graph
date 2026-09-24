@@ -24,6 +24,7 @@ pub const HTML_TOKENIZER: TokenizerOptions = TokenizerOptions {
     csharp_strings: false,
     markup: true,
     aspx: false,
+    regex_literals: false,
 };
 
 impl Extractor for HtmlExtractor {
