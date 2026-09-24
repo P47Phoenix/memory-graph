@@ -3,8 +3,13 @@
 //! here; extractors decide what the tokens mean.
 use crate::schema::{Span, TokenClass, TokenDecl};
 
-/// Span running from the start of `first` to the end of `last`.
+/// Span running from the start of `first` to the end of `last`. `last` must
+/// not end before `first` starts.
 pub fn span_between(first: &Span, last: &Span) -> Span {
+    debug_assert!(
+        first.start <= last.end,
+        "span_between: {first:?} > {last:?}"
+    );
     Span {
         start: first.start,
         end: last.end,
@@ -57,7 +62,9 @@ fn is_trivia(t: &TokenDecl) -> bool {
     matches!(t.class, TokenClass::Comment | TokenClass::Literal)
 }
 
-/// A forward cursor over tokens that can skip comments.
+/// A forward cursor over tokens that can skip comments. The `*_code`
+/// methods and `eat` skip only Comment tokens; string literals are code here
+/// (unlike in [`matching_close`], which ignores delimiters inside literals).
 #[derive(Debug, Clone)]
 pub struct Cursor<'a> {
     tokens: &'a [TokenDecl],
@@ -182,5 +189,37 @@ mod tests {
         assert_eq!(c.next_code().unwrap().1.text, "z");
         assert!(c.next_code().is_none());
         assert!(c.at_end());
+    }
+
+    #[test]
+    fn matching_close_ignores_delimiters_in_literals_and_comments() {
+        // Starting on a literal/comment whose text is a delimiter.
+        let lit = |s: &str| TokenDecl {
+            text: s.into(),
+            class: TokenClass::Literal,
+            span: tokenize("(")[0].span,
+        };
+        assert_eq!(matching_close(&[lit("(")], 0), None);
+        // A closer inside a literal or comment does not close.
+        let t = tokenize("( \")\" /* ) */ )");
+        assert_eq!(matching_close(&t, 0), Some(t.len() - 1));
+    }
+
+    #[test]
+    fn cursor_peek_set_pos_and_unmatched() {
+        let t = tokenize("a /* c */ b ( c");
+        let mut c = Cursor::new(&t);
+        assert_eq!(c.peek_code(1).unwrap().1.text, "b");
+        assert_eq!(c.peek_code(2).unwrap().1.text, "(");
+        assert!(c.peek_code(9).is_none());
+        c.set_pos(99);
+        assert_eq!(c.pos(), t.len());
+        assert!(c.at_end() && c.peek().is_none());
+        // An unmatched opener leaves the cursor where it was.
+        let open = t.iter().position(|t| t.text == "(").unwrap();
+        c.set_pos(open);
+        assert!(c.skip_balanced().is_none());
+        assert_eq!(c.pos(), open);
+        assert_eq!(c.tokens().len(), t.len());
     }
 }

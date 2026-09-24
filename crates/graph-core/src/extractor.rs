@@ -36,9 +36,14 @@ pub trait Extractor: Send + Sync {
     }
     /// File extensions (without the dot, any case) this extractor claims.
     /// [`Registry::detect_language`] maps them to [`Extractor::language`]
-    /// before falling back to the built-in extension table, so an extractor
-    /// can add a language the table does not know, or take over an extension
-    /// the table maps elsewhere.
+    /// before anything else (the built-in extension table, well-known file
+    /// names, the `#!` line), so an extractor can add a language the table
+    /// does not know, or take over an extension the table maps elsewhere.
+    ///
+    /// An extension is the text after the file name's last dot, as
+    /// `std::path::Path::extension` defines it: a claim such as `"d.ts"` can
+    /// never match (and is ignored), and a dotfile such as `.ini` has no
+    /// extension, so it is not matched by an `"ini"` claim.
     fn extensions(&self) -> &[&str] {
         &[]
     }
@@ -100,8 +105,10 @@ impl Registry {
     pub fn register(&mut self, e: Box<dyn Extractor>) {
         let lang = e.language().to_ascii_lowercase();
         for ext in e.extensions() {
-            let ext = ext.trim_start_matches('.').to_ascii_lowercase();
-            if !ext.is_empty() {
+            // Only single-segment extensions can ever match (see
+            // `Extractor::extensions`); drop empty and dotted claims.
+            let ext = ext.strip_prefix('.').unwrap_or(ext).to_ascii_lowercase();
+            if !ext.is_empty() && !ext.contains('.') {
                 self.extensions.insert(ext, lang.clone());
             }
         }
@@ -110,8 +117,7 @@ impl Registry {
 
     fn get(&self, language: &str) -> Option<&dyn Extractor> {
         self.extractors
-            .get(language)
-            .or_else(|| self.extractors.get(&language.to_ascii_lowercase()))
+            .get(&language.to_ascii_lowercase())
             .map(|e| &**e)
     }
 
@@ -119,7 +125,7 @@ impl Registry {
     pub fn extract(&self, language: &str, source: &str) -> Extraction {
         match self.get(language) {
             Some(e) => e.extract(source),
-            None => FallbackExtractor::new(language).extract(source),
+            None => FallbackExtractor::new(language.to_ascii_lowercase()).extract(source),
         }
     }
 
@@ -166,7 +172,10 @@ mod tests {
             format!("toy-{}", self.0)
         }
         fn extract(&self, source: &str) -> Extraction {
-            FallbackExtractor::new(self.0).extract(source)
+            Extraction {
+                has_errors: true,
+                ..FallbackExtractor::new(self.0).extract(source)
+            }
         }
     }
 
@@ -200,5 +209,41 @@ mod tests {
         assert_eq!(r.version("ToY"), "toy-Toy");
         assert!(!r.has("other"));
         assert_eq!(r.version("other"), fallback_version());
+        // `extract` uses the registered extractor whatever the case (the toy
+        // marks its output with `has_errors`).
+        assert!(r.extract("TOY", "x").has_errors);
+        assert!(!r.extract("Other", "x").has_errors);
+    }
+
+    #[test]
+    fn empty_and_dotted_claims_are_ignored() {
+        let mut r = Registry::default();
+        r.register(Box::new(Toy("toy", &["", ".", "d.ts", "..x"])));
+        assert!(r.extensions.is_empty());
+        assert_eq!(r.detect_language("a.d.ts", ""), "typescript");
+        assert_eq!(r.detect_language("a.", ""), "unknown");
+        // A dotfile has no extension, so it is never claimed.
+        r.register(Box::new(Toy("ini", &["ini"])));
+        assert_eq!(r.detect_language("x/.ini", ""), "unknown");
+        assert_eq!(r.detect_language("x/a.ini", ""), "ini");
+    }
+
+    proptest::proptest! {
+        /// With nothing claimed, detection is exactly the free function's, so
+        /// existing databases keep their languages and fingerprints.
+        #[test]
+        fn unclaimed_detection_matches_free_function(
+            path in "[a-zA-Z./_é-]{0,16}",
+            src in "(#!/usr/bin/env (python3|node|bash) -u\n)?[a-z ]{0,8}",
+        ) {
+            let mut r = Registry::default();
+            r.register(Box::new(Toy("toy", &["toy"])));
+            if !path.to_ascii_lowercase().ends_with(".toy") {
+                proptest::prop_assert_eq!(
+                    r.detect_language(&path, &src),
+                    crate::language::detect_language_from_content(&path, &src)
+                );
+            }
+        }
     }
 }

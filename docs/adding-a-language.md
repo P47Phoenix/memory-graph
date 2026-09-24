@@ -29,7 +29,10 @@ These `graph-core` items are the stable surface for extractors:
   new language (`toy`) or take over an existing extension (`rs`). If two
   extractors claim the same extension or language, the one registered last
   wins. Files whose extension nobody claims use the built-in table, well-known
-  file names (`Makefile`, `Dockerfile`) and the `#!` line.
+  file names (`Makefile`, `Dockerfile`) and the `#!` line; a claim beats all
+  three. An extension is what follows the file name's last dot, so a dotted
+  claim such as `d.ts` is ignored and a dotfile such as `.ini` is never
+  claimed.
 - `extract(src)` — returns tokens and symbols. It should never panic, and
   should set `has_errors` only when the source is truly unparseable for your
   extractor — a scanner that finds fewer symbols on odd input is not an error.

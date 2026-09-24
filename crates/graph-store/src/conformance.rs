@@ -1514,7 +1514,7 @@ impl Extractor for ToyExtractor {
         "toy-1".into()
     }
     fn extensions(&self) -> &[&str] {
-        &["TOY", ".toyx"]
+        &["TOY", ".toyx", "py"]
     }
     fn extract(&self, source: &str) -> Extraction {
         let body = source.trim_end();
@@ -1535,34 +1535,17 @@ impl Extractor for ToyExtractor {
 /// claims (auto-detected language), and an explicit language still wins.
 fn claimed_extension_extractor(h: &Harness) {
     let s = (h.open)(vec![Box::new(ToyExtractor)]).expect("open store");
-    s.index_bytes(
-        "o",
-        "r",
-        "a.toy",
-        b"alpha beta
-",
-        None,
-    )
-    .unwrap();
-    s.index_bytes(
-        "o",
-        "r",
-        "dir/b.ToyX",
-        b"gamma
-",
-        None,
-    )
-    .unwrap();
-    // Explicit language overrides the claim: fallback, no symbols.
-    s.index_bytes(
-        "o",
-        "r",
-        "c.toy",
-        b"delta
-",
-        Some("zig"),
-    )
-    .unwrap();
+    for (path, src) in [
+        ("a.toy", "alpha beta\n"),
+        ("dir/b.ToyX", "gamma\n"),
+        // A claim overrides the built-in table (`py` is python there).
+        ("e.py", "eps\n"),
+    ] {
+        s.index_bytes("o", "r", path, src.as_bytes(), None).unwrap();
+    }
+    // An explicit language overrides the claim: fallback, no symbols.
+    s.index_bytes("o", "r", "c.toy", b"delta\n", Some("zig"))
+        .unwrap();
     let hits = s.search_symbols(&SymbolQuery::new("whole")).unwrap();
     let mut files: Vec<(&str, Option<&str>, Option<&str>)> = hits
         .iter()
@@ -1580,6 +1563,7 @@ fn claimed_extension_extractor(h: &Harness) {
         vec![
             ("a.toy", Some("toylang"), Some("toy_file")),
             ("dir/b.ToyX", Some("toylang"), Some("toy_file")),
+            ("e.py", Some("toylang"), Some("toy_file")),
         ]
     );
     let info = s.describe(Some("o"), Some("r")).unwrap();

@@ -12,6 +12,15 @@ fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus")
 }
 
+/// A registry with every extractor the CLI ships.
+fn shipped_registry() -> graph_core::Registry {
+    let mut r = graph_core::Registry::default();
+    for e in graph_cli::shipped_extractors() {
+        r.register(e);
+    }
+    r
+}
+
 fn manifest() -> Value {
     serde_json::from_str(&std::fs::read_to_string(corpus_dir().join("corpus.json")).unwrap())
         .unwrap()
@@ -212,11 +221,12 @@ fn every_token_is_parsed_exactly() {
         let dir = corpus_dir().join(name);
         let mut langs: BTreeSet<String> = BTreeSet::new();
         let mut repo_tokens = 0usize;
+        let registry = shipped_registry();
         for rel in files(&dir) {
             let bytes = std::fs::read(dir.join(&rel)).unwrap();
             let src =
                 String::from_utf8(bytes).unwrap_or_else(|_| panic!("{name}/{rel} is not UTF-8"));
-            langs.insert(detect_language_from_content(&rel, &src));
+            langs.insert(registry.detect_language(&rel, &src));
             let toks = tokenize(&src);
             let mut covered = 0usize;
             let mut prev_end = 0usize;
@@ -276,13 +286,12 @@ fn every_parsed_token_is_stored() {
     let m = manifest();
     let db = tempfile::tempdir().unwrap();
     let mut store = RedbStore::open(db.path().join("corpus.redb")).unwrap();
-    let mut registry = graph_core::Registry::default();
     for e in graph_cli::shipped_extractors() {
         store.register(e);
     }
-    for e in graph_cli::shipped_extractors() {
-        registry.register(e);
-    }
+    // The store owns its extractors, so build a second set to compute the
+    // expected tokens independently.
+    let registry = shipped_registry();
     let mut expected: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut expected_by_lang: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     let mut rust_symbols = 0;
