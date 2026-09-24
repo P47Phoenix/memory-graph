@@ -105,9 +105,25 @@ const TYPE_KEYWORDS: &[&str] = &["class", "struct", "interface", "record", "enum
 /// Words that can precede a tuple return type's `(`, so that `(` does not
 /// start a parameter list.
 const MODIFIERS: &[&str] = &[
-    "public", "private", "protected", "internal", "static", "virtual", "override",
-    "abstract", "sealed", "async", "extern", "unsafe", "new", "readonly", "partial",
-    "required", "volatile", "file", "ref",
+    "public",
+    "private",
+    "protected",
+    "internal",
+    "static",
+    "virtual",
+    "override",
+    "abstract",
+    "sealed",
+    "async",
+    "extern",
+    "unsafe",
+    "new",
+    "readonly",
+    "partial",
+    "required",
+    "volatile",
+    "file",
+    "ref",
 ];
 
 struct Scanner<'a> {
@@ -167,7 +183,13 @@ impl Scanner<'_> {
             let Some((end, next)) = self.header_end(c, hi) else {
                 return;
             };
+            let file_scoped =
+                matches!(end, End::Semi { .. }) && (c..next).any(|k| self.text(k) == "namespace");
             self.declaration(c, &end, level, hi);
+            if file_scoped {
+                // Its body is the rest of the range, already scanned.
+                return;
+            }
             c = next;
         }
     }
@@ -189,9 +211,24 @@ impl Scanner<'_> {
                     if next < hi && self.text(next) == "=" && !self.is_arrow(next, hi) {
                         (last, next) = self.expression_end(next, hi)?;
                     }
-                    return Some((End::Block { open: c, close, last }, next));
+                    return Some((
+                        End::Block {
+                            open: c,
+                            close,
+                            last,
+                        },
+                        next,
+                    ));
                 }
-                ";" => return Some((End::Semi { at: c, arrow: false }, c + 1)),
+                ";" => {
+                    return Some((
+                        End::Semi {
+                            at: c,
+                            arrow: false,
+                        },
+                        c + 1,
+                    ))
+                }
                 "}" => return None,
                 _ if self.is_arrow(c, hi) => {
                     let (at, after) = self.expression_end(c, hi)?;
@@ -280,7 +317,7 @@ impl Scanner<'_> {
             _ => last,
         };
         let span = span_between(&self.tok(start).span, &self.tok(span_end).span);
-        let mut push = |s: &mut Self, name: String, kind: SymbolKind, lang: &str| {
+        let push = |s: &mut Self, name: String, kind: SymbolKind, lang: &str| {
             s.out.push(SymbolDecl {
                 name,
                 kind,
@@ -334,7 +371,11 @@ impl Scanner<'_> {
         let is_event = self.words(h, name_end).any(|w| w == "event");
         if let Some(op) = (h..name_end).find(|&c| self.text(c) == "operator") {
             let name: String = std::iter::once("operator")
-                .chain((op + 1..name_end).map(|c| self.text(c)))
+                .chain(
+                    (op + 1..name_end)
+                        .map(|c| self.text(c))
+                        .take_while(|t| *t != "("),
+                )
                 .collect::<Vec<_>>()
                 .join(" ");
             push(self, name, SymbolKind::Method, "operator");
@@ -417,7 +458,6 @@ impl Scanner<'_> {
         }
         self.is_ident(c).then_some(c)
     }
-
 }
 
 #[cfg(test)]

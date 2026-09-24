@@ -11,6 +11,8 @@ pub fn shipped_extractors() -> Vec<Box<dyn graph_core::Extractor>> {
     let mut v: Vec<Box<dyn graph_core::Extractor>> = Vec::new();
     #[cfg(feature = "lang-rust")]
     v.push(Box::new(graph_lang_rust::RustExtractor));
+    #[cfg(feature = "lang-csharp")]
+    v.push(Box::new(graph_lang_csharp::CSharpExtractor));
     v
 }
 
