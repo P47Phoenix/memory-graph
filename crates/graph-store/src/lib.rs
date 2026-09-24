@@ -262,6 +262,7 @@ pub(crate) fn prepare_file(
         bytes_len: f.bytes.len(),
         origin: f.origin.map(Into::into),
         work: Prepared::Rejected(StoreError::Rejected(String::new())),
+        v2: None,
     };
     if f.bytes.len() > MAX_SOURCE_BYTES {
         p.work = Prepared::Rejected(StoreError::TooLarge(format!("`{}`", f.path)));
@@ -311,7 +312,7 @@ pub(crate) fn commit_prepared(
     repo: &str,
     mut p: PreparedFile,
     opts: IndexOptions,
-    ingest: impl FnOnce(&PreparedFile, &Extraction) -> Result<IngestStats>,
+    ingest: impl FnOnce(&mut PreparedFile, &Extraction) -> Result<IngestStats>,
 ) -> Result<Result<IngestStats>> {
     if p.org != org || p.repo != repo {
         return Err(StoreError::Rejected(format!(
@@ -344,7 +345,7 @@ pub(crate) fn commit_prepared(
         w => w,
     };
     match work {
-        Prepared::Extracted(ex) => Ok(Ok(ingest(&p, &ex)?)),
+        Prepared::Extracted(ex) => Ok(Ok(ingest(&mut p, &ex)?)),
         Prepared::Rejected(e) => Ok(Err(e)),
         Prepared::Unchanged(_) => unreachable!("extracted above"),
     }

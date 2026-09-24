@@ -54,6 +54,9 @@ pub struct PreparedFile {
     pub(crate) bytes_len: usize,
     pub(crate) origin: Option<String>,
     pub(crate) work: Prepared,
+    /// v2 only: the backend's share of the per-file work, done while
+    /// preparing so the writer only interns and inserts.
+    pub(crate) v2: Option<Box<crate::v2::V2Prep>>,
 }
 
 pub(crate) enum Prepared {
