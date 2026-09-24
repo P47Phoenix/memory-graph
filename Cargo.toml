@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/graph-lang-rust", "crates/graph-core", "crates/graph-store", "crates/graph-cli", "examples/toy-extractor", "crates/graph-lang-csharp", "crates/graph-lang-javascript"]
+members = ["crates/graph-lang-rust", "crates/graph-core", "crates/graph-store", "crates/graph-cli", "examples/toy-extractor", "crates/graph-lang-csharp", "crates/graph-lang-javascript", "crates/graph-lang-html", "crates/graph-lang-aspx"]
 
 [workspace.package]
 version = "0.1.0"

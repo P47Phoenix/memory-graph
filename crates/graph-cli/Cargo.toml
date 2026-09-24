@@ -13,10 +13,12 @@ name = "memory-graph"
 path = "src/main.rs"
 
 [features]
-default = ["lang-rust", "lang-csharp", "lang-javascript"]
+default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html"]
 lang-rust = ["dep:graph-lang-rust"]
 lang-csharp = ["dep:graph-lang-csharp"]
 lang-javascript = ["dep:graph-lang-javascript"]
+lang-aspx = ["dep:graph-lang-aspx"]
+lang-html = ["dep:graph-lang-html"]
 
 [dependencies]
 graph-core = { path = "../graph-core" }
@@ -24,6 +26,8 @@ graph-store = { path = "../graph-store" }
 graph-lang-rust = { path = "../graph-lang-rust", optional = true }
 graph-lang-csharp = { path = "../graph-lang-csharp", optional = true }
 graph-lang-javascript = { path = "../graph-lang-javascript", optional = true }
+graph-lang-aspx = { path = "../graph-lang-aspx", optional = true }
+graph-lang-html = { path = "../graph-lang-html", optional = true }
 clap.workspace = true
 ignore.workspace = true
 anyhow.workspace = true

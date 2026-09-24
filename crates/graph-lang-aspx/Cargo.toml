@@ -1,0 +1,13 @@
+[package]
+name = "graph-lang-aspx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+graph-core = { path = "../graph-core" }
+graph-lang-html = { path = "../graph-lang-html" }
+
+[dev-dependencies]
+proptest.workspace = true
+

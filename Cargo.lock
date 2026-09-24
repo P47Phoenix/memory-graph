@@ -294,7 +294,9 @@ dependencies = [
  "anyhow",
  "clap",
  "graph-core",
+ "graph-lang-aspx",
  "graph-lang-csharp",
+ "graph-lang-html",
  "graph-lang-javascript",
  "graph-lang-rust",
  "graph-store",
@@ -315,7 +317,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-aspx"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "graph-lang-html",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-csharp"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-html"
 version = "0.1.0"
 dependencies = [
  "graph-core",
