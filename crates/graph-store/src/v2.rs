@@ -19,12 +19,13 @@
 //! The on-disk file is stamped `schema_version` 3, so v1 builds refuse it and
 //! this backend refuses a v1 file, in both cases before writing anything.
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
+use crate::{commit_prepared, prepare_file, stored_fingerprint_matches, PreparedFile};
 use crate::{dec, enc, RedbStore, SnapshotStats, Store, StoreRead};
 use crate::{
     kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile, Grain, Hit,
     IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit, SymbolQuery, Tally,
-    CATALOG, CATALOG_VERSION, CHILDREN, FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES, META, NAMES,
-    NODES, ORIGIN_DIRECTORY, SYMBOLS,
+    CATALOG, CATALOG_VERSION, CHILDREN, MAX_SOURCE_BYTES, META, NAMES, NODES, ORIGIN_DIRECTORY,
+    SYMBOLS,
 };
 use graph_core::{
     normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, SymbolKind,
@@ -2552,16 +2553,7 @@ impl V2Store {
     }
 
     fn fingerprint(&self, bytes: &[u8], lang: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let hash: String = Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        format!(
-            "sha256:{hash}|{}|{}|{FINGERPRINT_FORMAT_VERSION}",
-            lang.to_ascii_lowercase(),
-            self.registry.version(lang)
-        )
+        crate::fingerprint(&self.registry, bytes, lang)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2639,50 +2631,82 @@ impl V2Store {
         files: &[BatchFile<'_>],
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
+        self.commit_each(org, repo, files.len(), opts, |wt, i| {
+            let f = &files[i];
+            prepare_file(&self.registry, f, opts, |path, lang, fp| {
+                Ok(RedbStore::check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
+            })
+        })
+    }
+
+    /// See [`Store::prepare`]. The unchanged pre-check reads the last
+    /// committed state in its own read transaction.
+    fn prepare(
+        &self,
+        org: &str,
+        repo: &str,
+        f: &BatchFile<'_>,
+        opts: IndexOptions,
+    ) -> Result<PreparedFile> {
+        prepare_file(&self.registry, f, opts, |path, _, fp| {
+            stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
+        })
+    }
+
+    /// See [`Store::index_prepared`]: the same chunked transactions and
+    /// open-batch marker as `index_batch`.
+    fn index_prepared(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<Vec<Result<IngestStats>>> {
+        let n = files.len();
+        let mut it = files.into_iter();
+        self.commit_each(org, repo, n, opts, |_, _| {
+            Ok(it.next().expect("one prepared file per slot"))
+        })
+    }
+
+    /// The chunked write loop shared by `index_batch` and `index_prepared`.
+    /// `next` yields the `i`-th prepared file (it may read the current
+    /// transaction), committed before the next one is asked for.
+    fn commit_each(
+        &self,
+        org: &str,
+        repo: &str,
+        n: usize,
+        opts: IndexOptions,
+        mut next: impl FnMut(&redb::WriteTransaction, usize) -> Result<PreparedFile>,
+    ) -> Result<Vec<Result<IngestStats>>> {
         let mut wt = self.db.begin_write()?;
         let batch_id = Self::next_batch_id(&wt)?;
         Self::mark_open_batch(&wt, batch_id, org, repo)?;
         let mut in_txn = 0usize;
-        let mut out = Vec::with_capacity(files.len());
-        for f in files {
-            if f.bytes.len() > MAX_SOURCE_BYTES {
-                out.push(Err(StoreError::TooLarge(format!("`{}`", f.path))));
-                continue;
-            }
-            let Ok(src) = std::str::from_utf8(f.bytes) else {
-                out.push(Err(StoreError::NotUtf8(format!("`{}`", f.path))));
-                continue;
-            };
-            let path = normalize_path(f.path);
-            let lang = f.language.map_or_else(
-                || self.registry.detect_language(&path, src),
-                str::to_ascii_lowercase,
-            );
-            let fp = self.fingerprint(f.bytes, &lang);
-            if !opts.reindex {
-                if let Some((stats, _)) =
-                    RedbStore::check_unchanged(&wt, org, repo, &path, &lang, &fp, f.origin)?
-                {
-                    out.push(Ok(stats));
-                    continue;
-                }
-            }
-            let ex = self.registry.extract(&lang, src);
-            if let Err(StoreError::InvalidSpan(why)) = validate_spans(&ex) {
-                out.push(Err(StoreError::InvalidSpan(format!("`{path}`: {why}"))));
-                continue;
-            }
-            out.push(Ok(Self::ingest_validated(
-                &wt,
-                org,
-                repo,
-                &path,
-                &lang,
-                &ex,
-                (f.origin, Some(&fp)),
-            )?));
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = next(&wt, i)?;
+            let len = p.bytes_len;
+            let r = commit_prepared(&wt, org, repo, p, opts, |p, ex| {
+                Self::ingest_validated(
+                    &wt,
+                    org,
+                    repo,
+                    &p.path,
+                    &p.language,
+                    ex,
+                    (p.origin.as_deref(), Some(&p.fingerprint)),
+                )
+            })?;
+            // Only stored (not skipped or rejected) files count to the chunk.
+            let stored = matches!(&r, Ok(s) if !s.unchanged);
+            out.push(r);
             // Chunked commit: bound the size of one write transaction.
-            in_txn += f.bytes.len();
+            if !stored {
+                continue;
+            }
+            in_txn += len;
             if in_txn >= self.chunk_bytes {
                 wt.commit()?;
                 wt = self.db.begin_write()?;
@@ -3144,6 +3168,24 @@ impl Store for V2Store {
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
         V2Store::index_batch(self, org, repo, files, opts)
+    }
+    fn prepare(
+        &self,
+        org: &str,
+        repo: &str,
+        file: &BatchFile<'_>,
+        opts: IndexOptions,
+    ) -> Result<PreparedFile> {
+        V2Store::prepare(self, org, repo, file, opts)
+    }
+    fn index_prepared(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<Vec<Result<IngestStats>>> {
+        V2Store::index_prepared(self, org, repo, files, opts)
     }
     fn prune_files(
         &self,

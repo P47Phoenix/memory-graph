@@ -39,6 +39,43 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// One file made ready by [`Store::prepare`] for [`Store::index_prepared`]:
+/// its normalized path, language and fingerprint, plus the extraction (or
+/// the per-file rejection, or a note that the stored copy is unchanged).
+/// Only meaningful to the store that prepared it.
+pub struct PreparedFile {
+    pub(crate) path: String,
+    pub(crate) language: String,
+    pub(crate) fingerprint: String,
+    pub(crate) bytes_len: usize,
+    pub(crate) origin: Option<String>,
+    pub(crate) work: Prepared,
+}
+
+pub(crate) enum Prepared {
+    /// The stored copy carried this fingerprint when prepared: not extracted.
+    Unchanged,
+    Extracted(Extraction),
+    /// Not UTF-8, too large, or invalid spans: reported in the file's slot.
+    Rejected(StoreError),
+}
+
+impl PreparedFile {
+    /// The normalized path the file will be stored under.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    /// Source size in bytes.
+    pub fn bytes_len(&self) -> usize {
+        self.bytes_len
+    }
+    /// Whether `prepare` skipped extraction because the stored copy was
+    /// unchanged.
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self.work, Prepared::Unchanged)
+    }
+}
+
 /// One offset/limit page of a paged traversal (ADR 0003 story 11:
 /// [`StoreRead::children_page`], [`StoreRead::descendants_page`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +293,35 @@ pub trait Store: StoreRead + Send + Sync {
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>>;
 
+    /// The parallel-safe half of [`Store::index_batch`] for one file: size
+    /// and UTF-8 checks, path normalization, language detection, fingerprint
+    /// and extraction with span validation. Takes `&self` and writes nothing,
+    /// so many threads may call it while another commits. Without `reindex`
+    /// it first reads the last committed state and skips extraction when the
+    /// stored copy has the same fingerprint. Per-file rejections are carried
+    /// in the result; `Err` is a storage error.
+    fn prepare(
+        &self,
+        org: &str,
+        repo: &str,
+        file: &BatchFile<'_>,
+        opts: IndexOptions,
+    ) -> Result<PreparedFile>;
+
+    /// The committing half: store prepared files exactly as `index_batch`
+    /// would have stored the same inputs (same transactions, outcomes in
+    /// input order, same atomicity). The unchanged check is re-run
+    /// authoritatively inside the transaction. A file prepared as unchanged
+    /// that has changed since yields a per-file [`StoreError::Stale`] and is
+    /// not written: prepare it again with `reindex` and commit it again.
+    fn index_prepared(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<Vec<Result<IngestStats>>>;
+
     /// Remove directory-run files of `org/repo` not in `keep` (or report them
     /// with `dry_run`). Returns the removed paths.
     fn prune_files(
@@ -393,6 +459,24 @@ impl Store for RedbStore {
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
         RedbStore::index_batch(self, org, repo, files, opts)
+    }
+    fn prepare(
+        &self,
+        org: &str,
+        repo: &str,
+        file: &BatchFile<'_>,
+        opts: IndexOptions,
+    ) -> Result<PreparedFile> {
+        RedbStore::prepare(self, org, repo, file, opts)
+    }
+    fn index_prepared(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<Vec<Result<IngestStats>>> {
+        RedbStore::index_prepared(self, org, repo, files, opts)
     }
     fn prune_files(
         &self,

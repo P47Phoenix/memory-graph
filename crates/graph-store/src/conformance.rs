@@ -68,6 +68,10 @@ pub const CASES: &[(&str, Case)] = &[
     ("traversal", traversal),
     ("vacuum_preserves_reads", vacuum_preserves_reads),
     ("claimed_extension_extractor", claimed_extension_extractor),
+    ("prepared_matches_batch", prepared_matches_batch),
+    ("prepare_skips_unchanged", prepare_skips_unchanged),
+    ("prepared_rejections_in_order", prepared_rejections_in_order),
+    ("prepared_stale_unchanged", prepared_stale_unchanged),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1569,4 +1573,240 @@ fn claimed_extension_extractor(h: &Harness) {
     let info = s.describe(Some("o"), Some("r")).unwrap();
     let langs: Vec<&String> = info[0].languages.keys().collect();
     assert_eq!(langs, vec!["toylang", "zig"]);
+}
+
+/// Stats with the backend-specific node id blanked, for comparing two repos.
+fn stats_proj(r: &Result<crate::IngestStats, StoreError>) -> String {
+    match r {
+        Ok(st) => {
+            let mut st = st.clone();
+            st.file_id = 0;
+            format!("{st:?}")
+        }
+        Err(e) => format!("Err({e})"),
+    }
+}
+
+fn prepare_all(
+    s: &dyn Store,
+    repo: &str,
+    files: &[BatchFile<'_>],
+    opts: IndexOptions,
+) -> Vec<crate::PreparedFile> {
+    files
+        .iter()
+        .map(|f| s.prepare("o", repo, f, opts).unwrap())
+        .collect()
+}
+
+/// `prepare` + `index_prepared` stores exactly what `index_batch` stores for
+/// the same inputs: same per-file outcomes (in order), same tokens and
+/// symbols, same catalog. Files are prepared on several threads at once.
+fn prepared_matches_batch(h: &Harness) {
+    let s = (h.open)(vec![Box::new(BadSpans)]).expect("open store");
+    let lib = RUST.as_bytes();
+    let f = |p, b: &'static [u8], l: Option<&'static str>| BatchFile {
+        path: p,
+        bytes: b,
+        language: l,
+        origin: Some(ORIGIN_DIRECTORY),
+    };
+    let files = [
+        f("src/lib.rs", lib, Some("rust")),
+        f("./notes.md", b"# foo\nbar (foo)\n", None),
+        f("bad.c", b"bad", Some("conf-bad")),
+        f("bin.dat", b"\xff\xfe", None),
+        f("m.txt", b"foo mfoo m\n", None),
+        f("src/lib.rs", b"fn dup() {}\n", Some("rust")),
+    ];
+    for opts in [IndexOptions::default(), IndexOptions { reindex: true }] {
+        let batch = s.index_batch("o", "a", &files, opts).unwrap();
+        let prepared: Vec<_> = std::thread::scope(|sc| {
+            let hs: Vec<_> = files
+                .iter()
+                .map(|file| {
+                    let s = &*s;
+                    sc.spawn(move || s.prepare("o", "b", file, opts).unwrap())
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(prepared[1].path(), "notes.md", "path is normalized");
+        let committed = s.index_prepared("o", "b", prepared, opts).unwrap();
+        let (x, y): (Vec<_>, Vec<_>) = (
+            batch.iter().map(stats_proj).collect(),
+            committed.iter().map(stats_proj).collect(),
+        );
+        assert_eq!(x, y, "per-file outcomes ({opts:?})");
+    }
+    for p in ["src/lib.rs", "notes.md", "m.txt", "bad.c", "bin.dat"] {
+        let toks = |repo| {
+            s.file_tokens("o", repo, p)
+                .unwrap()
+                .map(|v| v.iter().map(proj).collect::<Vec<_>>())
+        };
+        assert_eq!(toks("a"), toks("b"), "file_tokens {p}");
+    }
+    for q in ["foo", "dup", "m"] {
+        let hits = |repo: &str| {
+            let mut q = Query::new(q);
+            q.repo = Some(repo.into());
+            s.search(&q)
+                .unwrap()
+                .iter()
+                .map(|h| h.count)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hits("a"), hits("b"), "search {q}");
+    }
+    let syms = |repo: &str| {
+        let mut q = SymbolQuery::new("dup");
+        q.repo = Some(repo.into());
+        s.search_symbols(&q).unwrap().len()
+    };
+    assert_eq!(syms("a"), syms("b"));
+    let d = s.describe(None, None).unwrap();
+    assert_eq!(d, s.describe_by_scan(None, None).unwrap());
+    let mut a = d.iter().find(|r| r.repo == "a").unwrap().clone();
+    let b = d.iter().find(|r| r.repo == "b").unwrap();
+    a.repo = "b".into();
+    assert_eq!(format!("{a:?}"), format!("{b:?}"), "describe");
+}
+
+/// Counts `extract` calls for language `conf-count`.
+struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Extractor for Counting {
+    fn language(&self) -> &str {
+        "conf-count"
+    }
+    fn extract(&self, src: &str) -> Extraction {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        plain(src)
+    }
+}
+
+/// `prepare` skips extraction for a file stored with the same fingerprint
+/// (and says so), unless `reindex`; the commit still refreshes `origin`.
+fn prepare_skips_unchanged(h: &Harness) {
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let s = (h.open)(vec![Box::new(Counting(n.clone()))]).expect("open store");
+    let calls = || n.load(std::sync::atomic::Ordering::SeqCst);
+    let file = |origin| BatchFile {
+        path: "a.cnt",
+        bytes: b"foo bar",
+        language: Some("conf-count"),
+        origin,
+    };
+    let first = prepare_all(&*s, "r", &[file(None)], IndexOptions::default());
+    assert!(!first[0].is_unchanged());
+    assert_eq!(first[0].bytes_len(), 7);
+    assert_eq!(calls(), 1);
+    // Nothing is stored until the commit.
+    assert!(s.file_tokens("o", "r", "a.cnt").unwrap().is_none());
+    let out = s
+        .index_prepared("o", "r", first, IndexOptions::default())
+        .unwrap();
+    assert!(!out[0].as_ref().unwrap().unchanged);
+
+    let again = prepare_all(
+        &*s,
+        "r",
+        &[file(Some(ORIGIN_DIRECTORY))],
+        IndexOptions::default(),
+    );
+    assert!(again[0].is_unchanged());
+    assert_eq!(calls(), 1, "unchanged file not extracted");
+    let out = s
+        .index_prepared("o", "r", again, IndexOptions::default())
+        .unwrap();
+    assert!(out[0].as_ref().unwrap().unchanged);
+    let origin = s.file_tokens("o", "r", "a.cnt").unwrap().unwrap()[0].parent;
+    let f = s.get(origin.unwrap()).unwrap().unwrap();
+    assert_eq!(
+        f.origin.as_deref(),
+        Some(ORIGIN_DIRECTORY),
+        "origin refreshed"
+    );
+
+    let forced = prepare_all(&*s, "r", &[file(None)], IndexOptions { reindex: true });
+    assert!(!forced[0].is_unchanged());
+    assert_eq!(calls(), 2, "reindex extracts");
+    let out = s
+        .index_prepared("o", "r", forced, IndexOptions { reindex: true })
+        .unwrap();
+    assert!(out[0].as_ref().unwrap().replaced);
+}
+
+/// Per-file rejections (invalid spans, not UTF-8) come back in their slots,
+/// in input order, and store nothing; their neighbours are stored.
+fn prepared_rejections_in_order(h: &Harness) {
+    let s = (h.open)(vec![Box::new(BadSpans)]).expect("open store");
+    let f = |p, b: &'static [u8], l| BatchFile {
+        path: p,
+        bytes: b,
+        language: l,
+        origin: None,
+    };
+    let files = [
+        f("ok1.c", b"xxxx", Some("text")),
+        f("bad.c", b"bad", Some("conf-bad")),
+        f("bin.c", b"\xff", None),
+        f("ok2.c", b"yyyy", Some("text")),
+    ];
+    let p = prepare_all(&*s, "r", &files, IndexOptions::default());
+    let out = s
+        .index_prepared("o", "r", p, IndexOptions::default())
+        .unwrap();
+    assert_eq!(out.len(), 4);
+    assert!(out[0].is_ok() && out[3].is_ok());
+    assert!(matches!(&out[1], Err(StoreError::InvalidSpan(m)) if m.contains("bad.c")));
+    assert!(matches!(&out[2], Err(StoreError::NotUtf8(m)) if m.contains("bin.c")));
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    assert!(s
+        .index_prepared("o", "r", vec![], IndexOptions::default())
+        .unwrap()
+        .is_empty());
+}
+
+/// A file prepared as unchanged that changes before the commit is reported
+/// `Stale` and not written; re-preparing with `reindex` stores it.
+fn prepared_stale_unchanged(h: &Harness) {
+    let s = open(h);
+    s.index_batch(
+        "o",
+        "r",
+        &[bf("a.txt", b"foo bar")],
+        IndexOptions::default(),
+    )
+    .unwrap();
+    let p = prepare_all(
+        &*s,
+        "r",
+        &[bf("a.txt", b"foo bar")],
+        IndexOptions::default(),
+    );
+    assert!(p[0].is_unchanged());
+    s.index_bytes("o", "r", "a.txt", b"foo CHANGED", Some("text"))
+        .unwrap();
+    let out = s
+        .index_prepared("o", "r", p, IndexOptions::default())
+        .unwrap();
+    assert!(matches!(&out[0], Err(StoreError::Stale(m)) if m.contains("a.txt")));
+    assert_eq!(
+        s.search(&Query::new("CHANGED")).unwrap().len(),
+        1,
+        "untouched"
+    );
+    let p = prepare_all(
+        &*s,
+        "r",
+        &[bf("a.txt", b"foo bar")],
+        IndexOptions { reindex: true },
+    );
+    let out = s
+        .index_prepared("o", "r", p, IndexOptions::default())
+        .unwrap();
+    assert!(out[0].as_ref().unwrap().replaced);
+    assert_eq!(s.search(&Query::new("bar")).unwrap().len(), 1);
+    assert_eq!(s.search(&Query::new("CHANGED")).unwrap().len(), 0);
 }
