@@ -13,6 +13,7 @@ impl Extractor for Fake {
         "zig"
     }
     fn extract(&self, source: &str) -> Extraction {
+        assert!(!source.starts_with("panic"), "extractor panics");
         let bad = source.starts_with("bad");
         let span = Span {
             start: if bad { 3 } else { 0 },
@@ -112,4 +113,47 @@ fn invalid_span_fails_one_file_and_exits_nonzero() {
         .unwrap()
         .starts_with("invalid span"));
     assert_eq!(v["files"], 1);
+}
+
+/// A panicking extractor mid-run stops the run with an error naming the file,
+/// without hanging, for any `jobs`; the same whole batches stay committed.
+#[test]
+fn extractor_panic_stops_the_run_for_any_jobs() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("src");
+    std::fs::create_dir(&dir).unwrap();
+    for i in 0..600 {
+        let body = if i == 400 { "panic" } else { "fine" };
+        std::fs::write(dir.join(format!("f{i:04}.zig")), body).unwrap();
+    }
+    let mut stored = Vec::new();
+    for jobs in [1, 8] {
+        let db = d.path().join(format!("g{jobs}.redb"));
+        let mut out = Vec::new();
+        let r = index_dir(
+            DirOpts {
+                db: &db,
+                org: "o",
+                repo: "r",
+                dir: &dir,
+                json: false,
+                max_file_size: 1 << 20,
+                prune: false,
+                force: false,
+                reindex: false,
+                jobs,
+                progress: Some(false),
+            },
+            open,
+            &mut out,
+        );
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(
+            err.contains("f0400.zig") && err.contains("panicked"),
+            "{err}"
+        );
+        let s = RedbStore::open(&db).unwrap();
+        stored.push(s.count_nodes(NodeKind::File).unwrap());
+    }
+    assert_eq!(stored, [256, 256], "whole batches before the panic");
 }

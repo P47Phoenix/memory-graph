@@ -97,7 +97,8 @@ enum Cmd {
         /// so the database is identical for any value
         #[arg(long, short = 'j', default_value_t = 0, hide_default_value = true)]
         jobs: usize,
-        /// Show live progress on stderr (default: only when stderr is a terminal and --json is off)
+        /// Show live progress on stderr even with --json (default: only when --json is off). Never drawn
+        /// when stderr is not a terminal
         #[arg(long, conflicts_with = "no_progress")]
         progress: bool,
         /// Never show live progress

@@ -45,8 +45,9 @@ pub struct DirOpts<'a> {
     /// Parsing threads; 0 means one per available CPU. The database is the
     /// same for any value: files are committed in walk order.
     pub jobs: usize,
-    /// Live progress on stderr: `Some(true)` forces it, `Some(false)`
-    /// disables it, `None` shows it when stderr is a terminal and `json` is off.
+    /// Live progress on stderr: `Some(true)` shows it even with `json`,
+    /// `Some(false)` disables it, `None` shows it when `json` is off. It is
+    /// never drawn when stderr is not a terminal.
     pub progress: Option<bool>,
 }
 
