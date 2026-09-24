@@ -67,6 +67,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("batch_origin_refresh", batch_origin_refresh),
     ("traversal", traversal),
     ("vacuum_preserves_reads", vacuum_preserves_reads),
+    ("claimed_extension_extractor", claimed_extension_extractor),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1499,4 +1500,73 @@ fn differential_traversal(a: &dyn Store, b: &dyn Store) {
         check_tree(a, ra);
         check_tree(b, rb);
     }
+}
+
+/// A third-party extractor for a language the built-in table does not know,
+/// claiming its own extensions (any case, leading dot optional).
+struct ToyExtractor;
+
+impl Extractor for ToyExtractor {
+    fn language(&self) -> &str {
+        "ToyLang"
+    }
+    fn version(&self) -> String {
+        "toy-1".into()
+    }
+    fn extensions(&self) -> &[&str] {
+        &["TOY", ".toyx", "py"]
+    }
+    fn extract(&self, source: &str) -> Extraction {
+        let body = source.trim_end();
+        Extraction {
+            has_errors: false,
+            symbols: vec![SymbolDecl {
+                name: "whole".into(),
+                kind: SymbolKind::Other,
+                lang_kind: Some("toy_file".into()),
+                span: span_of(source, body),
+            }],
+            tokens: tokenize(source),
+        }
+    }
+}
+
+/// An extractor registered at open time is used for the extensions it
+/// claims (auto-detected language), and an explicit language still wins.
+fn claimed_extension_extractor(h: &Harness) {
+    let s = (h.open)(vec![Box::new(ToyExtractor)]).expect("open store");
+    for (path, src) in [
+        ("a.toy", "alpha beta\n"),
+        ("dir/b.ToyX", "gamma\n"),
+        // A claim overrides the built-in table (`py` is python there).
+        ("e.py", "eps\n"),
+    ] {
+        s.index_bytes("o", "r", path, src.as_bytes(), None).unwrap();
+    }
+    // An explicit language overrides the claim: fallback, no symbols.
+    s.index_bytes("o", "r", "c.toy", b"delta\n", Some("zig"))
+        .unwrap();
+    let hits = s.search_symbols(&SymbolQuery::new("whole")).unwrap();
+    let mut files: Vec<(&str, Option<&str>, Option<&str>)> = hits
+        .iter()
+        .map(|h| {
+            (
+                h.file.as_str(),
+                h.language.as_deref(),
+                h.lang_kind.as_deref(),
+            )
+        })
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            ("a.toy", Some("toylang"), Some("toy_file")),
+            ("dir/b.ToyX", Some("toylang"), Some("toy_file")),
+            ("e.py", Some("toylang"), Some("toy_file")),
+        ]
+    );
+    let info = s.describe(Some("o"), Some("r")).unwrap();
+    let langs: Vec<&String> = info[0].languages.keys().collect();
+    assert_eq!(langs, vec!["toylang", "zig"]);
 }

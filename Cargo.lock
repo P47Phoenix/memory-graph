@@ -693,6 +693,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "toy-extractor"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "graph-store",
+ "tempfile",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

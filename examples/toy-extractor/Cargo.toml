@@ -1,0 +1,15 @@
+[package]
+name = "toy-extractor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Example third-party language extractor (INI files) for docs/adding-a-language.md"
+
+# A language plugin depends only on graph-core.
+[dependencies]
+graph-core = { path = "../../crates/graph-core" }
+
+[dev-dependencies]
+graph-store = { path = "../../crates/graph-store" }
+tempfile.workspace = true

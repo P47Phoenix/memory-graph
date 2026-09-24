@@ -25,3 +25,9 @@
   - See [C dependency](../glossary.md#c-dependency--pure-rust).
 
 **Open:** the Python parser is blocked on the ruff MSRV (the minimum Rust version ruff needs). See the [parser spike](../spikes/parser.md).
+
+## Addendum (2026-09-24): extractor plugin API (issue #69)
+
+- Extractors may claim file extensions (`Extractor::extensions`). `Registry::detect_language` checks registered claims first, then the built-in table in `graph-core::language` (so the table is no longer the only extension map). Last registration wins on conflicts, so a caller can override a built-in.
+- `Extractor`, `Extraction`, `SymbolDecl`, `TokenDecl`, `Span` and `graph_core::scan` are the stable plugin surface for third-party languages. Plugins are crates that depend only on `graph-core` and are registered at compile time (`open_store(..., extractors)` or a `lang-*` feature in `graph-cli`); dynamic loading is rejected (no stable Rust ABI; loaders bind the C `dl` library).
+- New extractors are token-stream scanners over the shared tokenizer, not AST parsers. See [adding a language](../adding-a-language.md).
