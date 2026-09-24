@@ -137,8 +137,6 @@ fn flush_batch(
                 let reason = format!("invalid span: {reason}");
                 t.failed.push((rel, reason));
             }
-            // Includes `Stale`, which cannot happen here: a run walks each
-            // path once and holds the database lock.
             Err(e) => return Err(e.into()),
         }
     }
