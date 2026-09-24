@@ -25,6 +25,7 @@ impl Extractor for RustExtractor {
             source,
             TokenizerOptions {
                 rust_literals: true,
+                ..Default::default()
             },
         );
         // syn strips a BOM before lexing, so its byte ranges start after it.

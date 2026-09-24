@@ -320,6 +320,7 @@ fn every_parsed_token_is_stored() {
                     src,
                     TokenizerOptions {
                         rust_literals: lang == "rust",
+                        ..Default::default()
                     },
                 );
                 assert_eq!(stored.len(), parsed.len(), "{repo}/{rel}");
