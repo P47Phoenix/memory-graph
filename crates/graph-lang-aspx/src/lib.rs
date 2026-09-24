@@ -16,7 +16,9 @@
 //!
 //! Server-side `<script runat="server">` code is tokenized but not scanned
 //! for C# symbols (follow-up #72). Element spans follow the HTML scanner's rule;
-//! server blocks are opaque to it, so their spans never cross a tag.
+//! server blocks are opaque to it (they may sit inside a start tag), so their
+//! spans never cross a tag. An unclosed `<%` hides the rest of the file from
+//! the element scanner; its own symbol spans just the `<%`.
 use graph_core::scan::span_between;
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
