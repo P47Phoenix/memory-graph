@@ -2,6 +2,7 @@
 //! No storage or query dependencies; no language-specific types.
 pub mod extractor;
 pub mod language;
+pub mod scan;
 pub mod schema;
 pub mod tokenizer;
 

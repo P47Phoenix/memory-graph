@@ -3,6 +3,17 @@ use anyhow::{bail, Context, Result};
 use graph_store::{IndexOptions, Store, ORIGIN_DIRECTORY};
 use std::io::{Read, Write};
 
+/// Every extractor compiled into this build, one per enabled `lang-*` Cargo
+/// feature. Third-party languages register their own `Extractor` the same
+/// way (see `docs/adding-a-language.md`).
+#[allow(unused_mut, clippy::vec_init_then_push)]
+pub fn shipped_extractors() -> Vec<Box<dyn graph_core::Extractor>> {
+    let mut v: Vec<Box<dyn graph_core::Extractor>> = Vec::new();
+    #[cfg(feature = "lang-rust")]
+    v.push(Box::new(graph_lang_rust::RustExtractor));
+    v
+}
+
 macro_rules! out {
     ($w:expr, $($a:tt)*) => {
         writeln!($w, $($a)*)?

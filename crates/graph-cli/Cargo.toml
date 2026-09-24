@@ -12,10 +12,14 @@ path = "src/lib.rs"
 name = "memory-graph"
 path = "src/main.rs"
 
+[features]
+default = ["lang-rust"]
+lang-rust = ["dep:graph-lang-rust"]
+
 [dependencies]
 graph-core = { path = "../graph-core" }
 graph-store = { path = "../graph-store" }
-graph-lang-rust = { path = "../graph-lang-rust" }
+graph-lang-rust = { path = "../graph-lang-rust", optional = true }
 clap.workspace = true
 ignore.workspace = true
 anyhow.workspace = true

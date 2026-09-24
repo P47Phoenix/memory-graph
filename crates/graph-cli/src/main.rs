@@ -283,7 +283,7 @@ fn open_for_indexing(
     open_with_overrides(
         resolve_backend(db, backend)?,
         db,
-        vec![Box::new(graph_lang_rust::RustExtractor)],
+        graph_cli::shipped_extractors(),
         overrides,
     )
 }
