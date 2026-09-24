@@ -1,4 +1,6 @@
-//! ASP.NET Web Forms markup extractor (`.aspx`, `.ascx`, `.master`, ...).
+//! ASP.NET Web Forms markup extractor (`.aspx`, `.ascx`, `.master`). `.asax`,
+//! `.ashx` and `.asmx` are not claimed: they are usually one directive then
+//! plain C#, which markup rules would misread.
 //!
 //! Symbols (all `SymbolKind::Other`):
 //!
@@ -13,7 +15,7 @@
 //! | HTML elements (see `graph-lang-html`) | `element`, `script`, ... | id / tag |
 //!
 //! Server-side `<script runat="server">` code is tokenized but not scanned
-//! for C# symbols (follow-up). Element spans follow the HTML scanner's rule;
+//! for C# symbols (follow-up #72). Element spans follow the HTML scanner's rule;
 //! server blocks are opaque to it, so their spans never cross a tag.
 use graph_core::scan::span_between;
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
@@ -38,7 +40,7 @@ impl Extractor for AspxExtractor {
     }
 
     fn extensions(&self) -> &[&str] {
-        &["aspx", "ascx", "master", "asax", "ashx", "asmx"]
+        &["aspx", "ascx", "master"]
     }
 
     fn version(&self) -> String {

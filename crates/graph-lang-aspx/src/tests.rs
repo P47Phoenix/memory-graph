@@ -81,6 +81,21 @@ fn directives_controls_and_blocks() {
 }
 
 #[test]
+fn computed_attribute_values_are_not_names() {
+    let s = syms("<div id=<%= X %> runat=\"server\"></div><td class=<%# Eval(\"a\") %> id=t></td>");
+    let names: Vec<_> = s.iter().map(|x| (x.0.as_str(), x.1.as_str())).collect();
+    assert_eq!(
+        names,
+        [
+            ("div", "control"),
+            ("X", "expression"),
+            ("t", "element"),
+            ("Eval", "binding"),
+        ]
+    );
+}
+
+#[test]
 fn claims_web_forms_extensions() {
     for e in ["aspx", "ascx", "master"] {
         assert!(AspxExtractor.extensions().contains(&e));

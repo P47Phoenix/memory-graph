@@ -10,7 +10,9 @@
 //! a close tag pops to the nearest open tag with the same name. A matched
 //! element spans its start tag through its close tag; anything popped without
 //! a match, void and self-closing elements, and elements never closed span
-//! only their own start tag.
+//! only their own start tag. Raw-text elements (`script`, `style`,
+//! `textarea`, `title`) skip their content to the close tag; one that is never
+//! closed is scanned on as ordinary markup.
 use graph_core::scan::span_between;
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -183,7 +185,9 @@ pub fn scan_elements(
 }
 
 /// If an opaque region starts at `i`, the index after its end (or the end of
-/// input when it never closes).
+/// input when it never closes). An opener matches its exact text or that text
+/// plus one character (`<%` also matches `<%=`, `<%#`, ...): the forms the
+/// `aspx` tokenizer dialect emits as single tokens.
 fn skip_opaque(tokens: &[TokenDecl], i: usize, opaque: &[(&str, &str)]) -> Option<usize> {
     let t = &tokens[i].text;
     let (_, close) = opaque
@@ -228,6 +232,12 @@ fn start_tag(tokens: &[TokenDecl], i: usize, opaque: &[(&str, &str)]) -> Option<
         if t.class == TokenClass::Identifier {
             let mut value = String::new();
             if j + 2 < end && tokens[j + 1].text == "=" {
+                if let Some(k) = skip_opaque(tokens, j + 2, opaque) {
+                    // `id=<%= x %>`: a computed value, not a name.
+                    attrs.push((t.text.clone(), String::new()));
+                    j = k;
+                    continue;
+                }
                 let v = &tokens[j + 2];
                 value = v.text.trim_matches(|c| c == '"' || c == '\'').to_string();
                 j += 2;
