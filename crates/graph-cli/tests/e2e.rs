@@ -2018,3 +2018,84 @@ fn export_ndjson_round_trips_node_counts() {
         );
     }
 }
+
+/// Index `dir` with `--json` and the given extra flags; returns the summary
+/// without `elapsed_ms`, and the stderr.
+fn index_json(db: &str, backend: &str, dir: &str, extra: &[&str]) -> (serde_json::Value, String) {
+    let mut args = vec![
+        "--db",
+        db,
+        "--backend",
+        backend,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    args.push(dir);
+    let (ok, out, err) = run(&args);
+    assert!(ok, "{out}{err}");
+    let mut v: serde_json::Value = serde_json::from_str(&out).expect("stdout is pure JSON");
+    v.as_object_mut().unwrap().remove("elapsed_ms");
+    (v, err)
+}
+
+/// Parallel parsing commits in walk order, so the database file and the
+/// summary are identical for any `--jobs`, on both backends: for a first
+/// index, a forced re-index and an all-unchanged run.
+#[test]
+fn index_is_identical_for_any_jobs() {
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus");
+    let corpus = corpus.to_str().unwrap();
+    for backend in ["v1", "v2"] {
+        let d = tempfile::tempdir().unwrap();
+        let mut dbs = Vec::new();
+        let mut sums = Vec::new();
+        for jobs in ["1", "8"] {
+            let db = d.path().join(format!("g{jobs}"));
+            let db = db.to_str().unwrap();
+            let (first, _) = index_json(db, backend, corpus, &["--jobs", jobs]);
+            let (again, _) = index_json(db, backend, corpus, &["--jobs", jobs, "--reindex"]);
+            let (skip, _) = index_json(db, backend, corpus, &["--jobs", jobs]);
+            assert!(first["files"].as_u64().unwrap() > 100, "{first}");
+            assert_eq!(skip["unchanged"], skip["files"], "{skip}");
+            sums.push((first, again, skip));
+            dbs.push(std::fs::read(db).unwrap());
+        }
+        assert_eq!(sums[0], sums[1], "{backend}: summaries differ");
+        assert!(dbs[0] == dbs[1], "{backend}: database files differ");
+    }
+}
+
+/// `--progress` draws on stderr only: stdout stays the pure JSON summary.
+#[test]
+fn progress_keeps_stdout_clean() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..20 {
+        std::fs::write(root.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+    }
+    std::fs::write(root.join("bin.dat"), b"a\0b").unwrap();
+    let root = root.to_str().unwrap();
+    let db = |n: &str| d.path().join(n).to_string_lossy().into_owned();
+    let (quiet, qerr) = index_json(&db("a"), "v1", root, &["--no-progress", "-j", "3"]);
+    let (shown, _) = index_json(&db("b"), "v1", root, &["--progress", "-j", "3"]);
+    assert_eq!(quiet, shown);
+    assert_eq!(quiet["files"], 20);
+    assert!(qerr.is_empty(), "no progress output: {qerr}");
+    let (ok, _, err) = run(&[
+        "index",
+        "--progress",
+        "--no-progress",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root,
+    ]);
+    assert!(!ok && err.contains("cannot be used with"), "{err}");
+}

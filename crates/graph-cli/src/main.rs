@@ -93,6 +93,16 @@ enum Cmd {
         /// same content, language and extractor version are skipped). Does not affect --prune's safety checks
         #[arg(long)]
         reindex: bool,
+        /// Parsing threads (default: one per CPU). Files are still committed in walk order by one writer,
+        /// so the database is identical for any value
+        #[arg(long, short = 'j', default_value_t = 0, hide_default_value = true)]
+        jobs: usize,
+        /// Show live progress on stderr (default: only when stderr is a terminal and --json is off)
+        #[arg(long, conflicts_with = "no_progress")]
+        progress: bool,
+        /// Never show live progress
+        #[arg(long)]
+        no_progress: bool,
         dir: PathBuf,
     },
     /// Drop dictionary terms that no file refers to any more (v2 databases; a no-op for v1)
@@ -432,6 +442,9 @@ fn run() -> Result<()> {
             prune,
             force,
             reindex,
+            jobs,
+            progress,
+            no_progress,
             dir,
         } => index_dir(
             DirOpts {
@@ -444,6 +457,12 @@ fn run() -> Result<()> {
                 prune,
                 force,
                 reindex,
+                jobs,
+                progress: match (progress, no_progress) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
             },
             |db| open_for_indexing(db, cli.backend, v2_overrides),
             &mut std::io::stdout().lock(),

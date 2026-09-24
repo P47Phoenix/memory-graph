@@ -52,6 +52,8 @@ fn run(db: &Path, dir: &Path, json: bool, prune: bool) -> (anyhow::Result<()>, S
             prune,
             force: false,
             reindex: false,
+            jobs: 2,
+            progress: None,
         },
         open,
         &mut out,
