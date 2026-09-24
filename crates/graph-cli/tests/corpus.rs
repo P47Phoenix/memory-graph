@@ -1,7 +1,7 @@
 //! Checks over the vendored public test corpus (testdata/corpus): the manifest
 //! is consistent and public-only, cross-repo links resolve, and every token of
 //! every file is parsed with exact spans and stored in the graph.
-use graph_core::tokenizer::{tokenize, tokenize_with, TokenizerOptions};
+use graph_core::tokenizer::tokenize;
 use graph_core::{detect_language_from_content, TokenClass};
 use graph_store::{BatchFile, Query, RedbStore};
 use serde_json::Value;
@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus")
+}
+
+/// A registry with every extractor the CLI ships.
+fn shipped_registry() -> graph_core::Registry {
+    let mut r = graph_core::Registry::default();
+    for e in graph_cli::shipped_extractors() {
+        r.register(e);
+    }
+    r
 }
 
 fn manifest() -> Value {
@@ -212,11 +221,12 @@ fn every_token_is_parsed_exactly() {
         let dir = corpus_dir().join(name);
         let mut langs: BTreeSet<String> = BTreeSet::new();
         let mut repo_tokens = 0usize;
+        let registry = shipped_registry();
         for rel in files(&dir) {
             let bytes = std::fs::read(dir.join(&rel)).unwrap();
             let src =
                 String::from_utf8(bytes).unwrap_or_else(|_| panic!("{name}/{rel} is not UTF-8"));
-            langs.insert(detect_language_from_content(&rel, &src));
+            langs.insert(registry.detect_language(&rel, &src));
             let toks = tokenize(&src);
             let mut covered = 0usize;
             let mut prev_end = 0usize;
@@ -276,7 +286,12 @@ fn every_parsed_token_is_stored() {
     let m = manifest();
     let db = tempfile::tempdir().unwrap();
     let mut store = RedbStore::open(db.path().join("corpus.redb")).unwrap();
-    store.register(Box::new(graph_lang_rust::RustExtractor));
+    for e in graph_cli::shipped_extractors() {
+        store.register(e);
+    }
+    // The store owns its extractors, so build a second set to compute the
+    // expected tokens independently.
+    let registry = shipped_registry();
     let mut expected: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut expected_by_lang: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     let mut rust_symbols = 0;
@@ -306,7 +321,7 @@ fn every_parsed_token_is_stored() {
             for ((rel, bytes), st) in rels.iter().zip(&contents).zip(stats) {
                 let st = st.unwrap();
                 let src = std::str::from_utf8(bytes).unwrap();
-                let lang = detect_language_from_content(rel, src);
+                let lang = registry.detect_language(rel, src);
                 assert!(
                     !st.has_errors || lang == "rust",
                     "{repo}/{rel} unexpectedly flagged has_errors"
@@ -314,14 +329,10 @@ fn every_parsed_token_is_stored() {
                 if lang == "rust" {
                     rust_symbols += st.symbols;
                 }
-                // Stored tokens are identical to the parser's, in text, class and span.
+                // Stored tokens are identical to the registered extractor's
+                // (or the fallback tokenizer's), in text, class and span.
                 let stored = store.file_tokens(org, repo, rel).unwrap().unwrap();
-                let parsed = tokenize_with(
-                    src,
-                    TokenizerOptions {
-                        rust_literals: lang == "rust",
-                    },
-                );
+                let parsed = registry.extract(&lang, src).tokens;
                 assert_eq!(stored.len(), parsed.len(), "{repo}/{rel}");
                 for (a, b) in stored.iter().zip(&parsed) {
                     assert_eq!(

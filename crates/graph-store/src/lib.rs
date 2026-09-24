@@ -1,8 +1,8 @@
 //! Embedded graph store on `redb` (pure Rust). Knows nothing about any
 //! particular language.
 use graph_core::{
-    check_contains, detect_language_from_content, normalize_path, Extraction, Extractor, Node,
-    NodeId, NodeKind, Registry, Span, SymbolKind, TokenClass,
+    check_contains, normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, Span,
+    SymbolKind, TokenClass,
 };
 use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableMultimapTable,
@@ -851,7 +851,7 @@ impl RedbStore {
             std::str::from_utf8(bytes).map_err(|_| StoreError::NotUtf8(format!("`{path}`")))?;
         let path = normalize_path(path);
         let lang = language.map_or_else(
-            || detect_language_from_content(&path, src),
+            || self.registry.detect_language(&path, src),
             str::to_ascii_lowercase,
         );
         let fp = self.fingerprint(bytes, &lang);
@@ -986,7 +986,7 @@ impl RedbStore {
             };
             let path = normalize_path(f.path);
             let lang = f.language.map_or_else(
-                || detect_language_from_content(&path, src),
+                || self.registry.detect_language(&path, src),
                 str::to_ascii_lowercase,
             );
             let fp = self.fingerprint(f.bytes, &lang);

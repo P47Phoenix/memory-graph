@@ -27,8 +27,7 @@ use crate::{
     NODES, ORIGIN_DIRECTORY, SYMBOLS,
 };
 use graph_core::{
-    detect_language_from_content, normalize_path, Extraction, Extractor, Node, NodeId, NodeKind,
-    Registry, SymbolKind,
+    normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, SymbolKind,
 };
 use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableMultimapTable,
@@ -2583,7 +2582,7 @@ impl V2Store {
             std::str::from_utf8(bytes).map_err(|_| StoreError::NotUtf8(format!("`{path}`")))?;
         let path = normalize_path(path);
         let lang = language.map_or_else(
-            || detect_language_from_content(&path, src),
+            || self.registry.detect_language(&path, src),
             str::to_ascii_lowercase,
         );
         let fp = self.fingerprint(bytes, &lang);
@@ -2656,7 +2655,7 @@ impl V2Store {
             };
             let path = normalize_path(f.path);
             let lang = f.language.map_or_else(
-                || detect_language_from_content(&path, src),
+                || self.registry.detect_language(&path, src),
                 str::to_ascii_lowercase,
             );
             let fp = self.fingerprint(f.bytes, &lang);
