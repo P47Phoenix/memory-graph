@@ -39,16 +39,39 @@ pub struct TokenizerOptions {
     /// C# string prefixes: verbatim `@"..."` (no backslash escapes, `""` is an
     /// escaped quote), interpolated `$"..."`, and `$@"..."` / `@$"..."`, each
     /// one Literal. Interpolation holes are not lexed separately, so a `"`
-    /// inside `{...}` ends the literal early (spans stay exact).
+    /// inside `{...}` ends the literal early (spans stay exact). Not handled:
+    /// raw strings (`"""..."""`, `$$"""..."""`) and the `u8` suffix.
     pub csharp_strings: bool,
-    /// Markup (HTML/XML-like): `<!-- ... -->` is a Comment; `//` and `/*`
-    /// are not comments (they are ordinary text in markup); `-` and `:` join
-    /// an identifier when a letter, digit or `_` follows them, so `data-id`
-    /// and `asp:Button` are single Identifier tokens.
+    /// Markup (HTML/XML-like), lexed with a little context:
+    /// - `<!-- ... -->` is a Comment (`<!-->` and `<!--->` are empty ones).
+    /// - Inside a tag (from a `<` directly followed by a letter, `/`, `!` or
+    ///   `?`, to the next `>`): `"..."` and `'...'` are attribute-value
+    ///   Literals (no escapes), and `-`/`:` join an identifier when a letter,
+    ///   digit or `_` follows (`data-id`, `asp:Button`).
+    /// - Outside tags (text, including `<script>`/`<style>` bodies): quotes
+    ///   are single Punctuation tokens, so a stray `"` in prose cannot swallow
+    ///   the file, and `//` and `/*` are not comments.
     pub markup: bool,
     /// ASP.NET server tags: `<%-- ... --%>` is a Comment; `<%@`, `<%=`,
-    /// `<%#`, `<%:`, `<%$`, `<%` and `%>` are single Punctuation tokens.
+    /// `<%#`, `<%:`, `<%$`, `<%` and `%>` are single Punctuation tokens (`%>`
+    /// is one even outside a server tag). Meant to be combined with `markup`:
+    /// between `<%` and `%>` the markup rules are off (C#-like code: `//`
+    /// comments, normal strings, no name joining), and a quoted attribute
+    /// value stops before a `<%` and resumes after the matching `%>`, so
+    /// `Text='<%# Eval("x") %>'` exposes its server tag. A server tag inside
+    /// an HTML `<!-- -->` comment stays part of the comment.
     pub aspx: bool,
+}
+
+/// Lexing context for the `markup`/`aspx` dialects; unused otherwise.
+#[derive(Default)]
+struct MarkupState {
+    /// Inside a start/end tag, between `<name` and `>`.
+    tag: bool,
+    /// Inside an ASP.NET server tag, between `<%` and `%>`.
+    code: bool,
+    /// An attribute value interrupted by a server tag, awaiting this quote.
+    pending: Option<char>,
 }
 
 /// `tokenize` with an explicit dialect.
@@ -56,6 +79,7 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let (mut i, mut line, mut col) = (0usize, 1u32, 1u32);
+    let mut m = MarkupState::default();
     // Advance position tracking over src[from..to].
     let adv = |from: usize, to: usize, line: &mut u32, col: &mut u32| {
         for c in src[from..to].chars() {
@@ -75,16 +99,27 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
             continue;
         }
         let rest = &src[i..];
+        // Markup rules apply outside server-tag code.
+        let markup = opts.markup && !m.code;
         let (len, class) = if let Some(n) = opts.aspx.then(|| aspx_len(rest)).flatten() {
+            if n.1 == TokenClass::Punctuation {
+                m.code = rest.starts_with("<%");
+            }
             n
-        } else if opts.markup && rest.starts_with("<!--") {
+        } else if let Some(q) = m.pending.filter(|_| markup) {
+            let (n, closed) = attr_value_len(rest, q, 0, opts.aspx);
+            if closed {
+                m.pending = None;
+            }
+            (n, TokenClass::Literal)
+        } else if markup && rest.starts_with("<!--") {
             (
-                rest[4..].find("-->").map_or(rest.len(), |p| p + 7),
+                rest[2..].find("-->").map_or(rest.len(), |p| p + 5),
                 TokenClass::Comment,
             )
-        } else if !opts.markup && rest.starts_with("//") {
+        } else if !markup && rest.starts_with("//") {
             (rest.find('\n').unwrap_or(rest.len()), TokenClass::Comment)
-        } else if let Some(after) = rest.strip_prefix("/*").filter(|_| !opts.markup) {
+        } else if let Some(after) = rest.strip_prefix("/*").filter(|_| !markup) {
             (
                 after.find("*/").map_or(rest.len(), |p| p + 4),
                 TokenClass::Comment,
@@ -95,14 +130,13 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
             .flatten()
         {
             (n, TokenClass::Literal)
-        } else if let Some(n) = opts
-            .csharp_strings
+        } else if let Some(n) = (opts.csharp_strings && !markup)
             .then(|| csharp_literal_len(rest))
             .flatten()
         {
             (n, TokenClass::Literal)
         } else if c.is_alphabetic() || c == '_' {
-            (ident_len(rest, opts.markup), TokenClass::Identifier)
+            (ident_len(rest, markup && m.tag), TokenClass::Identifier)
         } else if c.is_ascii_digit() {
             let n = rest
                 .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.'))
@@ -113,6 +147,16 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
                 n -= 1;
             }
             (n, TokenClass::Literal)
+        } else if markup && matches!(c, '"' | '\'' | '`') {
+            if m.tag && c != '`' {
+                let (n, closed) = attr_value_len(rest, c, 1, opts.aspx);
+                if !closed {
+                    m.pending = Some(c);
+                }
+                (n, TokenClass::Literal)
+            } else {
+                (1, TokenClass::Punctuation)
+            }
         } else if c == '\'' && opts.single_quote_strings {
             (single_quoted_len(rest), TokenClass::Literal)
         } else if c == '"' || c == '`' || (c == '\'' && is_char_literal(rest)) {
@@ -122,6 +166,15 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
         } else {
             (c.len_utf8(), TokenClass::Punctuation)
         };
+        if markup && len == 1 {
+            match c {
+                '<' => {
+                    m.tag = rest[1..].starts_with(|n: char| n.is_alphabetic() || "/!?".contains(n))
+                }
+                '>' => m.tag = false,
+                _ => {}
+            }
+        }
         let end = i + len;
         let (sl, sc) = (line, col);
         adv(i, end, &mut line, &mut col);
@@ -161,10 +214,30 @@ fn ident_len(rest: &str, markup: bool) -> usize {
 }
 
 /// `'...'` with backslash escapes, ending at the closing quote or before the
-/// end of the line.
+/// end of the line (`\n` or `\r\n`).
 fn single_quoted_len(rest: &str) -> usize {
-    let line = rest.find('\n').unwrap_or(rest.len());
+    let mut line = rest.find('\n').unwrap_or(rest.len());
+    if rest[..line].ends_with('\r') && line > 1 {
+        line -= 1;
+    }
     quoted_len(&rest[..line], '\'')
+}
+
+/// A markup attribute value from `rest[from..]` (1 skips the opening quote):
+/// up to and including the closing `q` (returns `closed`), or, with `aspx`,
+/// up to a `<%` (not closed, the value resumes after `%>`), or to end of
+/// input. No escapes. Never returns 0 for `from == 1`; for `from == 0` the
+/// caller guarantees `rest` does not start with `<%`.
+fn attr_value_len(rest: &str, q: char, from: usize, aspx: bool) -> (usize, bool) {
+    for (p, ch) in rest.char_indices().skip(from) {
+        if ch == q {
+            return (p + 1, true);
+        }
+        if aspx && rest[p..].starts_with("<%") {
+            return (p, false);
+        }
+    }
+    (rest.len(), false)
 }
 
 /// C# `@"..."`, `$"..."`, `$@"..."` and `@$"..."` at the start of `rest`.
@@ -340,16 +413,19 @@ mod tests {
 
     /// One golden per non-default dialect over `DIALECT_SOURCES`.
     const DIALECT_GOLDENS: &[(&str, u64)] = &[
-        ("single_quote_strings", 0xb5121bb946bfd025),
-        ("csharp_strings", 0x62bb7a18fb1d8f0e),
-        ("markup", 0xebf9c44c3fc485e1),
-        ("aspx", 0x94fd34518ee1d913),
+        ("single_quote_strings", 0x9261c81518b47bfe),
+        ("csharp_strings", 0xd738673d9e7ecb1f),
+        ("markup", 0xe3a43ed7688ec442),
+        ("aspx", 0x5a827fb7e21ee243),
+        ("aspx_only", 0xe399a6c0b514361d),
     ];
 
     const DIALECT_SOURCES: &[&str] = &[
-        "const s = 'it\\'s'; // c\nlet t = 'open\nx",
+        "const s = 'it\\'s'; // c\nlet t = 'open\r\nx",
         r#"var a = @"C:\x ""q"""; var b = $"{n}\""; var c = $@"{d}"""; @$"z" @x"#,
-        "<div data-id=\"a\" class='b'><!-- note --> http://x/*y*/ a: b- <!-- open",
+        "<div data-id=\"a\" class='b'><!-- note --> http://x/*y*/ a: b- 27\" <!--> <!-- open",
+        r#"<asp:Label Text='<%# Eval("x") %> of' /><% s = @"a""b"; // c
+%><style>p{color:red}</style>"#,
         r#"<%@ Page Language="C#" %><%-- hidden --%><asp:Button id="b1" runat="server" /><%= x %><%# Eval("y") %><%: z %><%$ r %><% if (a) { %> <%-- open"#,
     ];
 
@@ -362,7 +438,9 @@ mod tests {
             "aspx" => {
                 o.markup = true;
                 o.aspx = true;
+                o.csharp_strings = true;
             }
+            "aspx_only" => o.aspx = true,
             _ => unreachable!("{name}"),
         }
         o
@@ -471,10 +549,90 @@ mod tests {
                 ":"
             ]
         );
-        assert_eq!(dtoks("markup", "data-id")[0].1, TokenClass::Identifier);
+        // Names join only inside a tag.
+        assert_eq!(
+            dtexts("markup", "data-id <a data-id>")[..4],
+            ["data", "-", "id", "<"]
+        );
+        assert_eq!(dtoks("markup", "<a data-id>")[2].1, TokenClass::Identifier);
         let t = dtoks("markup", "a <!-- x -- y --> b <!-- open");
         assert_eq!(t[1], ("<!-- x -- y -->".to_string(), TokenClass::Comment));
         assert_eq!(t[3], ("<!-- open".to_string(), TokenClass::Comment));
+        assert_eq!(
+            dtexts("markup", "<!--> a <!---> b <!----> c"),
+            ["<!-->", "a", "<!--->", "b", "<!---->", "c"]
+        );
+    }
+
+    #[test]
+    fn markup_quotes_are_strings_only_in_tags() {
+        use TokenClass::*;
+        // A stray quote in text does not swallow the following tag.
+        let t = dtoks("markup", "<p>27\" monitor, don't</p><form id=\"f\" v='x'>");
+        assert!(t.contains(&("\"".to_string(), Punctuation)));
+        assert!(t.contains(&("'".to_string(), Punctuation)));
+        assert!(t.contains(&("\"f\"".to_string(), Literal)));
+        assert!(t.contains(&("'x'".to_string(), Literal)));
+        assert!(t.contains(&("form".to_string(), Identifier)));
+        // Style and script bodies are text: no joining, quotes are punctuation.
+        assert_eq!(
+            dtexts("markup", "<style>a{color:red}</style>")[5..8],
+            ["color", ":", "red"]
+        );
+        // `<` not followed by a name does not open a tag.
+        assert_eq!(
+            dtexts("markup", "a < b-c \"d\"")[2..],
+            ["b", "-", "c", "\"", "d", "\""]
+        );
+    }
+
+    #[test]
+    fn aspx_code_and_attribute_values() {
+        use TokenClass::*;
+        // Server code uses code rules: no joining, `//` comments, strings.
+        assert_eq!(
+            dtexts("aspx", "<%= ok?a:b %><%= n-1 %>"),
+            ["<%=", "ok", "?", "a", ":", "b", "%>", "<%=", "n", "-", "1", "%>"]
+        );
+        let t = dtoks("aspx", "<% // c\n s = \"<p>\"; %>");
+        assert_eq!(t[1], ("// c".to_string(), Comment));
+        assert_eq!(t[4], ("\"<p>\"".to_string(), Literal));
+        // A quoted attribute value pauses around a server tag.
+        let t = dtoks(
+            "aspx",
+            "<asp:Label Text='<%# Eval(\"x\") %> of y' runat=\"server\" />",
+        );
+        let lit = |s: &str| (s.to_string(), Literal);
+        assert_eq!(t[4], lit("'"));
+        assert_eq!(t[5], ("<%#".to_string(), Punctuation));
+        assert_eq!(t[8], lit("\"x\""));
+        assert_eq!(t[10], ("%>".to_string(), Punctuation));
+        assert_eq!(t[11], lit("of y'"));
+        assert_eq!(t[12], ("runat".to_string(), Identifier));
+        assert_eq!(t[14], lit("\"server\""));
+        // A server tag inside an HTML comment stays in the comment.
+        assert_eq!(dtoks("aspx", "<!-- <%= s %> -->")[0].1, Comment);
+    }
+
+    #[test]
+    fn aspx_without_markup() {
+        let o = TokenizerOptions {
+            aspx: true,
+            ..Default::default()
+        };
+        let t: Vec<String> = tokenize_with("<% // c\n x %> a-b 'q'", o)
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(t, ["<%", "// c", "x", "%>", "a", "-", "b", "'q'"]);
+    }
+
+    #[test]
+    fn single_quote_crlf() {
+        assert_eq!(
+            dtexts("single_quote_strings", "x\r\n'y\r\nz '\r\n"),
+            ["x", "'y", "z", "'"]
+        );
         // Default dialect: `-` splits names.
         assert_eq!(texts("data-id"), ["data", "-", "id"]);
     }
