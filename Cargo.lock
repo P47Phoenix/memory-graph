@@ -295,6 +295,7 @@ dependencies = [
  "clap",
  "graph-core",
  "graph-lang-csharp",
+ "graph-lang-javascript",
  "graph-lang-rust",
  "graph-store",
  "ignore",
@@ -315,6 +316,14 @@ dependencies = [
 
 [[package]]
 name = "graph-lang-csharp"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-javascript"
 version = "0.1.0"
 dependencies = [
  "graph-core",

@@ -13,6 +13,8 @@ pub fn shipped_extractors() -> Vec<Box<dyn graph_core::Extractor>> {
     v.push(Box::new(graph_lang_rust::RustExtractor));
     #[cfg(feature = "lang-csharp")]
     v.push(Box::new(graph_lang_csharp::CSharpExtractor));
+    #[cfg(feature = "lang-javascript")]
+    v.push(Box::new(graph_lang_javascript::JavaScriptExtractor));
     v
 }
 

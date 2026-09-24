@@ -19,7 +19,8 @@
 //! Known limits: preprocessor lines are dropped, so when both `#if`/`#else`
 //! branches open a brace the braces are unbalanced; an unmatched `{` then
 //! runs to the end of its enclosing range, so later declarations are still
-//! found (possibly nested one level too deep). A multi-declarator field
+//! found (possibly nested one level too deep), except those that end up
+//! inside an unclosed method body, which is never scanned. A multi-declarator field
 //! (`int x = 1, y = 2;`) yields one symbol, named by its first declarator;
 //! fixed-size buffers (`fixed byte b[4];`) and top-level local functions are
 //! not symbols; a string nested inside an interpolation hole (`$"{"x"}"`)
@@ -37,6 +38,7 @@ pub const CSHARP_TOKENIZER: TokenizerOptions = TokenizerOptions {
     csharp_strings: true,
     markup: false,
     aspx: false,
+    regex_literals: false,
 };
 
 impl Extractor for CSharpExtractor {
