@@ -150,6 +150,59 @@ fn malformed_input_degrades() {
 }
 
 #[test]
+fn expression_bodied_members_are_named_before_the_arrow() {
+    let s = syms(
+        "class A { int Count => 42; int Name => Get(x); string S => \"a\"; int T => a.b.C; \
+         Func<int,int> F => x => x; int M() => 1; }\ninterface I { int P => 1; }",
+    );
+    let got: Vec<_> = s.iter().map(|x| (x.0.as_str(), x.2.as_str())).collect();
+    assert_eq!(
+        got,
+        [
+            ("A", "class"),
+            ("Count", "property"),
+            ("Name", "property"),
+            ("S", "property"),
+            ("T", "property"),
+            ("F", "property"),
+            ("M", "method"),
+            ("I", "interface"),
+            ("P", "property"),
+        ]
+    );
+}
+
+#[test]
+fn brace_initialized_fields_and_operators() {
+    let s = syms(
+        "class A { int[] a = { 1, 2 }; Action d = delegate { }; Dictionary<string,int> m = new() { [\"a\"] = 1 }; \
+         public static bool operator ==(A x, A y) => true; public static bool operator !=(A x, A y) { return false; } \
+         public static implicit operator int(A a) => 0; }",
+    );
+    for f in ["a", "d", "m"] {
+        assert_eq!(find(&s, f).2, "field", "{f}");
+    }
+    assert_eq!(find(&s, "a").3, "int[] a = { 1, 2 };");
+    let ops: Vec<_> = s
+        .iter()
+        .filter(|x| x.2 == "operator")
+        .map(|x| x.0.as_str())
+        .collect();
+    assert_eq!(ops, ["operator ==", "operator !=", "operator int"]);
+}
+
+#[test]
+fn unbalanced_preprocessor_branches_keep_later_symbols() {
+    let src = "namespace N {\nclass A {\n#if DEBUG\n  void D1() {\n#else\n  void D1() { int q;\n#endif\n  }\n  void After() { }\n}\nclass B { }\n}\n";
+    let s = syms(src);
+    // Both `#if` branches are kept, so braces are unbalanced: `After` lands
+    // in `D1`'s (unscanned) body, but the rest of the file is not lost.
+    for n in ["N", "A", "D1", "B"] {
+        find(&s, n);
+    }
+}
+
+#[test]
 fn verbatim_strings_do_not_confuse_braces() {
     let s = syms("class A { string s = @\"}{\"; void M() { var t = $\"{x}\"; } }");
     assert_eq!(s.len(), 3);
@@ -174,6 +227,10 @@ proptest! {
         prop_assert!(!ex.has_errors);
         for s in &ex.symbols {
             prop_assert!(s.span.start < s.span.end && s.span.end as usize <= src.len());
+            // Spans start and end on token boundaries.
+            prop_assert!(ex.tokens.iter().any(|t| t.span.start == s.span.start));
+            prop_assert!(ex.tokens.iter().any(|t| t.span.end == s.span.end));
+            prop_assert!(!s.name.is_empty());
         }
         assert_nested(&ex);
     }

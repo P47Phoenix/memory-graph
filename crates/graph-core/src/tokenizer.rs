@@ -58,8 +58,11 @@ pub struct TokenizerOptions {
     /// between `<%` and `%>` the markup rules are off (C#-like code: `//`
     /// comments, normal strings, no name joining), and a quoted attribute
     /// value stops before a `<%` and resumes after the matching `%>`, so
-    /// `Text='<%# Eval("x") %>'` exposes its server tag. A server tag inside
-    /// an HTML `<!-- -->` comment stays part of the comment.
+    /// `Text='<%# Eval("x") %>'` exposes its server tag. A `//` comment in
+    /// server code ends before `%>`; a string literal in server code does not
+    /// (`<%= "a%>b" %>` keeps `"a%>b"` whole). A server tag inside an HTML
+    /// `<!-- -->` comment stays part of the comment. Heuristic limit: in a
+    /// `<script>` body, `a<b` opens a "tag" until the next `>`.
     pub aspx: bool,
 }
 
@@ -118,7 +121,12 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
                 TokenClass::Comment,
             )
         } else if !markup && rest.starts_with("//") {
-            (rest.find('\n').unwrap_or(rest.len()), TokenClass::Comment)
+            let mut n = rest.find('\n').unwrap_or(rest.len());
+            // ASP.NET ends a server block at `%>` even inside a `//` comment.
+            if m.code {
+                n = rest[..n].find("%>").unwrap_or(n);
+            }
+            (n, TokenClass::Comment)
         } else if let Some(after) = rest.strip_prefix("/*").filter(|_| !markup) {
             (
                 after.find("*/").map_or(rest.len(), |p| p + 4),
@@ -413,11 +421,11 @@ mod tests {
 
     /// One golden per non-default dialect over `DIALECT_SOURCES`.
     const DIALECT_GOLDENS: &[(&str, u64)] = &[
-        ("single_quote_strings", 0x9261c81518b47bfe),
-        ("csharp_strings", 0xd738673d9e7ecb1f),
-        ("markup", 0xe3a43ed7688ec442),
-        ("aspx", 0x5a827fb7e21ee243),
-        ("aspx_only", 0xe399a6c0b514361d),
+        ("single_quote_strings", 0x5862eb38ccd1b215),
+        ("csharp_strings", 0xdec33731853d98ea),
+        ("markup", 0x5b94845307f3ba38),
+        ("aspx", 0xee576a64669b31c9),
+        ("aspx_only", 0x2d8c0d0a2f513729),
     ];
 
     const DIALECT_SOURCES: &[&str] = &[
@@ -425,7 +433,7 @@ mod tests {
         r#"var a = @"C:\x ""q"""; var b = $"{n}\""; var c = $@"{d}"""; @$"z" @x"#,
         "<div data-id=\"a\" class='b'><!-- note --> http://x/*y*/ a: b- 27\" <!--> <!-- open",
         r#"<asp:Label Text='<%# Eval("x") %> of' /><% s = @"a""b"; // c
-%><style>p{color:red}</style>"#,
+%><style>p{color:red}</style><% // t %><b id="z">"#,
         r#"<%@ Page Language="C#" %><%-- hidden --%><asp:Button id="b1" runat="server" /><%= x %><%# Eval("y") %><%: z %><%$ r %><% if (a) { %> <%-- open"#,
     ];
 
@@ -593,6 +601,22 @@ mod tests {
         assert_eq!(
             dtexts("aspx", "<%= ok?a:b %><%= n-1 %>"),
             ["<%=", "ok", "?", "a", ":", "b", "%>", "<%=", "n", "-", "1", "%>"]
+        );
+        // A `//` comment ends at `%>`; markup rules resume after it.
+        let t = dtexts("aspx", "<% // TODO %>\n<asp:Label id=\"a\">");
+        assert_eq!(
+            t,
+            [
+                "<%",
+                "// TODO ",
+                "%>",
+                "<",
+                "asp:Label",
+                "id",
+                "=",
+                "\"a\"",
+                ">"
+            ]
         );
         let t = dtoks("aspx", "<% // c\n s = \"<p>\"; %>");
         assert_eq!(t[1], ("// c".to_string(), Comment));
