@@ -1715,9 +1715,16 @@ fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
         t.elapsed().as_secs_f64() * 1000.0 / reps as f64
     }
 
+    // Best of several interleaved rounds per size: contention from tests
+    // running in parallel only ever adds time, so the minimum is the least
+    // noisy estimate (issue #78: single rounds gave 2.7-3.4x on a loaded CI
+    // runner vs ~1.3-1.5x unloaded).
     let reps = 10;
-    let ms1 = avg_ms(&s1, reps);
-    let ms2 = avg_ms(&s2, reps);
+    let (mut ms1, mut ms2) = (f64::MAX, f64::MAX);
+    for _ in 0..5 {
+        ms1 = ms1.min(avg_ms(&s1, reps));
+        ms2 = ms2.min(avg_ms(&s2, reps));
+    }
     let ratio = ms2 / ms1.max(0.001);
     eprintln!(
         "rebuild_refs cost: 1x corpus ({} files) {ms1:.3} ms/call, 2x corpus {ms2:.3} ms/call, \
