@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A pure-Rust, embedded graph database for source code: org → repo → file → symbol → token, stored in a single [redb](https://github.com/cberner/redb) file. It is language-agnostic by design — the schema, storage and query layers know nothing about any specific language. Every language gets exact-span tokens from a generic fallback tokenizer; languages with an extractor (currently Rust, via `syn`) additionally get symbols (functions, types, methods, ...). See `README.md` for the CLI walkthrough and `docs/epic-code-memory-graph.md` / `docs/adr/` for the design rationale.
+A pure-Rust, embedded graph database for source code: org → repo → file → symbol → token, stored in a single [redb](https://github.com/cberner/redb) file. It is language-agnostic by design — the schema, storage and query layers know nothing about any specific language. Every language gets exact-span tokens from a generic fallback tokenizer; languages with an extractor (Rust via `syn`; C#, JavaScript, ASP.NET markup and HTML via token-stream scanners) additionally get symbols (functions, types, methods, ...). See `README.md` for the CLI walkthrough and `docs/epic-code-memory-graph.md` / `docs/adr/` for the design rationale.
 
 ## Commands
 
@@ -28,7 +28,8 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
 ### Crate layout (`Cargo.toml` workspace)
 
 - **graph-core**: language-agnostic types only — the schema (`Node`, `NodeKind`, spans), the `Extractor` trait, the generic fallback tokenizer (`tokenizer.rs`, with a `TokenizerOptions` dialect switch used by extractors), and `language.rs` (extension/shebang → language name detection). No storage, no CLI, no language-specific parsing.
-- **graph-lang-rust**: the one concrete `Extractor` implementation today, built on `syn` + `proc-macro2`. Produces symbols (functions, methods, types, ...) for Rust files; every other language falls back to graph-core's generic tokenizer with no symbols.
+- **graph-lang-rust**: the Rust `Extractor`, built on `syn` + `proc-macro2`.
+- **graph-lang-csharp / graph-lang-javascript / graph-lang-html / graph-lang-aspx**: token-stream scanners (not parsers) over the shared tokenizer's dialects, using `graph_core::scan`; they depend only on `graph-core` (aspx also reuses the HTML element scanner). Languages without an extractor fall back to the generic tokenizer with no symbols. The CLI registers them via `graph_cli::shipped_extractors()` behind `lang-*` Cargo features (all default). Extractors claim file extensions (`Extractor::extensions`); `Registry::detect_language` checks claims before the built-in table. Third-party languages: see `docs/adding-a-language.md` and `examples/toy-extractor`.
 - **graph-store**: the storage engine and query layer. This is the largest and most architecturally important crate:
   - `api.rs` defines the object-safe `Store` / `StoreRead` traits. The CLI and library consumers depend on these traits, never on a concrete backend. `open_store(Backend, path, extractors) -> Box<dyn Store>` is the entry point; `Backend::Redb` (v1, the original format) and `Backend::RedbV2` (v2, in progress) are the two implementations.
   - `lib.rs` is the v1 (`RedbStore`) backend: one redb table per node kind plus a catalog table (language/symbol-kind counts per repo, kept in step with every write so `describe` and filter validation are O(repos) not O(tokens)). Schema-versioned; old databases upgrade in place on first open.
@@ -43,7 +44,7 @@ Nodes: `Org → Repo → File → Symbol → Token`, each with an exact byte/lin
 
 ### Key invariants to preserve
 
-- **Language-agnosticism**: no language-specific types or logic outside an `Extractor` implementation (currently only `graph-lang-rust`). The fallback tokenizer must keep working for any language with no extractor registered.
+- **Language-agnosticism**: no language-specific types or logic outside an `Extractor` implementation (the `graph-lang-*` crates). The fallback tokenizer must keep working for any language with no extractor registered.
 - **Exact spans**: every token/symbol's text, byte range, line and column must match the source exactly — this is property-tested and is the basis of the corpus test.
 - **Pure Rust**: `scripts/check-no-c-deps.py` fails CI on any dependency with a `links` key or a C/C++ build script. A `-sys` crate is fine as long as it's pure Rust (it keys on build mechanism, not crate naming).
 - **v1 is frozen**: v2 development must never change v1's on-disk format, behavior, or CLI output. The differential harness in `conformance.rs` (`run_differential`) is what enforces this — it should keep passing as v2 evolves.
