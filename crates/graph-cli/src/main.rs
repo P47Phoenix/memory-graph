@@ -93,10 +93,25 @@ enum Cmd {
         /// same content, language and extractor version are skipped). Does not affect --prune's safety checks
         #[arg(long)]
         reindex: bool,
-        /// Parsing threads (default: one per CPU). Files are still committed in walk order by one writer,
-        /// so the database is identical for any value
+        /// Parse threads (default: one per CPU but one, left for the database writer). Files are still
+        /// committed in walk order by one writer, so the stored content is the same for any value
         #[arg(long, short = 'j', default_value_t = 0, hide_default_value = true)]
         jobs: usize,
+        /// Cap on source bytes read but not yet committed, e.g. 512M or 2G (default: an eighth of the
+        /// free memory, between 256M and 4G)
+        #[arg(long, value_parser = graph_cli::sysinfo::parse_size)]
+        memory: Option<u64>,
+        /// Commit fixed batches (256 files / 32 MiB) instead of everything ready, so the database file is
+        /// byte-for-byte reproducible on any machine (slower when the writer is the bottleneck)
+        #[arg(long)]
+        deterministic: bool,
+        /// Print how busy each stage (walk, parse, commit) was, and the bottleneck, on stderr at the end
+        /// (with --json: a `stats` object in the summary)
+        #[arg(long)]
+        stats: bool,
+        /// Write a Chrome/Perfetto trace of the run (one span per file per stage) to this file
+        #[arg(long)]
+        trace: Option<PathBuf>,
         /// Show live progress on stderr even with --json (default: only when --json is off). Never drawn
         /// when stderr is not a terminal
         #[arg(long, conflicts_with = "no_progress")]
@@ -444,6 +459,10 @@ fn run() -> Result<()> {
             force,
             reindex,
             jobs,
+            memory,
+            deterministic,
+            stats,
+            trace,
             progress,
             no_progress,
             dir,
@@ -459,6 +478,10 @@ fn run() -> Result<()> {
                 force,
                 reindex,
                 jobs,
+                memory,
+                deterministic,
+                stats,
+                trace: trace.as_deref(),
                 progress: match (progress, no_progress) {
                     (true, _) => Some(true),
                     (_, true) => Some(false),

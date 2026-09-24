@@ -2043,9 +2043,9 @@ fn index_json(db: &str, backend: &str, dir: &str, extra: &[&str]) -> (serde_json
     (v, err)
 }
 
-/// Parallel parsing commits in walk order, so the database file and the
-/// summary are identical for any `--jobs`, on both backends: for a first
-/// index, a forced re-index and an all-unchanged run.
+/// With `--deterministic` (fixed batches), parallel parsing still commits in
+/// walk order, so the database file and the summary are byte-identical for
+/// any `--jobs`, on both backends: first index, forced re-index, unchanged.
 #[test]
 fn index_is_identical_for_any_jobs() {
     let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus");
@@ -2057,9 +2057,14 @@ fn index_is_identical_for_any_jobs() {
         for jobs in ["1", "8"] {
             let db = d.path().join(format!("g{jobs}"));
             let db = db.to_str().unwrap();
-            let (first, _) = index_json(db, backend, corpus, &["--jobs", jobs]);
-            let (again, _) = index_json(db, backend, corpus, &["--jobs", jobs, "--reindex"]);
-            let (skip, _) = index_json(db, backend, corpus, &["--jobs", jobs]);
+            let (first, _) = index_json(db, backend, corpus, &["--deterministic", "--jobs", jobs]);
+            let (again, _) = index_json(
+                db,
+                backend,
+                corpus,
+                &["--deterministic", "--jobs", jobs, "--reindex"],
+            );
+            let (skip, _) = index_json(db, backend, corpus, &["--deterministic", "--jobs", jobs]);
             assert!(first["files"].as_u64().unwrap() > 100, "{first}");
             assert_eq!(skip["unchanged"], skip["files"], "{skip}");
             sums.push((first, again, skip));
@@ -2098,4 +2103,96 @@ fn progress_keeps_stdout_clean() {
         root,
     ]);
     assert!(!ok && err.contains("cannot be used with"), "{err}");
+}
+
+/// The default (adaptive group commit: transaction sizes follow timing)
+/// stores the same content as `--deterministic` whatever the thread count or
+/// memory budget: the exports and summaries match exactly.
+#[test]
+fn adaptive_commit_stores_the_same_content() {
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus");
+    let corpus = corpus.to_str().unwrap();
+    for backend in ["v1", "v2"] {
+        let d = tempfile::tempdir().unwrap();
+        let mut seen = Vec::new();
+        for flags in [
+            vec!["--deterministic", "-j", "1"],
+            vec!["-j", "8"],
+            vec!["-j", "3", "--memory", "64K"],
+        ] {
+            let db = d.path().join(format!("g{}", seen.len()));
+            let db = db.to_str().unwrap();
+            let (sum, _) = index_json(db, backend, corpus, &flags);
+            let (ok, export, err) = run(&["--db", db, "--backend", backend, "export"]);
+            assert!(ok, "{err}");
+            seen.push((flags, sum, export));
+        }
+        for w in seen.windows(2) {
+            assert_eq!(
+                w[0].1, w[1].1,
+                "{backend}: {:?} vs {:?} summary",
+                w[0].0, w[1].0
+            );
+            assert!(
+                w[0].2 == w[1].2,
+                "{backend}: {:?} vs {:?} export",
+                w[0].0,
+                w[1].0
+            );
+        }
+    }
+}
+
+/// `--stats` adds a per-stage table on stderr (a `stats` object with
+/// `--json`), and `--trace` writes a valid Chrome trace.
+#[test]
+fn stats_and_trace() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..30 {
+        std::fs::write(root.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+    }
+    let root = root.to_str().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let trace = d.path().join("t.json").to_string_lossy().into_owned();
+    let (sum, _) = index_json(&db, "v2", root, &["--stats", "--trace", &trace]);
+    let stages = sum["stats"]["stages"].as_array().unwrap();
+    let names: Vec<_> = stages
+        .iter()
+        .map(|s| s["stage"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["walk", "parse", "commit"]);
+    assert_eq!(stages[0]["items"], 30);
+    assert_eq!(stages[1]["items"], 30);
+    assert_eq!(stages[2]["items"], 30);
+    let t: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+    let evs = t["traceEvents"].as_array().unwrap();
+    assert!(evs
+        .iter()
+        .any(|e| e["name"].as_str().unwrap_or("").starts_with("parsing f")));
+    assert!(evs.iter().any(|e| e["name"]
+        .as_str()
+        .unwrap_or("")
+        .starts_with("committing txn")));
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "--backend",
+        "v2",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--stats",
+        "--reindex",
+        root,
+    ]);
+    assert!(ok, "{err}");
+    assert!(out.starts_with("indexed o/r"), "stdout unchanged: {out}");
+    assert!(
+        err.contains("stage") && err.contains("commit") && err.contains("sizing:"),
+        "{err}"
+    );
 }
