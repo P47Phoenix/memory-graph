@@ -35,7 +35,7 @@ use redb::{
     ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -1773,7 +1773,7 @@ impl<'t> W<'t> {
 
         self.streams.remove(file)?;
         self.tally_stream(tally, scope, file, &s, -1)?;
-        let mut terms: HashSet<u64> = HashSet::new();
+        let mut terms: BTreeSet<u64> = BTreeSet::new(); // ordered: reproducible file
         for t in &s.tokens {
             terms.insert(t.term);
         }
