@@ -209,15 +209,26 @@ fn read_and_prepare(store: &dyn Store, o: &DirOpts, item: &Item) -> Result<Outco
         language: None,
         origin: Some(ORIGIN_DIRECTORY),
     };
-    let p = store.prepare(o.org, o.repo, &file, IndexOptions { reindex: o.reindex })?;
+    let p = store
+        .prepare(o.org, o.repo, &file, IndexOptions { reindex: o.reindex })
+        .with_context(|| format!("database error while preparing `{rel}`"))?;
     Ok(Outcome::Prepared(rel.clone(), p))
 }
 
-/// `read_and_prepare` with a panicking extractor turned into an error, so one
-/// bad file cannot wedge the pipeline.
-fn work(store: &dyn Store, o: &DirOpts, item: &Item) -> Result<Outcome> {
+/// `read_and_prepare` for worker `k` (shown on its progress line), with any
+/// panic turned into an error, so one bad file cannot wedge the pipeline.
+fn work(
+    store: &dyn Store,
+    o: &DirOpts,
+    item: &Item,
+    k: usize,
+    progress: &Progress,
+) -> Result<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        read_and_prepare(store, o, item)
+        progress.worker(k, item_name(item));
+        let r = read_and_prepare(store, o, item);
+        progress.worker(k, None);
+        r
     }))
     .unwrap_or_else(|_| {
         let what = match item {
@@ -308,10 +319,7 @@ fn run_pipeline(
     let progress = w.progress;
     if jobs <= 1 {
         for item in items {
-            progress.worker(0, item_name(item));
-            let oc = work(store, o, item);
-            progress.worker(0, None);
-            w.take(oc?)?;
+            w.take(work(store, o, item, 0, progress)?)?;
         }
         return Ok(());
     }
@@ -325,9 +333,7 @@ fn run_pipeline(
             sc.spawn(move || loop {
                 let next = job_rx.lock().map(|rx| rx.recv());
                 let Ok(Ok(i)) = next else { break };
-                progress.worker(k, item_name(&items[i]));
-                let oc = work(store, o, &items[i]);
-                progress.worker(k, None);
+                let oc = work(store, o, &items[i], k, progress);
                 if res_tx.send((i, oc)).is_err() {
                     break;
                 }
@@ -514,6 +520,8 @@ pub fn index_dir_with(
     progress.set_workers(jobs);
     run_pipeline(&*store, &o, &items, jobs, &mut w)?;
     w.flush()?;
+    // Clear the live display before warnings and the summary are printed.
+    progress.finish();
     let Writer {
         tally,
         mut skipped,

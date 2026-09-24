@@ -22,7 +22,7 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// Draw on stderr (about 10 redraws a second).
+    /// Draw on stderr (redraws are rate-limited by indicatif).
     pub fn stderr(label: &str) -> Self {
         Self::new(label, ProgressDrawTarget::stderr())
     }
@@ -73,6 +73,9 @@ impl Progress {
         self.overall.set_length(files as u64);
         self.overall.set_position(0);
         self.overall.reset_eta();
+        // Keep the rate and ETA moving while one large file parses.
+        self.overall
+            .enable_steady_tick(std::time::Duration::from_millis(200));
         self.redraw_msg();
     }
 
