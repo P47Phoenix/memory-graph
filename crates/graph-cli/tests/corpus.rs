@@ -369,6 +369,36 @@ fn every_parsed_token_is_stored() {
         rust_symbols > 50,
         "Rust extractor found only {rust_symbols} symbols in anyhow"
     );
+    // The C# scanner finds real declarations with exact spans.
+    let mut q = graph_store::SymbolQuery::new("AbstractRebusTransport");
+    q.language = Some("csharp".into());
+    let hits = store.search_symbols(&q).unwrap();
+    let class = hits
+        .iter()
+        .find(|h| h.lang_kind.as_deref() == Some("class"))
+        .expect("AbstractRebusTransport class");
+    assert_eq!(class.file, "Rebus/Transport/AbstractRebusTransport.cs");
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("csharp".into());
+    q.kind = Some("method".into());
+    let methods = store.search_symbols(&q).unwrap();
+    assert!(
+        methods.iter().any(|h| h
+            .qualified
+            .starts_with("Rebus.Transport::AbstractRebusTransport::")),
+        "no methods nested in AbstractRebusTransport"
+    );
+    let cs_symbols: usize = store
+        .describe(None, None)
+        .unwrap()
+        .iter()
+        .filter_map(|i| i.languages.get("csharp"))
+        .map(|l| l.symbols)
+        .sum();
+    assert!(
+        cs_symbols > 500,
+        "C# extractor found only {cs_symbols} symbols"
+    );
     // Cross-repo, cross-language search works on real code.
     let hits = store.search(&Query::new("ITransport")).unwrap();
     let repos: BTreeSet<_> = hits.iter().filter_map(|h| h.repo.clone()).collect();

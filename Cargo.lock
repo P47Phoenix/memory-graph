@@ -294,6 +294,7 @@ dependencies = [
  "anyhow",
  "clap",
  "graph-core",
+ "graph-lang-csharp",
  "graph-lang-rust",
  "graph-store",
  "ignore",
@@ -310,6 +311,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "graph-lang-csharp"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
 ]
 
 [[package]]
