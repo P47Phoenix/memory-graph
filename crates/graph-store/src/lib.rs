@@ -22,7 +22,10 @@ pub(crate) mod codec;
 pub mod conformance;
 pub mod migrate;
 mod v2;
-pub use api::{detect_backend, open_store, Backend, Page, SnapshotStats, Store, StoreRead};
+use api::Prepared;
+pub use api::{
+    detect_backend, open_store, Backend, Page, PreparedFile, SnapshotStats, Store, StoreRead,
+};
 pub use codec::{encode_posting, POSTING_BLOCK};
 pub use v2::{CompactStats, V2Snapshot, V2Store, VacuumStats};
 
@@ -178,6 +181,173 @@ fn validate_spans(ex: &Extraction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fingerprint of `bytes` indexed as `lang` with `registry`'s extractor.
+/// Pure, so it can run on any thread.
+fn fingerprint(registry: &Registry, bytes: &[u8], lang: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash: String = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!(
+        "sha256:{hash}|{}|{}|{FINGERPRINT_FORMAT_VERSION}",
+        lang.to_ascii_lowercase(),
+        registry.version(lang)
+    )
+}
+
+/// Whether the file stored under org/repo/path (as of `rt`) carries `fp`.
+/// Both backends keep org/repo/file nodes in the same `names`/`nodes` tables.
+pub(crate) fn stored_fingerprint_matches(
+    rt: &ReadTransaction,
+    org: &str,
+    repo: &str,
+    path: &str,
+    fp: &str,
+) -> Result<bool> {
+    fn open<T>(r: std::result::Result<T, redb::TableError>) -> Result<Option<T>> {
+        match r {
+            Ok(t) => Ok(Some(t)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    let (Some(names), Some(nodes)) = (open(rt.open_table(NAMES))?, open(rt.open_table(NODES))?)
+    else {
+        return Ok(false);
+    };
+    let find = |parent: Option<NodeId>, kind: NodeKind, name: &str| -> Result<Option<NodeId>> {
+        Ok(names
+            .get(name_key(parent, kind, name).as_str())?
+            .map(|v| v.value()))
+    };
+    let Some(org_id) = find(None, NodeKind::Org, org)? else {
+        return Ok(false);
+    };
+    let Some(repo_id) = find(Some(org_id), NodeKind::Repo, repo)? else {
+        return Ok(false);
+    };
+    let Some(file_id) = find(Some(repo_id), NodeKind::File, path)? else {
+        return Ok(false);
+    };
+    let Some(raw) = nodes.get(file_id)? else {
+        return Ok(false);
+    };
+    Ok(dec(raw.value())?.fingerprint.as_deref() == Some(fp))
+}
+
+/// The pure half of indexing one file (see [`Store::prepare`]): size and
+/// UTF-8 checks, path normalization, language detection, fingerprint, then
+/// extraction and span validation, unless `unchanged(path, lang, fp)` says
+/// the stored copy already carries this fingerprint (asked only without
+/// `reindex`). Per-file rejections land in the result; only an error from
+/// `unchanged` (storage) is returned as `Err`.
+pub(crate) fn prepare_file(
+    registry: &Registry,
+    org: &str,
+    repo: &str,
+    f: &BatchFile<'_>,
+    opts: IndexOptions,
+    unchanged: impl FnOnce(&str, &str, &str) -> Result<bool>,
+) -> Result<PreparedFile> {
+    let path = normalize_path(f.path);
+    let mut p = PreparedFile {
+        org: org.into(),
+        repo: repo.into(),
+        path,
+        language: String::new(),
+        fingerprint: String::new(),
+        bytes_len: f.bytes.len(),
+        origin: f.origin.map(Into::into),
+        work: Prepared::Rejected(StoreError::Rejected(String::new())),
+    };
+    if f.bytes.len() > MAX_SOURCE_BYTES {
+        p.work = Prepared::Rejected(StoreError::TooLarge(format!("`{}`", f.path)));
+        return Ok(p);
+    }
+    let Ok(src) = std::str::from_utf8(f.bytes) else {
+        p.work = Prepared::Rejected(StoreError::NotUtf8(format!("`{}`", f.path)));
+        return Ok(p);
+    };
+    p.language = f.language.map_or_else(
+        || registry.detect_language(&p.path, src),
+        str::to_ascii_lowercase,
+    );
+    p.fingerprint = fingerprint(registry, f.bytes, &p.language);
+    p.work = if !opts.reindex && unchanged(&p.path, &p.language, &p.fingerprint)? {
+        // Keep the source: if the file changed by commit time, the commit
+        // extracts it after all (as `index_batch` would have).
+        Prepared::Unchanged(src.to_owned())
+    } else {
+        extract_checked(registry, &p.path, &p.language, src)
+    };
+    Ok(p)
+}
+
+/// Extract and validate spans, so a bad file only fails itself.
+fn extract_checked(registry: &Registry, path: &str, lang: &str, src: &str) -> Prepared {
+    let ex = registry.extract(lang, src);
+    match validate_spans(&ex) {
+        Err(StoreError::InvalidSpan(why)) => {
+            Prepared::Rejected(StoreError::InvalidSpan(format!("`{path}`: {why}")))
+        }
+        _ => Prepared::Extracted(ex),
+    }
+}
+
+/// The committing half, inside the caller's write transaction: re-run the
+/// unchanged check authoritatively (the prepare-time one only saved an
+/// extraction), then store the extraction through `ingest`, extracting now
+/// if a file prepared as unchanged has changed since (e.g. the same path
+/// earlier in the batch). `Ok(Err(_))` is a per-file outcome; `Err` is a
+/// storage error, or a file prepared for another org/repo, and aborts the
+/// transaction.
+pub(crate) fn commit_prepared(
+    wt: &redb::WriteTransaction,
+    registry: &Registry,
+    org: &str,
+    repo: &str,
+    mut p: PreparedFile,
+    opts: IndexOptions,
+    ingest: impl FnOnce(&PreparedFile, &Extraction) -> Result<IngestStats>,
+) -> Result<Result<IngestStats>> {
+    if p.org != org || p.repo != repo {
+        return Err(StoreError::Rejected(format!(
+            "`{}` was prepared for {}/{}, not {org}/{repo}",
+            p.path, p.org, p.repo
+        )));
+    }
+    let work = std::mem::replace(
+        &mut p.work,
+        Prepared::Rejected(StoreError::Rejected(String::new())),
+    );
+    if let Prepared::Rejected(e) = work {
+        return Ok(Err(e));
+    }
+    if !opts.reindex {
+        if let Some((stats, _)) = RedbStore::check_unchanged(
+            wt,
+            org,
+            repo,
+            &p.path,
+            &p.language,
+            &p.fingerprint,
+            p.origin.as_deref(),
+        )? {
+            return Ok(Ok(stats));
+        }
+    }
+    let work = match work {
+        Prepared::Unchanged(src) => extract_checked(registry, &p.path, &p.language, &src),
+        w => w,
+    };
+    match work {
+        Prepared::Extracted(ex) => Ok(Ok(ingest(&p, &ex)?)),
+        Prepared::Rejected(e) => Ok(Err(e)),
+        Prepared::Unchanged(_) => unreachable!("extracted above"),
+    }
 }
 
 /// Storage format v1 on one redb file: the first backend behind [`Store`].
@@ -758,16 +928,7 @@ impl RedbStore {
 
     /// Fingerprint of `bytes` indexed as `lang` with the current extractor.
     fn fingerprint(&self, bytes: &[u8], lang: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let hash: String = Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        format!(
-            "sha256:{hash}|{}|{}|{FINGERPRINT_FORMAT_VERSION}",
-            lang.to_ascii_lowercase(),
-            self.registry.version(lang)
-        )
+        fingerprint(&self.registry, bytes, lang)
     }
 
     /// If the file already stored under org/repo/path carries `fp`, leave its
@@ -973,47 +1134,79 @@ impl RedbStore {
         files: &[BatchFile<'_>],
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
+        self.commit_each(org, repo, files.len(), opts, |wt, i| {
+            let f = &files[i];
+            prepare_file(&self.registry, org, repo, f, opts, |path, lang, fp| {
+                Ok(Self::check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
+            })
+        })
+    }
+
+    /// See [`Store::prepare`]. The unchanged pre-check reads the last
+    /// committed state in its own read transaction.
+    pub fn prepare(
+        &self,
+        org: &str,
+        repo: &str,
+        f: &BatchFile<'_>,
+        opts: IndexOptions,
+    ) -> Result<PreparedFile> {
+        prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
+            stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
+        })
+    }
+
+    /// See [`Store::index_prepared`]: one write transaction, like
+    /// `index_batch`.
+    pub fn index_prepared(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<Vec<Result<IngestStats>>> {
+        let n = files.len();
+        let mut it = files.into_iter();
+        self.commit_each(org, repo, n, opts, |_, _| {
+            Ok(it.next().expect("one prepared file per slot"))
+        })
+    }
+
+    /// The write loop shared by `index_batch` and `index_prepared`. `next`
+    /// yields the `i`-th prepared file (it may read `wt`). Each file is
+    /// committed before the next one is asked for, so on the `index_batch`
+    /// path only one extraction is alive at a time.
+    fn commit_each(
+        &self,
+        org: &str,
+        repo: &str,
+        n: usize,
+        opts: IndexOptions,
+        mut next: impl FnMut(&redb::WriteTransaction, usize) -> Result<PreparedFile>,
+    ) -> Result<Vec<Result<IngestStats>>> {
         let wt = self.db.begin_write()?;
-        let mut out = Vec::with_capacity(files.len());
-        for f in files {
-            if f.bytes.len() > MAX_SOURCE_BYTES {
-                out.push(Err(StoreError::TooLarge(format!("`{}`", f.path))));
-                continue;
-            }
-            let Ok(src) = std::str::from_utf8(f.bytes) else {
-                out.push(Err(StoreError::NotUtf8(format!("`{}`", f.path))));
-                continue;
-            };
-            let path = normalize_path(f.path);
-            let lang = f.language.map_or_else(
-                || self.registry.detect_language(&path, src),
-                str::to_ascii_lowercase,
-            );
-            let fp = self.fingerprint(f.bytes, &lang);
-            if !opts.reindex {
-                if let Some((stats, _)) =
-                    Self::check_unchanged(&wt, org, repo, &path, &lang, &fp, f.origin)?
-                {
-                    out.push(Ok(stats));
-                    continue;
-                }
-            }
-            let ex = self.registry.extract(&lang, src);
-            // Validate before touching the transaction so a bad file leaves
-            // no partial writes and only fails itself.
-            if let Err(StoreError::InvalidSpan(why)) = validate_spans(&ex) {
-                out.push(Err(StoreError::InvalidSpan(format!("`{path}`: {why}"))));
-                continue;
-            }
-            out.push(Ok(Self::ingest_validated(
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = next(&wt, i)?;
+            out.push(commit_prepared(
                 &wt,
+                &self.registry,
                 org,
                 repo,
-                &path,
-                &lang,
-                &ex,
-                (f.origin, Some(&fp)),
-            )?));
+                p,
+                opts,
+                |p, ex| {
+                    Self::ingest_validated(
+                        &wt,
+                        org,
+                        repo,
+                        &p.path,
+                        &p.language,
+                        ex,
+                        (p.origin.as_deref(), Some(&p.fingerprint)),
+                    )
+                },
+            )?);
         }
         wt.commit()?;
         Ok(out)

@@ -2240,3 +2240,51 @@ fn descendants_ranged_file_symbol_decode_cost_is_linear_not_quadratic() {
          (~3x), not quadratic (~9x) -- issue #40 regressed"
     );
 }
+
+/// v2 chunk accounting through `index_prepared` (shared with `index_batch`):
+/// only stored files count towards `chunk_bytes`, and a chunk commits once
+/// it reaches the cap, so a later whole-batch error keeps earlier chunks.
+#[test]
+fn prepared_chunks_count_only_stored_files() {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = V2Store::open(d.path().join("g")).unwrap();
+    let f = |p, b: &'static [u8], l| BatchFile {
+        path: p,
+        bytes: b,
+        language: Some(l),
+        origin: None,
+    };
+    let opts = IndexOptions::default();
+    // A big unchanged file must not count: with cap 6, only "small" (5
+    // bytes) is stored before the bad file, so no chunk commits.
+    s.index_batch("o", "r", &[f("big.txt", b"0123456789", "text")], opts)
+        .unwrap();
+    s.set_chunk_bytes(6);
+    let files = [
+        f("big.txt", b"0123456789", "text"),
+        f("small.txt", b"abcde", "text"),
+        f("bad.txt", b"x", "a\0b"),
+    ];
+    let p: Vec<_> = files
+        .iter()
+        .map(|x| Store::prepare(&s, "o", "r", x, opts).unwrap())
+        .collect();
+    assert!(Store::index_prepared(&s, "o", "r", p, opts).is_err());
+    assert!(
+        s.file_tokens("o", "r", "small.txt").unwrap().is_none(),
+        "skipped file counted towards the chunk"
+    );
+    // Stored files do count: two 5-byte files reach cap 6 after the second
+    // only if both count; with cap 5 the first commits alone.
+    s.set_chunk_bytes(5);
+    let files = [f("small.txt", b"abcde", "text"), f("bad.txt", b"x", "a\0b")];
+    let p: Vec<_> = files
+        .iter()
+        .map(|x| Store::prepare(&s, "o", "r", x, opts).unwrap())
+        .collect();
+    assert!(Store::index_prepared(&s, "o", "r", p, opts).is_err());
+    assert!(
+        s.file_tokens("o", "r", "small.txt").unwrap().is_some(),
+        "a full chunk commits before the failing file"
+    );
+}
