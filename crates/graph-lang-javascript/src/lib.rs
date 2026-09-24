@@ -10,9 +10,16 @@
 //!
 //! Spans run from the first keyword (`export`, `async`, `const`, ...) through
 //! the closing `}` (or, for an arrow with an expression body, its `;`).
-//! Regex literals are not recognized by the shared tokenizer, so a regex
-//! containing an unbalanced brace can cut a scan short: the extractor then
-//! returns fewer symbols, never invalid spans or `has_errors`.
+//! Private members keep their `#` (`#p`). Declarations found inside an arrow
+//! body always lie within the arrow's span.
+//!
+//! Regex literals are lexed by the tokenizer's `regex_literals` heuristic (a
+//! `/` where an operand is expected); a regex it misjudges, or a template
+//! literal nesting backticks, can still cut a scan short: the extractor then
+//! returns fewer symbols, never invalid spans or `has_errors`. Not symbols:
+//! computed members (`[Symbol.iterator]() {}`), class-field arrows
+//! (`x = () => {}`), object-literal methods, anonymous
+//! `module.exports = function () {}`.
 use graph_core::scan::{matching_close, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -26,6 +33,7 @@ pub const JS_TOKENIZER: TokenizerOptions = TokenizerOptions {
     csharp_strings: false,
     markup: false,
     aspx: false,
+    regex_literals: true,
 };
 
 impl Extractor for JavaScriptExtractor {
@@ -70,7 +78,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     out
 }
 
-const PREFIXES: &[&str] = &["export", "default", "async", "declare"];
+const PREFIXES: &[&str] = &["export", "default", "async"];
 
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
@@ -119,8 +127,13 @@ impl Scanner<'_> {
         lang: &str,
         span: (usize, usize),
     ) {
+        // Private members keep their `#`: `#p` and `p` are different names.
+        let private = name > 0
+            && self.text(name - 1) == "#"
+            && self.tok(name - 1).span.end == self.tok(name).span.start;
+        let prefix = if private { "#" } else { "" };
         out.push(SymbolDecl {
-            name: self.text(name).to_string(),
+            name: format!("{prefix}{}", self.text(name)),
             kind,
             lang_kind: Some(lang.into()),
             span: span_between(&self.tok(span.0).span, &self.tok(span.1).span),
@@ -175,9 +188,19 @@ impl Scanner<'_> {
         if name >= hi || !self.is_ident(name) {
             return None;
         }
-        let open = (name + 1..hi).find(|&c| matches!(self.text(c), "{" | ";" | "}"))?;
-        if self.text(open) != "{" {
-            return None;
+        // The body is the first `{` after the heritage clause, skipping whole
+        // groups (`extends mix({ a() {} })`).
+        let mut open = name + 1;
+        loop {
+            if open >= hi {
+                return None;
+            }
+            match self.text(open) {
+                "{" => break,
+                ";" | "}" => return None,
+                "(" | "[" => open = self.close_of(open)? + 1,
+                _ => open += 1,
+            }
         }
         let close = self.close_of(open).filter(|&p| p < hi)?;
         let start = self.start_of(kw, lo);
@@ -273,7 +296,7 @@ impl Scanner<'_> {
             return None;
         }
         let body = arrow + 2;
-        if body >= hi {
+        if body >= hi || matches!(self.text(body), ";" | "," | ")" | "]" | "}") {
             return None;
         }
         let end = if self.text(body) == "{" {
@@ -283,7 +306,9 @@ impl Scanner<'_> {
             self.expression_end(body, hi)?
         };
         self.push(out, name, SymbolKind::Function, "arrow_fn", (start, end));
-        Some(body)
+        // Declarations inside the body must stay inside the arrow's span.
+        self.scan(body, end + 1, out);
+        Some(end + 1)
     }
 
     /// `close`, or the `;` right after it.
@@ -312,8 +337,17 @@ impl Scanner<'_> {
                 }
                 _ => {}
             }
+            // A line break ends the expression unless the next line continues
+            // it (`.then(...)`, `? a : b`, `+ x`) or this line ends in an
+            // operator.
             if c > last && self.tok(c).span.start_line > self.tok(last).span.end_line {
-                return Some(last);
+                let t = self.tok(c);
+                let continues = t.class == TokenClass::Operator
+                    || t.text.starts_with(['.', '?', ':'])
+                    || self.tok(last).class == TokenClass::Operator;
+                if !continues {
+                    return Some(last);
+                }
             }
             last = c;
             c += 1;

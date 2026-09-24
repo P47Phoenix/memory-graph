@@ -38,6 +38,7 @@ pub const CSHARP_TOKENIZER: TokenizerOptions = TokenizerOptions {
     csharp_strings: true,
     markup: false,
     aspx: false,
+    regex_literals: false,
 };
 
 impl Extractor for CSharpExtractor {
