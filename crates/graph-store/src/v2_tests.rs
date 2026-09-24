@@ -316,6 +316,324 @@ fn with_lazy_propagates_decode_errors_through_get_ancestors_parent() {
     );
 }
 
+/// Issue #66 (follow-up to issue #35 / PR #65): `with_lazy` has four more
+/// callers beyond `get`/`ancestors`/`parent` -- `children_ranged`,
+/// `children_ranged_file`, `descendants_ranged` and `descendants_ranged_file`
+/// (the range-based `children`/`descendants` paths, taken whenever
+/// `ranges_dense()` is true, which it is for every file built by
+/// `many_tokens_ext`: one top-level symbol transitively covering every
+/// token). Each shares the exact same
+/// `Ok(Some(f(&codec::decode_lazy(v.value())?)?))` pattern as the three
+/// callers PR #65 covered, so the same "never swallow the error" invariant
+/// applies here too; this test exercises it through `children`/`descendants`
+/// called on both a file id (the `*_file` variants) and a symbol id (the
+/// non-file variants), the same corrupt-stream construction PR #65 used.
+#[test]
+fn with_lazy_propagates_decode_errors_through_ranged_children_and_descendants() {
+    let n = 2 * codec::CHECKPOINT_EVERY + 3;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("b.redb")).unwrap();
+    s.ingest_file("o", "r", "x.rs", "rust", &many_tokens_ext(n))
+        .unwrap();
+    let any_tok = s.file_tokens("o", "r", "x.rs").unwrap().unwrap()[0].id;
+    let file = (any_tok >> 32) & 0x3fff_ffff;
+    let sym_id = (1u64 << 62) | (file << 32); // the file's only symbol, "S"
+
+    // Sanity: both range-based paths are actually reachable on this file
+    // before we start corrupting it, so a later `Err` really proves error
+    // propagation and not just "the range path was never taken".
+    assert!(!s.children(file).unwrap().is_empty());
+    assert!(!s.descendants(file).unwrap().is_empty());
+    assert!(!s.children(sym_id).unwrap().is_empty());
+    assert!(!s.descendants(sym_id).unwrap().is_empty());
+
+    let good = {
+        let rt = s.db.begin_read().unwrap();
+        let t = rt.open_table(crate::v2::STREAMS).unwrap();
+        t.get(file).unwrap().unwrap().value().to_vec()
+    };
+    assert!(!good.is_empty());
+
+    let set_stream = |bytes: &[u8]| {
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut t = wt.open_table(crate::v2::STREAMS).unwrap();
+            t.insert(file, bytes).unwrap();
+        }
+        wt.commit().unwrap();
+    };
+
+    // `decode_lazy` itself eagerly parses the format byte, header varints,
+    // the symbol section's bounds and the *entire* checkpoint table (only
+    // symbol/token *records* are decoded lazily -- see `codec::decode_lazy`).
+    // So any prefix shorter than that eagerly-parsed portion makes
+    // `decode_lazy` itself fail, and `with_lazy` must surface that failure
+    // identically through every one of its callers -- this is the shared
+    // "never swallow the error" behavior this test targets, independent of
+    // which caller-specific bytes (if any) each function goes on to decode
+    // lazily afterwards. Find that boundary directly rather than guessing at
+    // the header layout.
+    let eager_prefix_len = (0..=good.len())
+        .find(|&cut| codec::decode_lazy(&good[..cut]).is_ok())
+        .expect("the full stream itself must decode_lazy successfully");
+    assert!(
+        eager_prefix_len > 1,
+        "test wants decode_lazy to eagerly validate more than just the format byte"
+    );
+
+    // Every prefix shorter than that boundary must surface as an error
+    // through all four call sites, never `Ok(vec![])`/a panic -- this is
+    // exactly the scenario a `with_lazy` mutant that turned `Err(_)` into
+    // `Ok(None)` would hide.
+    for cut in 0..eager_prefix_len {
+        set_stream(&good[..cut]);
+        assert!(s.children(file).is_err(), "children(file) at prefix {cut}");
+        assert!(
+            s.descendants(file).is_err(),
+            "descendants(file) at prefix {cut}"
+        );
+        assert!(
+            s.children(sym_id).is_err(),
+            "children(sym_id) at prefix {cut}"
+        );
+        assert!(
+            s.descendants(sym_id).is_err(),
+            "descendants(sym_id) at prefix {cut}"
+        );
+    }
+
+    // Beyond that boundary, `descendants(file)`/`children(sym_id)`/
+    // `descendants(sym_id)` still need to decode token records for this
+    // file's single, everything-covering symbol `S` (its own range, or its
+    // top-level descendants subtree), so truncating anywhere in the token
+    // payload must still fail for them. `children(file)` alone needs only
+    // the already-validated symbol section for this particular file shape
+    // (`S` has no sibling top-level tokens to look up), so it is not
+    // expected to fail on every further truncation -- that is a property of
+    // *this caller's own logic*, not of `with_lazy`, and is exercised
+    // separately by `with_lazy_propagates_decode_errors_through_get_
+    // ancestors_parent`'s reasoning for `get`/`ancestors`/`parent`.
+    for cut in eager_prefix_len..good.len() {
+        set_stream(&good[..cut]);
+        assert!(
+            s.descendants(file).is_err(),
+            "descendants(file) at prefix {cut}"
+        );
+        assert!(
+            s.children(sym_id).is_err(),
+            "children(sym_id) at prefix {cut}"
+        );
+        assert!(
+            s.descendants(sym_id).is_err(),
+            "descendants(sym_id) at prefix {cut}"
+        );
+    }
+
+    // An invalid format byte is rejected outright at every call site.
+    let mut bad_fmt = good.clone();
+    bad_fmt[0] = 0xff;
+    set_stream(&bad_fmt);
+    assert!(s.children(file).is_err());
+    assert!(s.descendants(file).is_err());
+    assert!(s.children(sym_id).is_err());
+    assert!(s.descendants(sym_id).is_err());
+
+    // Sanity: restoring the original bytes makes the store healthy again.
+    set_stream(&good);
+    assert!(!s.children(file).unwrap().is_empty());
+    assert!(!s.descendants(file).unwrap().is_empty());
+    assert!(!s.children(sym_id).unwrap().is_empty());
+    assert!(!s.descendants(sym_id).unwrap().is_empty());
+}
+
+/// Issue #66: PR #65's corrupt-stream coverage only ever *truncates* a
+/// stream (or corrupts its leading format byte), which always shrinks the
+/// declared/actual length relationship in a way every decode step notices.
+/// This test instead flips individual bytes *within* an otherwise
+/// full-length stream -- the checkpoint table and the token-record payload
+/// region -- so the byte count stays exactly right and only the content is
+/// wrong.
+///
+/// The codec has **no checksum** (see `codec.rs`'s module doc and
+/// `corrupt_input_is_an_error_not_a_panic`/`every_checkpoint_field_is_
+/// verified`: correctness rests on structural bounds checks -- varint
+/// well-formedness, checkpoint offsets strictly inside the token section,
+/// a `debug_assert`-only re-derivation of symbol ranges -- not on any
+/// content-integrity check). So a mid-stream bit flip is expected to land
+/// in one of three buckets, and this test asserts only what the codec
+/// actually promises:
+///   1. it still trips a structural bounds check and decoding errors out
+///      (e.g. a mangled checkpoint offset or a varint that no longer
+///      terminates within the buffer);
+///   2. it produces a **different but still successfully decoded** result
+///      (no checksum to catch "wrong but plausible" bytes) -- this is an
+///      accepted, documented limit of the format, not a bug;
+///   3. in a debug build, the independent range-consistency `debug_assert`
+///      in `codec::decode` may fire as a panic for a range-shaped
+///      corruption -- also documented, so this test runs the corrupted call
+///      through `catch_unwind` and treats a caught panic from *that specific,
+///      known assertion* as an accepted outcome, while any *other* panic
+///      (a real out-of-bounds/UB-shaped bug) fails the test loudly.
+///
+/// Across every mutation this test tries, no call ever panics for a reason
+/// other than that documented debug-only assertion, and no out-of-range
+/// index/slice access occurs (Rust's bounds-checked indexing would itself
+/// panic on that, so the `catch_unwind` net also covers that case).
+#[test]
+fn mid_stream_corruption_never_panics_and_documents_no_checksum_guarantee() {
+    let n = 3 * codec::CHECKPOINT_EVERY + 7;
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("b.redb")).unwrap();
+    s.ingest_file("o", "r", "x.rs", "rust", &many_tokens_ext(n))
+        .unwrap();
+    let any_tok = s.file_tokens("o", "r", "x.rs").unwrap().unwrap()[0].id;
+    let file = (any_tok >> 32) & 0x3fff_ffff;
+    let sym_id = (1u64 << 62) | (file << 32);
+    let last_tok_id = s.file_tokens("o", "r", "x.rs").unwrap().unwrap()[n - 1].id;
+
+    let good = {
+        let rt = s.db.begin_read().unwrap();
+        let t = rt.open_table(crate::v2::STREAMS).unwrap();
+        t.get(file).unwrap().unwrap().value().to_vec()
+    };
+    assert!(
+        good.len() > 4 * codec::CHECKPOINT_EVERY,
+        "test wants a stream with real checkpoint/payload bytes to mutate"
+    );
+
+    let set_stream = |bytes: &[u8]| {
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut t = wt.open_table(crate::v2::STREAMS).unwrap();
+            t.insert(file, bytes).unwrap();
+        }
+        wt.commit().unwrap();
+    };
+
+    let mut clean_errors = 0usize;
+    let mut wrong_but_no_error = 0usize;
+    let mut known_debug_assert_panics = 0usize;
+
+    // Flip one byte (XOR 0xff, keeping the length identical) at a spread of
+    // offsets across the whole stream -- header, checkpoint table and deep
+    // into the token payload -- rather than only near the start.
+    let offsets: Vec<usize> = (0..good.len()).step_by(7).collect();
+    for &off in &offsets {
+        let mut bytes = good.clone();
+        bytes[off] ^= 0xff;
+        assert_eq!(bytes.len(), good.len(), "mutation must preserve length");
+        set_stream(&bytes);
+
+        // Run every `with_lazy`-backed call site through `catch_unwind` so a
+        // genuine out-of-bounds/UB-shaped panic is caught and reported
+        // (never silently swallowed), while a normal `Err(_)` or `Ok(_)`
+        // result is classified below.
+        let outcomes: Vec<(&str, std::thread::Result<Result<usize>>)> = vec![
+            (
+                "get(last_tok)",
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    s.get(last_tok_id).map(|o| o.is_some() as usize)
+                })),
+            ),
+            (
+                "ancestors(last_tok)",
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    s.ancestors(last_tok_id).map(|v| v.len())
+                })),
+            ),
+            (
+                "children(file)",
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    s.children(file).map(|v| v.len())
+                })),
+            ),
+            (
+                "descendants(file)",
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    s.descendants(file).map(|v| v.len())
+                })),
+            ),
+            (
+                "children(sym_id)",
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    s.children(sym_id).map(|v| v.len())
+                })),
+            ),
+            (
+                "descendants(sym_id)",
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    s.descendants(sym_id).map(|v| v.len())
+                })),
+            ),
+        ];
+
+        for (label, outcome) in outcomes {
+            match outcome {
+                Ok(Ok(_)) => wrong_but_no_error += 1,
+                Ok(Err(_)) => clean_errors += 1,
+                Err(payload) => {
+                    // Only the documented, debug-only range-consistency
+                    // `debug_assert` in `codec::decode` (message contains
+                    // "does not match", see `debug_assert_catches_a_
+                    // corrupted_dense_range` in codec.rs) is an accepted
+                    // panic here. Note the call sites above go through
+                    // `decode_lazy`, not `decode`, and only `get`/`ancestors`/
+                    // `children`/`descendants`'s *fallback* paths (not
+                    // exercised by a dense file like this one) call `decode`
+                    // directly -- so in practice this branch should not be
+                    // hit for this test's dense file, and any panic here is
+                    // reported loudly rather than assumed benign.
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    assert!(
+                        msg.contains("does not match"),
+                        "UNEXPECTED PANIC at mutated offset {off} (byte {orig:#04x} -> {new:#04x}) \
+                         via {label}: {msg}\n\
+                         This looks like a real out-of-bounds/UB-shaped bug from mid-stream \
+                         corruption, not the documented debug-only range-consistency assert. \
+                         Reporting per the issue #66 instructions instead of silently accepting it.",
+                        orig = good[off],
+                        new = bytes[off],
+                    );
+                    known_debug_assert_panics += 1;
+                }
+            }
+        }
+    }
+
+    // Restore the original bytes: proves nothing else about the store broke,
+    // and that every mutation above was genuinely a corruption, not some
+    // unrelated failure.
+    set_stream(&good);
+    assert_eq!(
+        names(s.ancestors(last_tok_id).unwrap()),
+        ["S", "x.rs", "r", "o"]
+    );
+    assert!(!s.children(file).unwrap().is_empty());
+    assert!(!s.descendants(sym_id).unwrap().is_empty());
+
+    // Document, rather than assert away, what mid-stream corruption actually
+    // does on this codec: some mutated offsets are caught as clean decode
+    // errors, some silently produce a different-but-plausible (no-checksum)
+    // result, and (only in debug builds, if a range field happened to be hit)
+    // some trip the documented independent-recomputation debug_assert. All
+    // three are legitimate given the codec's no-checksum design; what must
+    // never happen -- and did not happen across any of the offsets/call
+    // sites tried above -- is an unexplained panic or out-of-bounds read.
+    eprintln!(
+        "mid_stream_corruption_never_panics_and_documents_no_checksum_guarantee: \
+         {} clean errors, {} wrong-but-no-error (no checksum, by design), \
+         {} known debug_assert panics, across {} mutated offsets x 6 call sites",
+        clean_errors,
+        wrong_but_no_error,
+        known_debug_assert_panics,
+        offsets.len(),
+    );
+}
+
 #[test]
 fn vacuum_removes_only_dead_dictionary_terms() {
     let f = SymbolKind::Function;
