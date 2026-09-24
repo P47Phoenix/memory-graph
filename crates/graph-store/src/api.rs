@@ -42,8 +42,12 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// One file made ready by [`Store::prepare`] for [`Store::index_prepared`]:
 /// its normalized path, language and fingerprint, plus the extraction (or
 /// the per-file rejection, or a note that the stored copy is unchanged).
-/// Only meaningful to the store that prepared it.
+/// Commit it to the store, org and repo that prepared it: another org/repo
+/// is refused, and another store (with other extractor versions) would
+/// record a fingerprint its extractors did not produce.
 pub struct PreparedFile {
+    pub(crate) org: String,
+    pub(crate) repo: String,
     pub(crate) path: String,
     pub(crate) language: String,
     pub(crate) fingerprint: String,
@@ -53,8 +57,9 @@ pub struct PreparedFile {
 }
 
 pub(crate) enum Prepared {
-    /// The stored copy carried this fingerprint when prepared: not extracted.
-    Unchanged,
+    /// The stored copy carried this fingerprint when prepared: not
+    /// extracted. The source is kept in case it changed by commit time.
+    Unchanged(String),
     Extracted(Extraction),
     /// Not UTF-8, too large, or invalid spans: reported in the file's slot.
     Rejected(StoreError),
@@ -65,6 +70,10 @@ impl PreparedFile {
     pub fn path(&self) -> &str {
         &self.path
     }
+    /// The language detected (or given), lowercased.
+    pub fn language(&self) -> &str {
+        &self.language
+    }
     /// Source size in bytes.
     pub fn bytes_len(&self) -> usize {
         self.bytes_len
@@ -72,9 +81,15 @@ impl PreparedFile {
     /// Whether `prepare` skipped extraction because the stored copy was
     /// unchanged.
     pub fn is_unchanged(&self) -> bool {
-        matches!(self.work, Prepared::Unchanged)
+        matches!(self.work, Prepared::Unchanged(_))
     }
 }
+
+// Prepared on worker threads, committed on the writer's.
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<PreparedFile>();
+};
 
 /// One offset/limit page of a paged traversal (ADR 0003 story 11:
 /// [`StoreRead::children_page`], [`StoreRead::descendants_page`]).
@@ -311,9 +326,11 @@ pub trait Store: StoreRead + Send + Sync {
     /// The committing half: store prepared files exactly as `index_batch`
     /// would have stored the same inputs (same transactions, outcomes in
     /// input order, same atomicity). The unchanged check is re-run
-    /// authoritatively inside the transaction. A file prepared as unchanged
-    /// that has changed since yields a per-file [`StoreError::Stale`] and is
-    /// not written: prepare it again with `reindex` and commit it again.
+    /// authoritatively inside the transaction; a file prepared as unchanged
+    /// that has changed since (another writer, or the same path earlier in
+    /// the batch) is extracted then. `opts` should match `prepare`'s. Files
+    /// prepared for another org/repo make the call fail
+    /// ([`StoreError::Rejected`]).
     fn index_prepared(
         &self,
         org: &str,

@@ -107,12 +107,6 @@ pub enum StoreError {
         "snapshot expired after {age_secs}s (max age {max_age_secs}s); open a new snapshot with Store::snapshot"
     )]
     SnapshotExpired { age_secs: u64, max_age_secs: u64 },
-    /// [`Store::index_prepared`] was handed a file that [`Store::prepare`]
-    /// found unchanged, but it had changed in the store by commit time, so
-    /// there is no extraction to store. Nothing was written for that file;
-    /// prepare it again (with `reindex`) and commit it again.
-    #[error("stale prepared file: {0} changed since it was prepared")]
-    Stale(String),
 }
 
 impl<E: Into<redb::Error>> From<E> for StoreError {
@@ -252,18 +246,22 @@ pub(crate) fn stored_fingerprint_matches(
 /// `unchanged` (storage) is returned as `Err`.
 pub(crate) fn prepare_file(
     registry: &Registry,
+    org: &str,
+    repo: &str,
     f: &BatchFile<'_>,
     opts: IndexOptions,
     unchanged: impl FnOnce(&str, &str, &str) -> Result<bool>,
 ) -> Result<PreparedFile> {
     let path = normalize_path(f.path);
     let mut p = PreparedFile {
+        org: org.into(),
+        repo: repo.into(),
         path,
         language: String::new(),
         fingerprint: String::new(),
         bytes_len: f.bytes.len(),
         origin: f.origin.map(Into::into),
-        work: Prepared::Unchanged,
+        work: Prepared::Rejected(StoreError::Rejected(String::new())),
     };
     if f.bytes.len() > MAX_SOURCE_BYTES {
         p.work = Prepared::Rejected(StoreError::TooLarge(format!("`{}`", f.path)));
@@ -278,32 +276,53 @@ pub(crate) fn prepare_file(
         str::to_ascii_lowercase,
     );
     p.fingerprint = fingerprint(registry, f.bytes, &p.language);
-    if opts.reindex || !unchanged(&p.path, &p.language, &p.fingerprint)? {
-        let ex = registry.extract(&p.language, src);
-        // Validate here, off the write path, so a bad file only fails itself.
-        p.work = match validate_spans(&ex) {
-            Err(StoreError::InvalidSpan(why)) => {
-                Prepared::Rejected(StoreError::InvalidSpan(format!("`{}`: {why}", p.path)))
-            }
-            _ => Prepared::Extracted(ex),
-        };
-    }
+    p.work = if !opts.reindex && unchanged(&p.path, &p.language, &p.fingerprint)? {
+        // Keep the source: if the file changed by commit time, the commit
+        // extracts it after all (as `index_batch` would have).
+        Prepared::Unchanged(src.to_owned())
+    } else {
+        extract_checked(registry, &p.path, &p.language, src)
+    };
     Ok(p)
+}
+
+/// Extract and validate spans, so a bad file only fails itself.
+fn extract_checked(registry: &Registry, path: &str, lang: &str, src: &str) -> Prepared {
+    let ex = registry.extract(lang, src);
+    match validate_spans(&ex) {
+        Err(StoreError::InvalidSpan(why)) => {
+            Prepared::Rejected(StoreError::InvalidSpan(format!("`{path}`: {why}")))
+        }
+        _ => Prepared::Extracted(ex),
+    }
 }
 
 /// The committing half, inside the caller's write transaction: re-run the
 /// unchanged check authoritatively (the prepare-time one only saved an
-/// extraction), then store the extraction through `ingest`. `Ok(Err(_))` is
-/// a per-file outcome; `Err` is a storage error that aborts the transaction.
+/// extraction), then store the extraction through `ingest`, extracting now
+/// if a file prepared as unchanged has changed since (e.g. the same path
+/// earlier in the batch). `Ok(Err(_))` is a per-file outcome; `Err` is a
+/// storage error, or a file prepared for another org/repo, and aborts the
+/// transaction.
 pub(crate) fn commit_prepared(
     wt: &redb::WriteTransaction,
+    registry: &Registry,
     org: &str,
     repo: &str,
     mut p: PreparedFile,
     opts: IndexOptions,
     ingest: impl FnOnce(&PreparedFile, &Extraction) -> Result<IngestStats>,
 ) -> Result<Result<IngestStats>> {
-    let work = std::mem::replace(&mut p.work, Prepared::Unchanged);
+    if p.org != org || p.repo != repo {
+        return Err(StoreError::Rejected(format!(
+            "`{}` was prepared for {}/{}, not {org}/{repo}",
+            p.path, p.org, p.repo
+        )));
+    }
+    let work = std::mem::replace(
+        &mut p.work,
+        Prepared::Rejected(StoreError::Rejected(String::new())),
+    );
     if let Prepared::Rejected(e) = work {
         return Ok(Err(e));
     }
@@ -320,9 +339,14 @@ pub(crate) fn commit_prepared(
             return Ok(Ok(stats));
         }
     }
+    let work = match work {
+        Prepared::Unchanged(src) => extract_checked(registry, &p.path, &p.language, &src),
+        w => w,
+    };
     match work {
         Prepared::Extracted(ex) => Ok(Ok(ingest(&p, &ex)?)),
-        _ => Ok(Err(StoreError::Stale(format!("`{}`", p.path)))),
+        Prepared::Rejected(e) => Ok(Err(e)),
+        Prepared::Unchanged(_) => unreachable!("extracted above"),
     }
 }
 
@@ -1112,7 +1136,7 @@ impl RedbStore {
     ) -> Result<Vec<Result<IngestStats>>> {
         self.commit_each(org, repo, files.len(), opts, |wt, i| {
             let f = &files[i];
-            prepare_file(&self.registry, f, opts, |path, lang, fp| {
+            prepare_file(&self.registry, org, repo, f, opts, |path, lang, fp| {
                 Ok(Self::check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
             })
         })
@@ -1127,7 +1151,7 @@ impl RedbStore {
         f: &BatchFile<'_>,
         opts: IndexOptions,
     ) -> Result<PreparedFile> {
-        prepare_file(&self.registry, f, opts, |path, _, fp| {
+        prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
             stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
         })
     }
@@ -1164,17 +1188,25 @@ impl RedbStore {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let p = next(&wt, i)?;
-            out.push(commit_prepared(&wt, org, repo, p, opts, |p, ex| {
-                Self::ingest_validated(
-                    &wt,
-                    org,
-                    repo,
-                    &p.path,
-                    &p.language,
-                    ex,
-                    (p.origin.as_deref(), Some(&p.fingerprint)),
-                )
-            })?);
+            out.push(commit_prepared(
+                &wt,
+                &self.registry,
+                org,
+                repo,
+                p,
+                opts,
+                |p, ex| {
+                    Self::ingest_validated(
+                        &wt,
+                        org,
+                        repo,
+                        &p.path,
+                        &p.language,
+                        ex,
+                        (p.origin.as_deref(), Some(&p.fingerprint)),
+                    )
+                },
+            )?);
         }
         wt.commit()?;
         Ok(out)

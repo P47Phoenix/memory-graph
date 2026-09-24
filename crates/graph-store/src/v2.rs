@@ -2633,7 +2633,7 @@ impl V2Store {
     ) -> Result<Vec<Result<IngestStats>>> {
         self.commit_each(org, repo, files.len(), opts, |wt, i| {
             let f = &files[i];
-            prepare_file(&self.registry, f, opts, |path, lang, fp| {
+            prepare_file(&self.registry, org, repo, f, opts, |path, lang, fp| {
                 Ok(RedbStore::check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
             })
         })
@@ -2648,7 +2648,7 @@ impl V2Store {
         f: &BatchFile<'_>,
         opts: IndexOptions,
     ) -> Result<PreparedFile> {
-        prepare_file(&self.registry, f, opts, |path, _, fp| {
+        prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
             stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
         })
     }
@@ -2688,7 +2688,7 @@ impl V2Store {
         for i in 0..n {
             let p = next(&wt, i)?;
             let len = p.bytes_len;
-            let r = commit_prepared(&wt, org, repo, p, opts, |p, ex| {
+            let r = commit_prepared(&wt, &self.registry, org, repo, p, opts, |p, ex| {
                 Self::ingest_validated(
                     &wt,
                     org,
@@ -2981,7 +2981,9 @@ impl V2Store {
                 });
             }
         }
-        let mut ords: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Ordered, so postings are inserted in the same order every run and
+        // the file is byte-for-byte reproducible (whatever `--jobs` is).
+        let mut ords: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (i, t) in stream.tokens.iter().enumerate() {
             ords.entry(t.term).or_default().push(i);
         }

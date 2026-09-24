@@ -71,7 +71,15 @@ pub const CASES: &[(&str, Case)] = &[
     ("prepared_matches_batch", prepared_matches_batch),
     ("prepare_skips_unchanged", prepare_skips_unchanged),
     ("prepared_rejections_in_order", prepared_rejections_in_order),
-    ("prepared_stale_unchanged", prepared_stale_unchanged),
+    (
+        "prepared_changed_since_prepare",
+        prepared_changed_since_prepare,
+    ),
+    (
+        "prepared_changed_file_replaces",
+        prepared_changed_file_replaces,
+    ),
+    ("prepared_duplicate_paths", prepared_duplicate_paths),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1768,45 +1776,78 @@ fn prepared_rejections_in_order(h: &Harness) {
         .is_empty());
 }
 
-/// A file prepared as unchanged that changes before the commit is reported
-/// `Stale` and not written; re-preparing with `reindex` stores it.
-fn prepared_stale_unchanged(h: &Harness) {
+/// The commit-time check is the authority, both ways: a file prepared as
+/// unchanged that changed since is extracted and stored; a file prepared as
+/// changed that someone stored meanwhile is reported unchanged.
+fn prepared_changed_since_prepare(h: &Harness) {
     let s = open(h);
-    s.index_batch(
-        "o",
-        "r",
-        &[bf("a.txt", b"foo bar")],
-        IndexOptions::default(),
-    )
-    .unwrap();
-    let p = prepare_all(
-        &*s,
-        "r",
-        &[bf("a.txt", b"foo bar")],
-        IndexOptions::default(),
-    );
+    let d = IndexOptions::default();
+    s.index_batch("o", "r", &[bf("a.txt", b"foo bar")], d)
+        .unwrap();
+    let p = prepare_all(&*s, "r", &[bf("a.txt", b"foo bar")], d);
     assert!(p[0].is_unchanged());
     s.index_bytes("o", "r", "a.txt", b"foo CHANGED", Some("text"))
         .unwrap();
-    let out = s
-        .index_prepared("o", "r", p, IndexOptions::default())
-        .unwrap();
-    assert!(matches!(&out[0], Err(StoreError::Stale(m)) if m.contains("a.txt")));
-    assert_eq!(
-        s.search(&Query::new("CHANGED")).unwrap().len(),
-        1,
-        "untouched"
-    );
-    let p = prepare_all(
-        &*s,
-        "r",
-        &[bf("a.txt", b"foo bar")],
-        IndexOptions { reindex: true },
-    );
-    let out = s
-        .index_prepared("o", "r", p, IndexOptions::default())
-        .unwrap();
-    assert!(out[0].as_ref().unwrap().replaced);
+    let out = s.index_prepared("o", "r", p, d).unwrap();
+    let st = out[0].as_ref().unwrap();
+    assert!(st.replaced && !st.unchanged && st.tokens == 2, "{st:?}");
     assert_eq!(s.search(&Query::new("bar")).unwrap().len(), 1);
     assert_eq!(s.search(&Query::new("CHANGED")).unwrap().len(), 0);
+
+    let p = prepare_all(&*s, "r", &[bf("a.txt", b"foo new")], d);
+    assert!(!p[0].is_unchanged());
+    s.index_batch("o", "r", &[bf("a.txt", b"foo new")], d)
+        .unwrap();
+    let out = s.index_prepared("o", "r", p, d).unwrap();
+    assert!(out[0].as_ref().unwrap().unchanged, "stored meanwhile");
+}
+
+/// Editing a stored file and preparing it without `reindex` extracts it and
+/// the commit replaces the stored copy (the everyday incremental case).
+fn prepared_changed_file_replaces(h: &Harness) {
+    let s = open(h);
+    let d = IndexOptions::default();
+    s.index_batch("o", "r", &[bf("a.txt", b"foo")], d).unwrap();
+    let p = prepare_all(&*s, "r", &[bf("a.txt", b"foo bar")], d);
+    assert!(!p[0].is_unchanged());
+    assert_eq!(p[0].language(), "text");
+    let out = s.index_prepared("o", "r", p, d).unwrap();
+    let st = out[0].as_ref().unwrap();
+    assert!(st.replaced && !st.unchanged, "{st:?}");
+    assert_eq!(s.search(&Query::new("bar")).unwrap().len(), 1);
+}
+
+/// The same path twice in one batch (`./x` normalizes to `x`): the prepared
+/// path stores what `index_batch` stores, the last copy winning.
+fn prepared_duplicate_paths(h: &Harness) {
+    let s = open(h);
+    let d = IndexOptions::default();
+    for repo in ["a", "b"] {
+        s.index_batch("o", repo, &[bf("x.txt", b"foo B")], d)
+            .unwrap();
+    }
+    let files = [bf("x.txt", b"foo A"), bf("./x.txt", b"foo B")];
+    let batch = s.index_batch("o", "a", &files, d).unwrap();
+    let p = prepare_all(&*s, "b", &files, d);
+    let prepared = s.index_prepared("o", "b", p, d).unwrap();
+    let (x, y): (Vec<_>, Vec<_>) = (
+        batch.iter().map(stats_proj).collect(),
+        prepared.iter().map(stats_proj).collect(),
+    );
+    assert_eq!(x.len(), 2);
+    assert_eq!(
+        x.iter().map(|v| v.replace("\"a\"", "")).collect::<Vec<_>>(),
+        y.iter().map(|v| v.replace("\"b\"", "")).collect::<Vec<_>>()
+    );
+    for repo in ["a", "b"] {
+        let toks = s.file_tokens("o", repo, "x.txt").unwrap().unwrap();
+        assert_eq!(toks[1].name, "B", "{repo}: last copy wins");
+    }
+    // Committing to another repo than the one prepared for is refused.
+    let p = prepare_all(&*s, "b", &[bf("y.txt", b"y")], d);
+    assert!(matches!(
+        s.index_prepared("o", "a", p, d),
+        Err(StoreError::Rejected(_))
+    ));
+    assert!(s.file_tokens("o", "a", "y.txt").unwrap().is_none());
 }
