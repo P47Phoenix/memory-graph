@@ -399,6 +399,21 @@ fn every_parsed_token_is_stored() {
         cs_symbols > 500,
         "C# extractor found only {cs_symbols} symbols"
     );
+    // ASP.NET markup: server controls and directives on a real site.
+    let mut q = graph_store::SymbolQuery::new("containerPlaceHolder");
+    q.language = Some("aspx".into());
+    let hits = store.search_symbols(&q).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].lang_kind.as_deref(), Some("control"));
+    assert_eq!(hits[0].file, "web/UserControls/PersonControl.ascx");
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("aspx".into());
+    q.repo = Some("webforms".into());
+    let aspx = store.search_symbols(&q).unwrap();
+    let kinds: BTreeSet<_> = aspx.iter().filter_map(|h| h.lang_kind.clone()).collect();
+    for k in ["directive", "control", "binding"] {
+        assert!(kinds.contains(k), "no aspx {k} symbol: {kinds:?}");
+    }
     // Cross-repo, cross-language search works on real code.
     let hits = store.search(&Query::new("ITransport")).unwrap();
     let repos: BTreeSet<_> = hits.iter().filter_map(|h| h.repo.clone()).collect();
@@ -508,8 +523,8 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 /// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
-    const EXPECTED_FILES: usize = 604;
-    const EXPECTED_HASH: u64 = 5439090845201774130;
+    const EXPECTED_FILES: usize = 623;
+    const EXPECTED_HASH: u64 = 9382767952147431474;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());
