@@ -14,8 +14,16 @@
 //!
 //! A declaration's span runs from its first token (attributes and modifiers
 //! included) through its closing `}` or `;`. Method bodies are not scanned
-//! (no local functions or variables). Odd input never sets `has_errors`: the
-//! scanner stops early and returns the symbols found so far.
+//! (no local functions or variables). Odd input never sets `has_errors`.
+//!
+//! Known limits: preprocessor lines are dropped, so when both `#if`/`#else`
+//! branches open a brace the braces are unbalanced; an unmatched `{` then
+//! runs to the end of its enclosing range, so later declarations are still
+//! found (possibly nested one level too deep). A multi-declarator field
+//! (`int x = 1, y = 2;`) yields one symbol, named by its first declarator;
+//! fixed-size buffers (`fixed byte b[4];`) and top-level local functions are
+//! not symbols; a string nested inside an interpolation hole (`$"{"x"}"`)
+//! ends the literal early (a tokenizer limit).
 use graph_core::scan::{matching_close, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -181,7 +189,9 @@ impl Scanner<'_> {
                 _ => {}
             }
             let Some((end, next)) = self.header_end(c, hi) else {
-                return;
+                // Unbalanced input: resynchronize one token later.
+                c += 1;
+                continue;
             };
             let file_scoped =
                 matches!(end, End::Semi { .. }) && (c..next).any(|k| self.text(k) == "namespace");
@@ -198,14 +208,37 @@ impl Scanner<'_> {
     /// and the code position after it; `None` if input is unbalanced or ends.
     fn header_end(&self, start: usize, hi: usize) -> Option<(End, usize)> {
         let mut c = start;
+        let mut operator = false;
         while c < hi {
             match self.text(c) {
                 "(" | "[" => c = self.close_of(c)? + 1,
+                "operator" => {
+                    operator = true;
+                    c += 1;
+                }
+                // `int[] a = { 1 };`, `Action d = delegate { };`: a field
+                // initializer, not a body.
+                "=" if !operator && !self.is_arrow(c, hi) => {
+                    let (at, after) = self.expression_end(c, hi)?;
+                    return Some((End::Semi { at, arrow: false }, after));
+                }
                 "{" => {
-                    let close = self.close_of(c)?;
-                    if close >= hi {
-                        return None;
-                    }
+                    // An unmatched `{` (e.g. from both `#if` branches being
+                    // kept) runs to the end of the enclosing range, so the
+                    // declarations after it are still found.
+                    let close = match self.close_of(c) {
+                        Some(close) if close < hi => close,
+                        // `close` is exclusive here (the body is `open+1..hi`);
+                        // the span ends at the range's last token.
+                        _ => {
+                            let end = End::Block {
+                                open: c,
+                                close: hi,
+                                last: hi - 1,
+                            };
+                            return Some((end, hi));
+                        }
+                    };
                     // `int P { get; set; } = 1;` keeps its initializer.
                     let (mut last, mut next) = (close, close + 1);
                     if next < hi && self.text(next) == "=" && !self.is_arrow(next, hi) {
@@ -277,9 +310,17 @@ impl Scanner<'_> {
         let mut first_paren = None;
         let mut first_eq = None;
         let mut first_where = None;
+        let mut first_arrow = None;
         let mut c = h;
+        let mut operator = false;
         while c < head_end {
+            // Only the part before an expression body `=>` names things.
+            if self.is_arrow(c, head_end + 1) {
+                first_arrow = Some(c);
+                break;
+            }
             match self.text(c) {
+                "operator" => operator = true,
                 "(" | "[" => {
                     // A parameter list follows a name (or the `>` of generic
                     // arguments), not a modifier or nothing (tuple types).
@@ -296,17 +337,23 @@ impl Scanner<'_> {
                     };
                     continue;
                 }
-                "=" if first_eq.is_none() && !self.is_arrow(c, head_end + 1) => first_eq = Some(c),
+                "=" if first_eq.is_none() && !operator => first_eq = Some(c),
                 "where" if first_where.is_none() => first_where = Some(c),
                 _ => {}
             }
             c += 1;
         }
-        let name_end = [first_paren, first_eq, first_where, Some(head_end)]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(head_end);
+        let name_end = [
+            first_paren,
+            first_eq,
+            first_where,
+            first_arrow,
+            Some(head_end),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(head_end);
         let span_end = match *end {
             // A file-scoped namespace runs to the end of its body range.
             End::Semi { at, .. }
@@ -370,14 +417,14 @@ impl Scanner<'_> {
         // Type members.
         let is_event = self.words(h, name_end).any(|w| w == "event");
         if let Some(op) = (h..name_end).find(|&c| self.text(c) == "operator") {
-            let name: String = std::iter::once("operator")
-                .chain(
-                    (op + 1..name_end)
-                        .map(|c| self.text(c))
-                        .take_while(|t| *t != "("),
-                )
-                .collect::<Vec<_>>()
-                .join(" ");
+            // `operator ==`, `operator int`: adjacent tokens join without a space.
+            let mut name = String::from("operator");
+            for c in (op + 1..name_end).take_while(|&c| self.text(c) != "(") {
+                if self.tok(c - 1).span.end != self.tok(c).span.start || c == op + 1 {
+                    name.push(' ');
+                }
+                name.push_str(self.text(c));
+            }
             push(self, name, SymbolKind::Method, "operator");
         } else if (h..name_end)
             .any(|c| self.text(c) == "this" && c + 1 < head_end && self.text(c + 1) == "[")
