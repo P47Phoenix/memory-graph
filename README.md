@@ -17,19 +17,19 @@ python3 scripts/check-no-c-deps.py                 # pure-Rust gate, same as CI
 ```
 ## Docker
 
-A container image is published to GitHub Container Registry on every push to `main` and on every `v*` tag, for `linux/amd64` and `linux/arm64`: a static musl binary on an empty base (`FROM scratch`), no shell, about 5 MB. It runs as user `65532`, its working directory is `/data`, and the default `--db ./graph.redb` therefore lands on the `/data` volume.
+A container image is published to GitHub Container Registry on every push to `main` and on every `v*` tag, for `linux/amd64` and `linux/arm64`: a static musl binary on an empty base (`FROM scratch`), no shell, under 10 MB. It runs as user `65532`, its working directory is `/data`, and the default `--db ./graph.redb` therefore lands on the `/data` volume.
 
 ```sh
 docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph index --org acme --repo api /src
 docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph search foo --json
 docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph describe
-docker run --rm --memory=512m ghcr.io/p47phoenix/memory-graph sysinfo   # the cgroup limit sizes the memory budget for the container, not the host
+docker run --rm --memory=512m ghcr.io/p47phoenix/memory-graph sysinfo   # the cgroup limit sizes the memory budget for the container, not the host (on Docker Desktop the source reads `sysinfo(2)`: /proc/meminfo is unreadable to non-root there)
 docker build -t memory-graph .                                          # the same image, built locally (cross-compiled; no QEMU needed for arm64)
 ```
 
 A fresh named volume (`-v mg-data:/data`) is writable as is. To keep the database in a host directory instead, bind-mount it and run as its owner: `-v "$PWD/db:/data" --user "$(id -u):$(id -g)"`.
 
-Tags: `main` (moves with the branch), `sha-<short commit>`, and for a release `0.1.0`, `0.1` and `latest` (`latest` only ever points at a release, so it is absent until the first one). A release is cut by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0` (the workspace version in `Cargo.toml` is bumped by hand). Pull requests build the image and run its smoke test but never push. Workflow: `.github/workflows/docker.yml`.
+Tags: `main` (moves with the branch), `sha-<short commit>`, and for a release `0.1.0`, `0.1` and `latest` (`latest` only ever points at a release and skips prereleases such as `v0.2.0-rc1`, so it is absent until the first one). A release is cut by pushing a tag that matches the workspace version in `Cargo.toml` (bumped by hand; the workflow refuses a tag that does not match): `git tag v0.1.0 && git push origin v0.1.0`. Pull requests and manual runs build the image and run its smoke test but never push. Workflow: `.github/workflows/docker.yml`.
 
 Languages are detected per file (extension, filename such as `Makefile`, or a `#!` line), so a polyglot repo needs no flags; `describe` shows what was found (from a small counter catalog kept in step with every write, so it and filter validation cost O(repos), not O(tokens); databases written before it are upgraded in place on first open: that one-time backfill writes to the file, so it must be writable, and afterwards older builds refuse the database with a schema-version error), and `--language`/`--kind` values are checked against it. Language names are lowercased; a UTF-8 BOM is ignored; file paths are normalized (`./a.rs` = `a.rs`). Every language is tokenized by a generic fallback; symbols arrive with per-language extractors (later stories).
 

@@ -60,9 +60,11 @@ the cgroup v2/v1 memory limit when one is below physical RAM,
 
 `.github/workflows/docker.yml` builds the `Dockerfile` (a static musl
 `memory-graph` on `scratch`, cross-compiled for `linux/amd64` and
-`linux/arm64` without QEMU) on every pull request, push to `main` and `v*`
-tag, and pushes to `ghcr.io/p47phoenix/memory-graph` for the last two. Before
-the multi-arch build it loads the amd64 image and smoke-tests it: `sysinfo`
+`linux/arm64` without QEMU) on every pull request, push to `main`, `v*`
+tag and manual run, and a second job, reached only by the push events and the
+only one allowed to write packages, pushes both architectures to
+`ghcr.io/p47phoenix/memory-graph` (a `v*` tag must equal the `Cargo.toml`
+version or it refuses). The first job loads the amd64 image and smoke-tests it: `sysinfo`
 (and `sysinfo --json` through `scripts/check-probes.py`, once plainly and once
 under `docker run --memory=512m`, where the source must mention `cgroup` and
 the total must fit the limit), `index` of `crates/graph-core/src` from a

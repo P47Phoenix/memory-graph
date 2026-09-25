@@ -13,7 +13,9 @@
 # The default database path is ./graph.redb, and the working directory is
 # /data, so the database lands on the /data volume unless --db says otherwise.
 
-FROM --platform=$BUILDPLATFORM rust:1-bookworm AS build
+# Pinned to a minor so a rebuild of the same commit gets the same compiler
+# (Cargo.lock fixes the dependencies, --locked enforces it). Bump on purpose.
+FROM --platform=$BUILDPLATFORM rust:1.98-bookworm AS build
 ARG TARGETARCH
 WORKDIR /src
 
@@ -35,12 +37,15 @@ COPY examples ./examples
 
 # rust-lld ships with the toolchain (next to the host's rustlib) but is not
 # on PATH; link-self-contained brings rustc's own musl crt objects so no
-# cross gcc is needed. Registry and target caches are BuildKit cache mounts.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+# cross gcc is needed. The registry and target caches are BuildKit cache
+# mounts: they persist on a local builder, but CI's builder is ephemeral,
+# so there the whole layer is cached (type=gha) and any source change
+# recompiles both architectures.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,target=/src/target,id=memory-graph-target-$TARGETARCH \
     t="$(cat /rust-target)" \
  && export PATH="$(rustc --print target-libdir)/../bin:$PATH" \
- && export RUSTFLAGS="-C linker=rust-lld -C link-self-contained=yes -C target-feature=+crt-static" \
+ && export RUSTFLAGS="-C linker=rust-lld -C link-self-contained=yes -C target-feature=+crt-static -C strip=symbols" \
  && cargo build --release --locked -p graph-cli --target "$t" \
  && cp "target/$t/release/memory-graph" /memory-graph
 
