@@ -97,10 +97,11 @@ enum Cmd {
         /// committed in walk order by one writer, so the stored content is the same for any value
         #[arg(long, short = 'j', default_value_t = 0, hide_default_value = true)]
         jobs: usize,
-        /// Cap on source bytes read but not yet committed, e.g. 512M or 2G (default: an eighth of the
-        /// free memory, between 256M and 4G)
-        #[arg(long, value_parser = graph_cli::sysinfo::parse_size)]
-        memory: Option<u64>,
+        /// Cap on source bytes read but not yet committed: a fixed size (2G) or a share of the free
+        /// memory (25%, the default) re-sampled during the run and lowered under memory pressure; at
+        /// least 20% of RAM is always left for the OS. Also read from MEMORY_GRAPH_MEMORY
+        #[arg(long, env = "MEMORY_GRAPH_MEMORY", value_parser = graph_cli::sysinfo::parse_memory_spec)]
+        memory: Option<graph_cli::sysinfo::MemorySpec>,
         /// Commit fixed batches (256 files / 32 MiB) instead of everything ready, so the database file is
         /// byte-for-byte reproducible on any machine (slower when the writer is the bottleneck)
         #[arg(long)]

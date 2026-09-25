@@ -49,9 +49,10 @@ pub struct DirOpts<'a> {
     /// Parsing threads; 0 sizes from the CPUs. Files are committed in walk
     /// order whatever the value, so the stored content is the same.
     pub jobs: usize,
-    /// Cap on source bytes in flight (read, not yet committed); `None` sizes
-    /// it from the free memory.
-    pub memory: Option<u64>,
+    /// Cap on source bytes in flight (read, not yet committed): a fixed size,
+    /// or a share of the free memory followed during the run; `None` means
+    /// the default share (see `sysinfo::DEFAULT_FRACTION`).
+    pub memory: Option<sysinfo::MemorySpec>,
     /// Commit the fixed batches of earlier releases (256 files / 32 MiB)
     /// instead of everything ready, so the database file is byte-for-byte
     /// the same on any machine.
@@ -463,12 +464,24 @@ fn run_pipeline(
         }
         drop((job_rx, res_tx));
         let finished = &finished;
+        // Sampler + display: every 125 ms re-read the machine's memory and
+        // move the budget (unless `--memory` fixed it), then redraw.
         sc.spawn(move || {
-            if display.is_hidden() {
-                return;
-            }
+            let mut policy = board.sizing.policy.clone();
+            let dynamic = matches!(policy.spec, sysinfo::MemorySpec::Fraction(_));
+            let mut tick = 0u32;
             while !finished.load(Relaxed) {
-                display.draw(&board.view());
+                if dynamic && tick.is_multiple_of(2) {
+                    let m = sysinfo::sample_memory();
+                    *board.memory.lock().unwrap_or_else(|e| e.into_inner()) = m;
+                    if let Some(d) = policy.update(m.as_ref(), board.budget.used()) {
+                        board.budget.set_cap(d.cap, &d.reason, d.under_pressure);
+                    }
+                }
+                tick = tick.wrapping_add(1);
+                if !display.is_hidden() {
+                    display.draw(&board.view());
+                }
                 std::thread::sleep(std::time::Duration::from_millis(125));
             }
             display.finish();
@@ -498,10 +511,10 @@ fn commit_all(
     let mut next = 0u64;
     let mut pending: Vec<(String, PreparedFile)> = Vec::new();
     let (mut pending_bytes, mut held) = (0u64, 0u64);
-    // A group commit takes at most half the budget, so parsing can refill
-    // the other half meanwhile.
-    let group_cap = (board.budget.cap() / 2).max(1);
     loop {
+        // A group commit takes at most half the budget (as it is right now),
+        // so parsing can refill the other half meanwhile.
+        let group_cap = (board.budget.cap() / 2).max(1);
         // Take everything that has arrived.
         for (seq, oc, size) in res_rx.try_iter() {
             buf.insert(seq, (oc, size));
@@ -655,14 +668,15 @@ pub fn index_dir_with(
     let start = std::time::Instant::now();
     let store = open(o.db)?;
     let trace: Option<&'static Trace> = o.trace.map(|_| &*Box::leak(Box::new(Trace::new())));
-    let mut sizing = sysinfo::Sizing::detect(o.jobs, o.memory);
-    if o.deterministic {
-        // A fixed batch holds its files' bytes until it commits, so the
-        // budget must fit one whole batch plus the file that closes it.
-        sizing.memory_budget = sizing
-            .memory_budget
-            .max(BATCH_BYTES as u64 + o.max_file_size);
-    }
+    // A fixed batch holds its files' bytes until it commits, so in
+    // deterministic mode the budget must always fit one whole batch plus the
+    // file that closes it.
+    let floor = if o.deterministic {
+        BATCH_BYTES as u64 + o.max_file_size
+    } else {
+        1
+    };
+    let sizing = sysinfo::Sizing::detect(o.jobs, o.memory, floor);
     let board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
     let run = run_pipeline(&*store, &o, &board, display);
     let view = board.view();
