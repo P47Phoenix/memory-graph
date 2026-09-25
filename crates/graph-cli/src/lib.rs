@@ -4,8 +4,12 @@ use graph_store::{IndexOptions, PreparedFile, Store, ORIGIN_DIRECTORY};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-mod progress;
-pub use progress::Progress;
+pub mod dataflow;
+pub mod progress;
+pub mod sysinfo;
+use dataflow::Trace;
+use progress::{Board, Display};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 /// Every extractor compiled into this build, one per enabled `lang-*` Cargo
 /// feature. Third-party languages register their own `Extractor` the same
@@ -42,9 +46,21 @@ pub struct DirOpts<'a> {
     pub prune: bool,
     pub force: bool,
     pub reindex: bool,
-    /// Parsing threads; 0 means one per available CPU. The database is the
-    /// same for any value: files are committed in walk order.
+    /// Parsing threads; 0 sizes from the CPUs. Files are committed in walk
+    /// order whatever the value, so the stored content is the same.
     pub jobs: usize,
+    /// Cap on source bytes in flight (read, not yet committed); `None` sizes
+    /// it from the free memory.
+    pub memory: Option<u64>,
+    /// Commit the fixed batches of earlier releases (256 files / 32 MiB)
+    /// instead of everything ready, so the database file is byte-for-byte
+    /// the same on any machine.
+    pub deterministic: bool,
+    /// Print a per-stage time table on stderr at the end (and add `stats` to
+    /// the `json` summary).
+    pub stats: bool,
+    /// Write a Chrome / Perfetto trace of the run here.
+    pub trace: Option<&'a std::path::Path>,
     /// Live progress on stderr: `Some(true)` shows it even with `json`,
     /// `Some(false)` disables it, `None` shows it when `json` is off. It is
     /// never drawn when stderr is not a terminal.
@@ -146,8 +162,9 @@ fn flush_batch(
 
 /// One walk entry, kept in walk order.
 enum Item {
-    /// A regular file to read and prepare: its relative path and full path.
-    File(String, std::path::PathBuf),
+    /// A regular file to read and prepare: relative path, full path, and the
+    /// bytes it will take (its size, capped at `max_file_size`).
+    File(String, std::path::PathBuf, u64),
     /// Skipped during the walk; `unreadable` blocks `--prune`.
     Skip {
         reason: &'static str,
@@ -167,10 +184,17 @@ enum Outcome {
 }
 
 /// Read one file (enforcing the size cap while reading, so a file that grows
-/// after the walk cannot exhaust memory), reject binaries, then `prepare` it.
-fn read_and_prepare(store: &dyn Store, o: &DirOpts, item: &Item) -> Result<Outcome> {
+/// after the walk cannot exhaust memory), reject binaries, then `prepare` it,
+/// reporting each step as parse thread `k`.
+fn read_and_prepare(
+    store: &dyn Store,
+    o: &DirOpts,
+    item: &Item,
+    board: &Board,
+    k: usize,
+) -> Result<Outcome> {
     let (rel, path) = match item {
-        Item::File(rel, path) => (rel, path),
+        Item::File(rel, path, _) => (rel, path),
         Item::Skip {
             reason,
             what,
@@ -191,9 +215,11 @@ fn read_and_prepare(store: &dyn Store, o: &DirOpts, item: &Item) -> Result<Outco
         })
     };
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(path).and_then(|f| {
-        f.take(o.max_file_size.saturating_add(1))
-            .read_to_end(&mut bytes)
+    let read = board.parse.busy(k, "reading", rel, || {
+        std::fs::File::open(path).and_then(|f| {
+            f.take(o.max_file_size.saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
     });
     if read.is_err() {
         return skip("unreadable", true);
@@ -210,85 +236,28 @@ fn read_and_prepare(store: &dyn Store, o: &DirOpts, item: &Item) -> Result<Outco
         language: None,
         origin: Some(ORIGIN_DIRECTORY),
     };
-    let p = store
-        .prepare(o.org, o.repo, &file, IndexOptions { reindex: o.reindex })
+    let p = board
+        .parse
+        .busy(k, "parsing", rel, || {
+            store.prepare(o.org, o.repo, &file, IndexOptions { reindex: o.reindex })
+        })
         .with_context(|| format!("database error while preparing `{rel}`"))?;
     Ok(Outcome::Prepared(rel.clone(), p))
 }
 
-/// `read_and_prepare` for worker `k` (shown on its progress line), with any
-/// panic turned into an error, so one bad file cannot wedge the pipeline.
-fn work(
-    store: &dyn Store,
-    o: &DirOpts,
-    item: &Item,
-    k: usize,
-    progress: &Progress,
-) -> Result<Outcome> {
+/// `read_and_prepare` with any panic turned into an error, so one bad file
+/// cannot wedge the pipeline.
+fn work(store: &dyn Store, o: &DirOpts, item: &Item, board: &Board, k: usize) -> Result<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        progress.worker(k, item_name(item));
-        let r = read_and_prepare(store, o, item);
-        progress.worker(k, None);
-        r
+        read_and_prepare(store, o, item, board, k)
     }))
     .unwrap_or_else(|_| {
         let what = match item {
-            Item::File(rel, _) => rel.as_str(),
+            Item::File(rel, _, _) => rel.as_str(),
             Item::Skip { what, .. } => what.as_str(),
         };
         Err(anyhow::anyhow!("indexing `{what}` panicked"))
     })
-}
-
-/// The single writer: takes outcomes in walk order, groups them into batches
-/// and commits each batch in one `index_prepared` call.
-struct Writer<'a> {
-    store: &'a dyn Store,
-    o: &'a DirOpts<'a>,
-    tally: Tally,
-    skipped: BTreeMap<String, Vec<String>>,
-    walk_errors: bool,
-    pending: Vec<(String, PreparedFile)>,
-    pending_bytes: usize,
-    progress: &'a Progress,
-}
-
-impl Writer<'_> {
-    fn take(&mut self, oc: Outcome) -> Result<()> {
-        match oc {
-            Outcome::Skip {
-                reason,
-                what,
-                unreadable,
-            } => {
-                self.walk_errors |= unreadable;
-                self.skipped.entry(reason.into()).or_default().push(what);
-                self.progress.skipped(1);
-            }
-            Outcome::Prepared(rel, p) => {
-                self.progress.read_bytes(p.bytes_len() as u64);
-                self.pending_bytes += p.bytes_len();
-                self.pending.push((rel, p));
-                if self.pending.len() >= BATCH_FILES || self.pending_bytes >= BATCH_BYTES {
-                    self.flush()?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        let n = self.pending.len();
-        let (skipped, failed) = (self.tally.skipped_n(), self.tally.failed.len());
-        flush_batch(self.store, self.o, &mut self.pending, &mut self.tally)?;
-        self.pending_bytes = 0;
-        self.progress.committed(
-            n,
-            self.tally.skipped_n() - skipped,
-            self.tally.failed.len() - failed,
-        );
-        Ok(())
-    }
 }
 
 impl Tally {
@@ -297,94 +266,356 @@ impl Tally {
     }
 }
 
-/// Resolve `--jobs`: 0 means one per available CPU.
-pub fn resolve_jobs(jobs: usize) -> usize {
-    if jobs > 0 {
-        jobs
-    } else {
-        std::thread::available_parallelism().map_or(1, usize::from)
-    }
+/// What the committing stage collected.
+#[derive(Default)]
+struct Collected {
+    tally: Tally,
+    skipped: BTreeMap<String, Vec<String>>,
+    walk_errors: bool,
 }
 
-/// Prepare `items` on `jobs` threads and hand the outcomes to `w` in walk
-/// order. Workers pull sequence numbers from a queue the writer refills as it
-/// consumes, so at most `window` outcomes exist at once (memory stays
-/// bounded however far a slow file holds up the reorder buffer).
+/// Walk `o.dir` in path order and stream every entry, numbered, to `tx`.
+fn walk(
+    o: &DirOpts,
+    board: &Board,
+    tx: crossbeam_channel::Sender<(u64, Item)>,
+    cancel: &AtomicBool,
+) {
+    let db_meta = std::fs::metadata(o.db).ok();
+    let db_canon = o.db.canonicalize().ok();
+    let db_name = o.db.file_name();
+    // Only the directory's own .gitignore files (and parents') apply: global
+    // git config, .git/info/exclude and .ignore files would make results
+    // differ between machines.
+    let walker = ignore::WalkBuilder::new(o.dir)
+        .hidden(false)
+        .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    let dir = o.dir.display().to_string();
+    board.walk.busy(0, "walking", &dir, || {
+        let mut seq = 0u64;
+        let mut send = |item: Item| {
+            let size = match &item {
+                Item::File(_, _, n) => *n,
+                Item::Skip { .. } => 0,
+            };
+            board.found_bytes.fetch_add(size, Relaxed);
+            board.found.fetch_add(1, Relaxed);
+            board.walk.count(1, size);
+            let ok = tx.send((seq, item)).is_ok();
+            seq += 1;
+            ok
+        };
+        for entry in walker {
+            if cancel.load(Relaxed) {
+                return;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    send(Item::Skip {
+                        reason: "unreadable",
+                        what: err.to_string(),
+                        unreadable: true,
+                    });
+                    continue;
+                }
+            };
+            if entry.depth() == 0 {
+                continue;
+            }
+            let ft = entry.file_type();
+            let rel = entry.path().strip_prefix(o.dir).unwrap_or(entry.path());
+            let skip = |reason| Item::Skip {
+                reason,
+                what: rel.to_string_lossy().into_owned(),
+                unreadable: false,
+            };
+            let Some(ft) = ft else { continue };
+            let item = if ft.is_symlink() {
+                skip("symlink")
+            } else if ft.is_dir() {
+                continue;
+            } else if !ft.is_file() {
+                skip("not a regular file")
+            } else if let Some(rel_s) = rel.to_str().map(str::to_owned) {
+                match entry.metadata() {
+                    Err(_) => Item::Skip {
+                        reason: "unreadable",
+                        what: rel_s,
+                        unreadable: true,
+                    },
+                    Ok(meta)
+                        if is_db_file(
+                            &meta,
+                            entry.path(),
+                            db_meta.as_ref(),
+                            db_canon.as_deref(),
+                            db_name,
+                        ) =>
+                    {
+                        Item::Skip {
+                            reason: "database file",
+                            what: rel_s,
+                            unreadable: false,
+                        }
+                    }
+                    Ok(meta) => {
+                        let size = meta.len().min(o.max_file_size);
+                        Item::File(rel_s, entry.into_path(), size)
+                    }
+                }
+            } else {
+                skip("non-UTF-8 path")
+            };
+            if !send(item) {
+                return;
+            }
+        }
+    });
+    board
+        .walk_done
+        .store(true, std::sync::atomic::Ordering::Release);
+    board.walk.done(0);
+}
+
+/// Streams the directory through walk → admit (memory budget) → parse ×N →
+/// commit (one writer, walk order). Stages never wait on each other except
+/// through the byte budget: parsed files pile up in memory, up to the
+/// budget, while the writer commits, and the writer commits everything that
+/// is ready (in walk order) in one transaction.
 fn run_pipeline(
     store: &dyn Store,
     o: &DirOpts,
-    items: &[Item],
-    jobs: usize,
-    w: &mut Writer,
-) -> Result<()> {
-    let progress = w.progress;
-    if jobs <= 1 {
-        for item in items {
-            w.take(work(store, o, item, 0, progress)?)?;
-        }
-        return Ok(());
-    }
-    let window = jobs * 4;
-    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<usize>(window);
-    let job_rx = std::sync::Mutex::new(job_rx);
-    let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, Result<Outcome>)>();
+    board: &Board,
+    display: &mut Display,
+) -> Result<Collected> {
+    let cancel = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    let (walk_tx, walk_rx) = crossbeam_channel::unbounded::<(u64, Item)>();
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<(u64, Item, u64)>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Result<Outcome>, u64)>();
+    let inflight = std::sync::Mutex::new(BTreeMap::<u64, String>::new());
+    let admit_blocked = AtomicBool::new(false);
     std::thread::scope(|sc| {
-        for k in 0..jobs {
-            let (job_rx, res_tx) = (&job_rx, res_tx.clone());
-            sc.spawn(move || loop {
-                let next = job_rx.lock().map(|rx| rx.recv());
-                let Ok(Ok(i)) = next else { break };
-                let oc = work(store, o, &items[i], k, progress);
-                if res_tx.send((i, oc)).is_err() {
-                    break;
-                }
-            });
-        }
-        drop(res_tx);
-        let mut sent = 0;
-        while sent < items.len().min(window) {
-            job_tx.send(sent).expect("workers outlive the queue");
-            sent += 1;
-        }
-        let mut buf: BTreeMap<usize, Result<Outcome>> = BTreeMap::new();
-        let mut next = 0;
-        let result = (|| -> Result<()> {
-            while next < items.len() {
-                let Ok((i, oc)) = res_rx.recv() else {
-                    bail!("indexing workers stopped unexpectedly");
+        let (cancel, board, inflight) = (&cancel, board, &inflight);
+        sc.spawn(move || walk(o, board, walk_tx, cancel));
+        // Admission: hold each file's bytes against the budget, in walk
+        // order, before it may be read (so the writer can always progress).
+        let admit_blocked = &admit_blocked;
+        sc.spawn(move || {
+            for (seq, item) in walk_rx {
+                let size = match &item {
+                    Item::File(_, _, n) => *n,
+                    Item::Skip { .. } => 0,
                 };
-                buf.insert(i, oc);
-                while let Some(oc) = buf.remove(&next) {
-                    next += 1;
-                    if sent < items.len() {
-                        // Never blocks: at most `window` jobs are outstanding.
-                        job_tx.send(sent).expect("workers outlive the queue");
-                        sent += 1;
-                    }
-                    w.take(oc?)?;
+                admit_blocked.store(true, Relaxed);
+                let ok = board.budget.acquire(size, cancel);
+                admit_blocked.store(false, Relaxed);
+                if !ok || job_tx.send((seq, item, size)).is_err() {
+                    return;
                 }
             }
-            Ok(())
-        })();
-        // Closing the queue stops the workers (after their current file).
-        drop(job_tx);
-        result
+        });
+        for k in 0..board.sizing.parse_threads {
+            let (job_rx, res_tx) = (job_rx.clone(), res_tx.clone());
+            sc.spawn(move || {
+                loop {
+                    let why = if admit_blocked.load(Relaxed) {
+                        "memory"
+                    } else {
+                        "input"
+                    };
+                    let next = if why == "memory" {
+                        board.parse.blocked(k, "memory budget", || job_rx.recv())
+                    } else {
+                        board.parse.starved(k, "files to parse", || job_rx.recv())
+                    };
+                    let Ok((seq, item, size)) = next else { break };
+                    if cancel.load(Relaxed) {
+                        break;
+                    }
+                    if let Item::File(rel, _, _) = &item {
+                        inflight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(seq, rel.clone());
+                    }
+                    let oc = work(store, o, &item, board, k);
+                    if matches!(oc, Ok(Outcome::Prepared(..))) {
+                        board.parse.count(1, size);
+                    }
+                    inflight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&seq);
+                    if res_tx.send((seq, oc, size)).is_err() {
+                        break;
+                    }
+                }
+                board.parse.done(k);
+            });
+        }
+        drop((job_rx, res_tx));
+        let finished = &finished;
+        sc.spawn(move || {
+            if display.is_hidden() {
+                return;
+            }
+            while !finished.load(Relaxed) {
+                display.draw(&board.view());
+                std::thread::sleep(std::time::Duration::from_millis(125));
+            }
+            display.finish();
+        });
+        let r = commit_all(store, o, board, res_rx, inflight);
+        // Stop every stage (after its current file) and wake budget waiters.
+        cancel.store(true, Relaxed);
+        board.budget.wake_all();
+        finished.store(true, Relaxed);
+        r
     })
 }
 
-fn item_name(item: &Item) -> Option<&str> {
-    match item {
-        Item::File(rel, _) => Some(rel),
-        Item::Skip { .. } => None,
+/// The single writer: takes outcomes in walk order and commits them. By
+/// default each transaction takes everything that is ready (group commit),
+/// so a slow disk gets bigger transactions and a fast one smaller, with no
+/// fixed batch size; `deterministic` keeps the fixed batches instead.
+fn commit_all(
+    store: &dyn Store,
+    o: &DirOpts,
+    board: &Board,
+    res_rx: crossbeam_channel::Receiver<(u64, Result<Outcome>, u64)>,
+    inflight: &std::sync::Mutex<BTreeMap<u64, String>>,
+) -> Result<Collected> {
+    let mut c = Collected::default();
+    let mut buf: BTreeMap<u64, (Result<Outcome>, u64)> = BTreeMap::new();
+    let mut next = 0u64;
+    let mut pending: Vec<(String, PreparedFile)> = Vec::new();
+    let (mut pending_bytes, mut held) = (0u64, 0u64);
+    // A group commit takes at most half the budget, so parsing can refill
+    // the other half meanwhile.
+    let group_cap = (board.budget.cap() / 2).max(1);
+    loop {
+        // Take everything that has arrived.
+        for (seq, oc, size) in res_rx.try_iter() {
+            buf.insert(seq, (oc, size));
+        }
+        while let Some((oc, size)) = buf.remove(&next) {
+            next += 1;
+            held += size;
+            match oc? {
+                Outcome::Skip {
+                    reason,
+                    what,
+                    unreadable,
+                } => {
+                    c.walk_errors |= unreadable;
+                    c.skipped.entry(reason.into()).or_default().push(what);
+                    board.skipped.fetch_add(1, Relaxed);
+                    board.handled.fetch_add(1, Relaxed);
+                }
+                Outcome::Prepared(rel, p) => {
+                    pending_bytes += p.bytes_len() as u64;
+                    pending.push((rel, p));
+                }
+            }
+            let full = if o.deterministic {
+                pending.len() >= BATCH_FILES || pending_bytes >= BATCH_BYTES as u64
+            } else {
+                pending_bytes >= group_cap
+            };
+            if full {
+                break;
+            }
+        }
+        let all_in = board.walk_done.load(std::sync::atomic::Ordering::Acquire)
+            && next == board.found.load(Relaxed);
+        let batch_full = if o.deterministic {
+            pending.len() >= BATCH_FILES || pending_bytes >= BATCH_BYTES as u64
+        } else {
+            !pending.is_empty()
+        };
+        if batch_full || (all_in && !pending.is_empty()) {
+            let n = pending.len();
+            let (skipped0, failed0) = (c.tally.skipped_n(), c.tally.failed.len());
+            let txn = board.txns.load(Relaxed) + 1;
+            let label = format!(
+                "txn {txn}: {n} files ({:.1} MB)",
+                pending_bytes as f64 / 1048576.0
+            );
+            let t0 = std::time::Instant::now();
+            board.commit.busy(0, "committing", &label, || {
+                flush_batch(store, o, &mut pending, &mut c.tally)
+            })?;
+            board.txns.store(txn, Relaxed);
+            board
+                .last_txn
+                .store(t0.elapsed().as_millis() as u64, Relaxed);
+            let (sk, fa) = (
+                c.tally.skipped_n() - skipped0,
+                c.tally.failed.len() - failed0,
+            );
+            board.commit.count((n - sk - fa) as u64, pending_bytes);
+            board.skipped.fetch_add(sk as u64, Relaxed);
+            board.failed.fetch_add(fa as u64, Relaxed);
+            board.handled.fetch_add(n as u64, Relaxed);
+            pending_bytes = 0;
+        }
+        if pending.is_empty() {
+            board.handled_bytes.fetch_add(held, Relaxed);
+            board.budget.release(held);
+            held = 0;
+        }
+        if all_in && pending.is_empty() && buf.is_empty() {
+            board.commit.done(0);
+            return Ok(c);
+        }
+        if buf.contains_key(&next) {
+            continue;
+        }
+        // Wait for the next file in walk order.
+        let on = inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&next)
+            .cloned()
+            .unwrap_or_else(|| {
+                if board.walk_done.load(std::sync::atomic::Ordering::Acquire) {
+                    "parsed files".into()
+                } else {
+                    "the walk".into()
+                }
+            });
+        match board.commit.starved(0, on, || {
+            res_rx.recv_timeout(std::time::Duration::from_millis(50))
+        }) {
+            Ok((seq, oc, size)) => {
+                buf.insert(seq, (oc, size));
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                if !(board.walk_done.load(std::sync::atomic::Ordering::Acquire)
+                    && next == board.found.load(Relaxed))
+                {
+                    bail!("indexing workers stopped unexpectedly");
+                }
+            }
+        }
     }
 }
 
 /// Index every text file under `dir`. Paths are stored relative to `dir`.
 /// Per-file problems are counted as skips; only database failures abort.
 ///
-/// The directory is walked first (paths and sizes only), then files are read
-/// and prepared (parsed) on `jobs` threads while this thread commits them in
-/// walk order, in the same batches whatever `jobs` is.
+/// The directory streams through walk → parse (one thread per spare CPU) →
+/// commit (one writer, walk order), bounded by a memory budget sized from
+/// the machine; a live view on stderr shows what every stage is doing.
 pub fn index_dir(
     o: DirOpts,
     open: impl FnOnce(&std::path::Path) -> Result<Box<dyn Store>>,
@@ -394,22 +625,20 @@ pub fn index_dir(
     let show = o
         .progress
         .unwrap_or_else(|| !o.json && std::io::stderr().is_terminal());
-    let progress = if show {
-        Progress::stderr(&format!("{}/{}", o.org, o.repo))
+    let mut display = if show {
+        Display::stderr()
     } else {
-        Progress::hidden()
+        Display::hidden()
     };
-    let r = index_dir_with(o, open, out, &progress);
-    progress.finish();
-    r
+    index_dir_with(o, open, out, &mut display)
 }
 
-/// `index_dir` reporting to a caller-supplied `progress`.
+/// `index_dir` drawing on a caller-supplied `display`.
 pub fn index_dir_with(
     o: DirOpts,
     open: impl FnOnce(&std::path::Path) -> Result<Box<dyn Store>>,
     out: &mut dyn Write,
-    progress: &Progress,
+    display: &mut Display,
 ) -> Result<()> {
     if o.org.is_empty() || o.repo.is_empty() {
         bail!("--org and --repo must not be empty");
@@ -425,111 +654,30 @@ pub fn index_dir_with(
     }
     let start = std::time::Instant::now();
     let store = open(o.db)?;
-    let db_meta = std::fs::metadata(o.db).ok();
-    let db_canon = o.db.canonicalize().ok();
-    let db_name = o.db.file_name();
-    let mut items: Vec<Item> = Vec::new();
-    let mut total_bytes = 0u64;
-    // Only the directory's own .gitignore files (and parents') apply: global
-    // git config, .git/info/exclude and .ignore files would make results
-    // differ between machines.
-    let walker = ignore::WalkBuilder::new(o.dir)
-        .hidden(false)
-        .require_git(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .filter_entry(|e| e.file_name() != ".git")
-        .build();
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                items.push(Item::Skip {
-                    reason: "unreadable",
-                    what: err.to_string(),
-                    unreadable: true,
-                });
-                continue;
-            }
-        };
-        if entry.depth() == 0 {
-            continue;
-        }
-        let ft = entry.file_type();
-        let rel = entry.path().strip_prefix(o.dir).unwrap_or(entry.path());
-        let skip = |reason| Item::Skip {
-            reason,
-            what: rel.to_string_lossy().into_owned(),
-            unreadable: false,
-        };
-        let Some(ft) = ft else { continue };
-        if ft.is_symlink() {
-            items.push(skip("symlink"));
-            continue;
-        }
-        if ft.is_dir() {
-            continue;
-        }
-        if !ft.is_file() {
-            items.push(skip("not a regular file"));
-            continue;
-        }
-        let Some(rel_s) = rel.to_str().map(str::to_owned) else {
-            items.push(skip("non-UTF-8 path"));
-            continue;
-        };
-        let Ok(meta) = entry.metadata() else {
-            items.push(Item::Skip {
-                reason: "unreadable",
-                what: rel_s,
-                unreadable: true,
-            });
-            continue;
-        };
-        if is_db_file(
-            &meta,
-            entry.path(),
-            db_meta.as_ref(),
-            db_canon.as_deref(),
-            db_name,
-        ) {
-            items.push(Item::Skip {
-                reason: "database file",
-                what: rel_s,
-                unreadable: false,
-            });
-            continue;
-        }
-        total_bytes += meta.len().min(o.max_file_size);
-        items.push(Item::File(rel_s, entry.into_path()));
-        progress.walked(items.len());
+    let trace: Option<&'static Trace> = o.trace.map(|_| &*Box::leak(Box::new(Trace::new())));
+    let mut sizing = sysinfo::Sizing::detect(o.jobs, o.memory);
+    if o.deterministic {
+        // A fixed batch holds its files' bytes until it commits, so the
+        // budget must fit one whole batch plus the file that closes it.
+        sizing.memory_budget = sizing
+            .memory_budget
+            .max(BATCH_BYTES as u64 + o.max_file_size);
     }
-    progress.start(items.len(), total_bytes);
-    let mut w = Writer {
-        store: &*store,
-        o: &o,
-        tally: Tally::default(),
-        skipped: BTreeMap::new(),
-        walk_errors: false,
-        pending: Vec::new(),
-        pending_bytes: 0,
-        progress,
-    };
-    let jobs = resolve_jobs(o.jobs);
-    progress.set_workers(jobs);
-    run_pipeline(&*store, &o, &items, jobs, &mut w)?;
-    w.flush()?;
-    // Clear the live display before warnings and the summary are printed.
-    progress.finish();
-    let Writer {
+    let board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
+    let run = run_pipeline(&*store, &o, &board, display);
+    let view = board.view();
+    if let (Some(path), Some(t)) = (o.trace, trace) {
+        t.write(path)
+            .with_context(|| format!("cannot write trace `{}`", path.display()))?;
+    }
+    if o.stats && !o.json {
+        eprint!("{}", view.stats_table());
+    }
+    let Collected {
         tally,
         mut skipped,
         walk_errors,
-        ..
-    } = w;
-    drop(items);
+    } = run?;
     let Tally {
         files,
         unchanged,
@@ -575,6 +723,10 @@ pub fn index_dir_with(
             "failed": failed.len(),
             "failed_files": failed.iter().map(|(p, r)| serde_json::json!({"path": p, "reason": r})).collect::<Vec<_>>(),
         });
+        let mut summary = summary;
+        if o.stats {
+            summary["stats"] = view.stats_json();
+        }
         out!(out, "{}", serde_json::to_string(&summary)?);
     } else {
         out!(out,
