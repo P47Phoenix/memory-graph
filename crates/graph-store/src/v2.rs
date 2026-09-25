@@ -28,7 +28,7 @@ use crate::{
     SYMBOLS,
 };
 use graph_core::{
-    normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, SymbolKind,
+    normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, SymbolKind, TokenClass,
 };
 use redb::{
     Database, DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableMultimapTable,
@@ -2648,9 +2648,13 @@ impl V2Store {
         f: &BatchFile<'_>,
         opts: IndexOptions,
     ) -> Result<PreparedFile> {
-        prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
+        let mut p = prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
             stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
-        })
+        })?;
+        if let crate::api::Prepared::Extracted(ex) = &p.work {
+            p.v2 = Some(Box::new(V2Prep::build(ex)));
+        }
+        Ok(p)
     }
 
     /// See [`Store::index_prepared`]: the same chunked transactions and
@@ -2689,7 +2693,8 @@ impl V2Store {
             let p = next(&wt, i)?;
             let len = p.bytes_len;
             let r = commit_prepared(&wt, &self.registry, org, repo, p, opts, |p, ex| {
-                Self::ingest_validated(
+                let prep = p.v2.take();
+                Self::ingest_prepped(
                     &wt,
                     org,
                     repo,
@@ -2697,6 +2702,7 @@ impl V2Store {
                     &p.language,
                     ex,
                     (p.origin.as_deref(), Some(&p.fingerprint)),
+                    prep.map(|b| *b),
                 )
             })?;
             // Only stored (not skipped or rejected) files count to the chunk.
@@ -2839,7 +2845,23 @@ impl V2Store {
         path: &str,
         language: &str,
         ex: &Extraction,
+        meta: (Option<&str>, Option<&str>),
+    ) -> Result<IngestStats> {
+        Self::ingest_prepped(wt, org, repo, path, language, ex, meta, None)
+    }
+
+    /// Write an extraction whose spans `validate_spans` accepted, using the
+    /// `V2Prep` built while preparing (built here when there is none).
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_prepped(
+        wt: &redb::WriteTransaction,
+        org: &str,
+        repo: &str,
+        path: &str,
+        language: &str,
+        ex: &Extraction,
         (origin, fingerprint): (Option<&str>, Option<&str>),
+        prep: Option<V2Prep>,
     ) -> Result<IngestStats> {
         if org.is_empty() || repo.is_empty() {
             return Err(StoreError::Rejected(
@@ -2926,70 +2948,38 @@ impl V2Store {
         f.fingerprint = fingerprint.map(Into::into);
         w.nodes.insert(file_id, enc(&f).as_slice())?;
 
-        let mut syms: Vec<_> = ex.symbols.iter().collect();
-        syms.sort_by_key(|s| (s.span.start, std::cmp::Reverse(s.span.end)));
-        let mut toks: Vec<_> = ex.tokens.iter().collect();
-        toks.sort_by_key(|t| t.span.start);
-
-        let mut stream = Stream::default();
-        // Open-symbol stack: (symbol index, end).
-        let mut open: Vec<(u32, u32)> = Vec::new();
-        let (mut si, mut ti) = (0, 0);
-        while si < syms.len() || ti < toks.len() {
-            let take_sym =
-                si < syms.len() && (ti >= toks.len() || syms[si].span.start <= toks[ti].span.start);
-            let pos = if take_sym {
-                syms[si].span.start
-            } else {
-                toks[ti].span.start
-            };
-            while open.last().is_some_and(|&(_, end)| end <= pos) {
-                open.pop();
-            }
-            let parent = open.last().map(|&(i, _)| i);
-            if take_sym {
-                let s = syms[si];
-                si += 1;
-                let name = w.intern(&s.name, &mut next_term)?;
-                let lang_kind = match &s.lang_kind {
-                    Some(k) => Some(w.intern(k, &mut next_term)?),
-                    None => None,
-                };
-                let idx = stream.symbols.len();
-                stream.symbols.push(SymRec {
-                    name,
-                    kind: s.kind,
-                    lang_kind,
-                    parent,
-                    span: s.span,
-                    // `codec::encode` derives the real transitive range from
-                    // `stream.tokens`' parent chains; this value is ignored.
-                    toks: None,
-                });
-                w.sym_idx
-                    .insert(s.name.as_str(), sub_id(TAG_SYM, file_id, idx))?;
-                open.push((idx as u32, s.span.end));
-            } else {
-                let t = toks[ti];
-                ti += 1;
-                let term = w.intern(&t.text, &mut next_term)?;
-                stream.tokens.push(TokRec {
-                    term,
-                    class: t.class,
-                    parent,
-                    span: t.span,
-                });
-            }
+        let V2Prep {
+            terms,
+            mut stream,
+            postings,
+            tally_nodes,
+        } = prep.unwrap_or_else(|| V2Prep::build(ex));
+        // Intern each distinct term once, in first-use order: the ids come out
+        // exactly as interning every occurrence in stream order would give.
+        let ids = terms
+            .iter()
+            .map(|t| w.intern(t, &mut next_term))
+            .collect::<Result<Vec<u64>>>()?;
+        for (idx, s) in stream.symbols.iter_mut().enumerate() {
+            w.sym_idx.insert(
+                terms[s.name as usize].as_str(),
+                sub_id(TAG_SYM, file_id, idx),
+            )?;
+            s.name = ids[s.name as usize];
+            s.lang_kind = s.lang_kind.map(|k| ids[k as usize]);
         }
-        // Ordered, so postings are inserted in the same order every run and
-        // the file is byte-for-byte reproducible (whatever `--jobs` is).
-        let mut ords: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
-        for (i, t) in stream.tokens.iter().enumerate() {
-            ords.entry(t.term).or_default().push(i);
+        for t in &mut stream.tokens {
+            t.term = ids[t.term as usize];
         }
-        for (term, o) in ords {
-            w.post
-                .insert((term, file_id), codec::encode_posting(&o).as_slice())?;
+        // Inserted in term-id order, so the file is byte-for-byte
+        // reproducible (whatever `--jobs` is).
+        let mut postings: Vec<(u64, Vec<u8>)> = postings
+            .into_iter()
+            .map(|(local, bytes)| (ids[local as usize], bytes))
+            .collect();
+        postings.sort_by_key(|p| p.0);
+        for (term, bytes) in postings {
+            w.post.insert((term, file_id), bytes.as_slice())?;
         }
         w.streams
             .insert(file_id, codec::encode(&stream).as_slice())?;
@@ -3001,7 +2991,9 @@ impl V2Store {
         let cid = content_id(file_id);
         w.refs.insert(cid, 1)?;
         w.content_files.insert(cid, file_id)?;
-        w.tally_stream(&mut tally, &scope, file_id, &stream, 1)?;
+        for (n, count) in &tally_nodes {
+            tally.node(&scope, n, *count);
+        }
         w.meta.insert("next_id", next)?;
         w.meta.insert("next_term", next_term)?;
         tally.apply(&mut w.cat)?;
@@ -3200,5 +3192,127 @@ impl Store for V2Store {
     }
     fn vacuum(&self) -> Result<VacuumStats> {
         V2Store::vacuum(self)
+    }
+}
+
+/// The v2 per-file work that needs no database: done by `Store::prepare` on
+/// the parse threads, so the single writer only interns terms and inserts.
+pub(crate) struct V2Prep {
+    /// The file's distinct terms (token texts, symbol names and kinds), in
+    /// first-use order along the stream.
+    terms: Vec<String>,
+    /// The stream with `terms` indexes where term ids go.
+    stream: Stream,
+    /// Encoded posting list (token ordinals) per term index.
+    postings: Vec<(u64, Vec<u8>)>,
+    /// Catalog deltas: one sample node per symbol kind / token class, and
+    /// how many of them the file has.
+    tally_nodes: Vec<(Node, i64)>,
+}
+
+/// The file-local number of `t`, numbering new terms in first-use order.
+fn intern_local<'a>(t: &'a str, terms: &mut Vec<String>, local: &mut HashMap<&'a str, u64>) -> u64 {
+    *local.entry(t).or_insert_with(|| {
+        terms.push(t.to_string());
+        terms.len() as u64 - 1
+    })
+}
+
+impl V2Prep {
+    /// Walk symbols and tokens in span order (symbols first on ties, the
+    /// outermost first), nesting each under the innermost open symbol.
+    pub(crate) fn build(ex: &Extraction) -> Self {
+        let mut syms: Vec<_> = ex.symbols.iter().collect();
+        syms.sort_by_key(|s| (s.span.start, std::cmp::Reverse(s.span.end)));
+        let mut toks: Vec<_> = ex.tokens.iter().collect();
+        toks.sort_by_key(|t| t.span.start);
+
+        // File-local term numbers, in first-use order.
+        let mut terms: Vec<String> = Vec::new();
+        let mut local: HashMap<&str, u64> = HashMap::new();
+        let mut stream = Stream::default();
+        let mut open: Vec<(u32, u32)> = Vec::new();
+        let (mut si, mut ti) = (0, 0);
+        // Keyed by name (the kinds are not `Ord`), with the kind kept.
+        type SymKey = (&'static str, Option<String>);
+        let mut sym_counts: BTreeMap<SymKey, (SymbolKind, i64)> = BTreeMap::new();
+        let mut class_counts: BTreeMap<&'static str, (TokenClass, i64)> = BTreeMap::new();
+        while si < syms.len() || ti < toks.len() {
+            let take_sym =
+                si < syms.len() && (ti >= toks.len() || syms[si].span.start <= toks[ti].span.start);
+            let pos = if take_sym {
+                syms[si].span.start
+            } else {
+                toks[ti].span.start
+            };
+            while open.last().is_some_and(|&(_, end)| end <= pos) {
+                open.pop();
+            }
+            let parent = open.last().map(|&(i, _)| i);
+            if take_sym {
+                let s = syms[si];
+                si += 1;
+                let name = intern_local(&s.name, &mut terms, &mut local);
+                let lang_kind = s
+                    .lang_kind
+                    .as_deref()
+                    .map(|k| intern_local(k, &mut terms, &mut local));
+                sym_counts
+                    .entry((s.kind.as_str(), s.lang_kind.clone()))
+                    .or_insert((s.kind, 0))
+                    .1 += 1;
+                let idx = stream.symbols.len();
+                stream.symbols.push(SymRec {
+                    name,
+                    kind: s.kind,
+                    lang_kind,
+                    parent,
+                    span: s.span,
+                    // `codec::encode` derives the real transitive range from
+                    // `stream.tokens`' parent chains; this value is ignored.
+                    toks: None,
+                });
+                open.push((idx as u32, s.span.end));
+            } else {
+                let t = toks[ti];
+                ti += 1;
+                class_counts
+                    .entry(t.class.as_str())
+                    .or_insert((t.class, 0))
+                    .1 += 1;
+                stream.tokens.push(TokRec {
+                    term: intern_local(&t.text, &mut terms, &mut local),
+                    class: t.class,
+                    parent,
+                    span: t.span,
+                });
+            }
+        }
+        let mut ords: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (i, t) in stream.tokens.iter().enumerate() {
+            ords.entry(t.term).or_default().push(i);
+        }
+        let postings = ords
+            .into_iter()
+            .map(|(t, o)| (t, codec::encode_posting(&o)))
+            .collect();
+        let mut tally_nodes = Vec::new();
+        for ((_, lang_kind), (kind, n)) in sym_counts {
+            let mut node = blank(0, None, NodeKind::Symbol, String::new());
+            node.symbol_kind = Some(kind);
+            node.lang_kind = lang_kind;
+            tally_nodes.push((node, n));
+        }
+        for (_, (class, n)) in class_counts {
+            let mut node = blank(0, None, NodeKind::Token, String::new());
+            node.token_class = Some(class);
+            tally_nodes.push((node, n));
+        }
+        Self {
+            terms,
+            stream,
+            postings,
+            tally_nodes,
+        }
     }
 }
