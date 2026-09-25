@@ -113,12 +113,12 @@ fn database_size_stays_within_bounds_of_source_and_tokens() {
          {per_source:.2}x source, {per_token:.1} B/token"
     );
     assert!(
-        per_source <= 15.0,
-        "database is {per_source:.2}x its source ({db_bytes} B for {source_bytes} B); limit 15.0x"
+        per_source <= 13.0,
+        "database is {per_source:.2}x its source ({db_bytes} B for {source_bytes} B); limit 13.0x"
     );
     assert!(
-        per_token <= 105.0,
-        "database is {per_token:.1} B/token ({db_bytes} B for {tokens} tokens); limit 105 B/token"
+        per_token <= 90.0,
+        "database is {per_token:.1} B/token ({db_bytes} B for {tokens} tokens); limit 90 B/token"
     );
 
     let (ok, out, err) = run(&["--db", db, "vacuum", "--compact"]);
@@ -130,12 +130,12 @@ fn database_size_stays_within_bounds_of_source_and_tokens() {
         "size gate after compact: db={db_bytes} B: {per_source:.2}x source, {per_token:.1} B/token"
     );
     assert!(
-        per_source <= 15.0,
-        "compacted database is {per_source:.2}x its source ({db_bytes} B for {source_bytes} B); limit 15.0x"
+        per_source <= 13.0,
+        "compacted database is {per_source:.2}x its source ({db_bytes} B for {source_bytes} B); limit 13.0x"
     );
     assert!(
-        per_token <= 105.0,
-        "compacted database is {per_token:.1} B/token ({db_bytes} B for {tokens} tokens); limit 105 B/token"
+        per_token <= 90.0,
+        "compacted database is {per_token:.1} B/token ({db_bytes} B for {tokens} tokens); limit 90 B/token"
     );
     // Still readable after compaction.
     let (ok, out, _) = run(&["--db", db, "describe"]);
