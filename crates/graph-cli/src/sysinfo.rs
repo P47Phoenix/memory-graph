@@ -17,7 +17,9 @@ pub const OS_RESERVE: f64 = 0.20;
 /// Default share of the free memory (above the reserve) this process may
 /// grow into. The budget itself is that share divided by the measured
 /// growth per source byte (see [`MemoryPolicy`]), so it is in RSS terms.
-pub const DEFAULT_FRACTION: f64 = 0.80;
+/// The footprint leaves out allocator rounding and the store's caches
+/// (measured 6-25% under the real growth), which the 30% slack covers.
+pub const DEFAULT_FRACTION: f64 = 0.70;
 /// Heap per source byte in flight assumed until measured. Measured on the
 /// test corpus: about 13x for v1 (tokens, symbols and their strings) and
 /// 25x for v2 (plus its pre-encoded stream and postings).
@@ -346,7 +348,7 @@ impl MemoryPolicy {
         } else {
             (held as f64 * self.expansion) as u64
         };
-        let spare = (m.available + growth).saturating_sub(reserve);
+        let spare = m.available.saturating_add(growth).saturating_sub(reserve);
         let target = (spare as f64 * fraction / self.expansion) as u64;
         let ceiling = m.total / 2;
         let floor = self.floor.max(FLOOR);
@@ -444,7 +446,10 @@ mod tests {
             expect(64, 60, 0, DEFAULT_FRACTION, INITIAL_EXPANSION)
         );
         assert!(
-            s.policy.reason.contains("80% of 60.0 GB free"),
+            s.policy.reason.contains(&format!(
+                "{}% of 60.0 GB free",
+                (DEFAULT_FRACTION * 100.0) as u64
+            )),
             "{}",
             s.policy.reason
         );
@@ -498,6 +503,10 @@ mod tests {
     fn growth_is_measured_and_sets_the_budget() {
         let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.8), FLOOR, Some(&mem(64, 40)));
         assert_eq!(p.cap, expect(64, 40, 0, 0.8, INITIAL_EXPANSION));
+        // One sample moves the running average by 30% of the difference.
+        let mut e = MemoryPolicy::new(MemorySpec::Fraction(0.8), FLOOR, Some(&mem(64, 40)));
+        e.update(Some(&mem(64, 40)), 1 << 30, 3 << 30);
+        assert!((e.expansion - (0.7 * INITIAL_EXPANSION + 0.3 * 3.0)).abs() < 1e-9);
         // Too little in flight to trust a ratio: the estimate stays.
         p.update(Some(&mem(64, 40)), 8 << 20, (8 << 20) * 3);
         assert_eq!(p.expansion, INITIAL_EXPANSION);

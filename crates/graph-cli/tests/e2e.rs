@@ -2276,6 +2276,8 @@ fn memory_share_follows_free_ram() {
     } else {
         assert!(m["reason"].as_str().unwrap().contains("unknown"), "{m}");
     }
+    // Everything in flight was released by the end.
+    assert_eq!(m["footprint_in_flight"], 0, "{m}");
     // The environment variable is the default for --memory.
     let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
         .env("MEMORY_GRAPH_MEMORY", "16K")

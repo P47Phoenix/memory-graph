@@ -98,7 +98,7 @@ enum Cmd {
         #[arg(long, short = 'j', default_value_t = 0, hide_default_value = true)]
         jobs: usize,
         /// Cap on source bytes read but not yet committed: a fixed size (2G), or the share of the free
-        /// memory this process may grow into (80%, the default), divided by the measured growth per source
+        /// memory this process may grow into (70%, the default), divided by the measured growth per source
         /// byte, re-sampled during the run and lowered under memory pressure; at least 20% of RAM is always
         /// left for the OS. Also read from MEMORY_GRAPH_MEMORY
         #[arg(long, env = "MEMORY_GRAPH_MEMORY", value_parser = graph_cli::sysinfo::parse_memory_spec)]
