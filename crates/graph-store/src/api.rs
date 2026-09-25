@@ -56,6 +56,8 @@ pub struct PreparedFile {
     pub(crate) work: Prepared,
     /// v2 only: the backend's share of the per-file work, done while
     /// preparing so the writer only interns and inserts.
+    /// Held alongside the extraction until commit, so a prepared v2 file
+    /// takes roughly twice the memory of its extraction.
     pub(crate) v2: Option<Box<crate::v2::V2Prep>>,
 }
 

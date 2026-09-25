@@ -3204,7 +3204,7 @@ pub(crate) struct V2Prep {
     /// The stream with `terms` indexes where term ids go.
     stream: Stream,
     /// Encoded posting list (token ordinals) per term index.
-    postings: Vec<(u32, Vec<u8>)>,
+    postings: Vec<(u64, Vec<u8>)>,
     /// Catalog deltas: one sample node per symbol kind / token class, and
     /// how many of them the file has.
     tally_nodes: Vec<(Node, i64)>,
@@ -3294,7 +3294,7 @@ impl V2Prep {
         }
         let postings = ords
             .into_iter()
-            .map(|(t, o)| (t as u32, codec::encode_posting(&o)))
+            .map(|(t, o)| (t, codec::encode_posting(&o)))
             .collect();
         let mut tally_nodes = Vec::new();
         for ((_, lang_kind), (kind, n)) in sym_counts {
