@@ -25,3 +25,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p graph-cli
       - run: bash scripts/disk-full-tmpfs.sh target/release/memory-graph
+  probes:
+    # The machine probes on each platform with one: memory must be known
+    # (and say where it came from), disk must be known. macOS only runs here.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p graph-cli --lib -- sysinfo diskinfo report
+      - run: cargo test -p graph-cli --test e2e sysinfo_reports_the_probes
+      - run: cargo run --release -p graph-cli -- sysinfo
+      - run: cargo run --release -p graph-cli -- sysinfo --json | python3 scripts/check-probes.py
+      - name: Container memory limit (cgroup) is honoured
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm --memory=512m -v "$PWD/target/release/memory-graph:/mg:ro" ubuntu:24.04 /mg sysinfo
+          docker run --rm --memory=512m -v "$PWD/target/release/memory-graph:/mg:ro" ubuntu:24.04 /mg sysinfo --json \
+            | python3 scripts/check-probes.py --max-total $((512 * 1024 * 1024)) --source-contains cgroup
+      - name: A box without /proc/meminfo still reads memory (sysinfo(2))
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm --mount type=bind,src=/dev/null,dst=/proc/meminfo -v "$PWD/target/release/memory-graph:/mg:ro" ubuntu:24.04 /mg sysinfo --json \
+            | python3 scripts/check-probes.py --source-contains "sysinfo(2)"

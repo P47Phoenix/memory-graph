@@ -1856,6 +1856,63 @@ fn adaptive_commit_stores_the_same_content() {
     }
 }
 
+/// `sysinfo` prints what the probes see (CPUs, memory with its source or
+/// the cause of its absence, the starting budget, the volume), as text and
+/// as JSON, and `index --stats` names the memory source too. On the
+/// platforms with a probe (Linux, macOS, Windows) memory must be known.
+#[test]
+fn sysinfo_reports_the_probes() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&["--db", &db, "sysinfo"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.starts_with("cpus: "), "{out}");
+    assert!(out.contains("\nbudget: "), "{out}");
+    assert!(out.contains("\ndisk ("), "{out}");
+    let (ok, out, err) = run(&["--db", &db, "sysinfo", "--json", "--memory", "3G"]);
+    assert!(ok, "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("stdout is pure JSON");
+    assert!(v["cpus"].as_u64().unwrap() >= 1, "{v}");
+    assert_eq!(v["budget"]["bytes"], 3u64 << 30, "{v}");
+    assert_eq!(v["budget"]["reason"], "fixed by --memory", "{v}");
+    assert!(v["disk"]["total"].as_u64().unwrap() > 0, "{v}");
+    assert!(v["disk"]["source"].is_string(), "{v}");
+    let m = &v["memory"];
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+        assert!(m["total"].as_u64().unwrap() > 0, "{v}");
+        assert!(m["available"].as_u64().unwrap() > 0, "{v}");
+        assert!(m["rss"].as_u64().unwrap() > 0, "{v}");
+        assert!(!m["source"].as_str().unwrap().is_empty(), "{v}");
+        assert!(m["error"].is_null(), "{v}");
+    } else {
+        assert!(m["total"].is_null(), "{v}");
+        assert!(
+            m["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("unsupported platform"),
+            "{v}"
+        );
+    }
+    // `index --stats` names the same source, and the JSON carries it.
+    let root = d.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+    let root = root.to_str().unwrap();
+    let (ok, _, err) = run(&[
+        "--db", &db, "index", "--org", "o", "--repo", "r", "--stats", root,
+    ]);
+    assert!(ok, "{err}");
+    let (sum, _) = index_json(&db, root, &["--stats", "--reindex"]);
+    if let Some(src) = m["source"].as_str() {
+        assert!(err.contains(&format!("  [{src}]")), "{err}");
+        assert_eq!(sum["stats"]["memory"]["source"], src, "{sum}");
+    } else {
+        assert!(err.contains("memory: free RAM unknown ("), "{err}");
+        assert_eq!(sum["stats"]["memory"]["error"], m["error"], "{sum}");
+    }
+}
+
 /// `--stats` adds a per-stage table on stderr (a `stats` object with
 /// `--json`), and `--trace` writes a valid Chrome trace.
 #[test]

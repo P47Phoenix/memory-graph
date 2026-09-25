@@ -29,8 +29,10 @@ pub struct Board {
     pub failed: AtomicU64,
     pub txns: AtomicU64,
     pub last_txn: AtomicU64,
-    /// The latest memory sample (from the sampler thread).
+    /// The latest good memory sample (from the sampler thread), and why the
+    /// latest probe failed if it did (a transient failure keeps the sample).
     pub memory: std::sync::Mutex<Option<MemSample>>,
+    pub memory_error: std::sync::Mutex<Option<String>>,
     /// Measured heap growth per source byte in flight (`f64` bits).
     pub expansion: AtomicU64,
     /// Heap footprint of the prepared files in flight.
@@ -77,7 +79,8 @@ impl Board {
                 );
                 b
             },
-            memory: std::sync::Mutex::new(sizing.memory),
+            memory: std::sync::Mutex::new(sizing.memory.clone().ok()),
+            memory_error: std::sync::Mutex::new(sizing.memory.clone().err()),
             expansion: AtomicU64::new(sizing.policy.expansion.to_bits()),
             footprint: AtomicU64::new(0),
             prepared_bytes: AtomicU64::new(0),
@@ -127,6 +130,11 @@ impl Board {
             mem_peak: self.budget.peak(),
             budget: self.budget.view(),
             memory: *self.memory.lock().unwrap_or_else(|e| e.into_inner()),
+            memory_error: self
+                .memory_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             expansion: f64::from_bits(self.expansion.load(Relaxed)),
             footprint: self.footprint.load(Relaxed),
             disk: *self.disk.lock().unwrap_or_else(|e| e.into_inner()),
@@ -166,6 +174,7 @@ pub struct BoardView {
     pub mem_peak: u64,
     pub budget: BudgetView,
     pub memory: Option<MemSample>,
+    pub memory_error: Option<String>,
     pub expansion: f64,
     pub footprint: u64,
     pub disk: Option<DiskSample>,
@@ -453,7 +462,7 @@ impl BoardView {
         ));
         if let Some(m) = &self.memory {
             s.push_str(&format!(
-                "memory: {} of {} free now{}; growth {:.1}x per source byte in flight; pressure {} time(s), {} in total\n",
+                "memory: {} of {} free now{}; growth {:.1}x per source byte in flight; pressure {} time(s), {} in total  [{}]{}\n",
                 mb(m.available),
                 mb(m.total),
                 m.rss
@@ -461,9 +470,16 @@ impl BoardView {
                 self.expansion,
                 b.pressure_episodes,
                 secs(b.pressure_time),
+                m.source,
+                self.memory_error
+                    .as_deref()
+                    .map_or(String::new(), |e| format!("; last probe failed: {e}")),
             ));
         } else {
-            s.push_str("memory: free RAM unknown on this platform\n");
+            s.push_str(&format!(
+                "memory: free RAM unknown ({}); assuming a fixed budget\n",
+                self.memory_error.as_deref().unwrap_or("no reading")
+            ));
         }
         s.push_str(&format!(
             "disk: db {}{}, projected {} ({:.1}x source), reserve {}{}{}\n",
@@ -518,6 +534,8 @@ impl BoardView {
                 "total": self.memory.map(|m| m.total),
                 "available": self.memory.map(|m| m.available),
                 "rss": self.memory.and_then(|m| m.rss),
+                "source": self.memory.map(|m| m.source),
+                "error": self.memory_error,
                 "expansion": self.expansion,
                 "footprint_in_flight": self.footprint,
                 "budget_end_in_memory": (self.budget.cap as f64 * self.expansion) as u64,
@@ -661,7 +679,9 @@ mod tests {
                 available: 8 << 30,
                 rss: Some(1 << 30),
                 psi_some_avg10: None,
+                source: "test probe",
             }),
+            memory_error: None,
             expansion: 6.0,
             footprint: 500 << 20,
             disk: Some(DiskSample {
@@ -676,11 +696,12 @@ mod tests {
             disk_check: true,
             sizing: Sizing::new(
                 4,
-                Some(MemSample {
+                Ok(MemSample {
                     total: 16 << 30,
                     available: 8 << 30,
                     rss: None,
                     psi_some_avg10: None,
+                    source: "test probe",
                 }),
                 3,
                 None,
@@ -715,9 +736,29 @@ mod tests {
             s.contains("8.0 GB of 16.0 GB free now, this process 1.0 GB"),
             "{s}"
         );
+        assert!(s.contains("in total  [test probe]\n"), "{s}");
         let j = v.stats_json();
         assert_eq!(j["memory"]["budget_max"], 2u64 << 30);
         assert_eq!(j["memory"]["total"], 16u64 << 30);
+        assert_eq!(j["memory"]["source"], "test probe");
+        assert_eq!(j["memory"]["error"], serde_json::Value::Null);
+        // A probe that failed once keeps the last sample and says so; one
+        // that never worked says why.
+        v.memory_error = Some("/proc/meminfo: Permission denied".into());
+        let s = v.stats_table();
+        assert!(
+            s.contains("[test probe]; last probe failed: /proc/meminfo: Permission denied"),
+            "{s}"
+        );
+        v.memory = None;
+        let s = v.stats_table();
+        assert!(
+            s.contains("memory: free RAM unknown (/proc/meminfo: Permission denied); assuming"),
+            "{s}"
+        );
+        let j = v.stats_json();
+        assert_eq!(j["memory"]["source"], serde_json::Value::Null);
+        assert_eq!(j["memory"]["error"], "/proc/meminfo: Permission denied");
     }
 
     #[test]

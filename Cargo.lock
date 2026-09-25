@@ -332,6 +332,7 @@ dependencies = [
  "graph-store",
  "ignore",
  "indicatif",
+ "libc",
  "redb",
  "rustix",
  "serde_json",
