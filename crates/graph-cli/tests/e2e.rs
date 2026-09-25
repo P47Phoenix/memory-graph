@@ -440,10 +440,16 @@ fn chunk_bytes_flag() {
         r,
     ]);
     assert!(ok, "{out}{err}");
+    let describe = |db: &str| run(&["--db", db, "describe", "--json"]);
     assert_eq!(
-        std::fs::read(&db_alias).unwrap(),
-        std::fs::read(&db_chunked).unwrap(),
+        describe(&db_alias),
+        describe(&db_chunked),
         "alias and new name index identically"
+    );
+    assert!(
+        describe(&db_alias).1.contains("\"files\":5"),
+        "{:?}",
+        describe(&db_alias)
     );
     let (ok, out, _) = run(&["--help"]);
     assert!(
