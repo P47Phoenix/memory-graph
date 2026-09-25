@@ -1,16 +1,19 @@
-//! v1-vs-v2 benchmark for the ADR 0003 story 4 checkpoint (not built by
-//! `cargo test`; run with `--release`). Indexes a set of source directories
-//! (each direct subdirectory is one repo), optionally replicated N times with
-//! rare identifiers renamed (same scaler as `spikes/data-model`), into a v1 and
-//! a v2 file, then compares size, ingest time and query latency, and checks
-//! that both backends return the same rows.
+//! Store benchmark, originally the v1-vs-v2 harness for the ADR 0003 story 4
+//! checkpoint (not built by `cargo test`; run with `--release`). Indexes a
+//! set of source directories (each direct subdirectory is one repo),
+//! optionally replicated N times with rare identifiers renamed (same scaler
+//! as `spikes/data-model`), into two files -- the default configuration and
+//! a chunked-commit one -- then compares size, ingest time and query latency,
+//! and checks that both return the same rows. (v1 was retired, ADR 0003 D5;
+//! the historical v1 columns in `docs/spikes/v2-checkpoint.md` came from the
+//! `v1-last` build of this harness.)
 //!
 //! ```sh
 //! cargo run --release -p graph-store --example v2bench -- \
 //!     <workdir> <copies> <reps> <dir> [<dir>...]
 //! ```
 use graph_core::TokenClass;
-use graph_store::{open_store, Backend, BatchFile, Grain, IndexOptions, Query, Store, SymbolQuery};
+use graph_store::{BatchFile, Grain, IndexOptions, Query, Store, SymbolQuery, V2Store};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Instant;
@@ -118,8 +121,13 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
-fn open(b: Backend, p: &Path) -> Box<dyn Store> {
-    open_store(b, p, vec![Box::new(graph_lang_rust::RustExtractor)]).unwrap()
+fn open(chunk_bytes: Option<usize>, p: &Path) -> Box<dyn Store> {
+    let mut s = V2Store::open(p).unwrap();
+    if let Some(b) = chunk_bytes {
+        s.set_chunk_bytes(b);
+    }
+    s.register(Box::new(graph_lang_rust::RustExtractor));
+    Box::new(s)
 }
 
 fn main() {
@@ -148,7 +156,7 @@ fn main() {
         )
     };
     let mut stores: Vec<(&str, Box<dyn Store>, std::path::PathBuf)> = vec![];
-    for (name, b) in [("v1", Backend::Redb), ("v2", Backend::RedbV2)] {
+    for (name, b) in [("default", None), ("chunked", Some(4 << 20))] {
         let p = work.join(format!("{name}.redb"));
         let _ = std::fs::remove_file(&p);
         let s = open(b, &p);
@@ -230,7 +238,7 @@ fn main() {
     let mut s = SymbolQuery::new("*");
     s.limit = Some(100);
     sq.push(("symbols `*` --limit 100".into(), s));
-    println!("\n| query | v1 p50 ms | v2 p50 ms | v2/v1 | rows equal |");
+    println!("\n| query | default p50 ms | chunked p50 ms | chunked/default | rows equal |");
     println!("|---|---|---|---|---|");
     let time = |s: &dyn Store, f: &dyn Fn(&dyn Store) -> usize| {
         let mut v = vec![];
@@ -277,7 +285,7 @@ fn main() {
         })
         .unwrap_or_default();
     println!("\npeak RSS of this process (both stores, queries): {rss}");
-    // Logical bytes of the two v2 tables that hold token data (keys plus
+    // Logical bytes of the two tables that hold token data (keys plus
     // values as redb stores them, before page slack): the file size only
     // moves in large steps, this shows small layout changes.
     {
@@ -288,7 +296,7 @@ fn main() {
         let t = rt.open_table(stream).unwrap();
         let sbytes: usize = t.iter().unwrap().map(|r| r.unwrap().1.value().len()).sum();
         println!(
-            "\nv2 stream table: {} rows, {} value bytes",
+            "\nstream table: {} rows, {} value bytes",
             t.len().unwrap(),
             sbytes
         );
@@ -298,18 +306,14 @@ fn main() {
         match rt.open_table(post) {
             Ok(t) => {
                 let b: usize = t.iter().unwrap().map(|r| r.unwrap().1.value().len()).sum();
-                println!(
-                    "v2 post table: {} rows, {} value bytes",
-                    t.len().unwrap(),
-                    b
-                );
+                println!("post table: {} rows, {} value bytes", t.len().unwrap(), b);
             }
             Err(_) => {
                 let post: redb::TableDefinition<(u64, u64), u64> =
                     redb::TableDefinition::new("post");
                 let t = rt.open_table(post).unwrap();
                 println!(
-                    "v2 post table: {} rows, {} value bytes (u64)",
+                    "post table: {} rows, {} value bytes (u64)",
                     t.len().unwrap(),
                     t.len().unwrap() * 8
                 );

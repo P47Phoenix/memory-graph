@@ -1,6 +1,6 @@
 # Spike: v2 store checkpoint measurements (ADR 0003 story 4)
 
-Status: measurements for the story 4 go/no-go input. Date 2026-09-21. This document presents numbers and a recommendation; **it does not decide go/no-go, the user does.** ADR 0003 stays Proposed.
+Status: measurements for the story 4 go/no-go input. Date 2026-09-21. (Historical note, 2026-09-25: v1 was retired outright, ADR 0003 D5; the v1 columns below were measured with what is now the `v1-last` tag, and `examples/v2bench.rs` now compares two configurations of the one store instead of v1 vs v2.) This document presents numbers and a recommendation; **it does not decide go/no-go, the user does.** ADR 0003 stays Proposed.
 
 **TL;DR.** At 9,876,231 tokens (public corpus plus the `syn` crate, replicated 9x) the v2 store is 24x smaller than v1 (257.5 MiB vs 6,256.5 MiB, 27.3 vs 664 bytes per token), ingests 5.1x faster (15.2 s vs 76.9 s), and no measured query is more than 1.51x slower than v1 (the limit is 2x); broad queries are up to about 500x faster. The `search_symbols` regression of issue #22 is fixed (4.7x slower before, 0.7x to 0.9x now, 0.14x for the full listing). On the **real, unreplicated** `syn` crate alone (855,726 tokens) two numbers are worse: the size is just under the 40 bytes per token limit (39.95), and a selective token-grain term such as `new` is 2.7x to 2.9x slower than v1 (8 ms vs 3 ms), because v2 walks the whole token section of every candidate file. The recommendation is at the end.
 

@@ -7,6 +7,7 @@ Beginner-friendly pictures of how memory-graph is built and how it behaves. Ever
 - **"Built today" means `main` as of commit 5bedd03** (ADR 0001, ADR 0002, the code in `crates/`, including story 0: the `describe` catalog and `schema_version` 2). Where a diagram still shows the older behaviour (a `describe` scan of every token), it is labelled as the state before story 0 or as a measured baseline.
 - **In a diagram with "Proposed" in its title, every line and box is proposed**; line style there only separates different kinds of edge (stated under each diagram). In a mixed diagram, dashed lines / dashed boxes = proposed or not decided. ADR 0003 is **Proposed** (not accepted). Diagram 15's right side and diagrams 14 and 17 reflect the user's decisions of 2026-09-20 on Q4 and Q5 (recorded in ADR 0003 and the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md)): the daemon path is **decided, not built**; sharding has a **decided key, build deferred**. The ADR itself is still not accepted.
 - Sizes: **[M]** measured, **[E]** estimated (same tags as the ADR).
+- **v1 is retired (ADR 0003 D5, 2026-09-25).** Diagrams labelled "current (v1)" or "Today (v1)" describe the original per-node layout as it was when they were drawn; it no longer exists in the code (`RedbStore`, `Backend`, `--backend`, `migrate` are gone, see git tag `v1-last`). The v2 layout in diagrams 2-4 is what is built, and it is the only storage format; a v1 file is refused with `StoreError::LegacyFormat` and never modified.
 
 ## Index
 
@@ -526,9 +527,9 @@ Details from the [paper](spikes/q4-q5-decision-paper.md): the daemon holds every
 
 ## 16. Versioning and migration (proposed)
 
-**Proposed (ADR 0003, D2, story 9 and 12).** `schema_version` means the on-disk layout (tables and key encoding) and is checked at open. Components have their own format versions in `meta`. Moving v1 to v2 is `memory-graph migrate`, which writes a new file, verifies it, and only then renames it into place; the source is never modified.
+**Proposed (ADR 0003, D2, story 9 and 12).** `schema_version` means the on-disk layout (tables and key encoding) and is checked at open. Components have their own format versions in `meta`. Moving v1 to v2 was `memory-graph migrate`, which writes a new file, verifies it, and only then renames it into place; the source is never modified.
 
-**How to read it:** first the "open" checks, then the migrate run. Any verification failure leaves both source and target untouched. `SCHEMA_VERSION` is 2 in the code today (story 0 added the `describe` catalog; a version-1 file is upgraded in place on open).
+**How to read it:** first the "open" checks, then the migrate run. Any verification failure leaves both source and target untouched. **As built (D5):** `SCHEMA_VERSION` is the v2 layout's 9; a v1 file (schema version 1 or 2) fails open with `LegacyFormat` naming the path, the version and the fix (re-index, or `migrate` in the `v1-last` release), bytes untouched; `migrate` itself no longer ships in this tree, so the lower half of the diagram is what the `v1-last` binary does.
 
 ```mermaid
 sequenceDiagram

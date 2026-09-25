@@ -79,11 +79,7 @@ generators such as tree-sitter: the pure-Rust gate forbids them).
 Library use: pass your extractor to `open_store`:
 
 ```rust
-let store = graph_store::open_store(
-    graph_store::Backend::RedbV2,
-    path,
-    vec![Box::new(toy_extractor::IniExtractor)],
-)?;
+let store = graph_store::open_store(path, vec![Box::new(toy_extractor::IniExtractor)])?;
 ```
 
 The `memory-graph` CLI registers `graph_cli::shipped_extractors()`, one per

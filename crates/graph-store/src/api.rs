@@ -8,8 +8,8 @@
 //! * [`Store`]: `StoreRead` plus the write operations and `snapshot()`.
 //!
 //! Both are object-safe on purpose (no generic methods, no associated types):
-//! the CLI holds a `Box<dyn Store>` chosen at run time (redb file now; the
-//! daemon's `RemoteStore` later, ADR Q5), and dynamic dispatch costs one
+//! the CLI holds a `Box<dyn Store>` (the redb file now; the daemon's
+//! `RemoteStore` later, ADR Q5), and dynamic dispatch costs one
 //! virtual call per store operation, negligible next to a query. Generics would
 //! have pushed a type parameter through every CLI function for no gain.
 //!
@@ -30,8 +30,8 @@
 //! `StoreError` and `BatchFile` (borrows its input) do not yet; the daemon
 //! story will add a wire form for them.
 use crate::{
-    BatchFile, Hit, IndexOptions, IngestStats, Query, RedbSnapshot, RedbStore, RepoInfo,
-    StoreError, SymbolHit, SymbolQuery, VacuumStats,
+    BatchFile, Hit, IndexOptions, IngestStats, Query, RepoInfo, StoreError, SymbolHit, SymbolQuery,
+    VacuumStats,
 };
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind};
 use std::collections::HashSet;
@@ -54,8 +54,8 @@ pub struct PreparedFile {
     pub(crate) bytes_len: usize,
     pub(crate) origin: Option<String>,
     pub(crate) work: Prepared,
-    /// v2 only: the backend's share of the per-file work, done while
-    /// preparing so the writer only interns and inserts.
+    /// The backend's share of the per-file work, done while preparing so
+    /// the writer only interns and inserts.
     /// Held alongside the extraction until commit, so a prepared v2 file
     /// takes roughly twice the memory of its extraction.
     pub(crate) v2: Option<Box<crate::v2::V2Prep>>,
@@ -154,10 +154,10 @@ pub trait StoreRead {
     fn parent(&self, id: NodeId) -> Result<Option<Node>>;
     fn count_nodes(&self, kind: NodeKind) -> Result<usize>;
     /// Every top-level (parent-less) node: one per org, in creation order.
-    /// Used by `migrate` (v1 -> v2) and `export` (ADR 0003 story 12) to walk
-    /// the whole graph through this trait alone, with no backend-specific
-    /// access: `roots()` plus `children`/`descendants` reaches every org,
-    /// repo, file, symbol and token.
+    /// Used by `export` (ADR 0003 story 12) to walk the whole graph through
+    /// this trait alone, with no backend-specific access: `roots()` plus
+    /// `children`/`descendants` reaches every org, repo, file, symbol and
+    /// token.
     fn roots(&self) -> Result<Vec<Node>>;
     /// Direct children in creation order: an org's repos, a repo's files, a
     /// file's top-level symbols and tokens outside any symbol (source order),
@@ -208,13 +208,11 @@ pub trait StoreRead {
     /// handle as earlier pages reads the same frozen transaction, so a writer
     /// running concurrently cannot change, add to or shrink a page already
     /// handed out or one fetched later in the same paging sequence -- proven
-    /// by `v2_tests::paging_is_snapshot_consistent_across_concurrent_writes`
-    /// (run against both backends via `both_backends()`, despite the v2-only
-    /// module it lives in). The default
-    /// implementation is built on `children`, which is in-memory per backend
-    /// today (see the crate's `CLAUDE.md` v1/v2 notes); it is still snapshot-
-    /// correct, just not yet lazy/streaming -- a future backend may override
-    /// this to avoid materializing the full child list per page.
+    /// by `v2_tests::paging_is_snapshot_consistent_across_concurrent_writes`.
+    /// The default implementation is built on `children`, which is
+    /// in-memory today; it is still snapshot-correct, just not yet
+    /// lazy/streaming -- a backend may override this to avoid materializing
+    /// the full child list per page.
     fn children_page(&self, id: NodeId, offset: usize, limit: usize) -> Result<Page<Node>> {
         page_slice(self.children(id)?, offset, limit)
     }
@@ -269,8 +267,7 @@ pub struct SnapshotStats {
 }
 
 /// A read-write store. Writers are serialized by the backend. A single-file
-/// write is atomic. A batch is atomic per backend-defined transaction: v1 uses
-/// one transaction per batch; v2 commits per chunk (see `index_batch`).
+/// write is atomic. A batch is atomic per chunk (see `index_batch`).
 pub trait Store: StoreRead + Send + Sync {
     /// A consistent, read-only view: everything read through it sees one
     /// committed state, whatever writers do meanwhile. Released on drop.
@@ -282,24 +279,18 @@ pub trait Store: StoreRead + Send + Sync {
     /// (default 15 minutes, matching ADR 0003 Q6's decision), returning
     /// [`StoreError::SnapshotExpired`] from that read rather than from this
     /// call -- `snapshot()` itself never fails because the *previous*
-    /// snapshot aged out. The v1 (`RedbStore`) backend does not implement
-    /// aging: its snapshot handles never expire, predating this mechanism
-    /// and kept frozen rather than retrofitted (see the crate's "v1 is
-    /// frozen" invariant). `snapshot_stats()`'s default return (all zero,
-    /// no oldest age) is the honest v1 answer too: v1 tracks no snapshot
-    /// count or age at all.
+    /// snapshot aged out.
     fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>>;
 
     /// Snapshot observability (ADR 0003 story 10): count, oldest age and
-    /// store size. The default (all zero, `oldest_age: None`) is what v1
-    /// reports, since v1 tracks none of this; a backend that does (today,
-    /// v2's `V2Store`) overrides it.
+    /// store size. The default (all zero, `oldest_age: None`) is for a
+    /// backend that tracks none of this; `V2Store` overrides it.
     fn snapshot_stats(&self) -> SnapshotStats {
         SnapshotStats::default()
     }
 
     /// Index raw bytes with an explicit `origin` and options; the primary
-    /// single-file entry point. See `RedbStore::index_bytes_opts`.
+    /// single-file entry point.
     #[allow(clippy::too_many_arguments)]
     fn index_bytes_opts(
         &self,
@@ -326,9 +317,8 @@ pub trait Store: StoreRead + Send + Sync {
     /// Index many files of one repo. Per-file failures are reported in their
     /// slot. A storage error makes the whole call return `Err`, and then the
     /// per-file results of any chunks that did commit are lost (only the
-    /// error is returned). v1 uses one transaction per batch, so an error
-    /// leaves nothing stored; v2 commits per chunk, so an error may leave
-    /// earlier chunks committed. Either way what is stored is complete and
+    /// error is returned). The store commits per chunk, so an error may
+    /// leave earlier chunks committed; what is stored is complete and
     /// consistent (whole files only), and re-running the batch skips stored
     /// files by fingerprint and stores the rest.
     fn index_batch(
@@ -380,10 +370,9 @@ pub trait Store: StoreRead + Send + Sync {
         dry_run: bool,
     ) -> Result<Vec<String>>;
 
-    /// Reclaim space left behind by replaced and pruned files. v2 removes the
+    /// Reclaim space left behind by replaced and pruned files: removes the
     /// dictionary terms nothing refers to any more (it does not compact the
-    /// file); v1 has no dictionary, so it is a no-op that reports zeros.
-    /// Never changes what any read returns.
+    /// file; see `V2Store::compact`). Never changes what any read returns.
     fn vacuum(&self) -> Result<VacuumStats>;
 
     fn index_bytes(
@@ -437,175 +426,17 @@ pub trait Store: StoreRead + Send + Sync {
     }
 }
 
-impl StoreRead for RedbStore {
-    fn get(&self, id: NodeId) -> Result<Option<Node>> {
-        RedbStore::get(self, id)
-    }
-    fn parent(&self, id: NodeId) -> Result<Option<Node>> {
-        RedbStore::parent(self, id)
-    }
-    fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
-        RedbStore::count_nodes(self, kind)
-    }
-    fn roots(&self) -> Result<Vec<Node>> {
-        RedbStore::roots_in(&self.db.begin_read()?)
-    }
-    fn children(&self, id: NodeId) -> Result<Vec<Node>> {
-        RedbStore::children_in(&self.db.begin_read()?, id)
-    }
-    fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
-        RedbStore::file_tokens(self, org, repo, path)
-    }
-    fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
-        RedbStore::describe(self, org, repo)
-    }
-    fn describe_by_scan(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
-        RedbStore::describe_by_scan(self, org, repo)
-    }
-    fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
-        RedbStore::search_symbols(self, q)
-    }
-    fn search(&self, q: &Query) -> Result<Vec<Hit>> {
-        RedbStore::search(self, q)
-    }
-}
-
-impl Store for RedbStore {
-    fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>> {
-        Ok(Box::new(RedbSnapshot {
-            rt: self.db.begin_read()?,
-        }))
-    }
-    fn index_bytes_opts(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        bytes: &[u8],
-        language: Option<&str>,
-        origin: Option<&str>,
-        opts: IndexOptions,
-    ) -> Result<IngestStats> {
-        RedbStore::index_bytes_opts(self, org, repo, path, bytes, language, origin, opts)
-    }
-    fn ingest_file_with_origin(
-        &self,
-        org: &str,
-        repo: &str,
-        path: &str,
-        language: &str,
-        ex: &Extraction,
-        origin: Option<&str>,
-    ) -> Result<IngestStats> {
-        RedbStore::ingest_file_with_origin(self, org, repo, path, language, ex, origin)
-    }
-    fn index_batch(
-        &self,
-        org: &str,
-        repo: &str,
-        files: &[BatchFile<'_>],
-        opts: IndexOptions,
-    ) -> Result<Vec<Result<IngestStats>>> {
-        RedbStore::index_batch(self, org, repo, files, opts)
-    }
-    fn prepare(
-        &self,
-        org: &str,
-        repo: &str,
-        file: &BatchFile<'_>,
-        opts: IndexOptions,
-    ) -> Result<PreparedFile> {
-        RedbStore::prepare(self, org, repo, file, opts)
-    }
-    fn index_prepared(
-        &self,
-        org: &str,
-        repo: &str,
-        files: Vec<PreparedFile>,
-        opts: IndexOptions,
-    ) -> Result<Vec<Result<IngestStats>>> {
-        RedbStore::index_prepared(self, org, repo, files, opts)
-    }
-    fn prune_files(
-        &self,
-        org: &str,
-        repo: &str,
-        keep: &HashSet<String>,
-        dry_run: bool,
-    ) -> Result<Vec<String>> {
-        RedbStore::prune_files(self, org, repo, keep, dry_run)
-    }
-    fn vacuum(&self) -> Result<VacuumStats> {
-        // v1 stores token text inline: there is no dictionary to collect.
-        Ok(VacuumStats::default())
-    }
-}
-
-impl StoreRead for RedbSnapshot {
-    fn get(&self, id: NodeId) -> Result<Option<Node>> {
-        RedbStore::get_in(&self.rt, id)
-    }
-    fn parent(&self, id: NodeId) -> Result<Option<Node>> {
-        RedbStore::parent_in(&self.rt, id)
-    }
-    fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
-        RedbStore::count_nodes_in(&self.rt, kind)
-    }
-    fn roots(&self) -> Result<Vec<Node>> {
-        RedbStore::roots_in(&self.rt)
-    }
-    fn children(&self, id: NodeId) -> Result<Vec<Node>> {
-        RedbStore::children_in(&self.rt, id)
-    }
-    fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
-        RedbStore::file_tokens_in(&self.rt, org, repo, path)
-    }
-    fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
-        RedbStore::describe_in(&self.rt, org, repo)
-    }
-    fn describe_by_scan(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
-        RedbStore::describe_by_scan_in(&self.rt, org, repo)
-    }
-    fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
-        RedbStore::search_symbols_in(&self.rt, q)
-    }
-    fn search(&self, q: &Query) -> Result<Vec<Hit>> {
-        RedbStore::search_in(&self.rt, q)
-    }
-}
-
-/// Storage engines the CLI can select.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Backend {
-    /// Storage format v1 on redb, one file (today's format).
-    #[default]
-    Redb,
-    /// Storage format v2 on redb (ADR 0003 stories 2-4, first slice): an
-    /// interned dictionary, one compact stream per file and count postings.
-    /// Opt-in; not the default, and it cannot open a v1 file.
-    RedbV2,
-}
-
-impl Backend {
-    /// Short name used on the command line and in messages.
-    pub fn name(self) -> &'static str {
-        match self {
-            Backend::Redb => "v1",
-            Backend::RedbV2 => "v2",
-        }
-    }
-}
-
-/// Which backend wrote the database file at `path`, from its stamped schema
-/// version, plus that version. `Ok(None)` when there is no file or it holds
-/// no schema yet (empty or freshly created), so any backend may claim it.
-/// Reads only; an unknown version is `SchemaMismatch`. It opens the file, so
-/// it fails with `Locked` while another process holds it.
+/// Schema version stamped in the database file at `path`, without opening a
+/// store. `Ok(None)` when there is no file or it holds no schema yet (empty
+/// or freshly created). `Ok(Some(v))` is the current layout. A file in the
+/// retired per-node format is [`StoreError::LegacyFormat`]; any other
+/// version is [`StoreError::SchemaMismatch`]. Reads only; it fails with
+/// `Locked` while another process holds the file.
 ///
 /// It opens the file with `Database::create`, so it needs write permission on
 /// the file, and it can never be strictly read-only: redb may repair a file
 /// left by a crash when it opens it.
-pub fn detect_backend(path: &Path) -> Result<Option<(Backend, u64)>> {
+pub fn detect_format(path: &Path) -> Result<Option<u64>> {
     match std::fs::metadata(path) {
         Ok(m) if m.is_file() && m.len() > 0 => {}
         _ => return Ok(None),
@@ -625,39 +456,26 @@ pub fn detect_backend(path: &Path) -> Result<Option<(Backend, u64)>> {
     };
     match found {
         None => Ok(None),
-        Some(v) if v == crate::v2::V2_SCHEMA_VERSION => Ok(Some((Backend::RedbV2, v))),
-        Some(v) if (crate::MIN_SCHEMA_VERSION..=crate::SCHEMA_VERSION).contains(&v) => {
-            Ok(Some((Backend::Redb, v)))
-        }
+        Some(v) if v == crate::v2::V2_SCHEMA_VERSION => Ok(Some(v)),
+        Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => Err(StoreError::LegacyFormat {
+            path: path.display().to_string(),
+            version: v,
+        }),
         Some(v) => Err(StoreError::SchemaMismatch { found: v }),
     }
 }
 
-/// Open (or create) a store of the chosen backend with `extractors`
-/// registered. Register every shipped extractor: the extractor version is part
-/// of a file's fingerprint, so a store without one re-indexes that language's
-/// files with the token-only fallback.
-pub fn open_store(
-    backend: Backend,
-    path: &Path,
-    extractors: Vec<Box<dyn Extractor>>,
-) -> Result<Box<dyn Store>> {
-    match backend {
-        Backend::Redb => {
-            let mut s = RedbStore::open(path)?;
-            for e in extractors {
-                s.register(e);
-            }
-            Ok(Box::new(s))
-        }
-        Backend::RedbV2 => {
-            let mut s = crate::V2Store::open(path)?;
-            for e in extractors {
-                s.register(e);
-            }
-            Ok(Box::new(s))
-        }
+/// Open (or create) the store at `path` with `extractors` registered.
+/// Register every shipped extractor: the extractor version is part of a
+/// file's fingerprint, so a store without one re-indexes that language's
+/// files with the token-only fallback. A file in the retired v1 format is
+/// refused ([`StoreError::LegacyFormat`]) and left untouched.
+pub fn open_store(path: &Path, extractors: Vec<Box<dyn Extractor>>) -> Result<Box<dyn Store>> {
+    let mut s = crate::V2Store::open(path)?;
+    for e in extractors {
+        s.register(e);
     }
+    Ok(Box::new(s))
 }
 
 #[cfg(test)]

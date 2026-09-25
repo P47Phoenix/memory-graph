@@ -13,10 +13,10 @@ fn run(args: &[&str]) -> (bool, String, String) {
 }
 
 /// Issue #69: a small ASP.NET Web Forms site indexes with symbols for every
-/// shipped language, on both backends.
+/// shipped language.
 #[test]
 fn aspnet_site_symbols() {
-    for backend in ["v1", "v2"] {
+    {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("site");
         std::fs::create_dir_all(root.join("Scripts")).unwrap();
@@ -39,8 +39,6 @@ fn aspnet_site_symbols() {
         let (ok, out, err) = run(&[
             "--db",
             &db,
-            "--backend",
-            backend,
             "index",
             "--org",
             "o",
@@ -49,12 +47,12 @@ fn aspnet_site_symbols() {
             root.to_str().unwrap(),
         ]);
         assert!(ok, "{out}{err}");
-        let (ok, out, err) = run(&["--db", &db, "--backend", backend, "describe", "--json"]);
+        let (ok, out, err) = run(&["--db", &db, "describe", "--json"]);
         assert!(ok, "{err}");
         for lang in ["aspx", "csharp", "javascript", "html"] {
             assert!(
                 out.contains(&format!("\"{lang}\"")),
-                "{backend}: {lang} missing: {out}"
+                "{lang} missing: {out}"
             );
         }
         for (name, lang_kind) in [
@@ -65,14 +63,13 @@ fn aspnet_site_symbols() {
             ("go", "arrow_fn"),
             ("about", "element"),
         ] {
-            let (ok, out, err) =
-                run(&["--db", &db, "--backend", backend, "symbols", "--json", name]);
+            let (ok, out, err) = run(&["--db", &db, "symbols", "--json", name]);
             assert!(ok, "{err}");
             let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
             let hits = v["results"].as_array().unwrap();
             assert!(
                 hits.iter().any(|h| h["lang_kind"] == lang_kind),
-                "{backend}: {name}/{lang_kind} not in {out}"
+                "{name}/{lang_kind} not in {out}"
             );
         }
     }
@@ -233,7 +230,7 @@ fn non_utf8_stores_nothing_and_lock_is_reported() {
     let (_, out, _) = run(&["--db", &dbs, "search", "f", "--grain", "file"]);
     assert!(out.is_empty());
     // Held lock -> clear message.
-    let _held = graph_store::RedbStore::open(&db).unwrap();
+    let _held = graph_store::V2Store::open(&db).unwrap();
     let (ok, _, err) = run(&["--db", &dbs, "search", "x"]);
     assert!(!ok && err.contains("locked"), "{err}");
     // Directory as --db.
@@ -380,11 +377,11 @@ fn index_directory() {
     assert!(!ok && err.contains("not a directory"));
 }
 
-/// `--v2-chunk-bytes` forces `index_batch` to commit many small chunks
-/// (one file per chunk here); the indexed result must be the same as an
-/// unchunked run, and the flag must be accepted (and ignored) on v1.
+/// `--chunk-bytes` forces `index_batch` to commit many small chunks (one
+/// file per chunk here); the indexed result must be the same as an
+/// unchunked run. The old spelling `--v2-chunk-bytes` is a hidden alias.
 #[test]
-fn v2_chunk_bytes_flag() {
+fn chunk_bytes_flag() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("proj");
     std::fs::create_dir_all(&root).unwrap();
@@ -397,9 +394,7 @@ fn v2_chunk_bytes_flag() {
     let (ok, out, err) = run(&[
         "--db",
         &db_chunked,
-        "--backend",
-        "v2",
-        "--v2-chunk-bytes",
+        "--chunk-bytes",
         "1",
         "index",
         "--org",
@@ -414,8 +409,6 @@ fn v2_chunk_bytes_flag() {
     let (ok, out, err) = run(&[
         "--db",
         &db_unchunked,
-        "--backend",
-        "v2",
         "index",
         "--org",
         "o",
@@ -426,17 +419,17 @@ fn v2_chunk_bytes_flag() {
     assert!(ok, "{out}{err}");
 
     for db in [&db_chunked, &db_unchunked] {
-        let (ok, out, _) = run(&["--db", db, "--backend", "v2", "search", "f3", "--json"]);
+        let (ok, out, _) = run(&["--db", db, "search", "f3", "--json"]);
         assert!(ok);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["results"].as_array().unwrap().len(), 1, "db={db}");
     }
 
-    // Ignored (not an error) on v1.
-    let db_v1 = d.path().join("v1").to_string_lossy().into_owned();
+    // The old flag name still works, as a hidden alias.
+    let db_alias = d.path().join("alias").to_string_lossy().into_owned();
     let (ok, out, err) = run(&[
         "--db",
-        &db_v1,
+        &db_alias,
         "--v2-chunk-bytes",
         "1",
         "index",
@@ -447,13 +440,23 @@ fn v2_chunk_bytes_flag() {
         r,
     ]);
     assert!(ok, "{out}{err}");
+    assert_eq!(
+        std::fs::read(&db_alias).unwrap(),
+        std::fs::read(&db_chunked).unwrap(),
+        "alias and new name index identically"
+    );
+    let (ok, out, _) = run(&["--help"]);
+    assert!(
+        ok && out.contains("--chunk-bytes") && !out.contains("--v2-chunk-bytes"),
+        "{out}"
+    );
 }
 
-/// `--v2-cache-bytes` sets redb's cache size; it must not change results
-/// (indexing, describe, search, vacuum), must work at any open (not just
-/// indexing), and must be accepted (and ignored) on v1.
+/// `--cache-bytes` sets redb's cache size; it must not change results
+/// (indexing, describe, search, vacuum) and must work at any open (not just
+/// indexing). The old spelling `--v2-cache-bytes` is a hidden alias.
 #[test]
-fn v2_cache_bytes_flag() {
+fn cache_bytes_flag() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("proj");
     std::fs::create_dir_all(&root).unwrap();
@@ -467,9 +470,7 @@ fn v2_cache_bytes_flag() {
     let (ok, out, err) = run(&[
         "--db",
         &db,
-        "--backend",
-        "v2",
-        "--v2-cache-bytes",
+        "--cache-bytes",
         "65536",
         "index",
         "--org",
@@ -485,9 +486,7 @@ fn v2_cache_bytes_flag() {
         let (ok, out, _) = run(&[
             "--db",
             &db,
-            "--backend",
-            "v2",
-            "--v2-cache-bytes",
+            "--cache-bytes",
             cache_bytes,
             "search",
             "f1",
@@ -497,37 +496,17 @@ fn v2_cache_bytes_flag() {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["results"].as_array().unwrap().len(), 1);
 
-        let (ok, out, err) = run(&[
-            "--db",
-            &db,
-            "--backend",
-            "v2",
-            "--v2-cache-bytes",
-            cache_bytes,
-            "vacuum",
-        ]);
+        let (ok, out, err) = run(&["--db", &db, "--cache-bytes", cache_bytes, "vacuum"]);
         assert!(ok, "{out}{err}");
     }
 
-    // Ignored (not an error) on v1.
-    let db_v1 = d.path().join("v1").to_string_lossy().into_owned();
-    let (ok, out, err) = run(&[
-        "--db",
-        &db_v1,
-        "--v2-cache-bytes",
-        "65536",
-        "index",
-        "--org",
-        "o",
-        "--repo",
-        "p",
-        r,
-    ]);
-    assert!(ok, "{out}{err}");
+    // The old flag name still works, as a hidden alias.
+    let (ok, out, err) = run(&["--db", &db, "--v2-cache-bytes", "65536", "describe"]);
+    assert!(ok && out.contains("o/p"), "{out}{err}");
 }
 
-/// `vacuum --compact` (ADR 0003 story 3, slice 3f): works end to end on v2,
-/// does not change query results, and is a no-op (not an error) on v1.
+/// `vacuum --compact` (ADR 0003 story 3, slice 3f): works end to end and
+/// does not change query results.
 #[test]
 fn vacuum_compact_flag() {
     let d = tempfile::tempdir().unwrap();
@@ -546,27 +525,16 @@ fn vacuum_compact_flag() {
     let r = root.to_str().unwrap();
     let db = d.path().join("g").to_string_lossy().into_owned();
 
-    let (ok, out, err) = run(&[
-        "--db",
-        &db,
-        "--backend",
-        "v2",
-        "index",
-        "--org",
-        "o",
-        "--repo",
-        "p",
-        r,
-    ]);
+    let (ok, out, err) = run(&["--db", &db, "index", "--org", "o", "--repo", "p", r]);
     assert!(ok, "{out}{err}");
 
-    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "vacuum", "--compact"]);
+    let (ok, out, err) = run(&["--db", &db, "vacuum", "--compact"]);
     assert!(ok, "{out}{err}");
     assert!(out.contains("vacuum:"), "{out}");
     assert!(out.contains("compact:"), "{out}");
 
     let f3_tok = format!("f3_0_{}", "x".repeat(20));
-    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "search", &f3_tok, "--json"]);
+    let (ok, out, _) = run(&["--db", &db, "search", &f3_tok, "--json"]);
     assert!(ok, "{out}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["results"].as_array().unwrap().len(), 1);
@@ -580,27 +548,17 @@ fn vacuum_compact_flag() {
         std::fs::remove_file(root.join(format!("f{i}.rs"))).unwrap();
     }
     let (ok, out, err) = run(&[
-        "--db",
-        &db,
-        "--backend",
-        "v2",
-        "index",
-        "--org",
-        "o",
-        "--repo",
-        "p",
-        "--prune",
-        r,
+        "--db", &db, "index", "--org", "o", "--repo", "p", "--prune", r,
     ]);
     assert!(ok, "{out}{err}");
     let before = std::fs::metadata(&db).unwrap().len();
-    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "vacuum", "--compact"]);
+    let (ok, out, err) = run(&["--db", &db, "vacuum", "--compact"]);
     assert!(ok, "{out}{err}");
     let after = std::fs::metadata(&db).unwrap().len();
     assert!(after < before, "before={before} after={after} {out}");
 
     let f0_tok = format!("f0_0_{}", "x".repeat(20));
-    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "search", &f0_tok, "--json"]);
+    let (ok, out, _) = run(&["--db", &db, "search", &f0_tok, "--json"]);
     assert!(ok, "{out}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -608,7 +566,7 @@ fn vacuum_compact_flag() {
         1,
         "surviving file still searchable"
     );
-    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "search", &f3_tok, "--json"]);
+    let (ok, out, _) = run(&["--db", &db, "search", &f3_tok, "--json"]);
     assert!(ok, "{out}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -616,14 +574,6 @@ fn vacuum_compact_flag() {
         0,
         "pruned file's data is gone"
     );
-
-    // No-op (not an error) on v1.
-    let db_v1 = d.path().join("v1").to_string_lossy().into_owned();
-    let (ok, out, err) = run(&["--db", &db_v1, "index", "--org", "o", "--repo", "p", r]);
-    assert!(ok, "{out}{err}");
-    let (ok, out, err) = run(&["--db", &db_v1, "vacuum", "--compact"]);
-    assert!(ok, "{out}{err}");
-    assert!(out.contains("nothing to do"), "{out}");
 }
 
 #[cfg(unix)]
@@ -1310,49 +1260,6 @@ fn symbols_json(db: &str, extra: &[&str]) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn old_database_without_symbol_index_version_is_upgraded_via_cli() {
-    use redb::{Database, MultimapTableDefinition, TableDefinition};
-    let d = tempfile::tempdir().unwrap();
-    let src = write_rust_repo(&d);
-    let db = d.path().join("g").to_string_lossy().into_owned();
-    let (ok, o, e) = run(&[
-        "--db",
-        &db,
-        "index",
-        "--org",
-        "o",
-        "--repo",
-        "r",
-        src.to_str().unwrap(),
-    ]);
-    assert!(ok, "{o}{e}");
-    {
-        // Simulate a database written before the symbol index existed.
-        let raw = Database::open(&db).unwrap();
-        let wt = raw.begin_write().unwrap();
-        wt.open_table(TableDefinition::<&str, u64>::new("meta"))
-            .unwrap()
-            .remove("symbol_index_version")
-            .unwrap();
-        wt.delete_multimap_table(MultimapTableDefinition::<&str, u64>::new("symbols_by_name"))
-            .unwrap();
-        wt.commit().unwrap();
-    }
-    let r = symbols_json(&db, &["foo"]);
-    assert_eq!(r.len(), 2, "{r:?}");
-    // The stamp is written back, so the next open is a no-op.
-    let raw = Database::open(&db).unwrap();
-    let rt = raw.begin_read().unwrap();
-    let v = rt
-        .open_table(TableDefinition::<&str, u64>::new("meta"))
-        .unwrap()
-        .get("symbol_index_version")
-        .unwrap()
-        .map(|v| v.value());
-    assert_eq!(v, Some(graph_store::SYMBOL_INDEX_VERSION));
-}
-
-#[test]
 fn symbols_trailing_star_and_escaped_star_via_cli() {
     let d = tempfile::tempdir().unwrap();
     let src = write_rust_repo(&d);
@@ -1719,63 +1626,15 @@ fn filter_validation_follows_the_catalog_across_prune_and_reindex() {
     assert_eq!(before, after);
 }
 
-#[test]
-fn v1_database_without_catalog_is_upgraded_via_cli() {
-    use redb::{Database, TableDefinition};
-    let d = tempfile::tempdir().unwrap();
-    let src = write_rust_repo(&d);
-    let db = d.path().join("g").to_string_lossy().into_owned();
-    let (ok, o, e) = run(&[
-        "--db",
-        &db,
-        "index",
-        "--org",
-        "o",
-        "--repo",
-        "r",
-        src.to_str().unwrap(),
-    ]);
-    assert!(ok, "{o}{e}");
-    let (_, expected, _) = run(&["--db", &db, "describe", "--json"]);
-    let meta = TableDefinition::<&str, u64>::new("meta");
-    {
-        // Simulate a database written by the previous release.
-        let raw = Database::open(&db).unwrap();
-        let wt = raw.begin_write().unwrap();
-        {
-            let mut m = wt.open_table(meta).unwrap();
-            m.insert("schema_version", 1).unwrap();
-            m.remove("catalog_version").unwrap();
-        }
-        wt.delete_table(TableDefinition::<&str, u64>::new("catalog"))
-            .unwrap();
-        wt.commit().unwrap();
-    }
-    let (ok, out, err) = run(&["--db", &db, "describe", "--json"]);
-    assert!(ok, "{err}");
-    assert_eq!(out, expected);
-    let raw = Database::open(&db).unwrap();
-    let v = raw
-        .begin_read()
-        .unwrap()
-        .open_table(meta)
-        .unwrap()
-        .get("schema_version")
-        .unwrap()
-        .map(|v| v.value());
-    assert_eq!(v, Some(graph_store::SCHEMA_VERSION));
-}
-
-/// Slice 3o: `describe --json` surfaces a v2 repo's crashed/in-progress
+/// Slice 3o: `describe --json` surfaces a repo's crashed/in-progress
 /// chunked-ingest batch (ADR 0003 story 3, decision D3, `RepoInfo::open_batch`).
 /// A real mid-batch process crash is impractical to script reliably in an
 /// e2e test, so this stamps the `open_batch`/`meta.open_batch_id` marker
-/// directly on a v2 database via redb, the same direct-table-write technique
-/// `v1_database_without_catalog_is_upgraded_via_cli` above already uses --
-/// exercising exactly what a reader observes on disk after a crash, without
-/// depending on a specific crash-timing mechanism.
+/// directly on the database via redb -- exercising exactly what a reader
+/// observes on disk after a crash, without depending on a specific
+/// crash-timing mechanism.
 #[test]
-fn describe_json_surfaces_a_crashed_v2_batch() {
+fn describe_json_surfaces_a_crashed_batch() {
     use redb::{Database, TableDefinition};
     let d = tempfile::tempdir().unwrap();
     let src = write_rust_repo(&d);
@@ -1783,8 +1642,6 @@ fn describe_json_surfaces_a_crashed_v2_batch() {
     let (ok, o, e) = run(&[
         "--db",
         &db,
-        "--backend",
-        "v2",
         "index",
         "--org",
         "o",
@@ -1795,11 +1652,11 @@ fn describe_json_surfaces_a_crashed_v2_batch() {
     assert!(ok, "{o}{e}");
 
     // Before corruption: no open batch.
-    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "describe", "--json"]);
+    let (ok, out, _) = run(&["--db", &db, "describe", "--json"]);
     assert!(ok);
     let before: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(before["repos"][0]["open_batch"], false);
-    let (ok, out, _) = run(&["--db", &db, "--backend", "v2", "describe"]);
+    let (ok, out, _) = run(&["--db", &db, "describe"]);
     assert!(ok && !out.contains("WARNING"), "{out}");
 
     // Stamp the marker directly, as if a chunk committed mid-batch and the
@@ -1823,131 +1680,19 @@ fn describe_json_surfaces_a_crashed_v2_batch() {
 
     // After corruption: describe --json reports it, and human-readable
     // describe prints the warning.
-    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "describe", "--json"]);
+    let (ok, out, err) = run(&["--db", &db, "describe", "--json"]);
     assert!(ok, "{err}");
     let after: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(after["repos"][0]["open_batch"], true, "{after}");
-    let (ok, out, err) = run(&["--db", &db, "--backend", "v2", "describe"]);
+    let (ok, out, err) = run(&["--db", &db, "describe"]);
     assert!(
         ok && out.contains("WARNING") && out.contains("o/r") && out.contains("incomplete ingest"),
         "{out}{err}"
     );
 }
 
-/// ADR 0003 story 12: index a small corpus into v1, migrate to v2, and
-/// confirm `search`/`describe`/`symbols` output is identical between the two
-/// (only stable, backend-agnostic fields: v2's own `open_batch` differs in
-/// kind from v1's, but both report `false` here).
-#[test]
-fn migrate_v1_to_v2_matches_on_search_describe_and_symbols() {
-    let d = tempfile::tempdir().unwrap();
-    let root = d.path().join("proj");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(
-        root.join("lib.rs"),
-        "fn foo() { bar(); }
-struct S;
-",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("main.zig"),
-        "pub fn foo() void {}
-",
-    )
-    .unwrap();
-    let v1_db = d.path().join("v1.redb").to_string_lossy().into_owned();
-    let (ok, out, err) = run(&[
-        "--db",
-        &v1_db,
-        "index",
-        "--org",
-        "acme",
-        "--repo",
-        "widgets",
-        root.to_str().unwrap(),
-    ]);
-    assert!(ok, "{out}{err}");
-
-    let v2_db = d.path().join("v2.redb");
-    let (ok, out, err) = run(&["--db", &v1_db, "migrate", v2_db.to_str().unwrap()]);
-    assert!(ok, "{out}{err}");
-    assert!(out.contains("files=2"), "{out}");
-    assert!(v2_db.is_file());
-
-    for args in [
-        vec!["search", "foo", "--json"],
-        vec!["search", "foo", "--grain", "file", "--json"],
-        vec!["search", "foo", "--grain", "symbol", "--json"],
-        vec!["symbols", "*", "--json"],
-        vec!["describe", "--json"],
-    ] {
-        let mut v1_args = vec!["--db", v1_db.as_str()];
-        v1_args.extend(args.iter().copied());
-        let mut v2_args = vec!["--db", v2_db.to_str().unwrap(), "--backend", "v2"];
-        v2_args.extend(args.iter().copied());
-        let (ok1, out1, err1) = run(&v1_args);
-        let (ok2, out2, err2) = run(&v2_args);
-        assert!(ok1 && ok2, "{args:?}: {err1}{err2}");
-        let mut a: serde_json::Value = serde_json::from_str(out1.trim()).unwrap();
-        let mut b: serde_json::Value = serde_json::from_str(out2.trim()).unwrap();
-        // `open_batch` is a v2-only concept (D3); both report `false` on
-        // this freshly migrated, uncorrupted store, but strip it so a
-        // future field there does not make an otherwise-identical
-        // `describe` fail this comparison for the wrong reason.
-        if let Some(repos) = a.get_mut("repos").and_then(|r| r.as_array_mut()) {
-            for r in repos {
-                r.as_object_mut().unwrap().remove("open_batch");
-            }
-        }
-        if let Some(repos) = b.get_mut("repos").and_then(|r| r.as_array_mut()) {
-            for r in repos {
-                r.as_object_mut().unwrap().remove("open_batch");
-            }
-        }
-        assert_eq!(a, b, "{args:?}");
-    }
-}
-
-/// A destination that already exists is refused without `--force`, and left
-/// untouched.
-#[test]
-fn migrate_refuses_an_existing_destination_without_force() {
-    let d = tempfile::tempdir().unwrap();
-    let v1_db = d.path().join("v1.redb").to_string_lossy().into_owned();
-    let f = d.path().join("a.rs");
-    std::fs::write(
-        &f,
-        "fn foo() {}
-",
-    )
-    .unwrap();
-    let (ok, _, err) = run(&[
-        "--db",
-        &v1_db,
-        "index-file",
-        "--org",
-        "o",
-        "--repo",
-        "r",
-        f.to_str().unwrap(),
-    ]);
-    assert!(ok, "{err}");
-
-    let dest = d.path().join("v2.redb");
-    std::fs::write(&dest, b"pre-existing").unwrap();
-    let (ok, _, err) = run(&["--db", &v1_db, "migrate", dest.to_str().unwrap()]);
-    assert!(!ok, "expected failure without --force");
-    assert!(err.contains("already exists"), "{err}");
-    assert_eq!(std::fs::read(&dest).unwrap(), b"pre-existing");
-
-    let (ok, out, err) = run(&["--db", &v1_db, "migrate", dest.to_str().unwrap(), "--force"]);
-    assert!(ok, "{out}{err}");
-    assert_ne!(std::fs::read(&dest).unwrap(), b"pre-existing");
-}
-
-/// `export` produces one well-formed JSON line per node and works on both
-/// backends through the `Store` trait (not backend-specific).
+/// `export` produces one well-formed JSON line per node through the `Store`
+/// trait (not layout-specific).
 #[test]
 fn export_ndjson_round_trips_node_counts() {
     let d = tempfile::tempdir().unwrap();
@@ -1958,13 +1703,11 @@ fn export_ndjson_round_trips_node_counts() {
 ",
     )
     .unwrap();
-    for backend in ["v1", "v2"] {
-        let db = d.path().join(format!("{backend}.redb"));
+    {
+        let db = d.path().join("g.redb");
         let (ok, out, err) = run(&[
             "--db",
             db.to_str().unwrap(),
-            "--backend",
-            backend,
             "index-file",
             "--org",
             "o",
@@ -1974,12 +1717,10 @@ fn export_ndjson_round_trips_node_counts() {
         ]);
         assert!(ok, "{out}{err}");
 
-        let out_path = d.path().join(format!("{backend}.ndjson"));
+        let out_path = d.path().join("g.ndjson");
         let (ok, _, err) = run(&[
             "--db",
             db.to_str().unwrap(),
-            "--backend",
-            backend,
             "export",
             "--out",
             out_path.to_str().unwrap(),
@@ -1997,43 +1738,17 @@ fn export_ndjson_round_trips_node_counts() {
                 .entry(v["kind"].as_str().unwrap().to_string())
                 .or_default() += 1;
         }
-        assert_eq!(
-            kinds.get("org").copied().unwrap_or(0),
-            1,
-            "{backend}: {kinds:?}"
-        );
-        assert_eq!(
-            kinds.get("repo").copied().unwrap_or(0),
-            1,
-            "{backend}: {kinds:?}"
-        );
-        assert_eq!(
-            kinds.get("file").copied().unwrap_or(0),
-            1,
-            "{backend}: {kinds:?}"
-        );
-        assert!(
-            kinds.get("token").copied().unwrap_or(0) > 0,
-            "{backend}: {kinds:?}"
-        );
+        assert_eq!(kinds.get("org").copied().unwrap_or(0), 1, "{kinds:?}");
+        assert_eq!(kinds.get("repo").copied().unwrap_or(0), 1, "{kinds:?}");
+        assert_eq!(kinds.get("file").copied().unwrap_or(0), 1, "{kinds:?}");
+        assert!(kinds.get("token").copied().unwrap_or(0) > 0, "{kinds:?}");
     }
 }
 
 /// Index `dir` with `--json` and the given extra flags; returns the summary
 /// without `elapsed_ms`, and the stderr.
-fn index_json(db: &str, backend: &str, dir: &str, extra: &[&str]) -> (serde_json::Value, String) {
-    let mut args = vec![
-        "--db",
-        db,
-        "--backend",
-        backend,
-        "index",
-        "--org",
-        "o",
-        "--repo",
-        "r",
-        "--json",
-    ];
+fn index_json(db: &str, dir: &str, extra: &[&str]) -> (serde_json::Value, String) {
+    let mut args = vec!["--db", db, "index", "--org", "o", "--repo", "r", "--json"];
     args.extend_from_slice(extra);
     args.push(dir);
     let (ok, out, err) = run(&args);
@@ -2045,33 +1760,32 @@ fn index_json(db: &str, backend: &str, dir: &str, extra: &[&str]) -> (serde_json
 
 /// With `--deterministic` (fixed batches), parallel parsing still commits in
 /// walk order, so the database file and the summary are byte-identical for
-/// any `--jobs`, on both backends: first index, forced re-index, unchanged.
+/// any `--jobs`: first index, forced re-index, unchanged.
 #[test]
 fn index_is_identical_for_any_jobs() {
     let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus");
     let corpus = corpus.to_str().unwrap();
-    for backend in ["v1", "v2"] {
+    {
         let d = tempfile::tempdir().unwrap();
         let mut dbs = Vec::new();
         let mut sums = Vec::new();
         for jobs in ["1", "8"] {
             let db = d.path().join(format!("g{jobs}"));
             let db = db.to_str().unwrap();
-            let (first, _) = index_json(db, backend, corpus, &["--deterministic", "--jobs", jobs]);
+            let (first, _) = index_json(db, corpus, &["--deterministic", "--jobs", jobs]);
             let (again, _) = index_json(
                 db,
-                backend,
                 corpus,
                 &["--deterministic", "--jobs", jobs, "--reindex"],
             );
-            let (skip, _) = index_json(db, backend, corpus, &["--deterministic", "--jobs", jobs]);
+            let (skip, _) = index_json(db, corpus, &["--deterministic", "--jobs", jobs]);
             assert!(first["files"].as_u64().unwrap() > 100, "{first}");
             assert_eq!(skip["unchanged"], skip["files"], "{skip}");
             sums.push((first, again, skip));
             dbs.push(std::fs::read(db).unwrap());
         }
-        assert_eq!(sums[0], sums[1], "{backend}: summaries differ");
-        assert!(dbs[0] == dbs[1], "{backend}: database files differ");
+        assert_eq!(sums[0], sums[1], "summaries differ");
+        assert!(dbs[0] == dbs[1], "database files differ");
     }
 }
 
@@ -2087,8 +1801,8 @@ fn progress_keeps_stdout_clean() {
     std::fs::write(root.join("bin.dat"), b"a\0b").unwrap();
     let root = root.to_str().unwrap();
     let db = |n: &str| d.path().join(n).to_string_lossy().into_owned();
-    let (quiet, qerr) = index_json(&db("a"), "v1", root, &["--no-progress", "-j", "3"]);
-    let (shown, _) = index_json(&db("b"), "v1", root, &["--progress", "-j", "3"]);
+    let (quiet, qerr) = index_json(&db("a"), root, &["--no-progress", "-j", "3"]);
+    let (shown, _) = index_json(&db("b"), root, &["--progress", "-j", "3"]);
     assert_eq!(quiet, shown);
     assert_eq!(quiet["files"], 20);
     assert!(qerr.is_empty(), "no progress output: {qerr}");
@@ -2112,7 +1826,7 @@ fn progress_keeps_stdout_clean() {
 fn adaptive_commit_stores_the_same_content() {
     let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus");
     let corpus = corpus.to_str().unwrap();
-    for backend in ["v1", "v2"] {
+    {
         let d = tempfile::tempdir().unwrap();
         let mut seen = Vec::new();
         for flags in [
@@ -2124,23 +1838,14 @@ fn adaptive_commit_stores_the_same_content() {
         ] {
             let db = d.path().join(format!("g{}", seen.len()));
             let db = db.to_str().unwrap();
-            let (sum, _) = index_json(db, backend, corpus, &flags);
-            let (ok, export, err) = run(&["--db", db, "--backend", backend, "export"]);
+            let (sum, _) = index_json(db, corpus, &flags);
+            let (ok, export, err) = run(&["--db", db, "export"]);
             assert!(ok, "{err}");
             seen.push((flags, sum, export));
         }
         for w in seen.windows(2) {
-            assert_eq!(
-                w[0].1, w[1].1,
-                "{backend}: {:?} vs {:?} summary",
-                w[0].0, w[1].0
-            );
-            assert!(
-                w[0].2 == w[1].2,
-                "{backend}: {:?} vs {:?} export",
-                w[0].0,
-                w[1].0
-            );
+            assert_eq!(w[0].1, w[1].1, "{:?} vs {:?} summary", w[0].0, w[1].0);
+            assert!(w[0].2 == w[1].2, "{:?} vs {:?} export", w[0].0, w[1].0);
         }
     }
 }
@@ -2158,7 +1863,7 @@ fn stats_and_trace() {
     let root = root.to_str().unwrap();
     let db = d.path().join("g").to_string_lossy().into_owned();
     let trace = d.path().join("t.json").to_string_lossy().into_owned();
-    let (sum, _) = index_json(&db, "v2", root, &["--stats", "--trace", &trace]);
+    let (sum, _) = index_json(&db, root, &["--stats", "--trace", &trace]);
     let stages = sum["stats"]["stages"].as_array().unwrap();
     let names: Vec<_> = stages
         .iter()
@@ -2180,8 +1885,6 @@ fn stats_and_trace() {
     let (ok, out, err) = run(&[
         "--db",
         &db,
-        "--backend",
-        "v2",
         "index",
         "--org",
         "o",
@@ -2215,7 +1918,7 @@ fn memory_budget_bounds_bytes_in_flight() {
         let db = d.path().join(format!("g{}", mode.len()));
         let mut flags = vec!["--stats", "--memory", "16K"];
         flags.extend_from_slice(mode);
-        let (sum, _) = index_json(db.to_str().unwrap(), "v2", root, &flags);
+        let (sum, _) = index_json(db.to_str().unwrap(), root, &flags);
         assert_eq!(sum["files"], 200, "{sum}");
         let peak = sum["stats"]["peak_in_flight"].as_u64().unwrap();
         let cap = sum["stats"]["memory_budget"].as_u64().unwrap();
@@ -2240,7 +1943,7 @@ fn memory_share_follows_free_ram() {
     }
     let root = root.to_str().unwrap();
     let db = d.path().join("g").to_string_lossy().into_owned();
-    let (sum, _) = index_json(&db, "v2", root, &["--stats", "--memory", "10%"]);
+    let (sum, _) = index_json(&db, root, &["--stats", "--memory", "10%"]);
     let m = &sum["stats"]["memory"];
     let total = m["total"].as_u64();
     if let (Some(total), Some(avail)) = (total, m["available"].as_u64()) {
@@ -2284,8 +1987,6 @@ fn memory_share_follows_free_ram() {
         .args([
             "--db",
             &db,
-            "--backend",
-            "v2",
             "index",
             "--org",
             "o",
