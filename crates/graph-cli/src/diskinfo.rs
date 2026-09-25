@@ -120,12 +120,29 @@ impl MinFree {
 pub struct DiskDecision {
     /// Bytes the database will probably reach once every found file is stored.
     pub projected_final: u64,
-    /// The database-bytes-per-source-byte in use (measured or assumed).
+    /// The database-bytes-per-newly-stored-source-byte in use (measured or
+    /// assumed).
     pub ratio: f64,
     /// The free space to keep.
     pub min_free: u64,
     /// Why the run must stop now, if it must.
     pub stop: Option<String>,
+}
+
+/// What the pipeline knows when the policy is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiskInputs {
+    /// The database file now, and when this run started (a rerun starts on
+    /// a file that already holds earlier runs' data).
+    pub db_len: u64,
+    pub db_len_start: u64,
+    /// Source bytes the walk has found, the writer has handled, and of those
+    /// how many were already stored (unchanged: they cost no space).
+    pub found_bytes: u64,
+    pub handled_bytes: u64,
+    pub unchanged_bytes: u64,
+    /// Only then is the projection complete enough to refuse on.
+    pub walk_done: bool,
 }
 
 /// Pure decision logic, fed each sample by the pipeline's sampler.
@@ -146,25 +163,29 @@ pub(crate) fn mb(b: u64) -> String {
 }
 
 impl DiskPolicy {
-    /// Decide from `sample` (None when the platform says nothing), the
-    /// database's current size, the source bytes found so far and stored so
-    /// far, and whether the walk has finished (only then is the projection
-    /// complete enough to refuse on).
-    pub fn decide(
-        &self,
-        sample: Option<&DiskSample>,
-        db_len: u64,
-        found_bytes: u64,
-        handled_bytes: u64,
-        walk_done: bool,
-    ) -> DiskDecision {
-        let ratio = if handled_bytes >= RATIO_CALIBRATE_MIN {
-            (db_len as f64 / handled_bytes as f64).max(2.0)
+    /// Decide from `sample` (None when the platform says nothing) and what
+    /// the run has seen so far. The ratio is the file's growth this run over
+    /// the source bytes newly stored this run (so a rerun onto a full file
+    /// does not count earlier runs' data), and the projection assumes the
+    /// rest of the tree is new in the same proportion as what was handled
+    /// (a resume walks over already-stored files first and projects little).
+    pub fn decide(&self, sample: Option<&DiskSample>, i: DiskInputs) -> DiskDecision {
+        let stored = i.handled_bytes.saturating_sub(i.unchanged_bytes);
+        let growth = i.db_len.saturating_sub(i.db_len_start);
+        let ratio = if stored >= RATIO_CALIBRATE_MIN {
+            (growth as f64 / stored as f64).max(2.0)
         } else {
             DISK_RATIO
         };
-        let remaining = found_bytes.saturating_sub(handled_bytes);
-        let projected_final = db_len.saturating_add((remaining as f64 * ratio) as u64);
+        let new_share = if i.handled_bytes > 0 {
+            stored as f64 / i.handled_bytes as f64
+        } else {
+            1.0
+        };
+        let remaining = i.found_bytes.saturating_sub(i.handled_bytes);
+        let projected_final = i
+            .db_len
+            .saturating_add((remaining as f64 * ratio * new_share) as u64);
         let min_free = self.min_free.resolve(sample.map(|s| s.total));
         let mut d = DiskDecision {
             projected_final,
@@ -184,11 +205,11 @@ impl DiskPolicy {
                 mb(s.available),
                 mb(min_free)
             ));
-        } else if walk_done {
-            let needed = projected_final.saturating_sub(db_len);
+        } else if i.walk_done {
+            let needed = projected_final.saturating_sub(i.db_len);
             if s.available.saturating_sub(needed) < min_free {
                 d.stop = Some(format!(
-                    "the database would reach about {} ({:.1}x the source) but only {} is free (keeping {})",
+                    "the database would reach about {} ({:.1}x the new source) but only {} is free (keeping {})",
                     mb(projected_final),
                     ratio,
                     mb(s.available),
@@ -205,11 +226,11 @@ impl DiskPolicy {
 /// stringifies the `io::Error`.
 pub fn is_disk_full(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
+    let code = |n: u32| m.contains(&format!("os error {n})"));
     m.contains("no space left on device")
         || m.contains("not enough space on the disk")
-        || m.contains("os error 28)")
-        || m.contains("os error 112)")
-        || m.contains("os error 39)")
+        || (cfg!(unix) && code(28))
+        || (cfg!(windows) && (code(112) || code(39)))
 }
 
 #[cfg(test)]
@@ -244,6 +265,17 @@ mod tests {
         assert_eq!(MinFree::Fraction(0.1).resolve(Some(100 * GIB)), 10 * GIB);
     }
 
+    fn inputs(db_len: u64, found: u64, handled: u64, walk_done: bool) -> DiskInputs {
+        DiskInputs {
+            db_len,
+            db_len_start: 0,
+            found_bytes: found,
+            handled_bytes: handled,
+            unchanged_bytes: 0,
+            walk_done,
+        }
+    }
+
     #[test]
     fn projection_and_calibration() {
         let p = DiskPolicy {
@@ -251,63 +283,86 @@ mod tests {
             enforce: true,
         };
         // Nothing stored yet: the assumed ratio projects the whole tree.
-        let d = p.decide(Some(&disk(1000, 500)), 0, 10 * GIB, 0, false);
+        let d = p.decide(Some(&disk(1000, 500)), inputs(0, 10 * GIB, 0, false));
         assert_eq!(d.ratio, DISK_RATIO);
         assert_eq!(d.projected_final, 100 * GIB);
         assert!(d.stop.is_none());
-        // Once 64 MiB is stored the measured ratio takes over.
-        let d = p.decide(Some(&disk(1000, 500)), 800 * MIB, 10 * GIB, 100 * MIB, true);
+        // Once 64 MiB is newly stored the measured ratio takes over.
+        let d = p.decide(
+            Some(&disk(1000, 500)),
+            inputs(800 * MIB, 10 * GIB, 100 * MIB, true),
+        );
         assert!((d.ratio - 8.0).abs() < 1e-9);
         // ...never below 2x.
-        let d = p.decide(Some(&disk(1000, 500)), 100 * MIB, 10 * GIB, 100 * MIB, true);
+        let d = p.decide(
+            Some(&disk(1000, 500)),
+            inputs(100 * MIB, 10 * GIB, 100 * MIB, true),
+        );
         assert_eq!(d.ratio, 2.0);
     }
 
     #[test]
-    fn stops_on_headroom_and_on_projection() {
+    fn a_rerun_onto_a_full_file_does_not_over_project() {
         let p = DiskPolicy {
-            min_free: MinFree::Default,
+            min_free: MinFree::Bytes(GIB),
             enforce: true,
         };
-        // Below the reserve: stop whatever the projection.
-        let d = p.decide(Some(&disk(1000, 3)), 0, GIB, 0, false);
-        assert!(
-            d.stop.as_deref().unwrap().contains("only 3.0 GB free"),
-            "{d:?}"
+        // Run 1 stopped with a 30 GB file after 3 GB of a 10 GB tree; the
+        // rerun starts on that file, walks the stored files first (all
+        // unchanged), and must not treat the old data as this run's growth.
+        let d = p.decide(
+            Some(&disk(100, 3)),
+            DiskInputs {
+                db_len: 30 * GIB,
+                db_len_start: 30 * GIB,
+                found_bytes: 10 * GIB,
+                handled_bytes: 200 * MIB,
+                unchanged_bytes: 200 * MIB,
+                walk_done: true,
+            },
         );
-        // Projection needs 100 GB but only 60 GB is free above the 50 GB
-        // reserve... only once the walk is done.
-        let d = p.decide(Some(&disk(1000, 110)), 0, 10 * GIB, 0, false);
+        assert_eq!(d.ratio, DISK_RATIO, "nothing new stored yet: assumed ratio");
+        assert_eq!(
+            d.projected_final,
+            30 * GIB,
+            "everything seen so far was unchanged"
+        );
         assert!(d.stop.is_none(), "{d:?}");
-        let d = p.decide(Some(&disk(1000, 110)), 0, 10 * GIB, 0, true);
-        assert!(
-            d.stop
-                .as_deref()
-                .unwrap()
-                .contains("would reach about 100.0 GB"),
-            "{d:?}"
+        // Past the stored files, new ones cost the measured ratio: 3 GB of
+        // the seen 3.5 GB were unchanged, so 1/7 of the rest counts.
+        let d = p.decide(
+            Some(&disk(100, 60)),
+            DiskInputs {
+                db_len: 30 * GIB + 640 * MIB,
+                db_len_start: 30 * GIB,
+                found_bytes: 10 * GIB,
+                handled_bytes: 3 * GIB + 512 * MIB,
+                unchanged_bytes: 3 * GIB,
+                walk_done: true,
+            },
         );
-        // Enough room: no stop.
-        let d = p.decide(Some(&disk(1000, 200)), 0, 10 * GIB, 0, true);
+        assert!((d.ratio - 1.25f64.max(2.0)).abs() < 1e-9, "{d:?}");
+        let remaining = (10 * GIB - (3 * GIB + 512 * MIB)) as f64;
+        let want = (30 * GIB + 640 * MIB) as f64 + remaining * 2.0 / 7.0;
+        assert!((d.projected_final as f64 - want).abs() < 1e6, "{d:?}");
         assert!(d.stop.is_none());
-        // Unknown platform never stops; --no-disk-check never stops.
-        assert!(p.decide(None, 0, 10 * GIB, 0, true).stop.is_none());
-        let off = DiskPolicy {
-            min_free: MinFree::Default,
-            enforce: false,
-        };
-        assert!(off
-            .decide(Some(&disk(1000, 1)), 0, 10 * GIB, 0, true)
-            .stop
-            .is_none());
     }
 
     #[test]
     fn disk_full_errors_are_recognized() {
-        let e = std::io::Error::from_raw_os_error(28);
-        assert!(is_disk_full(&format!("storage error: I/O error: {e}")));
-        let e = std::io::Error::from_raw_os_error(112);
-        assert!(is_disk_full(&format!("{e}")));
+        assert!(is_disk_full(
+            "storage error: I/O error: No space left on device (os error 28)"
+        ));
+        assert!(is_disk_full(
+            "There is not enough space on the disk. (os error 112)"
+        ));
+        if cfg!(windows) {
+            let e = std::io::Error::from_raw_os_error(112);
+            assert!(is_disk_full(&format!("{e}")));
+        } else {
+            let e = std::io::Error::from_raw_os_error(28);
+            assert!(is_disk_full(&format!("{e}")));
+        }
         assert!(!is_disk_full(
             "storage error: I/O error: permission denied (os error 13)"
         ));

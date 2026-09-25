@@ -105,11 +105,12 @@ fn stops_cleanly_when_the_disk_runs_low_and_resumes() {
     let stored = repo["files"].as_u64().unwrap();
     assert!(stored > 0 && stored < 3000, "stored {stored}: {desc}");
 
-    // Plenty of space again: the rerun skips what was stored and finishes.
+    // Just above the reserve again: the rerun must not count the file's
+    // existing data as its own growth, skips what was stored, and finishes.
     let generous: DiskProbe = Arc::new(|_p: &Path| {
         Some(DiskSample {
             total: 1000 * GIB,
-            available: 500 * GIB,
+            available: 2 * GIB + 200 * (1 << 20),
         })
     });
     let (r, sum) = run(&db, &dir, generous, MinFree::Bytes(2 * GIB));

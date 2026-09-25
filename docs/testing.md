@@ -3,7 +3,7 @@
 ## Disk space
 
 `memory-graph index` keeps a reserve of free space on the database's volume
-(`--min-free-disk`, default the larger of 2 GB and 5% of the volume) and
+(`--min-free-disk`, default 5% of the volume, between 2 GB and 32 GB) and
 projects the final database size from what it has stored so far. It refuses
 up front when the volume is already below the reserve, and stops cleanly mid-run
 when free space drops below it or when the projection (once the directory
@@ -24,8 +24,10 @@ Three layers test this:
    (`describe` shows no open batch), a partial store, and a full resume.
    Runs in `cargo test --workspace` on every platform.
 3. **Real ENOSPC** (`scripts/disk-full-tmpfs.sh`, Linux with sudo): indexes a
-   20x copy of `testdata/corpus` into a 48 MB tmpfs with a 4 MB reserve, then
-   enlarges the volume and reruns. CI runs it on ubuntu. On Windows a
+   20x copy of `testdata/corpus` into a 48 MB tmpfs three ways: with the
+   check off (a real `No space left on device`, reported as "disk full",
+   database still consistent), with a 4 MB reserve (clean stop), then after
+   enlarging the volume (resume). CI runs it on ubuntu. On Windows a
    size-capped volume needs a VHD and administrator rights, so that layer is
    manual there; the injected probe covers the logic.
 

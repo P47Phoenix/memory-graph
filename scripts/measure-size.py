@@ -82,7 +82,8 @@ def main() -> int:
             cmd += ["--backend", backend]
         cmd += ["vacuum"] + (["--compact"] if compact else [])
         t0 = time.time()
-        subprocess.run(cmd, check=False, capture_output=True, text=True)
+        sh(cmd)
+        # Token count is the fresh run's (the file holds the same tokens).
         rows.append((backend or "-", label, db.stat().st_size, None, None, time.time() - t0))
 
     total_tokens = None

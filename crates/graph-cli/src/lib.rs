@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 
 pub mod dataflow;
 pub mod diskinfo;
-use diskinfo::{DiskPolicy, DiskProbe, MinFree};
+use diskinfo::{DiskInputs, DiskPolicy, DiskProbe, MinFree};
 pub mod progress;
 pub mod sysinfo;
 use dataflow::Trace;
@@ -124,15 +124,17 @@ struct Tally {
 }
 
 /// Store the pending files in one transaction and fold the outcomes into `t`.
+/// Returns the source bytes of the files the store already had (unchanged).
 fn flush_batch(
     store: &dyn Store,
     o: &DirOpts,
     pending: &mut Vec<(String, PreparedFile)>,
     t: &mut Tally,
-) -> Result<()> {
+) -> Result<u64> {
     if pending.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let lens: Vec<u64> = pending.iter().map(|(_, p)| p.bytes_len() as u64).collect();
     let (rels, prepared): (Vec<String>, Vec<PreparedFile>) = pending.drain(..).unzip();
     let n = prepared.len();
     let outcomes = store
@@ -150,11 +152,15 @@ fn flush_batch(
                 ))
             }
         })?;
-    for (rel, r) in rels.into_iter().zip(outcomes) {
+    let mut unchanged_bytes = 0u64;
+    for ((rel, len), r) in rels.into_iter().zip(lens).zip(outcomes) {
         match r {
             Ok(st) => {
                 t.files += 1;
                 t.unchanged += usize::from(st.unchanged);
+                if st.unchanged {
+                    unchanged_bytes += len;
+                }
                 t.symbols += st.symbols;
                 t.tokens += st.tokens;
                 *t.by_lang.entry(st.language).or_default() += 1;
@@ -180,7 +186,7 @@ fn flush_batch(
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(())
+    Ok(unchanged_bytes)
 }
 
 /// One walk entry, kept in walk order.
@@ -510,12 +516,18 @@ fn run_pipeline(
                 if tick.is_multiple_of(2) {
                     let sample = probe(o.db);
                     let db_len = std::fs::metadata(o.db).map_or(0, |m| m.len());
+                    // `walk_done` first: it publishes the final `found_bytes`.
+                    let walk_done = board.walk_done.load(std::sync::atomic::Ordering::Acquire);
                     let d = disk_policy.decide(
                         sample.as_ref(),
-                        db_len,
-                        board.found_bytes.load(Relaxed),
-                        board.handled_bytes.load(Relaxed),
-                        board.walk_done.load(std::sync::atomic::Ordering::Acquire),
+                        DiskInputs {
+                            db_len,
+                            db_len_start: board.db_len_start.load(Relaxed),
+                            found_bytes: board.found_bytes.load(Relaxed),
+                            handled_bytes: board.handled_bytes.load(Relaxed),
+                            unchanged_bytes: board.unchanged_bytes.load(Relaxed),
+                            walk_done,
+                        },
                     );
                     *board.disk.lock().unwrap_or_else(|e| e.into_inner()) = sample;
                     board.db_len.store(db_len, Relaxed);
@@ -595,16 +607,21 @@ fn commit_all(
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(why) = stop {
-            // Only the group already taken is stored (bounded by the group
-            // cap, so it cannot fill the disk by itself); everything else
-            // parsed so far is abandoned and re-parsed on the rerun.
+            // What was committed stays. A partial fixed batch (only
+            // `--deterministic` leaves one pending here; the adaptive mode
+            // flushes every pass) is stored too, bounded by the group cap so
+            // it cannot fill the disk by itself. Everything else parsed so
+            // far is abandoned and re-parsed on the rerun; the budget and
+            // footprint those files hold die with the scope.
             if !pending.is_empty() {
                 let n = pending.len();
-                board
-                    .commit
-                    .busy(0, "committing", &format!("last {n} files"), || {
-                        flush_batch(store, o, &mut pending, &mut c.tally)
-                    })?;
+                let unchanged =
+                    board
+                        .commit
+                        .busy(0, "committing", &format!("last {n} files"), || {
+                            flush_batch(store, o, &mut pending, &mut c.tally)
+                        })?;
+                board.unchanged_bytes.fetch_add(unchanged, Relaxed);
                 board.txns.fetch_add(1, Relaxed);
             }
             board.budget.release(held);
@@ -663,9 +680,10 @@ fn commit_all(
                 pending_bytes as f64 / 1048576.0
             );
             let t0 = std::time::Instant::now();
-            board.commit.busy(0, "committing", &label, || {
+            let unchanged = board.commit.busy(0, "committing", &label, || {
                 flush_batch(store, o, &mut pending, &mut c.tally)
             })?;
+            board.unchanged_bytes.fetch_add(unchanged, Relaxed);
             board.txns.store(txn, Relaxed);
             board
                 .last_txn
@@ -688,6 +706,21 @@ fn commit_all(
             (held, held_fp, held_prepared) = (0, 0, 0);
         }
         if all_in && pending.is_empty() && buf.is_empty() {
+            // A stop that landed during the last commit lost nothing, but
+            // the run must not report success with a stop recorded.
+            if let Some(why) = board
+                .disk_stop
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                board.commit.done(0);
+                bail!(
+                    "stopped before the disk filled: {why}; {} files stored in {} transactions; free space and rerun to resume (stored files are skipped)",
+                    c.tally.files,
+                    board.txns.load(Relaxed)
+                );
+            }
             board.commit.done(0);
             return Ok(c);
         }
@@ -769,7 +802,7 @@ pub fn index_dir_with(
     }
     if o.deterministic && o.chunk_bytes < BATCH_BYTES as u64 + o.max_file_size {
         bail!(
-            "--deterministic needs --chunk-bytes of at least {} (one fixed batch plus one file), got {}",
+            "--deterministic needs --chunk-bytes of at least {} (one fixed batch plus one --max-file-size file), got {}; raise --chunk-bytes or lower --max-file-size",
             BATCH_BYTES as u64 + o.max_file_size,
             o.chunk_bytes
         );
@@ -803,6 +836,9 @@ pub fn index_dir_with(
     let sizing = sysinfo::Sizing::detect(o.jobs, o.memory, floor);
     let board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
     board.disk_check.store(o.disk_check, Relaxed);
+    board
+        .db_len_start
+        .store(std::fs::metadata(o.db).map_or(0, |m| m.len()), Relaxed);
     let run = run_pipeline(&*store, &o, &board, display);
     let view = board.view();
     if let (Some(path), Some(t)) = (o.trace, trace) {

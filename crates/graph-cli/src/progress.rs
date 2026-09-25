@@ -43,6 +43,9 @@ pub struct Board {
     /// disk guard stopped the run (if it did).
     pub disk: std::sync::Mutex<Option<DiskSample>>,
     pub db_len: AtomicU64,
+    pub db_len_start: AtomicU64,
+    /// Source bytes of handled files the store already had (unchanged).
+    pub unchanged_bytes: AtomicU64,
     pub disk_projected: AtomicU64,
     pub disk_ratio: AtomicU64,
     pub disk_min_free: AtomicU64,
@@ -77,6 +80,8 @@ impl Board {
             prepared_bytes: AtomicU64::new(0),
             disk: std::sync::Mutex::new(None),
             db_len: AtomicU64::new(0),
+            db_len_start: AtomicU64::new(0),
+            unchanged_bytes: AtomicU64::new(0),
             disk_projected: AtomicU64::new(0),
             disk_ratio: AtomicU64::new(crate::diskinfo::DISK_RATIO.to_bits()),
             disk_min_free: AtomicU64::new(0),
