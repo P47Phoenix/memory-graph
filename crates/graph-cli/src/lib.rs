@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 pub mod dataflow;
+pub mod diskinfo;
 pub mod progress;
 pub mod sysinfo;
 use dataflow::Trace;

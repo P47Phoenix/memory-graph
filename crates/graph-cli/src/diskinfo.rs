@@ -1,0 +1,300 @@
+//! Disk space for `memory-graph index`: how much the database's volume has
+//! free, how big the database is likely to get, and when to stop before the
+//! disk fills (a 10 GB tree once produced a 420 GB v1 database and died on
+//! `No space left on device`).
+use std::path::Path;
+use std::sync::Arc;
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+/// One reading of the volume the database lives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSample {
+    pub total: u64,
+    /// Free for this user right now.
+    pub available: u64,
+}
+
+/// A source of disk readings; tests inject one that scripts a shrinking disk.
+pub type DiskProbe = Arc<dyn Fn(&Path) -> Option<DiskSample> + Send + Sync>;
+
+/// Read the volume holding `path` (a file or directory), if the platform says.
+pub fn sample_disk(path: &Path) -> Option<DiskSample> {
+    // The database may not exist yet: ask about its directory.
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf)
+    };
+    sample_dir(&dir)
+}
+
+#[cfg(windows)]
+fn sample_dir(dir: &Path) -> Option<DiskSample> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the three out
+    // pointers are valid u64s; the return value is checked.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    (ok != 0).then_some(DiskSample {
+        total,
+        available: avail,
+    })
+}
+
+#[cfg(unix)]
+fn sample_dir(dir: &Path) -> Option<DiskSample> {
+    let s = rustix::fs::statvfs(dir).ok()?;
+    let frsize = if s.f_frsize > 0 {
+        s.f_frsize
+    } else {
+        s.f_bsize
+    };
+    Some(DiskSample {
+        total: s.f_blocks.saturating_mul(frsize),
+        available: s.f_bavail.saturating_mul(frsize),
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn sample_dir(_dir: &Path) -> Option<DiskSample> {
+    None
+}
+
+/// Database bytes per source byte assumed until measured: 8.2x on a 20x copy
+/// of `testdata/corpus`, 7-8x on real monorepos (#67), with a margin for
+/// redb growing its file in region steps.
+pub const DISK_RATIO: f64 = 10.0;
+/// The projection trusts the measured ratio once this much source is stored.
+const RATIO_CALIBRATE_MIN: u64 = 64 * MIB;
+/// Never let the volume drop below this (or 5% of it, whichever is more)
+/// unless told otherwise: the OS, logs and other programs need room too.
+pub const MIN_FREE_FLOOR: u64 = 2 * GIB;
+pub const MIN_FREE_FRACTION: f64 = 0.05;
+
+/// How much free space to keep: `Bytes` from `--min-free-disk 4G`,
+/// `Fraction` from `5%`, or the default rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MinFree {
+    Default,
+    Bytes(u64),
+    Fraction(f64),
+}
+
+impl MinFree {
+    pub fn resolve(self, total: Option<u64>) -> u64 {
+        match self {
+            MinFree::Bytes(b) => b,
+            MinFree::Fraction(f) => total.map_or(MIN_FREE_FLOOR, |t| (t as f64 * f) as u64),
+            MinFree::Default => total.map_or(MIN_FREE_FLOOR, |t| {
+                MIN_FREE_FLOOR.max((t as f64 * MIN_FREE_FRACTION) as u64)
+            }),
+        }
+    }
+}
+
+/// What the policy decided from one reading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskDecision {
+    /// Bytes the database will probably reach once every found file is stored.
+    pub projected_final: u64,
+    /// The database-bytes-per-source-byte in use (measured or assumed).
+    pub ratio: f64,
+    /// The free space to keep.
+    pub min_free: u64,
+    /// Why the run must stop now, if it must.
+    pub stop: Option<String>,
+}
+
+/// Pure decision logic, fed each sample by the pipeline's sampler.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskPolicy {
+    pub min_free: MinFree,
+    /// `--no-disk-check`: report, never stop.
+    pub enforce: bool,
+}
+
+fn mb(b: u64) -> String {
+    let m = b as f64 / MIB as f64;
+    if m >= 1024.0 {
+        format!("{:.1} GB", m / 1024.0)
+    } else {
+        format!("{m:.0} MB")
+    }
+}
+
+impl DiskPolicy {
+    /// Decide from `sample` (None when the platform says nothing), the
+    /// database's current size, the source bytes found so far and stored so
+    /// far, and whether the walk has finished (only then is the projection
+    /// complete enough to refuse on).
+    pub fn decide(
+        &self,
+        sample: Option<&DiskSample>,
+        db_len: u64,
+        found_bytes: u64,
+        handled_bytes: u64,
+        walk_done: bool,
+    ) -> DiskDecision {
+        let ratio = if handled_bytes >= RATIO_CALIBRATE_MIN {
+            (db_len as f64 / handled_bytes as f64).max(2.0)
+        } else {
+            DISK_RATIO
+        };
+        let remaining = found_bytes.saturating_sub(handled_bytes);
+        let projected_final = db_len.saturating_add((remaining as f64 * ratio) as u64);
+        let min_free = self.min_free.resolve(sample.map(|s| s.total));
+        let mut d = DiskDecision {
+            projected_final,
+            ratio,
+            min_free,
+            stop: None,
+        };
+        let Some(s) = sample else {
+            return d;
+        };
+        if !self.enforce {
+            return d;
+        }
+        if s.available < min_free {
+            d.stop = Some(format!(
+                "only {} free on the database's volume (keeping {})",
+                mb(s.available),
+                mb(min_free)
+            ));
+        } else if walk_done {
+            let needed = projected_final.saturating_sub(db_len);
+            if s.available.saturating_sub(needed) < min_free {
+                d.stop = Some(format!(
+                    "the database would reach about {} ({:.1}x the source) but only {} is free (keeping {})",
+                    mb(projected_final),
+                    ratio,
+                    mb(s.available),
+                    mb(min_free)
+                ));
+            }
+        }
+        d
+    }
+}
+
+/// Whether a storage error is the disk filling up (Linux ENOSPC 28, Windows
+/// ERROR_DISK_FULL 112 / ERROR_HANDLE_DISK_FULL 39), by text since redb
+/// stringifies the `io::Error`.
+pub fn is_disk_full(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("no space left on device")
+        || m.contains("not enough space on the disk")
+        || m.contains("os error 28)")
+        || m.contains("os error 112)")
+        || m.contains("os error 39)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disk(total_gb: u64, avail_gb: u64) -> DiskSample {
+        DiskSample {
+            total: total_gb * GIB,
+            available: avail_gb * GIB,
+        }
+    }
+
+    #[test]
+    fn min_free_rules() {
+        assert_eq!(MinFree::Default.resolve(Some(20 * GIB)), 2 * GIB, "floor");
+        assert_eq!(MinFree::Default.resolve(Some(100 * GIB)), 5 * GIB, "5%");
+        assert_eq!(MinFree::Default.resolve(None), 2 * GIB);
+        assert_eq!(MinFree::Bytes(7).resolve(Some(100 * GIB)), 7);
+        assert_eq!(MinFree::Fraction(0.1).resolve(Some(100 * GIB)), 10 * GIB);
+    }
+
+    #[test]
+    fn projection_and_calibration() {
+        let p = DiskPolicy {
+            min_free: MinFree::Default,
+            enforce: true,
+        };
+        // Nothing stored yet: the assumed ratio projects the whole tree.
+        let d = p.decide(Some(&disk(1000, 500)), 0, 10 * GIB, 0, false);
+        assert_eq!(d.ratio, DISK_RATIO);
+        assert_eq!(d.projected_final, 100 * GIB);
+        assert!(d.stop.is_none());
+        // Once 64 MiB is stored the measured ratio takes over.
+        let d = p.decide(Some(&disk(1000, 500)), 800 * MIB, 10 * GIB, 100 * MIB, true);
+        assert!((d.ratio - 8.0).abs() < 1e-9);
+        // ...never below 2x.
+        let d = p.decide(Some(&disk(1000, 500)), 100 * MIB, 10 * GIB, 100 * MIB, true);
+        assert_eq!(d.ratio, 2.0);
+    }
+
+    #[test]
+    fn stops_on_headroom_and_on_projection() {
+        let p = DiskPolicy {
+            min_free: MinFree::Default,
+            enforce: true,
+        };
+        // Below the reserve: stop whatever the projection.
+        let d = p.decide(Some(&disk(1000, 3)), 0, GIB, 0, false);
+        assert!(
+            d.stop.as_deref().unwrap().contains("only 3.0 GB free"),
+            "{d:?}"
+        );
+        // Projection needs 100 GB but only 60 GB is free above the 50 GB
+        // reserve... only once the walk is done.
+        let d = p.decide(Some(&disk(1000, 110)), 0, 10 * GIB, 0, false);
+        assert!(d.stop.is_none(), "{d:?}");
+        let d = p.decide(Some(&disk(1000, 110)), 0, 10 * GIB, 0, true);
+        assert!(
+            d.stop
+                .as_deref()
+                .unwrap()
+                .contains("would reach about 100.0 GB"),
+            "{d:?}"
+        );
+        // Enough room: no stop.
+        let d = p.decide(Some(&disk(1000, 200)), 0, 10 * GIB, 0, true);
+        assert!(d.stop.is_none());
+        // Unknown platform never stops; --no-disk-check never stops.
+        assert!(p.decide(None, 0, 10 * GIB, 0, true).stop.is_none());
+        let off = DiskPolicy {
+            min_free: MinFree::Default,
+            enforce: false,
+        };
+        assert!(off
+            .decide(Some(&disk(1000, 1)), 0, 10 * GIB, 0, true)
+            .stop
+            .is_none());
+    }
+
+    #[test]
+    fn disk_full_errors_are_recognized() {
+        let e = std::io::Error::from_raw_os_error(28);
+        assert!(is_disk_full(&format!("storage error: I/O error: {e}")));
+        let e = std::io::Error::from_raw_os_error(112);
+        assert!(is_disk_full(&format!("{e}")));
+        assert!(!is_disk_full(
+            "storage error: I/O error: permission denied (os error 13)"
+        ));
+    }
+
+    #[test]
+    fn this_volume_is_sampled_here() {
+        if cfg!(any(windows, unix)) {
+            let s = sample_disk(Path::new(".")).unwrap();
+            assert!(s.total >= s.available && s.total > 0);
+            let f = sample_disk(Path::new("./does-not-exist.redb")).unwrap();
+            assert_eq!(f.total, s.total);
+        }
+    }
+}
