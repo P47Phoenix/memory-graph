@@ -89,6 +89,7 @@ pub const DEFAULT_CHUNK_BYTES: u64 = 64 << 20;
 fn group_cap(board: &Board, o: &DirOpts) -> u64 {
     (board.budget.cap() / 2)
         .min(o.chunk_bytes.saturating_mul(8))
+        .min(board.disk_group_cap.load(Relaxed))
         .max(1)
 }
 
@@ -525,6 +526,17 @@ fn run_pipeline(
                 if tick.is_multiple_of(2) {
                     let sample = probe(o.db);
                     let db_len = std::fs::metadata(o.db).map_or(0, |m| m.len());
+                    // Size the next group to what fits on the volume (at the
+                    // ratio measured so far), unless batches are fixed.
+                    if let Some(s) = &sample {
+                        if o.disk_check && !o.deterministic {
+                            let min_free = o.min_free_disk.resolve(Some(s.total));
+                            let ratio = f64::from_bits(board.disk_ratio.load(Relaxed));
+                            board
+                                .disk_group_cap
+                                .store(diskinfo::group_fit(s.available, min_free, ratio), Relaxed);
+                        }
+                    }
                     // `walk_done` first: it publishes the final `found_bytes`.
                     let walk_done = board.walk_done.load(std::sync::atomic::Ordering::Acquire);
                     let d = disk_policy.decide(

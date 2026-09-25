@@ -51,6 +51,9 @@ pub struct Board {
     pub disk_min_free: AtomicU64,
     pub disk_stop: std::sync::Mutex<Option<String>>,
     pub disk_check: AtomicBool,
+    /// Source bytes one group commit may take so it fits on the volume
+    /// (set by the sampler; `u64::MAX` until a reading arrives).
+    pub disk_group_cap: AtomicU64,
 }
 
 impl Board {
@@ -87,6 +90,7 @@ impl Board {
             disk_min_free: AtomicU64::new(0),
             disk_stop: std::sync::Mutex::new(None),
             disk_check: AtomicBool::new(true),
+            disk_group_cap: AtomicU64::new(u64::MAX),
             start: Instant::now(),
             walk: Stage::new("walk", 1).traced(0, trace),
             parse: Stage::new("parse", t).traced(100, trace),

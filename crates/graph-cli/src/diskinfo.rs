@@ -230,6 +230,15 @@ impl DiskPolicy {
     }
 }
 
+/// Source bytes one group commit may take so that it fits: half of what is
+/// free above the reserve, at the current ratio, and at least 1 MiB (below
+/// that the run stops anyway). A small volume gets small commits instead of
+/// an early refusal.
+pub fn group_fit(available: u64, min_free: u64, ratio: f64) -> u64 {
+    let room = available.saturating_sub(min_free) / 2;
+    ((room as f64 / ratio.max(1.0)) as u64).max(MIB)
+}
+
 /// Whether a storage error is the disk filling up (Linux ENOSPC 28, Windows
 /// ERROR_DISK_FULL 112 / ERROR_HANDLE_DISK_FULL 39), by text since redb
 /// stringifies the `io::Error`.
@@ -412,6 +421,19 @@ mod tests {
             .decide(Some(&disk(1000, 1)), inputs(0, 10 * GIB, 0, true))
             .stop
             .is_none());
+    }
+
+    #[test]
+    fn groups_shrink_to_what_fits() {
+        // 46 MB free, 4 MB reserve, 10x: 21 MB of room, 2.1 MB of source.
+        assert_eq!(
+            group_fit(46 * MIB, 4 * MIB, 10.0),
+            (21.0 * MIB as f64 / 10.0) as u64
+        );
+        // Below the reserve the floor applies (the guard stops the run).
+        assert_eq!(group_fit(3 * MIB, 4 * MIB, 10.0), MIB);
+        // Plenty of room: huge.
+        assert!(group_fit(500 * GIB, 32 * GIB, 8.0) > 20 * GIB);
     }
 
     #[test]
