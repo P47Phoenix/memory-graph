@@ -88,6 +88,32 @@ impl PreparedFile {
     pub fn is_unchanged(&self) -> bool {
         matches!(self.work, Prepared::Unchanged(_))
     }
+    /// About how many bytes of heap this prepared file occupies (the
+    /// extraction's tokens, symbols and strings, or the kept source, plus
+    /// the backend's pre-encoded work), so a caller can budget memory.
+    pub fn memory_footprint(&self) -> usize {
+        use std::mem::size_of;
+        let strings = self.path.capacity()
+            + self.language.capacity()
+            + self.fingerprint.capacity()
+            + self.origin.as_ref().map_or(0, String::capacity);
+        let work = match &self.work {
+            Prepared::Unchanged(src) => src.capacity(),
+            Prepared::Rejected(_) => 0,
+            Prepared::Extracted(ex) => {
+                ex.tokens.capacity() * size_of::<graph_core::TokenDecl>()
+                    + ex.tokens.iter().map(|t| t.text.capacity()).sum::<usize>()
+                    + ex.symbols.capacity() * size_of::<graph_core::SymbolDecl>()
+                    + ex.symbols
+                        .iter()
+                        .map(|s| {
+                            s.name.capacity() + s.lang_kind.as_ref().map_or(0, String::capacity)
+                        })
+                        .sum::<usize>()
+            }
+        };
+        size_of::<Self>() + strings + work + self.v2.as_ref().map_or(0, |p| p.footprint())
+    }
 }
 
 // Prepared on worker threads, committed on the writer's.

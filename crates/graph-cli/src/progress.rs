@@ -30,6 +30,13 @@ pub struct Board {
     pub last_txn: AtomicU64,
     /// The latest memory sample (from the sampler thread).
     pub memory: std::sync::Mutex<Option<MemSample>>,
+    /// Measured heap growth per source byte in flight (`f64` bits).
+    pub expansion: AtomicU64,
+    /// Heap footprint of the prepared files in flight.
+    pub footprint: AtomicU64,
+    /// Source bytes of those prepared files (the rest of what is held is
+    /// still being read or parsed).
+    pub prepared_bytes: AtomicU64,
 }
 
 impl Board {
@@ -54,6 +61,9 @@ impl Board {
                 b
             },
             memory: std::sync::Mutex::new(sizing.memory),
+            expansion: AtomicU64::new(sizing.policy.expansion.to_bits()),
+            footprint: AtomicU64::new(0),
+            prepared_bytes: AtomicU64::new(0),
             start: Instant::now(),
             walk: Stage::new("walk", 1).traced(0, trace),
             parse: Stage::new("parse", t).traced(100, trace),
@@ -90,6 +100,8 @@ impl Board {
             mem_peak: self.budget.peak(),
             budget: self.budget.view(),
             memory: *self.memory.lock().unwrap_or_else(|e| e.into_inner()),
+            expansion: f64::from_bits(self.expansion.load(Relaxed)),
+            footprint: self.footprint.load(Relaxed),
             sizing: self.sizing.clone(),
         }
     }
@@ -116,6 +128,8 @@ pub struct BoardView {
     pub mem_peak: u64,
     pub budget: BudgetView,
     pub memory: Option<MemSample>,
+    pub expansion: f64,
+    pub footprint: u64,
     pub sizing: Sizing,
 }
 
@@ -304,9 +318,11 @@ impl BoardView {
             format!("({})", self.budget.reason)
         };
         lines.push(format!(
-            "  memory  in flight {} · budget {} {why}{bn}",
+            "  memory  in flight {} (≈{} in memory) · budget {} (≈{}) {why}{bn}",
             mb(self.mem_used),
-            mb(self.mem_cap)
+            mb(self.footprint),
+            mb(self.mem_cap),
+            mb((self.mem_cap as f64 * self.expansion) as u64)
         ));
         lines
             .into_iter()
@@ -352,23 +368,25 @@ impl BoardView {
         };
         let b = &self.budget;
         s.push_str(&format!(
-            "sizing: {} parse threads ({} CPUs); memory budget {} at start, {}..{} during the run ({}), peak in flight {}; {} transactions\n",
+            "sizing: {} parse threads ({} CPUs); memory budget {} at start, {}..{} of source during the run (about {} in memory at the end; {}), peak in flight {}; {} transactions\n",
             self.sizing.parse_threads,
             self.sizing.cpus,
             mb(self.sizing.memory_budget),
             mb(b.cap_min),
             mb(b.cap_max),
+            mb((b.cap as f64 * self.expansion) as u64),
             b.reason,
             mb(self.mem_peak),
             self.txns,
         ));
         if let Some(m) = &self.memory {
             s.push_str(&format!(
-                "memory: {} of {} free now{}; pressure {} time(s), {} in total\n",
+                "memory: {} of {} free now{}; growth {:.1}x per source byte in flight; pressure {} time(s), {} in total\n",
                 mb(m.available),
                 mb(m.total),
                 m.rss
                     .map_or(String::new(), |r| format!(", this process {}", mb(r))),
+                self.expansion,
                 b.pressure_episodes,
                 secs(b.pressure_time),
             ));
@@ -412,6 +430,9 @@ impl BoardView {
                 "total": self.memory.map(|m| m.total),
                 "available": self.memory.map(|m| m.available),
                 "rss": self.memory.and_then(|m| m.rss),
+                "expansion": self.expansion,
+                "footprint_in_flight": self.footprint,
+                "budget_end_in_memory": (self.budget.cap as f64 * self.expansion) as u64,
             },
         })
     }
@@ -543,6 +564,8 @@ mod tests {
                 rss: Some(1 << 30),
                 psi_some_avg10: None,
             }),
+            expansion: 6.0,
+            footprint: 500 << 20,
             sizing: Sizing::new(
                 4,
                 Some(MemSample {
@@ -563,15 +586,23 @@ mod tests {
         let mut v = view();
         let t = v.render(200).join("\n");
         assert!(
-            t.contains("in flight 84 MB · budget 1.0 GB (25% of 8.0 GB free"),
+            t.contains(
+                "in flight 84 MB (≈500 MB in memory) · budget 1.0 GB (≈6.0 GB) (25% of 8.0 GB free"
+            ),
             "{t}"
         );
         v.budget.pressure = true;
         v.budget.reason = "pressure: only 1.0 GB of 16.0 GB free".into();
         let t = v.render(200).join("\n");
-        assert!(t.contains("budget 1.0 GB ⚠ pressure: only"), "{t}");
+        assert!(
+            t.contains("budget 1.0 GB (≈6.0 GB) ⚠ pressure: only"),
+            "{t}"
+        );
         let s = v.stats_table();
-        assert!(s.contains("1.0 GB..2.0 GB during the run"), "{s}");
+        assert!(
+            s.contains("1.0 GB..2.0 GB of source during the run (about 6.0 GB in memory"),
+            "{s}"
+        );
         assert!(
             s.contains("8.0 GB of 16.0 GB free now, this process 1.0 GB"),
             "{s}"
