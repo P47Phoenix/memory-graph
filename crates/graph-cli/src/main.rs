@@ -142,6 +142,19 @@ enum Cmd {
         no_disk_check: bool,
         dir: PathBuf,
     },
+    /// Show what `index` sizes itself from on this machine: CPUs, memory (and where the reading came
+    /// from, or why there is none), the budget it would start with, and the free space on --db's volume
+    Sysinfo {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+        /// The `--memory` setting to size the budget with (default: 70%). Also read from MEMORY_GRAPH_MEMORY
+        #[arg(long, env = "MEMORY_GRAPH_MEMORY", value_parser = graph_cli::sysinfo::parse_memory_spec)]
+        memory: Option<graph_cli::sysinfo::MemorySpec>,
+        /// The `--min-free-disk` setting to report the reserve for
+        #[arg(long, value_parser = graph_cli::diskinfo::parse_min_free)]
+        min_free_disk: Option<graph_cli::diskinfo::MinFree>,
+    },
     /// Drop dictionary terms that no file refers to any more
     Vacuum {
         /// Also rebuild the file to reclaim the space `vacuum` frees but redb does not return on its own
@@ -465,6 +478,22 @@ fn run() -> Result<()> {
             |db| open_for_indexing(db, overrides),
             &mut std::io::stdout().lock(),
         )?,
+        Cmd::Sysinfo {
+            json,
+            memory,
+            min_free_disk,
+        } => {
+            let r = graph_cli::report::Report::detect(
+                &cli.db,
+                memory,
+                min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
+            );
+            if json {
+                out!("{}", serde_json::to_string_pretty(&r.json())?);
+            } else {
+                write!(std::io::stdout().lock(), "{}", r.text())?;
+            }
+        }
         Cmd::Vacuum { compact } => {
             if !cli.db.is_file() {
                 bail!("database `{}` does not exist", cli.db.display());

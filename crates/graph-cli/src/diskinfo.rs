@@ -32,6 +32,14 @@ pub fn sample_disk(path: &Path) -> Option<DiskSample> {
     sample_dir(&dir)
 }
 
+/// Which call reads the volume on this platform (for `sysinfo`).
+#[cfg(windows)]
+pub const DISK_SOURCE: &str = "GetDiskFreeSpaceExW";
+#[cfg(unix)]
+pub const DISK_SOURCE: &str = "statvfs";
+#[cfg(not(any(windows, unix)))]
+pub const DISK_SOURCE: &str = "none";
+
 #[cfg(windows)]
 fn sample_dir(dir: &Path) -> Option<DiskSample> {
     use std::os::windows::ffi::OsStrExt;

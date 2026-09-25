@@ -31,6 +31,31 @@ Three layers test this:
    size-capped volume needs a VHD and administrator rights, so that layer is
    manual there; the injected probe covers the logic.
 
+## Machine probes
+
+`memory-graph sysinfo` prints what `index` sizes itself from: CPUs, memory
+(with the probe that read it, or the cause when none could), the starting
+budget and the free space on the database's volume; `--json` gives an object.
+The memory probe is `/proc/meminfo` on Linux (else `sysinfo(2)`), capped by
+the cgroup v2/v1 memory limit when one is below physical RAM,
+`host_statistics64` on macOS and `GlobalMemoryStatusEx` on Windows.
+
+1. **Unit tests** (`crates/graph-cli/src/sysinfo.rs`, `report.rs`): the
+   `/proc/meminfo` parser with and without `MemAvailable` and on malformed
+   lines, the cgroup cap (`max`, v1's unlimited sentinel, usage above the
+   limit), the fallback reason text, the report's text and JSON.
+2. **e2e** (`crates/graph-cli/tests/e2e.rs`, `sysinfo_reports_the_probes`):
+   the command's output, and `index --stats` naming the same source.
+3. **CI `probes` job** (`.github/workflows/ci.yml`): on ubuntu 24.04,
+   macOS and Windows, the unit and e2e tests plus `sysinfo --json` checked
+   by `scripts/check-probes.py` (memory known, source named); on ubuntu also
+   inside `docker run --memory=512m` (total at most 512 MiB, source mentions
+   `cgroup`) and with `/proc/meminfo` masked (source `sysinfo(2)`). The
+   macOS and Windows legs are the only places those probes run in CI (the
+   main job is Linux). The cgroup walk (`cgroup_walk_up`) is unit-tested on
+   every platform over a fake cgroup tree, including the v1 spellings that
+   no CI runner has any more.
+
 ## Database size
 
 `crates/graph-cli/tests/size_gate.rs` indexes `testdata/corpus` and fails if

@@ -8,6 +8,7 @@ pub mod dataflow;
 pub mod diskinfo;
 use diskinfo::{DiskInputs, DiskPolicy, DiskProbe, MinFree};
 pub mod progress;
+pub mod report;
 pub mod sysinfo;
 use dataflow::Trace;
 use progress::{Board, Display};
@@ -572,8 +573,18 @@ fn run_pipeline(
                     }
                 }
                 if dynamic && tick.is_multiple_of(2) {
-                    let m = sysinfo::sample_memory();
-                    *board.memory.lock().unwrap_or_else(|e| e.into_inner()) = m;
+                    // A probe that fails mid-run keeps the last good sample
+                    // (the budget does not fall back to 512M because one
+                    // read of /proc raced a cgroup change) and records why.
+                    let probed = sysinfo::sample_memory();
+                    let m = {
+                        let mut mem = board.memory.lock().unwrap_or_else(|e| e.into_inner());
+                        match probed {
+                            Ok(m) => *mem = (Some(m), None),
+                            Err(e) => mem.1 = Some(e),
+                        }
+                        mem.0
+                    };
                     let held = board.budget.used();
                     let prepared = board.prepared_bytes.load(Relaxed);
                     let fp = board.footprint.load(Relaxed);
