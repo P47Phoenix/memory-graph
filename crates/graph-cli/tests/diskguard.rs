@@ -21,6 +21,17 @@ fn run(
     probe: DiskProbe,
     min_free: MinFree,
 ) -> (anyhow::Result<()>, serde_json::Value) {
+    run_with(db, dir, probe, min_free, true, false)
+}
+
+fn run_with(
+    db: &Path,
+    dir: &Path,
+    probe: DiskProbe,
+    min_free: MinFree,
+    disk_check: bool,
+    deterministic: bool,
+) -> (anyhow::Result<()>, serde_json::Value) {
     let mut out = Vec::new();
     let r = index_dir(
         DirOpts {
@@ -35,14 +46,14 @@ fn run(
             reindex: false,
             jobs: 4,
             memory: None,
-            deterministic: false,
+            deterministic,
             stats: true,
             trace: None,
             progress: Some(false),
             disk_probe: Some(probe),
             min_free_disk: min_free,
-            disk_check: true,
-            chunk_bytes: 64 << 10,
+            disk_check,
+            chunk_bytes: if deterministic { 64 << 20 } else { 64 << 10 },
         },
         open,
         &mut out,
@@ -141,4 +152,63 @@ fn refuses_up_front_below_the_reserve() {
         "{err}"
     );
     assert!(!db.exists(), "nothing was created");
+}
+
+#[test]
+fn no_disk_check_proceeds_below_the_reserve() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("src");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+    let db = d.path().join("g.redb");
+    let low: DiskProbe = Arc::new(|_p: &Path| {
+        Some(DiskSample {
+            total: 100 * GIB,
+            available: GIB,
+        })
+    });
+    let (r, sum) = run_with(&db, &dir, low, MinFree::Default, false, false);
+    r.unwrap();
+    assert_eq!(sum["files"], 1, "{sum}");
+    assert_eq!(sum["stats"]["disk"]["check"], false);
+    assert_eq!(sum["stats"]["disk"]["stopped"], serde_json::Value::Null);
+}
+
+/// Under `--deterministic` a stop can catch a partial fixed batch: it is
+/// written out, so nothing already parsed in order is lost.
+#[test]
+fn deterministic_stop_keeps_the_partial_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("src");
+    std::fs::create_dir(&dir).unwrap();
+    for i in 0..600 {
+        let body = format!("fn f{i}() {{ {} }}\n", "let x = 1; ".repeat(300));
+        std::fs::write(dir.join(format!("f{i:03}.rs")), body).unwrap();
+    }
+    let db = d.path().join("g.redb");
+    // Stop as soon as the first fixed batch (256 files) has been committed.
+    let db_path = db.clone();
+    let base = Arc::new(AtomicU64::new(0));
+    let base2 = base.clone();
+    let probe: DiskProbe = Arc::new(move |_p: &Path| {
+        let len = std::fs::metadata(&db_path).map_or(0, |m| m.len());
+        if len > 0 && base2.load(Relaxed) == 0 {
+            base2.store(len, Relaxed);
+        }
+        let grown = len.saturating_sub(base2.load(Relaxed));
+        Some(DiskSample {
+            total: 1000 * GIB,
+            available: if grown > 64 << 10 { GIB } else { 100 * GIB },
+        })
+    });
+    let (r, _) = run_with(&db, &dir, probe, MinFree::Bytes(2 * GIB), true, true);
+    let err = format!("{:#}", r.unwrap_err());
+    assert!(err.contains("stopped before the disk filled"), "{err}");
+    let stored = describe(&db)["repos"][0]["files"].as_u64().unwrap();
+    // At least one whole batch, plus whatever partial batch was pending.
+    assert!((256..600).contains(&stored), "stored {stored}");
+    assert!(
+        !stored.is_multiple_of(256) || stored == 256 || stored == 512,
+        "stored {stored}"
+    );
 }

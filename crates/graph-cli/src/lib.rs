@@ -83,6 +83,15 @@ pub struct DirOpts<'a> {
 /// (the store's own default).
 pub const DEFAULT_CHUNK_BYTES: u64 = 64 << 20;
 
+/// Source bytes one group commit may take: half the memory budget (as it is
+/// right now) so parsing can refill the other half meanwhile, and at most a
+/// few store transactions so a failure loses little.
+fn group_cap(board: &Board, o: &DirOpts) -> u64 {
+    (board.budget.cap() / 2)
+        .min(o.chunk_bytes.saturating_mul(8))
+        .max(1)
+}
+
 /// Whether `path` is the database file itself: (dev, ino) on unix, otherwise a
 /// canonical-path comparison limited to entries with the database's file name.
 fn is_db_file(
@@ -527,6 +536,11 @@ fn run_pipeline(
                             handled_bytes: board.handled_bytes.load(Relaxed),
                             unchanged_bytes: board.unchanged_bytes.load(Relaxed),
                             walk_done,
+                            group_bytes: if o.deterministic {
+                                BATCH_BYTES as u64 + o.max_file_size
+                            } else {
+                                group_cap(board, o)
+                            },
                         },
                     );
                     *board.disk.lock().unwrap_or_else(|e| e.into_inner()) = sample;
@@ -590,12 +604,7 @@ fn commit_all(
     let mut pending: Vec<(String, PreparedFile)> = Vec::new();
     let (mut pending_bytes, mut held, mut held_fp, mut held_prepared) = (0u64, 0u64, 0u64, 0u64);
     loop {
-        // A group commit takes at most half the budget (as it is right now),
-        // so parsing can refill the other half meanwhile, and at most a few
-        // store transactions, so a failure loses little.
-        let group_cap = (board.budget.cap() / 2)
-            .min(o.chunk_bytes.saturating_mul(8))
-            .max(1);
+        let group_cap = group_cap(board, o);
         // Take everything that has arrived.
         for (seq, oc, size, fp) in res_rx.try_iter() {
             buf.insert(seq, (oc, size, fp));

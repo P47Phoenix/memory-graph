@@ -143,6 +143,9 @@ pub struct DiskInputs {
     pub unchanged_bytes: u64,
     /// Only then is the projection complete enough to refuse on.
     pub walk_done: bool,
+    /// Source bytes one group commit may take: the stop must leave room for
+    /// the commit in progress, which cannot be interrupted.
+    pub group_bytes: u64,
 }
 
 /// Pure decision logic, fed each sample by the pipeline's sampler.
@@ -155,7 +158,9 @@ pub struct DiskPolicy {
 
 pub(crate) fn mb(b: u64) -> String {
     let m = b as f64 / MIB as f64;
-    if m >= 1024.0 {
+    if m >= 1024.0 * 1024.0 {
+        format!("{:.1} TB", m / (1024.0 * 1024.0))
+    } else if m >= 1024.0 {
         format!("{:.1} GB", m / 1024.0)
     } else {
         format!("{m:.0} MB")
@@ -199,11 +204,15 @@ impl DiskPolicy {
         if !self.enforce {
             return d;
         }
-        if s.available < min_free {
+        // A commit in progress cannot be interrupted, so stop while there is
+        // still room for one whole group on top of the reserve.
+        let group_room = (i.group_bytes as f64 * ratio) as u64;
+        if s.available < min_free.saturating_add(group_room) {
             d.stop = Some(format!(
-                "only {} free on the database's volume (keeping {})",
+                "only {} free on the database's volume (keeping {} plus {} for the commit in progress)",
                 mb(s.available),
-                mb(min_free)
+                mb(min_free),
+                mb(group_room)
             ));
         } else if i.walk_done {
             let needed = projected_final.saturating_sub(i.db_len);
@@ -248,6 +257,7 @@ mod tests {
     fn min_free_flag_parses() {
         assert_eq!(parse_min_free("4G"), Ok(MinFree::Bytes(4 * GIB)));
         assert_eq!(parse_min_free("5%"), Ok(MinFree::Fraction(0.05)));
+        assert_eq!(mb(1 << 40), "1.0 TB");
         assert!(parse_min_free("0").is_err());
     }
 
@@ -273,6 +283,7 @@ mod tests {
             handled_bytes: handled,
             unchanged_bytes: 0,
             walk_done,
+            group_bytes: 0,
         }
     }
 
@@ -319,6 +330,7 @@ mod tests {
                 handled_bytes: 200 * MIB,
                 unchanged_bytes: 200 * MIB,
                 walk_done: true,
+                group_bytes: 0,
             },
         );
         assert_eq!(d.ratio, DISK_RATIO, "nothing new stored yet: assumed ratio");
@@ -339,6 +351,7 @@ mod tests {
                 handled_bytes: 3 * GIB + 512 * MIB,
                 unchanged_bytes: 3 * GIB,
                 walk_done: true,
+                group_bytes: 0,
             },
         );
         assert!((d.ratio - 1.25f64.max(2.0)).abs() < 1e-9, "{d:?}");
@@ -346,6 +359,59 @@ mod tests {
         let want = (30 * GIB + 640 * MIB) as f64 + remaining * 2.0 / 7.0;
         assert!((d.projected_final as f64 - want).abs() < 1e6, "{d:?}");
         assert!(d.stop.is_none());
+    }
+
+    #[test]
+    fn stops_on_headroom_and_on_projection() {
+        let p = DiskPolicy {
+            min_free: MinFree::Default,
+            enforce: true,
+        };
+        // Below the reserve: stop whatever the projection.
+        let d = p.decide(Some(&disk(1000, 3)), inputs(0, GIB, 0, false));
+        assert!(
+            d.stop.as_deref().unwrap().contains("only 3.0 GB free"),
+            "{d:?}"
+        );
+        // Projection needs 100 GB but only 58 GB is free above the 32 GB
+        // reserve... only once the walk is done.
+        let d = p.decide(Some(&disk(1000, 90)), inputs(0, 10 * GIB, 0, false));
+        assert!(d.stop.is_none(), "{d:?}");
+        let d = p.decide(Some(&disk(1000, 90)), inputs(0, 10 * GIB, 0, true));
+        assert!(
+            d.stop
+                .as_deref()
+                .unwrap()
+                .contains("would reach about 100.0 GB"),
+            "{d:?}"
+        );
+        // Enough room: no stop.
+        let d = p.decide(Some(&disk(1000, 200)), inputs(0, 10 * GIB, 0, true));
+        assert!(d.stop.is_none());
+        // The commit in progress needs room too: 512 MB of source at 10x is
+        // 5 GB, so 35 GB free is not enough above the 32 GB reserve.
+        let mut i = inputs(0, GIB, 0, false);
+        i.group_bytes = 512 * MIB;
+        let d = p.decide(Some(&disk(1000, 35)), i);
+        assert!(
+            d.stop
+                .as_deref()
+                .unwrap()
+                .contains("for the commit in progress"),
+            "{d:?}"
+        );
+        i.group_bytes = 64 * MIB;
+        assert!(p.decide(Some(&disk(1000, 35)), i).stop.is_none());
+        // Unknown platform never stops; --no-disk-check never stops.
+        assert!(p.decide(None, inputs(0, 10 * GIB, 0, true)).stop.is_none());
+        let off = DiskPolicy {
+            min_free: MinFree::Default,
+            enforce: false,
+        };
+        assert!(off
+            .decide(Some(&disk(1000, 1)), inputs(0, 10 * GIB, 0, true))
+            .stop
+            .is_none());
     }
 
     #[test]
