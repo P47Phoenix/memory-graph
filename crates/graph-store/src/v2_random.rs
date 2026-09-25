@@ -1,8 +1,8 @@
-//! v1-vs-v2 comparisons that cross stream checkpoints (files of 64+ tokens),
-//! with replace, prune, language and class filters, plus the old-schema
-//! refusal test.
+//! Configuration-equivalence comparisons that cross stream checkpoints
+//! (files of 64+ tokens), with replace, prune, language and class filters,
+//! plus the old-schema and legacy-format refusal tests.
 use super::*;
-use crate::v2_tests::both_backends;
+use crate::v2_tests::two_configs;
 use graph_core::{Extraction, Span, SymbolDecl, TokenClass, TokenDecl};
 use proptest::prelude::*;
 
@@ -120,8 +120,8 @@ fn same(a: &dyn Store, b: &dyn Store) -> std::result::Result<(), TestCaseError> 
 }
 
 #[test]
-fn files_around_the_checkpoint_boundary_match_v1() {
-    let (_d, a, b) = both_backends();
+fn files_around_the_checkpoint_boundary_match_across_configurations() {
+    let (_d, a, b) = two_configs();
     for (i, n) in [63usize, 64, 65, 127, 128, 129, 200]
         .into_iter()
         .enumerate()
@@ -139,8 +139,8 @@ fn files_around_the_checkpoint_boundary_match_v1() {
 /// Ordinals in the same block, in adjacent blocks and far apart, with a
 /// rare term whose hits straddle checkpoints.
 #[test]
-fn sparse_hits_across_blocks_match_v1() {
-    let (_d, a, b) = both_backends();
+fn sparse_hits_across_blocks_match_across_configurations() {
+    let (_d, a, b) = two_configs();
     let mut toks: Vec<Tok> = vec![(1, 0); 300];
     for i in [0, 62, 63, 64, 65, 127, 128, 250, 299] {
         toks[i] = (0, if i % 2 == 0 { 0 } else { 1 });
@@ -178,14 +178,21 @@ fn old_schema_v2_file_is_rejected_and_left_unchanged() {
     let digest = |p: &std::path::Path| Sha256::digest(std::fs::read(p).unwrap());
     let before = digest(&path);
     match V2Store::open(&path) {
-        Err(StoreError::Rejected(m)) => assert!(m.contains("schema version 3"), "{m}"),
+        Err(StoreError::SchemaMismatch { found: 3 }) => {}
         Err(e) => panic!("wrong error {e:?}"),
         Ok(_) => panic!("old schema opened"),
     }
     assert_eq!(digest(&path), before, "file unchanged");
-    // The v1 backend refuses it too, also untouched.
-    assert!(open_store(Backend::Redb, &path, vec![]).is_err());
-    assert_eq!(digest(&path), before, "file unchanged after v1 attempt");
+    // A retired v1 file (schema version 2) is refused as legacy, untouched.
+    let legacy = d.path().join("legacy.redb");
+    crate::tests::stamped_file(&legacy, 2);
+    let before = digest(&legacy);
+    match V2Store::open(&legacy) {
+        Err(StoreError::LegacyFormat { version: 2, .. }) => {}
+        Err(e) => panic!("wrong error {e:?}"),
+        Ok(_) => panic!("legacy file opened"),
+    }
+    assert_eq!(digest(&legacy), before, "legacy file unchanged");
 }
 
 type FileSpec = (usize, usize, usize, Vec<Tok>, Vec<Sym>);
@@ -206,12 +213,12 @@ fn file_spec() -> impl Strategy<Value = FileSpec> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
     #[test]
-    fn v1_and_v2_agree_on_random_corpora(
+    fn configurations_agree_on_random_corpora(
         files in prop::collection::vec(file_spec(), 1..5),
         replacement in file_spec(),
         keep in prop::collection::vec(any::<bool>(), 5),
     ) {
-        let (_d, a, b) = both_backends();
+        let (_d, a, b) = two_configs();
         let langs = ["rust", "zig"];
         let ing = |s: &dyn Store, o: &str, r: &str, p: &str, l: &str, ex: &Extraction| {
             s.ingest_file_with_origin(o, r, p, l, ex, Some(ORIGIN_DIRECTORY))

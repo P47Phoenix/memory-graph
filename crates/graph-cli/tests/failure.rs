@@ -4,7 +4,7 @@
 use graph_cli::{index_dir, DirOpts};
 use graph_core::NodeKind;
 use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind};
-use graph_store::{open_store, Backend, RedbStore, Store};
+use graph_store::{open_store, Store, StoreRead, V2Store};
 use std::path::Path;
 
 struct Fake;
@@ -37,7 +37,7 @@ impl Extractor for Fake {
 }
 
 fn open(db: &Path) -> anyhow::Result<Box<dyn Store>> {
-    Ok(open_store(Backend::Redb, db, vec![Box::new(Fake)])?)
+    Ok(open_store(db, vec![Box::new(Fake)])?)
 }
 
 fn run(db: &Path, dir: &Path, json: bool, prune: bool) -> (anyhow::Result<()>, String) {
@@ -94,7 +94,7 @@ fn invalid_span_fails_one_file_and_exits_nonzero() {
         "path is not repeated in the reason: {text}"
     );
 
-    let s = RedbStore::open(&db).unwrap();
+    let s = V2Store::open(&db).unwrap();
     assert!(s.file_tokens("o", "r", "ok.zig").unwrap().is_some());
     assert!(s.file_tokens("o", "r", "new.zig").unwrap().is_none());
     // Old version preserved, and --prune was skipped so gone.zig remains too.
@@ -160,7 +160,7 @@ fn extractor_panic_stops_the_run_for_any_jobs() {
             err.contains("f0400.zig") && err.contains("panicked"),
             "{err}"
         );
-        let s = RedbStore::open(&db).unwrap();
+        let s = V2Store::open(&db).unwrap();
         stored.push(s.count_nodes(NodeKind::File).unwrap());
     }
     assert_eq!(stored, [256, 256], "whole batches before the panic");

@@ -1,4 +1,5 @@
-//! v2 test gaps (issue #19 QA comment) and a randomized v1-vs-v2 differential.
+//! v2 test gaps (issue #19 QA comment) and configuration-equivalence checks
+//! (`two_configs`: the same store with different chunk and cache settings).
 //! Each named test kills the mutant it is named for.
 use super::*;
 
@@ -39,11 +40,15 @@ pub(crate) fn span_ext(
     }
 }
 
-pub(crate) fn both_backends() -> (tempfile::TempDir, Box<dyn Store>, Box<dyn Store>) {
+/// Two empty stores in different configurations: `a` with the defaults,
+/// `b` committing one file per chunk with a small cache. Query-visible
+/// behaviour must not depend on either setting (`run_differential`).
+pub(crate) fn two_configs() -> (tempfile::TempDir, Box<dyn Store>, Box<dyn Store>) {
     let d = tempfile::tempdir().unwrap();
-    let a = open_store(Backend::Redb, &d.path().join("a.redb"), vec![]).unwrap();
-    let b = open_store(Backend::RedbV2, &d.path().join("b.redb"), vec![]).unwrap();
-    (d, a, b)
+    let a = open_store(&d.path().join("a.redb"), vec![]).unwrap();
+    let mut b = V2Store::open_with_cache_bytes(d.path().join("b.redb"), Some(1 << 20)).unwrap();
+    b.set_chunk_bytes(1);
+    (d, a, Box::new(b))
 }
 
 fn names(v: Vec<graph_core::Node>) -> Vec<String> {
@@ -60,7 +65,7 @@ fn hit_names(s: &dyn Store, p: &str) -> Vec<String> {
 
 #[test]
 fn search_symbols_repo_filter() {
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     let ex = span_ext(&[("S", SymbolKind::Function, 0, 4)], &[("t", 0, 1)]);
     for s in [&a, &b] {
         s.ingest_file("o", "r1", "x.rs", "rust", &ex).unwrap();
@@ -85,7 +90,7 @@ fn search_symbols_repo_filter() {
 #[test]
 fn search_symbols_literal_star_and_prefix() {
     let f = SymbolKind::Function;
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     let ex = span_ext(
         &[
             ("a*", f, 0, 4),
@@ -107,7 +112,7 @@ fn search_symbols_literal_star_and_prefix() {
 #[test]
 fn search_symbols_rows_sorted_by_source_position_within_a_file() {
     let f = SymbolKind::Function;
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     // Name order (index order) is the reverse of source order.
     let ex = span_ext(&[("a", f, 20, 24), ("b", f, 0, 4), ("c", f, 10, 14)], &[]);
     for s in [&a, &b] {
@@ -119,7 +124,7 @@ fn search_symbols_rows_sorted_by_source_position_within_a_file() {
 #[test]
 fn traversal_by_symbol_id_and_out_of_range_boundaries() {
     let d = tempfile::tempdir().unwrap();
-    let s = open_store(Backend::RedbV2, &d.path().join("b.redb"), vec![]).unwrap();
+    let s = open_store(&d.path().join("b.redb"), vec![]).unwrap();
     // S(0..20) > T(2..10); tokens: t0 in T, t1 in S, t2 outside.
     let ex = span_ext(
         &[
@@ -1275,7 +1280,7 @@ fn children_of_a_file_does_not_decode_the_whole_file() {
 /// locks in the symbol-vs-token tie-break rule ("symbols before tokens on a
 /// tie") for `children_ranged_file`'s merge loop specifically. QA review (PR
 /// #38) found this exact bug class was only caught incidentally by an
-/// unrelated fixture (`tests::v1_vs_v2_differential`'s `eq.rs`), which would
+/// unrelated fixture (`run_differential`'s `eq.rs`), which would
 /// silently stop covering it if that fixture is ever edited -- a dedicated,
 /// intention-revealing test closes that gap, matching slice 3i's precedent.
 #[test]
@@ -1367,523 +1372,17 @@ fn vacuum_keeps_a_symbol_only_lang_kind_term() {
     assert_eq!(hits[0].lang_kind.as_deref(), Some("struct_item"));
 }
 
-/// ADR 0003 story 3, slice 3k (closing benchmark for slices 3g-3j): measures
-/// `children`/`descendants`/`ancestors` latency for v1, "v2-before" (the
-/// eager full-stream-decode path every one of these operations used before
-/// slice 3g) and "v2-after" (today's default, range-based where dense), over
-/// this repo's own `crates/` tree with the real `RustExtractor` -- the same
-/// corpus every prior slice in this story measured on.
-///
-/// "v2-before" is measured via the `#[cfg(test)]` fallback hooks that already
-/// exist on `V2Store` for exactly this purpose (`children_via_fallback[_file]`,
-/// `descendants_via_fallback[_file]`, and `ancestors_via_fallback` added for
-/// this slice): each is the literal pre-optimization body, called directly on
-/// the *same* indexed store and the *same* ids as "v2-after", so this is an
-/// apples-to-apples before/after on identical data, not a separate build.
-/// That is simpler and just as representative as checking out the pre-3g
-/// commit into a second binary, and it is what the task scoping explicitly
-/// allowed as option (b).
-///
-/// Per-id timings are p50 over 15 repetitions (matching the existing spike
-/// doc's convention for a corpus this size, `docs/spikes/v2-checkpoint.md`),
-/// then summed per operation across the sampled ids to report one aggregate
-/// number per operation (the same aggregation slice 3j's own decode-cost
-/// measurement used).
-#[test]
-fn traversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus() {
-    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for e in std::fs::read_dir(p).unwrap().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                if !path.ends_with("target") && !path.ends_with(".git") {
-                    walk(&path, out);
-                }
-            } else if path.extension().is_some_and(|x| x == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(std::path::Path::new("../../crates"), &mut files);
-    assert!(
-        !files.is_empty(),
-        "expected to find this repo's own .rs files"
-    );
-    files.sort();
-
-    use graph_core::Extractor;
-    let extractor = graph_lang_rust::RustExtractor;
-
-    let d = tempfile::tempdir().unwrap();
-    let v1 = open_store(Backend::Redb, &d.path().join("v1.redb"), vec![]).unwrap();
-    let v2 = V2Store::open(d.path().join("v2.redb")).unwrap();
-
-    let mut n_files = 0usize;
-    for path in &files {
-        let Ok(src) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let rel = path.to_string_lossy().replace('\\', "/");
-        let ex = extractor.extract(&src);
-        if v1.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
-            continue;
-        }
-        if v2.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
-            continue;
-        }
-        n_files += 1;
-    }
-    assert!(n_files > 10, "expected a substantial corpus, got {n_files}");
-
-    // Pick a representative sample of real ids from one store: file ids
-    // (file-level calls), plus symbols with the largest subtree (worst case
-    // for the old eager decode), the smallest subtree (leaves), and the
-    // deepest nesting (longest ancestor chain). Applied identically to each
-    // backend's own store and ids (backends assign different ids over the
-    // same source, so the sample is chosen independently per backend, not
-    // id-for-id).
-    struct Sample {
-        files: Vec<NodeId>,
-        largest: Vec<NodeId>,
-        smallest: Vec<NodeId>,
-        deepest: Vec<NodeId>,
-    }
-    fn sample(s: &dyn Store, rel_paths: &[String]) -> Sample {
-        let mut files = Vec::new();
-        let mut by_size: Vec<(usize, NodeId)> = Vec::new();
-        let mut by_depth: Vec<(usize, NodeId)> = Vec::new();
-        for rel in rel_paths {
-            let Some(toks) = s.file_tokens("o", "r", rel).unwrap() else {
-                continue;
-            };
-            let Some(first) = toks.first() else { continue };
-            // The file id is the topmost ancestor of any token in it.
-            let anc = s.ancestors(first.id).unwrap();
-            let Some(file) = anc.last().map(|n| n.id).or(Some(first.id)) else {
-                continue;
-            };
-            files.push(file);
-            for sym in s
-                .descendants(file)
-                .unwrap()
-                .into_iter()
-                .filter(|n| n.kind == graph_core::NodeKind::Symbol)
-            {
-                let nsub = s.descendants(sym.id).unwrap().len();
-                let depth = s.ancestors(sym.id).unwrap().len();
-                by_size.push((nsub, sym.id));
-                by_depth.push((depth, sym.id));
-            }
-        }
-        by_size.sort_by_key(|a| std::cmp::Reverse(a.0));
-        by_depth.sort_by_key(|a| std::cmp::Reverse(a.0));
-        let largest = by_size.iter().take(5).map(|&(_, id)| id).collect();
-        let smallest = by_size.iter().rev().take(5).map(|&(_, id)| id).collect();
-        let deepest = by_depth.iter().take(5).map(|&(_, id)| id).collect();
-        // Cap the file sample: every file plus every symbol category would
-        // dominate the file-level aggregate otherwise.
-        files.truncate(10);
-        Sample {
-            files,
-            largest,
-            smallest,
-            deepest,
-        }
-    }
-    let rel_paths: Vec<String> = files
-        .iter()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .collect();
-    let s1 = sample(&*v1, &rel_paths);
-    let s2 = sample(&v2, &rel_paths);
-
-    const REPS: usize = 15;
-    fn p50_ms(reps: usize, mut f: impl FnMut()) -> f64 {
-        let mut v = Vec::with_capacity(reps);
-        for _ in 0..reps {
-            let t = std::time::Instant::now();
-            f();
-            v.push(t.elapsed().as_secs_f64() * 1e3);
-        }
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
-    }
-
-    // v1 and v2-after: the ordinary `Store`/`StoreRead` trait methods, which
-    // is exactly what a caller gets today.
-    let sum_children_v1: f64 = s1
-        .files
-        .iter()
-        .chain(&s1.largest)
-        .chain(&s1.smallest)
-        .chain(&s1.deepest)
-        .map(|&id| {
-            p50_ms(REPS, || {
-                v1.children(id).unwrap();
-            })
-        })
-        .sum();
-    let sum_descendants_v1: f64 = s1
-        .files
-        .iter()
-        .chain(&s1.largest)
-        .chain(&s1.smallest)
-        .chain(&s1.deepest)
-        .map(|&id| {
-            p50_ms(REPS, || {
-                v1.descendants(id).unwrap();
-            })
-        })
-        .sum();
-    let sum_ancestors_v1: f64 = s1
-        .files
-        .iter()
-        .chain(&s1.largest)
-        .chain(&s1.smallest)
-        .chain(&s1.deepest)
-        .map(|&id| {
-            p50_ms(REPS, || {
-                v1.ancestors(id).unwrap();
-            })
-        })
-        .sum();
-
-    let sum_children_after: f64 = s2
-        .files
-        .iter()
-        .chain(&s2.largest)
-        .chain(&s2.smallest)
-        .chain(&s2.deepest)
-        .map(|&id| {
-            p50_ms(REPS, || {
-                v2.children(id).unwrap();
-            })
-        })
-        .sum();
-    let sum_descendants_after: f64 = s2
-        .files
-        .iter()
-        .chain(&s2.largest)
-        .chain(&s2.smallest)
-        .chain(&s2.deepest)
-        .map(|&id| {
-            p50_ms(REPS, || {
-                v2.descendants(id).unwrap();
-            })
-        })
-        .sum();
-    let sum_ancestors_after: f64 = s2
-        .files
-        .iter()
-        .chain(&s2.largest)
-        .chain(&s2.smallest)
-        .chain(&s2.deepest)
-        .map(|&id| {
-            p50_ms(REPS, || {
-                v2.ancestors(id).unwrap();
-            })
-        })
-        .sum();
-
-    // v2-before: the pre-3g/3i/3j eager fallback hooks, called directly on
-    // the same store and ids. `children_via_fallback`/`descendants_via_fallback`
-    // only answer for a symbol id (empty for a file/entity id), so file ids
-    // use the `_file` variants instead.
-    let sum_children_before: f64 = {
-        let files: f64 = s2
-            .files
-            .iter()
-            .map(|&id| {
-                p50_ms(REPS, || {
-                    v2.children_via_fallback_file(id).unwrap();
-                })
-            })
-            .sum();
-        let syms: f64 = s2
-            .largest
-            .iter()
-            .chain(&s2.smallest)
-            .chain(&s2.deepest)
-            .map(|&id| {
-                p50_ms(REPS, || {
-                    v2.children_via_fallback(id).unwrap();
-                })
-            })
-            .sum();
-        files + syms
-    };
-    let sum_descendants_before: f64 = {
-        let files: f64 = s2
-            .files
-            .iter()
-            .map(|&id| {
-                p50_ms(REPS, || {
-                    v2.descendants_via_fallback_file(id).unwrap();
-                })
-            })
-            .sum();
-        let syms: f64 = s2
-            .largest
-            .iter()
-            .chain(&s2.smallest)
-            .chain(&s2.deepest)
-            .map(|&id| {
-                p50_ms(REPS, || {
-                    v2.descendants_via_fallback(id).unwrap();
-                })
-            })
-            .sum();
-        files + syms
-    };
-    let sum_ancestors_before: f64 = s2
-        .files
-        .iter()
-        .chain(&s2.largest)
-        .chain(&s2.smallest)
-        .chain(&s2.deepest)
-        .map(|&id| {
-            p50_ms(REPS, || {
-                v2.ancestors_via_fallback(id).unwrap();
-            })
-        })
-        .sum();
-
-    println!(
-        "\ntraversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus \
-         ({n_files} files, {} v1 ids, {} v2 ids sampled: files + largest/smallest/deepest symbols)",
-        s1.files.len() + s1.largest.len() + s1.smallest.len() + s1.deepest.len(),
-        s2.files.len() + s2.largest.len() + s2.smallest.len() + s2.deepest.len(),
-    );
-    println!("| operation | v1 ms | v2-before ms | v2-after ms | v2-after/v1 |");
-    println!("|---|---|---|---|---|");
-    for (label, v1_ms, before_ms, after_ms) in [
-        (
-            "children",
-            sum_children_v1,
-            sum_children_before,
-            sum_children_after,
-        ),
-        (
-            "descendants",
-            sum_descendants_v1,
-            sum_descendants_before,
-            sum_descendants_after,
-        ),
-        (
-            "ancestors",
-            sum_ancestors_v1,
-            sum_ancestors_before,
-            sum_ancestors_after,
-        ),
-    ] {
-        println!(
-            "| {label} | {v1_ms:.3} | {before_ms:.3} | {after_ms:.3} | {:.2}x |",
-            after_ms / v1_ms
-        );
-    }
-
-    // Sanity bound for `children` and `ancestors`, not the go/no-go call:
-    // v2-after must not cost more than v2-before on the same ids for these
-    // two operations (the range-based path decodes a strict subset of what
-    // the eager path decodes whenever a range is usable, and falls back
-    // verbatim otherwise), so a regression that silently stopped using the
-    // range would still show up here even if the v1 comparison is noisy.
-    //
-    // `descendants` is deliberately NOT held to the same bound here. The
-    // quadratic cause this comment used to describe -- `descendants_ranged_file`
-    // rebuilding the whole file's symbol-to-children map once per top-level
-    // symbol via `with_lazy` -- is fixed (issue #40): the map is now built
-    // once per `descendants_ranged_file` call and shared across every
-    // top-level symbol's subtree walk (see
-    // `descendants_ranged_file_symbol_decode_cost_is_linear_not_quadratic`,
-    // which proves the decoded-symbol-record count now scales linearly, not
-    // quadratically, in the file's top-level symbol count). What is left
-    // unbounded here is real, not overhead: the range-based path decodes
-    // each top-level symbol's own transitive token range in full, which for
-    // a file dominated by one or few huge top-level symbols can still cost
-    // more wall-clock than the eager `file_walk` fallback walking the same
-    // stream once. That is a legitimate, honestly-reported tradeoff for some
-    // shapes of file, not a measurement bug -- asserting it away here would
-    // hide exactly the kind of finding this benchmark exists to surface.
-    assert!(
-        sum_children_after <= sum_children_before * 1.5,
-        "v2-after children ({sum_children_after:.3} ms) regressed past v2-before \
-         ({sum_children_before:.3} ms) by more than the 1.5x noise allowance"
-    );
-    assert!(
-        sum_ancestors_after <= sum_ancestors_before * 1.5,
-        "v2-after ancestors ({sum_ancestors_after:.3} ms) regressed past v2-before \
-         ({sum_ancestors_before:.3} ms) by more than the 1.5x noise allowance"
-    );
-}
-
-/// ADR 0003 story 4 go/no-go input (issue #22): token-grain `search` and
-/// `search_symbols` latency, v1 vs v2, on this repo's own `crates/` corpus.
-/// Same rigor as `traversal_latency_v1_vs_v2_before_vs_v2_after_on_this_repos_own_corpus`:
-/// a representative sample of real queries (not one anecdotal run), p50 over
-/// several repetitions per query, summed per operation across the sampled
-/// queries to report one aggregate ratio per operation.
-///
-/// This is a *regression gate*, not a go/no-go assertion: it only bounds how
-/// far v2 may drift from its measured-at-write-time ratio to v1, in either
-/// direction. It must never assert v2 is faster than v1 -- whether v2 becomes
-/// the default backend is a human call recorded in the ADR, not something a
-/// test enforces.
-#[test]
-fn search_latency_v1_vs_v2_on_this_repos_own_corpus() {
-    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for e in std::fs::read_dir(p).unwrap().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                if !path.ends_with("target") && !path.ends_with(".git") {
-                    walk(&path, out);
-                }
-            } else if path.extension().is_some_and(|x| x == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(std::path::Path::new("../../crates"), &mut files);
-    assert!(
-        !files.is_empty(),
-        "expected to find this repo's own .rs files"
-    );
-    files.sort();
-
-    use graph_core::Extractor;
-    let extractor = graph_lang_rust::RustExtractor;
-
-    let d = tempfile::tempdir().unwrap();
-    let v1 = open_store(Backend::Redb, &d.path().join("v1.redb"), vec![]).unwrap();
-    let v2 = V2Store::open(d.path().join("v2.redb")).unwrap();
-
-    let mut n_files = 0usize;
-    for path in &files {
-        let Ok(src) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let rel = path.to_string_lossy().replace('\\', "/");
-        let ex = extractor.extract(&src);
-        if v1.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
-            continue;
-        }
-        if v2.ingest_file("o", "r", &rel, "rust", &ex).is_err() {
-            continue;
-        }
-        n_files += 1;
-    }
-    assert!(n_files > 10, "expected a substantial corpus, got {n_files}");
-
-    // A representative sample of real query shapes: common identifiers that
-    // hit many files/tokens (worst case for per-file stream decode), plus a
-    // couple of narrower ones, at both `Token` and `Symbol` grain, and a
-    // handful of `search_symbols` name patterns (exact and prefix).
-    const REPS: usize = 5;
-    fn p50_ms(reps: usize, mut f: impl FnMut()) -> f64 {
-        let mut v = Vec::with_capacity(reps);
-        for _ in 0..reps {
-            let t = std::time::Instant::now();
-            f();
-            v.push(t.elapsed().as_secs_f64() * 1e3);
-        }
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
-    }
-
-    let search_terms = ["Result", "self", "String", "fn", "pub"];
-    let symbol_patterns = ["new", "fmt", "test*", "*"];
-
-    let sum_search_v1: f64 = search_terms
-        .iter()
-        .map(|&t| {
-            let q = crate::Query {
-                grain: crate::Grain::Token,
-                ..crate::Query::new(t)
-            };
-            p50_ms(REPS, || {
-                v1.search(&q).unwrap();
-            })
-        })
-        .sum();
-    let sum_search_v2: f64 = search_terms
-        .iter()
-        .map(|&t| {
-            let q = crate::Query {
-                grain: crate::Grain::Token,
-                ..crate::Query::new(t)
-            };
-            p50_ms(REPS, || {
-                v2.search(&q).unwrap();
-            })
-        })
-        .sum();
-
-    let sum_search_symbols_v1: f64 = symbol_patterns
-        .iter()
-        .map(|&p| {
-            let q = crate::SymbolQuery::new(p);
-            p50_ms(REPS, || {
-                v1.search_symbols(&q).unwrap();
-            })
-        })
-        .sum();
-    let sum_search_symbols_v2: f64 = symbol_patterns
-        .iter()
-        .map(|&p| {
-            let q = crate::SymbolQuery::new(p);
-            p50_ms(REPS, || {
-                v2.search_symbols(&q).unwrap();
-            })
-        })
-        .sum();
-
-    let ratio_search = sum_search_v2 / sum_search_v1;
-    let ratio_search_symbols = sum_search_symbols_v2 / sum_search_symbols_v1;
-    println!(
-        "\nsearch_latency_v1_vs_v2_on_this_repos_own_corpus ({n_files} files, \
-         {} search queries, {} search_symbols queries)",
-        search_terms.len(),
-        symbol_patterns.len(),
-    );
-    println!("| operation | v1 ms | v2 ms | v2/v1 |");
-    println!("|---|---|---|---|");
-    println!(
-        "| search (token grain) | {sum_search_v1:.3} | {sum_search_v2:.3} | {ratio_search:.2}x |"
-    );
-    println!(
-        "| search_symbols | {sum_search_symbols_v1:.3} | {sum_search_symbols_v2:.3} | {ratio_search_symbols:.2}x |"
-    );
-
-    // Regression gate, not a go/no-go assertion (see doc comment above): a
-    // generous bound around what was measured when this test was written
-    // (search ~1.3x-1.6x v1, search_symbols ~1.5x-2.5x v1 on this corpus size;
-    // see the ADR 0003 story 4 row for the exact numbers and named cause).
-    // Catches a future regression that makes either query shape dramatically
-    // worse without re-litigating whether v2 must beat v1.
-    assert!(
-        ratio_search < 6.0,
-        "v2 token-grain search regressed to {ratio_search:.2}x v1 (v1 {sum_search_v1:.3} ms, \
-         v2 {sum_search_v2:.3} ms); expected well under 6x -- see ADR 0003 story 4"
-    );
-    assert!(
-        ratio_search_symbols < 6.0,
-        "v2 search_symbols regressed to {ratio_search_symbols:.2}x v1 (v1 {sum_search_symbols_v1:.3} ms, \
-         v2 {sum_search_symbols_v2:.3} ms); expected well under 6x -- see ADR 0003 story 4"
-    );
-}
-
 // --- ADR 0003 story 11: paging (Store::children_page/descendants_page, Query/SymbolQuery::offset) ---
 
 /// Paging through a result set larger than one page (`children_page` on a
 /// fallback file with many direct token children -- the epic's story 12
 /// "fallback files" case: a File with no language extractor, so no Symbol
 /// nodes, lists every Token as a direct child) returns every item exactly
-/// once, in the same order `children` returns them, across every page, on
-/// both backends.
+/// once, in the same order `children` returns them, across every page, in
+/// both configurations.
 #[test]
 fn paging_children_covers_every_item_once_in_order() {
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     // "text" has no registered extractor: a fallback file, tokens only.
     let src: String = (0..250).map(|i| format!("t{i} ")).collect();
     let words = tokenize_words(&src);
@@ -1938,10 +1437,10 @@ fn paging_children_covers_every_item_once_in_order() {
 }
 
 /// Same coverage guarantee for `descendants_page` over a whole org (mixed
-/// repo/file/symbol/token levels), on both backends.
+/// repo/file/symbol/token levels), on both configurations.
 #[test]
 fn paging_descendants_covers_every_item_once_in_order() {
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     for s in [&a, &b] {
         for i in 0..8 {
             s.ingest_file(
@@ -1979,10 +1478,10 @@ fn paging_descendants_covers_every_item_once_in_order() {
 }
 
 /// Paged `search` (`Query::offset` + `Query::limit`) reconstructs exactly the
-/// same rows, in the same order, as one unpaged call, on both backends.
+/// same rows, in the same order, as one unpaged call, on both configurations.
 #[test]
 fn paging_search_offset_limit_matches_full_results() {
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     for s in [&a, &b] {
         for i in 0..12 {
             s.ingest_file(
@@ -2017,10 +1516,10 @@ fn paging_search_offset_limit_matches_full_results() {
 }
 
 /// Paged `search_symbols` (`SymbolQuery::offset` + `limit`) likewise
-/// reconstructs the unpaged result, on both backends.
+/// reconstructs the unpaged result, on both configurations.
 #[test]
 fn paging_search_symbols_offset_limit_matches_full_results() {
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     for s in [&a, &b] {
         for i in 0..9 {
             s.ingest_file(
@@ -2056,11 +1555,10 @@ fn paging_search_symbols_offset_limit_matches_full_results() {
 
 /// Paging is snapshot-consistent: pages already fetched, and pages fetched
 /// later in the same sequence, come from the one frozen read the snapshot
-/// took, not from a concurrent writer's changes -- on both backends (v1's
-/// `snapshot()` freezes too; only max-age expiry is v2-only, story 10).
+/// took, not from a concurrent writer's changes -- in both configurations.
 #[test]
 fn paging_is_snapshot_consistent_across_concurrent_writes() {
-    let (_d, a, b) = both_backends();
+    let (_d, a, b) = two_configs();
     for s in [&a, &b] {
         for i in 0..6 {
             s.ingest_file(

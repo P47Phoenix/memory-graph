@@ -3,7 +3,7 @@
 //! every file is parsed with exact spans and stored in the graph.
 use graph_core::tokenizer::tokenize;
 use graph_core::{detect_language_from_content, TokenClass};
-use graph_store::{BatchFile, Query, RedbStore};
+use graph_store::{BatchFile, Query, Store, StoreRead, V2Store};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -285,7 +285,7 @@ fn every_token_is_parsed_exactly() {
 fn every_parsed_token_is_stored() {
     let m = manifest();
     let db = tempfile::tempdir().unwrap();
-    let mut store = RedbStore::open(db.path().join("corpus.redb")).unwrap();
+    let mut store = V2Store::open(db.path().join("corpus.redb")).unwrap();
     for e in graph_cli::shipped_extractors() {
         store.register(e);
     }

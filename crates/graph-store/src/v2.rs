@@ -1,14 +1,14 @@
 //! Storage format v2 on redb (ADR 0003 stories 2-4, first slice): an interned
 //! dictionary, one compact stream per file (tokens and symbols, see
 //! [`crate::codec`]) and count postings `(term, file) -> count`. Tokens are not
-//! rows. Orgs, repos and files are entity rows (the same JSON `Node` as v1);
-//! symbols and tokens are addressed by ids that encode `(file, index)`.
+//! rows. Orgs, repos and files are entity rows (JSON `Node`s in the shared
+//! entity tables, see `common.rs`); symbols and tokens are addressed by ids
+//! that encode `(file, index)`.
 //!
-//! This backend sits behind [`Store`] as `Backend::RedbV2` and is checked
-//! against v1 by the conformance suite and `run_differential`. It is a first
-//! slice, not the final layout: see the ADR story notes for what remains
-//! (packed dictionary, block postings, sparse checkpoints, `--limit`
-//! push-down, versioned components, sharding).
+//! This is the only storage format (the per-node "v1" layout was retired,
+//! ADR 0003 D5). It sits behind [`Store`] via `open_store` and is checked by
+//! the conformance suite (`run_all`) and, across its own configurations
+//! (chunk size, cache size, jobs, compaction), by `run_differential`.
 //!
 //! Ids: `tag(2) | file_local(30) | index(32)`. Tag 0 is an entity (org, repo,
 //! file; `file_local` is the allocation counter and `index` is 0), tag 1 a
@@ -16,11 +16,12 @@
 //! (`index` = ordinal). Ids of symbols and tokens are stable only until the
 //! file is re-indexed (ADR Q1).
 //!
-//! The on-disk file is stamped `schema_version` 3, so v1 builds refuse it and
-//! this backend refuses a v1 file, in both cases before writing anything.
+//! The on-disk file is stamped with [`V2_SCHEMA_VERSION`]; any other version
+//! is refused before anything is written (a retired v1 file with
+//! [`StoreError::LegacyFormat`], anything else with `SchemaMismatch`).
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
+use crate::{check_unchanged, dec, describe_in, enc, SnapshotStats, Store, StoreRead};
 use crate::{commit_prepared, prepare_file, stored_fingerprint_matches, PreparedFile};
-use crate::{dec, enc, RedbStore, SnapshotStats, Store, StoreRead};
 use crate::{
     kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile, Grain, Hit,
     IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit, SymbolQuery, Tally,
@@ -43,7 +44,8 @@ use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, StoreError>;
 
-/// Layout version of a v2 file (v1 is 1 and 2).
+/// Layout version of the database file (the retired v1 layout used 1 and 2,
+/// see [`crate::LEGACY_SCHEMA_VERSIONS`]).
 ///
 /// Bumped to 8 for story 6 (ADR 0003, D1): `POST` values are now
 /// block-encoded (`codec::POSTING_BLOCK`-sized, self-contained blocks)
@@ -61,8 +63,7 @@ pub const V2_SCHEMA_VERSION: u64 = 9;
 /// silently calls `rebuild_refs` and stamps the current value in the same
 /// write transaction. Bump it whenever `rebuild_refs`'s output would change
 /// for existing data (i.e. whenever the refs/content_files derivation rule
-/// itself changes), the same trigger v1's `SYMBOL_INDEX_VERSION` uses for
-/// `symbols_by_name`/per-class counters.
+/// itself changes).
 pub const REFS_DERIVED_VERSION: u64 = 1;
 /// `meta` key holding the stored [`REFS_DERIVED_VERSION`] a file was last
 /// rebuilt/stamped at.
@@ -1141,8 +1142,8 @@ impl R {
         Ok(n)
     }
 
-    /// Every top-level (parent-less) node: one per org. Used by `migrate`/
-    /// `export` (ADR 0003 story 12) to enumerate the whole graph through the
+    /// Every top-level (parent-less) node: one per org. Used by `export`
+    /// (ADR 0003 story 12) to enumerate the whole graph through the
     /// `Store`/`StoreRead` trait alone, without backend-specific access; org
     /// and repo entity rows live in the `nodes` table (unlike symbols/tokens,
     /// which are stream-encoded), so this is the same one-table scan
@@ -2001,45 +2002,6 @@ impl V2Store {
         Ok(out)
     }
 
-    /// Test hook (ADR 0003 story 3, slice 3k benchmark): `ancestors` through
-    /// the pre-3g eager `codec::decode` of the whole stream, unconditionally
-    /// -- the same body `ancestors` had before slice 3g (PR #34) switched it
-    /// to `Lazy`/`with_lazy`. Slice 3g removed the eager path outright (no
-    /// fallback was kept, unlike `children`/`descendants`), so this hook
-    /// re-adds it, test-only, purely to measure "v2-before" against
-    /// "v2-after" on the same corpus; it is not reachable from any
-    /// non-test code and changes no production behavior.
-    #[cfg(test)]
-    pub(crate) fn ancestors_via_fallback(&self, id: NodeId) -> Result<Vec<Node>> {
-        let rt = self.db.begin_read()?;
-        let r = R::new(&rt)?;
-        let (tag, file, i) = split_id(id);
-        let mut out = Vec::new();
-        let mut up = if tag == 0 {
-            r.node(id)?.and_then(|n| n.parent)
-        } else {
-            let Some(s) = r.stream(file)? else {
-                return Ok(out);
-            };
-            let mut cur = match tag {
-                TAG_SYM if i < s.symbols.len() => s.symbols[i].parent,
-                TAG_TOK if i < s.tokens.len() => s.tokens[i].parent,
-                _ => return Ok(out),
-            };
-            while let Some(p) = cur {
-                out.push(r.sym_node(file, p as usize, &s.symbols)?);
-                cur = s.symbols[p as usize].parent;
-            }
-            Some(file)
-        };
-        while let Some(p) = up {
-            let n = r.need(p)?;
-            up = n.parent;
-            out.push(n);
-        }
-        Ok(out)
-    }
-
     /// Measurement hook (ADR 0003 story 3, slice 3j spike): compares the
     /// token records the eager `stream()` decode reads against what the
     /// range-based `children_ranged_file`/`descendants_ranged_file` path
@@ -2107,8 +2069,11 @@ impl V2Store {
         wt.commit().unwrap();
     }
 
-    /// Open or create a v2 database file. Refuses (without writing) a file
-    /// that is not v2: a v1 file must be re-indexed or migrated (ADR story 12).
+    /// Open or create a database file. Refuses a file of any other layout
+    /// before writing anything of its own (redb may still repair a file that
+    /// was not cleanly closed): a retired v1 file gets
+    /// [`StoreError::LegacyFormat`] (re-index from source, or convert with
+    /// the `v1-last` release).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_cache_bytes(path, None)
     }
@@ -2140,13 +2105,13 @@ impl V2Store {
         };
         match found {
             Some(V2_SCHEMA_VERSION) => {}
-            Some(v) => {
-                return Err(StoreError::Rejected(format!(
-                    "{} has schema version {v}, not the v2 layout ({V2_SCHEMA_VERSION}); \
-                     use the v1 backend, or re-index into a new file; database left unmodified",
-                    path.as_ref().display()
-                )))
+            Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => {
+                return Err(StoreError::LegacyFormat {
+                    path: path.as_ref().display().to_string(),
+                    version: v,
+                })
             }
+            Some(v) => return Err(StoreError::SchemaMismatch { found: v }),
             None => {
                 let wt = db.begin_write()?;
                 {
@@ -2400,9 +2365,8 @@ impl V2Store {
         // without external liveness infrastructure this crate does not have.
         // Deleting a temp file out from under a concurrently-running compact
         // (same or other process) would be a correctness bug, which is worse
-        // than the disk clutter it would fix. This is the same tradeoff
-        // documented in `migrate` (see its doc comment on the leftover-temp-
-        // file cleanup above), accepted there for the same reason. Follow-up
+        // than the disk clutter it would fix (the retired `migrate` made the
+        // same call for the same reason). Follow-up
         // if orphan accumulation becomes an operational concern: a
         // `repair`/`vacuum` CLI step that globs and removes stale
         // `*.compact-*.tmp` files with a human confirming no other process
@@ -2581,7 +2545,7 @@ impl V2Store {
         let wt = self.db.begin_write()?;
         if !opts.reindex {
             if let Some((stats, dirty)) =
-                RedbStore::check_unchanged(&wt, org, repo, &path, &lang, &fp, origin)?
+                check_unchanged(&wt, org, repo, &path, &lang, &fp, origin)?
             {
                 if dirty {
                     wt.commit()?;
@@ -2634,7 +2598,7 @@ impl V2Store {
         self.commit_each(org, repo, files.len(), opts, |wt, i| {
             let f = &files[i];
             prepare_file(&self.registry, org, repo, f, opts, |path, lang, fp| {
-                Ok(RedbStore::check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
+                Ok(check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
             })
         })
     }
@@ -3065,7 +3029,7 @@ macro_rules! store_read {
                 let $s = self;
                 $s.check_not_expired()?;
                 let g = $rt;
-                RedbStore::describe_in(&g, org, repo)
+                describe_in(&g, org, repo)
             }
             fn describe_by_scan(
                 &self,

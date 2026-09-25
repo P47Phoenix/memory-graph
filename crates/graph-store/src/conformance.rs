@@ -1,15 +1,19 @@
 //! Reusable conformance suite for [`Store`] implementations: the store-level
-//! behaviours every backend must share. It is the seed of the ADR 0003
-//! differential oracle (the same cases run against the redb backend, a future
-//! v2 store and a `RemoteStore`). [`run_differential`] is the fixed-query
-//! differential harness: it runs one query set against two stores and requires
-//! identical results.
+//! behaviours every implementation must share (the redb store in every
+//! configuration today; a `RemoteStore` later, ADR 0003 Q5).
+//!
+//! [`run_differential`] is the fixed-query *configuration equivalence*
+//! harness: it seeds two stores with the same corpus, runs one query set
+//! against both and requires identical results, so query-visible behaviour
+//! provably does not depend on chunk size, cache size, thread count, memory
+//! budget, compaction or a reopen. [`run_crash_rerun_differential`] extends
+//! it to a batch that crashed mid-way and was re-run.
 //!
 //! Use: build a [`Harness`] per case with a factory, then call [`run_all`]:
 //!
 //! ```ignore
 //! graph_store::conformance::run_all(&|| Harness {
-//!     open: Box::new(move |ex| open_store(Backend::Redb, &path, ex)),
+//!     open: Box::new(move |ex| open_store(&path, ex)),
 //!     exclusive: true,
 //!     guard: Some(Box::new(tempdir)),
 //! });
@@ -534,9 +538,9 @@ fn bf<'a>(path: &'a str, bytes: &'a [u8]) -> BatchFile<'a> {
     }
 }
 
-/// Contract common to v1 (one transaction per batch) and v2 (per chunk): after
-/// a batch that fails with a storage error, whatever is stored is complete and
-/// consistent, and a re-run stores the rest and skips what is stored.
+/// Whatever the chunking: after a batch that fails with a storage error,
+/// whatever is stored is complete and consistent, and a re-run stores the
+/// rest and skips what is stored.
 fn failed_batch_leaves_consistent_state(h: &Harness) {
     let s = open(h);
     let bad = BatchFile {
@@ -1070,11 +1074,14 @@ fn nul_handling(h: &Harness) {
         .is_empty());
 }
 
-/// Fixed-query differential harness: seed two stores with the same fixed
-/// corpus, run a fixed query set at every grain and filter, and require
-/// identical results (rows and order). Point `a` at the reference backend
-/// (redb) and `b` at the candidate (v2, `RemoteStore`). Panics naming the
-/// first differing query.
+/// Fixed-query differential harness (configuration equivalence): seed two
+/// empty stores with the same fixed corpus, run a fixed query set at every
+/// grain and filter, and require identical results (rows and order). `a` and
+/// `b` are the same store type in two configurations (chunk size, cache
+/// size, jobs, compaction, reopened or not), or a reference store and a
+/// candidate implementation (`RemoteStore`). Panics naming the first
+/// differing query. Both stores may already hold the same data (see
+/// [`run_crash_rerun_differential`]); they must not hold different data.
 pub fn run_differential(a: &dyn Store, b: &dyn Store) {
     for s in [a, b] {
         differential_seed(s);
@@ -1209,6 +1216,130 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         };
         assert_eq!(tok(a), tok(b), "file_tokens {p}");
     }
+}
+
+/// Crash-then-rerun equivalence: `crashed` indexes a batch that fails with a
+/// storage error part-way (a file whose language holds a NUL poisons its
+/// chunk: earlier chunks may stay committed, later files are never reached),
+/// then re-runs the batch without the poison; `fresh` indexes the good batch
+/// once. Both must then answer every query identically -- including after a
+/// prune and after the fixed [`run_differential`] corpus is added on top --
+/// so a crashed-and-resumed index is indistinguishable from a clean one
+/// whatever the chunking. Both stores must be empty on entry.
+pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
+    let names = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"];
+    let bodies: [&[u8]; 6] = [
+        b"foo bar baz",
+        b"foo (bar) qux",
+        b"let x = foo;",
+        b"bar bar bar",
+        "\u{1F600} foo".as_bytes(),
+        b"fn dup() { dup(); }",
+    ];
+    let good: Vec<BatchFile<'_>> = names
+        .iter()
+        .zip(bodies)
+        .map(|(n, b)| BatchFile {
+            path: n,
+            bytes: b,
+            language: Some("text"),
+            origin: Some(ORIGIN_DIRECTORY),
+        })
+        .collect();
+    // Poison after the third file: with small chunks the first files commit
+    // and the rest never run; with one big chunk nothing commits.
+    let mut poisoned = good[..3].to_vec();
+    poisoned.push(BatchFile {
+        path: "nul.txt",
+        bytes: b"foo",
+        language: Some("a\0b"),
+        origin: Some(ORIGIN_DIRECTORY),
+    });
+    poisoned.extend_from_slice(&good[3..]);
+    assert!(
+        crashed
+            .index_batch("o", "r", &poisoned, IndexOptions::default())
+            .is_err(),
+        "the poisoned batch must fail"
+    );
+    let rerun = crashed
+        .index_batch("o", "r", &good, IndexOptions::default())
+        .unwrap();
+    assert!(rerun.iter().all(|r| r.is_ok()), "{rerun:?}");
+    let once = fresh
+        .index_batch("o", "r", &good, IndexOptions::default())
+        .unwrap();
+    assert!(once.iter().all(|r| r.is_ok()), "{once:?}");
+    let same = |what: &str| {
+        assert_eq!(
+            fresh.describe(None, None).unwrap(),
+            crashed.describe(None, None).unwrap(),
+            "describe {what}"
+        );
+        assert_eq!(
+            crashed.describe(None, None).unwrap(),
+            crashed.describe_by_scan(None, None).unwrap(),
+            "catalog vs scan {what}"
+        );
+        for k in [
+            NodeKind::Org,
+            NodeKind::Repo,
+            NodeKind::File,
+            NodeKind::Symbol,
+        ] {
+            assert_eq!(
+                fresh.count_nodes(k).unwrap(),
+                crashed.count_nodes(k).unwrap(),
+                "count {k:?} {what}"
+            );
+        }
+        for n in names {
+            let tok = |s: &dyn Store| {
+                s.file_tokens("o", "r", n).unwrap().map(|v| {
+                    v.into_iter()
+                        .map(|t| (t.name, t.span, t.token_class))
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert_eq!(tok(fresh), tok(crashed), "file_tokens {n} {what}");
+        }
+        for text in ["foo", "bar", "dup", "x", "(", "\u{1F600}", "missing"] {
+            for grain in [
+                Grain::Token,
+                Grain::Symbol,
+                Grain::File,
+                Grain::Repo,
+                Grain::Org,
+            ] {
+                let mut q = Query::new(text);
+                q.grain = grain;
+                assert_eq!(
+                    fresh.search(&q).unwrap(),
+                    crashed.search(&q).unwrap(),
+                    "search {text}/{grain:?} {what}"
+                );
+            }
+        }
+        assert_eq!(
+            fresh.search_symbols(&SymbolQuery::new("*")).unwrap(),
+            crashed.search_symbols(&SymbolQuery::new("*")).unwrap(),
+            "symbols {what}"
+        );
+        assert!(
+            !fresh.search(&Query::new("foo")).unwrap().is_empty(),
+            "the corpus is indexed {what}"
+        );
+    };
+    same("after rerun");
+    // The rerun skipped whatever the crash had committed, and stored the rest.
+    assert_eq!(crashed.count_nodes(NodeKind::File).unwrap(), names.len());
+    let keep: HashSet<String> = ["a.txt", "d.txt"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        fresh.prune_files("o", "r", &keep, false).unwrap(),
+        crashed.prune_files("o", "r", &keep, false).unwrap()
+    );
+    same("after prune");
+    run_differential(fresh, crashed);
 }
 
 fn differential_seed(s: &dyn Store) {

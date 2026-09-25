@@ -2,7 +2,7 @@
 //! chunked commits and the consistency proptest.
 use super::*;
 use crate::v2::{content_id, hashed_key, MAX_INLINE_TERM, OPEN_BATCH, R};
-use crate::v2_tests::{both_backends, span_ext};
+use crate::v2_tests::{span_ext, two_configs};
 use redb::{ReadableTableMetadata, TableDefinition};
 
 fn sha(p: &std::path::Path) -> Vec<u8> {
@@ -113,8 +113,8 @@ fn long_term_extraction(texts: &[String], sym: &str) -> graph_core::Extraction {
 }
 
 #[test]
-fn very_long_terms_search_exactly_like_v1() {
-    let (_d, a, b) = both_backends();
+fn very_long_terms_search_identically_across_configurations() {
+    let (_d, a, b) = two_configs();
     let texts = long_term_texts();
     let sym = "S".repeat(MAX_INLINE_TERM * 4);
     let ex = long_term_extraction(&texts, &sym);
@@ -645,19 +645,6 @@ fn describe_reports_open_batch_after_a_crash_and_clears_it_after_a_completed_bat
     );
 }
 
-/// v1 has no chunked-batch marker at all: `describe` must unconditionally
-/// report `open_batch: false`, never error looking for a table that does not
-/// exist in the v1 layout.
-#[test]
-fn v1_describe_always_reports_open_batch_false() {
-    let d = tempfile::tempdir().unwrap();
-    let s = crate::RedbStore::open(d.path().join("v1.redb")).unwrap();
-    s.index_bytes("o", "r", "x.p", b"aaa", None).unwrap();
-    let infos = s.describe(None, None).unwrap();
-    assert_eq!(infos.len(), 1);
-    assert!(!infos[0].open_batch, "v1 never reports an open batch");
-}
-
 /// The marker names exactly one org/repo (redb allows only one writer
 /// transaction at a time, so only one batch can ever be open). A crashed
 /// batch for `o/r` must not leak `open_batch: true` onto an unrelated,
@@ -882,7 +869,7 @@ mod consistency {
         /// vacuum, every derived table equals what the streams imply, and a
         /// vacuum leaves no dead dictionary term. The oracle recomputes
         /// derived tables from the decoded streams; it does not check the
-        /// streams against the input spec or against v1 (the differential
+        /// streams against the input spec (the conformance and differential
         /// tests cover that), and `describe_by_scan` is itself code under test.
         #[test]
         fn derived_tables_always_match_the_streams(ops in prop::collection::vec(op(), 1..10)) {
@@ -1747,11 +1734,11 @@ fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
 
 /// A single term occurring far more than `codec::POSTING_BLOCK` times in one
 /// file, so its `POST` value spans several block-encoded blocks (story 6,
-/// ADR 0003, D1). Search results must be byte-for-byte identical to v1,
-/// which has no block concept at all.
+/// ADR 0003, D1). Search results must be identical whatever the chunking
+/// and cache configuration.
 #[test]
-fn a_term_repeated_across_many_posting_blocks_matches_v1() {
-    let (_d, a, b) = both_backends();
+fn a_term_repeated_across_many_posting_blocks_matches_across_configurations() {
+    let (_d, a, b) = two_configs();
     let n = crate::codec::POSTING_BLOCK * 3 + 7;
     let mut toks: Vec<(String, u32, u32)> = Vec::with_capacity(n);
     let mut at = 0u32;
@@ -1943,8 +1930,10 @@ fn schema_version_mismatch_still_hard_refuses() {
     let before = sha(&p);
 
     match V2Store::open(&p) {
-        Err(StoreError::Rejected(_)) => {}
-        Err(other) => panic!("expected StoreError::Rejected, got a different error: {other}"),
+        Err(StoreError::SchemaMismatch { found }) => {
+            assert_eq!(found, crate::v2::V2_SCHEMA_VERSION - 1)
+        }
+        Err(other) => panic!("expected StoreError::SchemaMismatch, got a different error: {other}"),
         Ok(_) => panic!("expected a hard refusal, got Ok"),
     }
     assert_eq!(
@@ -2595,7 +2584,7 @@ fn snapshot_stats_reports_count_and_monotonic_age() {
     assert!(stats4.store_size_bytes > 0);
 }
 
-// --- ADR 0003 story 11: paging vs. snapshot expiry (v2 only; v1 never expires) ---
+// --- ADR 0003 story 11: paging vs. snapshot expiry ---
 
 /// A page fetched after the snapshot's max age has elapsed returns
 /// `SnapshotExpired`, not stale or partial data and not a panic -- checked on
@@ -2653,21 +2642,6 @@ fn a_page_fetched_after_snapshot_expiry_returns_snapshot_expired() {
         snap.search_symbols(&sq),
         Err(StoreError::SnapshotExpired { .. })
     ));
-}
-
-/// v1's default `Store::snapshot_stats()` (unimplemented by `RedbStore`, per
-/// the "v1 is frozen" invariant) honestly reports zero snapshots and no
-/// oldest age -- it tracks none of this, rather than approximating it.
-#[test]
-fn v1_snapshot_stats_defaults_to_zero() {
-    let d = tempfile::tempdir().unwrap();
-    let p = d.path().join("v.redb");
-    let s = crate::RedbStore::open(&p).unwrap();
-    let _snap = s.snapshot().unwrap();
-    let stats = s.snapshot_stats();
-    assert_eq!(stats.open_count, 0);
-    assert!(stats.oldest_age.is_none());
-    assert_eq!(stats.store_size_bytes, 0);
 }
 
 // --- ADR 0003 story 7: holistic size/throughput regression gate, and a

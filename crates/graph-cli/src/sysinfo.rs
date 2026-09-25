@@ -21,9 +21,9 @@ pub const OS_RESERVE: f64 = 0.20;
 /// (measured 6-25% under the real growth), which the 30% slack covers.
 pub const DEFAULT_FRACTION: f64 = 0.70;
 /// Heap per source byte in flight assumed until measured. Measured on the
-/// test corpus: about 13x for v1 (tokens, symbols and their strings) and
-/// 25x for v2 (plus its pre-encoded stream and postings).
-pub const INITIAL_EXPANSION: f64 = 16.0;
+/// test corpus: about 25x (the extraction's tokens, symbols and their
+/// strings, plus the pre-encoded stream and postings the writer takes).
+pub const INITIAL_EXPANSION: f64 = 25.0;
 /// The measured growth is trusted only once this much is in flight.
 const CALIBRATE_MIN_HELD: u64 = 16 * MIB;
 
