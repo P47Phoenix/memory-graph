@@ -9,8 +9,10 @@
 //!
 //! The original per-node format ("v1", schema versions 1 and 2) was retired
 //! outright (ADR 0003, D5): a file in that format is refused with
-//! [`StoreError::LegacyFormat`] and left untouched. The last release that
-//! could read it is tagged `v1-last` and has `memory-graph migrate`.
+//! [`StoreError::LegacyFormat`] and left untouched (redb may first repair a
+//! file that was not cleanly closed, before the version is read). The last
+//! release that could read it is tagged `v1-last` and has `memory-graph
+//! migrate`.
 use graph_core::{NodeId, Span, SymbolKind, TokenClass};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,8 +55,9 @@ pub enum StoreError {
     Locked(String),
     #[error("incompatible schema version {found} (this build supports {SCHEMA_VERSION}); database left unmodified")]
     SchemaMismatch { found: u64 },
-    /// The file is in the retired per-node format (ADR 0003, D5). It is
-    /// never modified: re-index from source, or convert it with the last
+    /// The file is in the retired per-node format (ADR 0003, D5). It is not
+    /// modified (beyond redb's own crash repair of a file that was not
+    /// cleanly closed): re-index from source, or convert it with the last
     /// release that reads it.
     #[error("database `{path}` is in the retired v1 format (schema version {version}); this release reads only the v2 format. Re-index from source into a new file (recommended), or convert it with the last v1-capable release (git tag `v1-last`): `memory-graph migrate <new.redb>`")]
     LegacyFormat { path: String, version: u64 },

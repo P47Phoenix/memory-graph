@@ -1142,8 +1142,8 @@ impl R {
         Ok(n)
     }
 
-    /// Every top-level (parent-less) node: one per org. Used by `migrate`/
-    /// `export` (ADR 0003 story 12) to enumerate the whole graph through the
+    /// Every top-level (parent-less) node: one per org. Used by `export`
+    /// (ADR 0003 story 12) to enumerate the whole graph through the
     /// `Store`/`StoreRead` trait alone, without backend-specific access; org
     /// and repo entity rows live in the `nodes` table (unlike symbols/tokens,
     /// which are stream-encoded), so this is the same one-table scan
@@ -2069,9 +2069,11 @@ impl V2Store {
         wt.commit().unwrap();
     }
 
-    /// Open or create a database file. Refuses (without writing) a file of
-    /// any other layout: a retired v1 file gets [`StoreError::LegacyFormat`]
-    /// (re-index from source, or convert with the `v1-last` release).
+    /// Open or create a database file. Refuses a file of any other layout
+    /// before writing anything of its own (redb may still repair a file that
+    /// was not cleanly closed): a retired v1 file gets
+    /// [`StoreError::LegacyFormat`] (re-index from source, or convert with
+    /// the `v1-last` release).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_cache_bytes(path, None)
     }
@@ -2363,9 +2365,8 @@ impl V2Store {
         // without external liveness infrastructure this crate does not have.
         // Deleting a temp file out from under a concurrently-running compact
         // (same or other process) would be a correctness bug, which is worse
-        // than the disk clutter it would fix. This is the same tradeoff
-        // documented in `migrate` (see its doc comment on the leftover-temp-
-        // file cleanup above), accepted there for the same reason. Follow-up
+        // than the disk clutter it would fix (the retired `migrate` made the
+        // same call for the same reason). Follow-up
         // if orphan accumulation becomes an operational concern: a
         // `repair`/`vacuum` CLI step that globs and removes stale
         // `*.compact-*.tmp` files with a human confirming no other process
