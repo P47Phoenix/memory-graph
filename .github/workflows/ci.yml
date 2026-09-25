@@ -30,7 +30,9 @@ jobs:
     # (and say where it came from), disk must be known. macOS only runs here.
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu pinned to the docker image's release so the runner-built
+        # binary's glibc is not newer than the image's.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +42,7 @@ jobs:
       - run: cargo test -p graph-cli --test e2e sysinfo_reports_the_probes
       - run: cargo run --release -p graph-cli -- sysinfo
       - run: cargo run --release -p graph-cli -- sysinfo --json | python3 scripts/check-probes.py
+        shell: bash
       - name: Container memory limit (cgroup) is honoured
         if: runner.os == 'Linux'
         run: |

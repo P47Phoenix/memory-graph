@@ -578,16 +578,12 @@ fn run_pipeline(
                     // read of /proc raced a cgroup change) and records why.
                     let probed = sysinfo::sample_memory();
                     let m = {
-                        let mut last = board.memory.lock().unwrap_or_else(|e| e.into_inner());
-                        let mut err = board.memory_error.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut mem = board.memory.lock().unwrap_or_else(|e| e.into_inner());
                         match probed {
-                            Ok(m) => {
-                                *last = Some(m);
-                                *err = None;
-                            }
-                            Err(e) => *err = Some(e),
+                            Ok(m) => *mem = (Some(m), None),
+                            Err(e) => mem.1 = Some(e),
                         }
-                        *last
+                        mem.0
                     };
                     let held = board.budget.used();
                     let prepared = board.prepared_bytes.load(Relaxed);

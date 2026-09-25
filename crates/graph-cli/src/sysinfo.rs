@@ -88,7 +88,10 @@ pub fn parse_meminfo(text: &str) -> Result<(u64, u64), String> {
             .ok_or_else(|| format!("/proc/meminfo: cannot parse `{}`", line.trim()))?;
         // Every field is in kB (the unit is spelled out, so check it).
         match it.next() {
-            None | Some("kB") => Ok(Some(n * 1024)),
+            None | Some("kB") => n
+                .checked_mul(1024)
+                .map(Some)
+                .ok_or_else(|| format!("/proc/meminfo: value out of range in `{}`", line.trim())),
             Some(_) => Err(format!(
                 "/proc/meminfo: unexpected unit in `{}`",
                 line.trim()
@@ -100,10 +103,12 @@ pub fn parse_meminfo(text: &str) -> Result<(u64, u64), String> {
         Some(a) => a,
         None => {
             let free = field("MemFree:")?.ok_or("/proc/meminfo: no MemAvailable or MemFree")?;
-            let cached = field("Buffers:")?.unwrap_or(0)
-                + field("Cached:")?.unwrap_or(0)
-                + field("SReclaimable:")?.unwrap_or(0);
-            (free + cached).saturating_sub(field("Shmem:")?.unwrap_or(0))
+            let cached = field("Buffers:")?
+                .unwrap_or(0)
+                .saturating_add(field("Cached:")?.unwrap_or(0))
+                .saturating_add(field("SReclaimable:")?.unwrap_or(0));
+            free.saturating_add(cached)
+                .saturating_sub(field("Shmem:")?.unwrap_or(0))
         }
     };
     if total == 0 {
@@ -130,10 +135,87 @@ pub fn apply_cgroup(
     Some((limit, available.min(headroom)))
 }
 
+/// The cgroup paths of this process from `/proc/self/cgroup` text: the v2
+/// (unified) path and the v1 path of the hierarchy with the `memory`
+/// controller, whichever are present (a hybrid host has both).
+pub fn parse_cgroup_paths(text: &str) -> (Option<String>, Option<String>) {
+    let mut v2_path = None;
+    let mut v1_path = None;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(_), Some(ctl), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if ctl.is_empty() {
+            v2_path = Some(path.to_string());
+        } else if ctl.split(',').any(|c| c == "memory") {
+            v1_path = Some(path.to_string());
+        }
+    }
+    (v2_path, v1_path)
+}
+
+/// From the cgroup at `root/path` up to `root` (a limit may sit on an
+/// ancestor, and a container sees its own cgroup at the root), the
+/// smallest limit found (`None` for `max`) and the usage of the cgroup that
+/// carries it (`usage_file` less the `inactive_key` line of `memory.stat`,
+/// the way `docker stats` counts). `None` when no level has a readable
+/// limit file.
+pub fn cgroup_walk_up(
+    root: &std::path::Path,
+    path: &str,
+    limit_file: &str,
+    usage_file: &str,
+    inactive_key: &str,
+) -> Option<(Option<u64>, Option<u64>)> {
+    let read_trimmed = |p: std::path::PathBuf| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    let mut dir = root.join(path.trim_start_matches('/'));
+    let mut best: Option<(Option<u64>, Option<u64>)> = None;
+    let mut seen_any = false;
+    loop {
+        if let Some(raw) = read_trimmed(dir.join(limit_file)) {
+            seen_any = true;
+            // `max` (v2) or a number; v1's unlimited sentinel is a huge
+            // number that `apply_cgroup` treats as no limit.
+            let limit = raw.parse::<u64>().ok();
+            let usage = read_trimmed(dir.join(usage_file))
+                .and_then(|u| u.parse::<u64>().ok())
+                .map(|u| {
+                    let inactive = std::fs::read_to_string(dir.join("memory.stat"))
+                        .ok()
+                        .and_then(|s| {
+                            let l = s.lines().find(|l| l.starts_with(inactive_key))?;
+                            l.split_whitespace().nth(1)?.parse::<u64>().ok()
+                        })
+                        .unwrap_or(0);
+                    u.saturating_sub(inactive)
+                });
+            best = match (best, limit) {
+                (None, _) => Some((limit, usage)),
+                (Some((Some(b), _)), Some(l)) if l < b => Some((Some(l), usage)),
+                (Some((None, _)), Some(l)) => Some((Some(l), usage)),
+                (b, _) => b,
+            };
+        }
+        if !dir.starts_with(root) || dir == root {
+            break;
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    seen_any.then_some(best.unwrap_or((None, None)))
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{apply_cgroup, parse_meminfo, MemSample};
-    use std::path::{Path, PathBuf};
+    use super::{apply_cgroup, cgroup_walk_up, parse_cgroup_paths, parse_meminfo, MemSample};
+    use std::path::Path;
 
     pub fn sample() -> Result<MemSample, String> {
         let (total, available, source) = match std::fs::read_to_string("/proc/meminfo")
@@ -197,22 +279,9 @@ mod linux {
     /// cgroup memory controller is visible.
     fn cgroup_limit() -> Option<(u8, Option<u64>, Option<u64>)> {
         let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-        let mut v2_path = None;
-        let mut v1_path = None;
-        for line in text.lines() {
-            let mut parts = line.splitn(3, ':');
-            let (Some(_), Some(ctl), Some(path)) = (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            if ctl.is_empty() {
-                v2_path = Some(path.to_string());
-            } else if ctl.split(',').any(|c| c == "memory") {
-                v1_path = Some(path.to_string());
-            }
-        }
+        let (v2_path, v1_path) = parse_cgroup_paths(&text);
         if let Some(p) = v2_path {
-            if let Some(r) = walk_up(
+            if let Some(r) = cgroup_walk_up(
                 Path::new("/sys/fs/cgroup"),
                 &p,
                 "memory.max",
@@ -223,7 +292,7 @@ mod linux {
             }
         }
         if let Some(p) = v1_path {
-            if let Some(r) = walk_up(
+            if let Some(r) = cgroup_walk_up(
                 Path::new("/sys/fs/cgroup/memory"),
                 &p,
                 "memory.limit_in_bytes",
@@ -234,62 +303,6 @@ mod linux {
             }
         }
         None
-    }
-
-    /// From the cgroup at `root/path` up to `root` (a limit may sit on an
-    /// ancestor, and a container sees its own cgroup at the root), the
-    /// smallest limit found and the usage of the cgroup that carries it.
-    /// `None` when no level has a readable limit file.
-    fn walk_up(
-        root: &Path,
-        path: &str,
-        limit_file: &str,
-        usage_file: &str,
-        inactive_key: &str,
-    ) -> Option<(Option<u64>, Option<u64>)> {
-        let mut dir: PathBuf = root.join(path.trim_start_matches('/'));
-        let mut best: Option<(Option<u64>, Option<u64>)> = None;
-        let mut seen_any = false;
-        loop {
-            if let Some(raw) = read_trimmed(&dir.join(limit_file)) {
-                seen_any = true;
-                // `max` (v2) or a number; v1's unlimited sentinel is a huge
-                // number that `apply_cgroup` treats as no limit.
-                let limit = raw.parse::<u64>().ok();
-                let usage = read_trimmed(&dir.join(usage_file))
-                    .and_then(|u| u.parse::<u64>().ok())
-                    .map(|u| {
-                        let inactive = std::fs::read_to_string(dir.join("memory.stat"))
-                            .ok()
-                            .and_then(|s| {
-                                let l = s.lines().find(|l| l.starts_with(inactive_key))?;
-                                l.split_whitespace().nth(1)?.parse::<u64>().ok()
-                            })
-                            .unwrap_or(0);
-                        u.saturating_sub(inactive)
-                    });
-                best = match (best, limit) {
-                    (None, _) => Some((limit, usage)),
-                    (Some((Some(b), _)), Some(l)) if l < b => Some((Some(l), usage)),
-                    (Some((None, _)), Some(l)) => Some((Some(l), usage)),
-                    (b, _) => b,
-                };
-            }
-            if !dir.starts_with(root) || dir == root {
-                break;
-            }
-            match dir.parent() {
-                Some(p) => dir = p.to_path_buf(),
-                None => break,
-            }
-        }
-        seen_any.then_some(best.unwrap_or((None, None)))
-    }
-
-    fn read_trimmed(p: &Path) -> Option<String> {
-        std::fs::read_to_string(p)
-            .ok()
-            .map(|s| s.trim().to_string())
     }
 
     /// This process's resident set: `VmRSS` from `/proc/self/status` (kB
@@ -367,6 +380,9 @@ mod macos {
                 "sysctl {name}: {}",
                 std::io::Error::last_os_error()
             ));
+        }
+        if len != std::mem::size_of::<u64>() {
+            return Err(format!("sysctl {name}: {len}-byte value, expected 8"));
         }
         if v == 0 {
             return Err(format!("sysctl {name}: reported 0"));
@@ -718,16 +734,24 @@ impl MemoryPolicy {
         let ceiling = m.total / 2;
         let floor = self.floor.max(FLOOR);
         let cap = target.clamp(floor, ceiling.max(floor));
+        let clamped = if cap > target {
+            format!("; raised to the {} floor", mb(floor))
+        } else if cap < target {
+            "; capped at half of RAM".to_string()
+        } else {
+            String::new()
+        };
         Decision {
             cap,
             under_pressure: false,
             reason: format!(
-                "{}% of {} free above the {} OS reserve ÷ {:.1}× growth per source byte{}",
+                "{}% of {} free above the {} OS reserve ÷ {:.1}× growth per source byte{}{}",
                 pct(fraction),
                 mb(m.available),
                 mb(reserve),
                 self.expansion,
-                m.rss.map_or(String::new(), |r| format!("; RSS {}", mb(r)))
+                m.rss.map_or(String::new(), |r| format!("; RSS {}", mb(r))),
+                clamped
             ),
         }
     }
@@ -829,6 +853,84 @@ mod tests {
         assert_eq!(
             parse_meminfo("MemTotal: 0 kB\nMemAvailable: 0 kB\n"),
             Err("/proc/meminfo: MemTotal is 0".into())
+        );
+        // Values past u64 bytes are an error, not a wrap or a panic; the
+        // classic estimate saturates instead of overflowing.
+        assert_eq!(
+            parse_meminfo("MemTotal: 18014398509481985 kB\nMemAvailable: 1 kB\n"),
+            Err("/proc/meminfo: value out of range in `MemTotal: 18014398509481985 kB`".into())
+        );
+        assert_eq!(
+            parse_meminfo(
+                "MemTotal: 10 kB\nMemFree: 18014398509481983 kB\nBuffers: 18014398509481983 kB\n"
+            ),
+            Ok((10 * KB, 10 * KB))
+        );
+        assert_eq!(
+            parse_meminfo("MemTotal: 10 kB\nMemFree: 5 kB\nShmem: 500 kB\n"),
+            Ok((10 * KB, 0))
+        );
+    }
+
+    #[test]
+    fn cgroup_paths_parse() {
+        assert_eq!(parse_cgroup_paths("0::/\n"), (Some("/".into()), None));
+        assert_eq!(
+            parse_cgroup_paths("12:cpu,memory:/docker/abc\n1:name=systemd:/x\n0::/user.slice\n"),
+            (Some("/user.slice".into()), Some("/docker/abc".into()))
+        );
+        assert_eq!(parse_cgroup_paths("garbage\n3:cpu:/a\n"), (None, None));
+    }
+
+    #[test]
+    fn cgroup_walk_up_takes_the_tightest_ancestor_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let w = |p: &str, f: &str, v: &str| {
+            std::fs::create_dir_all(root.join(p)).unwrap();
+            std::fs::write(root.join(p).join(f), v).unwrap();
+        };
+        let walk =
+            |p: &str| cgroup_walk_up(root, p, "memory.max", "memory.current", "inactive_file");
+        // No limit file anywhere: no controller.
+        w("a/b", "memory.current", "10");
+        assert_eq!(walk("/a/b"), None);
+        // `max` at every level: a controller, no limit.
+        w("", "memory.max", "max");
+        w("a", "memory.max", "max");
+        w("a/b", "memory.max", "max\n");
+        assert_eq!(walk("/a/b"), Some((None, Some(10))));
+        // The parent limit binds; its usage, less inactive file pages, comes with it.
+        w("a", "memory.max", "1073741824");
+        w("a", "memory.current", "300000000");
+        w(
+            "a",
+            "memory.stat",
+            "anon 1\ninactive_file 100000000\nfile 2\n",
+        );
+        assert_eq!(walk("/a/b"), Some((Some(1073741824), Some(200000000))));
+        // A tighter child wins over the parent...
+        w("a/b", "memory.max", "268435456");
+        assert_eq!(walk("/a/b"), Some((Some(268435456), Some(10))));
+        // ...and a tighter grandparent over both; usage unparsable is None.
+        w("", "memory.max", "1000");
+        w("", "memory.current", "x");
+        assert_eq!(walk("/a/b"), Some((Some(1000), None)));
+        // A path outside the root only looks at the root.
+        assert_eq!(walk("/nope"), Some((Some(1000), None)));
+        // v1 spellings work the same way.
+        w("v1/c", "memory.limit_in_bytes", "9223372036854771712");
+        w("v1/c", "memory.usage_in_bytes", "50");
+        w("v1/c", "memory.stat", "total_inactive_file 20\n");
+        assert_eq!(
+            cgroup_walk_up(
+                &root.join("v1"),
+                "/c",
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+                "total_inactive_file"
+            ),
+            Some((Some(9223372036854771712), Some(30)))
         );
     }
 

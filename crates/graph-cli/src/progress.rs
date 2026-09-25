@@ -31,8 +31,7 @@ pub struct Board {
     pub last_txn: AtomicU64,
     /// The latest good memory sample (from the sampler thread), and why the
     /// latest probe failed if it did (a transient failure keeps the sample).
-    pub memory: std::sync::Mutex<Option<MemSample>>,
-    pub memory_error: std::sync::Mutex<Option<String>>,
+    pub memory: std::sync::Mutex<(Option<MemSample>, Option<String>)>,
     /// Measured heap growth per source byte in flight (`f64` bits).
     pub expansion: AtomicU64,
     /// Heap footprint of the prepared files in flight.
@@ -79,8 +78,10 @@ impl Board {
                 );
                 b
             },
-            memory: std::sync::Mutex::new(sizing.memory.clone().ok()),
-            memory_error: std::sync::Mutex::new(sizing.memory.clone().err()),
+            memory: std::sync::Mutex::new(match &sizing.memory {
+                Ok(m) => (Some(*m), None),
+                Err(e) => (None, Some(e.clone())),
+            }),
             expansion: AtomicU64::new(sizing.policy.expansion.to_bits()),
             footprint: AtomicU64::new(0),
             prepared_bytes: AtomicU64::new(0),
@@ -112,6 +113,13 @@ impl Board {
     }
 
     pub fn view(&self) -> BoardView {
+        // One lock, released before the literal below: a guard created
+        // inside a struct expression lives to its end, so two `lock()`s
+        // there would deadlock.
+        let (memory, memory_error) = {
+            let m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+            (m.0, m.1.clone())
+        };
         BoardView {
             label: self.label.clone(),
             elapsed: self.start.elapsed(),
@@ -129,12 +137,8 @@ impl Board {
             mem_cap: self.budget.cap(),
             mem_peak: self.budget.peak(),
             budget: self.budget.view(),
-            memory: *self.memory.lock().unwrap_or_else(|e| e.into_inner()),
-            memory_error: self
-                .memory_error
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+            memory,
+            memory_error,
             expansion: f64::from_bits(self.expansion.load(Relaxed)),
             footprint: self.footprint.load(Relaxed),
             disk: *self.disk.lock().unwrap_or_else(|e| e.into_inner()),

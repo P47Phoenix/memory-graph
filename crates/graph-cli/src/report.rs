@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// One reading of everything `index` sizes itself from.
 #[derive(Debug, Clone)]
 pub struct Report {
-    /// The volume asked about (the `--db` path's directory).
+    /// The `--db` path; the volume reported is the one holding it.
     pub db: PathBuf,
     pub sizing: Sizing,
     pub disk: Option<DiskSample>,

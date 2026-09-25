@@ -46,13 +46,15 @@ the cgroup v2/v1 memory limit when one is below physical RAM,
    limit), the fallback reason text, the report's text and JSON.
 2. **e2e** (`crates/graph-cli/tests/e2e.rs`, `sysinfo_reports_the_probes`):
    the command's output, and `index --stats` naming the same source.
-3. **CI `probes` job** (`.github/workflows/ci.yml`): on ubuntu and macOS,
-   the unit and e2e tests plus `sysinfo --json` checked by
-   `scripts/check-probes.py` (memory known, source named); on ubuntu also
+3. **CI `probes` job** (`.github/workflows/ci.yml`): on ubuntu 24.04,
+   macOS and Windows, the unit and e2e tests plus `sysinfo --json` checked
+   by `scripts/check-probes.py` (memory known, source named); on ubuntu also
    inside `docker run --memory=512m` (total at most 512 MiB, source mentions
    `cgroup`) and with `/proc/meminfo` masked (source `sysinfo(2)`). The
-   macOS leg is the only place the macOS code runs; Windows is covered by the
-   main job.
+   macOS and Windows legs are the only places those probes run in CI (the
+   main job is Linux). The cgroup walk (`cgroup_walk_up`) is unit-tested on
+   every platform over a fake cgroup tree, including the v1 spellings that
+   no CI runner has any more.
 
 ## Database size
 
