@@ -2,8 +2,8 @@
 //! it is working on, or what it is waiting for and why, plus the overall bar,
 //! the bottleneck and memory in flight. Drawn on stderr (stdout keeps only the
 //! final summary); `--stats` prints the same counters as a table at the end.
-use crate::dataflow::{Activity, Budget, Stage, StageView, Trace};
-use crate::sysinfo::Sizing;
+use crate::dataflow::{Activity, Budget, BudgetView, Stage, StageView, Trace};
+use crate::sysinfo::{MemSample, Sizing};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
@@ -28,6 +28,8 @@ pub struct Board {
     pub failed: AtomicU64,
     pub txns: AtomicU64,
     pub last_txn: AtomicU64,
+    /// The latest memory sample (from the sampler thread).
+    pub memory: std::sync::Mutex<Option<MemSample>>,
 }
 
 impl Board {
@@ -42,7 +44,16 @@ impl Board {
         }
         Self {
             label: label.to_string(),
-            budget: Budget::new(sizing.memory_budget),
+            budget: {
+                let b = Budget::new(sizing.memory_budget);
+                b.set_cap(
+                    sizing.memory_budget,
+                    &sizing.policy.reason,
+                    sizing.policy.under_pressure,
+                );
+                b
+            },
+            memory: std::sync::Mutex::new(sizing.memory),
             start: Instant::now(),
             walk: Stage::new("walk", 1).traced(0, trace),
             parse: Stage::new("parse", t).traced(100, trace),
@@ -77,6 +88,8 @@ impl Board {
             mem_used: self.budget.used(),
             mem_cap: self.budget.cap(),
             mem_peak: self.budget.peak(),
+            budget: self.budget.view(),
+            memory: *self.memory.lock().unwrap_or_else(|e| e.into_inner()),
             sizing: self.sizing.clone(),
         }
     }
@@ -101,6 +114,8 @@ pub struct BoardView {
     pub mem_used: u64,
     pub mem_cap: u64,
     pub mem_peak: u64,
+    pub budget: BudgetView,
+    pub memory: Option<MemSample>,
     pub sizing: Sizing,
 }
 
@@ -281,8 +296,15 @@ impl BoardView {
         let bn = self
             .bottleneck()
             .map_or(String::new(), |b| format!("   bottleneck: {b}"));
+        let why = if self.budget.pressure {
+            format!("⚠ {}", self.budget.reason)
+        } else if self.budget.reason.is_empty() {
+            String::new()
+        } else {
+            format!("({})", self.budget.reason)
+        };
         lines.push(format!(
-            "  memory  {} / {} budget{bn}",
+            "  memory  in flight {} · budget {} {why}{bn}",
             mb(self.mem_used),
             mb(self.mem_cap)
         ));
@@ -328,15 +350,32 @@ impl BoardView {
         } else {
             format!("parse threads busy {p:.0}%, writer busy {writer:.0}%")
         };
+        let b = &self.budget;
         s.push_str(&format!(
-            "sizing: {} parse threads ({} CPUs), memory budget {} ({} free), peak in flight {}; {} transactions\n{verdict}\n",
+            "sizing: {} parse threads ({} CPUs); memory budget {} at start, {}..{} during the run ({}), peak in flight {}; {} transactions\n",
             self.sizing.parse_threads,
             self.sizing.cpus,
-            mb(self.mem_cap),
-            self.sizing.available_memory.map_or("unknown".into(), mb),
+            mb(self.sizing.memory_budget),
+            mb(b.cap_min),
+            mb(b.cap_max),
+            b.reason,
             mb(self.mem_peak),
             self.txns,
         ));
+        if let Some(m) = &self.memory {
+            s.push_str(&format!(
+                "memory: {} of {} free now{}; pressure {} time(s), {} in total\n",
+                mb(m.available),
+                mb(m.total),
+                m.rss
+                    .map_or(String::new(), |r| format!(", this process {}", mb(r))),
+                b.pressure_episodes,
+                secs(b.pressure_time),
+            ));
+        } else {
+            s.push_str("memory: free RAM unknown on this platform\n");
+        }
+        s.push_str(&format!("{verdict}\n"));
         s
     }
 
@@ -362,6 +401,18 @@ impl BoardView {
             "memory_budget": self.mem_cap,
             "peak_in_flight": self.mem_peak,
             "transactions": self.txns,
+            "memory": {
+                "budget_start": self.sizing.memory_budget,
+                "budget_min": self.budget.cap_min,
+                "budget_max": self.budget.cap_max,
+                "budget_end": self.budget.cap,
+                "reason": self.budget.reason,
+                "pressure_episodes": self.budget.pressure_episodes,
+                "pressure_ms": self.budget.pressure_time.as_millis() as u64,
+                "total": self.memory.map(|m| m.total),
+                "available": self.memory.map(|m| m.available),
+                "rss": self.memory.and_then(|m| m.rss),
+            },
         })
     }
 }
@@ -475,8 +526,59 @@ mod tests {
             mem_used: 84 << 20,
             mem_cap: 1 << 30,
             mem_peak: 90 << 20,
-            sizing: Sizing::new(4, Some(8 << 30), 3, None),
+            budget: BudgetView {
+                cap: 1 << 30,
+                used: 84 << 20,
+                peak: 90 << 20,
+                cap_min: 1 << 30,
+                cap_max: 2 << 30,
+                reason: "25% of 8.0 GB free above the 3.2 GB OS reserve".into(),
+                pressure: false,
+                pressure_episodes: 0,
+                pressure_time: Duration::ZERO,
+            },
+            memory: Some(MemSample {
+                total: 16 << 30,
+                available: 8 << 30,
+                rss: Some(1 << 30),
+                psi_some_avg10: None,
+            }),
+            sizing: Sizing::new(
+                4,
+                Some(MemSample {
+                    total: 16 << 30,
+                    available: 8 << 30,
+                    rss: None,
+                    psi_some_avg10: None,
+                }),
+                3,
+                None,
+                1,
+            ),
         }
+    }
+
+    #[test]
+    fn memory_line_says_why() {
+        let mut v = view();
+        let t = v.render(200).join("\n");
+        assert!(
+            t.contains("in flight 84 MB · budget 1.0 GB (25% of 8.0 GB free"),
+            "{t}"
+        );
+        v.budget.pressure = true;
+        v.budget.reason = "pressure: only 1.0 GB of 16.0 GB free".into();
+        let t = v.render(200).join("\n");
+        assert!(t.contains("budget 1.0 GB ⚠ pressure: only"), "{t}");
+        let s = v.stats_table();
+        assert!(s.contains("1.0 GB..2.0 GB during the run"), "{s}");
+        assert!(
+            s.contains("8.0 GB of 16.0 GB free now, this process 1.0 GB"),
+            "{s}"
+        );
+        let j = v.stats_json();
+        assert_eq!(j["memory"]["budget_max"], 2u64 << 30);
+        assert_eq!(j["memory"]["total"], 16u64 << 30);
     }
 
     #[test]

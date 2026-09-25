@@ -191,22 +191,103 @@ impl Stage {
 
 /// A byte budget shared by the stages: producers acquire before taking in
 /// data and the last stage releases after it is done with it, so the data in
-/// flight never exceeds `cap` (a single item larger than `cap` still goes
-/// through, alone).
+/// flight never exceeds the cap (a single item larger than it still goes
+/// through, alone). The cap can move while the run goes on (`set_cap`):
+/// lowering it below what is held just makes new acquires wait.
 pub struct Budget {
-    cap: u64,
+    cap: AtomicU64,
     used: Mutex<u64>,
     cv: Condvar,
     peak: AtomicU64,
+    cap_min: AtomicU64,
+    cap_max: AtomicU64,
+    reason: Mutex<String>,
+    pressure: AtomicBool,
+    pressure_episodes: AtomicU64,
+    pressure_ns: AtomicU64,
+    pressure_since: Mutex<Option<Instant>>,
+}
+
+/// How the cap moved over a run (`--stats`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetView {
+    pub cap: u64,
+    pub used: u64,
+    pub peak: u64,
+    pub cap_min: u64,
+    pub cap_max: u64,
+    pub reason: String,
+    pub pressure: bool,
+    pub pressure_episodes: u64,
+    pub pressure_time: Duration,
 }
 
 impl Budget {
     pub fn new(cap: u64) -> Self {
+        let cap = cap.max(1);
         Self {
-            cap: cap.max(1),
+            cap: AtomicU64::new(cap),
             used: Mutex::new(0),
             cv: Condvar::new(),
             peak: AtomicU64::new(0),
+            cap_min: AtomicU64::new(cap),
+            cap_max: AtomicU64::new(cap),
+            reason: Mutex::new(String::new()),
+            pressure: AtomicBool::new(false),
+            pressure_episodes: AtomicU64::new(0),
+            pressure_ns: AtomicU64::new(0),
+            pressure_since: Mutex::new(None),
+        }
+    }
+
+    /// Move the cap (the policy decided from a fresh memory sample).
+    pub fn set_cap(&self, cap: u64, reason: &str, pressure: bool) {
+        let cap = cap.max(1);
+        self.cap.store(cap, Relaxed);
+        self.cap_min.fetch_min(cap, Relaxed);
+        self.cap_max.fetch_max(cap, Relaxed);
+        *self.reason.lock().unwrap_or_else(|e| e.into_inner()) = reason.to_string();
+        let was = self.pressure.swap(pressure, Relaxed);
+        if pressure != was {
+            let mut since = self
+                .pressure_since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if pressure {
+                self.pressure_episodes.fetch_add(1, Relaxed);
+                *since = Some(Instant::now());
+            } else if let Some(t) = since.take() {
+                self.pressure_ns
+                    .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            }
+        }
+        // A raised cap may let waiters through.
+        self.cv.notify_all();
+    }
+
+    pub fn view(&self) -> BudgetView {
+        let mut ns = self.pressure_ns.load(Relaxed);
+        if let Some(t) = *self
+            .pressure_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            ns += t.elapsed().as_nanos() as u64;
+        }
+        BudgetView {
+            cap: self.cap(),
+            used: self.used(),
+            peak: self.peak(),
+            cap_min: self.cap_min.load(Relaxed),
+            cap_max: self.cap_max.load(Relaxed),
+            reason: self
+                .reason
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            pressure: self.pressure.load(Relaxed),
+            pressure_episodes: self.pressure_episodes.load(Relaxed),
+            pressure_time: Duration::from_nanos(ns),
         }
     }
 
@@ -214,7 +295,7 @@ impl Budget {
     /// if `cancel` was set meanwhile.
     pub fn acquire(&self, n: u64, cancel: &AtomicBool) -> bool {
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
-        while *used > 0 && *used + n > self.cap {
+        while *used > 0 && *used + n > self.cap.load(Relaxed) {
             if cancel.load(Relaxed) {
                 return false;
             }
@@ -240,7 +321,7 @@ impl Budget {
     }
 
     pub fn cap(&self) -> u64 {
-        self.cap
+        self.cap.load(Relaxed)
     }
     pub fn used(&self) -> u64 {
         *self.used.lock().unwrap_or_else(|e| e.into_inner())
@@ -351,6 +432,31 @@ mod tests {
         cancel.store(true, Relaxed);
         b.wake_all();
         assert!(!t.join().unwrap());
+    }
+
+    #[test]
+    fn cap_moves_and_pressure_is_tracked() {
+        let b = std::sync::Arc::new(Budget::new(100));
+        let cancel = AtomicBool::new(false);
+        assert!(b.acquire(80, &cancel));
+        // Lowered below what is held: a new acquire waits...
+        b.set_cap(50, "pressure: test", true);
+        let b2 = b.clone();
+        let t = std::thread::spawn(move || {
+            let c = AtomicBool::new(false);
+            b2.acquire(10, &c)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!t.is_finished(), "waits while over the lowered cap");
+        // ...until the cap is raised again (or bytes are released).
+        b.set_cap(200, "plenty", false);
+        assert!(t.join().unwrap());
+        let v = b.view();
+        assert_eq!((v.cap_min, v.cap_max, v.cap), (50, 200, 200));
+        assert_eq!(v.pressure_episodes, 1);
+        assert!(v.pressure_time >= Duration::from_millis(30));
+        assert!(!v.pressure);
+        assert_eq!(v.reason, "plenty");
     }
 
     #[test]

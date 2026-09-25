@@ -2226,3 +2226,73 @@ fn memory_budget_bounds_bytes_in_flight() {
         }
     }
 }
+
+/// `--memory 25%` (also via `MEMORY_GRAPH_MEMORY`) budgets a share of the
+/// free memory above the 20% kept for the OS, re-sampled during the run,
+/// and `--stats` reports it.
+#[test]
+fn memory_share_follows_free_ram() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..40 {
+        std::fs::write(root.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+    }
+    let root = root.to_str().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (sum, _) = index_json(&db, "v2", root, &["--stats", "--memory", "10%"]);
+    let m = &sum["stats"]["memory"];
+    let total = m["total"].as_u64();
+    if let (Some(total), Some(avail)) = (total, m["available"].as_u64()) {
+        let cap = m["budget_max"].as_u64().unwrap();
+        // At most 10% of what was free above the reserve, plus the floor.
+        let bound = ((avail + sum["stats"]["peak_in_flight"].as_u64().unwrap())
+            .saturating_sub(total / 5))
+            / 10;
+        // `available` is the end-of-run sample: allow free memory to have
+        // moved by a quarter meanwhile (other tests run alongside).
+        assert!(
+            cap <= bound.max(256 << 20) * 5 / 4,
+            "cap {cap} bound {bound}: {m}"
+        );
+        let reason = m["reason"].as_str().unwrap();
+        // A loaded machine may already be under pressure; then the reason
+        // says so and the cap only shrinks.
+        if m["pressure_episodes"] == 0 {
+            assert!(cap >= (256 << 20).min(total / 2), "{m}");
+            assert!(reason.contains("10%"), "{m}");
+        } else {
+            assert!(reason.contains("pressure"), "{m}");
+        }
+    } else {
+        assert!(m["reason"].as_str().unwrap().contains("unknown"), "{m}");
+    }
+    // The environment variable is the default for --memory.
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+        .env("MEMORY_GRAPH_MEMORY", "16K")
+        .args([
+            "--db",
+            &db,
+            "--backend",
+            "v2",
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--json",
+            "--stats",
+            "--reindex",
+            root,
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["stats"]["memory_budget"], 16 * 1024, "{v}");
+    assert_eq!(v["stats"]["memory"]["reason"], "fixed by --memory");
+    let (ok, _, err) = run(&[
+        "index", "--memory", "150%", "--org", "o", "--repo", "r", root,
+    ]);
+    assert!(!ok && err.contains("at most 100"), "{err}");
+}
