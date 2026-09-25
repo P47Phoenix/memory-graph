@@ -70,9 +70,11 @@ fn sample_dir(_dir: &Path) -> Option<DiskSample> {
     None
 }
 
-/// Database bytes per source byte assumed until measured: 8.2x on a 20x copy
-/// of `testdata/corpus`, 7-8x on real monorepos (#67), with a margin for
-/// redb growing its file in region steps.
+/// Database bytes per source byte assumed until measured. `scripts/
+/// measure-size.py` on a 20x copy of `testdata/corpus` (2026-09-25): 8.0x
+/// fresh whatever the commit mode, no growth on an unchanged rerun, 16x
+/// after `--reindex` until `vacuum --compact`; real monorepos report 7-8x
+/// (#67). The margin covers redb growing its file in region steps.
 pub const DISK_RATIO: f64 = 10.0;
 /// The projection trusts the measured ratio once this much source is stored.
 const RATIO_CALIBRATE_MIN: u64 = 64 * MIB;
@@ -88,6 +90,14 @@ pub enum MinFree {
     Default,
     Bytes(u64),
     Fraction(f64),
+}
+
+/// Parse `--min-free-disk`: a size (`4G`) or a share of the volume (`5%`).
+pub fn parse_min_free(s: &str) -> Result<MinFree, String> {
+    Ok(match crate::sysinfo::parse_memory_spec(s)? {
+        crate::sysinfo::MemorySpec::Fixed(b) => MinFree::Bytes(b),
+        crate::sysinfo::MemorySpec::Fraction(f) => MinFree::Fraction(f),
+    })
 }
 
 impl MinFree {
@@ -208,6 +218,13 @@ mod tests {
             total: total_gb * GIB,
             available: avail_gb * GIB,
         }
+    }
+
+    #[test]
+    fn min_free_flag_parses() {
+        assert_eq!(parse_min_free("4G"), Ok(MinFree::Bytes(4 * GIB)));
+        assert_eq!(parse_min_free("5%"), Ok(MinFree::Fraction(0.05)));
+        assert!(parse_min_free("0").is_err());
     }
 
     #[test]

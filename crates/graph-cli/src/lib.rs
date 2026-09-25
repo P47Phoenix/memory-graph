@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 
 pub mod dataflow;
 pub mod diskinfo;
+use diskinfo::{DiskPolicy, DiskProbe, MinFree};
 pub mod progress;
 pub mod sysinfo;
 use dataflow::Trace;
@@ -67,7 +68,20 @@ pub struct DirOpts<'a> {
     /// `Some(false)` disables it, `None` shows it when `json` is off. It is
     /// never drawn when stderr is not a terminal.
     pub progress: Option<bool>,
+    /// Where disk readings come from; `None` asks the OS (tests script one).
+    pub disk_probe: Option<DiskProbe>,
+    /// Free space to keep on the database's volume (`--min-free-disk`).
+    pub min_free_disk: MinFree,
+    /// Stop before the disk fills (`false` = `--no-disk-check`: report only).
+    pub disk_check: bool,
+    /// Source bytes per store transaction (`--chunk-bytes`): one group commit
+    /// is capped at a few of these so a failure loses little.
+    pub chunk_bytes: u64,
 }
+
+/// Source bytes per redb transaction unless `--chunk-bytes` says otherwise
+/// (the store's own default).
+pub const DEFAULT_CHUNK_BYTES: u64 = 64 << 20;
 
 /// Whether `path` is the database file itself: (dev, ino) on unix, otherwise a
 /// canonical-path comparison limited to entries with the database's file name.
@@ -123,11 +137,18 @@ fn flush_batch(
     let n = prepared.len();
     let outcomes = store
         .index_prepared(o.org, o.repo, prepared, IndexOptions { reindex: o.reindex })
-        .with_context(|| {
-            format!(
-                "database error while indexing a batch of {n} files ({} files were already stored)",
-                t.files
-            )
+        .map_err(|e| {
+            if diskinfo::is_disk_full(&e.to_string()) {
+                anyhow::anyhow!(
+                    "disk full while indexing a batch of {n} files ({} files were already stored): {e}; free space and rerun to resume (stored files are skipped)",
+                    t.files
+                )
+            } else {
+                anyhow::Error::from(e).context(format!(
+                    "database error while indexing a batch of {n} files ({} files were already stored)",
+                    t.files
+                ))
+            }
         })?;
     for (rel, r) in rels.into_iter().zip(outcomes) {
         match r {
@@ -471,12 +492,47 @@ fn run_pipeline(
         drop((job_rx, res_tx));
         let finished = &finished;
         // Sampler + display: every 250 ms re-read the machine's memory and
-        // move the budget (unless `--memory` fixed it); redraw every 125 ms.
+        // move the budget (unless `--memory` fixed it) and re-read the disk;
+        // redraw every 125 ms.
         sc.spawn(move || {
             let mut policy = board.sizing.policy.clone();
             let dynamic = matches!(policy.spec, sysinfo::MemorySpec::Fraction(_));
+            let disk_policy = DiskPolicy {
+                min_free: o.min_free_disk,
+                enforce: o.disk_check,
+            };
+            let probe: DiskProbe = o
+                .disk_probe
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(diskinfo::sample_disk));
             let mut tick = 0u32;
             while !finished.load(Relaxed) {
+                if tick.is_multiple_of(2) {
+                    let sample = probe(o.db);
+                    let db_len = std::fs::metadata(o.db).map_or(0, |m| m.len());
+                    let d = disk_policy.decide(
+                        sample.as_ref(),
+                        db_len,
+                        board.found_bytes.load(Relaxed),
+                        board.handled_bytes.load(Relaxed),
+                        board.walk_done.load(std::sync::atomic::Ordering::Acquire),
+                    );
+                    *board.disk.lock().unwrap_or_else(|e| e.into_inner()) = sample;
+                    board.db_len.store(db_len, Relaxed);
+                    board.disk_projected.store(d.projected_final, Relaxed);
+                    board.disk_ratio.store(d.ratio.to_bits(), Relaxed);
+                    board.disk_min_free.store(d.min_free, Relaxed);
+                    if let Some(why) = d.stop {
+                        let mut stop = board.disk_stop.lock().unwrap_or_else(|e| e.into_inner());
+                        if stop.is_none() {
+                            *stop = Some(why);
+                            // Stop admitting and parsing; the writer commits
+                            // what is pending and reports.
+                            cancel.store(true, Relaxed);
+                            board.budget.wake_all();
+                        }
+                    }
+                }
                 if dynamic && tick.is_multiple_of(2) {
                     let m = sysinfo::sample_memory();
                     *board.memory.lock().unwrap_or_else(|e| e.into_inner()) = m;
@@ -523,11 +579,43 @@ fn commit_all(
     let (mut pending_bytes, mut held, mut held_fp, mut held_prepared) = (0u64, 0u64, 0u64, 0u64);
     loop {
         // A group commit takes at most half the budget (as it is right now),
-        // so parsing can refill the other half meanwhile.
-        let group_cap = (board.budget.cap() / 2).max(1);
+        // so parsing can refill the other half meanwhile, and at most a few
+        // store transactions, so a failure loses little.
+        let group_cap = (board.budget.cap() / 2)
+            .min(o.chunk_bytes.saturating_mul(8))
+            .max(1);
         // Take everything that has arrived.
         for (seq, oc, size, fp) in res_rx.try_iter() {
             buf.insert(seq, (oc, size, fp));
+        }
+        // The disk guard asked to stop: store what is ready and report.
+        let stop = board
+            .disk_stop
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(why) = stop {
+            // Only the group already taken is stored (bounded by the group
+            // cap, so it cannot fill the disk by itself); everything else
+            // parsed so far is abandoned and re-parsed on the rerun.
+            if !pending.is_empty() {
+                let n = pending.len();
+                board
+                    .commit
+                    .busy(0, "committing", &format!("last {n} files"), || {
+                        flush_batch(store, o, &mut pending, &mut c.tally)
+                    })?;
+                board.txns.fetch_add(1, Relaxed);
+            }
+            board.budget.release(held);
+            board.footprint.fetch_sub(held_fp, Relaxed);
+            board.prepared_bytes.fetch_sub(held_prepared, Relaxed);
+            board.commit.done(0);
+            bail!(
+                "stopped before the disk filled: {why}; {} files stored in {} transactions; free space and rerun to resume (stored files are skipped)",
+                c.tally.files,
+                board.txns.load(Relaxed)
+            );
         }
         while let Some((oc, size, fp)) = buf.remove(&next) {
             next += 1;
@@ -679,6 +767,28 @@ pub fn index_dir_with(
             o.db.display()
         );
     }
+    if o.deterministic && o.chunk_bytes < BATCH_BYTES as u64 + o.max_file_size {
+        bail!(
+            "--deterministic needs --chunk-bytes of at least {} (one fixed batch plus one file), got {}",
+            BATCH_BYTES as u64 + o.max_file_size,
+            o.chunk_bytes
+        );
+    }
+    // Pre-flight: refuse when the volume is already below the reserve.
+    let probe: DiskProbe = o
+        .disk_probe
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::new(diskinfo::sample_disk));
+    if let Some(s) = probe(o.db) {
+        let min_free = o.min_free_disk.resolve(Some(s.total));
+        if o.disk_check && s.available < min_free {
+            bail!(
+                "refusing to index: only {} MB free on the database's volume (keeping {} MB); free space, lower --min-free-disk, or pass --no-disk-check",
+                s.available >> 20,
+                min_free >> 20
+            );
+        }
+    }
     let start = std::time::Instant::now();
     let store = open(o.db)?;
     let trace: Option<&'static Trace> = o.trace.map(|_| &*Box::leak(Box::new(Trace::new())));
@@ -692,6 +802,7 @@ pub fn index_dir_with(
     };
     let sizing = sysinfo::Sizing::detect(o.jobs, o.memory, floor);
     let board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
+    board.disk_check.store(o.disk_check, Relaxed);
     let run = run_pipeline(&*store, &o, &board, display);
     let view = board.view();
     if let (Some(path), Some(t)) = (o.trace, trace) {

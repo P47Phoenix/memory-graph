@@ -3,6 +3,7 @@
 //! the bottleneck and memory in flight. Drawn on stderr (stdout keeps only the
 //! final summary); `--stats` prints the same counters as a table at the end.
 use crate::dataflow::{Activity, Budget, BudgetView, Stage, StageView, Trace};
+use crate::diskinfo::DiskSample;
 use crate::sysinfo::{MemSample, Sizing};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -37,6 +38,16 @@ pub struct Board {
     /// Source bytes of those prepared files (the rest of what is held is
     /// still being read or parsed).
     pub prepared_bytes: AtomicU64,
+    /// The latest disk reading, the database's size, the projected final
+    /// size, the ratio behind it (`f64` bits), the reserve, and why the
+    /// disk guard stopped the run (if it did).
+    pub disk: std::sync::Mutex<Option<DiskSample>>,
+    pub db_len: AtomicU64,
+    pub disk_projected: AtomicU64,
+    pub disk_ratio: AtomicU64,
+    pub disk_min_free: AtomicU64,
+    pub disk_stop: std::sync::Mutex<Option<String>>,
+    pub disk_check: AtomicBool,
 }
 
 impl Board {
@@ -64,6 +75,13 @@ impl Board {
             expansion: AtomicU64::new(sizing.policy.expansion.to_bits()),
             footprint: AtomicU64::new(0),
             prepared_bytes: AtomicU64::new(0),
+            disk: std::sync::Mutex::new(None),
+            db_len: AtomicU64::new(0),
+            disk_projected: AtomicU64::new(0),
+            disk_ratio: AtomicU64::new(crate::diskinfo::DISK_RATIO.to_bits()),
+            disk_min_free: AtomicU64::new(0),
+            disk_stop: std::sync::Mutex::new(None),
+            disk_check: AtomicBool::new(true),
             start: Instant::now(),
             walk: Stage::new("walk", 1).traced(0, trace),
             parse: Stage::new("parse", t).traced(100, trace),
@@ -102,6 +120,17 @@ impl Board {
             memory: *self.memory.lock().unwrap_or_else(|e| e.into_inner()),
             expansion: f64::from_bits(self.expansion.load(Relaxed)),
             footprint: self.footprint.load(Relaxed),
+            disk: *self.disk.lock().unwrap_or_else(|e| e.into_inner()),
+            db_len: self.db_len.load(Relaxed),
+            disk_projected: self.disk_projected.load(Relaxed),
+            disk_ratio: f64::from_bits(self.disk_ratio.load(Relaxed)),
+            disk_min_free: self.disk_min_free.load(Relaxed),
+            disk_stop: self
+                .disk_stop
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            disk_check: self.disk_check.load(Relaxed),
             sizing: self.sizing.clone(),
         }
     }
@@ -130,6 +159,13 @@ pub struct BoardView {
     pub memory: Option<MemSample>,
     pub expansion: f64,
     pub footprint: u64,
+    pub disk: Option<DiskSample>,
+    pub db_len: u64,
+    pub disk_projected: u64,
+    pub disk_ratio: f64,
+    pub disk_min_free: u64,
+    pub disk_stop: Option<String>,
+    pub disk_check: bool,
     pub sizing: Sizing,
 }
 
@@ -324,6 +360,7 @@ impl BoardView {
             mb(self.mem_cap),
             mb((self.mem_cap as f64 * self.expansion) as u64)
         ));
+        lines.push(self.disk_line());
         lines
             .into_iter()
             .map(|l| {
@@ -334,6 +371,32 @@ impl BoardView {
                 }
             })
             .collect()
+    }
+
+    /// The `disk` line of the live display.
+    fn disk_line(&self) -> String {
+        let mut l = match &self.disk {
+            Some(d) => format!(
+                "  disk    db {} · free {} of {} · projected {} (≈{:.1}x source) · stops below {}",
+                mb(self.db_len),
+                mb(d.available),
+                mb(d.total),
+                mb(self.disk_projected),
+                self.disk_ratio,
+                mb(self.disk_min_free)
+            ),
+            None => format!(
+                "  disk    db {} · free space unknown on this platform",
+                mb(self.db_len)
+            ),
+        };
+        if !self.disk_check {
+            l.push_str(" (check off)");
+        }
+        if let Some(why) = &self.disk_stop {
+            l.push_str(&format!(" ⚠ stopping: {why}"));
+        }
+        l
     }
 
     /// The end-of-run table (`--stats`).
@@ -393,6 +456,22 @@ impl BoardView {
         } else {
             s.push_str("memory: free RAM unknown on this platform\n");
         }
+        s.push_str(&format!(
+            "disk: db {}{}, projected {} ({:.1}x source), reserve {}{}{}\n",
+            mb(self.db_len),
+            self.disk.map_or(String::new(), |d| format!(
+                ", {} free of {}",
+                mb(d.available),
+                mb(d.total)
+            )),
+            mb(self.disk_projected),
+            self.disk_ratio,
+            mb(self.disk_min_free),
+            if self.disk_check { "" } else { " (check off)" },
+            self.disk_stop
+                .as_deref()
+                .map_or(String::new(), |w| format!("; stopped: {w}")),
+        ));
         s.push_str(&format!("{verdict}\n"));
         s
     }
@@ -433,6 +512,16 @@ impl BoardView {
                 "expansion": self.expansion,
                 "footprint_in_flight": self.footprint,
                 "budget_end_in_memory": (self.budget.cap as f64 * self.expansion) as u64,
+            },
+            "disk": {
+                "db_bytes": self.db_len,
+                "total": self.disk.map(|d| d.total),
+                "available": self.disk.map(|d| d.available),
+                "projected_bytes": self.disk_projected,
+                "ratio": self.disk_ratio,
+                "min_free": self.disk_min_free,
+                "check": self.disk_check,
+                "stopped": self.disk_stop,
             },
         })
     }
@@ -566,6 +655,16 @@ mod tests {
             }),
             expansion: 6.0,
             footprint: 500 << 20,
+            disk: Some(DiskSample {
+                total: 931 << 30,
+                available: 41 << 30,
+            }),
+            db_len: 3200 << 20,
+            disk_projected: 12100 << 20,
+            disk_ratio: 10.0,
+            disk_min_free: 2 << 30,
+            disk_stop: None,
+            disk_check: true,
             sizing: Sizing::new(
                 4,
                 Some(MemSample {
@@ -655,6 +754,31 @@ mod tests {
         let t = v.stats_table();
         assert!(t.contains("writer-bound"), "{t}");
         assert_eq!(v.stats_json()["stages"][2]["busy_ms"], 9000);
+    }
+
+    #[test]
+    fn disk_line_and_stats() {
+        let mut v = view();
+        let t = v.render(200).join("\n");
+        assert!(
+            t.contains("disk    db 3.1 GB · free 41.0 GB of 931.0 GB · projected 11.8 GB (≈10.0x source) · stops below 2.0 GB"),
+            "{t}"
+        );
+        v.disk_stop = Some("only 1.0 GB free".into());
+        assert!(v
+            .render(200)
+            .join("\n")
+            .contains("⚠ stopping: only 1.0 GB free"));
+        let s = v.stats_table();
+        assert!(s.contains("disk: db 3.1 GB, 41.0 GB free of 931.0 GB, projected 11.8 GB (10.0x source), reserve 2.0 GB; stopped: only"), "{s}");
+        assert_eq!(v.stats_json()["disk"]["projected_bytes"], 12100u64 << 20);
+        v.disk = None;
+        v.disk_check = false;
+        let t = v.render(200).join("\n");
+        assert!(
+            t.contains("free space unknown on this platform (check off)"),
+            "{t}"
+        );
     }
 
     #[test]
