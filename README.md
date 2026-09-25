@@ -25,7 +25,7 @@ The graph is `Org → Repo → File → Symbol → Token`.
 
 ## Install
 
-**From source** (a stable Rust toolchain):
+**From source** (current stable Rust; there is no pinned minimum version):
 
 ```sh
 cargo build --release
@@ -40,13 +40,13 @@ docker pull ghcr.io/p47phoenix/memory-graph:main
 
 ## Quick start
 
-Index a directory as a repo, then query it. Every command takes `--db <file>` (default `./graph.redb`); the file is created on the first `index`.
+Index a directory as a repo, then query it. Every command takes `--db <file>` (default `./graph.redb`); the file is created on the first `index`. `--org` and `--repo` are names you choose; they become the top two levels of the graph, and one database can hold many repos.
 
 ```sh
 memory-graph --db ./g index --org acme --repo api ./api        # whole directory; honors .gitignore, skips binaries
 memory-graph --db ./g describe                                  # what got indexed: languages and symbol kinds per repo
 memory-graph --db ./g search foo --language rust                # every token `foo` in Rust files
-memory-graph --db ./g symbols 'pars*' --kind method --json      # method definitions whose name starts with `pars`
+memory-graph --db ./g symbols 'Node*' --kind struct --json      # struct definitions whose name starts with `Node`
 ```
 
 What that looks like on this repository's own `crates/graph-core/src`:
@@ -57,8 +57,8 @@ indexed demo/graph-core: files=6 unchanged=0 symbols=277 tokens=11737 skipped=0 
   rust: 6
 
 $ memory-graph --db ./g search Node --language rust --limit 2
-demo/graph-core/schema.rs:140:12    rust    Node    hits=1
-demo/graph-core/schema.rs:202:17    rust    tests::node_round_trip::n    hits=1
+demo/graph-core/schema.rs:140:12	rust	Node	hits=1
+demo/graph-core/schema.rs:202:17	rust	tests::node_round_trip::n	hits=1
 
 $ memory-graph --db ./g describe
 demo/graph-core: 6 files
@@ -84,7 +84,7 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 | `vacuum [--compact]` | Drop dictionary terms no file uses; `--compact` rebuilds the file to give the space back. |
 | `export [--out FILE]` | Dump every node (org, repo, file, symbol, token, with spans) as newline-delimited JSON. An escape hatch; there is no importer yet. |
 
-Every query command has `--json` (an object on stdout) and `--limit`/`--offset` for paging; results are ordered by org, repo, file, position.
+`search`, `symbols` and `describe` take `--json` (an object on stdout); `search` and `symbols` also take `--limit`/`--offset` for paging, with results ordered by org, repo, file, position.
 
 Global options: `--db <file>` (default `./graph.redb`), `--chunk-bytes` (commit a transaction every this many source bytes, default 64 MiB) and `--cache-bytes` (redb's cache, default 1 GiB). Run `memory-graph <command> --help` for the full list.
 
@@ -92,34 +92,34 @@ Global options: `--db <file>` (default `./graph.redb`), `--chunk-bytes` (commit 
 
 ### Incremental by default
 
-Each file's fingerprint is the SHA-256 of its bytes plus the language, the extractor and tokenizer versions and the store format version. A file whose fingerprint is already stored is left untouched and counted as `unchanged` (a subset of `files`; it adds nothing to `symbols`/`tokens`). Changed content, a language override, or a new extractor version re-indexes the file fully.
+Each file's fingerprint is the SHA-256 of its bytes plus the language, the extractor and tokenizer versions and the store format version. A file whose fingerprint is already stored is left untouched (only its `origin` is refreshed if it differs) and counted as `unchanged` (a subset of `files`; it adds nothing to `symbols`/`tokens`; `index-file` prints `[unchanged]`). Unchanged files still count as seen for `--prune`. Changed content, a language override, or a new extractor version re-indexes the file fully.
 
 | Flag | Effect |
 |---|---|
 | `--reindex` | Re-index every file even if unchanged (`index-file` has it too). |
-| `--prune` | Remove this repo's files that this run did not index (deleted, renamed, newly ignored). Only files last written by a directory run are considered. Skipped when some paths were unreadable, and refused when the run indexed nothing, unless `--force`. |
-| `--force` | With `--prune`: allow removals even when nothing was indexed. `--reindex --prune` still refuses that. |
+| `--prune` | Remove this repo's files that this run did not index (deleted, renamed, newly ignored). Only files last written by a directory run are considered (`index-file` clears that mark). Skipped when some paths were unreadable, and refused when the run indexed nothing, unless `--force`. |
+| `--force` | With `--prune`: allow removals even when nothing was indexed. `--reindex` does not bypass that check. |
 | `--max-file-size N` | Skip files larger than N bytes (lockfiles, minified bundles, dumps). |
 
 Known limitation: `index-file` stores the path as given, so it only shares a File node with a directory `index` when called with the same repo-relative path.
 
 ### Failures stay per file
 
-If a file fails span validation (an extractor or tokenizer bug), only that file is left out: the rest of the batch is stored, `index` prints `failed: <path>: <reason>`, skips `--prune` with a warning and exits non-zero at the end (`failed=N` in the summary, `failed` and `failed_files` in `--json`). Storage errors still abort the batch. A panicking extractor stops the run naming the file; committed transactions stay stored.
+If a file fails span validation (an extractor or tokenizer bug), only that file is left out: the rest of the batch is stored, `index` prints `failed: <path>: <reason>`, skips `--prune` with a warning and exits non-zero at the end (`failed=N` in the summary, `failed` and `failed_files` in `--json`). Storage errors still abort the batch. `index-file` (one file) still hard-fails on an invalid span. A panicking extractor stops the run naming the file; committed transactions stay stored.
 
 ### Sizing: threads, memory, disk
 
 `index` streams the directory through three concurrent stages, *walk → parse → commit*, and sizes itself from the machine. Nothing needs tuning on a normal box; these are the knobs.
 
 - **Threads.** One parse thread per CPU but one (the writer). `--jobs N` overrides. Files are committed in walk order by a single writer, so the stored content is the same for any thread count.
-- **Memory.** The source bytes in flight (read but not yet committed) are capped by a budget derived from free RAM, re-sampled every quarter second: 20% of RAM is always left to the OS, the process may grow into 70% of what is free above that, and that headroom is divided by the measured growth per source byte (about 25x). Under pressure (free RAM below the reserve, the process past 60% of RAM, or Linux PSI stalls) the budget halves per sample and only grows again once 30% of RAM is free. `--memory 50%` changes the share; `--memory 2G` fixes the budget in source bytes; `MEMORY_GRAPH_MEMORY` sets the default. Memory is read from `/proc/meminfo` on Linux (else `sysinfo(2)`), capped by the cgroup limit when one is set, `host_statistics64` on macOS and `GlobalMemoryStatusEx` on Windows. If no probe works the budget is a fixed 512M and the memory line says why.
-- **Disk.** The database is about 8x the source. `index` keeps a reserve free on the database's volume (5% of it, between 2G and 32G; `--min-free-disk 4G` or `5%`), refuses to start below it, and stops cleanly if free space or the projected final size would go below it: what was committed stays, the database is consistent, and a rerun resumes. A real "No space left on device" is reported the same way. `--no-disk-check` reports but never stops.
-- **Reproducible files.** `--deterministic` commits fixed batches so the database file is byte-for-byte the same on any machine (slower when the writer is the bottleneck).
+- **Memory.** The source bytes in flight (read but not yet committed) are capped by a budget derived from free RAM, re-sampled every quarter second: 20% of RAM is always left to the OS, the process may grow into 70% of what is free above that, and that headroom is divided by the measured growth per source byte (about 25x). Under pressure (free RAM below the reserve, the process past 60% of RAM, or Linux PSI stalls) the budget halves per sample and only grows again once 30% of RAM is free. The budget is at least 256M and at most half of RAM (64M under pressure). `--memory 50%` changes the share; `--memory 2G` fixes the budget in source bytes (never re-sampled); `MEMORY_GRAPH_MEMORY` sets the default. Memory is read from `/proc/meminfo` on Linux (else `sysinfo(2)`), capped by the cgroup limit when one is set, `host_statistics64` on macOS and `GlobalMemoryStatusEx` on Windows. If no probe works the budget is a fixed 512M and the memory line says why.
+- **Disk.** The database is about 10x the source. `index` keeps a reserve free on the database's volume (5% of it, between 2G and 32G; `--min-free-disk 4G` or `5%`), refuses to start below it, and stops cleanly if free space or the projected final size (10x the remaining source until measured, then the measured ratio) would go below it: what was committed stays, the database is consistent, it exits non-zero with `stopped before the disk filled: ...; free space and rerun to resume`, and a rerun resumes. A real "No space left on device" is reported the same way. `--no-disk-check` reports but never stops.
+- **Reproducible files.** `--deterministic` commits fixed batches (256 files / 32 MiB) so the database file is byte-for-byte the same on any machine (slower when the writer is the bottleneck); the budget is raised to fit one batch plus one file, and a disk stop writes out the partial batch.
 
 ### Watching a run
 
 - A live view on stderr (only when it is a terminal) shows each stage's work, what it waits for (`blocked: memory budget full`), memory in flight, disk, and the bottleneck. On by default without `--json`; `--progress` forces it with `--json`; `--no-progress` turns it off. Stdout carries only the final summary.
-- `--stats` prints how busy each stage was and names the bottleneck (`writer-bound`), the memory source and a `disk:` line; with `--json` it is a `stats` object.
+- `--stats` prints how busy each stage was and names the bottleneck (`writer-bound`), the memory source and a `disk:` line; with `--json` it is a `stats` object (with `stats.disk`).
 - `--trace run.json` writes a Chrome/Perfetto trace with one span per file per stage.
 - `memory-graph sysinfo` (`--json` for an object) prints what the probes see; paste it into a report when sizing looks wrong.
 
@@ -140,21 +140,23 @@ The image `ghcr.io/p47phoenix/memory-graph` is a static binary on an empty base 
 Mount the source read-only and keep the database on a named volume:
 
 ```sh
-docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph index --org acme --repo api /src
-docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph describe
-docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph search foo --json
+docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
+docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main describe
+docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main search foo --json
 ```
 
-A fresh named volume is writable as is. To keep the database in a host directory instead, bind-mount it and run as its owner:
+Always give a tag: `latest` only exists once a release has been tagged (see the table below), so until then use `:main`.
+
+A fresh named volume is writable as is. To keep the database in a host directory instead, bind-mount it and run as its owner (Linux, macOS, Git Bash; on Docker Desktop a bind mount is writable without `--user`):
 
 ```sh
-docker run --rm -v "$PWD/db:/data" --user "$(id -u):$(id -g)" ghcr.io/p47phoenix/memory-graph describe
+docker run --rm -v "$PWD/db:/data" --user "$(id -u):$(id -g)" ghcr.io/p47phoenix/memory-graph:main describe
 ```
 
 A memory limit on the container sizes the budget for the container, not the host:
 
 ```sh
-docker run --rm --memory=512m ghcr.io/p47phoenix/memory-graph sysinfo
+docker run --rm --memory=512m ghcr.io/p47phoenix/memory-graph:main sysinfo
 ```
 
 (On Docker Desktop the memory source reads `sysinfo(2)` because `/proc/meminfo` is unreadable to non-root there; on a Linux host it reads `/proc/meminfo`.)
@@ -180,7 +182,7 @@ The workflow (`.github/workflows/docker.yml`) builds and smoke-tests the image o
 
 ```sh
 docker build -t memory-graph .                                  # host architecture
-docker buildx build --platform linux/arm64 -t memory-graph .    # cross-compiled; no QEMU needed
+docker buildx build --platform linux/arm64 --load -t memory-graph .   # cross-compiled; no QEMU needed to build
 ```
 
 ## Languages
@@ -193,9 +195,9 @@ Languages are detected per file from the extension, the filename (`Makefile`) or
 | C# | `cs`, `csx` | token-stream scanner |
 | JavaScript | `js`, `mjs`, `cjs`, `jsx` | token-stream scanner |
 | HTML | `html`, `htm`, `xhtml` | element scanner |
-| ASP.NET markup | `aspx`, `ascx`, `master` | HTML scanner plus directives |
+| ASP.NET markup | `aspx`, `ascx`, `master` | HTML scanner plus directives, server controls, code blocks and bindings |
 
-Everything else (Python, Go, SQL, YAML, ...) is tokenized with exact spans and no symbols. Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
+Everything else (Python, Go, SQL, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
 
 Tokenizer dialects: the generic tokenizer treats `r"a\"b"` as an identifier `r` and a string with Python-style escapes. The Rust extractor uses the `rust_literals` dialect, where raw strings (`r"..."`, `r#"..."#`, `br#"..."#`) and byte literals (`b"..."`, `b'x'`) are single literal tokens and an unterminated raw string runs to end of input.
 
@@ -203,15 +205,15 @@ To add a language, implement the `Extractor` trait in its own crate: see [docs/a
 
 ## Storage
 
-- **Format.** One redb file holding an interned dictionary, one compact stream per file with sparse checkpoints, and count postings ([ADR 0003](docs/adr/0003-data-model.md)). About 8-10x the source, 55 bytes per token on the test corpus; `scripts/measure-size.py` prints the full table and `crates/graph-cli/tests/size_gate.rs` enforces the ratio in CI.
+- **Format.** One redb file holding an interned dictionary, one compact stream per file with sparse checkpoints, and count postings ([ADR 0003](docs/adr/0003-data-model.md)). About 10x the source and 70 bytes per token on the small test corpus (40 bytes per token at 10 M tokens, where page and dictionary overhead amortise); `scripts/measure-size.py` prints the full table and `crates/graph-cli/tests/size_gate.rs` enforces the ratio in CI (15x, 90 bytes per token).
 - **Growth and reclaiming space.** Unchanged files add nothing on a rerun; `--reindex` can double the file until `vacuum --compact`, since redb reuses freed pages but never shrinks the file. `vacuum` frees dictionary terms after churn; `--compact` rebuilds the file.
-- **Catalog.** `describe` and filter validation read a small counter catalog kept in step with every write, so they cost O(repos), not O(tokens). A database written before the catalog existed is backfilled on first open (the file must be writable), after which older builds refuse it with a schema-version error.
+- **Catalog.** `describe` and filter validation read a small counter catalog kept in step with every write, so they cost O(repos), not O(tokens). It is part of the format, written from the first index.
 - **Versioned on disk.** Any change to the stored bytes bumps the schema version; a file from another version is refused without being written to.
 - **The v1 format is retired (2026-09-25).** The original per-node layout cost about 525 bytes per token (a fresh index of a 10 GB tree reached 420 GB). Opening a v1 file fails with a message naming its schema version and leaves it untouched. Re-index from source into a new file, or convert it with the last v1-capable release, git tag `v1-last`, using `memory-graph migrate <new.redb>`. `--backend v2` is accepted as a no-op, `--backend v1` is an error; `--v2-chunk-bytes`/`--v2-cache-bytes` are now `--chunk-bytes`/`--cache-bytes` (old spellings still work).
 
 ## Using it as a library
 
-The CLI depends on the object-safe `graph_store::Store` / `StoreRead` traits, not on redb. `open_store(path, extractors)` returns a `Box<dyn Store>` over `V2Store`, the one storage format; bring the traits into scope (`use graph_store::{Store, StoreRead}`) to call methods on it. Indexing is split into `Store::prepare` (pure, callable from many threads) and `Store::index_prepared` (the commit); `Store::index_batch` reports a file's `InvalidSpan` in that file's result slot and returns `Err` only for storage errors. `Extractor` requires `Send + Sync`. `graph_store::conformance::run_all` is a reusable test suite for any `Store` implementation. See the [architecture diagrams](docs/architecture-diagrams.md).
+The CLI depends on the object-safe `graph_store::Store` / `StoreRead` traits, not on redb. `open_store(path, extractors)` returns a `Box<dyn Store>` over `V2Store`, the one storage format (`V2Store::open(path)` gives the concrete type); bring the traits into scope (`use graph_store::{Store, StoreRead}`) to call methods on it. Indexing is split into `Store::prepare` (pure, callable from many threads) and `Store::index_prepared` (the commit); `Store::index_batch` reports a file's `InvalidSpan` in that file's result slot and returns `Err` only for storage errors. `Extractor` requires `Send + Sync`. `graph_store::conformance::run_all` is a reusable test suite for any `Store` implementation. See the [architecture diagrams](docs/architecture-diagrams.md).
 
 ## Development
 
