@@ -93,7 +93,7 @@ enum Cmd {
         /// same content, language and extractor version are skipped). Does not affect --prune's safety checks
         #[arg(long)]
         reindex: bool,
-        /// Parse threads (default: one per CPU but one, left for the database writer). Files are still
+        /// Parse threads (default, or 0: one per CPU but one, left for the database writer). Files are still
         /// committed in walk order by one writer, so the stored content is the same for any value
         #[arg(long, short = 'j', default_value_t = 0, hide_default_value = true)]
         jobs: usize,

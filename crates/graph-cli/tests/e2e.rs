@@ -2198,3 +2198,31 @@ fn stats_and_trace() {
         "{err}"
     );
 }
+
+/// Source bytes in flight never exceed `--memory` (unless one file alone is
+/// bigger): held bytes stay counted until their transaction commits.
+#[test]
+fn memory_budget_bounds_bytes_in_flight() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..200 {
+        let body = format!("fn f{i}() {{ {} }}\n", "let x = 1; ".repeat(200));
+        std::fs::write(root.join(format!("f{i:03}.rs")), body).unwrap();
+    }
+    let root = root.to_str().unwrap();
+    for mode in [&["-j", "8"][..], &["--deterministic", "-j", "8"][..]] {
+        let db = d.path().join(format!("g{}", mode.len()));
+        let mut flags = vec!["--stats", "--memory", "16K"];
+        flags.extend_from_slice(mode);
+        let (sum, _) = index_json(db.to_str().unwrap(), "v2", root, &flags);
+        assert_eq!(sum["files"], 200, "{sum}");
+        let peak = sum["stats"]["peak_in_flight"].as_u64().unwrap();
+        let cap = sum["stats"]["memory_budget"].as_u64().unwrap();
+        assert!(peak <= cap, "{mode:?}: peak {peak} > budget {cap}");
+        if mode.len() == 2 {
+            assert_eq!(cap, 16 * 1024, "adaptive keeps the requested budget");
+            assert!(sum["stats"]["transactions"].as_u64().unwrap() > 1);
+        }
+    }
+}
