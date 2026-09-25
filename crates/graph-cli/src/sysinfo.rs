@@ -236,22 +236,37 @@ impl MemoryPolicy {
         self.reason.clone_from(&d.reason);
     }
 
-    /// Feed a sample, with `held` source bytes in flight taking `footprint`
-    /// bytes of heap; returns the new cap when it changed enough to matter.
-    /// Refines the growth estimate from footprint ÷ held once enough is
-    /// held for the ratio to mean something.
+    /// Feed a sample, with `held` source bytes in flight, all of them
+    /// prepared and taking `footprint` bytes of heap. See `update_measured`.
     pub fn update(
         &mut self,
         sample: Option<&MemSample>,
         held: u64,
         footprint: u64,
     ) -> Option<Decision> {
+        self.update_measured(sample, held, held, footprint)
+    }
+
+    /// Feed a sample, with `held` source bytes in flight of which `prepared`
+    /// are parsed and take `footprint` bytes of heap (the rest are still
+    /// being read or parsed); returns the new cap when it changed enough to
+    /// matter. Refines the growth estimate from footprint ÷ prepared once
+    /// enough is prepared for the ratio to mean something.
+    pub fn update_measured(
+        &mut self,
+        sample: Option<&MemSample>,
+        held: u64,
+        prepared: u64,
+        footprint: u64,
+    ) -> Option<Decision> {
         // (A zero footprint means nothing measured yet, not free parsing.)
-        if held >= CALIBRATE_MIN_HELD && footprint > 0 {
-            let seen = (footprint as f64 / held as f64).clamp(1.0, 64.0);
+        if prepared >= CALIBRATE_MIN_HELD && footprint > 0 {
+            let seen = (footprint as f64 / prepared as f64).clamp(1.0, 64.0);
             self.expansion = 0.7 * self.expansion + 0.3 * seen;
         }
-        let d = self.decide(sample, held, footprint);
+        // Bytes still being parsed will take about the estimate.
+        let growth = footprint + (held.saturating_sub(prepared) as f64 * self.expansion) as u64;
+        let d = self.decide(sample, held, growth);
         let moved = d.under_pressure != self.under_pressure
             || (d.cap as f64 - self.cap as f64).abs() > 0.10 * self.cap as f64;
         if !moved {
@@ -262,8 +277,8 @@ impl MemoryPolicy {
     }
 
     /// The cap for `sample`, given `held` source bytes in flight taking
-    /// `footprint` bytes of heap.
-    fn decide(&self, sample: Option<&MemSample>, held: u64, footprint: u64) -> Decision {
+    /// `growth` bytes of heap (measured, or estimated when 0).
+    fn decide(&self, sample: Option<&MemSample>, held: u64, growth: u64) -> Decision {
         let fraction = match self.spec {
             MemorySpec::Fixed(bytes) => {
                 return Decision {
@@ -326,8 +341,8 @@ impl MemoryPolicy {
         // so the budget does not shrink itself as it fills. The share of that
         // headroom divided by the heap per source byte gives the budget in
         // source bytes.
-        let growth = if footprint > 0 {
-            footprint
+        let growth = if growth > 0 {
+            growth
         } else {
             (held as f64 * self.expansion) as u64
         };
@@ -507,6 +522,23 @@ mod tests {
             "{}",
             p.reason
         );
+        // Bytes admitted but still being parsed do not drag the ratio down:
+        // a few large files mid-parse next to a few small prepared ones.
+        let x = p.expansion;
+        let d = p.update_measured(Some(&m), 64 << 20, 1 << 20, (1 << 20) * 3);
+        assert_eq!(p.expansion, x, "{d:?}");
+        // ...and they count at the estimate towards what is held.
+        let mut q = MemoryPolicy::new(MemorySpec::Fraction(0.8), FLOOR, Some(&mem(64, 40)));
+        let d = q.update_measured(Some(&mem(64, 30)), 3 << 30, 1 << 30, 2 << 30);
+        // (That call also refined the estimate from the 2x it measured.)
+        let x = q.expansion;
+        assert!(x < INITIAL_EXPANSION && x > 2.0);
+        let growth = (2u64 << 30) + ((2u64 << 30) as f64 * x) as u64;
+        let spare = ((30u64 << 30) + growth) - (64u64 << 30) / 5;
+        assert_eq!(
+            d.unwrap().cap,
+            ((spare as f64 * 0.8 / x) as u64).min(32 << 30)
+        );
         // Wild ratios are clamped.
         for _ in 0..40 {
             p.update(Some(&m), held, held * 500);
@@ -521,7 +553,6 @@ mod tests {
     #[test]
     fn policy_follows_free_memory_and_backs_off_under_pressure() {
         let mut p = unit_growth(0.25, &mem(16, 8));
-        let reserve = (16u64 << 30) / 5;
         assert_eq!(p.cap, expect(16, 8, 0, 0.25, 1.0));
         assert!(!p.under_pressure);
         // A wobble under the 10% deadband is not reported; a bigger move is.
@@ -541,7 +572,6 @@ mod tests {
         // Plenty more free: the cap grows.
         let d = p.update(Some(&mem(16, 12)), 0, 0).unwrap();
         assert!(d.cap > expect(16, 8, 0, 0.25, 1.0));
-        let _ = reserve;
         // What we hold (at the growth estimate) is added back, so filling
         // the budget does not shrink it.
         let held = 1u64 << 30;

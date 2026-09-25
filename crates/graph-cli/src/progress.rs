@@ -34,6 +34,9 @@ pub struct Board {
     pub expansion: AtomicU64,
     /// Heap footprint of the prepared files in flight.
     pub footprint: AtomicU64,
+    /// Source bytes of those prepared files (the rest of what is held is
+    /// still being read or parsed).
+    pub prepared_bytes: AtomicU64,
 }
 
 impl Board {
@@ -60,6 +63,7 @@ impl Board {
             memory: std::sync::Mutex::new(sizing.memory),
             expansion: AtomicU64::new(sizing.policy.expansion.to_bits()),
             footprint: AtomicU64::new(0),
+            prepared_bytes: AtomicU64::new(0),
             start: Instant::now(),
             walk: Stage::new("walk", 1).traced(0, trace),
             parse: Stage::new("parse", t).traced(100, trace),

@@ -454,6 +454,7 @@ fn run_pipeline(
                         board.parse.count(1, size);
                         fp = p.memory_footprint() as u64;
                         board.footprint.fetch_add(fp, Relaxed);
+                        board.prepared_bytes.fetch_add(size, Relaxed);
                     }
                     inflight
                         .lock()
@@ -478,8 +479,10 @@ fn run_pipeline(
                 if dynamic && tick.is_multiple_of(2) {
                     let m = sysinfo::sample_memory();
                     *board.memory.lock().unwrap_or_else(|e| e.into_inner()) = m;
-                    let (held, fp) = (board.budget.used(), board.footprint.load(Relaxed));
-                    if let Some(d) = policy.update(m.as_ref(), held, fp) {
+                    let held = board.budget.used();
+                    let prepared = board.prepared_bytes.load(Relaxed);
+                    let fp = board.footprint.load(Relaxed);
+                    if let Some(d) = policy.update_measured(m.as_ref(), held, prepared, fp) {
                         board.budget.set_cap(d.cap, &d.reason, d.under_pressure);
                     }
                     board.expansion.store(policy.expansion.to_bits(), Relaxed);
@@ -516,7 +519,7 @@ fn commit_all(
     let mut buf: BTreeMap<u64, (Result<Outcome>, u64, u64)> = BTreeMap::new();
     let mut next = 0u64;
     let mut pending: Vec<(String, PreparedFile)> = Vec::new();
-    let (mut pending_bytes, mut held, mut held_fp) = (0u64, 0u64, 0u64);
+    let (mut pending_bytes, mut held, mut held_fp, mut held_prepared) = (0u64, 0u64, 0u64, 0u64);
     loop {
         // A group commit takes at most half the budget (as it is right now),
         // so parsing can refill the other half meanwhile.
@@ -541,6 +544,7 @@ fn commit_all(
                     board.handled.fetch_add(1, Relaxed);
                 }
                 Outcome::Prepared(rel, p) => {
+                    held_prepared += size;
                     pending_bytes += p.bytes_len() as u64;
                     pending.push((rel, p));
                 }
@@ -591,7 +595,8 @@ fn commit_all(
             board.handled_bytes.fetch_add(held, Relaxed);
             board.budget.release(held);
             board.footprint.fetch_sub(held_fp, Relaxed);
-            (held, held_fp) = (0, 0);
+            board.prepared_bytes.fetch_sub(held_prepared, Relaxed);
+            (held, held_fp, held_prepared) = (0, 0, 0);
         }
         if all_in && pending.is_empty() && buf.is_empty() {
             board.commit.done(0);

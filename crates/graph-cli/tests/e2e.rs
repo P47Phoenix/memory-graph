@@ -2247,9 +2247,10 @@ fn memory_share_follows_free_ram() {
         let cap = m["budget_max"].as_u64().unwrap();
         // At most 10% of what was free above the reserve, divided by the
         // measured growth per source byte, plus the floor.
-        // The estimate starts at INITIAL_EXPANSION and moves toward the
-        // measured value, so the cap never exceeded the bound at the lower
-        // of the two.
+        // The estimate starts at INITIAL_EXPANSION and settles at the
+        // measured value (a running average, so it can wobble a little on
+        // the way), which puts the cap under the bound at the lower of the
+        // two.
         let growth = m["expansion"].as_f64().unwrap();
         assert!((1.0..=64.0).contains(&growth), "{m}");
         let growth = growth.min(graph_cli::sysinfo::INITIAL_EXPANSION);
