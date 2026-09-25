@@ -19,6 +19,7 @@ cargo test -p graph-cli --test e2e                          # CLI end-to-end tes
 python3 scripts/test_gate.py                               # CI's own extra gate
 python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any -sys crate or C build script (see below)
 python3 scripts/vendor-corpus.py                            # re-vendor testdata/corpus/ (pinned commits, license-checked)
+docker build -t memory-graph .                              # the container image (static musl binary on scratch; .github/workflows/docker.yml publishes it to ghcr.io)
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test --workspace`, `test_gate.py`, `check-no-c-deps.py`) on every push/PR. A PR is not done until all of these pass on its head SHA.
