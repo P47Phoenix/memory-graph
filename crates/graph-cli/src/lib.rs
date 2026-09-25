@@ -378,7 +378,9 @@ fn walk(
             }
         }
     });
-    board.walk_done.store(true, Relaxed);
+    board
+        .walk_done
+        .store(true, std::sync::atomic::Ordering::Release);
     board.walk.done(0);
 }
 
@@ -532,7 +534,8 @@ fn commit_all(
                 break;
             }
         }
-        let all_in = board.walk_done.load(Relaxed) && next == board.found.load(Relaxed);
+        let all_in = board.walk_done.load(std::sync::atomic::Ordering::Acquire)
+            && next == board.found.load(Relaxed);
         let batch_full = if o.deterministic {
             pending.len() >= BATCH_FILES || pending_bytes >= BATCH_BYTES as u64
         } else {
@@ -583,7 +586,7 @@ fn commit_all(
             .get(&next)
             .cloned()
             .unwrap_or_else(|| {
-                if board.walk_done.load(Relaxed) {
+                if board.walk_done.load(std::sync::atomic::Ordering::Acquire) {
                     "parsed files".into()
                 } else {
                     "the walk".into()
@@ -597,7 +600,9 @@ fn commit_all(
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                if !(board.walk_done.load(Relaxed) && next == board.found.load(Relaxed)) {
+                if !(board.walk_done.load(std::sync::atomic::Ordering::Acquire)
+                    && next == board.found.load(Relaxed))
+                {
                     bail!("indexing workers stopped unexpectedly");
                 }
             }
@@ -650,7 +655,14 @@ pub fn index_dir_with(
     let start = std::time::Instant::now();
     let store = open(o.db)?;
     let trace: Option<&'static Trace> = o.trace.map(|_| &*Box::leak(Box::new(Trace::new())));
-    let sizing = sysinfo::Sizing::detect(o.jobs, o.memory);
+    let mut sizing = sysinfo::Sizing::detect(o.jobs, o.memory);
+    if o.deterministic {
+        // A fixed batch holds its files' bytes until it commits, so the
+        // budget must fit one whole batch plus the file that closes it.
+        sizing.memory_budget = sizing
+            .memory_budget
+            .max(BATCH_BYTES as u64 + o.max_file_size);
+    }
     let board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
     let run = run_pipeline(&*store, &o, &board, display);
     let view = board.view();

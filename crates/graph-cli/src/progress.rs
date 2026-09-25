@@ -67,7 +67,7 @@ impl Board {
             stages: [self.walk.view(), self.parse.view(), self.commit.view()],
             found: self.found.load(Relaxed),
             found_bytes: self.found_bytes.load(Relaxed),
-            walk_done: self.walk_done.load(Relaxed),
+            walk_done: self.walk_done.load(std::sync::atomic::Ordering::Acquire),
             handled: self.handled.load(Relaxed),
             handled_bytes: self.handled_bytes.load(Relaxed),
             skipped: self.skipped.load(Relaxed),

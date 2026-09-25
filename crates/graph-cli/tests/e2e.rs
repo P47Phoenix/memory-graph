@@ -2119,6 +2119,8 @@ fn adaptive_commit_stores_the_same_content() {
             vec!["--deterministic", "-j", "1"],
             vec!["-j", "8"],
             vec!["-j", "3", "--memory", "64K"],
+            // A budget below one fixed batch must not hang `--deterministic`.
+            vec!["--deterministic", "-j", "2", "--memory", "64K"],
         ] {
             let db = d.path().join(format!("g{}", seen.len()));
             let db = db.to_str().unwrap();
