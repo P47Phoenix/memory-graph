@@ -56,6 +56,24 @@ the cgroup v2/v1 memory limit when one is below physical RAM,
    every platform over a fake cgroup tree, including the v1 spellings that
    no CI runner has any more.
 
+## Container image
+
+`.github/workflows/docker.yml` builds the `Dockerfile` (a static musl
+`memory-graph` on `scratch`, cross-compiled for `linux/amd64` and
+`linux/arm64` without QEMU) on every pull request, push to `main`, `v*`
+tag and manual run, and a second job, reached only by the push events and the
+only one allowed to write packages, pushes both architectures to
+`ghcr.io/p47phoenix/memory-graph` (a `v*` tag must equal the `Cargo.toml`
+version or it refuses). The first job loads the amd64 image and smoke-tests it: `sysinfo`
+(and `sysinfo --json` through `scripts/check-probes.py`, once plainly and once
+under `docker run --memory=512m`, where the source must mention `cgroup` and
+the total must fit the limit), `index` of `crates/graph-core/src` from a
+read-only mount into a fresh named volume on `/data` (files and tokens
+stored, none failed), `search Node --json` (some results), `describe --json`
+(the repo is listed), and the image's user, working directory and entrypoint.
+The arm64 image is linked from the same pure-Rust source but not executed in
+CI (there is no arm64 runner); the amd64 smoke test is the assurance.
+
 ## Database size
 
 `crates/graph-cli/tests/size_gate.rs` indexes `testdata/corpus` and fails if

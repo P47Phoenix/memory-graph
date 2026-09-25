@@ -1,0 +1,9 @@
+# Only what `cargo build -p graph-cli` needs; everything else (target/,
+# testdata/, docs/, spikes/, .claude/ worktrees, .git) stays out of the
+# build context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!examples/
+**/target/

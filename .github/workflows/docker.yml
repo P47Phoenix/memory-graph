@@ -1,0 +1,119 @@
+name: Docker
+# Builds the memory-graph container image (Dockerfile: static musl binary on
+# scratch, linux/amd64 + linux/arm64) and smoke-tests the amd64 image on
+# every pull request, push to main, v* tag and manual dispatch. Only push
+# events publish, to ghcr.io/<owner>/memory-graph: on main the tags `main`
+# and `sha-<short>`, on a v* tag `<version>`, `<major>.<minor>` and (not for
+# a prerelease) `latest`. Pull requests and manual runs never push.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    # Build the amd64 image, load it and exercise it. No registry access.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build the amd64 image for the smoke test
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: memory-graph:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (sysinfo, cgroup limit, index, search, describe, image config)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run --rm memory-graph:smoke sysinfo
+          docker run --rm memory-graph:smoke sysinfo --json | python3 scripts/check-probes.py
+          # A cgroup memory limit sizes the budget for the container, not the host.
+          docker run --rm --memory=512m memory-graph:smoke sysinfo --json \
+            | python3 scripts/check-probes.py --max-total $((512 * 1024 * 1024)) --source-contains cgroup
+          # Index a small source tree from a read-only mount into a fresh named
+          # volume on /data (the image's working directory and default --db).
+          docker volume rm -f mg-smoke >/dev/null 2>&1 || true
+          docker run --rm -v "$PWD/crates/graph-core/src:/src:ro" -v mg-smoke:/data memory-graph:smoke \
+            index --org smoke --repo graph-core /src --json | tee index.json
+          python3 -c 'import json; s=json.load(open("index.json")); assert s["files"] > 0 and s["tokens"] > 0 and s["failed"] == 0, s'
+          docker run --rm -v mg-smoke:/data memory-graph:smoke search Node --language rust --json | tee search.json
+          python3 -c 'import json; r=json.load(open("search.json")); assert r["results"], r'
+          docker run --rm -v mg-smoke:/data memory-graph:smoke describe --json | tee describe.json
+          python3 -c 'import json; d=json.load(open("describe.json")); assert [r for r in d["repos"] if r["repo"] == "graph-core"], d'
+          docker volume rm -f mg-smoke >/dev/null
+          # Runs as a numeric non-root user from /data with the binary as
+          # entrypoint, and there is no shell in the image.
+          docker inspect memory-graph:smoke --format '{{.Config.User}} {{.Config.WorkingDir}} {{.Config.Entrypoint}}' \
+            | grep -q '^65532:65532 /data \[/memory-graph\]$'
+          if docker run --rm --entrypoint /bin/sh memory-graph:smoke -c true; then echo "image has a shell" >&2; exit 1; fi
+
+  publish:
+    # Both architectures, pushed to ghcr.io. Only this job may write packages,
+    # and only push events (main, v* tags) reach it.
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: The v* tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v" >&2; exit 1; }
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build linux/amd64 + linux/arm64 and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
