@@ -133,6 +133,13 @@ enum Cmd {
         /// Never show live progress
         #[arg(long)]
         no_progress: bool,
+        /// Free space to keep on the database's volume, e.g. 4G or 5% (default: 5%, between 2G and 32G).
+        /// The run refuses to start below it and stops cleanly, resumably, if it would go below it
+        #[arg(long, value_parser = graph_cli::diskinfo::parse_min_free)]
+        min_free_disk: Option<graph_cli::diskinfo::MinFree>,
+        /// Report disk space but never stop for it
+        #[arg(long)]
+        no_disk_check: bool,
         dir: PathBuf,
     },
     /// Drop dictionary terms that no file refers to any more
@@ -426,6 +433,8 @@ fn run() -> Result<()> {
             trace,
             progress,
             no_progress,
+            min_free_disk,
+            no_disk_check,
             dir,
         } => index_dir(
             DirOpts {
@@ -448,6 +457,10 @@ fn run() -> Result<()> {
                     (_, true) => Some(false),
                     _ => None,
                 },
+                disk_probe: None,
+                min_free_disk: min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
+                disk_check: !no_disk_check,
+                chunk_bytes: cli.chunk_bytes.unwrap_or(graph_cli::DEFAULT_CHUNK_BYTES),
             },
             |db| open_for_indexing(db, overrides),
             &mut std::io::stdout().lock(),

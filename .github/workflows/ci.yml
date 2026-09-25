@@ -16,3 +16,12 @@ jobs:
       - run: python3 scripts/test_gate.py
       - name: Pure-Rust gate (no -sys / C build scripts)
         run: python3 scripts/check-no-c-deps.py
+  disk-full:
+    # Real ENOSPC: index into a size-capped tmpfs, stop cleanly, resume.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p graph-cli
+      - run: bash scripts/disk-full-tmpfs.sh target/release/memory-graph

@@ -333,6 +333,7 @@ dependencies = [
  "ignore",
  "indicatif",
  "redb",
+ "rustix",
  "serde_json",
  "tempfile",
  "windows-sys 0.59.0",
