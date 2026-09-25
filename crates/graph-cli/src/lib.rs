@@ -464,8 +464,8 @@ fn run_pipeline(
         }
         drop((job_rx, res_tx));
         let finished = &finished;
-        // Sampler + display: every 125 ms re-read the machine's memory and
-        // move the budget (unless `--memory` fixed it), then redraw.
+        // Sampler + display: every 250 ms re-read the machine's memory and
+        // move the budget (unless `--memory` fixed it); redraw every 125 ms.
         sc.spawn(move || {
             let mut policy = board.sizing.policy.clone();
             let dynamic = matches!(policy.spec, sysinfo::MemorySpec::Fraction(_));

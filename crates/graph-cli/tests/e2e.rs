@@ -2249,8 +2249,10 @@ fn memory_share_follows_free_ram() {
         let bound = ((avail + sum["stats"]["peak_in_flight"].as_u64().unwrap())
             .saturating_sub(total / 5))
             / 10;
+        // `available` is the end-of-run sample: allow free memory to have
+        // moved by a quarter meanwhile (other tests run alongside).
         assert!(
-            cap <= bound.max(256 << 20) * 11 / 10,
+            cap <= bound.max(256 << 20) * 5 / 4,
             "cap {cap} bound {bound}: {m}"
         );
         let reason = m["reason"].as_str().unwrap();

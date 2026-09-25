@@ -42,10 +42,14 @@ pub fn sample_memory() -> Option<MemSample> {
         };
         let total = kb("MemTotal:")? * 1024;
         let available = kb("MemAvailable:")? * 1024;
-        let rss = std::fs::read_to_string("/proc/self/statm")
+        // VmRSS is in kB whatever the page size (statm counts pages).
+        let rss = std::fs::read_to_string("/proc/self/status")
             .ok()
-            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .map(|pages| pages * 4096);
+            .and_then(|s| {
+                let line = s.lines().find(|l| l.starts_with("VmRSS:"))?;
+                line.split_whitespace().nth(1)?.parse::<u64>().ok()
+            })
+            .map(|kb| kb * 1024);
         let psi_some_avg10 = std::fs::read_to_string("/proc/pressure/memory")
             .ok()
             .and_then(|s| {
@@ -109,9 +113,13 @@ pub enum MemorySpec {
 }
 
 /// Parse `--memory`: a size like `512M` / `2G` / `1048576` (binary units),
-/// or a percentage of free memory like `25%`.
+/// or a percentage of free memory like `25%`. Empty (an unset-looking
+/// `MEMORY_GRAPH_MEMORY=`) means the default.
 pub fn parse_memory_spec(s: &str) -> Result<MemorySpec, String> {
     let t = s.trim();
+    if t.is_empty() {
+        return Ok(MemorySpec::Fraction(DEFAULT_FRACTION));
+    }
     if let Some(p) = t.strip_suffix('%') {
         let n: f64 = p
             .trim()
@@ -175,6 +183,16 @@ pub struct Decision {
     pub reason: String,
 }
 
+/// A share as a percentage, with a decimal only when it needs one.
+fn pct(f: f64) -> String {
+    let p = f * 100.0;
+    if (p - p.round()).abs() < 0.05 {
+        format!("{p:.0}")
+    } else {
+        format!("{p:.1}")
+    }
+}
+
 fn mb(b: u64) -> String {
     let m = b as f64 / MIB as f64;
     if m >= 1024.0 {
@@ -229,7 +247,9 @@ impl MemoryPolicy {
             }
             MemorySpec::Fraction(f) => f,
         };
-        let Some(m) = sample else {
+        // A reading without a total is no reading (it would pin us under
+        // pressure through the RSS check).
+        let Some(m) = sample.filter(|m| m.total > 0) else {
             return Decision {
                 cap: FALLBACK_BUDGET.max(self.floor),
                 under_pressure: false,
@@ -266,10 +286,13 @@ impl MemoryPolicy {
                     mb(reserve)
                 )
             };
+            // Each sample halves what is held, so the cap ratchets down to
+            // the pressure floor and stays there until free memory is back
+            // above 30% of RAM.
             return Decision {
                 cap: (held / 2).max(self.floor).max(PRESSURE_FLOOR),
                 under_pressure: true,
-                reason: format!("pressure: {why}; lowered until the writer frees memory"),
+                reason: format!("pressure: {why}; budget held down until 30% is free"),
             };
         }
         // What we hold is part of what is no longer "available": add it back
@@ -283,8 +306,8 @@ impl MemoryPolicy {
             cap,
             under_pressure: false,
             reason: format!(
-                "{:.0}% of {} free above the {} OS reserve{}",
-                fraction * 100.0,
+                "{}% of {} free above the {} OS reserve{}",
+                pct(fraction),
                 mb(m.available),
                 mb(reserve),
                 m.rss.map_or(String::new(), |r| format!("; RSS {}", mb(r)))
@@ -399,8 +422,15 @@ mod tests {
         let reserve = (16u64 << 30) / 5;
         assert_eq!(p.cap, ((8u64 << 30) - reserve) / 4);
         assert!(!p.under_pressure);
-        // Small wobble: no change reported.
+        // A wobble under the 10% deadband is not reported; a bigger move is.
         assert!(p.update(Some(&mem(16, 8)), 0).is_none());
+        let cap0 = p.cap;
+        let mut wobble = mem(16, 8);
+        wobble.available += cap0 / 4; // target moves by 5% (a quarter of the 25% share)
+        assert!(p.update(Some(&wobble), 0).is_none());
+        wobble.available = (8u64 << 30) + cap0 * 3 / 5; // ~15%
+        assert!(p.update(Some(&wobble), 0).is_some());
+        let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), FLOOR, Some(&mem(16, 8)));
         // Plenty more free: the cap grows.
         let d = p.update(Some(&mem(16, 12)), 0).unwrap();
         assert!(d.cap > ((8u64 << 30) - reserve) / 4);
@@ -425,7 +455,7 @@ mod tests {
         let d = p.update(Some(&mem(16, 1)), 0).unwrap();
         assert_eq!(d.cap, FLOOR);
         let mut q = MemoryPolicy::new(MemorySpec::Fraction(0.25), 1, Some(&mem(16, 10)));
-        assert_eq!(q.update(Some(&mem(16, 1)), 0).unwrap().cap, PRESSURE_FLOOR);
+        assert_eq!(q.update(Some(&mem(16, 1)), 0).unwrap().cap, 64 << 20);
         // Our own growth counts too.
         let mut big = mem(16, 10);
         big.rss = Some(11 << 30);
@@ -441,6 +471,12 @@ mod tests {
             .unwrap()
             .reason
             .contains("stalling"));
+        // A bogus total is treated as no reading, not as pressure.
+        let mut bogus = mem(0, 0);
+        bogus.rss = Some(1 << 20);
+        let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), 1, Some(&bogus));
+        assert!(!p.under_pressure && p.reason.contains("unknown"));
+        assert!(p.update(Some(&bogus), 0).is_none());
         // Fixed never moves.
         let mut p = MemoryPolicy::new(MemorySpec::Fixed(1 << 30), 1, Some(&mem(16, 10)));
         assert!(p.update(Some(&mem(16, 1)), 5 << 30).is_none());
@@ -452,6 +488,13 @@ mod tests {
         assert_eq!(parse_memory_spec("512M"), Ok(MemorySpec::Fixed(512 * MIB)));
         assert_eq!(parse_memory_spec("25%"), Ok(MemorySpec::Fraction(0.25)));
         assert_eq!(parse_memory_spec(" 100 % "), Ok(MemorySpec::Fraction(1.0)));
+        assert_eq!(parse_memory_spec("0.5%"), Ok(MemorySpec::Fraction(0.005)));
+        assert_eq!(
+            parse_memory_spec(""),
+            Ok(MemorySpec::Fraction(DEFAULT_FRACTION))
+        );
+        assert_eq!(pct(0.25), "25");
+        assert_eq!(pct(0.005), "0.5");
         assert!(parse_memory_spec("0%").is_err());
         assert!(parse_memory_spec("150%").is_err());
         assert!(parse_memory_spec("x%").is_err());
