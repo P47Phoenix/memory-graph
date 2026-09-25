@@ -400,7 +400,8 @@ fn run_pipeline(
     let finished = AtomicBool::new(false);
     let (walk_tx, walk_rx) = crossbeam_channel::unbounded::<(u64, Item)>();
     let (job_tx, job_rx) = crossbeam_channel::unbounded::<(u64, Item, u64)>();
-    let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Result<Outcome>, u64)>();
+    // (walk sequence, outcome, source bytes, heap footprint)
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Result<Outcome>, u64, u64)>();
     let inflight = std::sync::Mutex::new(BTreeMap::<u64, String>::new());
     let admit_blocked = AtomicBool::new(false);
     std::thread::scope(|sc| {
@@ -448,14 +449,17 @@ fn run_pipeline(
                             .insert(seq, rel.clone());
                     }
                     let oc = work(store, o, &item, board, k);
-                    if matches!(oc, Ok(Outcome::Prepared(..))) {
+                    let mut fp = 0;
+                    if let Ok(Outcome::Prepared(_, p)) = &oc {
                         board.parse.count(1, size);
+                        fp = p.memory_footprint() as u64;
+                        board.footprint.fetch_add(fp, Relaxed);
                     }
                     inflight
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&seq);
-                    if res_tx.send((seq, oc, size)).is_err() {
+                    if res_tx.send((seq, oc, size, fp)).is_err() {
                         break;
                     }
                 }
@@ -474,9 +478,11 @@ fn run_pipeline(
                 if dynamic && tick.is_multiple_of(2) {
                     let m = sysinfo::sample_memory();
                     *board.memory.lock().unwrap_or_else(|e| e.into_inner()) = m;
-                    if let Some(d) = policy.update(m.as_ref(), board.budget.used()) {
+                    let (held, fp) = (board.budget.used(), board.footprint.load(Relaxed));
+                    if let Some(d) = policy.update(m.as_ref(), held, fp) {
                         board.budget.set_cap(d.cap, &d.reason, d.under_pressure);
                     }
+                    board.expansion.store(policy.expansion.to_bits(), Relaxed);
                 }
                 tick = tick.wrapping_add(1);
                 if !display.is_hidden() {
@@ -503,25 +509,26 @@ fn commit_all(
     store: &dyn Store,
     o: &DirOpts,
     board: &Board,
-    res_rx: crossbeam_channel::Receiver<(u64, Result<Outcome>, u64)>,
+    res_rx: crossbeam_channel::Receiver<(u64, Result<Outcome>, u64, u64)>,
     inflight: &std::sync::Mutex<BTreeMap<u64, String>>,
 ) -> Result<Collected> {
     let mut c = Collected::default();
-    let mut buf: BTreeMap<u64, (Result<Outcome>, u64)> = BTreeMap::new();
+    let mut buf: BTreeMap<u64, (Result<Outcome>, u64, u64)> = BTreeMap::new();
     let mut next = 0u64;
     let mut pending: Vec<(String, PreparedFile)> = Vec::new();
-    let (mut pending_bytes, mut held) = (0u64, 0u64);
+    let (mut pending_bytes, mut held, mut held_fp) = (0u64, 0u64, 0u64);
     loop {
         // A group commit takes at most half the budget (as it is right now),
         // so parsing can refill the other half meanwhile.
         let group_cap = (board.budget.cap() / 2).max(1);
         // Take everything that has arrived.
-        for (seq, oc, size) in res_rx.try_iter() {
-            buf.insert(seq, (oc, size));
+        for (seq, oc, size, fp) in res_rx.try_iter() {
+            buf.insert(seq, (oc, size, fp));
         }
-        while let Some((oc, size)) = buf.remove(&next) {
+        while let Some((oc, size, fp)) = buf.remove(&next) {
             next += 1;
             held += size;
+            held_fp += fp;
             match oc? {
                 Outcome::Skip {
                     reason,
@@ -583,7 +590,8 @@ fn commit_all(
         if pending.is_empty() {
             board.handled_bytes.fetch_add(held, Relaxed);
             board.budget.release(held);
-            held = 0;
+            board.footprint.fetch_sub(held_fp, Relaxed);
+            (held, held_fp) = (0, 0);
         }
         if all_in && pending.is_empty() && buf.is_empty() {
             board.commit.done(0);
@@ -608,8 +616,8 @@ fn commit_all(
         match board.commit.starved(0, on, || {
             res_rx.recv_timeout(std::time::Duration::from_millis(50))
         }) {
-            Ok((seq, oc, size)) => {
-                buf.insert(seq, (oc, size));
+            Ok((seq, oc, size, fp)) => {
+                buf.insert(seq, (oc, size, fp));
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {

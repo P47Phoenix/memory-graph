@@ -14,8 +14,16 @@ pub const PRESSURE_FLOOR: u64 = 64 * MIB;
 /// else: the budget only ever targets what is free above it, and dropping
 /// below it is memory pressure.
 pub const OS_RESERVE: f64 = 0.20;
-/// Default share of the free memory (above the reserve) to budget.
-pub const DEFAULT_FRACTION: f64 = 0.25;
+/// Default share of the free memory (above the reserve) this process may
+/// grow into. The budget itself is that share divided by the measured
+/// growth per source byte (see [`MemoryPolicy`]), so it is in RSS terms.
+pub const DEFAULT_FRACTION: f64 = 0.80;
+/// Heap per source byte in flight assumed until measured. Measured on the
+/// test corpus: about 13x for v1 (tokens, symbols and their strings) and
+/// 25x for v2 (plus its pre-encoded stream and postings).
+pub const INITIAL_EXPANSION: f64 = 16.0;
+/// The measured growth is trusted only once this much is in flight.
+const CALIBRATE_MIN_HELD: u64 = 16 * MIB;
 
 /// One reading of the machine's memory.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,8 +115,9 @@ pub fn available_memory() -> Option<u64> {
 pub enum MemorySpec {
     /// A fixed budget (`2G`): never re-sampled.
     Fixed(u64),
-    /// A share of the free memory above the OS reserve (`25%`), followed
-    /// during the run.
+    /// A share of the free memory above the OS reserve (`80%`) that this
+    /// process may grow into, followed during the run and divided by the
+    /// measured growth per source byte.
     Fraction(f64),
 }
 
@@ -173,6 +182,9 @@ pub struct MemoryPolicy {
     /// Why the current cap is what it is, for the display.
     pub reason: String,
     pub cap: u64,
+    /// Measured heap bytes per source byte in flight (a running average
+    /// of footprint ÷ held, starting at [`INITIAL_EXPANSION`]).
+    pub expansion: f64,
 }
 
 /// A change the policy decided on.
@@ -211,8 +223,9 @@ impl MemoryPolicy {
             under_pressure: false,
             reason: String::new(),
             cap: 1,
+            expansion: INITIAL_EXPANSION,
         };
-        let d = p.decide(first, 0);
+        let d = p.decide(first, 0, 0);
         p.apply(&d);
         p
     }
@@ -223,9 +236,22 @@ impl MemoryPolicy {
         self.reason.clone_from(&d.reason);
     }
 
-    /// Feed a sample; returns the new cap when it changed enough to matter.
-    pub fn update(&mut self, sample: Option<&MemSample>, held: u64) -> Option<Decision> {
-        let d = self.decide(sample, held);
+    /// Feed a sample, with `held` source bytes in flight taking `footprint`
+    /// bytes of heap; returns the new cap when it changed enough to matter.
+    /// Refines the growth estimate from footprint ÷ held once enough is
+    /// held for the ratio to mean something.
+    pub fn update(
+        &mut self,
+        sample: Option<&MemSample>,
+        held: u64,
+        footprint: u64,
+    ) -> Option<Decision> {
+        // (A zero footprint means nothing measured yet, not free parsing.)
+        if held >= CALIBRATE_MIN_HELD && footprint > 0 {
+            let seen = (footprint as f64 / held as f64).clamp(1.0, 64.0);
+            self.expansion = 0.7 * self.expansion + 0.3 * seen;
+        }
+        let d = self.decide(sample, held, footprint);
         let moved = d.under_pressure != self.under_pressure
             || (d.cap as f64 - self.cap as f64).abs() > 0.10 * self.cap as f64;
         if !moved {
@@ -235,8 +261,9 @@ impl MemoryPolicy {
         Some(d)
     }
 
-    /// The cap for `sample`, given `held` bytes we hold right now.
-    fn decide(&self, sample: Option<&MemSample>, held: u64) -> Decision {
+    /// The cap for `sample`, given `held` source bytes in flight taking
+    /// `footprint` bytes of heap.
+    fn decide(&self, sample: Option<&MemSample>, held: u64, footprint: u64) -> Decision {
         let fraction = match self.spec {
             MemorySpec::Fixed(bytes) => {
                 return Decision {
@@ -296,9 +323,16 @@ impl MemoryPolicy {
             };
         }
         // What we hold is part of what is no longer "available": add it back
-        // so the budget does not shrink itself as it fills.
-        let spare = (m.available + held).saturating_sub(reserve);
-        let target = (spare as f64 * fraction) as u64;
+        // so the budget does not shrink itself as it fills. The share of that
+        // headroom divided by the heap per source byte gives the budget in
+        // source bytes.
+        let growth = if footprint > 0 {
+            footprint
+        } else {
+            (held as f64 * self.expansion) as u64
+        };
+        let spare = (m.available + growth).saturating_sub(reserve);
+        let target = (spare as f64 * fraction / self.expansion) as u64;
         let ceiling = m.total / 2;
         let floor = self.floor.max(FLOOR);
         let cap = target.clamp(floor, ceiling.max(floor));
@@ -306,10 +340,11 @@ impl MemoryPolicy {
             cap,
             under_pressure: false,
             reason: format!(
-                "{}% of {} free above the {} OS reserve{}",
+                "{}% of {} free above the {} OS reserve ÷ {:.1}× growth per source byte{}",
                 pct(fraction),
                 mb(m.available),
                 mb(reserve),
+                self.expansion,
                 m.rss.map_or(String::new(), |r| format!("; RSS {}", mb(r)))
             ),
         }
@@ -376,12 +411,35 @@ mod tests {
         }
     }
 
+    /// The fraction budget for `avail` GB free of `total` GB, `held` bytes in
+    /// flight, at growth `x`.
+    fn expect(total_gb: u64, avail_gb: u64, held: u64, f: f64, x: f64) -> u64 {
+        let total = total_gb << 30;
+        let reserve = total / 5;
+        let spare = ((avail_gb << 30) + held * x as u64).saturating_sub(reserve);
+        ((spare as f64 * f / x) as u64).clamp(FLOOR, total / 2)
+    }
+
     #[test]
     fn sizing_follows_the_hardware() {
         let s = Sizing::new(32, Some(mem(64, 60)), 0, None, FLOOR);
         assert_eq!(s.parse_threads, 31);
-        // 25% of (60 - 12.8 reserve) GB.
-        assert_eq!(s.memory_budget, ((60u64 << 30) - (64u64 << 30) / 5) / 4);
+        assert_eq!(
+            s.memory_budget,
+            expect(64, 60, 0, DEFAULT_FRACTION, INITIAL_EXPANSION)
+        );
+        assert!(
+            s.policy.reason.contains("80% of 60.0 GB free"),
+            "{}",
+            s.policy.reason
+        );
+        assert!(
+            s.policy
+                .reason
+                .contains(&format!("{INITIAL_EXPANSION:.1}× growth")),
+            "{}",
+            s.policy.reason
+        );
         let s = Sizing::new(1, Some(mem(2, 1)), 0, None, 1);
         assert_eq!(s.parse_threads, 1);
         assert_eq!(s.memory_budget, FLOOR, "fraction floor");
@@ -405,69 +463,122 @@ mod tests {
             FLOOR,
         );
         assert_eq!(s.memory_budget, FLOOR);
-        // The ceiling is half of RAM.
-        let s = Sizing::new(
-            8,
-            Some(mem(16, 16)),
-            0,
-            Some(MemorySpec::Fraction(1.0)),
-            FLOOR,
+        // The ceiling is half of RAM (at growth 1, 100% of 12.8 GB spare).
+        let mut p = MemoryPolicy::new(MemorySpec::Fraction(1.0), FLOOR, Some(&mem(16, 16)));
+        p.expansion = 1.0;
+        assert_eq!(p.update(Some(&mem(16, 16)), 0, 0).unwrap().cap, 8 << 30);
+    }
+
+    /// A policy on `m` with the growth estimate at 1x, so a 16 GB fixture
+    /// sits above the 256 MiB floor.
+    fn unit_growth(f: f64, m: &MemSample) -> MemoryPolicy {
+        let mut p = MemoryPolicy::new(MemorySpec::Fraction(f), FLOOR, Some(m));
+        p.expansion = 1.0;
+        let d = p.decide(Some(m), 0, 0);
+        p.apply(&d);
+        p
+    }
+
+    #[test]
+    fn growth_is_measured_and_sets_the_budget() {
+        let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.8), FLOOR, Some(&mem(64, 40)));
+        assert_eq!(p.cap, expect(64, 40, 0, 0.8, INITIAL_EXPANSION));
+        // Too little in flight to trust a ratio: the estimate stays.
+        p.update(Some(&mem(64, 40)), 8 << 20, (8 << 20) * 3);
+        assert_eq!(p.expansion, INITIAL_EXPANSION);
+        // Prepared files take 3x their source: the estimate converges to 3
+        // and the budget doubles against the initial 6x guess.
+        let held = 1u64 << 30;
+        let mut m = mem(64, 40);
+        m.available -= held * 3;
+        for _ in 0..20 {
+            p.update(Some(&m), held, held * 3);
+        }
+        assert!((p.expansion - 3.0).abs() < 0.05, "{}", p.expansion);
+        // The cap follows (within the 10% deadband of the last move).
+        let want = expect(64, 40, 0, 0.8, p.expansion) as f64;
+        assert!(
+            (p.cap as f64 / want - 1.0).abs() < 0.10,
+            "{} vs {want}",
+            p.cap
         );
-        assert_eq!(s.memory_budget, 8 << 30);
+        assert!(
+            p.reason.contains("× growth per source byte"),
+            "{}",
+            p.reason
+        );
+        // Wild ratios are clamped.
+        for _ in 0..40 {
+            p.update(Some(&m), held, held * 500);
+        }
+        assert!(p.expansion <= 64.0);
+        // Before any footprint is known, held bytes stand in at the estimate.
+        let mut q = MemoryPolicy::new(MemorySpec::Fraction(0.8), FLOOR, Some(&mem(64, 40)));
+        let d = q.update(Some(&mem(64, 30)), 2 << 30, 0).unwrap();
+        assert_eq!(d.cap, expect(64, 30, 2 << 30, 0.8, INITIAL_EXPANSION));
     }
 
     #[test]
     fn policy_follows_free_memory_and_backs_off_under_pressure() {
-        let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), FLOOR, Some(&mem(16, 8)));
+        let mut p = unit_growth(0.25, &mem(16, 8));
         let reserve = (16u64 << 30) / 5;
-        assert_eq!(p.cap, ((8u64 << 30) - reserve) / 4);
+        assert_eq!(p.cap, expect(16, 8, 0, 0.25, 1.0));
         assert!(!p.under_pressure);
         // A wobble under the 10% deadband is not reported; a bigger move is.
-        assert!(p.update(Some(&mem(16, 8)), 0).is_none());
+        assert!(p.update(Some(&mem(16, 8)), 0, 0).is_none());
+        // (On a box big enough that the floor is not what sets the cap.)
+        let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), FLOOR, Some(&mem(64, 40)));
         let cap0 = p.cap;
-        let mut wobble = mem(16, 8);
-        wobble.available += cap0 / 4; // target moves by 5% (a quarter of the 25% share)
-        assert!(p.update(Some(&wobble), 0).is_none());
-        wobble.available = (8u64 << 30) + cap0 * 3 / 5; // ~15%
-        assert!(p.update(Some(&wobble), 0).is_some());
-        let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), FLOOR, Some(&mem(16, 8)));
+        assert!(cap0 > FLOOR);
+        let mut wobble = mem(64, 40);
+        // Free memory that moves the target by this share of the cap.
+        let step = |k: f64| (cap0 as f64 * k * INITIAL_EXPANSION / 0.25) as u64;
+        wobble.available += step(0.05);
+        assert!(p.update(Some(&wobble), 0, 0).is_none());
+        wobble.available = (40u64 << 30) + step(0.15);
+        assert!(p.update(Some(&wobble), 0, 0).is_some());
+        let mut p = unit_growth(0.25, &mem(16, 8));
         // Plenty more free: the cap grows.
-        let d = p.update(Some(&mem(16, 12)), 0).unwrap();
-        assert!(d.cap > ((8u64 << 30) - reserve) / 4);
-        // What we hold is added back, so filling the budget does not shrink it.
+        let d = p.update(Some(&mem(16, 12)), 0, 0).unwrap();
+        assert!(d.cap > expect(16, 8, 0, 0.25, 1.0));
+        let _ = reserve;
+        // What we hold (at the growth estimate) is added back, so filling
+        // the budget does not shrink it.
         let held = 1u64 << 30;
-        let d = p.update(Some(&mem(16, 11)), held);
+        let mut fuller = mem(16, 12);
+        fuller.available -= held;
+        let d = p.update(Some(&fuller), held, 0);
         assert!(d.is_none(), "{d:?}");
         // Free memory falls below the 20% reserve: pressure, cap = held/2.
-        let d = p.update(Some(&mem(16, 3)), 2 << 30).unwrap();
+        let d = p.update(Some(&mem(16, 3)), 2 << 30, 0).unwrap();
         assert!(d.under_pressure);
         assert_eq!(d.cap, 1 << 30);
         assert!(d.reason.contains("pressure") && d.reason.contains("for the OS"));
         // Slightly above the reserve is not enough to leave (hysteresis).
-        assert!(p.update(Some(&mem(16, 3)), 2 << 30).is_none());
-        let d = p.update(Some(&mem(16, 4)), 2 << 30);
+        assert!(p.update(Some(&mem(16, 3)), 2 << 30, 0).is_none());
+        let d = p.update(Some(&mem(16, 4)), 2 << 30, 0);
         assert!(d.is_none() || d.as_ref().unwrap().under_pressure);
         // Comfortably above it: back to the fraction target.
-        let d = p.update(Some(&mem(16, 6)), 2 << 30).unwrap();
+        let d = p.update(Some(&mem(16, 6)), 2 << 30, 0).unwrap();
         assert!(!d.under_pressure);
         assert!(d.cap >= FLOOR);
         // Pressure never goes below the hard floor.
-        let d = p.update(Some(&mem(16, 1)), 0).unwrap();
+        let d = p.update(Some(&mem(16, 1)), 0, 0).unwrap();
         assert_eq!(d.cap, FLOOR);
         let mut q = MemoryPolicy::new(MemorySpec::Fraction(0.25), 1, Some(&mem(16, 10)));
-        assert_eq!(q.update(Some(&mem(16, 1)), 0).unwrap().cap, 64 << 20);
+        assert_eq!(q.update(Some(&mem(16, 1)), 0, 0).unwrap().cap, 64 << 20);
         // Our own growth counts too.
         let mut big = mem(16, 10);
         big.rss = Some(11 << 30);
         let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), FLOOR, Some(&mem(16, 10)));
-        let d = p.update(Some(&big), 0).unwrap();
+        let d = p.update(Some(&big), 0, 0).unwrap();
         assert!(d.under_pressure && d.reason.contains("this process"));
         // And a Linux PSI stall.
         let mut stall = mem(16, 10);
         stall.psi_some_avg10 = Some(25.0);
         let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), FLOOR, Some(&mem(16, 10)));
         assert!(p
-            .update(Some(&stall), 0)
+            .update(Some(&stall), 0, 0)
             .unwrap()
             .reason
             .contains("stalling"));
@@ -476,10 +587,10 @@ mod tests {
         bogus.rss = Some(1 << 20);
         let mut p = MemoryPolicy::new(MemorySpec::Fraction(0.25), 1, Some(&bogus));
         assert!(!p.under_pressure && p.reason.contains("unknown"));
-        assert!(p.update(Some(&bogus), 0).is_none());
+        assert!(p.update(Some(&bogus), 0, 0).is_none());
         // Fixed never moves.
         let mut p = MemoryPolicy::new(MemorySpec::Fixed(1 << 30), 1, Some(&mem(16, 10)));
-        assert!(p.update(Some(&mem(16, 1)), 5 << 30).is_none());
+        assert!(p.update(Some(&mem(16, 1)), 5 << 30, 0).is_none());
         assert_eq!(p.cap, 1 << 30);
     }
 

@@ -3210,6 +3210,25 @@ pub(crate) struct V2Prep {
     tally_nodes: Vec<(Node, i64)>,
 }
 
+impl V2Prep {
+    /// About how many bytes of heap this takes.
+    pub(crate) fn footprint(&self) -> usize {
+        use std::mem::size_of;
+        size_of::<Self>()
+            + self.terms.capacity() * size_of::<String>()
+            + self.terms.iter().map(String::capacity).sum::<usize>()
+            + self.stream.symbols.capacity() * size_of::<SymRec>()
+            + self.stream.tokens.capacity() * size_of::<TokRec>()
+            + self.postings.capacity() * size_of::<(u64, Vec<u8>)>()
+            + self
+                .postings
+                .iter()
+                .map(|(_, v)| v.capacity())
+                .sum::<usize>()
+            + self.tally_nodes.capacity() * size_of::<(Node, i64)>()
+    }
+}
+
 /// The file-local number of `t`, numbering new terms in first-use order.
 fn intern_local<'a>(t: &'a str, terms: &mut Vec<String>, local: &mut HashMap<&'a str, u64>) -> u64 {
     *local.entry(t).or_insert_with(|| {
