@@ -78,10 +78,13 @@ fn sample_dir(_dir: &Path) -> Option<DiskSample> {
 pub const DISK_RATIO: f64 = 10.0;
 /// The projection trusts the measured ratio once this much source is stored.
 const RATIO_CALIBRATE_MIN: u64 = 64 * MIB;
-/// Never let the volume drop below this (or 5% of it, whichever is more)
-/// unless told otherwise: the OS, logs and other programs need room too.
+/// Never let the volume drop below this (or 5% of it, whichever is more,
+/// up to `MIN_FREE_CEILING`) unless told otherwise: the OS, logs and other
+/// programs need room too, but a multi-terabyte volume does not need
+/// hundreds of gigabytes kept idle.
 pub const MIN_FREE_FLOOR: u64 = 2 * GIB;
 pub const MIN_FREE_FRACTION: f64 = 0.05;
+pub const MIN_FREE_CEILING: u64 = 32 * GIB;
 
 /// How much free space to keep: `Bytes` from `--min-free-disk 4G`,
 /// `Fraction` from `5%`, or the default rule.
@@ -106,7 +109,7 @@ impl MinFree {
             MinFree::Bytes(b) => b,
             MinFree::Fraction(f) => total.map_or(MIN_FREE_FLOOR, |t| (t as f64 * f) as u64),
             MinFree::Default => total.map_or(MIN_FREE_FLOOR, |t| {
-                MIN_FREE_FLOOR.max((t as f64 * MIN_FREE_FRACTION) as u64)
+                ((t as f64 * MIN_FREE_FRACTION) as u64).clamp(MIN_FREE_FLOOR, MIN_FREE_CEILING)
             }),
         }
     }
@@ -133,7 +136,7 @@ pub struct DiskPolicy {
     pub enforce: bool,
 }
 
-fn mb(b: u64) -> String {
+pub(crate) fn mb(b: u64) -> String {
     let m = b as f64 / MIB as f64;
     if m >= 1024.0 {
         format!("{:.1} GB", m / 1024.0)
@@ -231,6 +234,11 @@ mod tests {
     fn min_free_rules() {
         assert_eq!(MinFree::Default.resolve(Some(20 * GIB)), 2 * GIB, "floor");
         assert_eq!(MinFree::Default.resolve(Some(100 * GIB)), 5 * GIB, "5%");
+        assert_eq!(
+            MinFree::Default.resolve(Some(4000 * GIB)),
+            32 * GIB,
+            "ceiling"
+        );
         assert_eq!(MinFree::Default.resolve(None), 2 * GIB);
         assert_eq!(MinFree::Bytes(7).resolve(Some(100 * GIB)), 7);
         assert_eq!(MinFree::Fraction(0.1).resolve(Some(100 * GIB)), 10 * GIB);

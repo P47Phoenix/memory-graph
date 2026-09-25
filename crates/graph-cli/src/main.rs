@@ -133,7 +133,7 @@ enum Cmd {
         /// Never show live progress
         #[arg(long)]
         no_progress: bool,
-        /// Free space to keep on the database's volume, e.g. 4G or 5% (default: the larger of 2G and 5%).
+        /// Free space to keep on the database's volume, e.g. 4G or 5% (default: 5%, between 2G and 32G).
         /// The run refuses to start below it and stops cleanly, resumably, if it would go below it
         #[arg(long, value_parser = graph_cli::diskinfo::parse_min_free)]
         min_free_disk: Option<graph_cli::diskinfo::MinFree>,

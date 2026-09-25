@@ -783,9 +783,9 @@ pub fn index_dir_with(
         let min_free = o.min_free_disk.resolve(Some(s.total));
         if o.disk_check && s.available < min_free {
             bail!(
-                "refusing to index: only {} MB free on the database's volume (keeping {} MB); free space, lower --min-free-disk, or pass --no-disk-check",
-                s.available >> 20,
-                min_free >> 20
+                "refusing to index: only {} free on the database's volume (keeping {}); free space, lower --min-free-disk, or pass --no-disk-check",
+                diskinfo::mb(s.available),
+                diskinfo::mb(min_free)
             );
         }
     }

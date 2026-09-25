@@ -155,7 +155,8 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
                 "K" => 1024,
                 "M" => MIB,
                 "G" => 1024 * MIB,
-                _ => return Err(format!("unknown size unit in `{s}` (use K, M or G)")),
+                "T" => 1024 * 1024 * MIB,
+                _ => return Err(format!("unknown size unit in `{s}` (use K, M, G or T)")),
             };
             (&s[..i], mul)
         }
@@ -652,7 +653,8 @@ mod tests {
         assert_eq!(parse_size("64KiB"), Ok(64 * 1024));
         assert_eq!(parse_size("1000"), Ok(1000));
         assert!(parse_size("0").is_err());
-        assert!(parse_size("5T").is_err());
+        assert_eq!(parse_size("5T"), Ok(5 * 1024 * 1024 * MIB));
+        assert!(parse_size("5P").is_err());
         assert!(parse_size("x").is_err());
     }
 
