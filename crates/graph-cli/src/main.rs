@@ -460,7 +460,7 @@ fn run() -> Result<()> {
                 disk_probe: None,
                 min_free_disk: min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
                 disk_check: !no_disk_check,
-                chunk_bytes: cli.v2_chunk_bytes.unwrap_or(graph_cli::DEFAULT_CHUNK_BYTES),
+                chunk_bytes: cli.chunk_bytes.unwrap_or(graph_cli::DEFAULT_CHUNK_BYTES),
             },
             |db| open_for_indexing(db, overrides),
             &mut std::io::stdout().lock(),

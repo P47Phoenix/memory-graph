@@ -4,7 +4,7 @@
 //! must resume, skipping what was stored.
 use graph_cli::diskinfo::{DiskProbe, DiskSample, MinFree};
 use graph_cli::{index_dir, DirOpts};
-use graph_store::{open_store, Backend, Store};
+use graph_store::{open_store, Store};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -12,11 +12,7 @@ use std::sync::Arc;
 const GIB: u64 = 1 << 30;
 
 fn open(db: &Path) -> anyhow::Result<Box<dyn Store>> {
-    Ok(open_store(
-        Backend::RedbV2,
-        db,
-        graph_cli::shipped_extractors(),
-    )?)
+    Ok(open_store(db, graph_cli::shipped_extractors())?)
 }
 
 fn run(
@@ -57,14 +53,7 @@ fn run(
 
 fn describe(db: &Path) -> serde_json::Value {
     let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "--backend",
-            "v2",
-            "describe",
-            "--json",
-        ])
+        .args(["--db", db.to_str().unwrap(), "describe", "--json"])
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
