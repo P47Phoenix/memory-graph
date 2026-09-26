@@ -31,9 +31,9 @@ mod v2;
 pub use api::{detect_format, open_store, Page, PreparedFile, SnapshotStats, Store, StoreRead};
 pub use codec::{encode_posting, POSTING_BLOCK};
 pub(crate) use common::{
-    check_unchanged, commit_prepared, dec, describe_in, enc, fingerprint, kind_label, kind_matches,
-    name_key, open_failed, prepare_file, stored_fingerprint_matches, validate_spans, Scope, Tally,
-    CATALOG, CHILDREN, META, NAMES, NODES, SYMBOLS,
+    check_unchanged, commit_prepared, dec, describe_in, enc, fingerprint, grain_accepts,
+    kind_label, kind_matches, name_key, open_failed, prepare_file, stored_fingerprint_matches,
+    validate_spans, Scope, Tally, CATALOG, CHILDREN, META, NAMES, NODES, SYMBOLS,
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
 pub use v2::V2_SCHEMA_VERSION as SCHEMA_VERSION;
@@ -108,10 +108,24 @@ pub struct IndexOptions {
 #[serde(rename_all = "snake_case")]
 pub enum Grain {
     Token,
+    /// The nearest enclosing symbol of any kind.
     Symbol,
+    /// The nearest enclosing callable: generic kind `method` or `function`.
+    Method,
+    /// The nearest enclosing generic `type`, or a language's method container
+    /// that is not a type (a Rust `impl` block).
+    Class,
     File,
     Repo,
     Org,
+}
+
+impl Grain {
+    /// Grains whose rows are an enclosing symbol (symbol, method, class):
+    /// they read the symbol chain and take `Query::symbol_kind`.
+    pub fn is_symbolic(self) -> bool {
+        matches!(self, Self::Symbol | Self::Method | Self::Class)
+    }
 }
 
 impl std::str::FromStr for Grain {
@@ -120,10 +134,16 @@ impl std::str::FromStr for Grain {
         Ok(match s {
             "token" => Self::Token,
             "symbol" => Self::Symbol,
+            "method" => Self::Method,
+            "class" => Self::Class,
             "file" => Self::File,
             "repo" => Self::Repo,
             "org" => Self::Org,
-            _ => return Err(format!("unknown grain `{s}` (token|symbol|file|repo|org)")),
+            _ => {
+                return Err(format!(
+                    "unknown grain `{s}` (token|symbol|method|class|file|repo|org)"
+                ))
+            }
         })
     }
 }
@@ -136,8 +156,10 @@ pub struct Query {
     pub repo: Option<String>,
     pub class: Option<TokenClass>,
     pub grain: Grain,
-    /// Restrict the symbol grain to this kind: generic (`method`) or
-    /// language-specific (`struct`).
+    /// Restrict the symbol, method or class grain to this kind: generic
+    /// (`method`) or language-specific (`struct`). Combined with the grain's
+    /// own rule (`--grain class --symbol-kind struct` is the nearest
+    /// enclosing struct).
     pub symbol_kind: Option<String>,
     /// Keep at most this many rows (after deterministic ordering).
     pub limit: Option<usize>,
@@ -274,14 +296,17 @@ pub struct Hit {
     pub lang_kind: Option<String>,
     /// Token grain: the token's class.
     pub token_class: Option<TokenClass>,
-    /// Token grain: the token; symbol grain: the symbol.
+    /// Token grain: the token; symbol, method and class grains: the picked
+    /// symbol's full span.
     pub span: Option<Span>,
     /// Number of matching tokens contained in this node.
     pub count: usize,
-    /// Symbol grain only: the file has no symbols at all (e.g. fallback language).
+    /// Symbol, method and class grains only: the file has no symbols at all
+    /// (e.g. fallback language).
     pub no_symbols: bool,
-    /// Symbol grain only: the file has symbols, but none enclosing the match
-    /// (of the requested kind); rolled up to the file.
+    /// Symbol, method and class grains only: the file has symbols, but none
+    /// enclosing the match satisfies the grain (and the requested kind);
+    /// rolled up to the file.
     pub no_matching_symbol: bool,
 }
 

@@ -298,6 +298,100 @@ fn rust_symbols_grains_end_to_end() {
     assert_eq!(rows(&["--grain", "file"]).len(), 2);
     assert_eq!(rows(&["--grain", "repo"]).len(), 2);
     assert_eq!(rows(&["--grain", "org"]).len(), 2);
+
+    // Method and class grains, across languages (c.js sorts before lib.rs).
+    let js = d.path().join("c.js");
+    std::fs::write(&js, "class C { m() { foo(); } }\n").unwrap();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index-file",
+        "--org",
+        "o1",
+        "--repo",
+        "r",
+        js.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let summary = |r: &serde_json::Value| {
+        (
+            // index-file stores the path as given: compare the file name
+            std::path::Path::new(r["file"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            r["symbol"].as_str().map(String::from),
+            r["count"].as_u64().unwrap(),
+            r["lang_kind"].as_str().map(String::from),
+        )
+    };
+    let m = rows(&["--grain", "method"]);
+    let got: Vec<_> = m.iter().map(summary).collect();
+    assert_eq!(
+        got,
+        [
+            ("c.js".into(), Some("C::m".into()), 1, Some("method".into())),
+            ("lib.rs".into(), Some("S::a".into()), 2, Some("fn".into())),
+            ("lib.rs".into(), Some("S::b".into()), 1, Some("fn".into())),
+            ("lib.rs".into(), Some("free".into()), 1, Some("fn".into())),
+            ("m.zig".into(), None, 1, None),
+        ]
+    );
+    assert_eq!(m[0]["grain"], "method");
+    assert_eq!(m[4]["no_symbols"], true);
+    // The whole method, not just its first token.
+    assert_eq!(
+        (
+            m[1]["span"]["start_line"].as_u64(),
+            m[1]["span"]["end_line"].as_u64()
+        ),
+        (Some(3), Some(3))
+    );
+    assert_eq!(m[1]["span"]["end_col"], 34);
+    let c = rows(&["--grain", "class"]);
+    let got: Vec<_> = c.iter().map(summary).collect();
+    assert_eq!(
+        got,
+        [
+            ("c.js".into(), Some("C".into()), 1, Some("class".into())),
+            // free()'s foo has no enclosing type: rolled to the file
+            ("lib.rs".into(), None, 1, None),
+            // the impl block is the class container of a and b
+            ("lib.rs".into(), Some("S".into()), 3, Some("impl".into())),
+            ("m.zig".into(), None, 1, None),
+        ]
+    );
+    assert_eq!(c[0]["grain"], "class");
+    assert_eq!(c[1]["no_matching_symbol"], true);
+    assert_eq!(c[2]["symbol_kind"], "other");
+    assert_eq!(c[2]["span"]["start_line"], 2);
+    assert_eq!(c[2]["span"]["end_line"], 5);
+    // --symbol-kind narrows within the grain; other grains still refuse it.
+    let n = rows(&["--grain", "class", "--symbol-kind", "class"]);
+    assert_eq!(n.iter().filter(|r| r["symbol"].is_string()).count(), 1);
+    let (ok, _, err) = run(&[
+        "--db",
+        &db,
+        "search",
+        "foo",
+        "--grain",
+        "file",
+        "--symbol-kind",
+        "method",
+    ]);
+    assert!(
+        !ok && err.contains("--grain symbol, method or class"),
+        "{err}"
+    );
+    // Text mode shows the definition's full span, start to end.
+    let (ok, out, _) = run(&["--db", &db, "search", "foo", "--grain", "method"]);
+    assert!(
+        ok && out.contains("lib.rs:3:5-3:34\trust\tS::a\thits=2"),
+        "{out}"
+    );
+    let (_, out, _) = run(&["--db", &db, "search", "foo"]);
+    assert!(!out.contains("-3:"), "token rows keep start only: {out}");
     // Syntax error falls back and is reported.
     let bad = d.path().join("bad.rs");
     std::fs::write(&bad, "fn foo( {").unwrap();
@@ -902,6 +996,92 @@ mod prune_and_limits {
         );
         let (ok, _, err) = idx(&db, "r", &["--max-file-size", "0"], &root);
         assert!(!ok && err.contains("--max-file-size"), "{err}");
+    }
+
+    /// No default cap: a file over the old 8 MiB default indexes; the flag
+    /// still opts in to a limit.
+    #[test]
+    fn no_default_file_size_limit() {
+        let (_d, root, db) = setup(&[]);
+        let mut big = vec![b'a'; (8 << 20) + 1];
+        big.push(b'\n');
+        std::fs::write(root.join("big.txt"), &big).unwrap();
+        let (ok, out, err) = idx(&db, "r", &["--json"], &root);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["files"], 1, "{v}");
+        assert_eq!(v["tokens"], 1, "{v}");
+        assert!(v["skipped_by_reason"]["too large"].is_null(), "{v}");
+        let (ok, out, err) = idx(&db, "r2", &["--max-file-size", "8388608", "--json"], &root);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["files"], 0, "{v}");
+        assert_eq!(
+            v["skipped_by_reason"]["too large"],
+            serde_json::json!(["big.txt"])
+        );
+    }
+
+    /// A file the store cannot hold (spans are 32-bit) is skipped from its
+    /// metadata, without being read, and named with the reason. Sparse, so
+    /// it costs no disk; only where `set_len` makes a sparse file cheaply.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn over_4gib_is_skipped_by_reason() {
+        let (_d, root, db) = setup(&["a.txt"]);
+        let huge = std::fs::File::create(root.join("huge.txt")).unwrap();
+        if huge.set_len((u32::MAX as u64) + 1).is_err() {
+            eprintln!("skipping: cannot create a sparse 4 GiB file here");
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let (ok, out, err) = idx(&db, "r", &["--json"], &root);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["files"], 1, "{v}");
+        assert_eq!(
+            v["skipped_by_reason"]["larger than 4 GiB (span limit)"],
+            serde_json::json!(["huge.txt"]),
+            "{v}"
+        );
+        assert!(t0.elapsed().as_secs() < 30, "nothing of it was read");
+    }
+
+    /// `--deterministic` no longer needs a chunk sized for a maximum file:
+    /// one fixed batch is enough, and a file larger than a batch is a batch
+    /// of its own, admitted even on a budget smaller than the file. The
+    /// content equals the adaptive run's.
+    #[test]
+    fn deterministic_takes_any_file_size() {
+        let (_d, root, db) = setup(&["a.txt", "b.txt"]);
+        let mut big = vec![b'z'; 40 << 20];
+        big.push(b'\n');
+        std::fs::write(root.join("m_big.txt"), &big).unwrap();
+        std::fs::write(root.join("z.txt"), "foo\n").unwrap();
+        let (ok, _, err) = run(&[
+            "--db",
+            &db,
+            "--chunk-bytes",
+            "33554432",
+            "index",
+            "--deterministic",
+            "--memory",
+            "64K",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--json",
+            root.to_str().unwrap(),
+        ]);
+        assert!(ok, "{err}");
+        let (ok, det, err) = run(&["--db", &db, "export"]);
+        assert!(ok, "{err}");
+        let db2 = format!("{db}2");
+        let (ok, _, err) = idx(&db2, "r", &["--json"], &root);
+        assert!(ok, "{err}");
+        let (_, ada, _) = run(&["--db", &db2, "export"]);
+        assert!(det == ada, "deterministic and adaptive exports differ");
     }
 
     #[test]

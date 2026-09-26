@@ -41,11 +41,11 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
 
 ### Core data model
 
-Nodes: `Org → Repo → File → Symbol → Token`, each with an exact byte/line/col span. A File's identity is a fingerprint (SHA-256 of source bytes + language + extractor version + store format version) — re-indexing an unchanged file is a no-op except for refreshing `origin`. Search supports a `--grain` roll-up (`token|symbol|file|repo|org`) with language/kind filters and `--json` output; `describe` reports which languages and symbol kinds are actually present per repo.
+Nodes: `Org → Repo → File → Symbol → Token`, each with an exact byte/line/col span. A File's identity is a fingerprint (SHA-256 of source bytes + language + extractor version + store format version) — re-indexing an unchanged file is a no-op except for refreshing `origin`. Search supports a `--grain` roll-up (`token|symbol|method|class|file|repo|org`; the symbolic grains return the nearest enclosing symbol / callable / type-or-impl with its full span) with language/kind filters and `--json` output; `describe` reports which languages and symbol kinds are actually present per repo.
 
 ### Key invariants to preserve
 
-- **Language-agnosticism**: no language-specific types or logic outside an `Extractor` implementation (the `graph-lang-*` crates). The fallback tokenizer must keep working for any language with no extractor registered.
+- **Language-agnosticism**: no language-specific types or logic outside an `Extractor` implementation (the `graph-lang-*` crates). The fallback tokenizer must keep working for any language with no extractor registered. One documented exception: the `class` search grain treats the language-specific kind `impl` (a Rust impl block, generic kind `other`) as a class container (`CLASS_CONTAINER_LANG_KINDS` in `graph-store/src/common.rs`), because methods nest in the impl, not in the struct.
 - **Exact spans**: every token/symbol's text, byte range, line and column must match the source exactly — this is property-tested and is the basis of the corpus test.
 - **Pure Rust**: `scripts/check-no-c-deps.py` fails CI on any dependency with a `links` key or a C/C++ build script. A `-sys` crate is fine as long as it's pure Rust (it keys on build mechanism, not crate naming).
 - **On-disk format is versioned**: any change to stored bytes bumps `V2_SCHEMA_VERSION` (or a component's `derived_version`) and either upgrades on open or refuses with `LegacyFormat`/`SchemaMismatch` without writing; golden-byte tests in `codec.rs` enforce it.

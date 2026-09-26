@@ -23,10 +23,10 @@ use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
 use crate::{check_unchanged, dec, describe_in, enc, SnapshotStats, Store, StoreRead};
 use crate::{commit_prepared, prepare_file, stored_fingerprint_matches, PreparedFile};
 use crate::{
-    kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile, Grain, Hit,
-    IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit, SymbolQuery, Tally,
-    CATALOG, CATALOG_VERSION, CHILDREN, MAX_SOURCE_BYTES, META, NAMES, NODES, ORIGIN_DIRECTORY,
-    SYMBOLS,
+    grain_accepts, kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile,
+    Grain, Hit, IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit,
+    SymbolQuery, Tally, CATALOG, CATALOG_VERSION, CHILDREN, MAX_SOURCE_BYTES, META, NAMES, NODES,
+    ORIGIN_DIRECTORY, SYMBOLS,
 };
 use graph_core::{
     normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, SymbolKind, TokenClass,
@@ -1550,8 +1550,8 @@ impl R {
             if matches.is_empty() {
                 continue;
             }
-            // Only token and symbol grain read the enclosing symbols.
-            let need_chain = matches!(q.grain, Grain::Token | Grain::Symbol);
+            // Only the token and symbolic grains read the enclosing symbols.
+            let need_chain = matches!(q.grain, Grain::Token) || q.grain.is_symbolic();
             let syms = if need_chain {
                 lazy.symbols()?
             } else {
@@ -1595,9 +1595,13 @@ impl R {
                             sub_id(TAG_TOK, fid, ord),
                         );
                     }
-                    Grain::Symbol => {
+                    Grain::Symbol | Grain::Method | Grain::Class => {
+                        // Innermost enclosing symbol the grain accepts (any
+                        // for symbol, a callable for method, a type or impl
+                        // for class), narrowed by `symbol_kind` when given.
                         let pick = chain.iter().position(|s| {
-                            q.symbol_kind.as_deref().is_none_or(|k| kind_matches(s, k))
+                            grain_accepts(q.grain, s)
+                                && q.symbol_kind.as_deref().is_none_or(|k| kind_matches(s, k))
                         });
                         match pick {
                             Some(i) => {

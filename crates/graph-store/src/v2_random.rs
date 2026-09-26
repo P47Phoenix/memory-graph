@@ -73,6 +73,8 @@ fn all_queries() -> Vec<Query> {
         for grain in [
             Grain::Token,
             Grain::Symbol,
+            Grain::Method,
+            Grain::Class,
             Grain::File,
             Grain::Repo,
             Grain::Org,

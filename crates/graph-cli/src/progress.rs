@@ -21,6 +21,8 @@ pub struct Board {
     /// Entries found by the walk so far (files and walk-time skips).
     pub found: AtomicU64,
     pub found_bytes: AtomicU64,
+    /// Largest file admitted so far (bytes): sizes a deterministic group.
+    pub largest_file: AtomicU64,
     pub walk_done: AtomicBool,
     /// Entries fully handled (committed, skipped or failed).
     pub handled: AtomicU64,
@@ -102,6 +104,7 @@ impl Board {
             sizing,
             found: AtomicU64::new(0),
             found_bytes: AtomicU64::new(0),
+            largest_file: AtomicU64::new(0),
             walk_done: AtomicBool::new(false),
             handled: AtomicU64::new(0),
             handled_bytes: AtomicU64::new(0),

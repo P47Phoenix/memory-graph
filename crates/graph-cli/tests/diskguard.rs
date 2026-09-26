@@ -40,7 +40,7 @@ fn run_with(
             repo: "r",
             dir,
             json: true,
-            max_file_size: 1 << 20,
+            max_file_size: Some(1 << 20),
             prune: false,
             force: false,
             reindex: false,

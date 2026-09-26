@@ -291,11 +291,13 @@ impl Budget {
         }
     }
 
-    /// Wait until `n` bytes fit (or nothing else is in flight). Returns false
-    /// if `cancel` was set meanwhile.
-    pub fn acquire(&self, n: u64, cancel: &AtomicBool) -> bool {
+    /// Wait until `n` bytes fit, or at most `slack` bytes are in flight (0:
+    /// nothing else in flight), so an item of any size goes through alone
+    /// or on top of at most `slack`. Returns false if `cancel` was set
+    /// meanwhile.
+    pub fn acquire(&self, n: u64, slack: u64, cancel: &AtomicBool) -> bool {
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
-        while *used > 0 && *used + n > self.cap.load(Relaxed) {
+        while *used > slack && *used + n > self.cap.load(Relaxed) {
             if cancel.load(Relaxed) {
                 return false;
             }
@@ -409,12 +411,12 @@ mod tests {
     fn budget_bounds_bytes_in_flight() {
         let b = std::sync::Arc::new(Budget::new(100));
         let cancel = AtomicBool::new(false);
-        assert!(b.acquire(60, &cancel));
-        assert!(b.acquire(40, &cancel));
+        assert!(b.acquire(60, 0, &cancel));
+        assert!(b.acquire(40, 0, &cancel));
         let b2 = b.clone();
         let t = std::thread::spawn(move || {
             let c = AtomicBool::new(false);
-            b2.acquire(30, &c)
+            b2.acquire(30, 0, &c)
         });
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(b.used(), 100, "third acquire waits");
@@ -424,27 +426,48 @@ mod tests {
         assert!(b.peak() <= 100);
         // An item bigger than the budget goes through alone.
         b.release(70);
-        assert!(b.acquire(500, &cancel));
+        assert!(b.acquire(500, 0, &cancel));
         // Cancel wakes a waiter.
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (b2, c2) = (b.clone(), cancel.clone());
-        let t = std::thread::spawn(move || b2.acquire(1, &c2));
+        let t = std::thread::spawn(move || b2.acquire(1, 0, &c2));
         cancel.store(true, Relaxed);
         b.wake_all();
         assert!(!t.join().unwrap());
     }
 
     #[test]
+    fn slack_admits_any_size_on_top_of_a_small_load() {
+        let b = std::sync::Arc::new(Budget::new(100));
+        let cancel = AtomicBool::new(false);
+        // Up to `slack` in flight: an item of any size goes through.
+        assert!(b.acquire(30, 32, &cancel));
+        assert!(b.acquire(500, 32, &cancel));
+        assert_eq!(b.used(), 530);
+        // Over `slack` and over the cap: waits until enough is released.
+        let b2 = b.clone();
+        let t = std::thread::spawn(move || {
+            let c = AtomicBool::new(false);
+            b2.acquire(1, 32, &c)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!t.is_finished(), "waits while over slack and cap");
+        b.release(500);
+        assert!(t.join().unwrap());
+        assert_eq!(b.used(), 31);
+    }
+
+    #[test]
     fn cap_moves_and_pressure_is_tracked() {
         let b = std::sync::Arc::new(Budget::new(100));
         let cancel = AtomicBool::new(false);
-        assert!(b.acquire(80, &cancel));
+        assert!(b.acquire(80, 0, &cancel));
         // Lowered below what is held: a new acquire waits...
         b.set_cap(50, "pressure: test", true);
         let b2 = b.clone();
         let t = std::thread::spawn(move || {
             let c = AtomicBool::new(false);
-            b2.acquire(10, &c)
+            b2.acquire(10, 0, &c)
         });
         std::thread::sleep(Duration::from_millis(30));
         assert!(!t.is_finished(), "waits while over the lowered cap");

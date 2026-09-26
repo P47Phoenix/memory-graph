@@ -141,7 +141,13 @@ fn zero_length_and_equal_span_symbols_are_configuration_independent() {
     for s in [&a, &b] {
         s.ingest_file("o", "r", "x.rs", "rust", &ex).unwrap();
     }
-    for grain in [Grain::Token, Grain::Symbol, Grain::File] {
+    for grain in [
+        Grain::Token,
+        Grain::Symbol,
+        Grain::Method,
+        Grain::Class,
+        Grain::File,
+    ] {
         for kind in [None, Some("method"), Some("function")] {
             let mut q = Query::new("foo");
             q.grain = grain;

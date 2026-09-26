@@ -1,5 +1,6 @@
 //! `--deterministic` needs one fixed batch per transaction, so a chunk size
-//! smaller than a batch plus one file is refused up front.
+//! smaller than a batch is refused up front (a file larger than a batch is
+//! a batch of its own, so no file term is needed).
 use std::process::Command;
 
 #[test]
