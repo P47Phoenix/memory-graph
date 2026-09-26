@@ -67,7 +67,7 @@ The three levels above a symbol. A **file** is one source file. A **repo** (repo
 An operating-system call that forces data out of memory onto the disk, so it survives a power cut. Used in: [ADR 0003](adr/0003-data-model.md).
 
 ## Grain / roll-up
-The **grain** is the level you count at: token, symbol, file, repo or org. A **roll-up** adds up hits from small things into bigger things. Example: "the word `foo` appears 40 times in this repo" is a roll-up to repo grain. Used in: [ADR 0003](adr/0003-data-model.md), [learnings](learnings.md).
+The **grain** is the level you count at: token, symbol (the nearest enclosing symbol), method (the nearest enclosing method or function), class (the nearest enclosing type, or a Rust impl block), file, repo or org. A **roll-up** adds up hits from small things into bigger things. Example: "the word `foo` appears 40 times in this repo" is a roll-up to repo grain. Used in: [ADR 0003](adr/0003-data-model.md), [learnings](learnings.md).
 
 ## Graph / node / parent
 A **graph** is a set of things (**nodes**) plus links between them. Today the nodes are org, repo, file, symbol and token (ADR 0003's v2 proposal stops storing tokens as nodes). A node's **parent** is the thing that contains it: a file's parent is its repo. Like a family tree. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0003](adr/0003-data-model.md).

@@ -91,7 +91,8 @@ enum Cmd {
         json: bool,
         /// Skip files larger than this many bytes (lockfiles, minified bundles, dumps). Off by default:
         /// the only built-in limit is the store's 4 GiB span limit. A file is held in memory whole while
-        /// it is parsed, so a 1 GB file needs several GB of RAM; the memory budget admits such a file alone
+        /// it is parsed and its parse takes about 25x its size (a 1 GB file about 25 GB); the memory
+        /// budget admits such a file alone
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         max_file_size: Option<u64>,
         /// Remove files of this repo that were not indexed in this run (deleted, renamed, newly ignored or
@@ -403,6 +404,11 @@ fn run() -> Result<()> {
             reindex,
             path,
         } => {
+            if let Ok(m) = std::fs::metadata(&path) {
+                if let Some(reason) = graph_cli::size_skip_reason(m.len(), None) {
+                    bail!("`{}` is {reason}", path.display());
+                }
+            }
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("cannot read `{}`", path.display()))?;
             let path_str = path
@@ -639,6 +645,27 @@ fn run() -> Result<()> {
         } => {
             if symbol_kind.is_some() && !grain.is_symbolic() {
                 bail!("--symbol-kind requires --grain symbol, method or class");
+            }
+            // A generic kind the grain can never accept would only ever give
+            // `no_matching_symbol` rows: refuse it, like a typo. Language-
+            // specific kinds are checked against `describe` below.
+            if let Some(k) = symbol_kind.as_deref() {
+                use graph_core::SymbolKind as K;
+                if let Ok(g) = k.parse::<K>() {
+                    let (fits, allowed) = match grain {
+                        Grain::Method => {
+                            (matches!(g, K::Method | K::Function), "method or function")
+                        }
+                        Grain::Class => (matches!(g, K::Type | K::Other), "type or other"),
+                        _ => (true, ""),
+                    };
+                    if !fits {
+                        bail!(
+                            "--symbol-kind {k} can never be a --grain {} row (generic kinds there: {allowed}); use --grain symbol for any kind",
+                            format!("{grain:?}").to_lowercase()
+                        );
+                    }
+                }
             }
             let store = open_existing(&cli.db, overrides)?;
             validate_filters(

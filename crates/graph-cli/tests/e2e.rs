@@ -367,9 +367,38 @@ fn rust_symbols_grains_end_to_end() {
     assert_eq!(c[2]["symbol_kind"], "other");
     assert_eq!(c[2]["span"]["start_line"], 2);
     assert_eq!(c[2]["span"]["end_line"], 5);
-    // --symbol-kind narrows within the grain; other grains still refuse it.
+    // --symbol-kind narrows within the grain; other grains still refuse it,
+    // and a generic kind the grain can never hold is refused too.
     let n = rows(&["--grain", "class", "--symbol-kind", "class"]);
     assert_eq!(n.iter().filter(|r| r["symbol"].is_string()).count(), 1);
+    let (ok, _, err) = run(&[
+        "--db",
+        &db,
+        "search",
+        "foo",
+        "--grain",
+        "class",
+        "--symbol-kind",
+        "method",
+    ]);
+    assert!(
+        !ok && err.contains("can never be a --grain class row"),
+        "{err}"
+    );
+    let (ok, _, err) = run(&[
+        "--db",
+        &db,
+        "search",
+        "foo",
+        "--grain",
+        "method",
+        "--symbol-kind",
+        "type",
+    ]);
+    assert!(
+        !ok && err.contains("can never be a --grain method row"),
+        "{err}"
+    );
     let (ok, _, err) = run(&[
         "--db",
         &db,
@@ -1082,6 +1111,50 @@ mod prune_and_limits {
         assert!(ok, "{err}");
         let (_, ada, _) = run(&["--db", &db2, "export"]);
         assert!(det == ada, "deterministic and adaptive exports differ");
+    }
+
+    /// A large file skipped at read time (a binary) must not pin the budget
+    /// while a small deterministic batch waits for the next file: with the
+    /// skipped bytes held until the flush, admission and the writer waited
+    /// on each other for ever.
+    #[test]
+    fn deterministic_survives_a_large_skipped_file() {
+        let (_d, root, db) = setup(&["a.txt", "z.txt"]);
+        std::fs::write(root.join("m_blob.bin"), vec![0u8; 40 << 20]).unwrap();
+        let t = std::thread::spawn({
+            let (db, root) = (db.clone(), root.clone());
+            move || {
+                run(&[
+                    "--db",
+                    &db,
+                    "--chunk-bytes",
+                    "33554432",
+                    "index",
+                    "--deterministic",
+                    "--memory",
+                    "64K",
+                    "--org",
+                    "o",
+                    "--repo",
+                    "r",
+                    "--json",
+                    root.to_str().unwrap(),
+                ])
+            }
+        });
+        let t0 = std::time::Instant::now();
+        while !t.is_finished() {
+            assert!(t0.elapsed().as_secs() < 120, "index hung");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (ok, out, err) = t.join().unwrap();
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["files"], 2, "{v}");
+        assert_eq!(
+            v["skipped_by_reason"]["binary"],
+            serde_json::json!(["m_blob.bin"])
+        );
     }
 
     #[test]

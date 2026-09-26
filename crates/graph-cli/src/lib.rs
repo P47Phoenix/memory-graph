@@ -206,6 +206,8 @@ fn flush_batch(
                 .entry("not valid UTF-8".into())
                 .or_default()
                 .push(rel),
+            // The store's only `TooLarge` cause is `MAX_SOURCE_BYTES`, the
+            // span limit; the walk normally catches such a file earlier.
             Err(graph_store::StoreError::TooLarge(_)) => t
                 .skipped
                 .entry(TOO_LARGE_FOR_SPANS.into())
@@ -281,6 +283,13 @@ fn read_and_prepare(
             unreadable,
         })
     };
+    // The walk already skipped over-limit files; a file that grew since is
+    // caught here from fresh metadata, before anything of it is read.
+    if let Ok(m) = std::fs::metadata(path) {
+        if let Some(reason) = size_skip_reason(m.len(), o.max_file_size) {
+            return skip(reason, false);
+        }
+    }
     let mut bytes = Vec::new();
     let read = board.parse.busy(k, "reading", rel, || {
         std::fs::File::open(path).and_then(|f| {
@@ -291,7 +300,7 @@ fn read_and_prepare(
     if read.is_err() {
         return skip("unreadable", true);
     }
-    // The walk already skipped over-limit files; this catches one that grew.
+    // ... and one that grew between the check and the read.
     if let Some(reason) = size_skip_reason(bytes.len() as u64, o.max_file_size) {
         return skip(reason, false);
     }
@@ -728,7 +737,6 @@ fn commit_all(
                 break;
             }
             next += 1;
-            held += size;
             held_fp += fp;
             match oc? {
                 Outcome::Skip {
@@ -736,13 +744,28 @@ fn commit_all(
                     what,
                     unreadable,
                 } => {
+                    // Nothing of it is kept: give its walk-time bytes back
+                    // now. Held until the batch flushed, a large file skipped
+                    // at read time (a binary) would pin the budget while a
+                    // small deterministic batch waits for the next file,
+                    // which admission could then never let through.
+                    board.budget.release(size);
+                    board.handled_bytes.fetch_add(size, Relaxed);
                     c.walk_errors |= unreadable;
                     c.skipped.entry(reason.into()).or_default().push(what);
                     board.skipped.fetch_add(1, Relaxed);
                     board.handled.fetch_add(1, Relaxed);
                 }
                 Outcome::Prepared(rel, p) => {
-                    held_prepared += size;
+                    // Hold what was read, at most what admission charged; a
+                    // file that shrank since the walk gives the rest back.
+                    let len = (p.bytes_len() as u64).min(size);
+                    if size > len {
+                        board.budget.release(size - len);
+                        board.handled_bytes.fetch_add(size - len, Relaxed);
+                    }
+                    held += len;
+                    held_prepared += len;
                     pending_bytes += p.bytes_len() as u64;
                     pending.push((rel, p));
                 }
