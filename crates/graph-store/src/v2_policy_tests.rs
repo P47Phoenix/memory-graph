@@ -124,7 +124,14 @@ fn very_long_terms_search_identically_across_configurations() {
         s.ingest_file("o", "r", "again.txt", "text", &ex).unwrap();
     }
     for t in texts.iter().map(String::as_str).chain(["missing"]) {
-        for grain in [Grain::Token, Grain::Symbol, Grain::File, Grain::Repo] {
+        for grain in [
+            Grain::Token,
+            Grain::Symbol,
+            Grain::Method,
+            Grain::Class,
+            Grain::File,
+            Grain::Repo,
+        ] {
             let mut q = Query::new(t);
             q.grain = grain;
             let (ha, hb) = (a.search(&q).unwrap(), b.search(&q).unwrap());

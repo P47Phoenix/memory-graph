@@ -89,9 +89,12 @@ enum Cmd {
         repo: String,
         #[arg(long)]
         json: bool,
-        /// Skip files larger than this many bytes (lockfiles, minified bundles, dumps)
-        #[arg(long, default_value_t = 8 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..))]
-        max_file_size: u64,
+        /// Skip files larger than this many bytes (lockfiles, minified bundles, dumps). Off by default:
+        /// the only built-in limit is the store's 4 GiB span limit. A file is held in memory whole while
+        /// it is parsed and its parse takes about 25x its size (a 1 GB file about 25 GB); the memory
+        /// budget admits such a file alone
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_file_size: Option<u64>,
         /// Remove files of this repo that were not indexed in this run (deleted, renamed, newly ignored or
         /// skipped). Only files last indexed by a directory run are considered: `index-file` clears that
         /// mark, and a later directory run sets it again. Skipped when some paths were unreadable; refused
@@ -115,8 +118,9 @@ enum Cmd {
         /// left for the OS. Also read from MEMORY_GRAPH_MEMORY
         #[arg(long, env = "MEMORY_GRAPH_MEMORY", value_parser = graph_cli::sysinfo::parse_memory_spec)]
         memory: Option<graph_cli::sysinfo::MemorySpec>,
-        /// Commit fixed batches (256 files / 32 MiB) instead of everything ready, so the database file is
-        /// byte-for-byte reproducible on any machine (slower when the writer is the bottleneck)
+        /// Commit fixed batches (256 files / 32 MiB; a file that does not fit is a batch of its own) instead
+        /// of everything ready, so the database file is byte-for-byte reproducible on any machine (slower
+        /// when the writer is the bottleneck)
         #[arg(long)]
         deterministic: bool,
         /// Print how busy each stage (walk, parse, commit) was, and the bottleneck, on stderr at the end
@@ -230,11 +234,13 @@ enum Cmd {
         /// Token class (NOT a symbol kind; see --symbol-kind): identifier, keyword, literal, operator, punctuation, comment, other
         #[arg(long)]
         kind: Option<TokenClass>,
-        /// Level results are rolled up to: token, symbol, file, repo or org
+        /// Level results are rolled up to: token, symbol (nearest enclosing symbol), method
+        /// (nearest enclosing method or function), class (nearest enclosing type, or a Rust impl
+        /// block), file, repo or org. Symbol, method and class rows carry that symbol's full span
         #[arg(long, default_value = "token")]
         grain: Grain,
-        /// With --grain symbol: only symbols of this symbol kind (case-insensitive; generic or
-        /// language-specific; see `describe`)
+        /// With --grain symbol, method or class: only symbols of this symbol kind
+        /// (case-insensitive; generic or language-specific; see `describe`)
         #[arg(long)]
         symbol_kind: Option<String>,
         /// Show at most this many rows (ordered by org, repo, file, position)
@@ -398,6 +404,11 @@ fn run() -> Result<()> {
             reindex,
             path,
         } => {
+            if let Ok(m) = std::fs::metadata(&path) {
+                if let Some(reason) = graph_cli::size_skip_reason(m.len(), None) {
+                    bail!("`{}` is {reason}", path.display());
+                }
+            }
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("cannot read `{}`", path.display()))?;
             let path_str = path
@@ -632,8 +643,29 @@ fn run() -> Result<()> {
             offset,
             json,
         } => {
-            if symbol_kind.is_some() && grain != Grain::Symbol {
-                bail!("--symbol-kind requires --grain symbol");
+            if symbol_kind.is_some() && !grain.is_symbolic() {
+                bail!("--symbol-kind requires --grain symbol, method or class");
+            }
+            // A generic kind the grain can never accept would only ever give
+            // `no_matching_symbol` rows: refuse it, like a typo. Language-
+            // specific kinds are checked against `describe` below.
+            if let Some(k) = symbol_kind.as_deref() {
+                use graph_core::SymbolKind as K;
+                if let Ok(g) = k.parse::<K>() {
+                    let (fits, allowed) = match grain {
+                        Grain::Method => {
+                            (matches!(g, K::Method | K::Function), "method or function")
+                        }
+                        Grain::Class => (matches!(g, K::Type | K::Other), "type or other"),
+                        _ => (true, ""),
+                    };
+                    if !fits {
+                        bail!(
+                            "--symbol-kind {k} can never be a --grain {} row (generic kinds there: {allowed}); use --grain symbol for any kind",
+                            format!("{grain:?}").to_lowercase()
+                        );
+                    }
+                }
             }
             let store = open_existing(&cli.db, overrides)?;
             validate_filters(
@@ -654,9 +686,19 @@ fn run() -> Result<()> {
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
+                    // A symbol row is a whole definition: show where it ends too.
                     let loc = h
                         .span
-                        .map(|s| format!(":{}:{}", s.start_line, s.start_col))
+                        .map(|s| {
+                            if h.grain.is_symbolic() {
+                                format!(
+                                    ":{}:{}-{}:{}",
+                                    s.start_line, s.start_col, s.end_line, s.end_col
+                                )
+                            } else {
+                                format!(":{}:{}", s.start_line, s.start_col)
+                            }
+                        })
                         .unwrap_or_default();
                     let path = [Some(h.org.as_str()), h.repo.as_deref(), h.file.as_deref()]
                         .into_iter()

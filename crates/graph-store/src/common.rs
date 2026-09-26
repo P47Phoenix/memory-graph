@@ -322,6 +322,32 @@ pub(crate) fn commit_prepared(
 
 /// A symbol matches a kind name if it is its generic kind or its
 /// language-specific kind string (ASCII case-insensitive, like `--language`).
+/// Language-specific kinds that contain methods without being a generic
+/// `type`: a Rust `impl` block (generic `other`). The one language-specific
+/// name the store knows; the alternative (the Rust extractor calling an impl
+/// a type) would change `symbols --kind` results and force a re-index.
+const CLASS_CONTAINER_LANG_KINDS: &[&str] = &["impl"];
+
+/// Whether `sym` can be a row of `grain`: any symbol for `Symbol`, a callable
+/// (`method` or `function`) for `Method`, a `type` or a class container for
+/// `Class`. Never true for the token, file, repo and org grains.
+pub(crate) fn grain_accepts(grain: crate::Grain, sym: &Node) -> bool {
+    match grain {
+        crate::Grain::Symbol => true,
+        crate::Grain::Method => matches!(
+            sym.symbol_kind,
+            Some(SymbolKind::Method | SymbolKind::Function)
+        ),
+        crate::Grain::Class => {
+            sym.symbol_kind == Some(SymbolKind::Type)
+                || CLASS_CONTAINER_LANG_KINDS
+                    .iter()
+                    .any(|k| kind_matches(sym, k))
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn kind_matches(sym: &Node, kind: &str) -> bool {
     sym.symbol_kind
         .unwrap_or(SymbolKind::Other)

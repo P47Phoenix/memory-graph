@@ -207,6 +207,8 @@ fn main() {
         for (g, gn) in [
             (Grain::Token, "token"),
             (Grain::Symbol, "symbol"),
+            (Grain::Method, "method"),
+            (Grain::Class, "class"),
             (Grain::File, "file"),
             (Grain::Repo, "repo"),
             (Grain::Org, "org"),

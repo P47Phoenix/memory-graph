@@ -251,7 +251,7 @@ Non-UTF-8 or oversized files give a per-file error and are not stored; a file wh
 
 ## 8. Search with roll-up by grain
 
-**Built today for v1, proposed for v2.** A search by exact text can report hits at token, symbol, file, repo or org grain (a "roll-up" groups hits by ancestor and counts them). In v1 each hit and each ancestor is a decoded JSON node; in v2 the file/repo/org grains read only the `(term, content_id) -> count` postings and never decode a stream.
+**Built today for v1, proposed for v2.** A search by exact text can report hits at token, symbol, method, class, file, repo or org grain (a "roll-up" groups hits by ancestor and counts them). In v1 each hit and each ancestor is a decoded JSON node; in v2 the file/repo/org grains read only the `(term, content_id) -> count` postings and never decode a stream.
 
 **How to read it:** the two `alt` branches are the two designs. In v1 every matching token and its ancestors are loaded before language/org/repo filters apply; only v2 filters by language first. In v2, token and symbol grain (or class filters) still decode the streams of files that have postings. Order is deterministic: `(org, repo, file path, start_byte, ordinal)`.
 
@@ -272,7 +272,7 @@ sequenceDiagram
         Store->>redb: dictionary lookup, text to term id
         alt grain is file, repo or org
             Store->>redb: read postings (term, content_id) to count, group by parent chain, sum
-        else grain is token or symbol, or class filter
+        else grain is token, symbol, method or class, or a token-class filter
             Store->>redb: decode streams of files that have postings
         end
         Note over Store,redb: candidate files iterate in sorted-by-path order, so limit stops early

@@ -46,6 +46,7 @@ pub struct Harness {
 /// Every case, by name.
 pub const CASES: &[(&str, Case)] = &[
     ("ingest_replace_and_grains", ingest_replace_and_grains),
+    ("method_and_class_grains", method_and_class_grains),
     ("filters_and_limit", filters_and_limit),
     ("symbol_search", symbol_search),
     ("unchanged_skip_and_reindex", unchanged_skip_and_reindex),
@@ -231,6 +232,159 @@ fn ingest_replace_and_grains(h: &Harness) {
     let p = s.parent(t.id).unwrap().expect("token has a parent");
     assert_eq!(p.kind, NodeKind::File);
     assert!(s.get(t.id).unwrap().is_some());
+}
+
+/// Method and class grains: the nearest enclosing callable / type-or-impl,
+/// with that symbol's full span; `symbol_kind` narrows further.
+fn method_and_class_grains(h: &Harness) {
+    const SRC: &str = "foo();\nstruct T { foo: u32 }\nimpl S {\n    fn a() { foo(); foo(); }\n    fn b() { foo(); }\n}\nfn free() { foo(); }\n";
+    const JS: &str = "class C { m() { foo(); } }\n";
+    let lk = |name: &str, kind: SymbolKind, lang_kind: &str, needle: &str| SymbolDecl {
+        name: name.into(),
+        kind,
+        lang_kind: Some(lang_kind.into()),
+        span: span_of(SRC, needle),
+    };
+    let impl_src = "impl S {\n    fn a() { foo(); foo(); }\n    fn b() { foo(); }\n}";
+    let rust = Extraction {
+        has_errors: false,
+        symbols: vec![
+            lk("T", SymbolKind::Type, "struct", "struct T { foo: u32 }"),
+            lk("S", SymbolKind::Other, "impl", impl_src),
+            lk("a", SymbolKind::Method, "fn", "fn a() { foo(); foo(); }"),
+            lk("b", SymbolKind::Method, "fn", "fn b() { foo(); }"),
+            lk("free", SymbolKind::Function, "fn", "fn free() { foo(); }"),
+        ],
+        tokens: tokenize(SRC),
+    };
+    let js = Extraction {
+        has_errors: false,
+        symbols: vec![
+            SymbolDecl {
+                name: "C".into(),
+                kind: SymbolKind::Type,
+                lang_kind: Some("class".into()),
+                span: span_of(JS, JS.trim_end()),
+            },
+            SymbolDecl {
+                name: "m".into(),
+                kind: SymbolKind::Method,
+                lang_kind: Some("method".into()),
+                span: span_of(JS, "m() { foo(); }"),
+            },
+        ],
+        tokens: tokenize(JS),
+    };
+    let s = open(h);
+    s.ingest_file("o1", "r1", "c.js", "javascript", &js)
+        .unwrap();
+    s.ingest_file("o1", "r1", "lib.rs", "rust", &rust).unwrap();
+    s.ingest_file("o2", "r2", "main.zig", "zig", &plain(ZIG))
+        .unwrap();
+    // (file, symbol, count, lang_kind, no_symbols, no_matching_symbol)
+    type Row = (String, Option<String>, usize, Option<String>, bool, bool);
+    let rows = |q: &Query| -> Vec<Row> {
+        let hits = s.search(q).unwrap();
+        for h in &hits {
+            assert_eq!(h.grain, q.grain);
+        }
+        hits.into_iter()
+            .map(|h| {
+                (
+                    h.file.unwrap(),
+                    h.symbol,
+                    h.count,
+                    h.lang_kind,
+                    h.no_symbols,
+                    h.no_matching_symbol,
+                )
+            })
+            .collect()
+    };
+    let row = |file: &str, sym: Option<&str>, n: usize, lk: Option<&str>, ns: bool, nm: bool| {
+        (
+            file.to_string(),
+            sym.map(str::to_string),
+            n,
+            lk.map(str::to_string),
+            ns,
+            nm,
+        )
+    };
+
+    let mut q = Query::new("foo");
+    q.grain = Grain::Method;
+    assert_eq!(
+        rows(&q),
+        [
+            row("c.js", Some("C::m"), 1, Some("method"), false, false),
+            // module-level `foo()` and the struct field: no enclosing callable
+            row("lib.rs", None, 2, None, false, true),
+            row("lib.rs", Some("S::a"), 2, Some("fn"), false, false),
+            row("lib.rs", Some("S::b"), 1, Some("fn"), false, false),
+            row("lib.rs", Some("free"), 1, Some("fn"), false, false),
+            row("main.zig", None, 1, None, true, false),
+        ]
+    );
+    // The method's full span, byte and line/col.
+    let a = &s.search(&q).unwrap()[2];
+    let sp = a.span.unwrap();
+    assert_eq!(
+        &SRC[sp.start as usize..sp.end as usize],
+        "fn a() { foo(); foo(); }"
+    );
+    assert_eq!(sp, span_of(SRC, "fn a() { foo(); foo(); }"));
+    assert_eq!(
+        (sp.start_line, sp.start_col, sp.end_line, sp.end_col),
+        (4, 5, 4, 29)
+    );
+
+    q.grain = Grain::Class;
+    assert_eq!(
+        rows(&q),
+        [
+            row("c.js", Some("C"), 1, Some("class"), false, false),
+            // module-level `foo()` and the one in `free`: no enclosing type
+            row("lib.rs", None, 2, None, false, true),
+            row("lib.rs", Some("T"), 1, Some("struct"), false, false),
+            row("lib.rs", Some("S"), 3, Some("impl"), false, false),
+            row("main.zig", None, 1, None, true, false),
+        ]
+    );
+    let hits = s.search(&q).unwrap();
+    let imp = &hits[3];
+    assert_eq!(imp.symbol_kind, Some(SymbolKind::Other));
+    assert_eq!(imp.span, Some(span_of(SRC, impl_src)));
+
+    // `symbol_kind` narrows within the grain.
+    q.symbol_kind = Some("struct".into());
+    assert_eq!(
+        rows(&q),
+        [
+            row("c.js", None, 1, None, false, true),
+            row("lib.rs", None, 5, None, false, true),
+            row("lib.rs", Some("T"), 1, Some("struct"), false, false),
+            row("main.zig", None, 1, None, true, false),
+        ]
+    );
+    q.grain = Grain::Method;
+    q.symbol_kind = Some("function".into());
+    assert_eq!(
+        rows(&q),
+        [
+            row("c.js", None, 1, None, false, true),
+            row("lib.rs", None, 5, None, false, true),
+            row("lib.rs", Some("free"), 1, Some("fn"), false, false),
+            row("main.zig", None, 1, None, true, false),
+        ]
+    );
+    // Language filter still applies.
+    q.symbol_kind = None;
+    q.language = Some("javascript".into());
+    assert_eq!(
+        rows(&q),
+        [row("c.js", Some("C::m"), 1, Some("method"), false, false)]
+    );
 }
 
 fn filters_and_limit(h: &Harness) {
@@ -906,6 +1060,8 @@ fn order_and_limit_determinism(h: &Harness) {
     for grain in [
         Grain::Token,
         Grain::Symbol,
+        Grain::Method,
+        Grain::Class,
         Grain::File,
         Grain::Repo,
         Grain::Org,
@@ -1090,6 +1246,8 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
     let grains = [
         Grain::Token,
         Grain::Symbol,
+        Grain::Method,
+        Grain::Class,
         Grain::File,
         Grain::Repo,
         Grain::Org,
@@ -1307,6 +1465,8 @@ pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
             for grain in [
                 Grain::Token,
                 Grain::Symbol,
+                Grain::Method,
+                Grain::Class,
                 Grain::File,
                 Grain::Repo,
                 Grain::Org,

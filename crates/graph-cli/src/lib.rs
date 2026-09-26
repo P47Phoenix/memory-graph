@@ -45,7 +45,9 @@ pub struct DirOpts<'a> {
     pub repo: &'a str,
     pub dir: &'a std::path::Path,
     pub json: bool,
-    pub max_file_size: u64,
+    /// Skip files larger than this (`--max-file-size`); `None` = no limit
+    /// below the store's span limit (`size_skip_reason`).
+    pub max_file_size: Option<u64>,
     pub prune: bool,
     pub force: bool,
     pub reindex: bool,
@@ -121,6 +123,28 @@ fn is_db_file(
 const BATCH_FILES: usize = 256;
 const BATCH_BYTES: usize = 32 * 1024 * 1024;
 
+/// Skip reason for a file the store cannot hold: spans are 32-bit offsets.
+pub const TOO_LARGE_FOR_SPANS: &str = "larger than 4 GiB (span limit)";
+
+/// Why a file of `len` bytes is not indexed, if it is not: over the store's
+/// span limit, or over the user's `--max-file-size`. Decided from the walk's
+/// metadata, so nothing over either limit is ever read.
+pub fn size_skip_reason(len: u64, max_file_size: Option<u64>) -> Option<&'static str> {
+    if len > graph_store::MAX_SOURCE_BYTES as u64 {
+        Some(TOO_LARGE_FOR_SPANS)
+    } else if max_file_size.is_some_and(|m| len > m) {
+        Some("too large")
+    } else {
+        None
+    }
+}
+
+/// Bytes a file read may take before it is known to be over a limit.
+fn read_cap(max_file_size: Option<u64>) -> u64 {
+    let span_cap = graph_store::MAX_SOURCE_BYTES as u64;
+    max_file_size.map_or(span_cap, |m| m.min(span_cap))
+}
+
 #[derive(Default)]
 struct Tally {
     files: usize,
@@ -182,9 +206,13 @@ fn flush_batch(
                 .entry("not valid UTF-8".into())
                 .or_default()
                 .push(rel),
-            Err(graph_store::StoreError::TooLarge(_)) => {
-                t.skipped.entry("too large".into()).or_default().push(rel)
-            }
+            // The store's only `TooLarge` cause is `MAX_SOURCE_BYTES`, the
+            // span limit; the walk normally catches such a file earlier.
+            Err(graph_store::StoreError::TooLarge(_)) => t
+                .skipped
+                .entry(TOO_LARGE_FOR_SPANS.into())
+                .or_default()
+                .push(rel),
             Err(graph_store::StoreError::InvalidSpan(why)) => {
                 // The store prefixes the path; the CLI names it separately.
                 let reason = why
@@ -203,7 +231,8 @@ fn flush_batch(
 /// One walk entry, kept in walk order.
 enum Item {
     /// A regular file to read and prepare: relative path, full path, and the
-    /// bytes it will take (its size, capped at `max_file_size`).
+    /// bytes it will take (its size at walk time; over-limit files are
+    /// `Skip`ped by the walk and never read).
     File(String, std::path::PathBuf, u64),
     /// Skipped during the walk; `unreadable` blocks `--prune`.
     Skip {
@@ -254,18 +283,26 @@ fn read_and_prepare(
             unreadable,
         })
     };
+    // The walk already skipped over-limit files; a file that grew since is
+    // caught here from fresh metadata, before anything of it is read.
+    if let Ok(m) = std::fs::metadata(path) {
+        if let Some(reason) = size_skip_reason(m.len(), o.max_file_size) {
+            return skip(reason, false);
+        }
+    }
     let mut bytes = Vec::new();
     let read = board.parse.busy(k, "reading", rel, || {
         std::fs::File::open(path).and_then(|f| {
-            f.take(o.max_file_size.saturating_add(1))
+            f.take(read_cap(o.max_file_size).saturating_add(1))
                 .read_to_end(&mut bytes)
         })
     });
     if read.is_err() {
         return skip("unreadable", true);
     }
-    if bytes.len() as u64 > o.max_file_size {
-        return skip("too large", false);
+    // ... and one that grew between the check and the read.
+    if let Some(reason) = size_skip_reason(bytes.len() as u64, o.max_file_size) {
+        return skip(reason, false);
     }
     if bytes.contains(&0) {
         return skip("binary", false);
@@ -405,10 +442,17 @@ fn walk(
                             unreadable: false,
                         }
                     }
-                    Ok(meta) => {
-                        let size = meta.len().min(o.max_file_size);
-                        Item::File(rel_s, entry.into_path(), size)
-                    }
+                    Ok(meta) => match size_skip_reason(meta.len(), o.max_file_size) {
+                        Some(reason) => Item::Skip {
+                            reason,
+                            what: rel_s,
+                            unreadable: false,
+                        },
+                        None => {
+                            board.largest_file.fetch_max(meta.len(), Relaxed);
+                            Item::File(rel_s, entry.into_path(), meta.len())
+                        }
+                    },
                 }
             } else {
                 skip("non-UTF-8 path")
@@ -448,7 +492,17 @@ fn run_pipeline(
         sc.spawn(move || walk(o, board, walk_tx, cancel));
         // Admission: hold each file's bytes against the budget, in walk
         // order, before it may be read (so the writer can always progress).
+        // In deterministic mode a file of any size is admitted while less
+        // than one fixed batch is in flight: the pending batch (under
+        // BATCH_BYTES) and this file are the "one batch plus one file" the
+        // writer needs, and a file that does not fit the batch is committed
+        // alone, so admission never waits on a batch that cannot close.
         let admit_blocked = &admit_blocked;
+        let slack = if o.deterministic {
+            BATCH_BYTES as u64
+        } else {
+            0
+        };
         sc.spawn(move || {
             for (seq, item) in walk_rx {
                 let size = match &item {
@@ -456,7 +510,7 @@ fn run_pipeline(
                     Item::Skip { .. } => 0,
                 };
                 admit_blocked.store(true, Relaxed);
-                let ok = board.budget.acquire(size, cancel);
+                let ok = board.budget.acquire(size, slack, cancel);
                 admit_blocked.store(false, Relaxed);
                 if !ok || job_tx.send((seq, item, size)).is_err() {
                     return;
@@ -550,7 +604,9 @@ fn run_pipeline(
                             unchanged_bytes: board.unchanged_bytes.load(Relaxed),
                             walk_done,
                             group_bytes: if o.deterministic {
-                                BATCH_BYTES as u64 + o.max_file_size
+                                // One fixed batch plus the largest file seen:
+                                // a file that does not fit is a batch alone.
+                                BATCH_BYTES as u64 + board.largest_file.load(Relaxed)
                             } else {
                                 group_cap(board, o)
                             },
@@ -666,9 +722,21 @@ fn commit_all(
                 board.txns.load(Relaxed)
             );
         }
+        // Deterministic: a file that would push the fixed batch past its
+        // byte limit closes the batch first and starts the next one (alone,
+        // if it is larger than a batch). A pure function of the files'
+        // sizes in walk order, so the file stays reproducible.
+        let overflows = |pending_bytes: u64, pending_n: usize, oc: &Result<Outcome>| {
+            o.deterministic
+                && pending_n > 0
+                && matches!(oc, Ok(Outcome::Prepared(_, p)) if pending_bytes + p.bytes_len() as u64 > BATCH_BYTES as u64)
+        };
         while let Some((oc, size, fp)) = buf.remove(&next) {
+            if overflows(pending_bytes, pending.len(), &oc) {
+                buf.insert(next, (oc, size, fp));
+                break;
+            }
             next += 1;
-            held += size;
             held_fp += fp;
             match oc? {
                 Outcome::Skip {
@@ -676,13 +744,28 @@ fn commit_all(
                     what,
                     unreadable,
                 } => {
+                    // Nothing of it is kept: give its walk-time bytes back
+                    // now. Held until the batch flushed, a large file skipped
+                    // at read time (a binary) would pin the budget while a
+                    // small deterministic batch waits for the next file,
+                    // which admission could then never let through.
+                    board.budget.release(size);
+                    board.handled_bytes.fetch_add(size, Relaxed);
                     c.walk_errors |= unreadable;
                     c.skipped.entry(reason.into()).or_default().push(what);
                     board.skipped.fetch_add(1, Relaxed);
                     board.handled.fetch_add(1, Relaxed);
                 }
                 Outcome::Prepared(rel, p) => {
-                    held_prepared += size;
+                    // Hold what was read, at most what admission charged; a
+                    // file that shrank since the walk gives the rest back.
+                    let len = (p.bytes_len() as u64).min(size);
+                    if size > len {
+                        board.budget.release(size - len);
+                        board.handled_bytes.fetch_add(size - len, Relaxed);
+                    }
+                    held += len;
+                    held_prepared += len;
                     pending_bytes += p.bytes_len() as u64;
                     pending.push((rel, p));
                 }
@@ -699,7 +782,11 @@ fn commit_all(
         let all_in = board.walk_done.load(std::sync::atomic::Ordering::Acquire)
             && next == board.found.load(Relaxed);
         let batch_full = if o.deterministic {
-            pending.len() >= BATCH_FILES || pending_bytes >= BATCH_BYTES as u64
+            pending.len() >= BATCH_FILES
+                || pending_bytes >= BATCH_BYTES as u64
+                || buf
+                    .get(&next)
+                    .is_some_and(|(oc, _, _)| overflows(pending_bytes, pending.len(), oc))
         } else {
             !pending.is_empty()
         };
@@ -832,10 +919,10 @@ pub fn index_dir_with(
             o.db.display()
         );
     }
-    if o.deterministic && o.chunk_bytes < BATCH_BYTES as u64 + o.max_file_size {
+    if o.deterministic && o.chunk_bytes < BATCH_BYTES as u64 {
         bail!(
-            "--deterministic needs --chunk-bytes of at least {} (one fixed batch plus one --max-file-size file), got {}; raise --chunk-bytes or lower --max-file-size",
-            BATCH_BYTES as u64 + o.max_file_size,
+            "--deterministic needs --chunk-bytes of at least {} (one fixed batch), got {}; raise --chunk-bytes",
+            BATCH_BYTES,
             o.chunk_bytes
         );
     }
@@ -858,10 +945,10 @@ pub fn index_dir_with(
     let store = open(o.db)?;
     let trace: Option<&'static Trace> = o.trace.map(|_| &*Box::leak(Box::new(Trace::new())));
     // A fixed batch holds its files' bytes until it commits, so in
-    // deterministic mode the budget must always fit one whole batch plus the
-    // file that closes it.
+    // deterministic mode the budget must always fit one whole batch; the
+    // file that closes it is admitted on top (admission slack, below).
     let floor = if o.deterministic {
-        BATCH_BYTES as u64 + o.max_file_size
+        BATCH_BYTES as u64
     } else {
         1
     };
@@ -980,4 +1067,37 @@ pub fn index_dir_with(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::{read_cap, size_skip_reason, TOO_LARGE_FOR_SPANS};
+
+    const SPAN_CAP: u64 = graph_store::MAX_SOURCE_BYTES as u64;
+
+    #[test]
+    fn no_limit_by_default_except_the_span_cap() {
+        assert_eq!(size_skip_reason(0, None), None);
+        assert_eq!(size_skip_reason(1 << 30, None), None);
+        assert_eq!(size_skip_reason(SPAN_CAP, None), None);
+        assert_eq!(
+            size_skip_reason(SPAN_CAP + 1, None),
+            Some(TOO_LARGE_FOR_SPANS)
+        );
+    }
+
+    #[test]
+    fn user_cap_applies_below_the_span_cap() {
+        assert_eq!(size_skip_reason(5, Some(5)), None);
+        assert_eq!(size_skip_reason(6, Some(5)), Some("too large"));
+        // A user cap above the span cap changes nothing.
+        assert_eq!(size_skip_reason(SPAN_CAP, Some(u64::MAX)), None);
+        assert_eq!(
+            size_skip_reason(SPAN_CAP + 1, Some(u64::MAX)),
+            Some(TOO_LARGE_FOR_SPANS)
+        );
+        assert_eq!(read_cap(None), SPAN_CAP);
+        assert_eq!(read_cap(Some(5)), 5);
+        assert_eq!(read_cap(Some(u64::MAX)), SPAN_CAP);
+    }
 }
