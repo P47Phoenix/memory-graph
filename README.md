@@ -157,7 +157,7 @@ The `index` line prints the same summary as the native binary (`indexed acme/api
 
 To see the live progress view (one line per pipeline stage) give the container a terminal with `-t`; without it only the final summary is printed.
 
-The image has no shell, so `docker exec ... sh` and `--entrypoint /bin/sh` do not work. Everything is done through the `memory-graph` entrypoint.
+The image has no shell, so there is nothing to `docker exec` into and `--entrypoint /bin/sh` fails. Everything is done through the `memory-graph` entrypoint, and each command exits when done.
 
 ### Windows
 
@@ -168,23 +168,24 @@ docker run --rm -v "${PWD}:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-g
 docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main describe
 ```
 
-Git Bash rewrites container paths such as `/src` into Windows paths (the error reads `` `C:/Program Files/Git/src` is not a directory``). Turn that off for the command:
+Git Bash rewrites container paths such as `/src` and `/data` into Windows paths (the error reads `` `C:/Program Files/Git/src` is not a directory``, and a bind-mounted `/data` leaves a stray `db;C` directory behind). Turn that off for every `docker run` that mounts something, including the alias below: prefix the command, or export the variable once for the shell.
 
 ```sh
 MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
+export MSYS_NO_PATHCONV=1     # or once per shell
 ```
 
 ### Keeping the database in a host directory
 
-A fresh named volume is writable by the image's user as is. To keep the database in a directory you can see, bind-mount it and run as its owner; on Linux and macOS (and Git Bash) that is `--user "$(id -u):$(id -g)"`. On Docker Desktop (Windows, macOS) a bind mount is writable without `--user`.
+A fresh named volume is writable by the image's user as is. To keep the database in a directory you can see, bind-mount it and run as its owner; on Linux and macOS that is `--user "$(id -u):$(id -g)"`. On Docker Desktop (Windows, macOS) a bind mount is writable without `--user`; in Git Bash add the `MSYS_NO_PATHCONV=1` prefix from the Windows section. Keep the directory outside the source tree, or the database file shows up in the index summary as `skipped (database file)`.
 
 ```sh
-mkdir -p db
-docker run --rm -v "$PWD:/src:ro" -v "$PWD/db:/data" --user "$(id -u):$(id -g)" ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
-ls db     # graph.redb
+mkdir -p ~/mg-db
+docker run --rm -v "$PWD:/src:ro" -v "$HOME/mg-db:/data" --user "$(id -u):$(id -g)" ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
+ls ~/mg-db     # graph.redb
 ```
 
-A `Permission denied ... must be writable` error on `/data/graph.redb` means the directory (or an existing database) is owned by another user: match it with `--user`, or use a named volume.
+A `Permission denied ... must be writable` error on `/data/graph.redb` means the directory (or an existing database) is owned by another user: match it with `--user`, or use a named volume. Once a database was created under one `--user`, keep using it; a later run as the image's default user cannot open it.
 
 ### Memory, threads and other settings
 
@@ -196,11 +197,11 @@ docker run --rm --cpus=4 -e MEMORY_GRAPH_MEMORY=1G -v "$PWD:/src:ro" -v mg-data:
   ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src --jobs 4 --stats
 ```
 
-On Docker Desktop the memory source reads `sysinfo(2)` because `/proc/meminfo` is unreadable to non-root there; on a Linux host it reads `/proc/meminfo`. The total is the same either way; `sysinfo(2)` has no page-cache figure, so its free-memory reading, and the budget derived from it, is somewhat lower.
+On Docker Desktop the memory source reads `sysinfo(2)+cgroup v2` because `/proc/meminfo` is unreadable to non-root there; on a Linux host it reads `/proc/meminfo+cgroup v2`. The total is the same either way; `sysinfo(2)` has no page-cache figure, so its free-memory reading, and the budget derived from it, is somewhat lower.
 
 ### Docker Compose
 
-For repeated use, a `compose.yaml` next to the project fixes the mounts and settings once:
+For repeated use, a `compose.yaml` next to the project fixes the mounts and settings once. The `name:` on the volume keeps it the same `mg-data` volume the `docker run` commands above use (without it Compose prefixes the project name and the database is a different one). The file itself is indexed along with the project (one `yaml` file in the summary).
 
 ```yaml
 services:
@@ -214,6 +215,7 @@ services:
 
 volumes:
   mg-data:
+    name: mg-data
 ```
 
 ```sh
@@ -225,7 +227,7 @@ docker compose down -v      # also deletes the database volume
 
 ### Shell alias
 
-A one-line wrapper makes the container feel like the native binary:
+A one-line wrapper makes the container feel like the native binary (in Git Bash, `export MSYS_NO_PATHCONV=1` first):
 
 ```sh
 alias mg='docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main'
