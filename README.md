@@ -196,7 +196,7 @@ docker run --rm --cpus=4 -e MEMORY_GRAPH_MEMORY=1G -v "$PWD:/src:ro" -v mg-data:
   ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src --jobs 4 --stats
 ```
 
-On Docker Desktop the memory source reads `sysinfo(2)` because `/proc/meminfo` is unreadable to non-root there; on a Linux host it reads `/proc/meminfo`. Either way the numbers are the same.
+On Docker Desktop the memory source reads `sysinfo(2)` because `/proc/meminfo` is unreadable to non-root there; on a Linux host it reads `/proc/meminfo`. The total is the same either way; `sysinfo(2)` has no page-cache figure, so its free-memory reading, and the budget derived from it, is somewhat lower.
 
 ### Docker Compose
 
@@ -219,6 +219,7 @@ volumes:
 ```sh
 docker compose run --rm memory-graph index --org acme --repo api /src
 docker compose run --rm memory-graph search foo --grain class
+docker compose run --rm -T memory-graph search foo --json > hits.json   # -T: no TTY when piping or redirecting
 docker compose down -v      # also deletes the database volume
 ```
 
@@ -227,10 +228,13 @@ docker compose down -v      # also deletes the database volume
 A one-line wrapper makes the container feel like the native binary:
 
 ```sh
-alias mg='docker run --rm -t -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main'
+alias mg='docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main'
 mg index --org acme --repo api /src
 mg search foo --grain method
+mg search foo --json > hits.json
 ```
+
+Add `-t` to see the live view while indexing, but not when piping or redirecting `--json` output: a TTY merges stderr into stdout and ends lines with CRLF. The same applies to `docker compose run`, which allocates a TTY by default; pass `-T` there when piping.
 
 ### Troubleshooting
 
@@ -238,10 +242,10 @@ mg search foo --grain method
 |---|---|
 | `manifest unknown` on pull or run | No tag given, so Docker asked for `latest`, which does not exist until the first release. Use `:main` or a `sha-…`/version tag. |
 | `` `/src` is not a directory`` or a `C:/Program Files/Git/...` path in the error | Git Bash path conversion. Prefix the command with `MSYS_NO_PATHCONV=1`, or use PowerShell. |
-| `database ./graph.redb does not exist` on `search`/`describe` | The `/data` mount differs from the one `index` used. Mount the same named volume or directory. |
+| ``database `./graph.redb` does not exist`` on `search`/`describe` | The `/data` mount differs from the one `index` used. Mount the same named volume or directory. |
 | `Permission denied ... must be writable` | A bind-mounted `/data` owned by another user. Add `--user "$(id -u):$(id -g)"` or use a named volume. |
 | No progress lines, only the summary | Progress needs a terminal: add `-t`. |
-| `exec: "/bin/sh": no such file` | The image has no shell by design. Use the `memory-graph` commands. |
+| `exec: "/bin/sh": stat /bin/sh: no such file or directory` | The image has no shell by design. Use the `memory-graph` commands. |
 
 ### Tags and releases
 
