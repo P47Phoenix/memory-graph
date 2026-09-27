@@ -32,10 +32,11 @@ cargo build --release
 # the binary is target/release/memory-graph; put it on your PATH or call it by path
 ```
 
-**Docker** (no toolchain needed; see [Docker](#docker) for volumes and tags):
+**Docker** (no toolchain needed; see [Docker](#docker) for the full instructions):
 
 ```sh
 docker pull ghcr.io/p47phoenix/memory-graph:main
+docker run --rm ghcr.io/p47phoenix/memory-graph:main --help
 ```
 
 ## Quick start
@@ -133,33 +134,114 @@ If a file fails span validation (an extractor or tokenizer bug), only that file 
 
 ## Docker
 
-The image `ghcr.io/p47phoenix/memory-graph` is a static binary on an empty base (`FROM scratch`): no shell, 7 MB, `linux/amd64` and `linux/arm64`. It runs as user `65532`, its working directory is `/data`, and the default `--db ./graph.redb` therefore lands on the `/data` volume.
+The image `ghcr.io/p47phoenix/memory-graph` is the CLI as a static binary on an empty base (`FROM scratch`): no shell, no package manager, 7 MB, built for `linux/amd64` and `linux/arm64`. Every CLI command and flag in this README works unchanged inside it. Three things to know:
 
-### Run
+- It runs as user `65532`, not root.
+- Its working directory is `/data`, so the default `--db ./graph.redb` lands on whatever you mount at `/data`. Mount the same volume on every run and the commands share one database.
+- Always give a tag. `latest` only exists once a release has been tagged (see [Tags and releases](#tags-and-releases)); until then use `:main`.
 
-Mount the source read-only and keep the database on a named volume:
+### First run
+
+Pull the image, index a project into a named volume, then query it. The source is mounted read-only at `/src`; the database lives in the `mg-data` volume.
 
 ```sh
+docker pull ghcr.io/p47phoenix/memory-graph:main
+cd ~/code/api
 docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
 docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main describe
-docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main search foo --json
+docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main search foo --language rust
+docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main search foo --grain method --json
 ```
 
-Always give a tag: `latest` only exists once a release has been tagged (see the table below), so until then use `:main`.
+The `index` line prints the same summary as the native binary (`indexed acme/api: files=... symbols=... tokens=...`). Re-run it after editing the code: unchanged files are skipped. To index a second project into the same database, run `index` again with another `--repo` (or `--org`) and a different source mount; `describe` then lists both.
 
-A fresh named volume is writable as is. To keep the database in a host directory instead, bind-mount it and run as its owner (Linux, macOS, Git Bash; on Docker Desktop a bind mount is writable without `--user`):
+To see the live progress view (one line per pipeline stage) give the container a terminal with `-t`; without it only the final summary is printed.
+
+The image has no shell, so `docker exec ... sh` and `--entrypoint /bin/sh` do not work. Everything is done through the `memory-graph` entrypoint.
+
+### Windows
+
+PowerShell: same commands, with `${PWD}` for the current directory.
+
+```powershell
+docker run --rm -v "${PWD}:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
+docker run --rm -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main describe
+```
+
+Git Bash rewrites container paths such as `/src` into Windows paths (the error reads `` `C:/Program Files/Git/src` is not a directory``). Turn that off for the command:
 
 ```sh
-docker run --rm -v "$PWD/db:/data" --user "$(id -u):$(id -g)" ghcr.io/p47phoenix/memory-graph:main describe
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
 ```
 
-A memory limit on the container sizes the budget for the container, not the host:
+### Keeping the database in a host directory
+
+A fresh named volume is writable by the image's user as is. To keep the database in a directory you can see, bind-mount it and run as its owner; on Linux and macOS (and Git Bash) that is `--user "$(id -u):$(id -g)"`. On Docker Desktop (Windows, macOS) a bind mount is writable without `--user`.
 
 ```sh
-docker run --rm --memory=512m ghcr.io/p47phoenix/memory-graph:main sysinfo
+mkdir -p db
+docker run --rm -v "$PWD:/src:ro" -v "$PWD/db:/data" --user "$(id -u):$(id -g)" ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src
+ls db     # graph.redb
 ```
 
-(On Docker Desktop the memory source reads `sysinfo(2)` because `/proc/meminfo` is unreadable to non-root there; on a Linux host it reads `/proc/meminfo`.)
+A `Permission denied ... must be writable` error on `/data/graph.redb` means the directory (or an existing database) is owned by another user: match it with `--user`, or use a named volume.
+
+### Memory, threads and other settings
+
+The container sizes itself like the native binary: parse threads from the CPUs it can see, the memory budget from free RAM, and a container memory limit is honoured (the budget is sized for the limit, not the host). All `index` flags work; `--memory` can also be given as an environment variable.
+
+```sh
+docker run --rm --memory=512m ghcr.io/p47phoenix/memory-graph:main sysinfo                                 # what the container will size from
+docker run --rm --cpus=4 -e MEMORY_GRAPH_MEMORY=1G -v "$PWD:/src:ro" -v mg-data:/data \
+  ghcr.io/p47phoenix/memory-graph:main index --org acme --repo api /src --jobs 4 --stats
+```
+
+On Docker Desktop the memory source reads `sysinfo(2)` because `/proc/meminfo` is unreadable to non-root there; on a Linux host it reads `/proc/meminfo`. Either way the numbers are the same.
+
+### Docker Compose
+
+For repeated use, a `compose.yaml` next to the project fixes the mounts and settings once:
+
+```yaml
+services:
+  memory-graph:
+    image: ghcr.io/p47phoenix/memory-graph:main
+    volumes:
+      - ./:/src:ro
+      - mg-data:/data
+    environment:
+      MEMORY_GRAPH_MEMORY: "50%"
+
+volumes:
+  mg-data:
+```
+
+```sh
+docker compose run --rm memory-graph index --org acme --repo api /src
+docker compose run --rm memory-graph search foo --grain class
+docker compose down -v      # also deletes the database volume
+```
+
+### Shell alias
+
+A one-line wrapper makes the container feel like the native binary:
+
+```sh
+alias mg='docker run --rm -t -v "$PWD:/src:ro" -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main'
+mg index --org acme --repo api /src
+mg search foo --grain method
+```
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `manifest unknown` on pull or run | No tag given, so Docker asked for `latest`, which does not exist until the first release. Use `:main` or a `sha-…`/version tag. |
+| `` `/src` is not a directory`` or a `C:/Program Files/Git/...` path in the error | Git Bash path conversion. Prefix the command with `MSYS_NO_PATHCONV=1`, or use PowerShell. |
+| `database ./graph.redb does not exist` on `search`/`describe` | The `/data` mount differs from the one `index` used. Mount the same named volume or directory. |
+| `Permission denied ... must be writable` | A bind-mounted `/data` owned by another user. Add `--user "$(id -u):$(id -g)"` or use a named volume. |
+| No progress lines, only the summary | Progress needs a terminal: add `-t`. |
+| `exec: "/bin/sh": no such file` | The image has no shell by design. Use the `memory-graph` commands. |
 
 ### Tags and releases
 
