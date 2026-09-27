@@ -128,8 +128,8 @@ So that I can locate identifiers and literals in any language.
 - Given no matches, When searched, Then the result must be empty and the exit code 0.
 - Given results, When printed, Then they must be ordered by org, repo, path and byte offset.
 - Given `--json`, When searched, Then stdout must be one JSON document `{"query":…,"grain":…,"results":[…]}` and nothing else, so an agent can consume it.
-- Given `--grain token|symbol|file|repo|org` (default `token`), When searched, Then results are the distinct nodes of that grain containing a match, each with its containment path and a hit count; `--symbol-kind method` restricts the symbol grain to that kind.
-- Given a match in a file with no enclosing symbol of the requested kind, When searched at symbol grain, Then it rolls up to its File and is flagged `no_symbols`.
+- Given `--grain token|symbol|method|class|file|repo|org` (default `token`), When searched, Then results are the distinct nodes of that grain containing a match, each with its containment path and a hit count. `symbol` is the nearest enclosing symbol of any kind, `method` the nearest enclosing method or free function, `class` the nearest enclosing type or a Rust `impl` block (amended 2026-09-27, PR #99); these rows carry the definition's full span (start and end byte, line and column). `--symbol-kind` restricts a symbol, method or class grain to that kind, and a generic kind the grain can never hold is refused.
+- Given a match in a file with no enclosing symbol satisfying the requested grain and kind, When searched at symbol, method or class grain, Then it rolls up to its File (the row keeps the requested grain, with no symbol) and is flagged `no_matching_symbol` (`no_symbols` when the file has no symbols at all).
 
 **9. Rust extractor (8 pts)**
 As an AI-agent integrator
