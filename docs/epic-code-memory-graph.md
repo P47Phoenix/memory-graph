@@ -10,7 +10,7 @@
 - (e) p95 search latency is under 100 ms on 1,000+ files. This target is a placeholder until story 18.
 - (f) Re-indexing an unchanged repo re-parses 0 files.
 
-**Out of Scope:** Network server or MCP interface, auth, semantic or embedding search, cross-file reference resolution (call graphs, type resolution), GUI, distributed storage, git history, a query language (fixed query functions only), and bundled extractors beyond Rust and Python in this epic.
+**Out of Scope:** MCP interface, auth, TLS on the wire, semantic or embedding search, cross-file reference resolution (call graphs, type resolution), GUI, git history, a query language (fixed query functions only), and bundled extractors beyond Rust and Python in this epic. *Amended 2026-09-28 ([ADR 0004](adr/0004-client-server-and-replication.md), Proposed):* a network server (`memory-graph serve` over gRPC) and replicated storage (a Raft cluster with durable writes, reads on every node) are now in scope as stories 20-25; "distributed storage" in the sense of sharding a database across nodes stays out of scope (ADR 0003 Q4, build deferred).
 
 ### Story Map
 
@@ -35,8 +35,14 @@
 | 17 | Error tolerance and JSON output with stable API | Medium | 5 | P3 | 10, 8 |
 | 18 | Remove data and benchmark at scale | Medium | 5 | P3 | 15 |
 | 19 | Spike: WASM-hosted extractor plugins (wasmi) | Risk reduction | 3 | P4 | 4 |
+| 20 | Single-node server and client (gRPC, `serve`, `--server`) | High | 8 | P2 | 17, ADR 0004 accepted |
+| 21 | Replication: Raft log, snapshots, `--bootstrap` | High | 8 | P2 | 20 |
+| 22 | Membership and write forwarding | High | 8 | P2 | 21 |
+| 23 | Linearizable reads and crash tests | High | 5 | P3 | 22 |
+| 24 | Observability and packaging (metrics, health, Compose, Kubernetes) | Medium | 5 | P3 | 22 |
+| 25 | Cluster hardening (benchmarks, soak, `--update-advertise`) | Medium | 3 | P4 | 23, 24 |
 
-Total: 19 stories, 89 pts (average about 4.7).
+Total: 25 stories, 126 pts (average about 5.0). Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md) (Proposed); they start only once that ADR is accepted.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -47,6 +53,7 @@ Later slices:
 - **Structure:** stories 9–12
 - **Agent integration:** stories 13 and 14
 - **Operational and reach:** stories 15–19
+- **Client/server and cluster (ADR 0004):** stories 20–25
 
 ### Full Story Definitions
 
@@ -239,6 +246,78 @@ Time-boxed to 1 day. Output: documented findings + story estimate.
 - Given the runtime, When assessed, Then the findings confirm it is pure Rust and record its speed against a native extractor on a 10k-line file.
 - Given the recommendation, When the spike closes, Then it must state go or no-go and the follow-up stories needed.
 
+**20. Single-node server and client (8 pts)**
+As a developer or agent
+I want a `memory-graph serve` process to own the database and the command line to talk to it over gRPC
+So that many readers and one index run share a database without fighting over the file lock, from any machine.
+Design: [ADR 0004](adr/0004-client-server-and-replication.md) D1-D4; delivers ADR 0003 story 12a (gRPC over TCP instead of a Unix socket).
+- Given `memory-graph serve --db ./g --listen 127.0.0.1:7000`, When a second process runs `search --server 127.0.0.1:7000` during an index run through the server, Then it must get repeatable results and must never see a partially applied group commit.
+- Given the `.proto` contract under `crates/graph-proto/proto/`, When `cargo run -p xtask -- proto` regenerates the checked-in code, Then CI must fail on any diff, and no `protoc` binary may be required anywhere.
+- Given the client `RemoteStore`, When the store conformance suite (`run_all`) runs against it over an in-process test server, Then every case must pass, and `run_differential(embedded, remote)` must find no difference on the same inputs.
+- Given `index`, `search`, `describe` and `export` run with `--server` against the vendored corpus, When their output is diffed against an embedded run, Then the outputs must be identical, and the served file reopened embedded must answer identically.
+- Given two `serve` processes on one file, When the second starts, Then it must fail with `Locked`, and an embedded `--db` open of a served file must retry with jittered back-off for 5 s and then fail with a message naming `serve` and the holder from the `LOCK` sidecar.
+- Given a client with an unknown `protocol_version`, When it calls `Hello`, Then the server must refuse with `FAILED_PRECONDITION` and the CLI must exit with code 5.
+- Given `--db` and `--server` together (flag or `MEMORY_GRAPH_SERVER`), When any command runs, Then it must be refused with a message naming both; given `--chunk-bytes` or `--cache-bytes` with `--server`, Then it must be refused with "pass to serve".
+- Given the RPC-overhead benchmark at 10 M tokens, When measured, Then p50 overhead over embedded must stay under the 5 ms trigger recorded in ADR 0003 Q5.
+- Given the workspace after this story, When `scripts/check-no-c-deps.py` runs, Then it must pass, and it must name the crate when a deny-listed crate (`ring`, `aws-lc-sys`, `openssl-sys`, `libz-sys`) enters the tree.
+
+**21. Replication: Raft log, snapshots, `--bootstrap` (8 pts)**
+As a database operator
+I want several `serve` nodes to replicate one database through Raft
+So that the data survives the loss of a node and every node can answer reads.
+Design: ADR 0004 D5-D7.
+- Given `serve --data-dir <dir> --bootstrap --node-id 1` and two more nodes added as learners and promoted, When files are indexed through the leader, Then every node must apply the same entries and `run_differential(remote n1, remote n3)` and the embedded oracle must find no difference.
+- Given a write, When the leader acknowledges it, Then the entry must already be fsynced in the Raft log on a majority and applied on the leader in one fsynced store transaction that records `last_applied`.
+- Given a node killed after the log commit and before apply, When it restarts, Then it must replay the entry exactly once (`crash_after_log_before_apply_replays_once`, `kill_during_apply_reapplies_exactly_once`).
+- Given the leader stops, When a new leader is elected, Then writes must resume, and `LOCAL` reads on every remaining node must have succeeded throughout.
+- Given a follower that fell behind the log purge point, When it reconnects, Then it must catch up through `InstallSnapshot` and then match the leader.
+- Given a snapshot taken with `cluster snapshot --out`, When it is restored with `serve --bootstrap --restore` into an empty directory, Then the new cluster must answer every query as the original did and must carry a new cluster id.
+- Given a corpus index plus a snapshot, When the size gate runs, Then Raft log bytes must be at most 1.5x the source, and bytes per entry and fsync throughput must be recorded in `docs/spikes/raft-replication.md`.
+
+**22. Membership and write forwarding (8 pts)**
+As a database operator or agent
+I want to add, promote and remove nodes safely and to write through any node
+So that the cluster grows and shrinks without downtime and clients need not find the leader.
+Design: ADR 0004 D6, D8, D9.
+- Given `serve --join <peer> --auto-promote` on an empty directory, When it starts, Then it must copy the cluster id, join as a learner, catch up, and become a voter once its lag is zero; with `--standby` it must stay a learner.
+- Given `--bootstrap` or `--join` on a directory that already belongs to the same cluster, When the node restarts with the same command line, Then it must resume from persisted state; on a directory from another cluster it must refuse with `WrongCluster`.
+- Given an `index` sent to a follower, When it completes, Then the response must carry `forwarded_to_leader` and the applied index must equal the leader's.
+- Given a partition that isolates a minority, When clients use the minority, Then `LOCAL` reads must succeed, writes must fail with `NoLeader`, and after the partition heals every node must converge.
+- Given `cluster remove`, When it targets the leader, 3 voters down to 2 without `--force`, or anything below quorum, Then it must be refused with the reason.
+- Given a node whose extractor version set hash differs, When promotion is requested, Then it must be refused.
+- Given membership changes under an index load, When they complete, Then no acknowledged write may be missing on any voter.
+
+**23. Linearizable reads and crash tests (5 pts)**
+As an AI-agent integrator
+I want a read mode that is guaranteed to see every acknowledged write
+So that an agent can index and then query without a race.
+Design: ADR 0004 D7, D8.
+- Given `--read linearizable` on node 3 right after a write acknowledged by node 1, When the query runs, Then it must include that write.
+- Given `--read local` (the default), When the node has no known leader or lags the leader, Then the JSON output must carry `stale_possible: true`.
+- Given a linearizable read on a minority partition, When it runs, Then it must fail with `NoLeader` rather than answer stale data.
+- Given the CI `cluster` job, When it spawns three binaries, kills the leader with SIGKILL mid-batch and restarts it, Then every acknowledged batch must be present on all nodes.
+
+**24. Observability and packaging (5 pts)**
+As a database operator
+I want logs, metrics, health probes and ready-made deployments
+So that I can run the cluster in Docker Compose or Kubernetes and see what it is doing.
+Design: ADR 0004 D10.
+- Given `--log-format json`, When the server logs, Then every line must be one JSON object with level, target and message.
+- Given `--metrics-listen`, When scraped, Then the Prometheus text must parse and must include the Raft term, leader id, role, log, committed, applied and snapshot indexes, per-peer replication lag, store and log bytes, RPC durations and forwarded write counts; `cluster status --json` must show the same numbers.
+- Given the gRPC health service, When the store is open, Then the default service must be `SERVING`; the `memory-graph.ready` service must be `SERVING` only while a leader is known; `memory-graph health [--ready] --server` must exit non-zero otherwise.
+- Given `deploy/compose/cluster.yml`, When CI runs `up --wait`, indexes via node 2, queries node 3, stops node 1, writes and reads again, restarts node 1 and waits for sync, Then every step must succeed and `down -v` must leave nothing behind.
+- Given `docs/deploy/kubernetes.md`, When followed, Then it must describe a StatefulSet with a headless service for `--advertise`, node ids from the ordinal, gRPC readiness on `memory-graph.ready`, a PodDisruptionBudget of `minAvailable: 2` and `cluster remove` before scale-down.
+
+**25. Cluster hardening (3 pts)**
+As a database operator
+I want measured replication performance, a soak run and the remaining operator knobs
+So that the cluster can be trusted at the epic's scale target.
+Design: ADR 0004 revisit triggers.
+- Given the replication benchmark, When run at the story 18 corpus and at 10 M tokens, Then replicated ingest throughput relative to embedded, snapshot install time and linearizable read latency must be recorded in the docs, and any number past a revisit trigger must open an issue.
+- Given a soak run of at least one hour with continuous indexing and a node restarted every five minutes, When it ends, Then no acknowledged write may be missing and the Raft log must stay within the purge policy.
+- Given `serve --update-advertise <addr>` on an existing member, When it restarts, Then the cluster must learn the new address without a re-join.
+- Given the open configuration question (ADR 0004 Q2), When this story closes, Then either a TOML configuration file is delivered or an issue records why not.
+
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
 - **Language-agnostic by construction:** the schema uses a language tag plus a generic kind vocabulary with an optional language-specific kind string. Only extractors know about a language, and story 16 checks this by requiring zero schema, storage or query changes.
@@ -259,7 +338,7 @@ Time-boxed to 1 day. Output: documented findings + story estimate.
 2. Is org and repo ever derived from a git remote, or always supplied by the user?
 3. Is Python the second built-in language, or would you prefer TypeScript or Go? Pure-Rust parsers for those are less mature.
 4. Should the fixed generic kind vocabulary in story 4 be extended, for example with `enum`, `interface` or `field`?
-5. Is an MCP or server interface wanted soon? Story 17 is the seam.
+5. Is an MCP or server interface wanted soon? Story 17 is the seam. *Server: answered 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md) (stories 20-25); MCP stays open.*
 6. What are your scale targets (largest repo, number of repos)? Story 18 targets are placeholders.
 7. Will the crate be published, and under which license? That constrains dependency licenses.
 
