@@ -83,19 +83,32 @@ impl DiskGuard {
     /// store's size) free; an unreadable volume passes (never refuse on a
     /// platform that cannot say).
     pub fn check(&self, what: &str) -> Result<(), StoreError> {
+        let store = Self::size(&self.store);
+        self.check_need(
+            what,
+            store,
+            &format!("one snapshot copy of the {store}-byte store"),
+        )
+    }
+
+    /// `Ok` when the volume has `min_free` plus `extra` bytes free (a
+    /// snapshot install: the received file and the staged copy of it).
+    pub fn check_extra(&self, what: &str, extra: u64) -> Result<(), StoreError> {
+        self.check_need(what, extra, &format!("{extra} bytes for the {what}"))
+    }
+
+    fn check_need(&self, what: &str, extra: u64, why: &str) -> Result<(), StoreError> {
         if self.min_free == 0 {
             return Ok(());
         }
         let Some(free) = (self.probe)(&self.dir) else {
             return Ok(());
         };
-        let store = Self::size(&self.store);
-        let need = self.min_free.saturating_add(store);
+        let need = self.min_free.saturating_add(extra);
         if free < need {
             return Err(StoreError::Storage(format!(
                 "disk full: {what} refused: {free} bytes free on the volume of `{}`, \
-                 need {need} (--min-free-disk {} + one snapshot copy of the {store}-byte store; \
-                 the Raft log is {} bytes)",
+                 need {need} (--min-free-disk {} + {why}; the Raft log is {} bytes)",
                 self.dir.display(),
                 self.min_free,
                 Self::size(&self.log),

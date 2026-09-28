@@ -2195,6 +2195,33 @@ impl V2Store {
             }
             e => open_failed(path.as_ref(), &e),
         })?;
+        Self::from_db(db, path.as_ref(), cache_bytes)
+    }
+
+    /// [`open_with_cache_bytes`](Self::open_with_cache_bytes) over a redb
+    /// [`redb::StorageBackend`] instead of a file (the server's power-cut
+    /// durability tests, ADR 0004 D7). `path` only names the store in
+    /// messages; nothing is read from or written to it. The file-based
+    /// operations ([`compact`](Self::compact), `export_snapshot`,
+    /// `install_snapshot`) are not meaningful on such a store.
+    pub fn open_with_backend(
+        path: impl AsRef<Path>,
+        backend: impl redb::StorageBackend,
+        cache_bytes: Option<usize>,
+    ) -> Result<Self> {
+        let mut builder = Database::builder();
+        if let Some(bytes) = cache_bytes {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder
+            .create_with_backend(backend)
+            .map_err(|e| open_failed(path.as_ref(), &e))?;
+        Self::from_db(db, path.as_ref(), cache_bytes)
+    }
+
+    /// Check (or stamp, for a new file) the schema of an opened database
+    /// and wrap it.
+    fn from_db(db: Database, path: &Path, cache_bytes: Option<usize>) -> Result<Self> {
         let found = {
             let rt = db.begin_read()?;
             match rt.open_table(META) {
@@ -2207,7 +2234,7 @@ impl V2Store {
             Some(V2_SCHEMA_VERSION) => {}
             Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => {
                 return Err(StoreError::LegacyFormat {
-                    path: path.as_ref().display().to_string(),
+                    path: path.display().to_string(),
                     version: v,
                 })
             }
@@ -2263,7 +2290,7 @@ impl V2Store {
                 "memory-graph: v2 store {}: refs/content_files derived_version \
                  {derived_refs_version:?} != current {REFS_DERIVED_VERSION}; \
                  self-healing (rebuilding) on open",
-                path.as_ref().display()
+                path.display()
             );
             rebuild_refs_in(&db)?;
         }
@@ -2273,7 +2300,7 @@ impl V2Store {
             registry: Registry::default(),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             cache_bytes,
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
             snapshot_tracker: Arc::new(Mutex::new(SnapshotTracker::default())),
             marked_commit_hook: None,

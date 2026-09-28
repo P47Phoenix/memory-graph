@@ -268,6 +268,7 @@ Design: [ADR 0004](adr/0004-client-server-and-replication.md) D1-D4; delivers AD
 - Given the workspace after this story, When `scripts/check-no-c-deps.py` runs, Then it must pass, and it must name the crate when a deny-listed crate (`ring`, `aws-lc-sys`, `openssl-sys`, `libz-sys`) enters the tree.
 
 **21. Replication: Raft log, snapshots, `--bootstrap` (8 pts)**
+Status: Delivered in PR #114. Measurements: [spikes/raft-replication.md](spikes/raft-replication.md).
 As a database operator
 I want several `serve` nodes to replicate one database through Raft
 So that the data survives the loss of a node and every node can answer reads.

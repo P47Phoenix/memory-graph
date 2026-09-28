@@ -13,16 +13,32 @@
 //! * Errors: every transport failure, timeout or remote status is
 //!   `Unreachable`, so openraft backs off before retrying (a `Network`
 //!   error would retry at once, which on a persistent refusal such as a
-//!   wrong cluster is a busy loop); the cached channel is dropped so the
-//!   next attempt reconnects.
+//!   wrong cluster is a busy loop). A transport failure drops the cached
+//!   channel so the next attempt reconnects; a plain timeout does not (the
+//!   connection is fine, the peer is slow). Each failure is recorded per
+//!   peer ([`NetStats`], shown in `Admin.Status` replication) and logged
+//!   with its gRPC code, at most once per peer every
+//!   [`WARN_EVERY`].
+//! * `AppendEntries` and openraft's timeout: openraft 0.9 wraps every
+//!   `append_entries` call in a hard timeout of `heartbeat_interval`, with
+//!   no separate knob (only snapshots have `install_snapshot_timeout`). An
+//!   entry of several MiB may need longer than a heartbeat to cross a slow
+//!   link and be fsynced; if dropping our future cancelled the RPC, such an
+//!   entry would never arrive (a livelock). So an `AppendEntries` that
+//!   carries entries runs as its own task ([`APPEND_TRANSFER_TIMEOUT`]
+//!   bounds it), and openraft's timeout only stops the wait: its retry of
+//!   the same entries (same vote, previous log id and entry ids) joins the
+//!   transfer still under way instead of starting over. Heartbeats (no
+//!   entries) are sent directly and meanwhile still reach the follower, so
+//!   a long transfer does not cause an election.
 //! * Channels are cached per target node id and rebuilt when the member's
-//!   address changes or a call failed.
+//!   address changes or a transport call failed.
 //! * [`FaultPlan`] / [`FaultyNetwork`]: test fault injection (partitions,
 //!   dropped `AppendEntries`), a wrapper that stage C/D tests reuse.
 use super::snapshot_dir::read_sidecar;
 use super::types::{NodeId, TypeConfig};
 use super::wire;
-use crate::paths::{ClusterIdentity, CLUSTER_ID_HEADER};
+use crate::paths::{ClusterIdentity, CLUSTER_ID_HEADER, EXTRACTORS_HASH_HEADER};
 use graph_proto::pb;
 use graph_proto::pb::raft_client::RaftClient;
 use graph_proto::PROTOCOL_VERSION_HEADER;
@@ -44,9 +60,93 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 
-/// Soft cap on the entry bytes of one `AppendEntries` RPC (a single larger
-/// entry is sent alone).
-pub const RAFT_RPC_MAX_BYTES: usize = 16 << 20;
+/// Soft cap on the entry bytes of one `AppendEntries` RPC: more entries
+/// than fit are answered locally with `PayloadTooLarge` and openraft sends
+/// fewer. A single entry larger than the cap (an `IndexChunk` is cut at
+/// `RAFT_ENTRY_MAX_BYTES` = 8 MiB, and one file bigger than that is an
+/// entry of its own) is sent alone.
+pub const RAFT_RPC_MAX_BYTES: usize = 4 << 20;
+
+/// The longest one `AppendEntries` transfer that carries entries may take
+/// (it outlives openraft's per-call timeout, see the module docs).
+pub const APPEND_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// At most one warning per peer this often.
+pub const WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// Per-peer network outcomes (shared by every connection of a node).
+#[derive(Clone, Default)]
+pub struct NetStats {
+    inner: Arc<Mutex<NetStatsInner>>,
+}
+
+#[derive(Default)]
+struct NetStatsInner {
+    peers: HashMap<NodeId, PeerStats>,
+    payload_too_large: u64,
+    joined_transfers: u64,
+}
+
+#[derive(Default)]
+struct PeerStats {
+    last_error: Option<String>,
+    last_warned: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl NetStats {
+    fn with<T>(&self, f: impl FnOnce(&mut NetStatsInner) -> T) -> T {
+        f(&mut self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    /// A failed RPC to `target`: remember it and warn (rate limited).
+    fn failed(&self, target: NodeId, what: &str) {
+        self.with(|s| {
+            let p = s.peers.entry(target).or_default();
+            p.last_error = Some(what.to_string());
+            let now = std::time::Instant::now();
+            if p.last_warned.is_none_or(|t| now.duration_since(t) >= WARN_EVERY) {
+                tracing::warn!(
+                    target_node = target,
+                    error = what,
+                    suppressed = p.suppressed,
+                    "raft RPC failed"
+                );
+                p.last_warned = Some(now);
+                p.suppressed = 0;
+            } else {
+                p.suppressed += 1;
+            }
+        });
+    }
+
+    fn succeeded(&self, target: NodeId) {
+        self.with(|s| {
+            if let Some(p) = s.peers.get_mut(&target) {
+                p.last_error = None;
+            }
+        });
+    }
+
+    /// The last error of the last failed RPC to `target`, unless an RPC
+    /// succeeded since.
+    pub fn last_error(&self, target: NodeId) -> Option<String> {
+        self.with(|s| s.peers.get(&target).and_then(|p| p.last_error.clone()))
+    }
+
+    /// `AppendEntries` answered locally with `PayloadTooLarge`.
+    pub fn payload_too_large(&self) -> u64 {
+        self.with(|s| s.payload_too_large)
+    }
+
+    /// openraft retries that joined a transfer still under way.
+    pub fn joined_transfers(&self) -> u64 {
+        self.with(|s| s.joined_transfers)
+    }
+}
 
 /// Snapshot stream chunk size.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 1 << 20;
@@ -57,10 +157,12 @@ fn unreachable(target: NodeId, what: impl std::fmt::Display) -> Unreachable {
     Unreachable::new(&std::io::Error::other(format!("node {target}: {what}")))
 }
 
-/// Adds the protocol version and this node's cluster id to every call.
+/// Adds the protocol version, this node's cluster id and its extractor
+/// version set hash to every call.
 #[derive(Clone)]
 pub struct RaftHeaders {
     identity: Arc<ClusterIdentity>,
+    extractors_hash: Arc<str>,
 }
 
 impl Interceptor for RaftHeaders {
@@ -78,6 +180,9 @@ impl Interceptor for RaftHeaders {
                 md.insert(CLUSTER_ID_HEADER, v);
             }
         }
+        if let Ok(v) = self.extractors_hash.parse() {
+            md.insert(EXTRACTORS_HASH_HEADER, v);
+        }
         Ok(req)
     }
 }
@@ -88,16 +193,20 @@ type Client = RaftClient<InterceptedService<Channel, RaftHeaders>>;
 #[derive(Clone)]
 pub struct GrpcNetwork {
     identity: Arc<ClusterIdentity>,
+    extractors_hash: Arc<str>,
     channels: Arc<Mutex<HashMap<NodeId, (String, Channel)>>>,
     connect_timeout: Duration,
+    stats: NetStats,
 }
 
 impl GrpcNetwork {
-    pub fn new(identity: Arc<ClusterIdentity>) -> Self {
+    pub fn new(identity: Arc<ClusterIdentity>, extractors_hash: &str, stats: NetStats) -> Self {
         Self {
             identity,
+            extractors_hash: Arc::from(extractors_hash),
             channels: Arc::new(Mutex::new(HashMap::new())),
             connect_timeout: Duration::from_secs(2),
+            stats,
         }
     }
 
@@ -143,15 +252,50 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
             target,
             addr: node.addr.clone(),
             net: self.clone(),
+            inflight: None,
         }
     }
 }
+
+/// What makes two `AppendEntries` the same transfer: the leader's vote,
+/// the previous log id, and the first and last entry ids with the count.
+type AppendKey = (
+    pb::RaftVote,
+    Option<pb::RaftLogId>,
+    Option<(u64, u64)>,
+    Option<(u64, u64)>,
+    usize,
+);
+
+fn append_key(r: &AppendEntriesRequest<TypeConfig>) -> AppendKey {
+    let id = |e: &super::types::Entry| (e.log_id.leader_id.term, e.log_id.index);
+    (
+        wire::vote_to_pb(&r.vote),
+        r.prev_log_id.as_ref().map(wire::log_id_to_pb),
+        r.entries.first().map(id),
+        r.entries.last().map(id),
+        r.entries.len(),
+    )
+}
+
+type Transfer = tokio::task::JoinHandle<Result<pb::AppendEntriesResponse, String>>;
 
 /// One peer.
 pub struct GrpcConnection {
     target: NodeId,
     addr: String,
     net: GrpcNetwork,
+    /// The last `AppendEntries` with entries, possibly still under way.
+    inflight: Option<(AppendKey, Transfer)>,
+}
+
+/// Whether a status is the transport failing (reconnect) rather than the
+/// peer answering.
+fn is_transport(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled
+    )
 }
 
 impl GrpcConnection {
@@ -159,31 +303,97 @@ impl GrpcConnection {
         let ch = self
             .net
             .channel(self.target, &self.addr)
-            .map_err(|e| unreachable(self.target, e))?;
+            .map_err(|e| self.failed(e))?;
         let headers = RaftHeaders {
             identity: Arc::clone(&self.net.identity),
+            extractors_hash: Arc::clone(&self.net.extractors_hash),
         };
         Ok(RaftClient::with_interceptor(ch, headers)
             .max_decoding_message_size(NO_LIMIT)
             .max_encoding_message_size(NO_LIMIT))
     }
 
-    /// A failed call: drop the channel so the next one reconnects.
+    /// A failed call: record it (and warn, rate limited).
     fn failed(&self, what: impl std::fmt::Display) -> Unreachable {
-        self.net.forget(self.target);
+        let what = what.to_string();
+        self.net.stats.failed(self.target, &what);
         unreachable(self.target, what)
     }
 
-    /// Run one unary call under the RPC's hard timeout.
+    /// A failed call with a status: also drop the channel on a transport
+    /// failure so the next call reconnects.
+    fn failed_status(&self, st: &tonic::Status) -> Unreachable {
+        if is_transport(st.code()) {
+            self.net.forget(self.target);
+        }
+        self.failed(format!("{:?}: {}", st.code(), st.message()))
+    }
+
+    /// Run one unary call under the RPC's hard timeout. A timeout keeps
+    /// the channel (the connection works, the peer is slow).
     async fn unary<T>(
         &self,
         option: &RPCOption,
         fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     ) -> Result<T, Unreachable> {
         match tokio::time::timeout(option.hard_ttl(), fut).await {
-            Ok(Ok(r)) => Ok(r.into_inner()),
-            Ok(Err(st)) => Err(self.failed(format!("{}: {}", st.code(), st.message()))),
-            Err(_) => Err(self.failed(format!("timed out after {:?}", option.hard_ttl()))),
+            Ok(Ok(r)) => {
+                self.net.stats.succeeded(self.target);
+                Ok(r.into_inner())
+            }
+            Ok(Err(st)) => Err(self.failed_status(&st)),
+            Err(_) => Err(self.failed(format!(
+                "DeadlineExceeded: no answer within {:?}",
+                option.hard_ttl()
+            ))),
+        }
+    }
+
+    /// Send (or join) an `AppendEntries` that carries entries, as a task
+    /// that outlives openraft's timeout on this call.
+    async fn transfer(
+        &mut self,
+        key: AppendKey,
+        req: pb::AppendEntriesRequest,
+    ) -> Result<pb::AppendEntriesResponse, Unreachable> {
+        let joined = matches!(&self.inflight, Some((k, _)) if *k == key);
+        if joined {
+            self.net.stats.with(|s| s.joined_transfers += 1);
+        } else {
+            // Another transfer (older entries, an older vote) may still be
+            // running: it finishes or times out on its own; its answer is
+            // not this call's.
+            let mut c = self.client()?;
+            let net = self.net.clone();
+            let target = self.target;
+            let task = tokio::spawn(async move {
+                match tokio::time::timeout(APPEND_TRANSFER_TIMEOUT, c.append_entries(req)).await {
+                    Ok(Ok(r)) => Ok(r.into_inner()),
+                    Ok(Err(st)) => {
+                        if is_transport(st.code()) {
+                            net.forget(target);
+                        }
+                        Err(format!("{:?}: {}", st.code(), st.message()))
+                    }
+                    Err(_) => Err(format!(
+                        "DeadlineExceeded: the transfer took over {APPEND_TRANSFER_TIMEOUT:?}"
+                    )),
+                }
+            });
+            self.inflight = Some((key, task));
+        }
+        let (_, task) = self.inflight.as_mut().expect("set above");
+        // Cancel-safe: if openraft's timeout drops this future, the task
+        // (and the handle in `inflight`) stays for the retry to join.
+        let out = task.await;
+        self.inflight = None;
+        match out {
+            Ok(Ok(r)) => {
+                self.net.stats.succeeded(self.target);
+                Ok(r)
+            }
+            Ok(Err(e)) => Err(self.failed(e)),
+            Err(e) => Err(self.failed(format!("append task: {e}"))),
         }
     }
 }
@@ -212,12 +422,17 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
         let sizes: Vec<usize> = req.entries.iter().map(Vec::len).collect();
         let fit = entries_that_fit(&sizes, RAFT_RPC_MAX_BYTES);
         if fit < sizes.len() {
+            self.net.stats.with(|s| s.payload_too_large += 1);
             return Err(RPCError::PayloadTooLarge(
                 PayloadTooLarge::new_entries_hint(fit as u64),
             ));
         }
-        let mut c = self.client()?;
-        let resp = self.unary(&option, c.append_entries(req)).await?;
+        let resp = if req.entries.is_empty() {
+            let mut c = self.client()?;
+            self.unary(&option, c.append_entries(req)).await?
+        } else {
+            self.transfer(append_key(&rpc), req).await?
+        };
         wire::append_resp_from_pb(resp).map_err(|e| RPCError::Unreachable(self.failed(e)))
     }
 
@@ -293,9 +508,10 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
             Err(e) => return Err(self.failed(format!("snapshot reader: {e}")).into()),
         }
         let resp = r
-            .map_err(|st| self.failed(format!("{}: {}", st.code(), st.message())))?
+            .map_err(|st| self.failed_status(&st))?
             .into_inner();
         let vote = wire::vote_from_pb(resp.vote).map_err(|e| self.failed(e))?;
+        self.net.stats.succeeded(self.target);
         Ok(SnapshotResponse::new(vote))
     }
 }

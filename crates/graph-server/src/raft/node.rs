@@ -3,7 +3,7 @@
 //! mode's first start), resume from the log after, run the snapshot policy,
 //! and answer the leader and membership questions the services ask.
 use super::log_store::{AppendObserver, RedbLogStore};
-use super::network::{FaultPlan, FaultyNetwork, GrpcNetwork};
+use super::network::{FaultPlan, FaultyNetwork, GrpcNetwork, NetStats};
 use super::snapshot_dir::SnapshotDir;
 use super::state_machine::{SmFailpoints, StoreStateMachine};
 use super::types::{LogRequest, LogResponse, NodeId, TypeConfig};
@@ -40,7 +40,7 @@ pub struct RaftSettings {
     /// default 1000), so a briefly lagging follower catches up from the
     /// log rather than by a snapshot.
     pub log_keep_entries: u64,
-    /// Purge only once this many entries can go at once.
+    /// Purge only once this many entries can go at once (default 1).
     pub purge_batch_size: u64,
     /// At most this many entries per `AppendEntries` (the byte cap in the
     /// network also applies).
@@ -58,7 +58,11 @@ impl RaftSettings {
             snapshot_log_entries: 10_000,
             snapshot_log_bytes: 1 << 30,
             log_keep_entries: 1000,
-            purge_batch_size: 64,
+            // 1, not a bigger batch: an entry carries up to 8 MiB of
+            // source, so waiting for 64 purgeable entries could keep
+            // 512 MiB of log after a snapshot (a whole corpus index is a
+            // handful of entries). A purge is one range delete.
+            purge_batch_size: 1,
             max_payload_entries: 64,
         }
     }
@@ -92,6 +96,10 @@ pub struct NodeStart {
     pub identity: Arc<ClusterIdentity>,
     /// Initialize a one-member cluster if the log is not initialized yet.
     pub initialize: bool,
+    /// Test-only: the log lives on this storage backend, not in a file.
+    pub storage_backend: Option<crate::powercut::BackendFactory>,
+    /// This node's extractor version set hash (sent on every Raft RPC).
+    pub extractors_hash: String,
     pub settings: RaftSettings,
     pub disk: DiskGuard,
     /// Test hooks.
@@ -108,6 +116,8 @@ pub struct RaftNode {
     pub addr: String,
     pub snapshots: Arc<SnapshotDir>,
     pub disk: DiskGuard,
+    /// Per-peer network outcomes (the last error, shown in `Status`).
+    pub net_stats: NetStats,
     /// Test hook ([`crate::server::TestingHooks::withhold_leader`]).
     pub withhold_leader: bool,
 }
@@ -161,11 +171,29 @@ impl RaftNode {
         }
         .validate()
         .map_err(fatal)?;
-        let mut log_store = RedbLogStore::open(&p.log_path)?;
+        let mut log_store = RedbLogStore::open_with(
+            &p.log_path,
+            p.storage_backend.as_ref().map(|f| f(&p.log_path)),
+        )?;
         log_store.set_observer(p.append_observer.clone());
+        {
+            let (slot, snaps, log) = (
+                Arc::clone(&p.slot),
+                Arc::clone(&p.snapshots),
+                log_store.clone(),
+            );
+            tokio::task::spawn_blocking(move || repair_stale_snapshot(&slot, &snaps, &log))
+                .await
+                .map_err(fatal)??;
+        }
         let sm = StoreStateMachine::new(Arc::clone(&p.slot), Arc::clone(&p.snapshots))
             .with_failpoints(p.failpoints);
-        let net = GrpcNetwork::new(Arc::clone(&p.identity));
+        let net_stats = NetStats::default();
+        let net = GrpcNetwork::new(
+            Arc::clone(&p.identity),
+            &p.extractors_hash,
+            net_stats.clone(),
+        );
         let config = Arc::new(config);
         let raft = match p.faults.clone() {
             Some(plan) => {
@@ -191,6 +219,7 @@ impl RaftNode {
             addr: p.advertise,
             snapshots: p.snapshots,
             disk: p.disk,
+            net_stats,
             withhold_leader: false,
         };
         if node.sole_voter() {
@@ -285,6 +314,22 @@ impl RaftNode {
         Ok(r.log_id().index)
     }
 
+    /// Make `id` (already a learner) a voter, keeping every other member
+    /// as it is at the moment the change is applied: an add, not a
+    /// replacement of the voter set, so two promotes racing each other
+    /// both take effect. Returns the final membership entry's index.
+    pub async fn promote(&self, id: NodeId) -> Result<u64, StoreError> {
+        let r = self
+            .raft
+            .change_membership(
+                openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
+                true,
+            )
+            .await
+            .map_err(write_err)?;
+        Ok(r.log_id().index)
+    }
+
     /// Build a snapshot now (after the disk guard) and wait until the
     /// current snapshot covers what was applied when asked; returns its
     /// `(index, term)`.
@@ -348,12 +393,28 @@ impl RaftNode {
 /// bytes appended since the last one, if the disk guard allows; openraft
 /// then purges the log below it, keeping `log_keep_entries`. Ends when the
 /// Raft node shuts down.
+///
+/// It re-evaluates on every metrics change and at least every
+/// [`POLICY_TICK`], so a build the disk guard refused is retried once space
+/// frees up even on an idle cluster; a triggered build that never produced
+/// a snapshot (openraft logs a failed build and carries on) is retried
+/// after [`SNAPSHOT_RETRY`]. The byte trigger counts from what the log held
+/// above the snapshot at start, so a restart does not reset it.
 async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
     let mut rx = node.raft.metrics();
     let entries = s.snapshot_log_entries.max(1);
     let mut last_snap = rx.borrow().snapshot.map(|l| l.index);
-    let mut base_bytes = node.log_store.appended_bytes();
-    let mut pending: Option<u64> = None;
+    let mut base_bytes = {
+        let log = node.log_store.clone();
+        let snap = last_snap.unwrap_or(0);
+        let above = tokio::task::spawn_blocking(move || log.bytes_after(snap))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(0);
+        node.log_store.appended_bytes().saturating_sub(above)
+    };
+    let mut pending: Option<(u64, std::time::Instant)> = None;
     let mut disk_refused = false;
     loop {
         let (applied, snap, running) = {
@@ -370,9 +431,13 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
         if snap != last_snap {
             last_snap = snap;
             base_bytes = node.log_store.appended_bytes();
-            if pending.is_some_and(|p| snap.unwrap_or(0) >= p) {
+            if pending.is_some_and(|(p, _)| snap.unwrap_or(0) >= p) {
                 pending = None;
             }
+        }
+        if pending.is_some_and(|(_, at)| at.elapsed() >= SNAPSHOT_RETRY) {
+            tracing::warn!("a triggered snapshot build produced no snapshot; retrying");
+            pending = None;
         }
         let since = applied.saturating_sub(snap.unwrap_or(0));
         let bytes = node.log_store.appended_bytes().saturating_sub(base_bytes);
@@ -385,7 +450,7 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                     if node.raft.trigger().snapshot().await.is_err() {
                         return;
                     }
-                    pending = Some(applied);
+                    pending = Some((applied, std::time::Instant::now()));
                 }
                 Err(e) => {
                     if !disk_refused {
@@ -395,8 +460,50 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                 }
             }
         }
-        if rx.changed().await.is_err() {
-            return;
+        tokio::select! {
+            r = rx.changed() => if r.is_err() { return },
+            _ = tokio::time::sleep(POLICY_TICK) => {}
         }
     }
+}
+
+/// The snapshot policy re-evaluates at least this often.
+pub const POLICY_TICK: Duration = Duration::from_secs(1);
+
+/// A triggered build that produced no snapshot is retried after this.
+pub const SNAPSHOT_RETRY: Duration = Duration::from_secs(30);
+
+/// Start-up repair of a crash between a snapshot install's store swap and
+/// the promotion of the received file to the current snapshot (ADR 0004
+/// D7): the store is then at the installed index N while the current
+/// snapshot is an older M, and the log does not hold the entries between
+/// (they came in the snapshot, never as entries). openraft would take M as
+/// this node's snapshot while its applied state is N; a laggard it later
+/// leads would get M and then need entries this node never had, forever.
+/// So when the store's marker is above the current snapshot and the log
+/// does not reach the marker, a snapshot of the store is built now, before
+/// openraft starts. Returns whether it built one.
+pub fn repair_stale_snapshot(
+    slot: &StoreSlot,
+    snaps: &SnapshotDir,
+    log: &RedbLogStore,
+) -> Result<bool, StoreError> {
+    let marker = slot.with_store(|s| s.raft_marker())?.map_or(0, |m| m.index);
+    let snap = snaps.current().map_or(0, |(s, _)| s.index);
+    if marker == 0 || snap >= marker {
+        return Ok(false);
+    }
+    let log_last = log.last_index()?.unwrap_or(0);
+    if log_last >= marker {
+        return Ok(false);
+    }
+    tracing::warn!(
+        marker,
+        snapshot = snap,
+        log_last,
+        "the store is ahead of the current snapshot and the log (an interrupted snapshot \
+         install); building a snapshot of the store before starting"
+    );
+    snaps.build(slot)?;
+    Ok(true)
 }

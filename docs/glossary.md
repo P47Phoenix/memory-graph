@@ -42,6 +42,16 @@ Rust's word for a package of code. Think of it as one box of a bigger toy set. U
 ## Daemon
 A program that keeps running in the background and does work for other programs. Here, `memory-graph serve` is the daemon: it is the only program that opens the database file, and it may also host the MCP server (open, issue #109). The command line asks it (`--server`) instead of opening the file itself. A single-node version is built (epic story 20, stage A); [ADR 0004](adr/0004-client-server-and-replication.md) makes it reachable over the network (gRPC) and lets several of them form a cluster (epic story 20 builds it). Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md), [architecture diagrams](architecture-diagrams.md).
 
+## Data directory / `node.json` / bootstrap
+The directory a cluster node keeps everything in (`serve --data-dir`):
+- `node.json`: the node's identity (node id, cluster id, advertised address, versions);
+- `graph.redb`: the store;
+- `raft.redb`: the Raft log and vote;
+- `snapshots/`: the latest snapshot;
+- `LOCK`.
+
+**Bootstrap** (`--bootstrap`) creates a new cluster in an empty data directory, with a new random cluster id and this node as its only voter. On a directory that already has a `node.json` it is a plain restart. **Restore** (`--restore <file>`, with `--bootstrap`) seeds that new cluster's store from a snapshot file. Used in: [ADR 0004](adr/0004-client-server-and-replication.md) D6, [README](../README.md#cluster-preview).
+
 ## Dictionary
 A table that gives each distinct piece of text one small number (its id). Like a school register: instead of writing "Alexandra Petrovna" everywhere, you write "17". Used in: [ADR 0003](adr/0003-data-model.md).
 

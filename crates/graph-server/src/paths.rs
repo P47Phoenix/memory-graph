@@ -533,6 +533,7 @@ mod tests {
             store_format_version: 1,
             extractors_hash: "x".into(),
             created: 0,
+            bootstrapped: false,
         }
     }
 

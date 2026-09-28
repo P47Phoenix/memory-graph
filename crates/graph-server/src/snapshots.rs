@@ -205,10 +205,16 @@ impl SnapshotTable {
 
     /// Drop every handle (a compact or snapshot install replaces the file
     /// they read; their next use answers `SnapshotExpired`).
-    pub fn clear(&self) {
+    ///
+    /// Returns a weak reference to each dropped view: a request that got
+    /// its view before the clear may still be reading it (and with it the
+    /// old file), which a caller about to replace the file waits out.
+    pub fn clear(&self) -> Vec<std::sync::Weak<Mutex<V2Snapshot>>> {
         let mut t = self.lock();
+        let out = t.open.values().map(|h| Arc::downgrade(&h.snap)).collect();
         t.open.clear();
         t.per_conn.clear();
+        out
     }
 
     /// Open handles right now.

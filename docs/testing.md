@@ -75,9 +75,16 @@ The arm64 image is linked from the same pure-Rust source but not executed in
 CI (there is no arm64 runner); the amd64 smoke test is the assurance.
 
 A second step runs a server round on the same image: container 1 runs
-`serve --db /data/graph.redb --listen 0.0.0.0:7000` on a docker network and a volume; one-shot containers on that network wait for `health`, run
-`index --server` and `search --server`, `health --ready` and `cluster leader`; image's own `HEALTHCHECK` must turn `healthy`; `docker stop` (SIGTERM) must 0 and leave no `graph.redb.LOCK` on the volume, after which an embedded
-`describe` of the file lists the repo.
+`serve --data-dir /data --bootstrap --node-id 1 --listen 0.0.0.0:7000` on a
+docker network and a volume. One-shot containers on that network wait for
+`health`, then run `index --server`, `search --server`, `health --ready`,
+`cluster leader` and `cluster status --json` (the node leads and reports its
+cluster id and data directory). The image's own `HEALTHCHECK` must turn
+`healthy`. `docker stop` (SIGTERM) must exit 0 and leave `graph.redb`,
+`raft.redb` and `node.json`, but no `LOCK`, on the volume. `docker start`
+(the same command, `--bootstrap` included) must come back ready with the
+same cluster id and the indexed data. After a second stop, an embedded
+`describe` of `/data/graph.redb` lists the repo.
 
 ## Server and client (ADR 0004 stage A)
 
@@ -118,6 +125,76 @@ Four layers, from the wire up:
    in release): embedded versus remote on the same file, p50/p95; the numbers
    and the verdict against the 5 ms trigger are in
    [spikes/rpc-overhead.md](spikes/rpc-overhead.md).
+
+## Cluster (ADR 0004 stage B)
+
+Two more layers on top of the four above. Every wait polls a condition with
+a hard timeout and a message naming what it waited for. Faults are injected
+through deterministic hooks (failpoints in `TestingHooks`, the network
+`FaultPlan`, a fake free-space probe), never by sleeping and hoping.
+
+5. **Cluster testbed** (`cargo test -p graph-server --test cluster`):
+   `graph_server::testing::ClusterTestbed` runs n in-process nodes on
+   `127.0.0.1:0` with temporary data directories and fast Raft timing. It
+   runs them on its own runtime thread, so `RemoteStore` can be used from
+   the test thread. Node 1 bootstraps and the others start uninitialized;
+   `form()` adds and promotes them. Nodes can `stop()`, `kill()` (no
+   graceful shutdown, the store dropped without a clean close) and
+   `restart()` on the same port and directory. The tests cover:
+   - replication of a corpus subset: three languages and a file over 1 MiB,
+     with `run_differential` between two nodes and against an embedded
+     oracle;
+   - leader loss, with local reads on the survivors checked continuously
+     through the election, writes resuming on the new leader, and the old
+     leader catching up;
+   - a laggard catching up by `InstallSnapshot` after the log was purged
+     past it;
+   - restarting every node from persisted state;
+   - exactly-once apply across a crash before apply and inside the apply
+     transaction (failpoints), and an acknowledged write surviving `kill()`
+     of every node;
+   - the log's durability order (the `LogFlushed` callback only after the
+     redb commit returns, recorded by an observer);
+   - `cluster snapshot --out` restored into a new cluster (same answers, a
+     new cluster id, a fresh log);
+   - bootstrap idempotence, the refusals (an empty directory without flags,
+     a different node id, another extractors hash on install), and the disk
+     guard's `RESOURCE_EXHAUSTED`.
+
+   The log store's own unit tests (`cargo test -p graph-server --lib
+   log_store`) include the post-purge compaction.
+6. **Three processes** (`cargo test -p graph-cli --test cluster_e2e`): three
+   real `memory-graph serve --data-dir ... --node-id N --listen 127.0.0.1:0`
+   processes run in these steps:
+   1. Node 1 starts with `--bootstrap`, and nodes 2 and 3 with the hidden
+      `--wait-for-membership`. They form a cluster through the CLI's preview
+      `cluster add-learner` / `cluster promote`, and `cluster status` shows
+      every member and the leader's lag.
+   2. The vendored corpus is indexed through node 1 with `--server`. Node 3,
+      a follower serving local reads, answers `describe`, `search`,
+      `symbols` and `export` byte for byte as an embedded run does.
+   3. The leader is stopped with `Admin.Shutdown`, and `cluster leader` on a
+      survivor names the new one. A write goes through it and is read back
+      from the other survivor.
+   4. The old leader restarts from its data directory with no flags (same
+      port, since the advertised address is part of its identity). It
+      rejoins as a follower, catches up and answers identically.
+   5. On unix, SIGTERM stops the new leader cleanly and the remaining two
+      nodes elect again.
+
+   A second test covers the `serve --data-dir` refusals (an empty directory
+   without `--bootstrap`, `--restore` without `--bootstrap`, `--db` with
+   `--data-dir`, a different `--node-id` on restart) and `--bootstrap` on
+   an initialized directory keeping its cluster id. The ignored
+   `measure_replication` in the same file produces
+   [spikes/raft-replication.md](spikes/raft-replication.md) (run it with
+   `--release --ignored --nocapture`).
+
+The Raft log's size gate is in `crates/graph-cli/tests/size_gate.rs`. After
+three corpus passes, `cluster snapshot` and the purge, `raft.redb` must be at
+most 1.5x the source indexed. The Docker smoke (above) serves
+`--data-dir /data --bootstrap` and checks that `docker start` after a stop is
+an idempotent restart.
 
 ## Database size
 

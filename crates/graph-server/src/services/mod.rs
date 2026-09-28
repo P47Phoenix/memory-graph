@@ -76,7 +76,9 @@ impl Ctx {
                 if view == View::Linearizable {
                     self.raft.ensure_linearizable().await.map_err(status)?;
                 }
-                tokio::task::spawn_blocking(move || slot.with_store(|s| f(s)))
+                // Fails fast (UNAVAILABLE) while a snapshot install swaps
+                // the file (D8): the client moves to its next endpoint.
+                tokio::task::spawn_blocking(move || slot.with_store_read(|s| f(s)))
                     .await
                     .map_err(join_err)?
                     .map_err(status)

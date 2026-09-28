@@ -11,7 +11,7 @@ use crate::disk::{system_probe, DiskGuard, FreeSpaceProbe};
 use crate::extractors::{extractors_hash, share};
 use crate::lock::LockFile;
 use crate::paths::{self, ClusterIdentity, InitMode, NodeJson, NodePaths};
-use crate::raft::log_store::AppendObserver;
+use crate::raft::log_store::{AppendObserver, RedbLogStore};
 use crate::raft::network::FaultPlan;
 use crate::raft::node::NodeStart;
 use crate::raft::snapshot_dir::SnapshotDir;
@@ -98,6 +98,13 @@ pub struct ServeConfig {
     /// Fault injection for tests of the client and CLI (never set by
     /// `serve`).
     pub testing: TestingHooks,
+    /// Test-only: open the store and the log over these redb storage
+    /// backends instead of files (the power-cut tests). Snapshots, installs
+    /// and `compact` still use files and are not supported with it.
+    pub storage_backend: Option<crate::powercut::BackendFactory>,
+    /// Test-only: a snapshot install waits at this gate (holding the
+    /// store's install state) until the test opens it.
+    pub install_gate: Option<crate::slot::InstallGate>,
 }
 
 /// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
@@ -125,6 +132,13 @@ pub struct TestingHooks {
     /// index fails just before its commit (data and marker staged, then
     /// rolled back), and openraft stops the node.
     pub fail_in_apply_txn: Option<u64>,
+    /// Failpoint: a first start fails right after writing `node.json`,
+    /// before the Raft node is initialized (a crash in that window).
+    pub fail_after_node_json: bool,
+    /// Hold every received `AppendEntries` that carries entries for this
+    /// long before handing it to Raft (a slow link or disk, longer than
+    /// the leader's heartbeat timeout). Heartbeats are not delayed.
+    pub delay_append_entries_ms: Option<u64>,
 }
 
 impl ServeConfig {
@@ -147,6 +161,8 @@ impl ServeConfig {
             shutdown_grace: Duration::from_secs(30),
             sysinfo: None,
             testing: TestingHooks::default(),
+            storage_backend: None,
+            install_gate: None,
         }
     }
 
@@ -285,6 +301,15 @@ pub async fn start(
         Some(p) => p.node_id,
         None => cfg.node_id.unwrap_or(1),
     };
+    // Bind before anything is written: a port in use must not leave a store
+    // behind (the next start would find a store and no node.json). A store
+    // held by another server is still refused below, by redb's lock.
+    let listener = TcpListener::bind(cfg.listen)
+        .await
+        .map_err(|e| io_err(&format!("cannot listen on {}", cfg.listen), e))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| io_err("local address", e))?;
     if let Some(dir) = &paths.data_dir {
         std::fs::create_dir_all(dir)
             .map_err(|e| io_err(&format!("creating `{}`", dir.display()), e))?;
@@ -292,14 +317,21 @@ pub async fn start(
     if let Some(snap) = plan.as_ref().and_then(|p| p.restore.as_deref()) {
         paths::restore_into(snap, &paths.store)?;
     }
+    let store_existed = cfg.storage_backend.is_some() || paths.store.exists();
+    let log_probe = match &cfg.storage_backend {
+        Some(_) => None,
+        None => Some(RedbLogStore::probe(&paths.log)?),
+    };
     // redb's exclusive lock is the ownership check (`Locked` for a second
     // server on the same file); everything else follows.
-    let slot = StoreSlot::open(
+    let slot = StoreSlot::open_with(
         &paths.store,
         extractors,
         cfg.cache_bytes,
         cfg.snapshot_max_age,
+        cfg.storage_backend.clone(),
     )?;
+    slot.set_install_gate(cfg.install_gate.clone());
     if let Some(at) = cfg.testing.fail_in_apply_txn {
         slot.set_marked_commit_hook(Some(Arc::new(move |m: &graph_store::RaftMarker| {
             if m.index == at {
@@ -312,12 +344,7 @@ pub async fn start(
             }
         })));
     }
-    let listener = TcpListener::bind(cfg.listen)
-        .await
-        .map_err(|e| io_err(&format!("cannot listen on {}", cfg.listen), e))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| io_err("local address", e))?;
+    let mut initialize = plan.is_none();
     let (identity, advertise) = match (&plan, &paths.node_json) {
         (Some(plan), Some(json_path)) => {
             let (json, advertise) = match &plan.existing {
@@ -332,6 +359,21 @@ pub async fn start(
                             )));
                         }
                     }
+                    // The log and the store must agree before the node
+                    // takes part in any election (QA: a lost raft.redb
+                    // would let it vote twice in a term).
+                    if let Some(probe) = log_probe {
+                        let marker = slot
+                            .with_store(|s| s.raft_marker())?
+                            .map_or(0, |m| m.index);
+                        paths::check_log_and_store(
+                            paths.data_dir.as_deref().unwrap_or(Path::new("")),
+                            probe,
+                            store_existed,
+                            marker,
+                        )?;
+                    }
+                    initialize = found.bootstrapped;
                     (found.clone(), found.advertise.clone())
                 }
                 None => {
@@ -349,8 +391,17 @@ pub async fn start(
                         store_format_version: graph_store::SCHEMA_VERSION,
                         extractors_hash: hash.clone(),
                         created: paths::now_secs(),
+                        bootstrapped: plan.bootstrap,
                     };
                     json.write(json_path)?;
+                    if cfg.testing.fail_after_node_json {
+                        return Err(StoreError::Storage(
+                            "testing: failpoint after writing node.json, before the Raft \
+                             node is initialized"
+                                .into(),
+                        ));
+                    }
+                    initialize = plan.bootstrap;
                     if let Some(id) = &cluster_id {
                         eprintln!(
                             "memory-graph serve: WARNING: --bootstrap created a NEW cluster {id} \
@@ -403,8 +454,13 @@ pub async fn start(
         snapshots: Arc::clone(&snapshots),
         identity: Arc::clone(&identity),
         // `--db` mode initializes a one-member cluster on first start
-        // (stage A); `--data-dir` only with `--bootstrap` on an empty dir.
-        initialize: plan.as_ref().is_none_or(|p| p.bootstrap),
+        // (stage A); `--data-dir` only a node that minted its cluster
+        // (`bootstrapped` in node.json: `--bootstrap` on an empty dir),
+        // also on a later start if a crash came before the initialization
+        // (guarded by `is_initialized`, so a no-op once it happened).
+        initialize,
+        storage_backend: cfg.storage_backend.clone(),
+        extractors_hash: hash.clone(),
         settings,
         disk,
         faults: cfg.fault_plan.clone(),
@@ -526,6 +582,11 @@ pub async fn start(
                 raft: raft.raft.clone(),
                 identity: Arc::clone(&identity),
                 snapshots: Arc::clone(&snapshots),
+                disk: raft.disk.clone(),
+                delay_append: cfg
+                    .testing
+                    .delay_append_entries_ms
+                    .map(Duration::from_millis),
             })
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),

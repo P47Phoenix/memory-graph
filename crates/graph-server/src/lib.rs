@@ -24,6 +24,8 @@
 //! * [`services`]: the four tonic services (`raft` is the peers' side).
 //! * [`disk`]: the disk guard (`--min-free-disk`).
 //! * [`lock`]: the LOCK sidecar naming the holder.
+//! * [`powercut`]: a test-only in-memory redb storage backend that can
+//!   lose power (the durability tests).
 //! * [`testing`]: [`testing::TestServer`] and [`testing::ClusterTestbed`]
 //!   for tests.
 //!
@@ -40,6 +42,7 @@ pub mod disk;
 pub mod extractors;
 pub mod lock;
 pub mod paths;
+pub mod powercut;
 pub mod raft;
 pub mod server;
 pub mod services;
