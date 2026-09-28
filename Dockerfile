@@ -61,5 +61,12 @@ COPY --from=build --chown=65532:65532 /data /data
 USER 65532:65532
 WORKDIR /data
 VOLUME ["/data"]
+# Server mode (ADR 0004): `serve --db /data/graph.redb --listen 0.0.0.0:7000`.
+# The health check asks the server itself over gRPC (grpc.health.v1); in a
+# container that runs a one-shot command instead, there is nothing on 7000
+# and the check simply fails, which a one-shot run never waits for.
+EXPOSE 7000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --start-interval=1s --retries=3 \
+  CMD ["/memory-graph", "health", "--server", "127.0.0.1:7000"]
 ENTRYPOINT ["/memory-graph"]
 CMD ["--help"]
