@@ -1045,6 +1045,11 @@ pub fn index_dir_with(
             "failed_files": failed.iter().map(|(p, r)| serde_json::json!({"path": p, "reason": r})).collect::<Vec<_>>(),
         });
         let mut summary = summary;
+        if let Some(r) = &view.remote {
+            // `--server`: whether the connected node forwarded the writes
+            // to the leader (it is a follower).
+            summary["forwarded_to_leader"] = r.forwarded_to_leader.into();
+        }
         if o.stats {
             summary["stats"] = view.stats_json();
         }

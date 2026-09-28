@@ -16,18 +16,29 @@
 //! * `Promote`: an unknown id, a voter, or a node whose extractor version
 //!   set hash differs (asked again at promotion time) is refused.
 //! * `Remove`: the leader itself ("transfer leadership first"), 3 voters
-//!   down to 2 without `force`, and any removal after which the voters that
-//!   are reachable now would be fewer than a quorum of the new voter set
-//!   (or no voter would be left) are refused.
+//!   down to 2 without `force`, and any removal for which the voters that
+//!   are reachable now are fewer than a quorum of the new voter set or of
+//!   the old one (joint consensus needs both), or no voter would be left,
+//!   are refused.
 //!
-//! `TransferLeader` (openraft 0.9 has no transfer of its own): the leader
-//! checks the target is a voter with a replication lag of zero, stops its
-//! heartbeats and its own elections and refuses new writes (`NoLeader`, the
-//! client retries) so no append renews the followers' leader lease, waits
-//! the lease out (`election_timeout_max`), then asks the target to campaign
-//! (`Admin.TriggerElect` -> `Raft::trigger().elect()`), repeating until the
-//! target leads or [`TRANSFER_WAIT`] passes; its heartbeats and elections
-//! are switched back on whatever the outcome.
+//! TransferLeader (openraft 0.9 has no transfer of its own): the leader
+//! checks the target is a voter with a replication lag of zero, takes the
+//! one transfer slot (a concurrent second transfer is refused), refuses new
+//! writes and membership changes (NoLeader, the client retries) so its
+//! log stops growing, checks the lag again, then asks the target to
+//! campaign every [TRANSFER_POLL] (Admin.TriggerElect ->
+//! Raft::trigger().elect()) until it leads or [TRANSFER_WAIT] passes.
+//! Heartbeats stay on (openraft 0.9 can switch off heartbeats, but not
+//! appends alone, and appends are what the write refusal stops): the
+//! followers keep their leader lease, so a transfer that fails (the target
+//! is down) disturbs nobody and leadership simply stays. The leader's own
+//! vote is not leased by its heartbeats, so it grants the target's vote
+//! (the target's log is as long as its own) and steps down; in a larger
+//! cluster the other followers' leases then run out (lection_timeout_max
+//! after the last heartbeat) before any of them campaigns on its own (lease
+//! plus at least lection_timeout_min), and the target, asking every
+//! poll, collects their votes first. The leader's own elections are off
+//! during the transfer and switched back on whatever the outcome.
 use super::{status, Ctx};
 use crate::forward::{forward_error, Route};
 use crate::raft::NodeId;
@@ -88,6 +99,14 @@ fn ensure_leader(ctx: &Ctx) -> Result<(), Status> {
     } else {
         Err(status(ctx.raft.not_leader()))
     }
+}
+
+/// [`ensure_leader`] for a membership change: also `NoLeader` while a
+/// leadership transfer runs here (the client retries, and reaches the new
+/// leader).
+fn ensure_leader_idle(ctx: &Ctx) -> Result<(), Status> {
+    ensure_leader(ctx)?;
+    ctx.raft.no_leader_while_transferring().map_err(status)
 }
 
 /// Ask the server at `addr` who it is (`Admin.Status`) and refuse
@@ -181,7 +200,7 @@ fn members_of(ctx: &Ctx) -> Vec<pb::Member> {
 
 /// `Promote` on the leader, with its guards.
 async fn promote_guarded(ctx: &Ctx, id: NodeId) -> Result<u64, Status> {
-    ensure_leader(ctx)?;
+    ensure_leader_idle(ctx)?;
     let m = ctx.raft.metrics();
     let mem = m.membership_config.membership();
     let Some(node) = mem.get_node(&id) else {
@@ -226,7 +245,7 @@ fn reachable_voters(ctx: &Ctx, voters: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
 
 /// `Remove` on the leader, with its guards.
 async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Status> {
-    ensure_leader(ctx)?;
+    ensure_leader_idle(ctx)?;
     if id == ctx.info.node_id {
         return Err(rejected(format!(
             "node {id} is the leader; transfer leadership first (`cluster transfer-leader \
@@ -247,17 +266,24 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Statu
     if after.is_empty() {
         return Err(rejected(format!("removing node {id} would leave no voter")));
     }
-    let quorum = after.len() / 2 + 1;
-    let up = reachable_voters(ctx, &after);
-    if up.len() < quorum {
-        let down: Vec<NodeId> = after.difference(&up).copied().collect();
-        return Err(rejected(format!(
-            "removing node {id} would drop below quorum: {} voters would remain ({after:?}), \
-             a quorum is {quorum}, and only {} of them are reachable now ({down:?} are not); \
-             bring them back first. --force does not override this",
-            after.len(),
-            up.len()
-        )));
+    // Joint consensus: the change commits only with a quorum of the old
+    // voter set AND one of the new set, so both are checked (the removed
+    // node counts toward the old set when it answers).
+    for (set, which) in [(&after, "remain"), (&voters, "vote on the change")] {
+        let quorum = set.len() / 2 + 1;
+        let up = reachable_voters(ctx, set);
+        if up.len() < quorum {
+            let down: Vec<NodeId> = set.difference(&up).copied().collect();
+            return Err(rejected(format!(
+                "removing node {id} would drop below quorum: {} voters would {which} \
+                 ({set:?}), a quorum is {quorum}, and only {} of them are reachable now \
+                 ({down:?} are not); bring them back first. --force does not override this. \
+                 (A node that just came back may still show its last error for a moment; \
+                 retry shortly.)",
+                set.len(),
+                up.len()
+            )));
+        }
     }
     if voters.len() == 3 && after.len() == 2 && !force {
         return Err(rejected(format!(
@@ -268,29 +294,66 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Statu
     ctx.raft.remove(id, true).await.map_err(status)
 }
 
-/// Switches a leader's heartbeats and elections off (and refuses new
-/// writes) for a transfer, and back on when dropped, whatever the outcome.
+/// Holds the transfer slot (new writes and membership changes answer
+/// `NoLeader`) and switches this node's own elections off, both undone when
+/// dropped, whatever the outcome.
 struct TransferGuard<'a> {
     ctx: &'a Ctx,
 }
 
 impl<'a> TransferGuard<'a> {
-    fn new(ctx: &'a Ctx) -> Self {
-        ctx.raft.transferring.store(true, Ordering::SeqCst);
-        let rc = ctx.raft.raft.runtime_config();
-        rc.heartbeat(false);
-        rc.elect(false);
-        Self { ctx }
+    /// Take the transfer; a second concurrent `TransferLeader` is refused.
+    fn new(ctx: &'a Ctx) -> Result<Self, Status> {
+        if ctx
+            .raft
+            .transferring
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(rejected(
+                "a leadership transfer is already in progress; wait for it to end".into(),
+            ));
+        }
+        ctx.raft.raft.runtime_config().elect(false);
+        Ok(Self { ctx })
     }
 }
 
 impl Drop for TransferGuard<'_> {
     fn drop(&mut self) {
-        let rc = self.ctx.raft.raft.runtime_config();
-        rc.heartbeat(true);
-        rc.elect(true);
+        self.ctx.raft.raft.runtime_config().elect(true);
         self.ctx.raft.transferring.store(false, Ordering::SeqCst);
     }
+}
+
+/// How often `TransferLeader` asks the target to campaign, and checks
+/// whether it won.
+pub const TRANSFER_POLL: Duration = Duration::from_millis(50);
+
+/// Wait until `to` matched this leader's last log index (lag zero), or
+/// refuse after [`TRANSFER_CATCH_UP`].
+async fn wait_caught_up(ctx: &Ctx, to: NodeId) -> Result<(), Status> {
+    ctx.raft
+        .raft
+        .wait(Some(TRANSFER_CATCH_UP))
+        .metrics(
+            |m| {
+                let last = m.last_log_index;
+                m.replication
+                    .as_ref()
+                    .and_then(|r| r.get(&to))
+                    .is_some_and(|l| l.map(|l| l.index) == last)
+            },
+            "the transfer target caught up",
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| {
+            rejected(format!(
+                "node {to} did not catch up with the leader within {TRANSFER_CATCH_UP:?}; \
+                 leadership stays here"
+            ))
+        })
 }
 
 /// `TransferLeader` on the leader (see the module doc).
@@ -311,36 +374,13 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
         )));
     }
     let addr = node.addr.clone();
-    ctx.raft
-        .raft
-        .wait(Some(TRANSFER_CATCH_UP))
-        .metrics(
-            |m| {
-                let last = m.last_log_index;
-                m.replication
-                    .as_ref()
-                    .and_then(|r| r.get(&to))
-                    .is_some_and(|l| l.map(|l| l.index) == last)
-            },
-            "the transfer target caught up",
-        )
-        .await
-        .map_err(|_| {
-            rejected(format!(
-                "node {to} did not catch up with the leader within {TRANSFER_CATCH_UP:?}; \
-                 leadership stays here"
-            ))
-        })?;
-    let lease = Duration::from_millis(ctx.raft.settings.election_max_ms);
-    let _guard = TransferGuard::new(ctx);
-    tracing::info!(
-        to,
-        ?lease,
-        "transferring leadership: waiting out the leader lease"
-    );
-    tokio::time::sleep(lease + Duration::from_millis(100)).await;
+    wait_caught_up(ctx, to).await?;
+    let _guard = TransferGuard::new(ctx)?;
+    // Re-check under the guard: no new write is accepted now, so what was
+    // in flight when the first check passed must reach the target too.
+    wait_caught_up(ctx, to).await?;
+    tracing::info!(to, "transferring leadership: asking the target to campaign");
     let deadline = Instant::now() + TRANSFER_WAIT;
-    let round = lease * 2;
     loop {
         let mut client = ctx.fwd.admin_client(&addr)?;
         match tokio::time::timeout(
@@ -350,13 +390,13 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
         .await
         {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(to, error = %e, "TriggerElect failed"),
-            Err(_) => tracing::warn!(to, "TriggerElect timed out"),
+            Ok(Err(e)) => tracing::debug!(to, error = %e, "TriggerElect failed"),
+            Err(_) => tracing::debug!(to, "TriggerElect timed out"),
         }
         let won = ctx
             .raft
             .raft
-            .wait(Some(round))
+            .wait(Some(TRANSFER_POLL))
             .metrics(|m| m.current_leader == Some(to), "the target leads")
             .await
             .is_ok();
@@ -444,7 +484,7 @@ pub fn spawn_auto_promote(ctx: Arc<Ctx>, id: NodeId) {
 
 /// `Join` on the leader.
 async fn join_guarded(ctx: &Arc<Ctx>, r: pb::JoinRequest) -> Result<pb::JoinResponse, Status> {
-    ensure_leader(ctx)?;
+    ensure_leader_idle(ctx)?;
     let (id, addr) = (r.node_id, r.advertise.clone());
     if id == 0 || addr.is_empty() {
         return Err(rejected(
@@ -484,6 +524,13 @@ async fn join_guarded(ctx: &Arc<Ctx>, r: pb::JoinRequest) -> Result<pb::JoinResp
         // Already a learner at this address: a restarted joiner asking
         // again. Nothing to add.
         Some(_) => {}
+        None if r.rejoin => {
+            return Err(rejected(format!(
+                "node {id} is not a member of this cluster (it was removed); it is not added \
+                 back on its own re-join. Add it again with `cluster add-learner {id} {addr}`, \
+                 or join it from an empty data directory"
+            )))
+        }
         None => {
             probe_node(ctx, id, &addr).await?;
             log_index = ctx
@@ -510,13 +557,20 @@ async fn join_guarded(ctx: &Arc<Ctx>, r: pb::JoinRequest) -> Result<pb::JoinResp
 macro_rules! on_leader {
     ($self:ident, $req:ident, $method:ident) => {
         if let Route::Leader { addr, .. } = $self.ctx.fwd.route(&$self.ctx.raft, &$req)? {
-            let resp = $self
+            let deadline = $self
                 .ctx
                 .fwd
-                .admin_client(&addr)?
-                .$method($req.into_inner())
-                .await
-                .map_err(forward_error)?;
+                .deadline($req.metadata(), crate::forward::FORWARD_ADMIN_TIMEOUT);
+            let mut client = $self.ctx.fwd.admin_client(&addr)?;
+            let resp = crate::forward::within(
+                deadline,
+                client.$method(crate::forward::Forwarder::request(
+                    $req.into_inner(),
+                    deadline,
+                )),
+            )
+            .await
+            .map_err(forward_error)?;
             $self.ctx.fwd.count();
             return Ok(Response::new(resp.into_inner()));
         }
@@ -695,7 +749,7 @@ impl pb::admin_server::Admin for AdminService {
                 "AddLearner needs a node id (>= 1) and an address".into(),
             ));
         }
-        ensure_leader(&self.ctx)?;
+        ensure_leader_idle(&self.ctx)?;
         if let Some(n) = self
             .ctx
             .raft

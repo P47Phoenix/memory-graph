@@ -725,6 +725,31 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
     wait_applied(&n3, committed(&n1));
     let hit = ok(&["--server", &n3.addr, "search", "forwarded_marker"]);
     assert!(hit.contains("a.rs"), "{hit}");
+    // `index --json` says whether the connected node forwarded the writes.
+    for (i, (node, forwarded)) in [(&n2, true), (&n1, false)].into_iter().enumerate() {
+        std::fs::write(
+            src.join(format!("json{i}.rs")),
+            format!("pub fn j{i}() {{}}\n"),
+        )
+        .unwrap();
+        let mut a = node.server().to_vec();
+        a.extend([
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--no-progress",
+            "--json",
+            src.to_str().unwrap(),
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&ok(&a)).unwrap();
+        assert_eq!(
+            v["forwarded_to_leader"], forwarded,
+            "node {}: {v}",
+            node.addr
+        );
+    }
 
     // Remove guards: refused with the reason, exit code 1.
     let o = run(&["--server", &n2.addr, "cluster", "remove", "1"]);

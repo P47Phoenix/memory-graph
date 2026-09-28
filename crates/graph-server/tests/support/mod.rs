@@ -266,3 +266,25 @@ pub fn member_list(c: &RemoteStore) -> Vec<(u64, String, String)> {
         .map(|m| (m.node_id, m.addr, m.role))
         .collect()
 }
+
+/// A per-test watchdog: if the returned guard is still alive after
+/// `limit`, the whole test binary exits with a message naming `what`
+/// (a hung test fails loudly instead of holding CI until its own timeout).
+/// Drop the guard (end of the test) to disarm it.
+pub fn watchdog(what: &'static str, limit: Duration) -> Watchdog {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(limit) {
+            eprintln!("WATCHDOG: test {what} still running after {limit:?}; failing the run");
+            std::process::exit(101);
+        }
+    });
+    Watchdog { _tx: tx }
+}
+
+pub struct Watchdog {
+    _tx: std::sync::mpsc::Sender<()>,
+}
+
+/// The default [watchdog] limit of a cluster test.
+pub const TEST_LIMIT: Duration = Duration::from_secs(300);

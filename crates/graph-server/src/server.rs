@@ -139,6 +139,9 @@ pub struct TestingHooks {
     /// long before handing it to Raft (a slow link or disk, longer than
     /// the leader's heartbeat timeout). Heartbeats are not delayed.
     pub delay_append_entries_ms: Option<u64>,
+    /// The default deadline of a request this node forwards to the leader
+    /// (when the client sent none) instead of `forward::FORWARD_*_TIMEOUT`.
+    pub forward_timeout_ms: Option<u64>,
 }
 
 impl ServeConfig {
@@ -526,7 +529,8 @@ pub async fn start(
         sysinfo: cfg.sysinfo.clone(),
         stall_writes_after: cfg.testing.stall_writes_after,
         writes_proposed: std::sync::atomic::AtomicUsize::new(0),
-        fwd: crate::forward::Forwarder::new(node_id, cfg.fault_plan.clone()),
+        fwd: crate::forward::Forwarder::new(node_id, cfg.fault_plan.clone())
+            .with_default_timeout(cfg.testing.forward_timeout_ms.map(Duration::from_millis)),
         auto_promoting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     });
 

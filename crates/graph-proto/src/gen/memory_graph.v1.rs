@@ -3390,6 +3390,13 @@ pub struct JoinRequest {
     /// (`--auto-promote`); otherwise it stays a learner.
     #[prost(bool, tag = "6")]
     pub auto_promote: bool,
+    /// Set on the joiner's periodic re-send while it believes it is a
+    /// learner (`--auto-promote`, and every restart of a joined node). The
+    /// leader never adds a node back on such a request: a node that is no
+    /// longer a member was removed, and only `cluster add-learner` (or a
+    /// fresh `--join` from an empty directory) adds it again.
+    #[prost(bool, tag = "7")]
+    pub rejoin: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JoinResponse {

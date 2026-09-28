@@ -185,6 +185,12 @@ message JoinRequest {
   // Promote to voter once the joiner's replication lag is zero
   // (`--auto-promote`); otherwise it stays a learner.
   bool auto_promote = 6;
+  // Set on the joiner's periodic re-send while it believes it is a
+  // learner (`--auto-promote`, and every restart of a joined node). The
+  // leader never adds a node back on such a request: a node that is no
+  // longer a member was removed, and only `cluster add-learner` (or a
+  // fresh `--join` from an empty directory) adds it again.
+  bool rejoin = 7;
 }
 message JoinResponse {
   string cluster_id = 1;

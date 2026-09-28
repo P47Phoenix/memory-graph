@@ -77,25 +77,40 @@ impl Ctx {
     /// (`Admin.ReadIndex`), and this node serves the read once it has
     /// applied that index itself, so the read sees every write acknowledged
     /// before it began. No leader, or none reachable: `NoLeader`.
+    ///
+    /// The forwarded `ReadIndex` gets the bounded default deadline; the
+    /// client's own `grpc-timeout` is enforced on this handler by tonic's
+    /// server (which drops, and so cancels, the forwarded call with it).
     pub async fn linearizable_barrier(&self) -> Result<(), Status> {
-        let leader = self.raft.leader();
-        if leader.id == Some(self.info.node_id) || self.raft.withhold_leader {
+        use crate::forward::{within, Forwarder, Route, FORWARD_UNARY_TIMEOUT};
+        if self.raft.withhold_leader {
             self.raft.ensure_linearizable().await.map_err(status)?;
             return Ok(());
         }
-        let route = self.fwd.route(&self.raft, &tonic::Request::new(()))?;
-        let crate::forward::Route::Leader { addr, .. } = route else {
-            self.raft.ensure_linearizable().await.map_err(status)?;
-            return Ok(());
+        // One routing decision: `Local` exactly when this node leads (a
+        // fresh request is never marked forwarded).
+        let addr = match self.fwd.route(&self.raft, &tonic::Request::new(()))? {
+            Route::Local => {
+                self.raft.ensure_linearizable().await.map_err(status)?;
+                return Ok(());
+            }
+            Route::Leader { addr, .. } => addr,
         };
-        let index = self
+        let deadline = self
             .fwd
-            .admin_client(&addr)?
-            .read_index(graph_proto::pb::ReadIndexRequest {})
-            .await
-            .map_err(crate::forward::forward_error)?
-            .into_inner()
-            .read_index;
+            .deadline(&tonic::metadata::MetadataMap::new(), FORWARD_UNARY_TIMEOUT);
+        let mut client = self.fwd.admin_client(&addr)?;
+        let index = within(
+            deadline,
+            client.read_index(Forwarder::request(
+                graph_proto::pb::ReadIndexRequest {},
+                deadline,
+            )),
+        )
+        .await
+        .map_err(crate::forward::forward_error)?
+        .into_inner()
+        .read_index;
         self.raft
             .raft
             .wait(Some(READ_INDEX_WAIT))

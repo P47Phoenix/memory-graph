@@ -1223,6 +1223,7 @@ fn run() -> Result<i32> {
                         addr,
                         s.hello().leader_id,
                         s.applied_index(),
+                        s.forwarded_to_leader(),
                     );
                     (PathBuf::new(), Some(s), Some(board))
                 }

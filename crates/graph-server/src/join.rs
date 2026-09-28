@@ -17,7 +17,10 @@
 //!   (a task on the leader). While this node is still a learner it sends
 //!   `Join` again every [`REJOIN_INTERVAL`] ([`spawn_rejoin`]), so neither
 //!   a restart of the joiner nor a change of leader loses the intent (the
-//!   leader keeps one promotion task per node).
+//!   leader keeps one promotion task per node). Such a re-send is marked
+//!   `rejoin`: a leader that no longer lists the node (it was removed, and
+//!   a removed node may never see the entry that removed it) refuses it
+//!   rather than adding it back, and the joiner stops asking (a warning).
 use crate::paths::{ClusterIdentity, JoinSpec};
 use crate::raft::{NodeId, RaftNode};
 use crate::server::ShutdownHandle;
@@ -142,6 +145,7 @@ pub fn join_request(
         store_format_version: graph_store::SCHEMA_VERSION,
         protocol_version: PROTOCOL_VERSION,
         auto_promote,
+        rejoin: false,
     }
 }
 
@@ -202,8 +206,11 @@ pub async fn join(
         if Instant::now() + delay > deadline {
             return Err(StoreError::Rejected(format!(
                 "could not join the cluster through {} within {:?} (--join-timeout): no leader \
-                 accepted the request; last error: {last}",
-                spec.peer, spec.timeout
+                 accepted the request; last error: {last}. If the leader added node {} as a \
+                 learner before the answer was lost, it stays in the membership as a learner \
+                 that never runs: remove it (`memory-graph cluster remove {}`) or start this \
+                 node again with the same --join to resume",
+                spec.peer, spec.timeout, req.node_id, req.node_id
             )));
         }
         tracing::debug!(target = %target, error = %last, ?delay, "--join: retrying");
@@ -230,8 +237,16 @@ fn adopt(identity: &ClusterIdentity, cluster_id: &str) -> Result<(), StoreError>
 /// `--auto-promote`: while this node is a learner, send `Join` again every
 /// [`REJOIN_INTERVAL`] (to the leader it knows, else the peer). Ends once
 /// it is a voter, or at shutdown.
-pub fn spawn_rejoin(raft: RaftNode, peer: String, req: pb::JoinRequest, shutdown: ShutdownHandle) {
+pub fn spawn_rejoin(
+    raft: RaftNode,
+    peer: String,
+    mut req: pb::JoinRequest,
+    shutdown: ShutdownHandle,
+) {
     let me = raft.node_id;
+    // Never an add: a leader that no longer lists this node refuses it (it
+    // was removed) instead of adding it back.
+    req.rejoin = true;
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -259,7 +274,22 @@ pub fn spawn_rejoin(raft: RaftNode, peer: String, req: pb::JoinRequest, shutdown
             .await;
             match r {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::debug!(%target, error = %e.message(), "re-join"),
+                Ok(Err(st)) => match classify(&target, &st) {
+                    Next::Retry(_) => {
+                        tracing::debug!(%target, error = %st.message(), "re-join; retrying")
+                    }
+                    // A refusal (removed, a member at another address,
+                    // other extractors): asking again changes nothing.
+                    Next::Fail(e) => {
+                        tracing::warn!(
+                            %target,
+                            error = %e,
+                            "the leader refused this node's --auto-promote re-join; not asking \
+                             again (re-add it with `cluster add-learner` if it was removed)"
+                        );
+                        return;
+                    }
+                },
                 Err(_) => tracing::debug!(%target, "re-join timed out"),
             }
         }

@@ -43,6 +43,54 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// client's.
 const NO_LIMIT: usize = usize::MAX;
 
+/// The deadline of a forwarded unary write or read barrier when the client
+/// sent none (`grpc-timeout`).
+pub const FORWARD_UNARY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// ... of a forwarded `Index` stream (a whole batch).
+pub const FORWARD_INDEX_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// ... of a forwarded membership change (`AddLearner --blocking` waits up
+/// to a minute for catch-up, `TransferLeader` up to its own wait).
+pub const FORWARD_ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The client's remaining deadline (`grpc-timeout`, gRPC's wire format:
+/// up to 8 digits and a unit `H`/`M`/`S`/`m`/`u`/`n`), when it sent one.
+pub fn incoming_timeout(md: &tonic::metadata::MetadataMap) -> Option<Duration> {
+    let v = md.get("grpc-timeout")?.to_str().ok()?;
+    if v.len() < 2 || v.len() > 9 {
+        return None;
+    }
+    let (digits, unit) = v.split_at(v.len() - 1);
+    let n: u64 = digits.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n.checked_mul(3600)?),
+        "M" => Duration::from_secs(n.checked_mul(60)?),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
+
+/// Run a forwarded call under `deadline`: the call itself carries it as
+/// `grpc-timeout` (see [`Forwarder::request`]) so the leader stops working
+/// on it, and this node stops waiting at the same moment (a leader that
+/// hangs cannot hold the handler forever). An expired deadline answers
+/// `DEADLINE_EXCEEDED`.
+pub async fn within<T>(
+    deadline: Duration,
+    call: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    match tokio::time::timeout(deadline, call).await {
+        Ok(r) => r,
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "the forwarded request got no answer from the leader within {deadline:?}"
+        ))),
+    }
+}
+
 /// Stamps the protocol version and [`FORWARDED_BY_HEADER`] on a forwarded
 /// request.
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +138,7 @@ pub struct Forwarder {
     faults: Option<FaultPlan>,
     channels: Mutex<HashMap<String, Channel>>,
     forwarded: AtomicU64,
+    default_timeout: Option<Duration>,
 }
 
 /// Whether `req` was forwarded by another node.
@@ -109,11 +158,21 @@ fn no_leader(why: &str) -> Status {
 /// failure), else `NoLeader` (the leader could not be reached; the client
 /// retries until its deadline). Every write is idempotent on a retry
 /// (ADR 0004 D2/D7), so a forward lost after it landed is safe to resend.
+///
+/// Note that `Cancelled` / `Unknown` transport losses (and a forward that
+/// hit its deadline) are ambiguous: the leader may have committed the
+/// write before the link failed, and the client's retry then applies it a
+/// second time. That is safe only because every write is idempotent:
+/// `Index`/`IndexFile` answer `unchanged`, `Prune` with the same keep set
+/// removes nothing more, `Vacuum` finds nothing left to reclaim, and a
+/// membership change is refused or a no-op (`tests/membership.rs`,
+/// `prune_and_vacuum_sent_twice_are_idempotent`).
 pub fn forward_error(st: Status) -> Status {
     if !st.details().is_empty() {
         return st;
     }
     if st.code() == Code::Unavailable
+        || st.code() == Code::DeadlineExceeded
         || graph_proto::error::is_transport_loss(st.code(), st.message())
     {
         tracing::debug!(error = %st, "forward to the leader failed");
@@ -129,7 +188,28 @@ impl Forwarder {
             faults,
             channels: Mutex::new(HashMap::new()),
             forwarded: AtomicU64::new(0),
+            default_timeout: None,
         }
+    }
+
+    /// Test hook: every forward's default deadline is this instead.
+    pub fn with_default_timeout(mut self, d: Option<Duration>) -> Self {
+        self.default_timeout = d;
+        self
+    }
+
+    /// The deadline of a forward of a request with metadata `md`: the
+    /// client's own (`grpc-timeout`) when it sent one, else `default`.
+    pub fn deadline(&self, md: &tonic::metadata::MetadataMap, default: Duration) -> Duration {
+        incoming_timeout(md).unwrap_or(self.default_timeout.unwrap_or(default))
+    }
+
+    /// A forwarded request carrying `msg` with `deadline` as its
+    /// `grpc-timeout`.
+    pub fn request<T>(msg: T, deadline: Duration) -> Request<T> {
+        let mut r = Request::new(msg);
+        r.set_timeout(deadline);
+        r
     }
 
     /// Requests this node forwarded to a leader so far.
@@ -177,6 +257,10 @@ impl Forwarder {
         if let Some(ch) = map.get(addr) {
             return Ok(ch.clone());
         }
+        // Only the node forwarded to last (the leader, or a transfer
+        // target) is kept: a cluster that changes leaders or addresses over
+        // months does not accumulate channels.
+        map.clear();
         let uri = if addr.contains("://") {
             addr.to_string()
         } else {
@@ -228,6 +312,7 @@ mod tests {
             Status::unavailable("tcp connect error"),
             Status::unknown("transport error"),
             Status::cancelled("gone"),
+            Status::deadline_exceeded("slow leader"),
         ] {
             let e = graph_proto::status_to_store_error(&forward_error(st));
             assert!(matches!(e, StoreError::NoLeader { .. }), "{e:?}");
@@ -237,6 +322,78 @@ mod tests {
             forward_error(Status::invalid_argument("x")).code(),
             Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn the_clients_deadline_is_propagated_else_a_bounded_default() {
+        let md = |v: &str| {
+            let mut m = tonic::metadata::MetadataMap::new();
+            m.insert("grpc-timeout", v.parse().unwrap());
+            m
+        };
+        assert_eq!(
+            incoming_timeout(&md("1500m")),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(incoming_timeout(&md("3S")), Some(Duration::from_secs(3)));
+        assert_eq!(incoming_timeout(&md("2M")), Some(Duration::from_secs(120)));
+        assert_eq!(incoming_timeout(&md("1H")), Some(Duration::from_secs(3600)));
+        assert_eq!(incoming_timeout(&md("7u")), Some(Duration::from_micros(7)));
+        assert_eq!(incoming_timeout(&md("9n")), Some(Duration::from_nanos(9)));
+        for bad in ["", "S", "12", "1x", "123456789S", "-1S"] {
+            let m = if bad.is_empty() {
+                tonic::metadata::MetadataMap::new()
+            } else {
+                md(bad)
+            };
+            assert_eq!(incoming_timeout(&m), None, "{bad:?}");
+        }
+        let f = Forwarder::new(1, None);
+        let none = tonic::metadata::MetadataMap::new();
+        assert_eq!(
+            f.deadline(&none, FORWARD_UNARY_TIMEOUT),
+            FORWARD_UNARY_TIMEOUT
+        );
+        assert_eq!(
+            f.deadline(&md("250m"), FORWARD_UNARY_TIMEOUT),
+            Duration::from_millis(250)
+        );
+        let f = f.with_default_timeout(Some(Duration::from_millis(5)));
+        assert_eq!(
+            f.deadline(&none, FORWARD_UNARY_TIMEOUT),
+            Duration::from_millis(5)
+        );
+        let r = Forwarder::request((), Duration::from_millis(1500));
+        assert_eq!(r.metadata().get("grpc-timeout").unwrap(), "1500000u");
+    }
+
+    #[test]
+    fn the_channel_cache_keeps_only_the_last_target() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _g = rt.enter();
+        let f = Forwarder::new(1, None);
+        f.channel("127.0.0.1:1").unwrap();
+        f.channel("127.0.0.1:2").unwrap();
+        f.channel("127.0.0.1:2").unwrap();
+        let keys: Vec<String> = f.channels.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["127.0.0.1:2"]);
+    }
+
+    #[tokio::test]
+    async fn a_forward_past_its_deadline_is_deadline_exceeded() {
+        let st = within(
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), Status>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(st.code(), Code::DeadlineExceeded);
+        assert!(within(Duration::from_secs(1), async { Ok::<_, Status>(1) })
+            .await
+            .is_ok());
     }
 
     #[test]

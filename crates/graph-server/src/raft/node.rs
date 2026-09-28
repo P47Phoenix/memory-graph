@@ -124,12 +124,13 @@ pub struct RaftNode {
     pub net_stats: NetStats,
     /// Test hook ([`crate::server::TestingHooks::withhold_leader`]).
     pub withhold_leader: bool,
-    /// The timings this node runs with (a leadership transfer waits out
-    /// the leader lease, `election_max_ms`).
+    /// The timings this node runs with.
     pub settings: RaftSettings,
     /// Set while this leader hands leadership over (`TransferLeader`): new
-    /// proposals and read barriers answer `NoLeader` (the client retries)
-    /// so no append renews the followers' leader lease meanwhile.
+    /// proposals, membership changes and read barriers answer `NoLeader`
+    /// (the client retries) so the log stops growing and the target, caught
+    /// up, gets the old leader's vote. Taken with a compare-exchange: one
+    /// transfer at a time.
     pub transferring: Arc<AtomicBool>,
 }
 
@@ -154,6 +155,27 @@ fn write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Store
             StoreError::Rejected(format!("membership change: {e}"))
         }
         RaftError::Fatal(e) => fatal(e),
+    }
+}
+
+/// How long a membership change waits for its entries to commit. A change
+/// that cannot commit (a new voter that refuses every append, a lost
+/// quorum) fails with this instead of holding the request forever; its
+/// entry stays in the log and commits if the cluster recovers.
+pub const MEMBERSHIP_COMMIT_WAIT: Duration = Duration::from_secs(60);
+
+async fn committed<T>(
+    change: impl std::future::Future<
+        Output = Result<T, RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>>,
+    >,
+) -> Result<T, StoreError> {
+    match tokio::time::timeout(MEMBERSHIP_COMMIT_WAIT, change).await {
+        Ok(r) => r.map_err(write_err),
+        Err(_) => Err(StoreError::Rejected(format!(
+            "the membership change did not commit within {MEMBERSHIP_COMMIT_WAIT:?} (a node \
+             it adds does not accept the leader's log, or a quorum is unreachable); it may \
+             still commit if the cluster recovers: check `cluster members`"
+        ))),
     }
 }
 
@@ -297,7 +319,9 @@ impl RaftNode {
         }
     }
 
-    fn no_leader_while_transferring(&self) -> Result<(), StoreError> {
+    /// `NoLeader` while a leadership transfer runs (or the test hook
+    /// withholds the leader).
+    pub fn no_leader_while_transferring(&self) -> Result<(), StoreError> {
         if self.withhold_leader || self.transferring.load(Ordering::SeqCst) {
             return Err(StoreError::NoLeader {
                 retry_after_ms: NO_LEADER_RETRY_MS,
@@ -338,14 +362,11 @@ impl RaftNode {
         addr: &str,
         blocking: bool,
     ) -> Result<u64, StoreError> {
+        self.no_leader_while_transferring()?;
         // openraft's own `blocking` waits only its default half second and
         // then answers success whatever the learner's state, so the wait
         // for catch-up is ours, with a real timeout and a real error.
-        let r = self
-            .raft
-            .add_learner(id, BasicNode::new(addr), false)
-            .await
-            .map_err(write_err)?;
+        let r = committed(self.raft.add_learner(id, BasicNode::new(addr), false)).await?;
         let index = r.log_id().index;
         if blocking && id != self.node_id {
             self.raft
@@ -374,11 +395,8 @@ impl RaftNode {
     /// Make exactly `voters` the voters (joint consensus, learners kept).
     /// Returns the final membership entry's index.
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<u64, StoreError> {
-        let r = self
-            .raft
-            .change_membership(voters, true)
-            .await
-            .map_err(write_err)?;
+        self.no_leader_while_transferring()?;
+        let r = committed(self.raft.change_membership(voters, true)).await?;
         Ok(r.log_id().index)
     }
 
@@ -387,14 +405,12 @@ impl RaftNode {
     /// replacement of the voter set, so two promotes racing each other
     /// both take effect. Returns the final membership entry's index.
     pub async fn promote(&self, id: NodeId) -> Result<u64, StoreError> {
-        let r = self
-            .raft
-            .change_membership(
-                openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
-                true,
-            )
-            .await
-            .map_err(write_err)?;
+        self.no_leader_while_transferring()?;
+        let r = committed(self.raft.change_membership(
+            openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
+            true,
+        ))
+        .await?;
         Ok(r.log_id().index)
     }
 
@@ -402,17 +418,14 @@ impl RaftNode {
     /// is not kept as a learner). The guards are the caller's
     /// (`Admin.Remove`). Returns the final membership entry's index.
     pub async fn remove(&self, id: NodeId, voter: bool) -> Result<u64, StoreError> {
+        self.no_leader_while_transferring()?;
         let ids = BTreeSet::from([id]);
         let change = if voter {
             openraft::ChangeMembers::RemoveVoters(ids)
         } else {
             openraft::ChangeMembers::RemoveNodes(ids)
         };
-        let r = self
-            .raft
-            .change_membership(change, false)
-            .await
-            .map_err(write_err)?;
+        let r = committed(self.raft.change_membership(change, false)).await?;
         Ok(r.log_id().index)
     }
 
