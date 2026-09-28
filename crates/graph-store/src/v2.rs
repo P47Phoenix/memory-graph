@@ -3335,6 +3335,47 @@ macro_rules! store_read {
 store_read!(V2Store, |s| s.db.begin_read()?);
 store_read!(V2Snapshot, |s| &s.rt);
 
+impl V2Store {
+    /// [`Store::snapshot`] as an owned handle with no borrow of the store
+    /// (ADR 0004 D1: a server keeps snapshot handles in a table for its
+    /// clients, outliving any one request). A `V2Snapshot` holds its own
+    /// read transaction and a shared tracker, so it needs no borrow; the
+    /// trait method only ties the lifetime for object safety. Same max age,
+    /// same accounting in [`Store::snapshot_stats`].
+    pub fn snapshot_owned(&self) -> Result<V2Snapshot> {
+        let rt = self.db.begin_read()?;
+        let created_at = Instant::now();
+        let tracker_id = {
+            let mut t = self
+                .snapshot_tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let id = t.next_id;
+            t.next_id += 1;
+            t.open.insert(id, created_at);
+            id
+        };
+        Ok(V2Snapshot {
+            rt,
+            tracker: Arc::clone(&self.snapshot_tracker),
+            tracker_id,
+            created_at,
+            max_age: self.max_snapshot_age,
+            warned: Cell::new(false),
+        })
+    }
+
+    /// The file this store was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The configured snapshot max age ([`set_max_snapshot_age`](Self::set_max_snapshot_age)).
+    pub fn max_snapshot_age(&self) -> Duration {
+        self.max_snapshot_age
+    }
+}
+
 impl Store for V2Store {
     fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>> {
         let rt = self.db.begin_read()?;

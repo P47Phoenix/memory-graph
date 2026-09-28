@@ -1278,7 +1278,8 @@ fn remote_prepared_is_rejected(h: &Harness) {
             IndexOptions::default(),
         )
         .unwrap();
-    assert!(local.remote_parts().is_none());
+    // A remote backend's own `prepare` is remote too.
+    assert_eq!(local.remote_parts().is_some(), h.accepts_remote_prepared);
     let results = s
         .index_prepared("o", "r", vec![local, remote], IndexOptions::default())
         .unwrap();
@@ -2069,10 +2070,16 @@ impl Extractor for Counting {
 
 /// `prepare` skips extraction for a file stored with the same fingerprint
 /// (and says so), unless `reindex`; the commit still refreshes `origin`.
+/// A remote backend (`accepts_remote_prepared`) defers the check and the
+/// extraction to the server, so its prepared file never says `unchanged`
+/// and the extractor runs at commit; the stored outcome and the number of
+/// extractions are the same either way, so those are asserted after each
+/// commit.
 fn prepare_skips_unchanged(h: &Harness) {
     let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let s = (h.open)(vec![Box::new(Counting(n.clone()))]).expect("open store");
     let calls = || n.load(std::sync::atomic::Ordering::SeqCst);
+    let local = !h.accepts_remote_prepared;
     let file = |origin| BatchFile {
         path: "a.cnt",
         bytes: b"foo bar",
@@ -2082,13 +2089,16 @@ fn prepare_skips_unchanged(h: &Harness) {
     let first = prepare_all(&*s, "r", &[file(None)], IndexOptions::default());
     assert!(!first[0].is_unchanged());
     assert_eq!(first[0].bytes_len(), 7);
-    assert_eq!(calls(), 1);
+    if local {
+        assert_eq!(calls(), 1, "extracted at prepare");
+    }
     // Nothing is stored until the commit.
     assert!(s.file_tokens("o", "r", "a.cnt").unwrap().is_none());
     let out = s
         .index_prepared("o", "r", first, IndexOptions::default())
         .unwrap();
     assert!(!out[0].as_ref().unwrap().unchanged);
+    assert_eq!(calls(), 1, "extracted exactly once");
 
     let again = prepare_all(
         &*s,
@@ -2096,12 +2106,15 @@ fn prepare_skips_unchanged(h: &Harness) {
         &[file(Some(ORIGIN_DIRECTORY))],
         IndexOptions::default(),
     );
-    assert!(again[0].is_unchanged());
+    if local {
+        assert!(again[0].is_unchanged());
+    }
     assert_eq!(calls(), 1, "unchanged file not extracted");
     let out = s
         .index_prepared("o", "r", again, IndexOptions::default())
         .unwrap();
     assert!(out[0].as_ref().unwrap().unchanged);
+    assert_eq!(calls(), 1, "unchanged file not extracted at commit either");
     let origin = s.file_tokens("o", "r", "a.cnt").unwrap().unwrap()[0].parent;
     let f = s.get(origin.unwrap()).unwrap().unwrap();
     assert_eq!(
@@ -2112,11 +2125,14 @@ fn prepare_skips_unchanged(h: &Harness) {
 
     let forced = prepare_all(&*s, "r", &[file(None)], IndexOptions { reindex: true });
     assert!(!forced[0].is_unchanged());
-    assert_eq!(calls(), 2, "reindex extracts");
+    if local {
+        assert_eq!(calls(), 2, "reindex extracts");
+    }
     let out = s
         .index_prepared("o", "r", forced, IndexOptions { reindex: true })
         .unwrap();
     assert!(out[0].as_ref().unwrap().replaced);
+    assert_eq!(calls(), 2, "reindex extracts exactly once more");
 }
 
 /// Per-file rejections (invalid spans, not UTF-8) come back in their slots,
@@ -2159,7 +2175,11 @@ fn prepared_changed_since_prepare(h: &Harness) {
     s.index_batch("o", "r", &[bf("a.txt", b"foo bar")], d)
         .unwrap();
     let p = prepare_all(&*s, "r", &[bf("a.txt", b"foo bar")], d);
-    assert!(p[0].is_unchanged());
+    // A remote backend defers the check to the server (never `unchanged`
+    // at prepare time); the commit-time outcome below is the same.
+    if !h.accepts_remote_prepared {
+        assert!(p[0].is_unchanged());
+    }
     s.index_bytes("o", "r", "a.txt", b"foo CHANGED", Some("text"))
         .unwrap();
     let out = s.index_prepared("o", "r", p, d).unwrap();
