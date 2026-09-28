@@ -1,14 +1,24 @@
-//! Start-up and shutdown (ADR 0004 D4/D10): open the store, bind, write the
-//! LOCK sidecar, start the Raft node, serve until told to stop. Shutdown
+//! Start-up and shutdown (ADR 0004 D4/D6/D10): resolve the node's files
+//! ([`NodePaths`]: `--data-dir` or `--db`) and identity (`node.json`,
+//! [`InitMode`]), open the store, bind, write the LOCK sidecar, start the
+//! Raft node, serve until told to stop. Shutdown
 //! order: health `""` and `memory-graph.ready` go `NOT_SERVING` at once; stop
 //! accepting and finish in-flight requests (bounded by the grace period);
 //! shut the Raft node down (bounded by the grace period too, logged on
 //! expiry); close the store; remove the sidecar last.
 use crate::conn::ConnIo;
+use crate::disk::{system_probe, DiskGuard, FreeSpaceProbe};
 use crate::extractors::{extractors_hash, share};
 use crate::lock::LockFile;
-use crate::raft::RaftNode;
+use crate::paths::{self, ClusterIdentity, InitMode, NodeJson, NodePaths};
+use crate::raft::log_store::{AppendObserver, RedbLogStore};
+use crate::raft::network::FaultPlan;
+use crate::raft::node::NodeStart;
+use crate::raft::snapshot_dir::SnapshotDir;
+use crate::raft::state_machine::SmFailpoints;
+use crate::raft::{RaftNode, RaftSettings};
 use crate::services::admin::AdminService;
+use crate::services::raft::RaftService;
 use crate::services::store::StoreService;
 use crate::services::write::WriteService;
 use crate::services::{Ctx, ServerInfo};
@@ -17,6 +27,7 @@ use crate::snapshots::SnapshotTable;
 use crate::READY_SERVICE;
 use graph_core::Extractor;
 use graph_proto::pb::admin_server::AdminServer;
+use graph_proto::pb::raft_server::RaftServer;
 use graph_proto::pb::store_server::StoreServer;
 use graph_proto::pb::write_server::WriteServer;
 use graph_proto::CheckVersion;
@@ -41,13 +52,41 @@ pub type SysInfoFn = Arc<dyn Fn(&Path) -> serde_json::Value + Send + Sync>;
 /// How a server is configured (the `serve` flags).
 #[derive(Clone)]
 pub struct ServeConfig {
-    /// The store file; `<db>.raft.redb`, `<db>.LOCK` and the snapshot files
-    /// go next to it.
+    /// `--db` mode (stage A): the store file; `<db>.raft.redb`, `<db>.LOCK`
+    /// and `<db>.snapshots/` go next to it. Empty in `--data-dir` mode
+    /// (both set is refused).
     pub db: PathBuf,
+    /// `--data-dir` mode (ADR 0004 D6): `node.json`, `graph.redb`,
+    /// `raft.redb`, `snapshots/`, `LOCK` in this directory.
+    pub data_dir: Option<PathBuf>,
+    /// What a `--data-dir` node does at start-up (ignored in `--db` mode).
+    pub init: InitMode,
     /// Where to listen; port 0 picks a free one (see [`Running::addr`]).
     pub listen: SocketAddr,
-    /// This node's Raft id (default 1).
-    pub node_id: u64,
+    /// This node's Raft id. `--db` mode: default 1. `--data-dir` mode:
+    /// required on the first start, then read from `node.json` (a
+    /// different value is refused).
+    pub node_id: Option<u64>,
+    /// `host:port` peers and clients reach this node at; default the bound
+    /// address with a wildcard IP replaced by the host name. Stored in
+    /// `node.json` (a different value on restart is refused).
+    pub advertise: Option<String>,
+    /// Raft timing and log retention; `None` picks
+    /// [`RaftSettings::cluster`] (`--data-dir`) or
+    /// [`RaftSettings::standalone`] (`--db`).
+    pub raft: Option<RaftSettings>,
+    /// The disk guard (`--min-free-disk`): writes and snapshot builds are
+    /// refused (`RESOURCE_EXHAUSTED`) while the volume has less than this
+    /// plus one snapshot copy free. 0 (the library default) turns it off;
+    /// the CLI passes its own default.
+    pub min_free_disk: u64,
+    /// The free-space probe (tests inject a fake one); `None`: the system's.
+    pub free_space_probe: Option<FreeSpaceProbe>,
+    /// Test-only: the fault plan every node of a testbed consults before
+    /// sending a Raft RPC.
+    pub fault_plan: Option<FaultPlan>,
+    /// Test-only: observe the log store's commits and flush callbacks.
+    pub append_observer: Option<AppendObserver>,
     /// redb cache size; `None` keeps redb's default.
     pub cache_bytes: Option<usize>,
     /// Snapshot handle (and store snapshot) max age; default 15 minutes.
@@ -59,6 +98,13 @@ pub struct ServeConfig {
     /// Fault injection for tests of the client and CLI (never set by
     /// `serve`).
     pub testing: TestingHooks,
+    /// Test-only: open the store and the log over these redb storage
+    /// backends instead of files (the power-cut tests). Snapshots, installs
+    /// and `compact` still use files and are not supported with it.
+    pub storage_backend: Option<crate::powercut::BackendFactory>,
+    /// Test-only: a snapshot install waits at this gate (holding the
+    /// store's install state) until the test opens it.
+    pub install_gate: Option<crate::slot::InstallGate>,
 }
 
 /// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
@@ -78,20 +124,60 @@ pub struct TestingHooks {
     /// after N` on stdout. `serve` sets it only from the test-only
     /// `MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER` environment variable.
     pub stall_writes_after: Option<usize>,
+    /// Failpoint: `apply` fails (an I/O error, so openraft stops the node)
+    /// just before the entry at this log index, which is then in the log
+    /// and committed but not applied.
+    pub fail_before_apply: Option<u64>,
+    /// Failpoint: the store transaction applying the entry at this log
+    /// index fails just before its commit (data and marker staged, then
+    /// rolled back), and openraft stops the node.
+    pub fail_in_apply_txn: Option<u64>,
+    /// Failpoint: a first start fails right after writing `node.json`,
+    /// before the Raft node is initialized (a crash in that window).
+    pub fail_after_node_json: bool,
+    /// Hold every received `AppendEntries` that carries entries for this
+    /// long before handing it to Raft (a slow link or disk, longer than
+    /// the leader's heartbeat timeout). Heartbeats are not delayed.
+    pub delay_append_entries_ms: Option<u64>,
 }
 
 impl ServeConfig {
+    /// `--db` mode (stage A).
     pub fn new(db: impl Into<PathBuf>, listen: SocketAddr) -> Self {
         Self {
             db: db.into(),
+            data_dir: None,
+            init: InitMode::Restart,
             listen,
-            node_id: 1,
+            node_id: None,
+            advertise: None,
+            raft: None,
+            min_free_disk: 0,
+            free_space_probe: None,
+            fault_plan: None,
+            append_observer: None,
             cache_bytes: None,
             snapshot_max_age: Duration::from_secs(15 * 60),
             shutdown_grace: Duration::from_secs(30),
             sysinfo: None,
             testing: TestingHooks::default(),
+            storage_backend: None,
+            install_gate: None,
         }
+    }
+
+    /// `--data-dir` mode (stage B) with `init` and `node_id`.
+    pub fn for_data_dir(
+        dir: impl Into<PathBuf>,
+        listen: SocketAddr,
+        init: InitMode,
+        node_id: Option<u64>,
+    ) -> Self {
+        let mut c = Self::new(PathBuf::new(), listen);
+        c.data_dir = Some(dir.into());
+        c.init = init;
+        c.node_id = node_id;
+        c
     }
 }
 
@@ -99,8 +185,13 @@ impl std::fmt::Debug for ServeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServeConfig")
             .field("db", &self.db)
+            .field("data_dir", &self.data_dir)
+            .field("init", &self.init)
             .field("listen", &self.listen)
             .field("node_id", &self.node_id)
+            .field("advertise", &self.advertise)
+            .field("raft", &self.raft)
+            .field("min_free_disk", &self.min_free_disk)
             .field("cache_bytes", &self.cache_bytes)
             .field("snapshot_max_age", &self.snapshot_max_age)
             .field("shutdown_grace", &self.shutdown_grace)
@@ -153,6 +244,10 @@ pub struct Running {
     task: tokio::task::JoinHandle<Result<(), StoreError>>,
     pub slot: Arc<StoreSlot>,
     pub raft: RaftNode,
+    /// Where this node keeps its files.
+    pub paths: NodePaths,
+    /// The cluster id as this node knows it.
+    pub identity: Arc<ClusterIdentity>,
 }
 
 impl Running {
@@ -177,40 +272,236 @@ fn io_err(what: &str, e: std::io::Error) -> StoreError {
     StoreError::Storage(format!("{what}: {e}"))
 }
 
+/// Resolve the node's files and start plan; refuses every inconsistent
+/// combination before anything is written.
+fn resolve(cfg: &ServeConfig) -> Result<(NodePaths, Option<paths::StartPlan>), StoreError> {
+    match &cfg.data_dir {
+        Some(dir) => {
+            if !cfg.db.as_os_str().is_empty() {
+                return Err(StoreError::Rejected(
+                    "--data-dir and --db cannot be used together".into(),
+                ));
+            }
+            let p = NodePaths::for_data_dir(dir);
+            let plan = paths::plan(&p, &cfg.init, cfg.node_id)?;
+            Ok((p, Some(plan)))
+        }
+        None => Ok((NodePaths::for_db(&cfg.db), None)),
+    }
+}
+
 /// Start a server on the current tokio runtime.
 pub async fn start(
     cfg: ServeConfig,
     extractors: Vec<Arc<dyn Extractor>>,
 ) -> Result<Running, StoreError> {
     let hash = extractors_hash(&extractors);
-    // redb's exclusive lock is the ownership check (`Locked` for a second
-    // server on the same file); everything else follows.
-    let slot = StoreSlot::open(&cfg.db, extractors, cfg.cache_bytes, cfg.snapshot_max_age)?;
+    let (paths, plan) = resolve(&cfg)?;
+    let node_id = match &plan {
+        Some(p) => p.node_id,
+        None => cfg.node_id.unwrap_or(1),
+    };
+    // Bind before anything is written: a port in use must not leave a store
+    // behind (the next start would find a store and no node.json). A store
+    // held by another server is still refused below, by redb's lock.
     let listener = TcpListener::bind(cfg.listen)
         .await
         .map_err(|e| io_err(&format!("cannot listen on {}", cfg.listen), e))?;
     let addr = listener
         .local_addr()
         .map_err(|e| io_err("local address", e))?;
-    let lock =
-        LockFile::create(&cfg.db, &addr.to_string()).map_err(|e| io_err("LOCK sidecar", e))?;
-    let mut raft = RaftNode::start(cfg.node_id, addr.to_string(), Arc::clone(&slot)).await?;
+    if let Some(dir) = &paths.data_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| io_err(&format!("creating `{}`", dir.display()), e))?;
+    }
+    if let Some(snap) = plan.as_ref().and_then(|p| p.restore.as_deref()) {
+        paths::restore_into(snap, &paths.store)?;
+    }
+    let store_existed = cfg.storage_backend.is_some() || paths.store.exists();
+    let log_probe = match &cfg.storage_backend {
+        Some(_) => None,
+        None => Some(RedbLogStore::probe(&paths.log)?),
+    };
+    // A lost store is refused before opening one would create it (and
+    // make the next start look consistent).
+    if let (Some(probe), Some(p)) = (log_probe, &plan) {
+        if p.existing.is_some() && !store_existed {
+            paths::check_log_and_store(
+                paths.data_dir.as_deref().unwrap_or(Path::new("")),
+                probe,
+                false,
+                0,
+            )?;
+        }
+    }
+    // redb's exclusive lock is the ownership check (`Locked` for a second
+    // server on the same file); everything else follows.
+    let slot = StoreSlot::open_with(
+        &paths.store,
+        extractors,
+        cfg.cache_bytes,
+        cfg.snapshot_max_age,
+        cfg.storage_backend.clone(),
+    )?;
+    slot.set_install_gate(cfg.install_gate.clone());
+    if let Some(at) = cfg.testing.fail_in_apply_txn {
+        slot.set_marked_commit_hook(Some(Arc::new(move |m: &graph_store::RaftMarker| {
+            if m.index == at {
+                tracing::warn!(index = at, "testing: failpoint in the apply transaction");
+                Err(StoreError::Storage(format!(
+                    "testing: failpoint in the transaction applying entry {at}"
+                )))
+            } else {
+                Ok(())
+            }
+        })));
+    }
+    let mut initialize = plan.is_none();
+    let (identity, advertise) = match (&plan, &paths.node_json) {
+        (Some(plan), Some(json_path)) => {
+            let (json, advertise) = match &plan.existing {
+                Some(found) => {
+                    if let Some(a) = &cfg.advertise {
+                        if a != &found.advertise {
+                            return Err(StoreError::Rejected(format!(
+                                "--advertise {a} differs from {} recorded in `{}` \
+                                 (changing it needs --update-advertise, a later stage)",
+                                found.advertise,
+                                json_path.display()
+                            )));
+                        }
+                    }
+                    // The log and the store must agree before the node
+                    // takes part in any election (QA: a lost raft.redb
+                    // would let it vote twice in a term).
+                    if let Some(probe) = log_probe {
+                        let marker = slot.with_store(|s| s.raft_marker())?.map_or(0, |m| m.index);
+                        paths::check_log_and_store(
+                            paths.data_dir.as_deref().unwrap_or(Path::new("")),
+                            probe,
+                            store_existed,
+                            marker,
+                        )?;
+                    }
+                    initialize = found.bootstrapped;
+                    (found.clone(), found.advertise.clone())
+                }
+                None => {
+                    let advertise = cfg
+                        .advertise
+                        .clone()
+                        .unwrap_or_else(|| paths::default_advertise(addr));
+                    let cluster_id = plan.bootstrap.then(paths::mint_cluster_id);
+                    let json = NodeJson {
+                        node_id,
+                        cluster_id: cluster_id.clone(),
+                        advertise: advertise.clone(),
+                        binary_version: crate::SERVER_VERSION.into(),
+                        protocol_version: graph_proto::PROTOCOL_VERSION,
+                        store_format_version: graph_store::SCHEMA_VERSION,
+                        extractors_hash: hash.clone(),
+                        created: paths::now_secs(),
+                        bootstrapped: plan.bootstrap,
+                    };
+                    json.write(json_path)?;
+                    if cfg.testing.fail_after_node_json {
+                        return Err(StoreError::Storage(
+                            "testing: failpoint after writing node.json, before the Raft \
+                             node is initialized"
+                                .into(),
+                        ));
+                    }
+                    initialize = plan.bootstrap;
+                    if let Some(id) = &cluster_id {
+                        eprintln!(
+                            "memory-graph serve: WARNING: --bootstrap created a NEW cluster {id} \
+                             in `{}` (node {node_id}); nodes of any other cluster will refuse it",
+                            paths.data_dir.as_deref().unwrap_or(Path::new("")).display()
+                        );
+                        tracing::warn!(cluster_id = %id, node_id, "bootstrapped a new cluster");
+                    }
+                    (json, advertise)
+                }
+            };
+            (
+                Arc::new(ClusterIdentity::for_node(json_path, json)),
+                advertise,
+            )
+        }
+        _ => (
+            Arc::new(ClusterIdentity::fixed("standalone")),
+            cfg.advertise.clone().unwrap_or_else(|| addr.to_string()),
+        ),
+    };
+    let lock = LockFile::create_at(&paths.lock, &addr.to_string())
+        .map_err(|e| io_err("LOCK sidecar", e))?;
+    let snapshots = Arc::new(SnapshotDir::open(&paths.snapshots_dir, &hash)?);
+    let guard_dir = match &paths.data_dir {
+        Some(d) => d.clone(),
+        None => paths
+            .store
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+    };
+    let disk = DiskGuard::new(
+        cfg.min_free_disk,
+        cfg.free_space_probe.clone().unwrap_or_else(system_probe),
+        &guard_dir,
+        &paths.store,
+        &paths.log,
+    );
+    let settings = cfg.raft.unwrap_or(if paths.data_dir.is_some() {
+        RaftSettings::cluster()
+    } else {
+        RaftSettings::standalone()
+    });
+    let mut raft = RaftNode::start(NodeStart {
+        node_id,
+        advertise: advertise.clone(),
+        slot: Arc::clone(&slot),
+        log_path: paths.log.clone(),
+        snapshots: Arc::clone(&snapshots),
+        identity: Arc::clone(&identity),
+        // `--db` mode initializes a one-member cluster on first start
+        // (stage A); `--data-dir` only a node that minted its cluster
+        // (`bootstrapped` in node.json: `--bootstrap` on an empty dir),
+        // also on a later start if a crash came before the initialization
+        // (guarded by `is_initialized`, so a no-op once it happened).
+        initialize,
+        storage_backend: cfg.storage_backend.clone(),
+        extractors_hash: hash.clone(),
+        settings,
+        disk,
+        faults: cfg.fault_plan.clone(),
+        failpoints: SmFailpoints {
+            fail_before_apply: cfg.testing.fail_before_apply,
+        },
+        append_observer: cfg.append_observer.clone(),
+    })
+    .await?;
     raft.withhold_leader = cfg.testing.withhold_leader;
     let shutdown = ShutdownHandle::new();
     let ctx = Arc::new(Ctx {
         slot: Arc::clone(&slot),
         raft: raft.clone(),
         info: ServerInfo {
-            node_id: cfg.node_id,
-            cluster_id: "standalone".into(),
+            node_id,
+            identity: Arc::clone(&identity),
             extractors_hash: hash,
-            db_path: cfg.db.display().to_string(),
+            db_path: paths.store.display().to_string(),
             listen_addr: addr.to_string(),
             started: Instant::now(),
             hello_protocol_version: cfg
                 .testing
                 .hello_protocol_version
                 .unwrap_or(graph_proto::PROTOCOL_VERSION),
+            data_dir: paths
+                .data_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+            advertise,
         },
         shutdown: shutdown.clone(),
         sysinfo: cfg.sysinfo.clone(),
@@ -295,6 +586,21 @@ pub async fn start(
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),
             CheckVersion,
+        ))
+        .add_service(InterceptedService::new(
+            RaftServer::new(RaftService {
+                raft: raft.raft.clone(),
+                identity: Arc::clone(&identity),
+                snapshots: Arc::clone(&snapshots),
+                disk: raft.disk.clone(),
+                delay_append: cfg
+                    .testing
+                    .delay_append_entries_ms
+                    .map(Duration::from_millis),
+            })
+            .max_decoding_message_size(no_limit)
+            .max_encoding_message_size(no_limit),
+            CheckVersion,
         ));
     let incoming = {
         let weak = Arc::downgrade(&slot);
@@ -305,7 +611,7 @@ pub async fn start(
         async move { s.wait().await }
     };
     let mut serve = tokio::spawn(router.serve_with_incoming_shutdown(incoming, signal));
-    tracing::info!(%addr, db = %cfg.db.display(), node_id = cfg.node_id, "serving");
+    tracing::info!(%addr, store = %paths.store.display(), node_id, "serving");
 
     let task = {
         let shutdown = shutdown.clone();
@@ -349,6 +655,8 @@ pub async fn start(
         task,
         slot,
         raft,
+        paths,
+        identity,
     })
 }
 

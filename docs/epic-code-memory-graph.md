@@ -247,7 +247,7 @@ Time-boxed to 1 day. Output: documented findings + story estimate.
 - Given the recommendation, When the spike closes, Then it must state go or no-go and the follow-up stories needed.
 
 **20. Single-node server and client (8 pts)**
-Status: Delivered on branch `stage-a` (PR pending). RPC overhead: [spikes/rpc-overhead.md](spikes/rpc-overhead.md).
+Status: Delivered in PR #113 (squash 0780415). RPC overhead: [spikes/rpc-overhead.md](spikes/rpc-overhead.md).
 As a developer or agent
 I want a `memory-graph serve` process to own the database and the command line to talk to it over gRPC
 So that many readers and one index run share a database without fighting over the file lock, from any machine.
@@ -268,6 +268,7 @@ Design: [ADR 0004](adr/0004-client-server-and-replication.md) D1-D4; delivers AD
 - Given the workspace after this story, When `scripts/check-no-c-deps.py` runs, Then it must pass, and it must name the crate when a deny-listed crate (`ring`, `aws-lc-sys`, `openssl-sys`, `libz-sys`) enters the tree.
 
 **21. Replication: Raft log, snapshots, `--bootstrap` (8 pts)**
+Status: Delivered in PR #114. Measurements: [spikes/raft-replication.md](spikes/raft-replication.md).
 As a database operator
 I want several `serve` nodes to replicate one database through Raft
 So that the data survives the loss of a node and every node can answer reads.

@@ -149,19 +149,93 @@ enum ClusterCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Build a Raft snapshot on the server now; with --out, download it (sha256 and size verified)
+    /// to this local file, which `serve --data-dir <empty dir> --bootstrap --restore <file>` can
+    /// seed a new cluster from
+    Snapshot {
+        /// Where to write the snapshot (on this machine, not the server's)
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// PREVIEW, stage B: add node <ID> at <ADDR> (host:port) as a non-voting learner. Waits for
+    /// the leader's catch-up acknowledgement; a learner that needs a snapshot may still be
+    /// installing it (`cluster status` shows its lag). Stage C completes membership (guards,
+    /// remove, transfer, --join)
+    #[command(hide = true)]
+    AddLearner {
+        id: u64,
+        addr: String,
+        /// Return once the change is committed, without the catch-up acknowledgement
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// PREVIEW, stage B: make learner <ID> a voter. Stage C completes membership (guards)
+    #[command(hide = true)]
+    Promote { id: u64 },
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve --db over gRPC (single node in this release): other processes, machines and containers
-    /// then use it with --server. Prints `listening on <addr>` once ready; stops on Ctrl-C / SIGTERM
+    /// Serve a database over gRPC; other processes, machines and containers then use it with
+    /// --server. `--data-dir <dir> --bootstrap` starts a one-node cluster in a data directory;
+    /// `--db <file>` serves a single file (stage A). Prints `listening on <addr>` once ready; stops
+    /// on Ctrl-C / SIGTERM
     Serve {
         /// Address to listen on (port 0 picks a free port; the line printed on start names it)
         #[arg(long, default_value = "127.0.0.1:7000", value_name = "HOST:PORT")]
         listen: String,
-        /// This node's id in the cluster
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
-        node_id: u64,
+        /// The node's data directory (node.json, graph.redb, raft.redb, snapshots/, LOCK).
+        /// Not together with --db
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// With --data-dir: create a NEW cluster with this node as its only voter (on a directory
+        /// that is already initialized: a plain restart)
+        #[arg(long, requires = "data_dir")]
+        bootstrap: bool,
+        /// With --bootstrap, into an empty --data-dir: seed the store from this snapshot file
+        /// (`cluster snapshot --out`); the new cluster gets a new id and a fresh log
+        #[arg(long, requires = "bootstrap", value_name = "FILE")]
+        restore: Option<PathBuf>,
+        /// Stage B only: start empty and wait for a leader to add this node (`cluster
+        /// add-learner`). Stage C replaces it with --join
+        #[arg(long, hide = true, requires = "data_dir", conflicts_with = "bootstrap")]
+        wait_for_membership: bool,
+        /// host:port peers and clients reach this node at (default: the listen address with a
+        /// wildcard IP replaced by the host name). Stored in node.json
+        #[arg(long, value_name = "HOST:PORT")]
+        advertise: Option<String>,
+        /// This node's id. --db: default 1. --data-dir: required on the first start, then read
+        /// from node.json (a different id is refused)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        node_id: Option<u64>,
+        /// Build a snapshot (and purge the log below it) after this many applied entries
+        /// (default 10000)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        snapshot_log_entries: Option<u64>,
+        /// ... or after this many log bytes: a size with a K/M/G suffix (default 1G)
+        #[arg(long, value_name = "SIZE", value_parser = graph_cli::sysinfo::parse_size)]
+        snapshot_log_bytes: Option<u64>,
+        /// Log entries kept below a snapshot, so a briefly lagging follower catches up from the
+        /// log rather than by a snapshot (default 1000)
+        #[arg(long, value_name = "N")]
+        log_keep_entries: Option<u64>,
+        /// Election timeout lower bound, ms (--data-dir default 1000)
+        #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
+        election_timeout_min: Option<u64>,
+        /// Election timeout upper bound, ms (--data-dir default 2000)
+        #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
+        election_timeout_max: Option<u64>,
+        /// Leader heartbeat interval, ms (--data-dir default 250)
+        #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_interval: Option<u64>,
+        /// Refuse writes and snapshot builds (RESOURCE_EXHAUSTED) while the volume has less than
+        /// this free plus one snapshot copy: a size (K/M/G) or a percentage of the volume such as
+        /// 5%. --data-dir default: 5% of the volume, clamped to 2-32 GiB. --db default: off
+        #[arg(long, value_parser = graph_cli::diskinfo::parse_min_free)]
+        min_free_disk: Option<graph_cli::diskinfo::MinFree>,
         /// How long an open snapshot handle (a paging client's frozen view) may live: seconds, or with
         /// an s/m/h suffix (default 15m)
         #[arg(long, value_parser = parse_duration, default_value = "15m")]
@@ -569,25 +643,27 @@ fn run() -> Result<i32> {
     // `serve` owns a file; everything else resolves --db / --server.
     if let Cmd::Serve {
         listen,
+        data_dir,
+        bootstrap,
+        restore,
+        wait_for_membership,
+        advertise,
         node_id,
+        snapshot_log_entries,
+        snapshot_log_bytes,
+        log_keep_entries,
+        election_timeout_min,
+        election_timeout_max,
+        heartbeat_interval,
+        min_free_disk,
         snapshot_max_age,
     } = &cli.cmd
     {
         if let Some(s) = &cli.server {
-            bail!("serve takes --db <file> to serve, not --server {s}");
+            bail!("serve takes --db <file> or --data-dir <dir> to serve, not --server {s}");
         }
         if cli.chunk_bytes.is_some() {
             bail!("--chunk-bytes does not apply to serve: the server cuts replicated log entries at {} MiB", graph_client::RAFT_ENTRY_MAX_BYTES >> 20);
-        }
-        let db = cli
-            .db
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(graph_cli::target::DEFAULT_DB));
-        if db.is_dir() {
-            bail!(
-                "--db `{}` is a directory; give a database file path",
-                db.display()
-            );
         }
         use std::net::ToSocketAddrs;
         let addr = listen
@@ -595,8 +671,124 @@ fn run() -> Result<i32> {
             .with_context(|| format!("--listen {listen}: not a host:port"))?
             .next()
             .ok_or_else(|| anyhow::anyhow!("--listen {listen}: resolves to no address"))?;
-        let mut cfg = graph_server::ServeConfig::new(&db, addr);
-        cfg.node_id = *node_id;
+        // Either a data directory (a cluster member, stage B) or a single
+        // file (stage A); `served` names it in messages.
+        let (mut cfg, served, disk_path) = match data_dir {
+            Some(dir) => {
+                if let Some(db) = &cli.db {
+                    bail!(
+                        "--data-dir and --db are exclusive: --data-dir `{}` keeps its store at \
+                         graph.redb inside it (drop --db `{}`)",
+                        dir.display(),
+                        db.display()
+                    );
+                }
+                if dir.is_file() {
+                    bail!(
+                        "--data-dir `{}` is a file; give a directory (or serve the file with --db)",
+                        dir.display()
+                    );
+                }
+                let init = if *bootstrap {
+                    graph_server::InitMode::Bootstrap {
+                        restore: restore.clone(),
+                    }
+                } else if *wait_for_membership {
+                    graph_server::InitMode::Uninitialized
+                } else {
+                    graph_server::InitMode::Restart
+                };
+                let cfg = graph_server::ServeConfig::for_data_dir(dir, addr, init, *node_id);
+                (cfg, dir.clone(), dir.clone())
+            }
+            None => {
+                let db = cli
+                    .db
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(graph_cli::target::DEFAULT_DB));
+                if db.is_dir() {
+                    bail!(
+                        "--db `{}` is a directory; give a database file path (or serve a data \
+                         directory with --data-dir)",
+                        db.display()
+                    );
+                }
+                let mut cfg = graph_server::ServeConfig::new(&db, addr);
+                cfg.node_id = Some(node_id.unwrap_or(1));
+                (cfg, db.clone(), db)
+            }
+        };
+        let cluster_mode = data_dir.is_some();
+        let tuned = snapshot_log_entries.is_some()
+            || snapshot_log_bytes.is_some()
+            || log_keep_entries.is_some()
+            || election_timeout_min.is_some()
+            || election_timeout_max.is_some()
+            || heartbeat_interval.is_some();
+        if tuned {
+            let mut r = if cluster_mode {
+                graph_server::RaftSettings::cluster()
+            } else {
+                graph_server::RaftSettings::standalone()
+            };
+            if let Some(v) = snapshot_log_entries {
+                r.snapshot_log_entries = *v;
+            }
+            if let Some(v) = snapshot_log_bytes {
+                r.snapshot_log_bytes = *v;
+            }
+            if let Some(v) = log_keep_entries {
+                r.log_keep_entries = *v;
+            }
+            if let Some(v) = election_timeout_min {
+                r.election_min_ms = *v;
+            }
+            if let Some(v) = election_timeout_max {
+                r.election_max_ms = *v;
+            }
+            if let Some(v) = heartbeat_interval {
+                r.heartbeat_ms = *v;
+            }
+            if r.election_min_ms >= r.election_max_ms {
+                bail!(
+                    "--election-timeout-min ({} ms) must be below --election-timeout-max ({} ms)",
+                    r.election_min_ms,
+                    r.election_max_ms
+                );
+            }
+            if r.heartbeat_ms >= r.election_min_ms {
+                bail!(
+                    "--heartbeat-interval ({} ms) must be below --election-timeout-min ({} ms), \
+                     or followers call elections while the leader is alive",
+                    r.heartbeat_ms,
+                    r.election_min_ms
+                );
+            }
+            cfg.raft = Some(r);
+        }
+        // The disk guard: on by default for a data directory (a cluster
+        // member keeps a log and snapshots), off by default for --db
+        // (stage A behaviour); an explicit --min-free-disk applies to both.
+        let min_free = match min_free_disk {
+            Some(m) => Some(*m),
+            None if cluster_mode => Some(graph_cli::diskinfo::MinFree::Default),
+            None => None,
+        };
+        if let Some(m) = min_free {
+            let total = graph_cli::diskinfo::sample_disk(&disk_path).map(|s| s.total);
+            cfg.min_free_disk = m.resolve(total);
+        }
+        cfg.advertise = advertise.clone();
+        if !cluster_mode && (tuned || advertise.is_some()) {
+            // Not refused (a stage A script may pass them), but said: with
+            // --db they tune the one-member log of this file only.
+            eprintln!(
+                "memory-graph serve: note: with --db, --advertise and the Raft options \
+                 (--snapshot-log-entries/-bytes, --log-keep-entries, --election-timeout-*, \
+                 --heartbeat-interval) apply to this single-node server's own log only; \
+                 clusters use --data-dir"
+            );
+        }
         cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
@@ -607,15 +799,18 @@ fn run() -> Result<i32> {
                 format!("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER={v}: not a count")
             })?);
         }
-        let shown = db.display().to_string();
-        let node = *node_id;
+        let shown = match (cluster_mode, node_id) {
+            (true, Some(n)) => format!("data dir {}, node {n}", served.display()),
+            (true, None) => format!("data dir {}", served.display()),
+            (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
+        };
         graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |a| {
             // Scripts and tests read this line for the bound port.
-            println!("memory-graph serve: listening on {a} (db {shown}, node {node})");
+            println!("memory-graph serve: listening on {a} ({shown})");
         })
         .map_err(|e| match e {
-            StoreError::Locked(why) => graph_cli::target::locked_error(&db, &why),
-            e => anyhow::Error::from(e).context(format!("serving `{}`", db.display())),
+            StoreError::Locked(why) => graph_cli::target::locked_error(&served, &why),
+            e => anyhow::Error::from(e).context(format!("serving `{}`", served.display())),
         })?;
         eprintln!("memory-graph serve: stopped");
         return Ok(0);
@@ -696,18 +891,57 @@ fn run() -> Result<i32> {
                                 "listen_addr": st.listen_addr,
                                 "uptime_secs": st.uptime_secs,
                                 "snapshot_handles": st.snapshot_handles,
+                                "role": st.role,
+                                "advertise": st.advertise,
+                                "data_dir": st.data_dir,
+                                "snapshot_index": st.snapshot_index,
+                                "purged_index": st.purged_index,
+                                "log_bytes": st.log_bytes,
+                                "store_bytes": st.store_bytes,
+                                "members": st.members.iter().map(|m| serde_json::json!({
+                                    "node_id": m.node_id,
+                                    "addr": m.addr,
+                                    "role": m.role,
+                                    "extractors_hash": m.extractors_hash,
+                                })).collect::<Vec<_>>(),
+                                "replication": st.replication.iter().map(|p| serde_json::json!({
+                                    "node_id": p.node_id,
+                                    "matched_index": p.matched_index,
+                                    "lag": p.lag,
+                                })).collect::<Vec<_>>(),
                             }))?
                         );
                     } else {
                         out!("{}", server_header(&addr, &st));
                         out!("  cluster   {}", st.cluster_id);
                         out!(
-                            "  node      {} ({}) listening on {}, term {}",
+                            "  node      {} ({}) listening on {}, advertised as {}, term {}",
                             st.node_id,
-                            st.state,
+                            if st.role.is_empty() {
+                                &st.state
+                            } else {
+                                &st.role
+                            },
                             st.listen_addr,
+                            if st.advertise.is_empty() {
+                                "-"
+                            } else {
+                                &st.advertise
+                            },
                             st.current_term
                         );
+                        for m in &st.members {
+                            let lag = st
+                                .replication
+                                .iter()
+                                .find(|p| p.node_id == m.node_id)
+                                .map(|p| match p.matched_index {
+                                    Some(i) => format!(", matched {i}, lag {}", p.lag),
+                                    None => format!(", nothing matched yet, lag {}", p.lag),
+                                })
+                                .unwrap_or_default();
+                            out!("  member    {} {} at {}{lag}", m.node_id, m.role, m.addr);
+                        }
                         out!(
                             "  leader    {}",
                             match (st.leader_id, st.leader_addr.as_deref()) {
@@ -722,6 +956,17 @@ fn run() -> Result<i32> {
                             st.applied_term,
                             st.committed_index,
                             st.last_log_index
+                        );
+                        out!(
+                            "  snapshot  {}, purged {}, log file {} bytes, store file {} bytes",
+                            if st.snapshot_index == 0 {
+                                "none".to_string()
+                            } else {
+                                format!("at {}", st.snapshot_index)
+                            },
+                            st.purged_index,
+                            st.log_bytes,
+                            st.store_bytes
                         );
                         out!(
                             "  server    {} (protocol {}, store format {}, extractors {})",
@@ -754,6 +999,54 @@ fn run() -> Result<i32> {
                     } else {
                         out!("{leader} {}", st.leader_addr.as_deref().unwrap_or("-"));
                     }
+                }
+                ClusterCmd::Snapshot { out, json } => {
+                    let info = s
+                        .admin_trigger_snapshot(out.as_deref())
+                        .context("cluster snapshot")?;
+                    if json {
+                        out!(
+                            "{}",
+                            serde_json::json!({
+                                "node_id": st.node_id,
+                                "last_applied_index": info.last_applied_index,
+                                "last_applied_term": info.last_applied_term,
+                                "size": info.size,
+                                "sha256": info.sha256,
+                                "extractors_hash": info.extractors_hash,
+                                "store_format_version": info.store_format_version,
+                                "out": out.as_ref().map(|p| p.display().to_string()),
+                            })
+                        );
+                    } else {
+                        out!(
+                            "snapshot of node {} at log index {} (term {}): {} bytes, sha256 {}",
+                            st.node_id,
+                            info.last_applied_index,
+                            info.last_applied_term,
+                            info.size,
+                            info.sha256
+                        );
+                        if let Some(p) = &out {
+                            out!("  written to {} (sha256 and size verified)", p.display());
+                        }
+                    }
+                }
+                ClusterCmd::AddLearner {
+                    id,
+                    addr: at,
+                    no_wait,
+                } => {
+                    let index = s
+                        .admin_add_learner(id, &at, !no_wait)
+                        .with_context(|| format!("cluster add-learner {id} {at}"))?;
+                    out!("node {id} at {at} added as a learner (log index {index})");
+                }
+                ClusterCmd::Promote { id } => {
+                    let index = s
+                        .admin_promote(id)
+                        .with_context(|| format!("cluster promote {id}"))?;
+                    out!("node {id} is now a voter (log index {index})");
                 }
             }
         }

@@ -1,7 +1,8 @@
 // Operator surface of a memory-graph server (ADR 0004 D1/D10). Stage A
-// implements `Status`, `SysInfo`, `Compact` and `Shutdown`; the cluster
-// operations are declared here so the contract is stable and answer
-// UNIMPLEMENTED until stage B/C.
+// implements `Status`, `SysInfo`, `Compact` and `Shutdown`; stage B adds
+// `Members`, `Leader`, `TriggerSnapshot` and minimal `AddLearner` /
+// `Promote` (no guards yet: stage C adds them, with `Remove` and
+// `TransferLeader`, which answer UNIMPLEMENTED until then).
 syntax = "proto3";
 
 package memory_graph.v1;
@@ -18,14 +19,17 @@ service Admin {
   // Graceful shutdown: stop accepting, finish in-flight, close the store.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 
-  // Cluster operations (stage B/C): UNIMPLEMENTED in stage A.
+  // Cluster operations (stage B/C).
   rpc Members(MembersRequest) returns (MembersResponse);
   rpc Leader(LeaderRequest) returns (LeaderResponse);
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
   rpc Promote(PromoteRequest) returns (PromoteResponse);
   rpc Remove(RemoveRequest) returns (RemoveResponse);
   rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
-  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (TriggerSnapshotResponse);
+  // Build a snapshot now; with `download`, stream the snapshot file back
+  // (a `SnapshotInfo` first, then the file in 1 MiB chunks) so a remote
+  // client can keep a backup (`cluster snapshot --out`).
+  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (stream TriggerSnapshotResponse);
   // Prometheus text exposition of the server's metrics.
   rpc Metrics(MetricsRequest) returns (MetricsResponse);
 }
@@ -55,6 +59,38 @@ message StatusResponse {
   SnapshotStats snapshots = 18;
   // Open snapshot handles held for clients (`Store.OpenSnapshot`).
   uint64 snapshot_handles = 19;
+  // Raft role, lower case: `leader`, `follower`, `candidate`, `learner`,
+  // `shutdown`.
+  string role = 20;
+  // Log index of the current snapshot (0: none) and of the last purged
+  // entry (0: none purged).
+  uint64 snapshot_index = 21;
+  uint64 purged_index = 22;
+  // Every member with its role and address.
+  repeated Member members = 23;
+  // The leader only: how far each peer's matched log index is behind this
+  // node's last log index.
+  repeated PeerLag replication = 24;
+  // Bytes of the Raft log file and of the store file on disk.
+  uint64 log_bytes = 25;
+  uint64 store_bytes = 26;
+  // The data directory (`serve --data-dir`); empty in `--db` mode.
+  string data_dir = 27;
+  // This node's advertised address (`--advertise`).
+  string advertise = 28;
+}
+
+// Replication progress of one peer, as the leader sees it.
+message PeerLag {
+  uint64 node_id = 1;
+  // The highest log index known to match on the peer (absent: none yet).
+  optional uint64 matched_index = 2;
+  // `last_log_index - matched_index` on the leader.
+  uint64 lag = 3;
+  // The last error replicating to this peer (its gRPC code and message):
+  // set while RPCs to it keep failing, or while it lags and no entries or
+  // snapshot reached it since the error; empty otherwise.
+  string last_error = 4;
 }
 
 message SysInfoRequest {}
@@ -97,6 +133,9 @@ message LeaderResponse {
 message AddLearnerRequest {
   uint64 node_id = 1;
   string addr = 2;
+  // Wait until the learner has caught up with the leader's log before
+  // answering.
+  bool blocking = 3;
 }
 message AddLearnerResponse {
   // Log index of the membership change.
@@ -112,11 +151,27 @@ message RemoveResponse { uint64 log_index = 1; }
 message TransferLeaderRequest { uint64 to_node_id = 1; }
 message TransferLeaderResponse {}
 
-message TriggerSnapshotRequest {}
-message TriggerSnapshotResponse {
-  // Index/term of the snapshot taken.
+message TriggerSnapshotRequest {
+  // Stream the snapshot file back after the `SnapshotInfo`.
+  bool download = 1;
+}
+// What the snapshot is: always the first message of the stream.
+message SnapshotInfo {
+  // Index/term of the last entry the snapshot contains.
   uint64 last_applied_index = 1;
   uint64 last_applied_term = 2;
+  uint64 size = 3;
+  // Lowercase hex SHA-256 of the file.
+  string sha256 = 4;
+  string extractors_hash = 5;
+  uint64 store_format_version = 6;
+}
+message TriggerSnapshotResponse {
+  oneof msg {
+    SnapshotInfo info = 1;
+    // A chunk of the snapshot file, in order (only with `download`).
+    bytes chunk = 2;
+  }
 }
 
 message MetricsRequest {}

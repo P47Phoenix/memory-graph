@@ -12,19 +12,32 @@ use std::time::Instant;
 use tonic::Status;
 
 pub mod admin;
+pub mod raft;
 pub mod store;
 pub mod write;
 
 /// Facts about this server that never change while it runs.
 pub struct ServerInfo {
     pub node_id: u64,
-    pub cluster_id: String,
+    /// The cluster id (learned later by an uninitialized member).
+    pub identity: Arc<crate::paths::ClusterIdentity>,
     pub extractors_hash: String,
     pub db_path: String,
     pub listen_addr: String,
     pub started: Instant,
     /// The protocol version `Hello` reports (the real one outside tests).
     pub hello_protocol_version: u32,
+    /// `serve --data-dir` (empty in `--db` mode).
+    pub data_dir: String,
+    /// This node's advertised address.
+    pub advertise: String,
+}
+
+impl ServerInfo {
+    /// The cluster id, empty while an uninitialized member has none.
+    pub fn cluster_id(&self) -> String {
+        self.identity.get().unwrap_or_default()
+    }
 }
 
 pub struct Ctx {
@@ -63,7 +76,9 @@ impl Ctx {
                 if view == View::Linearizable {
                     self.raft.ensure_linearizable().await.map_err(status)?;
                 }
-                tokio::task::spawn_blocking(move || slot.with_store(|s| f(s)))
+                // Fails fast (UNAVAILABLE) while a snapshot install swaps
+                // the file (D8): the client moves to its next endpoint.
+                tokio::task::spawn_blocking(move || slot.with_store_read(|s| f(s)))
                     .await
                     .map_err(join_err)?
                     .map_err(status)

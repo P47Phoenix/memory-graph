@@ -72,10 +72,11 @@ jobs:
           set -euxo pipefail
           docker network create mg-net
           docker volume rm -f mg-serve >/dev/null 2>&1 || true
-          # Container 1 serves a database on a named volume; container 2
-          # (one-shot runs on the same network) is the client.
+          # Container 1 serves a data directory on a named volume (the
+          # recommended single-container command); container 2 (one-shot runs
+          # on the same network) is the client.
           docker run -d --name mg-server --network mg-net -v mg-serve:/data memory-graph:smoke \
-            serve --db /data/graph.redb --listen 0.0.0.0:7000
+            serve --data-dir /data --bootstrap --node-id 1 --listen 0.0.0.0:7000
           trap 'docker logs mg-server || true; docker rm -f mg-server >/dev/null 2>&1 || true; docker network rm mg-net >/dev/null 2>&1 || true' EXIT
           ok=0
           for i in $(seq 1 60); do
@@ -98,11 +99,29 @@ jobs:
             sleep 1
           done
           [ "$s" = healthy ]
+          docker run --rm --network mg-net memory-graph:smoke --server mg-server:7000 cluster status --json | tee sstatus.json
+          python3 -c 'import json; s=json.load(open("sstatus.json")); assert s["role"] == "leader" and s["cluster_id"] and s["data_dir"] == "/data", s'
           # docker stop = SIGTERM: a graceful shutdown exits 0 and removes the
-          # LOCK sidecar, after which the file opens embedded.
+          # LOCK file. `docker start` reruns the same command: --bootstrap on
+          # an initialized data directory is a plain restart (same cluster,
+          # same data), as Compose and Kubernetes restarts need.
           docker stop -t 60 mg-server
           [ "$(docker inspect -f '{{.State.ExitCode}}' mg-server)" = 0 ]
-          docker run --rm -v mg-serve:/data busybox:1.37 sh -c 'test -e /data/graph.redb && test ! -e /data/graph.redb.LOCK'
+          docker run --rm -v mg-serve:/data busybox:1.37 sh -c 'test -e /data/graph.redb && test -e /data/raft.redb && test -e /data/node.json && test ! -e /data/LOCK'
+          docker start mg-server
+          ok=0
+          for i in $(seq 1 60); do
+            if docker run --rm --network mg-net memory-graph:smoke --server mg-server:7000 health --ready; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ]
+          docker run --rm --network mg-net memory-graph:smoke --server mg-server:7000 cluster status --json | tee sstatus2.json
+          python3 -c 'import json; a=json.load(open("sstatus.json")); b=json.load(open("sstatus2.json")); assert a["cluster_id"] == b["cluster_id"], (a, b)'
+          docker run --rm --network mg-net memory-graph:smoke --server mg-server:7000 search Node --language rust --json | tee ssearch2.json
+          python3 -c 'import json; r=json.load(open("ssearch2.json")); assert r["results"], r'
+          docker stop -t 60 mg-server
+          [ "$(docker inspect -f '{{.State.ExitCode}}' mg-server)" = 0 ]
+          # The store in the data directory opens embedded (default ./graph.redb in /data).
           docker run --rm -v mg-serve:/data memory-graph:smoke describe --json | tee sdescribe.json
           python3 -c 'import json; d=json.load(open("sdescribe.json")); assert [r for r in d["repos"] if r["repo"] == "graph-core"], d'
           docker rm mg-server >/dev/null

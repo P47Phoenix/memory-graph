@@ -65,7 +65,7 @@ impl pb::store_server::Store for StoreService {
             node_id: self.ctx.info.node_id,
             leader_id: leader.id,
             leader_addr: leader.addr,
-            cluster_id: self.ctx.info.cluster_id.clone(),
+            cluster_id: self.ctx.info.cluster_id(),
         }))
     }
 
@@ -277,7 +277,7 @@ impl pb::store_server::Store for StoreService {
         let conn = conn_id(&req);
         let slot = Arc::clone(&self.ctx.slot);
         let id = tokio::task::spawn_blocking(move || {
-            slot.with_store(|s| Ok(slot.snapshots().open(conn, s)))
+            slot.with_store_read(|s| Ok(slot.snapshots().open(conn, s)))
                 .map_err(|e| graph_proto::store_error_to_status(&e))?
         })
         .await

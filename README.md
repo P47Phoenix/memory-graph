@@ -85,9 +85,9 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 | `sysinfo` | What `index` sizes itself from on this machine: CPUs, memory and its source, the starting budget, free disk on the database's volume. |
 | `vacuum [--compact]` | Drop dictionary terms no file uses; `--compact` rebuilds the file to give the space back. |
 | `export [--out FILE]` | Dump every node (org, repo, file, symbol, token, with spans) as newline-delimited JSON. An escape hatch; there is no importer yet. |
-| `serve --db FILE [--listen HOST:PORT]` | Serve a database over gRPC for `--server` clients ([Server mode](#server-mode)). |
+| `serve --db FILE` / `serve --data-dir DIR [--bootstrap]` `[--listen HOST:PORT]` | Serve a database file, or a cluster node's data directory, over gRPC for `--server` clients ([Server mode](#server-mode), [Cluster](#cluster-preview)). |
 | `health [--ready]` | With `--server`: exit 0 when the server is serving (`--ready`: and has a leader), 1 when not. |
-| `cluster status` / `cluster leader` | With `--server`: the node's role, term, leader and log indexes; `leader` exits 3 when there is none. |
+| `cluster status` / `cluster leader` / `cluster snapshot [--out FILE]` | With `--server`: the node's role, term, leader, log indexes, members and replication lag; `leader` exits 3 when there is none; `snapshot` builds a Raft snapshot and can download it. |
 
 `search`, `symbols` and `describe` take `--json` (an object on stdout); `search` and `symbols` also take `--limit`/`--offset` for paging, with results ordered by org, repo, file, position.
 
@@ -152,13 +152,42 @@ memory-graph health && echo up                            # exit 0 when serving,
 - **Same commands, same answers.** Every command in this README takes `--server` in place of `--db` and prints byte for byte what it prints on the file (tested on the vendored corpus). `index --server` reads and sends the files; the server parses and commits them (the progress view shows `send` and `replicate: acked by leader N (idx K)` stages, and `--stats` an `rpc` row). Reads run while an index writes.
 - **Choosing the target.** `--db` and `--server` are exclusive; `MEMORY_GRAPH_SERVER` stands in for `--server` (the flag wins), and `--db` together with either is an error that names both. Neither means `./graph.redb`. `--read linearizable` (or `MEMORY_GRAPH_READ`) makes reads wait until they see every acknowledged write; the default `local` reads the node's store as it is (the same thing on a single node).
 - **Settings that belong to the server.** `--cache-bytes` goes to `serve`; `--chunk-bytes` is refused with `--server` (the server cuts its log entries at 8 MiB itself); `--jobs` only sizes the client's reading threads (a warning says so); the disk guard runs on the server, which reports a full disk as an error.
-- **`serve`.** `--listen` defaults to `127.0.0.1:7000` (`0.0.0.0:7000` to accept other machines; port `0` picks a free port and the printed line names it). `--node-id` (default 1), `--cache-bytes`, `--snapshot-max-age` (how long a paging client's frozen view may live, default `15m`). It writes `<db>.LOCK` (`{"pid", "listen", "started"}`) next to the file and removes it on a graceful stop (Ctrl-C, SIGTERM, `docker stop`). The Raft log lives in `<db>.raft.redb`.
+- **`serve`.** `--listen` defaults to `127.0.0.1:7000` (`0.0.0.0:7000` to accept other machines; port `0` picks a free port and the printed line names it). `--node-id` (default 1 with `--db`), `--cache-bytes`, `--snapshot-max-age` (how long a paging client's frozen view may live, default `15m`). With `--db` it writes `<db>.LOCK` (`{"pid", "listen", "started"}`) next to the file and removes it on a graceful stop (Ctrl-C, SIGTERM, `docker stop`); the Raft log lives in `<db>.raft.redb`. `--data-dir` (below) keeps everything in one directory instead.
 - **A served file opened directly** waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_WAIT_MS` changes that), then says who holds it: `database ./g is locked by pid 4242 (memory-graph serve on 127.0.0.1:7000); use --server 127.0.0.1:7000 or stop it`. Once the server stops, the file opens directly again and answers exactly as the server did.
 - **Also over `--server`:** `sysinfo` prints the server machine's report under `server <addr> node N (leader: M)`; `vacuum --compact` compacts the server's file; `health [--ready]` and `cluster status [--json]` / `cluster leader` report on the node.
 - **Exit codes:** 0 success; 1 failure (and `health`: not serving; a read whose server is unreachable or whose connection was lost); 3 `cluster leader` found no leader; 4 a write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write; 5 the server speaks another protocol or store format version.
 - **An error does not prove a write failed.** A write that fails with a lost connection or exit code 4 may still have been applied (the server can commit it and die before answering). Rerunning it is safe: `index` skips unchanged files by fingerprint, `prune` and `vacuum` are idempotent, and `ingest` of the same extraction stores the same thing. A retried write reports what the retry did: a `prune` that landed before the connection was lost reports 0 removed on the retry, though the stored state is correct.
 - **Write deadline.** `--write-deadline <duration>` (or `MEMORY_GRAPH_WRITE_DEADLINE`; e.g. `500ms`, `10s`, `2m`; default `10s`) is how long a write keeps retrying through no leader or a lost connection before it fails with exit code 4.
-- **Not yet:** this release serves a **single node**. Replication to followers, membership commands (`cluster add-learner`, `promote`, ...), TLS and authentication come with later stages of [ADR 0004](docs/adr/0004-client-server-and-replication.md); bind to loopback or a private network meanwhile.
+- **Not yet:** TLS and authentication come with a later stage of [ADR 0004](docs/adr/0004-client-server-and-replication.md); bind to loopback or a private network meanwhile.
+
+### Cluster (preview)
+
+`serve --data-dir` runs a node that replicates through Raft (ADR 0004 D5-D7). Every write is a log entry that a majority fsyncs before it is acknowledged, and every node answers reads from its own copy.
+
+```sh
+memory-graph serve --data-dir ./n1 --bootstrap --node-id 1 --listen 127.0.0.1:7001   # a NEW one-node cluster (prints a warning saying so)
+memory-graph --server 127.0.0.1:7001 index --org acme --repo api ./api
+memory-graph --server 127.0.0.1:7001 cluster status          # role, term, leader, log, snapshot, members, lag
+memory-graph --server 127.0.0.1:7001 cluster snapshot --out backup.redb
+memory-graph serve --data-dir ./n1 --listen 127.0.0.1:7001   # later: a restart needs no flags
+```
+
+- **Data directory.** It holds `node.json` (node id, cluster id, advertised address, versions), `graph.redb` (the store), `raft.redb` (the Raft log and vote), `snapshots/` (the latest snapshot and its `.meta`) and `LOCK`. `--data-dir` and `--db` are exclusive.
+- **Start-up.** `--bootstrap` on an empty directory creates a new cluster with a random id and this node as its only voter. On a directory that is already initialized it is a plain restart, so a container can keep the flag in its command. With neither flag, an initialized directory restarts from its state and an empty one is refused ("pass --bootstrap"). `--node-id` is required on the first start and then read from `node.json`; a different id is refused.
+- **`--advertise HOST:PORT`** is the address peers and clients reach this node at. The default is the listen address, with `0.0.0.0` or `[::]` replaced by the host name. It is stored in `node.json` and in the cluster membership, so restart a node on the same address.
+- **Restore.** `serve --data-dir <empty dir> --bootstrap --node-id 1 --restore backup.redb` seeds a new cluster from a `cluster snapshot --out` file. The store is checked, and the new cluster gets its own id and a fresh log.
+- **`cluster status [--json]`** adds, for a data-dir node: role, cluster id, advertised address, snapshot and purged indexes, every member with its role and address, the leader's per-peer replication lag, and the log and store file sizes. **`cluster snapshot [--out FILE] [--json]`** builds a snapshot now. With `--out` it downloads the file to this machine and verifies its SHA-256 and size.
+- **Log and snapshots.** A snapshot is built after `--snapshot-log-entries` (default 10000) applied entries or `--snapshot-log-bytes` (default 1G) of log. The log below it is then purged, keeping `--log-keep-entries` (default 1000) so a briefly lagging follower catches up from the log, and `raft.redb` is compacted. Timing: `--heartbeat-interval` (ms, default 250), `--election-timeout-min` / `--election-timeout-max` (ms, default 1000 / 2000).
+- **Disk guard.** `--min-free-disk` (a size, or a percentage of the volume; the default for a data directory is 5% of it, between 2G and 32G, and off for `--db`). Writes and snapshot builds are refused with `RESOURCE_EXHAUSTED` while less than that plus one snapshot copy is free.
+- **More nodes (preview).** Stage B can form a cluster by hand. Start the others with the hidden `--wait-for-membership` flag, then add each from the leader with the hidden `cluster add-learner <id> <host:port>` and `cluster promote <id>`:
+
+  ```sh
+  memory-graph serve --data-dir ./n2 --node-id 2 --listen 127.0.0.1:7002 --wait-for-membership
+  memory-graph --server 127.0.0.1:7001 cluster add-learner 2 127.0.0.1:7002
+  memory-graph --server 127.0.0.1:7001 cluster promote 2
+  ```
+
+  Writes must go to the leader. The client follows a `NotLeader` answer to it, and `cluster leader` names it. **Stage C** completes this with `serve --join <peer>` (replacing `--wait-for-membership`), write forwarding from followers, the membership guards and the rest of the membership commands (`remove`, leader transfer). Until then, treat multi-node clusters as a preview. Measurements: [docs/spikes/raft-replication.md](docs/spikes/raft-replication.md).
 
 ## Docker
 
@@ -273,11 +302,12 @@ The image exposes port 7000 and has a `HEALTHCHECK` that asks the server itself 
 ```sh
 docker network create mg
 docker run -d --name mg-server --network mg -p 127.0.0.1:7000:7000 -v mg-data:/data \
-  ghcr.io/p47phoenix/memory-graph:main serve --db /data/graph.redb --listen 0.0.0.0:7000
+  ghcr.io/p47phoenix/memory-graph:main serve --data-dir /data --bootstrap --node-id 1 --listen 0.0.0.0:7000
 docker run --rm --network mg -v "$PWD:/src:ro" ghcr.io/p47phoenix/memory-graph:main \
   --server mg-server:7000 index --org acme --repo api /src
 memory-graph --server 127.0.0.1:7000 search foo          # from the host, through the published port
-docker stop mg-server                                     # SIGTERM: a graceful stop, the LOCK sidecar is removed
+docker stop mg-server                                     # SIGTERM: a graceful stop, /data/LOCK is removed
+docker start mg-server                                    # same command again: --bootstrap on an initialized /data is a plain restart
 ```
 ### Troubleshooting
 

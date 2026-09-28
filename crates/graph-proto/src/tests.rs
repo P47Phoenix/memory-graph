@@ -995,6 +995,8 @@ decode_never_panics! {
     dnp_vote_request: pb::VoteRequest, dnp_vote_response: pb::VoteResponse,
     dnp_install_snapshot_header: pb::InstallSnapshotHeader, dnp_install_snapshot_request: pb::InstallSnapshotRequest,
     dnp_install_snapshot_response: pb::InstallSnapshotResponse, dnp_log_command: pb::LogCommand,
+    dnp_raft_vote: pb::RaftVote, dnp_raft_log_id: pb::RaftLogId, dnp_raft_empty: pb::RaftEmpty,
+    dnp_peer_lag: pb::PeerLag, dnp_snapshot_info: pb::SnapshotInfo,
 }
 
 // A fuzzed message that decodes must convert without panicking (to the Rust

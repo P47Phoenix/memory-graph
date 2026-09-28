@@ -11,8 +11,11 @@
 //!   entries through the store's marked writes (one transaction per entry,
 //!   exactly-once by the `RAFT_SM` marker) and builds / installs snapshots
 //!   with `export_snapshot` / `install_snapshot`.
-//! * [`network`]: a loopback `RaftNetworkFactory`; a one-member cluster
-//!   never sends an RPC.
+//! * [`network`]: [`network::GrpcNetwork`], the `RaftNetworkFactory` over
+//!   the peers' `Raft` gRPC service, and the test fault-injection wrapper
+//!   ([`network::FaultPlan`]); [`wire`] converts openraft's RPC types.
+//! * [`snapshot_dir`]: [`snapshot_dir::SnapshotDir`], the snapshot files
+//!   (`snap-<term>-<index>.redb` + `.meta`).
 //! * [`node`]: [`node::RaftNode`], start-up (`Raft::initialize` on first
 //!   start, resume from the log after) and the leader lookups the services
 //!   use.
@@ -24,8 +27,10 @@
 pub mod log_store;
 pub mod network;
 pub mod node;
+pub mod snapshot_dir;
 pub mod state_machine;
 pub mod types;
+pub mod wire;
 
-pub use node::RaftNode;
+pub use node::{RaftNode, RaftSettings};
 pub use types::{LogRequest, LogResponse, NodeId, TypeConfig};
