@@ -143,7 +143,7 @@ impl Conn {
         let mut last = None;
         for ep in cfg.endpoints.clone() {
             let channel = endpoint_for(&ep)?.connect_lazy();
-            match Self::hello_on(&channel, &cfg).await {
+            match Self::hello_on(&ep, &channel, &cfg).await {
                 Ok(h) => {
                     let hello = HelloInfo::from((h, ep.clone()));
                     return Ok(Conn {
@@ -170,6 +170,7 @@ impl Conn {
     }
 
     async fn hello_on(
+        endpoint: &str,
         channel: &Channel,
         cfg: &ClientConfig,
     ) -> Result<pb::HelloResponse, StoreError> {
@@ -197,12 +198,12 @@ impl Conn {
                 Err(st) if st.code() == Code::Unavailable && st.details().is_empty() => {
                     let delay = jitter(&cfg.retry, attempt);
                     if Instant::now() + delay > deadline {
-                        return Err(map_status("", &st));
+                        return Err(map_status(endpoint, &st));
                     }
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
-                Err(st) => return Err(map_status("", &st)),
+                Err(st) => return Err(map_status(endpoint, &st)),
             }
         }
     }

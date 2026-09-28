@@ -748,7 +748,6 @@ dependencies = [
 name = "graph-server"
 version = "0.1.0"
 dependencies = [
- "futures-util",
  "graph-core",
  "graph-lang-rust",
  "graph-proto",
