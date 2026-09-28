@@ -15,6 +15,7 @@
 //! graph_store::conformance::run_all(&|| Harness {
 //!     open: Box::new(move |ex| open_store(&path, ex)),
 //!     exclusive: true,
+//!     accepts_remote_prepared: false,
 //!     guard: Some(Box::new(tempdir)),
 //! });
 //! ```
@@ -39,6 +40,11 @@ pub struct Harness {
     /// `open` must fail with `StoreError::Locked`. Set false for a client
     /// backend (e.g. `RemoteStore`) where many handles are normal.
     pub exclusive: bool,
+    /// The backend commits a [`PreparedFile::remote`](crate::PreparedFile::remote)
+    /// file (ADR 0004 D2): true for a client backend that forwards the bytes
+    /// to a server that parses them; false (the default) for the embedded
+    /// store, which must reject it in that file's slot.
+    pub accepts_remote_prepared: bool,
     /// Kept alive for the case's duration (e.g. a temp dir).
     pub guard: Option<Box<dyn std::any::Any>>,
 }
@@ -85,6 +91,7 @@ pub const CASES: &[(&str, Case)] = &[
         prepared_changed_file_replaces,
     ),
     ("prepared_duplicate_paths", prepared_duplicate_paths),
+    ("remote_prepared_is_rejected", remote_prepared_is_rejected),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1228,6 +1235,82 @@ fn nul_handling(h: &Harness) {
         .search_symbols(&SymbolQuery::new("a\0b"))
         .unwrap()
         .is_empty());
+}
+
+/// A [`PreparedFile::remote`](crate::PreparedFile::remote) file (ADR 0004
+/// D2) carries raw bytes for a server to parse. An embedded store rejects it
+/// in that file's slot (the other files of the call are stored as usual); a
+/// client backend (`accepts_remote_prepared`) forwards it and stores it like
+/// any other file. Either way the file's normalized path, `bytes_len`,
+/// footprint and `remote_parts` are what the constructor was given.
+fn remote_prepared_is_rejected(h: &Harness) {
+    let s = open(h);
+    let bytes = b"alpha beta".to_vec();
+    let remote = crate::PreparedFile::remote(
+        "o",
+        "r",
+        "./src/../src/remote.txt",
+        bytes.clone(),
+        Some("Text".into()),
+        Some(ORIGIN_DIRECTORY.into()),
+    );
+    assert_eq!(remote.path(), "src/remote.txt", "normalized like prepare");
+    assert_eq!(remote.language(), "text");
+    assert_eq!(remote.bytes_len(), bytes.len());
+    assert!(!remote.is_unchanged());
+    assert!(remote.memory_footprint() >= bytes.len());
+    let parts = remote.remote_parts().expect("remote parts");
+    assert_eq!(parts.org, "o");
+    assert_eq!(parts.repo, "r");
+    assert_eq!(parts.path, "src/remote.txt");
+    assert_eq!(parts.bytes, bytes.as_slice());
+    assert_eq!(parts.language, Some("text"));
+    assert_eq!(parts.origin, Some(ORIGIN_DIRECTORY));
+    let no_lang = crate::PreparedFile::remote("o", "r", "x.txt", vec![], None, None);
+    assert_eq!(no_lang.language(), "");
+    assert_eq!(no_lang.remote_parts().unwrap().language, None);
+
+    let local = s
+        .prepare(
+            "o",
+            "r",
+            &bf("local.txt", b"gamma"),
+            IndexOptions::default(),
+        )
+        .unwrap();
+    assert!(local.remote_parts().is_none());
+    let results = s
+        .index_prepared("o", "r", vec![local, remote], IndexOptions::default())
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let local_stats = results[0].as_ref().expect("local file stored");
+    assert_eq!(local_stats.path, "local.txt");
+    if h.accepts_remote_prepared {
+        let stats = results[1]
+            .as_ref()
+            .expect("remote file stored by the server");
+        assert_eq!(stats.path, "src/remote.txt");
+        assert_eq!(stats.language, "text");
+        assert_eq!(s.search(&Query::new("alpha")).unwrap().len(), 1);
+        assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    } else {
+        match &results[1] {
+            Err(StoreError::Rejected(msg)) => assert_eq!(
+                msg,
+                "remote-prepared file cannot be committed to an embedded store"
+            ),
+            other => panic!("embedded store must reject a remote-prepared file, got {other:?}"),
+        }
+        assert!(s.search(&Query::new("alpha")).unwrap().is_empty());
+        assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+        // The rejection reaches nothing: no org/repo/file rows for it.
+        assert!(s.file_tokens("o", "r", "src/remote.txt").unwrap().is_none());
+    }
+    assert_eq!(s.search(&Query::new("gamma")).unwrap().len(), 1);
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
 }
 
 /// Fixed-query differential harness (configuration equivalence): seed two

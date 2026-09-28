@@ -114,6 +114,61 @@ pub(crate) const CONTENT_FILES: MultimapTableDefinition<u64, u64> =
 /// open" is fully answerable from this marker alone.
 pub(crate) const OPEN_BATCH: TableDefinition<&str, &str> = TableDefinition::new("open_batch");
 
+/// Raft state-machine bookkeeping (ADR 0004 D7): `"last_applied"` holds a
+/// [`RaftMarker`] (24 bytes, see [`RaftMarker::encode`]) and `"membership"`
+/// the opaque bytes the server hands in. The one recorded exception to the
+/// version-bump rule: a compatible addition that is **never** created by
+/// [`V2Store::open`] (so an embedded reopen stays byte-identical and never
+/// gains the table) and is created lazily by the first marked write
+/// (`index_prepared_marked` and friends). Readers guard
+/// `TableDoesNotExist` and report "no marker".
+pub(crate) const RAFT_SM: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_sm");
+const RAFT_LAST_APPLIED: &str = "last_applied";
+const RAFT_MEMBERSHIP: &str = "membership";
+
+/// The last Raft log entry applied to a store (ADR 0004 D5/D7), stored in
+/// [`RAFT_SM`] by the marked writes. Applying is exactly-once by this
+/// marker: a marked write whose `index` is not above the stored one is
+/// refused without writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RaftMarker {
+    pub term: u64,
+    pub index: u64,
+    pub node_id: u64,
+}
+
+impl RaftMarker {
+    /// Stored size of the marker: three little-endian `u64`s.
+    pub const ENCODED_LEN: usize = 24;
+
+    /// `term`, `index`, `node_id` as little-endian `u64`s, in that order
+    /// (no prost, no serde: 24 fixed bytes; golden-byte tested).
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..8].copy_from_slice(&self.term.to_le_bytes());
+        out[8..16].copy_from_slice(&self.index.to_le_bytes());
+        out[16..].copy_from_slice(&self.node_id.to_le_bytes());
+        out
+    }
+
+    /// Inverse of [`encode`](Self::encode); any other length is `Corrupt`.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let arr: &[u8; Self::ENCODED_LEN] = bytes.try_into().map_err(|_| {
+            StoreError::Corrupt(format!(
+                "raft marker is {} bytes, expected {}",
+                bytes.len(),
+                Self::ENCODED_LEN
+            ))
+        })?;
+        let u = |i: usize| u64::from_le_bytes(arr[i..i + 8].try_into().unwrap());
+        Ok(Self {
+            term: u(0),
+            index: u(8),
+            node_id: u(16),
+        })
+    }
+}
+
 /// The content id backing `file`'s stream/postings/symbol-index rows. Today
 /// this is the identity (content sharing is off, ADR 0003 story 3 Q2: "skipped
 /// unchanged files never touch refcounts", and every ingested file owns its
@@ -1794,6 +1849,39 @@ impl<'t> W<'t> {
     }
 }
 
+/// Copy every row of `def` from `rt` into the same-named table of `wt`
+/// (creating it), for [`V2Store::export_snapshot`].
+fn copy_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+    rt: &ReadTransaction,
+    wt: &redb::WriteTransaction,
+    def: TableDefinition<K, V>,
+) -> Result<()> {
+    let src = rt.open_table(def)?;
+    let mut dst = wt.open_table(def)?;
+    for row in src.iter()? {
+        let (k, v) = row?;
+        dst.insert(k.value(), v.value())?;
+    }
+    Ok(())
+}
+
+/// [`copy_table`] for a multimap table.
+fn copy_multimap<K: redb::Key + 'static, V: redb::Key + 'static>(
+    rt: &ReadTransaction,
+    wt: &redb::WriteTransaction,
+    def: MultimapTableDefinition<K, V>,
+) -> Result<()> {
+    let src = rt.open_multimap_table(def)?;
+    let mut dst = wt.open_multimap_table(def)?;
+    for row in src.iter()? {
+        let (k, vals) = row?;
+        for v in vals {
+            dst.insert(k.value(), v?.value())?;
+        }
+    }
+    Ok(())
+}
+
 /// Recompute `refs`/`content_files` from scratch by scanning every live
 /// file's stream row (the source of truth: a stream row exists iff its file
 /// is live, see `W::remove_content`) and rewriting both tables to match,
@@ -2208,8 +2296,22 @@ impl V2Store {
     /// keys, so its cost is linear in the store.
     pub fn vacuum(&self) -> Result<VacuumStats> {
         let wt = self.db.begin_write()?;
+        let (stats, nothing) = Self::vacuum_in(&wt)?;
+        if nothing {
+            // Nothing to remove: abandon the transaction so the file is
+            // byte-for-byte unchanged (a commit would rewrite its header).
+            wt.abort()?;
+        } else {
+            wt.commit()?;
+        }
+        Ok(stats)
+    }
+
+    /// The body of [`vacuum`](Self::vacuum) inside the caller's transaction;
+    /// the flag is "nothing was removed" (the caller may then abort).
+    fn vacuum_in(wt: &redb::WriteTransaction) -> Result<(VacuumStats, bool)> {
         let stats = {
-            let w = W::new(&wt)?;
+            let w = W::new(wt)?;
             let mut live: HashSet<u64> = HashSet::new();
             for r in w.post.iter()? {
                 live.insert(r?.0.value().0);
@@ -2268,15 +2370,158 @@ impl V2Store {
             };
             (stats, dead.is_empty())
         };
-        let (stats, nothing) = stats;
-        if nothing {
-            // Nothing to remove: abandon the transaction so the file is
-            // byte-for-byte unchanged (a commit would rewrite its header).
-            wt.abort()?;
-        } else {
-            wt.commit()?;
-        }
         Ok(stats)
+    }
+
+    // ----- Raft state-machine bookkeeping (ADR 0004 D5/D7) -----
+    //
+    // Not on the `Store` trait: only a server applying a replicated log
+    // needs them. Every `*_marked` write is exactly its plain counterpart
+    // plus, in the same (single) transaction, the marker and membership,
+    // and it refuses an entry at or below the stored marker without writing.
+
+    /// The stored [`RaftMarker`], or `Ok(None)` when the store has never
+    /// been written by a marked write (the `raft_sm` table does not exist).
+    pub fn raft_marker(&self) -> Result<Option<RaftMarker>> {
+        let rt = self.db.begin_read()?;
+        Self::raft_row(&rt, RAFT_LAST_APPLIED)?
+            .as_deref()
+            .map(RaftMarker::decode)
+            .transpose()
+    }
+
+    /// The opaque membership bytes the server last stored, if any.
+    pub fn raft_membership(&self) -> Result<Option<Vec<u8>>> {
+        let rt = self.db.begin_read()?;
+        Self::raft_row(&rt, RAFT_MEMBERSHIP)
+    }
+
+    fn raft_row(rt: &ReadTransaction, key: &str) -> Result<Option<Vec<u8>>> {
+        match rt.open_table(RAFT_SM) {
+            Ok(t) => Ok(t.get(key)?.map(|v| v.value().to_vec())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Refuse `marker` if the store's marker is already at or past its
+    /// index, else write it (and `membership` when given) into `wt`,
+    /// creating `raft_sm` on first use. `Err` leaves `wt` to be dropped
+    /// (aborted) by the caller, so nothing is written.
+    fn stamp_marker(
+        wt: &redb::WriteTransaction,
+        marker: RaftMarker,
+        membership: Option<&[u8]>,
+    ) -> Result<()> {
+        let mut t = wt.open_table(RAFT_SM)?;
+        if let Some(cur) = t.get(RAFT_LAST_APPLIED)? {
+            let cur = RaftMarker::decode(cur.value())?;
+            if cur.index >= marker.index {
+                return Err(StoreError::Rejected(format!(
+                    "raft marker {} already applied",
+                    marker.index
+                )));
+            }
+        }
+        t.insert(RAFT_LAST_APPLIED, marker.encode().as_slice())?;
+        if let Some(m) = membership {
+            t.insert(RAFT_MEMBERSHIP, m)?;
+        }
+        Ok(())
+    }
+
+    /// [`Store::index_prepared`] forced into **one** transaction (the chunk
+    /// cap is `usize::MAX` for this call whatever the store's setting) that
+    /// also records `marker` and `membership` (ADR 0004 D5: apply is
+    /// all-or-nothing with its marker, and transaction boundaries never
+    /// depend on a per-node setting). `Rejected("raft marker N already
+    /// applied")` without writing when the stored marker's index is `>=
+    /// marker.index`.
+    pub fn index_prepared_marked(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+        marker: RaftMarker,
+        membership: Option<&[u8]>,
+    ) -> Result<Vec<Result<IngestStats>>> {
+        let n = files.len();
+        let mut it = files.into_iter();
+        self.commit_each(
+            org,
+            repo,
+            n,
+            opts,
+            usize::MAX,
+            Some((marker, membership)),
+            |_, _| Ok(it.next().expect("one prepared file per slot")),
+        )
+    }
+
+    /// [`Store::prune_files`] (never a dry run) plus the marker, in one
+    /// transaction; same marker rule as [`index_prepared_marked`](Self::index_prepared_marked).
+    pub fn prune_files_marked(
+        &self,
+        org: &str,
+        repo: &str,
+        keep: &HashSet<String>,
+        marker: RaftMarker,
+        membership: Option<&[u8]>,
+    ) -> Result<Vec<String>> {
+        let wt = self.db.begin_write()?;
+        Self::stamp_marker(&wt, marker, membership)?;
+        let removed = Self::prune_in(&wt, org, repo, keep, false)?;
+        wt.commit()?;
+        Ok(removed)
+    }
+
+    /// [`Store::vacuum`] plus the marker, in one transaction, which always
+    /// commits (the marker is written even when no term was dead); same
+    /// marker rule as [`index_prepared_marked`](Self::index_prepared_marked).
+    pub fn vacuum_marked(
+        &self,
+        marker: RaftMarker,
+        membership: Option<&[u8]>,
+    ) -> Result<VacuumStats> {
+        let wt = self.db.begin_write()?;
+        Self::stamp_marker(&wt, marker, membership)?;
+        let (stats, _) = Self::vacuum_in(&wt)?;
+        wt.commit()?;
+        Ok(stats)
+    }
+
+    /// [`Store::ingest_file_with_origin`] plus the marker, in one
+    /// transaction; same marker rule as
+    /// [`index_prepared_marked`](Self::index_prepared_marked).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_file_marked(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+        language: &str,
+        ex: &Extraction,
+        origin: Option<&str>,
+        marker: RaftMarker,
+        membership: Option<&[u8]>,
+    ) -> Result<IngestStats> {
+        validate_spans(ex)?;
+        let wt = self.db.begin_write()?;
+        Self::stamp_marker(&wt, marker, membership)?;
+        let stats = Self::ingest_validated(&wt, org, repo, path, language, ex, (origin, None))?;
+        wt.commit()?;
+        Ok(stats)
+    }
+
+    /// Record `marker` (and `membership`) and nothing else: a log entry
+    /// with no store effect (openraft blank/membership entries); same
+    /// marker rule as [`index_prepared_marked`](Self::index_prepared_marked).
+    pub fn mark_only(&self, marker: RaftMarker, membership: Option<&[u8]>) -> Result<()> {
+        let wt = self.db.begin_write()?;
+        Self::stamp_marker(&wt, marker, membership)?;
+        wt.commit()?;
+        Ok(())
     }
 
     /// Recompute `refs` and `content_files` from scratch by scanning every
@@ -2329,17 +2574,7 @@ impl V2Store {
     /// over `path` unless the whole copy already committed.
     pub fn compact(self) -> Result<(Self, CompactStats)> {
         let io = |e: std::io::Error| StoreError::Storage(e.to_string());
-        let V2Store {
-            db,
-            registry,
-            chunk_bytes,
-            cache_bytes,
-            path,
-            max_snapshot_age,
-            snapshot_tracker: _,
-        } = self;
-
-        let before_bytes = std::fs::metadata(&path).map_err(io)?.len();
+        let path = self.path.clone();
         // PID alone collides if `compact` is ever called more than once
         // concurrently in one process (not today's one-shot CLI, but a
         // future embedder might); the nanosecond timestamp is cheap,
@@ -2377,119 +2612,23 @@ impl V2Store {
         // has the store open (see issue #32).
         let _ = std::fs::remove_file(&tmp);
 
-        let build = || -> Result<()> {
-            let new_db = Database::create(&tmp)?;
-            {
-                let rt = db.begin_read()?;
-                let wt = new_db.begin_write()?;
-                {
-                    let mut w = wt.open_table(META)?;
-                    for row in rt.open_table(META)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_table(CATALOG)?;
-                    for row in rt.open_table(CATALOG)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_table(NODES)?;
-                    for row in rt.open_table(NODES)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_table(NAMES)?;
-                    for row in rt.open_table(NAMES)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_multimap_table(CHILDREN)?;
-                    for row in rt.open_multimap_table(CHILDREN)?.iter()? {
-                        let (k, vals) = row?;
-                        for v in vals {
-                            w.insert(k.value(), v?.value())?;
-                        }
-                    }
-                }
-                {
-                    let mut w = wt.open_multimap_table(SYMBOLS)?;
-                    for row in rt.open_multimap_table(SYMBOLS)?.iter()? {
-                        let (k, vals) = row?;
-                        for v in vals {
-                            w.insert(k.value(), v?.value())?;
-                        }
-                    }
-                }
-                {
-                    let mut w = wt.open_table(DICT)?;
-                    for row in rt.open_table(DICT)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_table(DICT_REV)?;
-                    for row in rt.open_table(DICT_REV)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_table(STREAMS)?;
-                    for row in rt.open_table(STREAMS)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_table(POST)?;
-                    for row in rt.open_table(POST)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_table(REFS)?;
-                    for row in rt.open_table(REFS)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                {
-                    let mut w = wt.open_multimap_table(CONTENT_FILES)?;
-                    for row in rt.open_multimap_table(CONTENT_FILES)?.iter()? {
-                        let (k, vals) = row?;
-                        for v in vals {
-                            w.insert(k.value(), v?.value())?;
-                        }
-                    }
-                }
-                {
-                    let mut w = wt.open_table(OPEN_BATCH)?;
-                    for row in rt.open_table(OPEN_BATCH)?.iter()? {
-                        let (k, v) = row?;
-                        w.insert(k.value(), v.value())?;
-                    }
-                }
-                wt.commit()?;
+        let before_bytes = match self.export_snapshot(&tmp) {
+            Ok(stats) => stats.before_bytes,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
             }
-            drop(new_db);
-            Ok(())
         };
 
-        if let Err(e) = build() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-
+        let V2Store {
+            db,
+            registry,
+            chunk_bytes,
+            cache_bytes,
+            path,
+            max_snapshot_age,
+            snapshot_tracker: _,
+        } = self;
         // Drop the old handle before renaming over its path (Windows will
         // not allow the rename while any `Database` still has it open).
         drop(db);
@@ -2514,6 +2653,106 @@ impl V2Store {
                 after_bytes,
             },
         ))
+    }
+
+    /// Write a consistent copy of this store to a brand-new redb file at
+    /// `dest` (ADR 0004 D7: a Raft snapshot; also the copy step of
+    /// [`compact`](Self::compact)): one read transaction, every table copied
+    /// row by row (`raft_sm` too, when it exists), one write transaction on
+    /// the new file. The store stays open and usable; `dest` must not exist
+    /// (`Rejected`) and is removed again if the copy fails. Returns the
+    /// sizes of this file and of the copy.
+    pub fn export_snapshot(&self, dest: &Path) -> Result<CompactStats> {
+        let io = |e: std::io::Error| StoreError::Storage(e.to_string());
+        if dest.exists() {
+            return Err(StoreError::Rejected(format!(
+                "snapshot destination `{}` already exists",
+                dest.display()
+            )));
+        }
+        let before_bytes = std::fs::metadata(&self.path).map_err(io)?.len();
+        let build = || -> Result<()> {
+            let new_db = Database::create(dest)?;
+            let rt = self.db.begin_read()?;
+            let wt = new_db.begin_write()?;
+            copy_table(&rt, &wt, META)?;
+            copy_table(&rt, &wt, CATALOG)?;
+            copy_table(&rt, &wt, NODES)?;
+            copy_table(&rt, &wt, NAMES)?;
+            copy_multimap(&rt, &wt, CHILDREN)?;
+            copy_multimap(&rt, &wt, SYMBOLS)?;
+            copy_table(&rt, &wt, DICT)?;
+            copy_table(&rt, &wt, DICT_REV)?;
+            copy_table(&rt, &wt, STREAMS)?;
+            copy_table(&rt, &wt, POST)?;
+            copy_table(&rt, &wt, REFS)?;
+            copy_multimap(&rt, &wt, CONTENT_FILES)?;
+            copy_table(&rt, &wt, OPEN_BATCH)?;
+            // Lazily created by the marked writes (ADR 0004 D7): copied
+            // when present, never created here, so an unreplicated store's
+            // copy has no `raft_sm` either.
+            match rt.open_table(RAFT_SM) {
+                Ok(src) => {
+                    let mut dst = wt.open_table(RAFT_SM)?;
+                    for row in src.iter()? {
+                        let (k, v) = row?;
+                        dst.insert(k.value(), v.value())?;
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            wt.commit()?;
+            drop(rt);
+            drop(new_db);
+            Ok(())
+        };
+        if let Err(e) = build() {
+            let _ = std::fs::remove_file(dest);
+            return Err(e);
+        }
+        let after_bytes = std::fs::metadata(dest).map_err(io)?.len();
+        Ok(CompactStats {
+            before_bytes,
+            after_bytes,
+        })
+    }
+
+    /// Replace the store file at `path` by the snapshot file at `src` (ADR
+    /// 0004 D7: a follower installing a leader's snapshot). `src` must be a
+    /// store in the current format ([`detect_format`](crate::detect_format);
+    /// a file with no schema is `Rejected`). The caller guarantees no store
+    /// is open on `path` (Windows refuses to rename over an open file). The
+    /// swap is rename-based: an existing `path` is first moved aside to
+    /// `<path>.old`, `src` is renamed into place, and the old copy is
+    /// removed; if the second rename fails the old copy is moved back, so
+    /// `path` is never left missing. `src` is consumed on success.
+    pub fn install_snapshot(path: &Path, src: &Path) -> Result<()> {
+        let io = |e: std::io::Error| StoreError::Storage(e.to_string());
+        if crate::detect_format(src)?.is_none() {
+            return Err(StoreError::Rejected(format!(
+                "`{}` is not a store file (no schema version)",
+                src.display()
+            )));
+        }
+        let mut old = path.as_os_str().to_owned();
+        old.push(".old");
+        let old = PathBuf::from(old);
+        let _ = std::fs::remove_file(&old);
+        let had_old = path.exists();
+        if had_old {
+            std::fs::rename(path, &old).map_err(io)?;
+        }
+        if let Err(e) = std::fs::rename(src, path) {
+            if had_old {
+                let _ = std::fs::rename(&old, path);
+            }
+            return Err(io(e));
+        }
+        if had_old {
+            let _ = std::fs::remove_file(&old);
+        }
+        Ok(())
     }
 
     pub fn register(&mut self, e: Box<dyn Extractor>) {
@@ -2599,12 +2838,20 @@ impl V2Store {
         files: &[BatchFile<'_>],
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
-        self.commit_each(org, repo, files.len(), opts, |wt, i| {
-            let f = &files[i];
-            prepare_file(&self.registry, org, repo, f, opts, |path, lang, fp| {
-                Ok(check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
-            })
-        })
+        self.commit_each(
+            org,
+            repo,
+            files.len(),
+            opts,
+            self.chunk_bytes,
+            None,
+            |wt, i| {
+                let f = &files[i];
+                prepare_file(&self.registry, org, repo, f, opts, |path, lang, fp| {
+                    Ok(check_unchanged(wt, org, repo, path, lang, fp, f.origin)?.is_some())
+                })
+            },
+        )
     }
 
     /// See [`Store::prepare`]. The unchanged pre-check reads the last
@@ -2636,23 +2883,34 @@ impl V2Store {
     ) -> Result<Vec<Result<IngestStats>>> {
         let n = files.len();
         let mut it = files.into_iter();
-        self.commit_each(org, repo, n, opts, |_, _| {
+        self.commit_each(org, repo, n, opts, self.chunk_bytes, None, |_, _| {
             Ok(it.next().expect("one prepared file per slot"))
         })
     }
 
-    /// The chunked write loop shared by `index_batch` and `index_prepared`.
-    /// `next` yields the `i`-th prepared file (it may read the current
-    /// transaction), committed before the next one is asked for.
+    /// The chunked write loop shared by `index_batch`, `index_prepared` and
+    /// `index_prepared_marked`. `next` yields the `i`-th prepared file (it
+    /// may read the current transaction), committed before the next one is
+    /// asked for. `chunk_bytes` is the chunk cap for this call; a `marker`
+    /// (with `usize::MAX`, so the batch is one transaction) is stamped into
+    /// that transaction first, and refused before anything is written when
+    /// it is not above the stored one.
+    #[allow(clippy::too_many_arguments)]
     fn commit_each(
         &self,
         org: &str,
         repo: &str,
         n: usize,
         opts: IndexOptions,
+        chunk_bytes: usize,
+        marker: Option<(RaftMarker, Option<&[u8]>)>,
         mut next: impl FnMut(&redb::WriteTransaction, usize) -> Result<PreparedFile>,
     ) -> Result<Vec<Result<IngestStats>>> {
         let mut wt = self.db.begin_write()?;
+        if let Some((marker, membership)) = marker {
+            debug_assert_eq!(chunk_bytes, usize::MAX, "a marked batch is one transaction");
+            Self::stamp_marker(&wt, marker, membership)?;
+        }
         let batch_id = Self::next_batch_id(&wt)?;
         Self::mark_open_batch(&wt, batch_id, org, repo)?;
         let mut in_txn = 0usize;
@@ -2681,7 +2939,7 @@ impl V2Store {
                 continue;
             }
             in_txn += len;
-            if in_txn >= self.chunk_bytes {
+            if in_txn >= chunk_bytes {
                 wt.commit()?;
                 wt = self.db.begin_write()?;
                 // This chunk is not (yet) known to be the batch's last, so
@@ -2746,9 +3004,27 @@ impl V2Store {
         dry_run: bool,
     ) -> Result<Vec<String>> {
         let wt = self.db.begin_write()?;
+        let removed = Self::prune_in(&wt, org, repo, keep, dry_run)?;
+        if dry_run {
+            wt.abort()?;
+        } else {
+            wt.commit()?;
+        }
+        Ok(removed)
+    }
+
+    /// The body of [`prune_files`](Self::prune_files) inside the caller's
+    /// transaction (which the caller aborts for a dry run).
+    fn prune_in(
+        wt: &redb::WriteTransaction,
+        org: &str,
+        repo: &str,
+        keep: &HashSet<String>,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
         let mut removed = Vec::new();
         {
-            let mut w = W::new(&wt)?;
+            let mut w = W::new(wt)?;
             let mut tally = Tally::default();
             let org_id = w
                 .names
@@ -2795,11 +3071,6 @@ impl V2Store {
                 }
             }
             tally.apply(&mut w.cat)?;
-        }
-        if dry_run {
-            wt.abort()?;
-        } else {
-            wt.commit()?;
         }
         removed.sort();
         Ok(removed)

@@ -312,7 +312,7 @@ cargo test --workspace                                    # unit + integration t
 cargo test -p graph-cli --test corpus                      # public-repo corpus: exact spans, cross-repo links
 cargo test -p graph-cli --test e2e                          # CLI end-to-end
 python3 scripts/test_gate.py                               # CI's extra gate
-python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any C build script
+python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any C build script, native link or deny-listed crate, on any shipped target
 docker build -t memory-graph .                              # the container image
 ```
 
