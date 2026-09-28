@@ -35,7 +35,7 @@
 | 17 | Error tolerance and JSON output with stable API | Medium | 5 | P3 | 10, 8 |
 | 18 | Remove data and benchmark at scale | Medium | 5 | P3 | 15 |
 | 19 | Spike: WASM-hosted extractor plugins (wasmi) | Risk reduction | 3 | P4 | 4 |
-| 20 | Single-node server and client (gRPC, `serve`, `--server`) | High | 8 | P2 | 17, ADR 0004 accepted |
+| 20 | Single-node server and client (gRPC, `serve`, `--server`) | High | 8 | P2 | ADR 0004 accepted |
 | 21 | Replication: Raft log, snapshots, `--bootstrap` | High | 8 | P2 | 20 |
 | 22 | Membership and write forwarding | High | 8 | P2 | 21 |
 | 23 | Linearizable reads and crash tests | High | 5 | P3 | 22 |
@@ -257,8 +257,13 @@ Design: [ADR 0004](adr/0004-client-server-and-replication.md) D1-D4; delivers AD
 - Given `index`, `search`, `describe` and `export` run with `--server` against the vendored corpus, When their output is diffed against an embedded run, Then the outputs must be identical, and the served file reopened embedded must answer identically.
 - Given two `serve` processes on one file, When the second starts, Then it must fail with `Locked`, and an embedded `--db` open of a served file must retry with jittered back-off for 5 s and then fail with a message naming `serve` and the holder from the `LOCK` sidecar.
 - Given a client with an unknown `protocol_version`, When it calls `Hello`, Then the server must refuse with `FAILED_PRECONDITION` and the CLI must exit with code 5.
-- Given `--db` and `--server` together (flag or `MEMORY_GRAPH_SERVER`), When any command runs, Then it must be refused with a message naming both; given `--chunk-bytes` or `--cache-bytes` with `--server`, Then it must be refused with "pass to serve".
+- Given `--db` and `--server` together (flag or `MEMORY_GRAPH_SERVER`), When any command runs, Then it must be refused with a message naming both; given `--chunk-bytes` with `--server`, Then it must be refused (entries are cut at 8 MiB by the leader); given `--cache-bytes` with `--server`, Then it must be refused with "pass to serve".
 - Given the RPC-overhead benchmark at 10 M tokens, When measured, Then p50 overhead over embedded must stay under the 5 ms trigger recorded in ADR 0003 Q5.
+- Given a `search` with no `--limit` and more than 1000 hits through `--server`, When it runs, Then all hits must be returned from one frozen view (the server's default limit and `applied_default_limit` paging must be invisible to the caller).
+- Given a server-side snapshot handle older than 15 minutes, When it is used, Then the server must answer `SnapshotExpired` (`FAILED_PRECONDITION`); given 64 open handles on one connection, Then the 65th must be refused.
+- Given every `StoreError` variant, When mapped to a gRPC `Status` and back (property test), Then it must round-trip; given a `PreparedFile::remote` handed to the embedded store, Then it must be rejected with `Rejected` (conformance case).
+- Given `cluster leader` with no leader, Then the exit code must be 3; given a write whose deadline expires without a leader, Then the exit code must be 4.
+- Given a stale `LOCK` sidecar whose pid is dead, When an embedded open succeeds, Then the sidecar must be ignored and replaced, and the "busy" message must never name a dead holder.
 - Given the workspace after this story, When `scripts/check-no-c-deps.py` runs, Then it must pass, and it must name the crate when a deny-listed crate (`ring`, `aws-lc-sys`, `openssl-sys`, `libz-sys`) enters the tree.
 
 **21. Replication: Raft log, snapshots, `--bootstrap` (8 pts)**
@@ -267,8 +272,11 @@ I want several `serve` nodes to replicate one database through Raft
 So that the data survives the loss of a node and every node can answer reads.
 Design: ADR 0004 D5-D7.
 - Given `serve --data-dir <dir> --bootstrap --node-id 1` and two more nodes added as learners and promoted, When files are indexed through the leader, Then every node must apply the same entries and `run_differential(remote n1, remote n3)` and the embedded oracle must find no difference.
-- Given a write, When the leader acknowledges it, Then the entry must already be fsynced in the Raft log on a majority and applied on the leader in one fsynced store transaction that records `last_applied`.
-- Given a node killed after the log commit and before apply, When it restarts, Then it must replay the entry exactly once (`crash_after_log_before_apply_replays_once`, `kill_during_apply_reapplies_exactly_once`).
+- Given a write, When the leader acknowledges it, Then the entry must already be fsynced in the Raft log on a majority and applied on the leader in one fsynced store transaction that records `last_applied`. Tested with an instrumented redb `StorageBackend` per node that records write and fsync order and can "power-cut" (discard every byte written since the last fsync): after an acknowledged write, power-cut a majority and restart, the write must be present; power-cut before the acknowledgement was returned and restart, then no torn state and `last_applied` <= committed; the `LogFlushed` callback must never be invoked before the redb commit returns; an acknowledged write must survive SIGKILL of all three nodes at once.
+- Given a node killed after the log commit and before apply, When it restarts, Then it must replay the entry exactly once (`crash_after_log_before_apply_replays_once`, `kill_during_apply_reapplies_exactly_once`): afterwards `last_applied` in `RAFT_SM` must equal the log's committed index, and `count_nodes` and `describe` must equal a fresh embedded oracle.
+- Given a 20 MiB single file and a 100-file batch, When indexed through the server, Then entries must be cut per the 8 MiB rule (the large file alone in its entry) and every replica must answer identically; given `prune` (not dry-run) and `vacuum` through the server, Then they must replicate; given `vacuum --compact`, Then no log entry may be written.
+- Given a follower whose disk fills during apply, When writes continue, Then no acknowledgement may be lost (the majority is elsewhere), the follower must report `RESOURCE_EXHAUSTED`, and it must catch up once space is freed; given the leader's disk fills after the log commit and before apply, Then the write must not be acknowledged, the marker must be unchanged, and the entry must apply on the next attempt, never be skipped.
+- Given Windows, When the CI `probes` matrix runs, Then the kill test must use `TerminateProcess`, rename-on-install must succeed with an open snapshot handle on that node (the handle ends with `SnapshotExpired`), and `Ctrl-C` must remove the `LOCK` sidecar.
 - Given the leader stops, When a new leader is elected, Then writes must resume, and `LOCAL` reads on every remaining node must have succeeded throughout.
 - Given a follower that fell behind the log purge point, When it reconnects, Then it must catch up through `InstallSnapshot` and then match the leader.
 - Given a snapshot taken with `cluster snapshot --out`, When it is restored with `serve --bootstrap --restore` into an empty directory, Then the new cluster must answer every query as the original did and must carry a new cluster id.
@@ -286,13 +294,16 @@ Design: ADR 0004 D6, D8, D9.
 - Given `cluster remove`, When it targets the leader, 3 voters down to 2 without `--force`, or anything below quorum, Then it must be refused with the reason.
 - Given a node whose extractor version set hash differs, When promotion is requested, Then it must be refused.
 - Given membership changes under an index load, When they complete, Then no acknowledged write may be missing on any voter.
+- Given a client retry that re-sends an `IndexChunk` already committed under the previous leader, When both entries apply, Then the second must apply as unchanged (fingerprint skip), `count_nodes(File)` and `describe` must be unchanged, and `run_differential` against the embedded oracle must pass.
+- Given `--join` on a directory whose store is not empty, When it starts, Then it must be refused without `--accept-snapshot-overwrite`.
 
 **23. Linearizable reads and crash tests (5 pts)**
 As an AI-agent integrator
 I want a read mode that is guaranteed to see every acknowledged write
 So that an agent can index and then query without a race.
 Design: ADR 0004 D7, D8.
-- Given `--read linearizable` on node 3 right after a write acknowledged by node 1, When the query runs, Then it must include that write.
+- Given node 3 held behind by the fault-injecting `RaftNetwork` (its `AppendEntries` dropped) and a write acknowledged on node 1, When `--read linearizable` runs on node 3, Then it must include that write (the read waits for or forwards to the leader), while `--read local` on node 3 must not and must carry `stale_possible: true`.
+- Given the old leader stopped (SIGSTOP or partitioned) with a connected client, a new leader elected and a write acknowledged there, When the old leader resumes and the client runs `--read linearizable` on it, Then it must answer `NotLeader`/`NoLeader` or the new data, never the pre-write answer; a history checker over concurrent writers and linearizable readers must see the applied index monotonic per client.
 - Given `--read local` (the default), When the node has no known leader or lags the leader, Then the JSON output must carry `stale_possible: true`.
 - Given a linearizable read on a minority partition, When it runs, Then it must fail with `NoLeader` rather than answer stale data.
 - Given the CI `cluster` job, When it spawns three binaries, kills the leader with SIGKILL mid-batch and restarts it, Then every acknowledged batch must be present on all nodes.
@@ -305,7 +316,7 @@ Design: ADR 0004 D10.
 - Given `--log-format json`, When the server logs, Then every line must be one JSON object with level, target and message.
 - Given `--metrics-listen`, When scraped, Then the Prometheus text must parse and must include the Raft term, leader id, role, log, committed, applied and snapshot indexes, per-peer replication lag, store and log bytes, RPC durations and forwarded write counts; `cluster status --json` must show the same numbers.
 - Given the gRPC health service, When the store is open, Then the default service must be `SERVING`; the `memory-graph.ready` service must be `SERVING` only while a leader is known; `memory-graph health [--ready] --server` must exit non-zero otherwise.
-- Given `deploy/compose/cluster.yml`, When CI runs `up --wait`, indexes via node 2, queries node 3, stops node 1, writes and reads again, restarts node 1 and waits for sync, Then every step must succeed and `down -v` must leave nothing behind.
+- Given `deploy/compose/cluster.yml` (the first place the container image from story 20, with `EXPOSE` and the health check, is exercised as a cluster), When CI runs `up --wait`, indexes via node 2, queries node 3, stops node 1, writes and reads again, restarts node 1 and waits for sync, Then every step must succeed and `down -v` must leave nothing behind.
 - Given `docs/deploy/kubernetes.md`, When followed, Then it must describe a StatefulSet with a headless service for `--advertise`, node ids from the ordinal, gRPC readiness on `memory-graph.ready`, a PodDisruptionBudget of `minAvailable: 2` and `cluster remove` before scale-down.
 
 **25. Cluster hardening (3 pts)**
@@ -322,7 +333,7 @@ Design: ADR 0004 revisit triggers.
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
 - **Language-agnostic by construction:** the schema uses a language tag plus a generic kind vocabulary with an optional language-specific kind string. Only extractors know about a language, and story 16 checks this by requiring zero schema, storage or query changes.
 - **Two paths for a new language:** a compiled extractor (story 9 and 16 pattern) or externally supplied NDJSON (story 13). The WASM spike (story 19) is optional and comes last.
-- **Sizing:** no story is over 8 points, and story 9 is the only 8. It is split-ready by symbol kind if it overruns.
+- **Sizing:** no story is over 8 points. Story 9 was the only 8 until stories 20-22 (ADR 0004) joined it; 9 is split-ready by symbol kind, 20 by service (Store, Write, Admin), 21 and 22 by their sub-bullets, if any overruns.
 
 ### Assumptions
 - You are working solo, so no sprint mapping is given. Take a velocity baseline after the MVP slice (0.8 x available time).

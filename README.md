@@ -331,6 +331,6 @@ CI runs all of the above on every push and pull request, plus a real disk-full r
 ## Further reading
 
 - [docs/README.md](docs/README.md): the documentation index (glossary, epic, ADRs, spikes, learnings).
-- [ADR 0001](docs/adr/0001-storage.md) storage engine, [ADR 0002](docs/adr/0002-parsing-and-crate-layout.md) parsing and crate layout, [ADR 0003](docs/adr/0003-data-model.md) data model, [ADR 0004](docs/adr/0004-client-server-and-replication.md) client/server access and Raft replication (proposed).
+- [ADR 0001](docs/adr/0001-storage.md) storage engine, [ADR 0002](docs/adr/0002-parsing-and-crate-layout.md) parsing and crate layout, [ADR 0003](docs/adr/0003-data-model.md) data model, [ADR 0004](docs/adr/0004-client-server-and-replication.md) client/server access and Raft replication (Proposed).
 - [docs/testing.md](docs/testing.md): how disk-full, the machine probes, the container image and the size gate are tested.
 - [CLAUDE.md](CLAUDE.md): architecture summary and invariants for contributors.
