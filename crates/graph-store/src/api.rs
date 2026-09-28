@@ -68,9 +68,74 @@ pub(crate) enum Prepared {
     Extracted(Extraction),
     /// Not UTF-8, too large, or invalid spans: reported in the file's slot.
     Rejected(StoreError),
+    /// The raw source bytes, kept for a remote server to parse (ADR 0004
+    /// D2): nothing was extracted or fingerprinted on this side. Only a
+    /// remote backend can commit it; the embedded store rejects it in the
+    /// file's slot.
+    Remote(Vec<u8>),
+}
+
+/// The pieces of a remote-prepared file (see [`PreparedFile::remote`]) a
+/// client sends to the server, borrowed from the `PreparedFile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteParts<'a> {
+    pub org: &'a str,
+    pub repo: &'a str,
+    /// Normalized, as `prepare` would store it.
+    pub path: &'a str,
+    pub bytes: &'a [u8],
+    /// As given by the caller; `None` when the server should detect it.
+    pub language: Option<&'a str>,
+    pub origin: Option<&'a str>,
 }
 
 impl PreparedFile {
+    /// A file prepared for a remote server (ADR 0004 D2): the source bytes
+    /// are kept as they are, to be parsed by the server's own extractors.
+    /// `path` is normalized the same way [`Store::prepare`] normalizes it;
+    /// `language` is stored as given (lowercased) or left empty for the
+    /// server to detect. It has no fingerprint, is never `is_unchanged`
+    /// (the server decides), and its [`memory_footprint`] counts the bytes.
+    /// The embedded store refuses to commit it ([`StoreError::Rejected`] in
+    /// that file's slot of [`Store::index_prepared`]).
+    ///
+    /// [`memory_footprint`]: PreparedFile::memory_footprint
+    pub fn remote(
+        org: &str,
+        repo: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        language: Option<String>,
+        origin: Option<String>,
+    ) -> PreparedFile {
+        PreparedFile {
+            org: org.into(),
+            repo: repo.into(),
+            path: graph_core::normalize_path(path),
+            language: language.map(|l| l.to_ascii_lowercase()).unwrap_or_default(),
+            fingerprint: String::new(),
+            bytes_len: bytes.len(),
+            origin,
+            work: Prepared::Remote(bytes),
+            v2: None,
+        }
+    }
+
+    /// The parts a client sends for a file made by [`PreparedFile::remote`];
+    /// `None` for a file prepared by an embedded store.
+    pub fn remote_parts(&self) -> Option<RemoteParts<'_>> {
+        match &self.work {
+            Prepared::Remote(bytes) => Some(RemoteParts {
+                org: &self.org,
+                repo: &self.repo,
+                path: &self.path,
+                bytes,
+                language: (!self.language.is_empty()).then_some(self.language.as_str()),
+                origin: self.origin.as_deref(),
+            }),
+            _ => None,
+        }
+    }
     /// The normalized path the file will be stored under.
     pub fn path(&self) -> &str {
         &self.path
@@ -100,6 +165,7 @@ impl PreparedFile {
         let work = match &self.work {
             Prepared::Unchanged(src) => src.capacity(),
             Prepared::Rejected(_) => 0,
+            Prepared::Remote(bytes) => bytes.capacity(),
             Prepared::Extracted(ex) => {
                 ex.tokens.capacity() * size_of::<graph_core::TokenDecl>()
                     + ex.tokens.iter().map(|t| t.text.capacity()).sum::<usize>()

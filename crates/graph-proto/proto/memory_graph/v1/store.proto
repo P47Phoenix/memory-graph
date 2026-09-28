@@ -1,0 +1,159 @@
+// The read side of a memory-graph server (ADR 0004 D1): `Hello`, every
+// `graph_store::StoreRead` method, and snapshot handles. Every read request
+// carries a `View`; an absent view is LOCAL.
+syntax = "proto3";
+
+package memory_graph.v1;
+
+import "memory_graph/v1/common.proto";
+
+service Store {
+  // Version handshake; a client's first call. A `protocol_version` the
+  // server does not speak is refused with FAILED_PRECONDITION and a
+  // `StoreErrorDetail.Protocol` detail.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Parent(ParentRequest) returns (ParentResponse);
+  rpc CountNodes(CountNodesRequest) returns (CountNodesResponse);
+  rpc Roots(RootsRequest) returns (RootsResponse);
+  rpc Children(ChildrenRequest) returns (ChildrenResponse);
+  rpc ChildrenPage(ChildrenPageRequest) returns (NodePage);
+  // Depth first, source order, streamed in batches of at most 4096 nodes.
+  rpc Descendants(DescendantsRequest) returns (stream NodeBatch);
+  rpc DescendantsPage(DescendantsPageRequest) returns (NodePage);
+  rpc Ancestors(AncestorsRequest) returns (AncestorsResponse);
+  // All tokens of one file in source order, streamed in batches of at most
+  // 4096 nodes; a file that is not indexed answers one batch with
+  // `not_found` set.
+  rpc FileTokens(FileTokensRequest) returns (stream NodeBatch);
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+  // The reference scan behind `describe` (conformance oracle).
+  rpc DescribeByScan(DescribeRequest) returns (DescribeResponse);
+  // A request without `limit` gets the server's default limit (1000); when that
+  // fills the page, `applied_default_limit` is set and the client pages to completion.
+  rpc SearchSymbols(SearchSymbolsRequest) returns (SearchSymbolsResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // A server-side frozen view for `View.snapshot_id`; at most 64 per
+  // connection, expiring at the store's snapshot max age.
+  rpc OpenSnapshot(OpenSnapshotRequest) returns (OpenSnapshotResponse);
+  rpc CloseSnapshot(CloseSnapshotRequest) returns (CloseSnapshotResponse);
+  rpc SnapshotStats(SnapshotStatsRequest) returns (SnapshotStatsResponse);
+}
+
+message HelloRequest {
+  // `graph_proto::PROTOCOL_VERSION` of the client.
+  uint32 protocol_version = 1;
+  // The client binary's version, for logs.
+  string client_version = 2;
+}
+
+message HelloResponse {
+  uint32 protocol_version = 1;
+  string server_version = 2;
+  // `graph_store::SCHEMA_VERSION` of the served file.
+  uint64 store_format_version = 3;
+  // Hash of the server's extractor version set (ADR 0004 D5).
+  string extractors_hash = 4;
+  uint64 node_id = 5;
+  optional uint64 leader_id = 6;
+  optional string leader_addr = 7;
+  string cluster_id = 8;
+}
+
+message GetRequest {
+  View view = 1;
+  uint64 id = 2;
+}
+message GetResponse { optional Node node = 1; }
+
+message ParentRequest {
+  View view = 1;
+  uint64 id = 2;
+}
+message ParentResponse { optional Node node = 1; }
+
+message CountNodesRequest {
+  View view = 1;
+  NodeKind kind = 2;
+}
+message CountNodesResponse { uint64 count = 1; }
+
+message RootsRequest { View view = 1; }
+message RootsResponse { repeated Node nodes = 1; }
+
+message ChildrenRequest {
+  View view = 1;
+  uint64 id = 2;
+}
+message ChildrenResponse { repeated Node nodes = 1; }
+
+message ChildrenPageRequest {
+  View view = 1;
+  uint64 id = 2;
+  uint64 offset = 3;
+  uint64 limit = 4;
+}
+
+message DescendantsRequest {
+  View view = 1;
+  uint64 id = 2;
+}
+
+message DescendantsPageRequest {
+  View view = 1;
+  uint64 id = 2;
+  uint64 offset = 3;
+  uint64 limit = 4;
+}
+
+message AncestorsRequest {
+  View view = 1;
+  uint64 id = 2;
+}
+message AncestorsResponse { repeated Node nodes = 1; }
+
+message FileTokensRequest {
+  View view = 1;
+  string org = 2;
+  string repo = 3;
+  string path = 4;
+}
+
+message DescribeRequest {
+  View view = 1;
+  optional string org = 2;
+  optional string repo = 3;
+}
+message DescribeResponse { repeated RepoInfo repos = 1; }
+
+message SearchSymbolsRequest {
+  View view = 1;
+  SymbolQuery query = 2;
+}
+message SearchSymbolsResponse {
+  repeated SymbolHit hits = 1;
+  // The request had no `limit` and the server's default filled this page;
+  // page with `offset` under a snapshot handle to get the rest.
+  bool applied_default_limit = 2;
+}
+
+message SearchRequest {
+  View view = 1;
+  Query query = 2;
+}
+message SearchResponse {
+  repeated Hit hits = 1;
+  // As in `SearchSymbolsResponse`.
+  bool applied_default_limit = 2;
+}
+
+message OpenSnapshotRequest {}
+message OpenSnapshotResponse { uint64 snapshot_id = 1; }
+
+message CloseSnapshotRequest { uint64 snapshot_id = 1; }
+message CloseSnapshotResponse {}
+
+message SnapshotStatsRequest {}
+message SnapshotStatsResponse { SnapshotStats stats = 1; }

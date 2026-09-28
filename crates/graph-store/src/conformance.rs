@@ -15,6 +15,7 @@
 //! graph_store::conformance::run_all(&|| Harness {
 //!     open: Box::new(move |ex| open_store(&path, ex)),
 //!     exclusive: true,
+//!     accepts_remote_prepared: false,
 //!     guard: Some(Box::new(tempdir)),
 //! });
 //! ```
@@ -39,6 +40,11 @@ pub struct Harness {
     /// `open` must fail with `StoreError::Locked`. Set false for a client
     /// backend (e.g. `RemoteStore`) where many handles are normal.
     pub exclusive: bool,
+    /// The backend commits a [`PreparedFile::remote`](crate::PreparedFile::remote)
+    /// file (ADR 0004 D2): true for a client backend that forwards the bytes
+    /// to a server that parses them; false (the default) for the embedded
+    /// store, which must reject it in that file's slot.
+    pub accepts_remote_prepared: bool,
     /// Kept alive for the case's duration (e.g. a temp dir).
     pub guard: Option<Box<dyn std::any::Any>>,
 }
@@ -85,6 +91,7 @@ pub const CASES: &[(&str, Case)] = &[
         prepared_changed_file_replaces,
     ),
     ("prepared_duplicate_paths", prepared_duplicate_paths),
+    ("remote_prepared_is_rejected", remote_prepared_is_rejected),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1230,6 +1237,83 @@ fn nul_handling(h: &Harness) {
         .is_empty());
 }
 
+/// A [`PreparedFile::remote`](crate::PreparedFile::remote) file (ADR 0004
+/// D2) carries raw bytes for a server to parse. An embedded store rejects it
+/// in that file's slot (the other files of the call are stored as usual); a
+/// client backend (`accepts_remote_prepared`) forwards it and stores it like
+/// any other file. Either way the file's normalized path, `bytes_len`,
+/// footprint and `remote_parts` are what the constructor was given.
+fn remote_prepared_is_rejected(h: &Harness) {
+    let s = open(h);
+    let bytes = b"alpha beta".to_vec();
+    let remote = crate::PreparedFile::remote(
+        "o",
+        "r",
+        "./src/../src/remote.txt",
+        bytes.clone(),
+        Some("Text".into()),
+        Some(ORIGIN_DIRECTORY.into()),
+    );
+    assert_eq!(remote.path(), "src/remote.txt", "normalized like prepare");
+    assert_eq!(remote.language(), "text");
+    assert_eq!(remote.bytes_len(), bytes.len());
+    assert!(!remote.is_unchanged());
+    assert!(remote.memory_footprint() >= bytes.len());
+    let parts = remote.remote_parts().expect("remote parts");
+    assert_eq!(parts.org, "o");
+    assert_eq!(parts.repo, "r");
+    assert_eq!(parts.path, "src/remote.txt");
+    assert_eq!(parts.bytes, bytes.as_slice());
+    assert_eq!(parts.language, Some("text"));
+    assert_eq!(parts.origin, Some(ORIGIN_DIRECTORY));
+    let no_lang = crate::PreparedFile::remote("o", "r", "x.txt", vec![], None, None);
+    assert_eq!(no_lang.language(), "");
+    assert_eq!(no_lang.remote_parts().unwrap().language, None);
+
+    let local = s
+        .prepare(
+            "o",
+            "r",
+            &bf("local.txt", b"gamma"),
+            IndexOptions::default(),
+        )
+        .unwrap();
+    // A remote backend's own `prepare` is remote too.
+    assert_eq!(local.remote_parts().is_some(), h.accepts_remote_prepared);
+    let results = s
+        .index_prepared("o", "r", vec![local, remote], IndexOptions::default())
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let local_stats = results[0].as_ref().expect("local file stored");
+    assert_eq!(local_stats.path, "local.txt");
+    if h.accepts_remote_prepared {
+        let stats = results[1]
+            .as_ref()
+            .expect("remote file stored by the server");
+        assert_eq!(stats.path, "src/remote.txt");
+        assert_eq!(stats.language, "text");
+        assert_eq!(s.search(&Query::new("alpha")).unwrap().len(), 1);
+        assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    } else {
+        match &results[1] {
+            Err(StoreError::Rejected(msg)) => assert_eq!(
+                msg,
+                "remote-prepared file cannot be committed to an embedded store"
+            ),
+            other => panic!("embedded store must reject a remote-prepared file, got {other:?}"),
+        }
+        assert!(s.search(&Query::new("alpha")).unwrap().is_empty());
+        assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+        // The rejection reaches nothing: no org/repo/file rows for it.
+        assert!(s.file_tokens("o", "r", "src/remote.txt").unwrap().is_none());
+    }
+    assert_eq!(s.search(&Query::new("gamma")).unwrap().len(), 1);
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
+}
+
 /// Fixed-query differential harness (configuration equivalence): seed two
 /// empty stores with the same fixed corpus, run a fixed query set at every
 /// grain and filter, and require identical results (rows and order). `a` and
@@ -1986,10 +2070,16 @@ impl Extractor for Counting {
 
 /// `prepare` skips extraction for a file stored with the same fingerprint
 /// (and says so), unless `reindex`; the commit still refreshes `origin`.
+/// A remote backend (`accepts_remote_prepared`) defers the check and the
+/// extraction to the server, so its prepared file never says `unchanged`
+/// and the extractor runs at commit; the stored outcome and the number of
+/// extractions are the same either way, so those are asserted after each
+/// commit.
 fn prepare_skips_unchanged(h: &Harness) {
     let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let s = (h.open)(vec![Box::new(Counting(n.clone()))]).expect("open store");
     let calls = || n.load(std::sync::atomic::Ordering::SeqCst);
+    let local = !h.accepts_remote_prepared;
     let file = |origin| BatchFile {
         path: "a.cnt",
         bytes: b"foo bar",
@@ -1999,13 +2089,16 @@ fn prepare_skips_unchanged(h: &Harness) {
     let first = prepare_all(&*s, "r", &[file(None)], IndexOptions::default());
     assert!(!first[0].is_unchanged());
     assert_eq!(first[0].bytes_len(), 7);
-    assert_eq!(calls(), 1);
+    if local {
+        assert_eq!(calls(), 1, "extracted at prepare");
+    }
     // Nothing is stored until the commit.
     assert!(s.file_tokens("o", "r", "a.cnt").unwrap().is_none());
     let out = s
         .index_prepared("o", "r", first, IndexOptions::default())
         .unwrap();
     assert!(!out[0].as_ref().unwrap().unchanged);
+    assert_eq!(calls(), 1, "extracted exactly once");
 
     let again = prepare_all(
         &*s,
@@ -2013,12 +2106,15 @@ fn prepare_skips_unchanged(h: &Harness) {
         &[file(Some(ORIGIN_DIRECTORY))],
         IndexOptions::default(),
     );
-    assert!(again[0].is_unchanged());
+    if local {
+        assert!(again[0].is_unchanged());
+    }
     assert_eq!(calls(), 1, "unchanged file not extracted");
     let out = s
         .index_prepared("o", "r", again, IndexOptions::default())
         .unwrap();
     assert!(out[0].as_ref().unwrap().unchanged);
+    assert_eq!(calls(), 1, "unchanged file not extracted at commit either");
     let origin = s.file_tokens("o", "r", "a.cnt").unwrap().unwrap()[0].parent;
     let f = s.get(origin.unwrap()).unwrap().unwrap();
     assert_eq!(
@@ -2029,11 +2125,14 @@ fn prepare_skips_unchanged(h: &Harness) {
 
     let forced = prepare_all(&*s, "r", &[file(None)], IndexOptions { reindex: true });
     assert!(!forced[0].is_unchanged());
-    assert_eq!(calls(), 2, "reindex extracts");
+    if local {
+        assert_eq!(calls(), 2, "reindex extracts");
+    }
     let out = s
         .index_prepared("o", "r", forced, IndexOptions { reindex: true })
         .unwrap();
     assert!(out[0].as_ref().unwrap().replaced);
+    assert_eq!(calls(), 2, "reindex extracts exactly once more");
 }
 
 /// Per-file rejections (invalid spans, not UTF-8) come back in their slots,
@@ -2076,7 +2175,11 @@ fn prepared_changed_since_prepare(h: &Harness) {
     s.index_batch("o", "r", &[bf("a.txt", b"foo bar")], d)
         .unwrap();
     let p = prepare_all(&*s, "r", &[bf("a.txt", b"foo bar")], d);
-    assert!(p[0].is_unchanged());
+    // A remote backend defers the check to the server (never `unchanged`
+    // at prepare time); the commit-time outcome below is the same.
+    if !h.accepts_remote_prepared {
+        assert!(p[0].is_unchanged());
+    }
     s.index_bytes("o", "r", "a.txt", b"foo CHANGED", Some("text"))
         .unwrap();
     let out = s.index_prepared("o", "r", p, d).unwrap();

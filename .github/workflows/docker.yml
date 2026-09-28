@@ -66,6 +66,48 @@ jobs:
             | grep -q '^65532:65532 /data \[/memory-graph\]$'
           if docker run --rm --entrypoint /bin/sh memory-graph:smoke -c true; then echo "image has a shell" >&2; exit 1; fi
 
+      - name: Smoke test (server mode - serve, index/search --server, health, graceful stop)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker network create mg-net
+          docker volume rm -f mg-serve >/dev/null 2>&1 || true
+          # Container 1 serves a database on a named volume; container 2
+          # (one-shot runs on the same network) is the client.
+          docker run -d --name mg-server --network mg-net -v mg-serve:/data memory-graph:smoke \
+            serve --db /data/graph.redb --listen 0.0.0.0:7000
+          trap 'docker logs mg-server || true; docker rm -f mg-server >/dev/null 2>&1 || true; docker network rm mg-net >/dev/null 2>&1 || true' EXIT
+          ok=0
+          for i in $(seq 1 60); do
+            if docker run --rm --network mg-net memory-graph:smoke health --server mg-server:7000; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ]
+          docker run --rm --network mg-net -v "$PWD/crates/graph-core/src:/src:ro" memory-graph:smoke \
+            --server mg-server:7000 index --org smoke --repo graph-core /src --json | tee sindex.json
+          python3 -c 'import json; s=json.load(open("sindex.json")); assert s["files"] > 0 and s["tokens"] > 0 and s["failed"] == 0, s'
+          docker run --rm --network mg-net memory-graph:smoke --server mg-server:7000 search Node --language rust --json | tee ssearch.json
+          python3 -c 'import json; r=json.load(open("ssearch.json")); assert r["results"], r'
+          docker run --rm --network mg-net memory-graph:smoke --server mg-server:7000 health --ready
+          docker run --rm --network mg-net memory-graph:smoke --server mg-server:7000 cluster leader
+          # The image's own HEALTHCHECK turns healthy.
+          s=starting
+          for i in $(seq 1 60); do
+            s="$(docker inspect -f '{{.State.Health.Status}}' mg-server)"
+            [ "$s" = healthy ] && break
+            sleep 1
+          done
+          [ "$s" = healthy ]
+          # docker stop = SIGTERM: a graceful shutdown exits 0 and removes the
+          # LOCK sidecar, after which the file opens embedded.
+          docker stop -t 60 mg-server
+          [ "$(docker inspect -f '{{.State.ExitCode}}' mg-server)" = 0 ]
+          docker run --rm -v mg-serve:/data busybox:1.37 sh -c 'test -e /data/graph.redb && test ! -e /data/graph.redb.LOCK'
+          docker run --rm -v mg-serve:/data memory-graph:smoke describe --json | tee sdescribe.json
+          python3 -c 'import json; d=json.load(open("sdescribe.json")); assert [r for r in d["repos"] if r["repo"] == "graph-core"], d'
+          docker rm mg-server >/dev/null
+          docker volume rm -f mg-serve >/dev/null
+
   publish:
     # Both architectures, pushed to ghcr.io. Only this job may write packages,
     # and only push events (main, v* tags) reach it.

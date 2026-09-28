@@ -16,13 +16,17 @@ cargo test --workspace                                    # all unit + integrati
 cargo test -p graph-store <test_name>                     # a single test in one crate
 cargo test -p graph-cli --test corpus                      # public-repo corpus test (parses testdata/corpus, checks exact spans + cross-repo links)
 cargo test -p graph-cli --test e2e                          # CLI end-to-end tests
+cargo test -p graph-cli --test serve_e2e                    # memory-graph serve + --server end to end (real binary, free port)
+cargo test -p graph-client --test conformance               # run_all / run_differential against RemoteStore over an in-process server
+cargo run --manifest-path xtask/Cargo.toml -- proto          # regenerate crates/graph-proto/src/gen from the .proto files (pure Rust, no protoc)
+cargo run --release -p graph-client --example rpc_bench -- <db>   # RPC overhead vs embedded (docs/spikes/rpc-overhead.md)
 python3 scripts/test_gate.py                               # CI's own extra gate
 python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any -sys crate or C build script (see below)
 python3 scripts/vendor-corpus.py                            # re-vendor testdata/corpus/ (pinned commits, license-checked)
 docker build -t memory-graph .                              # the container image (static musl binary on scratch; .github/workflows/docker.yml publishes it to ghcr.io)
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test --workspace`, `test_gate.py`, `check-no-c-deps.py`) on every push/PR. A PR is not done until all of these pass on its head SHA.
+CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test --workspace`, `test_gate.py`, `check-no-c-deps.py`) on every push/PR, plus a `proto-regen` job that runs the xtask and fails on any diff under `crates/graph-proto/src/gen`. A PR is not done until all of these pass on its head SHA.
 
 ## Architecture
 
@@ -37,7 +41,11 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
   - `v2.rs` / `codec.rs`: the store itself, `V2Store` (ADR 0003) — an interned dictionary, one compact per-file token/symbol stream (with sparse checkpoints for fast random access), and count/ordinal postings. It is the only storage format: the original per-node format ("v1", ~525 B/token, retired 2026-09-25 after a fresh index of a 10 GB tree reached 420 GB) is refused on open with `StoreError::LegacyFormat` and left untouched (except redb's own crash repair of an uncleanly closed file); the last release that reads it is tagged `v1-last` (it has `migrate`). See `docs/spikes/v2-checkpoint.md` and ADR 0003's story table for measured numbers.
   - `conformance.rs`: a single black-box test suite (`run_all`) that any `Store` implementation must pass, plus `run_differential` (configuration equivalence: two stores fed the same inputs must answer every query identically, whatever their chunk/cache/jobs/compaction settings) and `run_crash_rerun_differential` (a batch that crashed mid-way and was re-run equals a fresh index). **Any change to store behavior should have a conformance case**, not just a unit test.
   - Reading a database's schema version from its file (without a full open) lives in `detect_format` (`api.rs`): the current version, `LegacyFormat` for a retired v1 file, `SchemaMismatch` for anything else.
-- **graph-cli**: the `memory-graph` binary. `lib.rs` holds the testable logic (`index_dir`, etc.); `main.rs` is argument parsing (clap) and wiring. Depends only on the `graph-store` traits, not on redb directly.
+- **graph-proto**: the wire contract (ADR 0004 D1): `proto/memory_graph/v1/*.proto` (package `memory_graph.v1`; services Store, Write, Admin, Raft), the tonic/prost code generated from them and checked in under `src/gen/` (never edit it; regenerate with the xtask), `convert.rs` (graph-core/graph-store types <-> messages, both ways) and `error.rs` (`StoreError` <-> `tonic::Status` with a `StoreErrorDetail` in the details). `PROTOCOL_VERSION` is checked in `Hello`.
+- **graph-server**: `memory-graph serve` as a library: `ServeConfig` / `run_blocking` / `start`, the store behind a `StoreSlot`, a one-member openraft node (`raft/`: Raft log in `<db>.raft.redb`, a state machine applying `LogCommand`s through the store's marked writes, exactly-once by the `raft_sm` marker), the tonic services, snapshot handles per connection, `grpc.health.v1`, and the `<db>.LOCK` sidecar (`lock.rs`). `testing::TestServer` is an in-process server for other crates' tests.
+- **graph-client**: `RemoteStore`, a `Store` + `StoreRead` over gRPC with a synchronous facade (it owns a small tokio runtime and panics if called from inside one), retries, read modes and snapshot paging.
+- **graph-cli**: the `memory-graph` binary. `lib.rs` holds the testable logic (`index_dir`, etc.); `target.rs` resolves `--db` / `--server` / env into a `Target`, opens it (embedded with a lock retry, or a `RemoteStore`) and maps errors to exit codes; `main.rs` is argument parsing (clap) and wiring, including `serve`, `health` and `cluster`. Depends on the `graph-store` traits, not on redb directly.
+- **xtask** (not a workspace member; own `Cargo.toml` and lockfile): dev tooling, today only `proto` (`protox` + `tonic-prost-build`). Never shipped and not seen by the pure-Rust gate.
 
 ### Core data model
 
@@ -47,7 +55,7 @@ Nodes: `Org → Repo → File → Symbol → Token`, each with an exact byte/lin
 
 - **Language-agnosticism**: no language-specific types or logic outside an `Extractor` implementation (the `graph-lang-*` crates). The fallback tokenizer must keep working for any language with no extractor registered. One documented exception: the `class` search grain treats the language-specific kind `impl` (a Rust impl block, generic kind `other`) as a class container (`CLASS_CONTAINER_LANG_KINDS` in `graph-store/src/common.rs`), because methods nest in the impl, not in the struct.
 - **Exact spans**: every token/symbol's text, byte range, line and column must match the source exactly — this is property-tested and is the basis of the corpus test.
-- **Pure Rust**: `scripts/check-no-c-deps.py` fails CI on any dependency with a `links` key or a C/C++ build script. A `-sys` crate is fine as long as it's pure Rust (it keys on build mechanism, not crate naming).
+- **Pure Rust**: `scripts/check-no-c-deps.py` fails CI on any dependency with a `links` key or a C/C++ build script. A `-sys` crate is fine as long as it's pure Rust (it keys on build mechanism, not crate naming), except the deny-list (`ring`, `aws-lc-sys`, `openssl-sys`, `libz-sys`), which fails by name. The gate is target-aware: it checks the union of the dependency graphs resolved for the six shipped targets (Linux gnu/musl x86_64, Linux aarch64, Windows MSVC, macOS x86_64/aarch64), so a crate that only exists on Haiku or wasm never fails it. `scripts/test_gate.py` also checks `cargo tree -i ring` / `aws-lc-sys` print nothing.
 - **On-disk format is versioned**: any change to stored bytes bumps `V2_SCHEMA_VERSION` (or a component's `derived_version`) and either upgrades on open or refuses with `LegacyFormat`/`SchemaMismatch` without writing; golden-byte tests in `codec.rs` enforce it.
 - **Configuration equivalence**: query-visible behaviour must not depend on chunk/cache/jobs/memory/compaction settings or on a crash-and-rerun (`run_differential`, `run_crash_rerun_differential`); node ids are still opaque and must never be treated as portable by callers.
 - **Size gate**: `crates/graph-cli/tests/size_gate.rs` pins the database at <= 15x its source and <= 105 B/token on the vendored corpus (measured 10.2x / 70 B/token); a layout change that grows the file fails there, not on a user's disk.

@@ -75,6 +75,7 @@ fn store_passes_conformance_suite() {
         conformance::Harness {
             open: Box::new(move |ex| open_store(&path, ex)),
             exclusive: true,
+            accepts_remote_prepared: false,
             guard: Some(Box::new(d)),
         }
     });

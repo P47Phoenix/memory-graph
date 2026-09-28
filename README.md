@@ -3,7 +3,7 @@
 An embedded graph database for source code. It indexes one or more repositories into a single file and answers questions such as "where is the token `Node` used?" or "which methods start with `parse`?" with exact byte, line and column spans.
 
 - **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor (Rust, C#, JavaScript, HTML, ASP.NET markup) additionally get symbols: functions, types, methods and so on.
-- **One file, no server.** The database is a single [redb](https://github.com/cberner/redb) file, about 8-10x the size of the indexed source.
+- **One file, optionally served.** The database is a single [redb](https://github.com/cberner/redb) file, about 8-10x the size of the indexed source. Opened in-process by default; `memory-graph serve` shares it with other processes, machines and containers over gRPC ([Server mode](#server-mode)).
 - **Pure Rust.** No C dependencies (enforced in CI), so it builds anywhere Rust does and ships as a 7 MB static container image.
 - **Incremental.** Unchanged files are skipped on re-index; deleted files can be pruned.
 
@@ -16,6 +16,7 @@ The graph is `Org → Repo → File → Symbol → Token`.
 - [Commands](#commands)
 - [Indexing](#indexing)
 - [Querying](#querying)
+- [Server mode](#server-mode)
 - [Docker](#docker)
 - [Languages](#languages)
 - [Storage](#storage)
@@ -84,10 +85,13 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 | `sysinfo` | What `index` sizes itself from on this machine: CPUs, memory and its source, the starting budget, free disk on the database's volume. |
 | `vacuum [--compact]` | Drop dictionary terms no file uses; `--compact` rebuilds the file to give the space back. |
 | `export [--out FILE]` | Dump every node (org, repo, file, symbol, token, with spans) as newline-delimited JSON. An escape hatch; there is no importer yet. |
+| `serve --db FILE [--listen HOST:PORT]` | Serve a database over gRPC for `--server` clients ([Server mode](#server-mode)). |
+| `health [--ready]` | With `--server`: exit 0 when the server is serving (`--ready`: and has a leader), 1 when not. |
+| `cluster status` / `cluster leader` | With `--server`: the node's role, term, leader and log indexes; `leader` exits 3 when there is none. |
 
 `search`, `symbols` and `describe` take `--json` (an object on stdout); `search` and `symbols` also take `--limit`/`--offset` for paging, with results ordered by org, repo, file, position.
 
-Global options: `--db <file>` (default `./graph.redb`), `--chunk-bytes` (commit a transaction every this many source bytes, default 64 MiB) and `--cache-bytes` (redb's cache, default 1 GiB). Run `memory-graph <command> --help` for the full list.
+Global options: `--db <file>` (default `./graph.redb`), `--server <host:port>` and `--read local|linearizable` ([Server mode](#server-mode)), `--chunk-bytes` (commit a transaction every this many source bytes, default 64 MiB) and `--cache-bytes` (redb's cache, default 1 GiB). Run `memory-graph <command> --help` for the full list.
 
 ## Indexing
 
@@ -131,6 +135,30 @@ If a file fails span validation (an extractor or tokenizer bug), only that file 
 - `--language`, `--kind` and `--symbol-kind` values are validated against what `describe` reports, so a typo is an error, not an empty result. Language names are case-insensitive.
 - `symbols` patterns: `name` (exact), `prefix*`, `*` (all), `name\*` (a literal `*`). `**` is rejected as ambiguous.
 - Page with `--limit N --offset M`. `--json` prints `{"query", "results": [...]}` (and `"grain"` for `search`).
+
+## Server mode
+
+A database file is opened by one process at a time. To share one between processes, machines or containers, serve it and point the other commands at the server:
+
+```sh
+memory-graph serve --db ./g --listen 127.0.0.1:7000     # prints: memory-graph serve: listening on 127.0.0.1:7000 (db ./g, node 1)
+memory-graph --server 127.0.0.1:7000 index --org acme --repo api ./api
+memory-graph --server 127.0.0.1:7000 search foo --language rust
+export MEMORY_GRAPH_SERVER=127.0.0.1:7000                 # every command in this shell now uses the server
+memory-graph describe
+memory-graph health && echo up                            # exit 0 when serving, 1 when not
+```
+
+- **Same commands, same answers.** Every command in this README takes `--server` in place of `--db` and prints byte for byte what it prints on the file (tested on the vendored corpus). `index --server` reads and sends the files; the server parses and commits them (the progress view shows `send` and `replicate: acked by leader N (idx K)` stages, and `--stats` an `rpc` row). Reads run while an index writes.
+- **Choosing the target.** `--db` and `--server` are exclusive; `MEMORY_GRAPH_SERVER` stands in for `--server` (the flag wins), and `--db` together with either is an error that names both. Neither means `./graph.redb`. `--read linearizable` (or `MEMORY_GRAPH_READ`) makes reads wait until they see every acknowledged write; the default `local` reads the node's store as it is (the same thing on a single node).
+- **Settings that belong to the server.** `--cache-bytes` goes to `serve`; `--chunk-bytes` is refused with `--server` (the server cuts its log entries at 8 MiB itself); `--jobs` only sizes the client's reading threads (a warning says so); the disk guard runs on the server, which reports a full disk as an error.
+- **`serve`.** `--listen` defaults to `127.0.0.1:7000` (`0.0.0.0:7000` to accept other machines; port `0` picks a free port and the printed line names it). `--node-id` (default 1), `--cache-bytes`, `--snapshot-max-age` (how long a paging client's frozen view may live, default `15m`). It writes `<db>.LOCK` (`{"pid", "listen", "started"}`) next to the file and removes it on a graceful stop (Ctrl-C, SIGTERM, `docker stop`). The Raft log lives in `<db>.raft.redb`.
+- **A served file opened directly** waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_WAIT_MS` changes that), then says who holds it: `database ./g is locked by pid 4242 (memory-graph serve on 127.0.0.1:7000); use --server 127.0.0.1:7000 or stop it`. Once the server stops, the file opens directly again and answers exactly as the server did.
+- **Also over `--server`:** `sysinfo` prints the server machine's report under `server <addr> node N (leader: M)`; `vacuum --compact` compacts the server's file; `health [--ready]` and `cluster status [--json]` / `cluster leader` report on the node.
+- **Exit codes:** 0 success; 1 failure (and `health`: not serving; a read whose server is unreachable or whose connection was lost); 3 `cluster leader` found no leader; 4 a write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write; 5 the server speaks another protocol or store format version.
+- **An error does not prove a write failed.** A write that fails with a lost connection or exit code 4 may still have been applied (the server can commit it and die before answering). Rerunning it is safe: `index` skips unchanged files by fingerprint, `prune` and `vacuum` are idempotent, and `ingest` of the same extraction stores the same thing. A retried write reports what the retry did: a `prune` that landed before the connection was lost reports 0 removed on the retry, though the stored state is correct.
+- **Write deadline.** `--write-deadline <duration>` (or `MEMORY_GRAPH_WRITE_DEADLINE`; e.g. `500ms`, `10s`, `2m`; default `10s`) is how long a write keeps retrying through no leader or a lost connection before it fails with exit code 4.
+- **Not yet:** this release serves a **single node**. Replication to followers, membership commands (`cluster add-learner`, `promote`, ...), TLS and authentication come with later stages of [ADR 0004](docs/adr/0004-client-server-and-replication.md); bind to loopback or a private network meanwhile.
 
 ## Docker
 
@@ -238,6 +266,19 @@ mg search foo --json > hits.json
 
 Add `-t` to see the live view while indexing, but not when piping or redirecting `--json` output: a TTY merges stderr into stdout and ends lines with CRLF. The same applies to `docker compose run`, which allocates a TTY by default; pass `-T` there when piping.
 
+### Serving from a container
+
+The image exposes port 7000 and has a `HEALTHCHECK` that asks the server itself (`health --server 127.0.0.1:7000`), so a served container reports `healthy`:
+
+```sh
+docker network create mg
+docker run -d --name mg-server --network mg -p 127.0.0.1:7000:7000 -v mg-data:/data \
+  ghcr.io/p47phoenix/memory-graph:main serve --db /data/graph.redb --listen 0.0.0.0:7000
+docker run --rm --network mg -v "$PWD:/src:ro" ghcr.io/p47phoenix/memory-graph:main \
+  --server mg-server:7000 index --org acme --repo api /src
+memory-graph --server 127.0.0.1:7000 search foo          # from the host, through the published port
+docker stop mg-server                                     # SIGTERM: a graceful stop, the LOCK sidecar is removed
+```
 ### Troubleshooting
 
 | Symptom | Cause and fix |
@@ -312,7 +353,7 @@ cargo test --workspace                                    # unit + integration t
 cargo test -p graph-cli --test corpus                      # public-repo corpus: exact spans, cross-repo links
 cargo test -p graph-cli --test e2e                          # CLI end-to-end
 python3 scripts/test_gate.py                               # CI's extra gate
-python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any C build script
+python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any C build script, native link or deny-listed crate, on any shipped target
 docker build -t memory-graph .                              # the container image
 ```
 

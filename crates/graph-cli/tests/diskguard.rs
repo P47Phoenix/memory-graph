@@ -54,6 +54,7 @@ fn run_with(
             min_free_disk: min_free,
             disk_check,
             chunk_bytes: if deterministic { 64 << 20 } else { 64 << 10 },
+            remote: None,
         },
         open,
         &mut out,

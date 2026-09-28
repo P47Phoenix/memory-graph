@@ -10,6 +10,7 @@ use diskinfo::{DiskInputs, DiskPolicy, DiskProbe, MinFree};
 pub mod progress;
 pub mod report;
 pub mod sysinfo;
+pub mod target;
 use dataflow::Trace;
 use progress::{Board, Display};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -80,6 +81,11 @@ pub struct DirOpts<'a> {
     /// Source bytes per store transaction (`--chunk-bytes`): one group commit
     /// is capped at a few of these so a failure loses little.
     pub chunk_bytes: u64,
+    /// Client mode (`index --server`): the store is remote, so `db` is not
+    /// a local file and the disk guard is off (the server reports a full
+    /// disk as a typed error); the board shows send / replicate stages and
+    /// counts the RPCs.
+    pub remote: Option<progress::RemoteBoard>,
 }
 
 /// Source bytes per redb transaction unless `--chunk-bytes` says otherwise
@@ -165,6 +171,7 @@ fn flush_batch(
     o: &DirOpts,
     pending: &mut Vec<(String, PreparedFile)>,
     t: &mut Tally,
+    board_remote: Option<&progress::RemoteBoard>,
 ) -> Result<u64> {
     if pending.is_empty() {
         return Ok(0);
@@ -172,9 +179,13 @@ fn flush_batch(
     let lens: Vec<u64> = pending.iter().map(|(_, p)| p.bytes_len() as u64).collect();
     let (rels, prepared): (Vec<String>, Vec<PreparedFile>) = pending.drain(..).unzip();
     let n = prepared.len();
-    let outcomes = store
-        .index_prepared(o.org, o.repo, prepared, IndexOptions { reindex: o.reindex })
-        .map_err(|e| {
+    let t0 = std::time::Instant::now();
+    let outcomes =
+        store.index_prepared(o.org, o.repo, prepared, IndexOptions { reindex: o.reindex });
+    if let Some(r) = board_remote {
+        r.record(lens.iter().sum(), t0.elapsed());
+    }
+    let outcomes = outcomes.map_err(|e| {
             if diskinfo::is_disk_full(&e.to_string()) {
                 anyhow::anyhow!(
                     "disk full while indexing a batch of {n} files ({} files were already stored): {e}; free space and rerun to resume (stored files are skipped)",
@@ -707,7 +718,7 @@ fn commit_all(
                     board
                         .commit
                         .busy(0, "committing", &format!("last {n} files"), || {
-                            flush_batch(store, o, &mut pending, &mut c.tally)
+                            flush_batch(store, o, &mut pending, &mut c.tally, board.remote.as_ref())
                         })?;
                 board.unchanged_bytes.fetch_add(unchanged, Relaxed);
                 board.txns.fetch_add(1, Relaxed);
@@ -795,12 +806,17 @@ fn commit_all(
             let (skipped0, failed0) = (c.tally.skipped_n(), c.tally.failed.len());
             let txn = board.txns.load(Relaxed) + 1;
             let label = format!(
-                "txn {txn}: {n} files ({:.1} MB)",
+                "{} {txn}: {n} files ({:.1} MB)",
+                if board.remote.is_some() {
+                    "batch"
+                } else {
+                    "txn"
+                },
                 pending_bytes as f64 / 1048576.0
             );
             let t0 = std::time::Instant::now();
             let unchanged = board.commit.busy(0, "committing", &label, || {
-                flush_batch(store, o, &mut pending, &mut c.tally)
+                flush_batch(store, o, &mut pending, &mut c.tally, board.remote.as_ref())
             })?;
             board.unchanged_bytes.fetch_add(unchanged, Relaxed);
             board.txns.store(txn, Relaxed);
@@ -902,7 +918,7 @@ pub fn index_dir(
 
 /// `index_dir` drawing on a caller-supplied `display`.
 pub fn index_dir_with(
-    o: DirOpts,
+    mut o: DirOpts,
     open: impl FnOnce(&std::path::Path) -> Result<Box<dyn Store>>,
     out: &mut dyn Write,
     display: &mut Display,
@@ -913,7 +929,14 @@ pub fn index_dir_with(
     if !o.dir.is_dir() {
         bail!("`{}` is not a directory", o.dir.display());
     }
-    if o.db.is_dir() {
+    let remote = o.remote.take();
+    if remote.is_some() {
+        // No local database: nothing to probe, and the server answers a
+        // full disk with a typed error instead.
+        o.disk_check = false;
+        o.disk_probe = Some(std::sync::Arc::new(|_: &std::path::Path| None));
+    }
+    if remote.is_none() && o.db.is_dir() {
         bail!(
             "--db `{}` is a directory; give a database file path",
             o.db.display()
@@ -953,7 +976,11 @@ pub fn index_dir_with(
         1
     };
     let sizing = sysinfo::Sizing::detect(o.jobs, o.memory, floor);
-    let board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
+    let mut board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
+    if let Some(r) = remote {
+        board.set_remote(r);
+    }
+    let board = board;
     board.disk_check.store(o.disk_check, Relaxed);
     board
         .db_len_start

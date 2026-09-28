@@ -23,6 +23,9 @@ lang-html = ["dep:graph-lang-html"]
 [dependencies]
 graph-core = { path = "../graph-core" }
 graph-store = { path = "../graph-store" }
+graph-server = { path = "../graph-server" }
+graph-client = { path = "../graph-client" }
+graph-proto = { path = "../graph-proto" }
 graph-lang-rust = { path = "../graph-lang-rust", optional = true }
 graph-lang-csharp = { path = "../graph-lang-csharp", optional = true }
 graph-lang-javascript = { path = "../graph-lang-javascript", optional = true }

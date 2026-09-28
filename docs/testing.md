@@ -74,6 +74,51 @@ stored, none failed), `search Node --json` (some results), `describe --json`
 The arm64 image is linked from the same pure-Rust source but not executed in
 CI (there is no arm64 runner); the amd64 smoke test is the assurance.
 
+A second step runs a server round on the same image: container 1 runs
+`serve --db /data/graph.redb --listen 0.0.0.0:7000` on a docker network and a volume; one-shot containers on that network wait for `health`, run
+`index --server` and `search --server`, `health --ready` and `cluster leader`; image's own `HEALTHCHECK` must turn `healthy`; `docker stop` (SIGTERM) must 0 and leave no `graph.redb.LOCK` on the volume, after which an embedded
+`describe` of the file lists the repo.
+
+## Server and client (ADR 0004 stage A)
+
+Four layers, from the wire up:
+
+1. **Wire types** (`crates/graph-proto`): proptest round trips for every
+   converted type (`Node`, `Query`, `SymbolQuery`, `Hit`, `SymbolHit`,
+   `RepoInfo`, `IngestStats`, `Extraction`, `Span`) and for
+   `StoreError` <-> `tonic::Status` (variant and message kept), plus "decoding
+   arbitrary bytes never panics" for each top-level message. The generated
+   code is checked by CI's `proto-regen` job (run the xtask, fail on a diff).
+2. **Remote conformance** (`cargo test -p graph-client --test conformance`):
+   the store conformance suite (`run_all`) against `RemoteStore` over an
+   in-process `graph_server::testing::TestServer` (a fresh server per case,
+   with that case's extractors), `run_differential(embedded, remote)`,
+   `run_crash_rerun_differential`, a server restart mid-batch, snapshot handle
+   expiry and the 65th-handle refusal, default-limit paging (more than 1000
+   hits from one frozen view), a `StoreError` round trip through a real RPC,
+   an unknown protocol version refused, and two servers on one file.
+3. **CLI end to end** (`cargo test -p graph-cli --test serve_e2e`): the real
+   `memory-graph serve` binary on `--listen 127.0.0.1:0` (the test reads the
+   bound port from the `listening on` line, so there are no port races).
+   `index`, `describe`, `search`, `symbols` and `export` over the vendored
+   corpus with `--server` (and with `--read linearizable`) print byte for byte
+   what an embedded run prints (elapsed times normalised); the served file,
+   reopened embedded after `Admin.Shutdown`, answers the same again and the
+   LOCK sidecar is gone; a second process reads while an index run writes;
+   target-selection errors (`--db` with `--server` or `MEMORY_GRAPH_SERVER`,
+   `--read` without a server), the `--chunk-bytes` / `--cache-bytes`
+   refusals; `health` exit codes before, during and after the server;
+   `cluster leader`/`status`, `sysinfo --server`, `vacuum --compact
+   --server`; the `Locked` message naming the server's pid and address (for
+   an embedded open, with `MEMORY_GRAPH_LOCK_WAIT_MS=300`, and for a second
+   `serve`); on unix, SIGTERM stopping the server gracefully. Exit code 5
+   (protocol mismatch) needs a server speaking another protocol version, so
+   its mapping is unit-tested in `crates/graph-cli/src/target.rs` instead.
+4. **RPC overhead** (`crates/graph-client/examples/rpc_bench.rs`, run by hand
+   in release): embedded versus remote on the same file, p50/p95; the numbers
+   and the verdict against the 5 ms trigger are in
+   [spikes/rpc-overhead.md](spikes/rpc-overhead.md).
+
 ## Database size
 
 `crates/graph-cli/tests/size_gate.rs` indexes `testdata/corpus` and fails if

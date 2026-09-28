@@ -57,6 +57,80 @@ pub struct Board {
     /// Source bytes one group commit may take so it fits on the volume
     /// (set by the sampler; `u64::MAX` until a reading arrives).
     pub disk_group_cap: AtomicU64,
+    /// Client mode (`--server`): the stages are relabelled (parse → send,
+    /// commit → replicate) and the RPCs are counted.
+    pub remote: Option<RemoteBoard>,
+}
+
+/// What `index --server` reports on top of the pipeline: which leader
+/// acknowledged the writes, up to which log index, and the RPC totals.
+pub struct RemoteBoard {
+    pub server: String,
+    pub leader_id: Option<u64>,
+    /// The highest applied log index the server reported (shared with the
+    /// client, which updates it on every `Index` answer).
+    pub applied_index: std::sync::Arc<AtomicU64>,
+    pub rpc_calls: AtomicU64,
+    pub rpc_micros: AtomicU64,
+    pub rpc_bytes: AtomicU64,
+}
+
+impl RemoteBoard {
+    pub fn new(
+        server: &str,
+        leader_id: Option<u64>,
+        applied_index: std::sync::Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            server: server.to_string(),
+            leader_id,
+            applied_index,
+            rpc_calls: AtomicU64::new(0),
+            rpc_micros: AtomicU64::new(0),
+            rpc_bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one write RPC of `bytes` source bytes that took `took`.
+    pub fn record(&self, bytes: u64, took: Duration) {
+        self.rpc_calls.fetch_add(1, Relaxed);
+        self.rpc_micros.fetch_add(took.as_micros() as u64, Relaxed);
+        self.rpc_bytes.fetch_add(bytes, Relaxed);
+    }
+
+    fn view(&self) -> RemoteView {
+        RemoteView {
+            server: self.server.clone(),
+            leader_id: self.leader_id,
+            applied_index: self.applied_index.load(Relaxed),
+            rpc_calls: self.rpc_calls.load(Relaxed),
+            rpc_time: Duration::from_micros(self.rpc_micros.load(Relaxed)),
+            rpc_bytes: self.rpc_bytes.load(Relaxed),
+        }
+    }
+}
+
+/// A copy of [`RemoteBoard`] for rendering.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteView {
+    pub server: String,
+    pub leader_id: Option<u64>,
+    pub applied_index: u64,
+    pub rpc_calls: u64,
+    pub rpc_time: Duration,
+    pub rpc_bytes: u64,
+}
+
+impl RemoteView {
+    /// `acked by leader N (idx K)`, the replicate stage's summary.
+    pub fn ack(&self) -> String {
+        format!(
+            "acked by leader {} (idx {})",
+            self.leader_id
+                .map_or_else(|| "?".to_string(), |l| l.to_string()),
+            self.applied_index
+        )
+    }
 }
 
 impl Board {
@@ -97,6 +171,7 @@ impl Board {
             disk_stop: std::sync::Mutex::new(None),
             disk_check: AtomicBool::new(true),
             disk_group_cap: AtomicU64::new(u64::MAX),
+            remote: None,
             start: Instant::now(),
             walk: Stage::new("walk", 1).traced(0, trace),
             parse: Stage::new("parse", t).traced(100, trace),
@@ -113,6 +188,15 @@ impl Board {
             txns: AtomicU64::new(0),
             last_txn: AtomicU64::new(0),
         }
+    }
+
+    /// Client mode: relabel the stages the way the work splits with a
+    /// server (the client only reads and sends; the server parses, commits
+    /// and replicates) and count the RPCs.
+    pub fn set_remote(&mut self, remote: RemoteBoard) {
+        self.parse.name = "send";
+        self.commit.name = "replicate";
+        self.remote = Some(remote);
     }
 
     pub fn view(&self) -> BoardView {
@@ -156,6 +240,7 @@ impl Board {
                 .clone(),
             disk_check: self.disk_check.load(Relaxed),
             sizing: self.sizing.clone(),
+            remote: self.remote.as_ref().map(RemoteBoard::view),
         }
     }
 }
@@ -192,6 +277,8 @@ pub struct BoardView {
     pub disk_stop: Option<String>,
     pub disk_check: bool,
     pub sizing: Sizing,
+    /// Client mode (`--server`) only.
+    pub remote: Option<RemoteView>,
 }
 
 fn mb(b: u64) -> String {
@@ -338,7 +425,7 @@ impl BoardView {
         if busy.len() > 4 {
             detail.push_str(&format!(" · … +{}", busy.len() - 4));
         }
-        lines.push(format!("  parse   {state:<13}  {detail}"));
+        lines.push(format!("  {:<8}{state:<13}  {detail}", parse.name));
         if dn < n && (bl > 0 || st > 0) {
             let why = if bl > 0 {
                 format!(
@@ -361,12 +448,22 @@ impl BoardView {
             Some((Activity::Done, _)) => "✓ done".to_string(),
             _ => "⏸ waiting for parsed files".to_string(),
         };
-        lines.push(format!(
-            "  commit  {cline}   ({} txns, {} files stored, last txn {})",
-            self.txns,
-            group(commit.items),
-            secs(self.last_txn)
-        ));
+        lines.push(match &self.remote {
+            None => format!(
+                "  commit  {cline}   ({} txns, {} files stored, last txn {})",
+                self.txns,
+                group(commit.items),
+                secs(self.last_txn)
+            ),
+            Some(r) => format!(
+                "  {}: {}   {cline}   ({} batches, {} files stored, last {})",
+                commit.name,
+                r.ack(),
+                self.txns,
+                group(commit.items),
+                secs(self.last_txn)
+            ),
+        });
         // memory + bottleneck
         let bn = self
             .bottleneck()
@@ -427,14 +524,18 @@ impl BoardView {
     /// The end-of-run table (`--stats`).
     pub fn stats_table(&self) -> String {
         let wall = self.elapsed.as_secs_f64().max(0.001);
-        let mut s = String::from(
-            "stage   threads  busy%  waiting-upstream%  blocked-downstream%    items    MB/s\n",
-        );
+        // "replicate" is wider than the embedded stage names.
+        let w = if self.remote.is_some() { 9 } else { 7 };
+        let mut s = String::from(if self.remote.is_some() {
+            "stage     threads  busy%  waiting-upstream%  blocked-downstream%    items    MB/s\n"
+        } else {
+            "stage   threads  busy%  waiting-upstream%  blocked-downstream%    items    MB/s\n"
+        });
         for st in &self.stages {
             let cap = wall * st.threads.len() as f64;
             let pct = |d: Duration| 100.0 * d.as_secs_f64() / cap;
             s.push_str(&format!(
-                "{:<7} {:>7}  {:>5.1}  {:>17.1}  {:>19.1}  {:>7}  {:>6.1}\n",
+                "{:<w$} {:>7}  {:>5.1}  {:>17.1}  {:>19.1}  {:>7}  {:>6.1}\n",
                 st.name,
                 st.threads.len(),
                 pct(st.busy),
@@ -442,6 +543,21 @@ impl BoardView {
                 pct(st.blocked),
                 st.items,
                 st.bytes as f64 / (1024.0 * 1024.0) / wall,
+            ));
+        }
+        if let Some(r) = &self.remote {
+            let mean = r.rpc_time.as_secs_f64() * 1000.0 / r.rpc_calls.max(1) as f64;
+            s.push_str(&format!(
+                "{:<w$} {:>7}  {:>5.1}  {:>17}  {:>19}  {:>7}  {:>6.1}   (server {}: mean {mean:.1} ms per Index call, {})\n",
+                "rpc",
+                1,
+                100.0 * r.rpc_time.as_secs_f64() / wall,
+                "-",
+                "-",
+                r.rpc_calls,
+                r.rpc_bytes as f64 / (1024.0 * 1024.0) / wall,
+                r.server,
+                r.ack(),
             ));
         }
         let parse = &self.stages[1];
@@ -523,7 +639,17 @@ impl BoardView {
                 })
             })
             .collect();
-        serde_json::json!({
+        let rpc = self.remote.as_ref().map(|r| {
+            serde_json::json!({
+                "server": r.server,
+                "leader_id": r.leader_id,
+                "applied_index": r.applied_index,
+                "calls": r.rpc_calls,
+                "busy_ms": r.rpc_time.as_millis() as u64,
+                "bytes": r.rpc_bytes,
+            })
+        });
+        let mut v = serde_json::json!({
             "stages": stages,
             "parse_threads": self.sizing.parse_threads,
             "cpus": self.sizing.cpus,
@@ -557,7 +683,11 @@ impl BoardView {
                 "check": self.disk_check,
                 "stopped": self.disk_stop,
             },
-        })
+        });
+        if let Some(rpc) = rpc {
+            v["rpc"] = rpc;
+        }
+        v
     }
 }
 
@@ -714,7 +844,40 @@ mod tests {
                 None,
                 1,
             ),
+            remote: None,
         }
+    }
+
+    /// Client mode relabels the stages and reports the leader's ack and
+    /// the RPC totals, live and in `--stats`; embedded mode has no `rpc`.
+    #[test]
+    fn remote_mode_shows_send_replicate_and_rpc() {
+        let mut v = view();
+        assert!(v.stats_json().get("rpc").is_none());
+        assert!(!v.stats_table().contains("rpc "));
+        v.stages[1].name = "send";
+        v.stages[2].name = "replicate";
+        v.remote = Some(RemoteView {
+            server: "127.0.0.1:7000".into(),
+            leader_id: Some(1),
+            applied_index: 17,
+            rpc_calls: 4,
+            rpc_time: Duration::from_millis(800),
+            rpc_bytes: 10 << 20,
+        });
+        let t = v.render(250).join("\n");
+        assert!(t.contains("  send    ▶ 2/3 busy"), "{t}");
+        assert!(t.contains("  replicate: acked by leader 1 (idx 17)"), "{t}");
+        let s = v.stats_table();
+        assert!(s.contains("\nrpc "), "{s}");
+        assert!(
+            s.contains("server 127.0.0.1:7000: mean 200.0 ms per Index call"),
+            "{s}"
+        );
+        let j = v.stats_json();
+        assert_eq!(j["rpc"]["calls"], 4);
+        assert_eq!(j["rpc"]["applied_index"], 17);
+        assert_eq!(j["stages"][1]["stage"], "send");
     }
 
     #[test]

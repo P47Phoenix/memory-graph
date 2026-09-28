@@ -1,0 +1,99 @@
+// The write side of a memory-graph server (ADR 0004 D1/D2). Every write is
+// proposed through Raft on the leader (D5); a follower forwards it and sets
+// `forwarded_to_leader`. `applied_index` is the log index the write was
+// applied at, for callers that want read-your-writes.
+syntax = "proto3";
+
+package memory_graph.v1;
+
+import "memory_graph/v1/common.proto";
+
+service Write {
+  // Index raw source bytes of one repo: the stream starts with an
+  // `IndexHeader`, then one `FileBytes` per file. The server parses with its
+  // own extractors. Per-file outcomes come back in input order.
+  rpc Index(stream IndexRequest) returns (IndexResponse);
+  // One file (`Store::index_bytes_opts`).
+  rpc IndexFile(IndexFileRequest) returns (IndexFileResponse);
+  // A caller-supplied extraction (`Store::ingest_file_with_origin`).
+  rpc IngestExtraction(IngestExtractionRequest) returns (IngestExtractionResponse);
+  // Remove directory-run files of a repo not in `keep`
+  // (`Store::prune_files`). `dry_run` is node-local and never logged.
+  rpc Prune(PruneRequest) returns (PruneResponse);
+  // `Store::vacuum`.
+  rpc Vacuum(VacuumRequest) returns (VacuumResponse);
+}
+
+message IndexHeader {
+  string org = 1;
+  string repo = 2;
+  IndexOptions options = 3;
+}
+
+message IndexRequest {
+  oneof msg {
+    IndexHeader header = 1;
+    FileBytes file = 2;
+  }
+}
+
+// The outcome of one file: its stats, or its per-file rejection.
+message FileResult {
+  oneof result {
+    IngestStats stats = 1;
+    StoreErrorDetail error = 2;
+  }
+}
+
+message IndexResponse {
+  repeated FileResult results = 1;
+  bool forwarded_to_leader = 2;
+  uint64 applied_index = 3;
+}
+
+message IndexFileRequest {
+  string org = 1;
+  string repo = 2;
+  FileBytes file = 3;
+  IndexOptions options = 4;
+}
+message IndexFileResponse {
+  IngestStats stats = 1;
+  bool forwarded_to_leader = 2;
+  uint64 applied_index = 3;
+}
+
+message IngestExtractionRequest {
+  string org = 1;
+  string repo = 2;
+  string path = 3;
+  string language = 4;
+  Extraction extraction = 5;
+  optional string origin = 6;
+}
+message IngestExtractionResponse {
+  IngestStats stats = 1;
+  bool forwarded_to_leader = 2;
+  uint64 applied_index = 3;
+}
+
+message PruneRequest {
+  string org = 1;
+  string repo = 2;
+  // Normalized paths to keep.
+  repeated string keep = 3;
+  bool dry_run = 4;
+}
+message PruneResponse {
+  // Removed (or, with `dry_run`, would-be-removed) paths.
+  repeated string removed = 1;
+  bool forwarded_to_leader = 2;
+  uint64 applied_index = 3;
+}
+
+message VacuumRequest {}
+message VacuumResponse {
+  VacuumStats stats = 1;
+  bool forwarded_to_leader = 2;
+  uint64 applied_index = 3;
+}

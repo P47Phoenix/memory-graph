@@ -296,6 +296,11 @@ pub(crate) fn commit_prepared(
     if let Prepared::Rejected(e) = work {
         return Ok(Err(e));
     }
+    if let Prepared::Remote(_) = work {
+        // ADR 0004 D2: the bytes were kept for a server to parse; this
+        // store has neither fingerprint nor extraction for them.
+        return Ok(Err(StoreError::Rejected(REMOTE_PREPARED_REJECTION.into())));
+    }
     if !opts.reindex {
         if let Some((stats, _)) = check_unchanged(
             wt,
@@ -317,8 +322,14 @@ pub(crate) fn commit_prepared(
         Prepared::Extracted(ex) => Ok(Ok(ingest(&mut p, &ex)?)),
         Prepared::Rejected(e) => Ok(Err(e)),
         Prepared::Unchanged(_) => unreachable!("extracted above"),
+        Prepared::Remote(_) => unreachable!("rejected above"),
     }
 }
+
+/// The per-file rejection an embedded store gives a
+/// [`PreparedFile::remote`] file (ADR 0004 D2).
+pub const REMOTE_PREPARED_REJECTION: &str =
+    "remote-prepared file cannot be committed to an embedded store";
 
 /// A symbol matches a kind name if it is its generic kind or its
 /// language-specific kind string (ASCII case-insensitive, like `--language`).
