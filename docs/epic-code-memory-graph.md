@@ -35,7 +35,7 @@
 | 17 | Error tolerance and JSON output with stable API | Medium | 5 | P3 | 10, 8 |
 | 18 | Remove data and benchmark at scale | Medium | 5 | P3 | 15 |
 | 19 | Spike: WASM-hosted extractor plugins (wasmi) | Risk reduction | 3 | P4 | 4 |
-| 20 | Single-node server and client (gRPC, `serve`, `--server`) | High | 8 | P2 | ADR 0004 accepted |
+| 20 | Single-node server and client (gRPC, `serve`, `--server`) | High | 8 | P2 | ADR 0004 (accepted 2026-09-28) |
 | 21 | Replication: Raft log, snapshots, `--bootstrap` | High | 8 | P2 | 20 |
 | 22 | Membership and write forwarding | High | 8 | P2 | 21 |
 | 23 | Linearizable reads and crash tests | High | 5 | P3 | 22 |

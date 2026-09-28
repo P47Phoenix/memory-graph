@@ -13,7 +13,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 - [glossary.md](glossary.md): every technical term in plain words, in alphabetical order.
 
 ## Product
-- [Epic: Language-agnostic code memory graph](epic-code-memory-graph.md): the goal, how we measure success, and the list of planned stories (1-19, plus 20-25 for the client/server and cluster work proposed by ADR 0004).
+- [Epic: Language-agnostic code memory graph](epic-code-memory-graph.md): the goal, how we measure success, and the list of planned stories (1-19, plus 20-25 for the client/server and cluster work added by ADR 0004, accepted 2026-09-28).
 
 ## Architecture decision records
 | ADR | Status | One line |
