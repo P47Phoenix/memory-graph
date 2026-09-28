@@ -250,13 +250,21 @@ impl SnapshotDir {
             store_format_version: graph_store::SCHEMA_VERSION,
         };
         let meta = meta_path_of(&final_path);
-        let tmp = self.dir.join(format!("{st}.meta.tmp"));
-        std::fs::write(
-            &tmp,
-            serde_json::to_string_pretty(&side).expect("sidecar serializes"),
+        // Durable: the data file is synced before its meta exists, and the
+        // meta through a synced temp file and a rename, then the directory
+        // (a meta must never describe bytes that a power cut lost).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&final_path)
+            .and_then(|f| f.sync_all())
+            .map_err(io)?;
+        crate::paths::durable_write(
+            &meta,
+            serde_json::to_string_pretty(&side)
+                .expect("sidecar serializes")
+                .as_bytes(),
         )
         .map_err(io)?;
-        replace_file(&tmp, &meta).map_err(io)?;
         self.prune_except(&final_path);
         Ok((side, final_path))
     }
@@ -296,6 +304,25 @@ impl SnapshotDir {
         })
     }
 
+    /// A snapshot file's own `RAFT_SM` marker must be the snapshot's last
+    /// log id: the store's applied state after the install is read from
+    /// that marker, so a file that says otherwise would leave the store and
+    /// openraft disagreeing about what was applied.
+    fn check_marker(path: &Path, meta: &SnapshotMeta) -> Result<(), StoreError> {
+        let (last, _) = {
+            let copy = V2Store::open(path)?;
+            super::state_machine::StoreStateMachine::read_applied(&copy)?
+        };
+        if last != meta.last_log_id {
+            return Err(StoreError::Rejected(format!(
+                "snapshot file `{}` is at {last:?} but its metadata says {:?}",
+                path.display(),
+                meta.last_log_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Install a received snapshot file (blocking): validate it, swap the
     /// store to a copy of it (`swap`, the slot's install under its write
     /// lock), and only then make it the current snapshot. A failed install
@@ -318,7 +345,7 @@ impl SnapshotDir {
             }
         };
         let valid = match graph_store::detect_format(&data.path) {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(_)) => Self::check_marker(&data.path, meta),
             Ok(None) => Err(StoreError::Rejected(format!(
                 "`{}` is not a store file",
                 data.path.display()
@@ -330,7 +357,14 @@ impl SnapshotDir {
             return Err(e);
         }
         // The swap consumes its source: install a copy (beside the store,
-        // so the swap is a same-volume rename).
+        // so the swap is a same-volume rename). Two copies are inherent,
+        // not an oversight: the store and the retained snapshot file are
+        // two files that diverge as soon as the store applies the next
+        // entry, so the one received file cannot become both by renames
+        // (a hard link would share the bytes and let the store's writes
+        // corrupt the snapshot). An install therefore needs room for the
+        // received file plus the staged copy (the Raft service checks
+        // that against the disk guard before receiving).
         let mut staged = store_path.as_os_str().to_owned();
         staged.push(".install.tmp");
         let staged = PathBuf::from(staged);

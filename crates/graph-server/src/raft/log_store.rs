@@ -19,11 +19,14 @@ use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{
     AnyError, CommittedLeaderId, EntryPayload, Membership, RaftLogReader, RaftTypeConfig, Vote,
 };
-use redb::{Database, ReadableTable, ReadableTableMetadata, StorageBackend, TableDefinition};
+use redb::{
+    Database, ReadTransaction, ReadableTable, ReadableTableMetadata, StorageBackend, TableDefinition,
+    WriteTransaction,
+};
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
@@ -102,7 +105,39 @@ pub struct RedbLogStore {
     appended_bytes: Arc<AtomicU64>,
     /// The file size right after the last compaction (0: none yet).
     compacted_bytes: Arc<AtomicU64>,
+    /// A background compaction is running.
+    compacting: Arc<AtomicBool>,
     observer: Option<AppendObserver>,
+    #[cfg(test)]
+    compact_gate: Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+}
+
+/// A redb transaction together with the read guard of the store's lock it
+/// was begun under. Fields drop in declaration order, so the transaction
+/// always ends before the guard is released: the ordering the compaction
+/// relies on is enforced by the type, not by convention.
+pub(crate) struct Guarded<'a, T> {
+    txn: T,
+    _guard: RwLockReadGuard<'a, Database>,
+}
+
+impl<T> std::ops::Deref for Guarded<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.txn
+    }
+}
+
+impl Guarded<'_, WriteTransaction> {
+    pub(crate) fn commit(self) -> Result<(), redb::CommitError> {
+        let Guarded { txn, _guard } = self;
+        txn.commit()
+    }
+
+    pub(crate) fn abort(self) -> Result<(), redb::StorageError> {
+        let Guarded { txn, _guard } = self;
+        txn.abort()
+    }
 }
 
 impl Debug for RedbLogStore {
@@ -191,7 +226,10 @@ impl RedbLogStore {
             path: path.to_path_buf(),
             appended_bytes: Arc::new(AtomicU64::new(0)),
             compacted_bytes: Arc::new(AtomicU64::new(0)),
+            compacting: Arc::new(AtomicBool::new(false)),
             observer: None,
+            #[cfg(test)]
+            compact_gate: Arc::default(),
         };
         // The byte trigger survives a restart: start from what the log
         // holds (the snapshot policy subtracts what lies at or below the
@@ -203,8 +241,7 @@ impl RedbLogStore {
 
     /// Encoded bytes of the entries above `index` in the log right now.
     pub fn bytes_after(&self, index: u64) -> Result<u64, StoreError> {
-        let db = self.db();
-        let rt = db.begin_read()?;
+        let rt = self.read_txn()?;
         let t = rt.open_table(LOG)?;
         let mut n = 0u64;
         for row in t.range::<u64>((Bound::Excluded(index), Bound::Unbounded))? {
@@ -241,11 +278,38 @@ impl RedbLogStore {
         })
     }
 
-    /// The database for one transaction. The guard must outlive the
-    /// transaction (bind it first), so [`Self::compact_if_sparse`] can
-    /// rely on no transaction of ours being open.
-    fn db(&self) -> RwLockReadGuard<'_, Database> {
+    fn guard(&self) -> RwLockReadGuard<'_, Database> {
         self.db.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A read transaction bound to the read side of the lock
+    /// ([`Guarded`]: the compiler keeps the guard alive for as long as the
+    /// transaction, so [`Self::compact_if_sparse`] can rely on no
+    /// transaction of ours being open while it holds the write side).
+    pub(crate) fn read_txn(&self) -> Result<Guarded<'_, ReadTransaction>, redb::TransactionError> {
+        let guard = self.guard();
+        let txn = guard.begin_read()?;
+        Ok(Guarded { txn, _guard: guard })
+    }
+
+    /// A write transaction bound to the read side of the lock (see
+    /// [`Self::read_txn`]); end it with [`Guarded::commit`].
+    pub(crate) fn write_txn(
+        &self,
+    ) -> Result<Guarded<'_, WriteTransaction>, redb::TransactionError> {
+        let guard = self.guard();
+        let txn = guard.begin_write()?;
+        Ok(Guarded { txn, _guard: guard })
+    }
+
+    /// Test-only: `compact_if_sparse` calls this while it holds the write
+    /// side of the lock, before compacting (a test holds it open).
+    #[cfg(test)]
+    pub(crate) fn set_compact_gate(&self, gate: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .compact_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
     }
 
     /// Shrink the file once a purge left it mostly free pages: redb reuses
@@ -254,30 +318,35 @@ impl RedbLogStore {
     /// between two snapshots (measured: a corpus index left 3.4x the source
     /// on disk after the snapshot purged the whole log).
     ///
-    /// Runs only when the file is at least twice its live pages plus
-    /// [`COMPACT_SLACK`], so a steady state does not compact on every
-    /// purge. `Database::compact` commits with two-phase commits (crash
-    /// safe: an interrupted compaction leaves a valid file); it holds the
-    /// write side of the lock, so appends wait for it, which is bounded by
-    /// the entries left after the purge (`--log-keep-entries`). Returns
-    /// whether it compacted; a failure is logged, never fatal (the log is
-    /// intact either way).
+    /// Cheap when there is nothing to gain: a file that has not grown by
+    /// [`COMPACT_SLACK`] since the last compaction is left alone after one
+    /// `stat`. Otherwise it compacts only when the file is at least twice
+    /// its live pages plus [`COMPACT_SLACK`], so a steady state does not
+    /// compact on every purge. `Database::compact` commits with two-phase
+    /// commits (crash safe: an interrupted compaction leaves a valid file);
+    /// it holds the write side of the lock, so log reads and writes wait
+    /// for it (bounded by the entries left after the purge,
+    /// `--log-keep-entries`). `purge` runs it in the background, so the
+    /// Raft core never awaits it. Returns whether it compacted; a failure
+    /// is logged, never fatal (the log is intact either way).
     pub fn compact_if_sparse(&self) -> bool {
         let file = self.file_bytes();
+        let floor = self.compacted_bytes.load(Ordering::Relaxed);
+        if file < floor.saturating_add(COMPACT_SLACK) {
+            return false;
+        }
         let live = {
-            let db = self.db();
             // A purge's pages are released only by later commits: two
             // empty ones (as `compact` does itself) make `allocated_pages`
-            // exact. Purges are rare (one per snapshot), so the two small
-            // fsyncs are cheap.
+            // exact.
             let release = || -> Result<(), redb::Error> {
                 for _ in 0..2 {
-                    db.begin_write()?.commit()?;
+                    self.write_txn()?.commit()?;
                 }
                 Ok(())
             };
             let stats = release().and_then(|()| {
-                let wt = db.begin_write()?;
+                let wt = self.write_txn()?;
                 let s = wt.stats();
                 wt.abort()?;
                 Ok(s?)
@@ -290,26 +359,27 @@ impl RedbLogStore {
                 }
             }
         };
-        // Not worth it while the file is within twice its live data, nor
-        // when it has barely grown since the last compaction (redb keeps a
-        // floor: its region layout and power-of-two value allocations).
-        let floor = self.compacted_bytes.load(Ordering::Relaxed);
-        if file < live.saturating_mul(2).saturating_add(COMPACT_SLACK)
-            || file < floor.saturating_add(COMPACT_SLACK)
-        {
+        // Not worth it while the file is within twice its live data (redb
+        // keeps a floor: its region layout and power-of-two value
+        // allocations).
+        if file < live.saturating_mul(2).saturating_add(COMPACT_SLACK) {
             return false;
         }
         let mut db = self.db.write().unwrap_or_else(|p| p.into_inner());
-        let mut rounds = 0;
-        loop {
-            match db.compact() {
-                Ok(true) if rounds < 8 => rounds += 1,
-                Ok(_) => break,
-                Err(e) => {
-                    tracing::warn!(error = %e, "raft log: compaction skipped");
-                    break;
-                }
+        #[cfg(test)]
+        {
+            let gate = self
+                .compact_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(g) = gate {
+                g();
             }
+        }
+        // `compact` itself loops until a pass makes no progress.
+        if let Err(e) = db.compact() {
+            tracing::warn!(error = %e, "raft log: compaction skipped");
         }
         drop(db);
         let after = self.file_bytes();
@@ -321,6 +391,11 @@ impl RedbLogStore {
             "raft log compacted after a purge"
         );
         true
+    }
+
+    /// Whether a background compaction (started by a purge) is running.
+    pub fn is_compacting(&self) -> bool {
+        self.compacting.load(Ordering::SeqCst)
     }
 
     /// Record every append's commit and flush callback (tests only).
@@ -348,8 +423,7 @@ impl RedbLogStore {
     }
 
     fn meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, StorageError> {
-        let db = self.db();
-        let rt = db.begin_read().map_err(read_err)?;
+        let rt = self.read_txn().map_err(read_err)?;
         let t = rt.open_table(META).map_err(read_err)?;
         match t.get(key).map_err(read_err)? {
             None => Ok(None),
@@ -361,8 +435,7 @@ impl RedbLogStore {
 
     fn set_meta<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<(), StorageError> {
         let bytes = serde_json::to_vec(value).map_err(write_err)?;
-        let db = self.db();
-        let wt = db.begin_write().map_err(write_err)?;
+        let wt = self.write_txn().map_err(write_err)?;
         {
             let mut t = wt.open_table(META).map_err(write_err)?;
             t.insert(key, bytes.as_slice()).map_err(write_err)?;
@@ -371,8 +444,7 @@ impl RedbLogStore {
     }
 
     fn last_log_id(&self) -> Result<Option<LogId>, StorageError> {
-        let db = self.db();
-        let rt = db.begin_read().map_err(read_err)?;
+        let rt = self.read_txn().map_err(read_err)?;
         let t = rt.open_table(LOG).map_err(read_err)?;
         let last = t.last().map_err(read_err)?;
         let out = match &last {
@@ -385,8 +457,7 @@ impl RedbLogStore {
 
     /// Delete `range` of indexes in one transaction.
     fn delete_range(&self, lo: Bound<u64>, hi: Bound<u64>) -> Result<(), StorageError> {
-        let db = self.db();
-        let wt = db.begin_write().map_err(write_err)?;
+        let wt = self.write_txn().map_err(write_err)?;
         {
             let mut t = wt.open_table(LOG).map_err(write_err)?;
             let keys: Vec<u64> = t
@@ -402,6 +473,18 @@ impl RedbLogStore {
         wt.commit().map_err(write_err)
     }
 
+    /// Put `e` in the log directly (unit tests: openraft's flush callback
+    /// cannot be built outside openraft).
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, e: &Entry) {
+        let wt = self.write_txn().unwrap();
+        wt.open_table(LOG)
+            .unwrap()
+            .insert(e.log_id.index, encode_entry(e).as_slice())
+            .unwrap();
+        wt.commit().unwrap();
+    }
+
     /// The last log index: the last entry's, else the purge point's.
     pub fn last_index(&self) -> Result<Option<u64>, StoreError> {
         let io = |e: StorageError| StoreError::Storage(format!("raft log: {e}"));
@@ -412,8 +495,7 @@ impl RedbLogStore {
 
     /// Entries in the log right now (tests and status).
     pub fn len(&self) -> Result<u64, StoreError> {
-        let db = self.db();
-        let rt = db.begin_read()?;
+        let rt = self.read_txn()?;
         Ok(rt.open_table(LOG)?.len()?)
     }
 
@@ -427,8 +509,7 @@ impl RaftLogReader<TypeConfig> for RedbLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry>, StorageError> {
-        let db = self.db();
-        let rt = db.begin_read().map_err(read_err)?;
+        let rt = self.read_txn().map_err(read_err)?;
         let t = rt.open_table(LOG).map_err(read_err)?;
         let mut out = Vec::new();
         for row in t
@@ -498,9 +579,7 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         // this on its own task, so nothing else of the node waits on it).
         let written = self
             .blocking(move |s| {
-                // The guard first: it outlives the transaction.
-                let db = s.db();
-                let wt = db.begin_write().map_err(write_err)?;
+                let wt = s.write_txn().map_err(write_err)?;
                 let mut bytes = 0u64;
                 let mut last = 0u64;
                 {
@@ -517,7 +596,6 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
                 // entries are fsynced, and only then is the flush reported
                 // (D7).
                 wt.commit().map_err(write_err)?;
-                drop(db);
                 if let Some(o) = &s.observer {
                     o(AppendEvent::Committed { last_index: last });
                 }
@@ -551,8 +629,7 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         self.blocking(move |s| {
             // The purge point and the deletion commit together.
             let bytes = serde_json::to_vec(&log_id).map_err(write_err)?;
-            let db = s.db();
-            let wt = db.begin_write().map_err(write_err)?;
+            let wt = s.write_txn().map_err(write_err)?;
             {
                 let mut meta = wt.open_table(META).map_err(write_err)?;
                 meta.insert(K_PURGED, bytes.as_slice()).map_err(write_err)?;
@@ -567,14 +644,23 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
                     t.remove(k).map_err(write_err)?;
                 }
             }
-            wt.commit().map_err(write_err)?;
-            drop(db);
-            // Still on the blocking pool: the compaction takes the write
-            // side of the lock and may move many pages.
-            s.compact_if_sparse();
-            Ok(())
+            wt.commit().map_err(write_err)
         })
-        .await
+        .await?;
+        // In the background: the Raft core awaits `purge`, and a
+        // compaction may take long enough to delay its heartbeats past an
+        // election timeout. At most one runs at a time.
+        if !self.compacting.swap(true, Ordering::SeqCst) {
+            let s = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let flag = Arc::clone(&s.compacting);
+                s.compact_if_sparse();
+                // Release the database before saying it is done.
+                drop(s);
+                flag.store(false, Ordering::SeqCst);
+            });
+        }
+        Ok(())
     }
 }
 
@@ -641,16 +727,11 @@ mod tests {
     /// A purge that frees most of the file compacts it: `raft.redb` does
     /// not keep the high-water mark of the log (the size gate in
     /// `graph-cli/tests/size_gate.rs` checks the same end to end).
-    #[test]
-    fn purge_compacts_a_mostly_free_log_and_keeps_the_rest() {
-        let d = tempfile::tempdir().unwrap();
-        let path = d.path().join("raft.redb");
-        let mut log = RedbLogStore::open(&path).unwrap();
-        // 24 entries of 1 MiB each, written the way `append` writes them
-        // (one fsynced transaction per batch).
+    /// 24 entries of 1 MiB each, written the way `append` writes them (one
+    /// fsynced transaction per batch of 4).
+    fn fill_24_mib(log: &RedbLogStore) {
         for batch in 0..6u64 {
-            let db = log.db();
-            let wt = db.begin_write().unwrap();
+            let wt = log.write_txn().unwrap();
             {
                 let mut t = wt.open_table(LOG).unwrap();
                 for i in 1..=4u64 {
@@ -666,6 +747,25 @@ mod tests {
             }
             wt.commit().unwrap();
         }
+    }
+
+    fn wait_compacted(log: &RedbLogStore) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while log.is_compacting() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the background compaction did not finish within 60 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn purge_compacts_a_mostly_free_log_and_keeps_the_rest() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("raft.redb");
+        let mut log = RedbLogStore::open(&path).unwrap();
+        fill_24_mib(&log);
         let before = log.file_bytes();
         assert!(before > 24 << 20, "{before}");
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -673,6 +773,7 @@ mod tests {
             .unwrap();
         let purged = LogId::new(CommittedLeaderId::new(1, 1), 22);
         rt.block_on(log.purge(purged)).unwrap();
+        wait_compacted(&log);
         let after = log.file_bytes();
         // redb rounds a 1 MiB value up to a 2 MiB allocation and keeps its
         // region layout: measured 84 MB -> 11.7 MB.
@@ -693,5 +794,86 @@ mod tests {
             rest.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
             [23, 24]
         );
+    }
+
+    /// The compaction after a purge runs in the background: `purge`
+    /// returns while it is held open (so the Raft core, which awaits
+    /// `purge`, keeps sending heartbeats); a log reader on a clone of the
+    /// store that holds a read transaction while it starts neither
+    /// deadlocks nor sees a torn log; later appends and reads work.
+    #[test]
+    fn a_compaction_runs_beside_the_raft_core_without_deadlock() {
+        use std::sync::mpsc;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("raft.redb");
+        let mut log = RedbLogStore::open(&path).unwrap();
+        fill_24_mib(&log);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // A reader (the log reader openraft hands to replication) holds a
+        // read transaction when the compaction wants the write side.
+        let reader = log.clone();
+        let rtxn = reader.read_txn().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        log.set_compact_gate(Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        })));
+        let purged = LogId::new(CommittedLeaderId::new(1, 1), 22);
+        // `purge` returns although the compaction cannot even start yet.
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), log.purge(purged))
+                .await
+                .expect("purge returned while the compaction waits")
+                .unwrap()
+        });
+        assert!(log.is_compacting());
+        // The held read transaction still reads the whole log as of its
+        // start (before the purge).
+        assert_eq!(rtxn.open_table(LOG).unwrap().len().unwrap(), 24);
+        drop(rtxn);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the compaction took the write side once the reader let go");
+        release_tx.send(()).unwrap();
+        wait_compacted(&log);
+        // Appends and reads go on.
+        log.insert_for_test(&Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 25),
+            payload: EntryPayload::Blank,
+        });
+        let rest = rt.block_on(log.try_get_log_entries(0..100)).unwrap();
+        assert_eq!(
+            rest.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            [23, 24, 25]
+        );
+        log.set_compact_gate(None);
+    }
+
+    /// The snapshot policy's byte trigger survives a restart: a reopened
+    /// log starts from the bytes it holds.
+    #[test]
+    fn appended_bytes_start_from_what_the_log_holds() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("raft.redb");
+        let log = RedbLogStore::open(&path).unwrap();
+        assert_eq!(log.appended_bytes(), 0);
+        let e = |i| Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), i),
+            payload: EntryPayload::Normal(LogRequest {
+                command: vec![7; 100],
+            }),
+        };
+        log.insert_for_test(&e(1));
+        log.insert_for_test(&e(2));
+        drop(log);
+        let log = RedbLogStore::open(&path).unwrap();
+        assert_eq!(log.appended_bytes(), 2 * 125);
+        assert_eq!(log.bytes_after(1).unwrap(), 125);
     }
 }

@@ -3233,7 +3233,7 @@ pub struct StatusResponse {
     pub advertise: ::prost::alloc::string::String,
 }
 /// Replication progress of one peer, as the leader sees it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PeerLag {
     #[prost(uint64, tag = "1")]
     pub node_id: u64,
@@ -3243,6 +3243,10 @@ pub struct PeerLag {
     /// `last_log_index - matched_index` on the leader.
     #[prost(uint64, tag = "3")]
     pub lag: u64,
+    /// The last error replicating to this peer (its gRPC code and message),
+    /// empty once a later RPC to it succeeded.
+    #[prost(string, tag = "4")]
+    pub last_error: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SysInfoRequest {}

@@ -21,6 +21,9 @@ use std::time::Duration;
 /// The suggested client back-off when no leader is known (`NoLeader`).
 pub const NO_LEADER_RETRY_MS: u64 = 200;
 
+/// How long a blocking `AddLearner` waits for the learner to catch up.
+pub const ADD_LEARNER_CATCH_UP: Duration = Duration::from_secs(60);
+
 /// Raft timing and log-retention knobs (the `serve` flags of ADR 0004
 /// D5/D7). [`RaftSettings::cluster`] is the `--data-dir` default,
 /// [`RaftSettings::standalone`] the stage A `--db` one.
@@ -295,12 +298,37 @@ impl RaftNode {
         addr: &str,
         blocking: bool,
     ) -> Result<u64, StoreError> {
+        // openraft's own `blocking` waits only its default half second and
+        // then answers success whatever the learner's state, so the wait
+        // for catch-up is ours, with a real timeout and a real error.
         let r = self
             .raft
-            .add_learner(id, BasicNode::new(addr), blocking)
+            .add_learner(id, BasicNode::new(addr), false)
             .await
             .map_err(write_err)?;
-        Ok(r.log_id().index)
+        let index = r.log_id().index;
+        if blocking && id != self.node_id {
+            self.raft
+                .wait(Some(ADD_LEARNER_CATCH_UP))
+                .metrics(
+                    |m| {
+                        m.replication
+                            .as_ref()
+                            .and_then(|r| r.get(&id))
+                            .and_then(|l| l.as_ref())
+                            .is_some_and(|l| l.index >= index)
+                    },
+                    "the new learner caught up",
+                )
+                .await
+                .map_err(|e| {
+                    StoreError::Rejected(format!(
+                        "node {id} at {addr} was added as a learner (log index {index}) but did \
+                         not catch up within {ADD_LEARNER_CATCH_UP:?}: {e}"
+                    ))
+                })?;
+        }
+        Ok(index)
     }
 
     /// Make exactly `voters` the voters (joint consensus, learners kept).

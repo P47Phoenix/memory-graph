@@ -5,7 +5,6 @@
 //! then). Membership changes must reach the leader: a follower answers
 //! `NotLeader` naming it.
 use super::{status, Ctx};
-use crate::raft::snapshot_dir::read_sidecar;
 use crate::raft::NodeId;
 use crate::SERVER_VERSION;
 use graph_proto::{pb, PROTOCOL_VERSION};
@@ -41,7 +40,74 @@ fn role(s: ServerState) -> &'static str {
     }
 }
 
+/// How long `AddLearner` waits for the node it is about to add to answer
+/// `Status`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl AdminService {
+    /// Before a membership change names `id` at `addr`, ask that server
+    /// who it is (`Admin.Status`) and refuse (`FAILED_PRECONDITION`) a
+    /// server that is another node, belongs to another cluster, or runs
+    /// other extractors; `UNAVAILABLE` when it cannot be asked. Otherwise a
+    /// foreign or dead member would sit in the membership, and a leader
+    /// would replicate to it forever. (Stage C adds a typed `WrongCluster`
+    /// and the promotion gate on top.)
+    async fn probe_new_member(&self, id: NodeId, addr: &str) -> Result<(), Status> {
+        let uri = if addr.contains("://") {
+            addr.to_string()
+        } else {
+            format!("http://{addr}")
+        };
+        let st = async {
+            let ch = tonic::transport::Endpoint::from_shared(uri)
+                .map_err(|e| Status::invalid_argument(format!("bad address `{addr}`: {e}")))?
+                .connect_timeout(PROBE_TIMEOUT)
+                .connect()
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("cannot reach node {id} at {addr}: {e}"))
+                })?;
+            pb::admin_client::AdminClient::with_interceptor(ch, graph_proto::SendVersion)
+                .status(pb::StatusRequest {})
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|e| {
+                    Status::unavailable(format!(
+                        "node {id} at {addr} did not answer Status: {}",
+                        e.message()
+                    ))
+                })
+        };
+        let st = tokio::time::timeout(PROBE_TIMEOUT, st)
+            .await
+            .map_err(|_| {
+                Status::unavailable(format!(
+                    "node {id} at {addr} did not answer within {PROBE_TIMEOUT:?}"
+                ))
+            })??;
+        if st.node_id != id {
+            return Err(Status::failed_precondition(format!(
+                "the server at {addr} is node {}, not node {id}",
+                st.node_id
+            )));
+        }
+        let ours = self.ctx.info.cluster_id();
+        if !st.cluster_id.is_empty() && st.cluster_id != ours {
+            return Err(Status::failed_precondition(format!(
+                "wrong cluster: node {id} at {addr} belongs to cluster {}, this one is {ours}",
+                st.cluster_id
+            )));
+        }
+        if st.extractors_hash != self.ctx.info.extractors_hash {
+            return Err(Status::failed_precondition(format!(
+                "node {id} at {addr} runs extractor version set `{}`, this cluster `{}`: a \
+                 replica must extract identically (ADR 0004 D5)",
+                st.extractors_hash, self.ctx.info.extractors_hash
+            )));
+        }
+        Ok(())
+    }
+
     fn members(&self) -> Vec<pb::Member> {
         let m = self.ctx.raft.metrics();
         let mem = m.membership_config.membership();
@@ -109,6 +175,12 @@ impl pb::admin_server::Admin for AdminService {
                             node_id: *id,
                             matched_index,
                             lag: last_log_index.saturating_sub(matched_index.unwrap_or(0)),
+                            last_error: self
+                                .ctx
+                                .raft
+                                .net_stats
+                                .last_error(*id)
+                                .unwrap_or_default(),
                         }
                     })
                     .collect()
@@ -230,6 +302,7 @@ impl pb::admin_server::Admin for AdminService {
                 "AddLearner needs a node id (>= 1) and an address".into(),
             )));
         }
+        self.probe_new_member(r.node_id, &r.addr).await?;
         let log_index = self
             .ctx
             .raft
@@ -251,14 +324,9 @@ impl pb::admin_server::Admin for AdminService {
                 "node {id} is not a member; add it as a learner first"
             ))));
         }
-        let mut voters: BTreeSet<NodeId> = mem.voter_ids().collect();
-        voters.insert(id);
-        let log_index = self
-            .ctx
-            .raft
-            .change_membership(voters)
-            .await
-            .map_err(status)?;
+        // An add of one voter (not "these are the voters"), so concurrent
+        // promotes do not undo each other.
+        let log_index = self.ctx.raft.promote(id).await.map_err(status)?;
         Ok(Response::new(pb::PromoteResponse { log_index }))
     }
 
@@ -288,17 +356,28 @@ impl pb::admin_server::Admin for AdminService {
             .snapshot_now(SNAPSHOT_WAIT)
             .await
             .map_err(status)?;
-        let (side, path) = self
-            .ctx
-            .raft
-            .snapshots
-            .current()
-            .ok_or_else(|| Status::internal("the snapshot was built but is not on disk"))?;
         // Open before answering: a newer build may remove the pair while we
-        // stream, and an open handle keeps the bytes readable.
-        let file = std::fs::File::open(&path)
-            .map_err(|e| Status::internal(format!("opening the snapshot: {e}")))?;
-        let _ = read_sidecar(&path);
+        // stream, and an open handle keeps the bytes readable. A build can
+        // also replace the pair between listing it and opening it: then the
+        // newer pair is current, so look again once.
+        let mut opened = None;
+        for _ in 0..2 {
+            let (side, path) =
+                self.ctx.raft.snapshots.current().ok_or_else(|| {
+                    Status::internal("the snapshot was built but is not on disk")
+                })?;
+            match std::fs::File::open(&path) {
+                Ok(f) => {
+                    opened = Some((side, f));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Status::internal(format!("opening the snapshot: {e}"))),
+            }
+        }
+        let (side, file) = opened.ok_or_else(|| {
+            Status::unavailable("the snapshot was replaced twice while opening it; retry")
+        })?;
         let info = pb::SnapshotInfo {
             last_applied_index: side.index,
             last_applied_term: side.term,

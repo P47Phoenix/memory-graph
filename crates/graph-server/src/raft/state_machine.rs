@@ -556,6 +556,60 @@ mod tests {
         assert_eq!(snaps.installed(), 0);
     }
 
+    /// A received file whose own marker is not the snapshot's last log id
+    /// is refused before any swap, and cleaned up.
+    #[test]
+    fn an_install_whose_file_marker_differs_from_its_meta_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let incoming = snaps.incoming_path();
+        marked_file(&incoming, 4);
+        let mut swapped = false;
+        let r = snaps.install_with(
+            slot.path(),
+            &meta_at(5),
+            &SnapshotFile {
+                path: incoming.clone(),
+            },
+            |_| {
+                swapped = true;
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(r, Err(StoreError::Rejected(ref m)) if m.contains("metadata")),
+            "{r:?}"
+        );
+        assert!(!swapped, "nothing was swapped");
+        assert!(!incoming.exists());
+        assert_eq!(snaps.current().unwrap().0.index, 1);
+        assert_eq!(snaps.installed(), 0);
+    }
+
+    /// Dev review 5: a crash between an install's store swap (store at 5)
+    /// and the promotion of the received file (snapshot still at 1), with
+    /// a log that never held entries 2..=5: the start-up repair builds a
+    /// snapshot of the store; with a log that does hold them, or a
+    /// snapshot that is current, it does nothing.
+    #[test]
+    fn a_store_ahead_of_snapshot_and_log_gets_a_fresh_snapshot_at_start() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        // The swapped-in store: marker 5, entries 2..=5 never in the log.
+        StoreStateMachine::apply_all(&slot, vec![blank(5)], NO_FP).unwrap();
+        let log = RedbLogStore::open(&d.path().join("raft.redb")).unwrap();
+        assert!(crate::raft::node::repair_stale_snapshot(&slot, &snaps, &log).unwrap());
+        assert_eq!(snaps.current().unwrap().0.index, 5);
+        // Now current: nothing to do.
+        assert!(!crate::raft::node::repair_stale_snapshot(&slot, &snaps, &log).unwrap());
+        // A store ahead of its snapshot whose log reaches the marker (the
+        // normal case after a restart) is left alone.
+        StoreStateMachine::apply_all(&slot, vec![blank(6)], NO_FP).unwrap();
+        log.insert_for_test(&blank(6));
+        assert!(!crate::raft::node::repair_stale_snapshot(&slot, &snaps, &log).unwrap());
+        assert_eq!(snaps.current().unwrap().0.index, 5);
+    }
+
     #[test]
     fn a_successful_install_promotes_the_file_then_its_meta() {
         let d = tempfile::tempdir().unwrap();
