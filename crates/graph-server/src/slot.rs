@@ -363,8 +363,13 @@ mod tests {
     #[test]
     fn a_swap_waits_for_readers_of_dropped_snapshot_handles() {
         let d = tempfile::tempdir().unwrap();
-        let slot = StoreSlot::open(&d.path().join("g.redb"), vec![], None, Duration::from_secs(900))
-            .unwrap();
+        let slot = StoreSlot::open(
+            &d.path().join("g.redb"),
+            vec![],
+            None,
+            Duration::from_secs(900),
+        )
+        .unwrap();
         slot.with_store(|s| {
             graph_store::Store::index_bytes(s, "o", "r", "a.rs", b"fn a() {}", None)
         })
@@ -376,7 +381,10 @@ mod tests {
         let held = slot.snapshots().get(id).unwrap();
         slot.set_handle_drain_timeout(Duration::from_millis(50));
         let e = slot.compact().unwrap_err();
-        assert!(matches!(e, StoreError::Locked(ref m) if m.contains("snapshot handle")), "{e}");
+        assert!(
+            matches!(e, StoreError::Locked(ref m) if m.contains("snapshot handle")),
+            "{e}"
+        );
         // The store is still open and serving, the handle gone.
         assert_eq!(
             slot.with_store_read(|s| graph_store::StoreRead::count_nodes(
@@ -404,8 +412,13 @@ mod tests {
     #[test]
     fn reads_fail_fast_while_a_snapshot_installs() {
         let d = tempfile::tempdir().unwrap();
-        let slot = StoreSlot::open(&d.path().join("g.redb"), vec![], None, Duration::from_secs(900))
-            .unwrap();
+        let slot = StoreSlot::open(
+            &d.path().join("g.redb"),
+            vec![],
+            None,
+            Duration::from_secs(900),
+        )
+        .unwrap();
         let src = d.path().join("snap.redb");
         slot.with_store(|s| s.export_snapshot(&src)).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
@@ -423,11 +436,16 @@ mod tests {
         let e = slot
             .with_store_read(|s| graph_store::StoreRead::count_nodes(s, graph_core::NodeKind::File))
             .unwrap_err();
-        assert!(matches!(e, StoreError::Locked(ref m) if m.contains("snapshot")), "{e}");
+        assert!(
+            matches!(e, StoreError::Locked(ref m) if m.contains("snapshot")),
+            "{e}"
+        );
         release_tx.send(()).unwrap();
         installer.join().unwrap().unwrap();
         assert!(!slot.is_installing());
-        slot.with_store_read(|s| graph_store::StoreRead::count_nodes(s, graph_core::NodeKind::File))
-            .unwrap();
+        slot.with_store_read(|s| {
+            graph_store::StoreRead::count_nodes(s, graph_core::NodeKind::File)
+        })
+        .unwrap();
     }
 }

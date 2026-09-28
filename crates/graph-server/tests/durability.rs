@@ -154,7 +154,10 @@ fn a_power_cut_mid_write_leaves_no_torn_state() {
                 st.applied_index
             );
             if acked {
-                assert_eq!(got, states[1], "{target} k={k}: an acknowledged write was lost");
+                assert_eq!(
+                    got, states[1],
+                    "{target} k={k}: an acknowledged write was lost"
+                );
             }
         }
     }

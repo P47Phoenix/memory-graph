@@ -262,6 +262,10 @@ fn raft_log_after_snapshot_and_purge_stays_within_bounds_of_source() {
         before as f64 / source_bytes as f64
     );
     assert!(
+        after < before,
+        "the purge after the snapshot did not shrink raft.redb ({before} B -> {after} B)"
+    );
+    assert!(
         ratio <= 1.5,
         "raft.redb is {ratio:.2}x its source after a snapshot and purge ({after} B for \
          {source_bytes} B); limit 1.5x"

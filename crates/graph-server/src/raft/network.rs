@@ -112,7 +112,9 @@ impl NetStats {
             p.last_error = Some(what.to_string());
             p.failing = true;
             let now = std::time::Instant::now();
-            if p.last_warned.is_none_or(|t| now.duration_since(t) >= WARN_EVERY) {
+            if p.last_warned
+                .is_none_or(|t| now.duration_since(t) >= WARN_EVERY)
+            {
                 tracing::warn!(
                     target_node = target,
                     error = what,
@@ -522,9 +524,7 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
             Ok(Err(e)) => return Err(self.failed(format!("reading the snapshot: {e}")).into()),
             Err(e) => return Err(self.failed(format!("snapshot reader: {e}")).into()),
         }
-        let resp = r
-            .map_err(|st| self.failed_status(&st))?
-            .into_inner();
+        let resp = r.map_err(|st| self.failed_status(&st))?.into_inner();
         let vote = wire::vote_from_pb(resp.vote).map_err(|e| self.failed(e))?;
         self.net.stats.succeeded(self.target, true);
         Ok(SnapshotResponse::new(vote))

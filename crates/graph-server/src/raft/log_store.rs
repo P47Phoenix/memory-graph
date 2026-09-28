@@ -20,8 +20,8 @@ use openraft::{
     AnyError, CommittedLeaderId, EntryPayload, Membership, RaftLogReader, RaftTypeConfig, Vote,
 };
 use redb::{
-    Database, ReadTransaction, ReadableTable, ReadableTableMetadata, StorageBackend, TableDefinition,
-    WriteTransaction,
+    Database, ReadTransaction, ReadableTable, ReadableTableMetadata, StorageBackend,
+    TableDefinition, WriteTransaction,
 };
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
@@ -61,6 +61,10 @@ pub enum AppendEvent {
 }
 
 pub type AppendObserver = Arc<dyn Fn(AppendEvent) + Send + Sync>;
+
+/// Test-only hook run while a compaction holds the write side of the lock.
+#[cfg(test)]
+type CompactGate = Arc<dyn Fn() + Send + Sync>;
 
 /// What [`RedbLogStore::probe`] found in a log file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,7 +113,7 @@ pub struct RedbLogStore {
     compacting: Arc<AtomicBool>,
     observer: Option<AppendObserver>,
     #[cfg(test)]
-    compact_gate: Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    compact_gate: Arc<std::sync::Mutex<Option<CompactGate>>>,
 }
 
 /// A redb transaction together with the read guard of the store's lock it

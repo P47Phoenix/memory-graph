@@ -375,9 +375,7 @@ pub async fn start(
                     // takes part in any election (QA: a lost raft.redb
                     // would let it vote twice in a term).
                     if let Some(probe) = log_probe {
-                        let marker = slot
-                            .with_store(|s| s.raft_marker())?
-                            .map_or(0, |m| m.index);
+                        let marker = slot.with_store(|s| s.raft_marker())?.map_or(0, |m| m.index);
                         paths::check_log_and_store(
                             paths.data_dir.as_deref().unwrap_or(Path::new("")),
                             probe,

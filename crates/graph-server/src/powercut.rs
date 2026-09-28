@@ -331,9 +331,6 @@ mod tests {
             Err(_) => true,
         };
         assert!(failed, "writes after the disk died fail");
-        assert!(disk
-            .events(p)
-            .iter()
-            .any(|e| matches!(e, DiskEvent::Sync)));
+        assert!(disk.events(p).iter().any(|e| matches!(e, DiskEvent::Sync)));
     }
 }

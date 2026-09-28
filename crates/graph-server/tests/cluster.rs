@@ -889,9 +889,17 @@ fn raft_rpcs_from_other_extractors_or_clusters_are_refused() {
         entries: vec![],
     };
     for (cluster, hash, what) in [
-        (me.cluster_id.clone(), "other-extractors".to_string(), "extractor"),
+        (
+            me.cluster_id.clone(),
+            "other-extractors".to_string(),
+            "extractor",
+        ),
         (me.cluster_id.clone(), String::new(), "extractor"),
-        ("another-cluster".to_string(), me.extractors_hash.clone(), "wrong cluster"),
+        (
+            "another-cluster".to_string(),
+            me.extractors_hash.clone(),
+            "wrong cluster",
+        ),
         (String::new(), me.extractors_hash.clone(), "named none"),
     ] {
         let peer = PeerHeaders { cluster, hash };
@@ -903,7 +911,7 @@ fn raft_rpcs_from_other_extractors_or_clusters_are_refused() {
                 .unwrap();
             let mut c = pb::raft_client::RaftClient::with_interceptor(ch, peer);
             (
-                c.vote(vote.clone()).await.unwrap_err(),
+                c.vote(vote).await.unwrap_err(),
                 c.append_entries(append.clone()).await.unwrap_err(),
             )
         });
@@ -1165,8 +1173,8 @@ fn restart_refuses_missing_raft_log() {
     let backup = d.path().join("backup");
     std::fs::create_dir_all(&backup).unwrap();
     {
-        let s = TestServer::try_start_config(bootstrap_cfg(&dir, "127.0.0.1:0", 1), exts())
-            .unwrap();
+        let s =
+            TestServer::try_start_config(bootstrap_cfg(&dir, "127.0.0.1:0", 1), exts()).unwrap();
         connect(s.endpoint())
             .index_bytes("o", "r", "a.rs", b"fn a() {}", None)
             .unwrap();
@@ -1200,10 +1208,16 @@ fn restart_refuses_missing_raft_log() {
     std::fs::copy(backup.join("raft.redb"), dir.join("raft.redb")).unwrap();
     std::fs::remove_file(dir.join("graph.redb")).unwrap();
     refused("store (graph.redb) is missing");
-    assert!(!dir.join("graph.redb").exists(), "a refused start creates no store");
+    assert!(
+        !dir.join("graph.redb").exists(),
+        "a refused start creates no store"
+    );
     std::fs::copy(backup.join("graph.redb"), dir.join("graph.redb")).unwrap();
     let s = start(InitMode::Restart).unwrap();
-    assert_eq!(connect(s.endpoint()).count_nodes(NodeKind::File).unwrap(), 1);
+    assert_eq!(
+        connect(s.endpoint()).count_nodes(NodeKind::File).unwrap(),
+        1
+    );
 }
 
 /// Dev review 3: a follower whose `AppendEntries` take longer than the
@@ -1242,10 +1256,12 @@ fn a_slow_append_longer_than_the_heartbeat_still_replicates() {
 #[test]
 fn adding_a_node_of_another_cluster_is_refused() {
     let d = tempfile::tempdir().unwrap();
-    let a = TestServer::try_start_config(bootstrap_cfg(&d.path().join("a"), "127.0.0.1:0", 1), exts())
-        .unwrap();
-    let b = TestServer::try_start_config(bootstrap_cfg(&d.path().join("b"), "127.0.0.1:0", 2), exts())
-        .unwrap();
+    let a =
+        TestServer::try_start_config(bootstrap_cfg(&d.path().join("a"), "127.0.0.1:0", 1), exts())
+            .unwrap();
+    let b =
+        TestServer::try_start_config(bootstrap_cfg(&d.path().join("b"), "127.0.0.1:0", 2), exts())
+            .unwrap();
     let mut other = ServeConfig::for_data_dir(
         d.path().join("c"),
         "127.0.0.1:0".parse().unwrap(),
@@ -1363,7 +1379,12 @@ fn payload_too_large_backlog_and_a_20_mib_file_replicate() {
     tb.node_mut(away).restart();
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
     assert!(
-        tb.node(leader).raft().unwrap().net_stats.payload_too_large() > 0,
+        tb.node(leader)
+            .raft()
+            .unwrap()
+            .net_stats
+            .payload_too_large()
+            > 0,
         "the backlog was split by PayloadTooLarge"
     );
     let (ca, cl) = (tb.client(away), tb.client(leader));
@@ -1396,7 +1417,13 @@ fn a_short_lag_follower_catches_up_from_the_log() {
     let c = tb.client(leader);
     index_files(&c, "o", "r", &[small_file(0)]);
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
-    let behind = tb.node(lag).raft().unwrap().metrics().last_log_index.unwrap();
+    let behind = tb
+        .node(lag)
+        .raft()
+        .unwrap()
+        .metrics()
+        .last_log_index
+        .unwrap();
     tb.node_mut(lag).stop();
     for i in 1..12 {
         let f = small_file(i);
@@ -1442,10 +1469,16 @@ fn a_follower_with_a_full_disk_lags_and_catches_up() {
     loop {
         let st = c.admin_status().unwrap();
         let peer = st.replication.iter().find(|p| p.node_id == 3).cloned();
-        if peer.as_ref().is_some_and(|p| p.last_error.contains("ResourceExhausted")) {
+        if peer
+            .as_ref()
+            .is_some_and(|p| p.last_error.contains("ResourceExhausted"))
+        {
             break;
         }
-        assert!(Instant::now() < deadline, "no disk-full error for node 3: {peer:?}");
+        assert!(
+            Instant::now() < deadline,
+            "no disk-full error for node 3: {peer:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
@@ -1480,9 +1513,10 @@ fn a_minority_partition_cannot_commit_and_heals() {
         let r = lonely.index_bytes("o", "r", "lost.rs", b"fn lost() {}", None);
         let _ = done_tx.send(r.is_ok());
     });
-    match done_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(ok) => assert!(!ok, "a minority committed a write"),
-        Err(_) => {} // still pending: not committed
+    // Still pending after 2 s means not committed; an answer must not be a
+    // success.
+    if let Ok(ok) = done_rx.recv_timeout(Duration::from_secs(2)) {
+        assert!(!ok, "a minority committed a write");
     }
     // The old leader may still believe it leads; wait for the majority's.
     let deadline = Instant::now() + CLUSTER_WAIT;
@@ -1567,8 +1601,9 @@ fn a_postponed_snapshot_is_built_on_an_idle_node() {
 #[test]
 fn compact_writes_no_log_entry() {
     let d = tempfile::tempdir().unwrap();
-    let s = TestServer::try_start_config(bootstrap_cfg(&d.path().join("n"), "127.0.0.1:0", 1), exts())
-        .unwrap();
+    let s =
+        TestServer::try_start_config(bootstrap_cfg(&d.path().join("n"), "127.0.0.1:0", 1), exts())
+            .unwrap();
     let c = connect(s.endpoint());
     index_files(&c, "o", "r", &(0..5).map(small_file).collect::<Vec<_>>());
     let before = c.admin_status().unwrap();

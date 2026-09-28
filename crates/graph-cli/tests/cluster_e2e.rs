@@ -552,6 +552,16 @@ fn data_dir_refusals() {
         text(&o.stderr)
     );
 
+    // --bootstrap names what to do with a data directory: without one it
+    // is refused, not ignored.
+    let o = run(&["--db", "a.redb", "serve", "--bootstrap"]);
+    assert!(!o.status.success());
+    assert!(
+        text(&o.stderr).contains("--data-dir"),
+        "{}",
+        text(&o.stderr)
+    );
+
     let o = run(&["--db", "a.redb", "serve", "--data-dir", "x"]);
     assert!(!o.status.success());
     assert!(text(&o.stderr).contains("exclusive"), "{}", text(&o.stderr));
@@ -578,7 +588,12 @@ fn data_dir_refusals() {
     ]);
     assert!(!o.status.success());
     let err = text(&o.stderr);
-    assert!(err.contains('1') && err.contains('2'), "{err}");
+    assert!(
+        err.contains("wrong node")
+            && err.contains("belongs to node 1")
+            && err.contains("--node-id 2"),
+        "{err}"
+    );
     n.restart(&["--bootstrap"]);
     wait_for("the restarted node to lead", || {
         (n.leader() == Some(1)).then_some(())

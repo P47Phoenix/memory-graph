@@ -49,10 +49,10 @@ The server parses and commits on the leader as the embedded store would. The 6% 
 | encoded bytes | 1,720,142 |
 | framing | 525 B (25 B/entry) |
 | payload | 1,719,617 B (1.02x source) |
-| `raft.redb` after one pass | 6,836,224 B (4.06x source) |
-| `raft.redb` after three passes (size gate) | 11,030,528 B (2.18x of 5,053,392 B) |
-| after `cluster snapshot` + purge, before compaction | 5,783,552 B (unchanged: 3.43x) |
-| after `cluster snapshot` + purge + compaction (three passes) | 2,658,304 B (0.53x) |
+| `raft.redb` after one pass (1 pass) | 6,836,224 B (4.06x source) |
+| `raft.redb` after three passes (3 passes, size gate) | 11,030,528 B (2.18x of 5,053,392 B) |
+| after `cluster snapshot` + purge, before compaction (3 passes) | 11,030,528 B (unchanged: 2.18x) |
+| after `cluster snapshot` + purge + compaction (3 passes) | 2,658,304 B (0.53x) |
 | empty `raft.redb` (just created) | 1,589,248 B |
 
 The payload is the prost `LogCommand`: the file bytes, their path, language and fingerprint. It is replicated as bytes and never as JSON (D5). The file overhead before a snapshot is redb's rather than the log's. Each ~90 KB entry takes a power-of-two run of pages, and a small file is dominated by its 1.6 MB floor.

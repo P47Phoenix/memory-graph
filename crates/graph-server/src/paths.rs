@@ -600,9 +600,11 @@ mod tests {
         drop(RedbLogStore::open(&p.log).unwrap());
         assert!(failed_first_start(&p));
         assert!(plan(&p, &boot, Some(1)).unwrap().bootstrap);
-        assert!(!plan(&p, &InitMode::Uninitialized, Some(2))
-            .unwrap()
-            .bootstrap);
+        assert!(
+            !plan(&p, &InitMode::Uninitialized, Some(2))
+                .unwrap()
+                .bootstrap
+        );
         assert!(plan(&p, &InitMode::Restart, Some(1)).is_err());
         // A store with data is somebody's store.
         let d2 = tempfile::tempdir().unwrap();
@@ -633,16 +635,22 @@ mod tests {
             purged: false,
         };
         // A lost (or blank) log beside a store that applied entries.
-        let e = check_log_and_store(dir, blank, true, 5).unwrap_err().to_string();
+        let e = check_log_and_store(dir, blank, true, 5)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("vote twice") && e.contains("missing"), "{e}");
         let empty = LogProbe {
             exists: true,
             ..LogProbe::default()
         };
-        let e = check_log_and_store(dir, empty, true, 5).unwrap_err().to_string();
+        let e = check_log_and_store(dir, empty, true, 5)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("empty"), "{e}");
         // A lost store beside a log with state.
-        let e = check_log_and_store(dir, voted, false, 0).unwrap_err().to_string();
+        let e = check_log_and_store(dir, voted, false, 0)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("store (graph.redb) is missing"), "{e}");
         // Consistent states.
         check_log_and_store(dir, voted, true, 5).unwrap();
@@ -670,7 +678,11 @@ mod tests {
         id.check_or_adopt(Some("A"), true).unwrap();
         assert_eq!(id.get().as_deref(), Some("A"));
         assert_eq!(
-            NodeJson::read(&path).unwrap().unwrap().cluster_id.as_deref(),
+            NodeJson::read(&path)
+                .unwrap()
+                .unwrap()
+                .cluster_id
+                .as_deref(),
             Some("A")
         );
         // Now the header is required and must match, for every RPC.

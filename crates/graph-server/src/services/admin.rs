@@ -363,10 +363,12 @@ impl pb::admin_server::Admin for AdminService {
         // newer pair is current, so look again once.
         let mut opened = None;
         for _ in 0..2 {
-            let (side, path) =
-                self.ctx.raft.snapshots.current().ok_or_else(|| {
-                    Status::internal("the snapshot was built but is not on disk")
-                })?;
+            let (side, path) = self
+                .ctx
+                .raft
+                .snapshots
+                .current()
+                .ok_or_else(|| Status::internal("the snapshot was built but is not on disk"))?;
             match std::fs::File::open(&path) {
                 Ok(f) => {
                     opened = Some((side, f));

@@ -779,6 +779,16 @@ fn run() -> Result<i32> {
             cfg.min_free_disk = m.resolve(total);
         }
         cfg.advertise = advertise.clone();
+        if !cluster_mode && (tuned || advertise.is_some()) {
+            // Not refused (a stage A script may pass them), but said: with
+            // --db they tune the one-member log of this file only.
+            eprintln!(
+                "memory-graph serve: note: with --db, --advertise and the Raft options \
+                 (--snapshot-log-entries/-bytes, --log-keep-entries, --election-timeout-*, \
+                 --heartbeat-interval) apply to this single-node server's own log only; \
+                 clusters use --data-dir"
+            );
+        }
         cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));

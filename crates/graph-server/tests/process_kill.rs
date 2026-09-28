@@ -5,8 +5,8 @@
 //! there. Only the child this test spawned is ever killed.
 use graph_client::{ClientConfig, RemoteStore};
 use graph_core::{Extractor, NodeKind};
-use graph_store::StoreRead;
 use graph_server::{InitMode, RaftSettings, ServeConfig};
+use graph_store::StoreRead;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
@@ -52,7 +52,12 @@ impl Drop for ChildGuard {
 
 fn spawn(dir: &std::path::Path) -> (ChildGuard, String) {
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["child_server_process", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "child_server_process",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD_ENV, dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
