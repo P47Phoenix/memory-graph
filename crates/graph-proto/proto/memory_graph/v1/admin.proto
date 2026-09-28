@@ -1,0 +1,126 @@
+// Operator surface of a memory-graph server (ADR 0004 D1/D10). Stage A
+// implements `Status`, `SysInfo`, `Compact` and `Shutdown`; the cluster
+// operations are declared here so the contract is stable and answer
+// UNIMPLEMENTED until stage B/C.
+syntax = "proto3";
+
+package memory_graph.v1;
+
+import "memory_graph/v1/common.proto";
+
+service Admin {
+  rpc Status(StatusRequest) returns (StatusResponse);
+  // The server's `sysinfo` report (memory, disk, cgroup) as the CLI's JSON.
+  rpc SysInfo(SysInfoRequest) returns (SysInfoResponse);
+  // Rebuild the store file in place (`V2Store::compact`): node-local, never
+  // replicated; pauses apply for its duration.
+  rpc Compact(CompactRequest) returns (CompactResponse);
+  // Graceful shutdown: stop accepting, finish in-flight, close the store.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Cluster operations (stage B/C): UNIMPLEMENTED in stage A.
+  rpc Members(MembersRequest) returns (MembersResponse);
+  rpc Leader(LeaderRequest) returns (LeaderResponse);
+  rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
+  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (TriggerSnapshotResponse);
+  // Prometheus text exposition of the server's metrics.
+  rpc Metrics(MetricsRequest) returns (MetricsResponse);
+}
+
+message StatusRequest {}
+message StatusResponse {
+  uint64 node_id = 1;
+  string cluster_id = 2;
+  optional uint64 leader_id = 3;
+  optional string leader_addr = 4;
+  // Raft role as openraft names it (`Leader`, `Follower`, `Learner`, ...).
+  string state = 5;
+  uint64 current_term = 6;
+  // Last log index/term applied to the store (`RAFT_SM.last_applied`).
+  uint64 applied_index = 7;
+  uint64 applied_term = 8;
+  // Last log index known to be committed.
+  uint64 committed_index = 9;
+  uint64 last_log_index = 10;
+  string server_version = 11;
+  uint32 protocol_version = 12;
+  uint64 store_format_version = 13;
+  string extractors_hash = 14;
+  string db_path = 15;
+  string listen_addr = 16;
+  uint64 uptime_secs = 17;
+  SnapshotStats snapshots = 18;
+  // Open snapshot handles held for clients (`Store.OpenSnapshot`).
+  uint64 snapshot_handles = 19;
+}
+
+message SysInfoRequest {}
+message SysInfoResponse {
+  // The `memory-graph sysinfo --json` document of the server's machine.
+  string json = 1;
+}
+
+message CompactRequest {}
+message CompactResponse { CompactStats stats = 1; }
+
+message ShutdownRequest {
+  // How long to wait for in-flight work; 0 means the server's default.
+  uint64 grace_ms = 1;
+}
+message ShutdownResponse {}
+
+// One cluster member as openraft knows it.
+message Member {
+  uint64 node_id = 1;
+  string addr = 2;
+  // `voter` or `learner`.
+  string role = 3;
+  // The member's extractor version set hash (ADR 0004 D5).
+  string extractors_hash = 4;
+}
+
+message MembersRequest {}
+message MembersResponse {
+  repeated Member members = 1;
+  optional uint64 leader_id = 2;
+}
+
+message LeaderRequest {}
+message LeaderResponse {
+  optional uint64 leader_id = 1;
+  optional string leader_addr = 2;
+}
+
+message AddLearnerRequest {
+  uint64 node_id = 1;
+  string addr = 2;
+}
+message AddLearnerResponse {
+  // Log index of the membership change.
+  uint64 log_index = 1;
+}
+
+message PromoteRequest { uint64 node_id = 1; }
+message PromoteResponse { uint64 log_index = 1; }
+
+message RemoveRequest { uint64 node_id = 1; }
+message RemoveResponse { uint64 log_index = 1; }
+
+message TransferLeaderRequest { uint64 to_node_id = 1; }
+message TransferLeaderResponse {}
+
+message TriggerSnapshotRequest {}
+message TriggerSnapshotResponse {
+  // Index/term of the snapshot taken.
+  uint64 last_applied_index = 1;
+  uint64 last_applied_term = 2;
+}
+
+message MetricsRequest {}
+message MetricsResponse {
+  // Prometheus text exposition format.
+  string text = 1;
+}

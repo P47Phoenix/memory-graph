@@ -3,3 +3,7 @@
 
 # Vendored corpus must stay byte-identical to upstream on every platform.
 testdata/corpus/** -text
+
+# Generated gRPC code: the xtask writes LF on every host so that CI's
+# `git diff --exit-code` after a regen is about content, never line endings.
+crates/graph-proto/src/gen/** text eol=lf

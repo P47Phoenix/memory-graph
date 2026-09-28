@@ -1,0 +1,19 @@
+[package]
+name = "graph-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "memory-graph wire contract (ADR 0004 D1): the memory_graph.v1 protobuf messages and gRPC services, with conversions to and from graph-core / graph-store types."
+
+[dependencies]
+graph-core = { path = "../graph-core" }
+graph-store = { path = "../graph-store" }
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
