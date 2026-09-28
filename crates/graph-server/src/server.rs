@@ -19,6 +19,7 @@ use graph_core::Extractor;
 use graph_proto::pb::admin_server::AdminServer;
 use graph_proto::pb::store_server::StoreServer;
 use graph_proto::pb::write_server::WriteServer;
+use graph_proto::CheckVersion;
 use graph_store::StoreError;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::StreamExt;
+use tonic::service::interceptor::InterceptedService;
 use tonic_health::ServingStatus;
 
 /// Produces the `sysinfo --json` document for `Admin.SysInfo`, given the
@@ -54,6 +56,21 @@ pub struct ServeConfig {
     pub shutdown_grace: Duration,
     /// The `Admin.SysInfo` provider.
     pub sysinfo: Option<SysInfoFn>,
+    /// Fault injection for tests of the client and CLI (never set by
+    /// `serve`).
+    pub testing: TestingHooks,
+}
+
+/// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
+/// codes 3/4/5 can be driven end to end against a real server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TestingHooks {
+    /// Act as if no leader were known: writes and linearizable reads answer
+    /// `NoLeader`, `Status`/`Hello`/`Leader` report none, `memory-graph.ready`
+    /// is `NOT_SERVING`.
+    pub withhold_leader: bool,
+    /// Answer `Hello` with this protocol version instead of the real one.
+    pub hello_protocol_version: Option<u32>,
 }
 
 impl ServeConfig {
@@ -66,6 +83,7 @@ impl ServeConfig {
             snapshot_max_age: Duration::from_secs(15 * 60),
             shutdown_grace: Duration::from_secs(30),
             sysinfo: None,
+            testing: TestingHooks::default(),
         }
     }
 }
@@ -80,6 +98,7 @@ impl std::fmt::Debug for ServeConfig {
             .field("snapshot_max_age", &self.snapshot_max_age)
             .field("shutdown_grace", &self.shutdown_grace)
             .field("sysinfo", &self.sysinfo.is_some())
+            .field("testing", &self.testing)
             .finish()
     }
 }
@@ -168,7 +187,8 @@ pub async fn start(
         .map_err(|e| io_err("local address", e))?;
     let lock =
         LockFile::create(&cfg.db, &addr.to_string()).map_err(|e| io_err("LOCK sidecar", e))?;
-    let raft = RaftNode::start(cfg.node_id, addr.to_string(), Arc::clone(&slot)).await?;
+    let mut raft = RaftNode::start(cfg.node_id, addr.to_string(), Arc::clone(&slot)).await?;
+    raft.withhold_leader = cfg.testing.withhold_leader;
     let shutdown = ShutdownHandle::new();
     let ctx = Arc::new(Ctx {
         slot: Arc::clone(&slot),
@@ -180,6 +200,10 @@ pub async fn start(
             db_path: cfg.db.display().to_string(),
             listen_addr: addr.to_string(),
             started: Instant::now(),
+            hello_protocol_version: cfg
+                .testing
+                .hello_protocol_version
+                .unwrap_or(graph_proto::PROTOCOL_VERSION),
         },
         shutdown: shutdown.clone(),
         sysinfo: cfg.sysinfo.clone(),
@@ -206,12 +230,13 @@ pub async fn start(
         let reporter = reporter.clone();
         let shutdown = shutdown.clone();
         let mut rx = raft.raft.metrics();
+        let raft_for_health = raft.clone();
         tokio::spawn(async move {
             loop {
                 if shutdown.is_triggered() {
                     return;
                 }
-                let ready = rx.borrow().current_leader.is_some();
+                let ready = raft_ready(&raft_for_health, &rx.borrow());
                 reporter
                     .set_service_status(
                         READY_SERVICE,
@@ -238,27 +263,30 @@ pub async fn start(
     let no_limit = usize::MAX;
     let router = tonic::transport::Server::builder()
         .add_service(health)
-        .add_service(
+        .add_service(InterceptedService::new(
             StoreServer::new(StoreService {
                 ctx: Arc::clone(&ctx),
             })
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),
-        )
-        .add_service(
+            CheckVersion,
+        ))
+        .add_service(InterceptedService::new(
             WriteServer::new(WriteService {
                 ctx: Arc::clone(&ctx),
             })
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),
-        )
-        .add_service(
+            CheckVersion,
+        ))
+        .add_service(InterceptedService::new(
             AdminServer::new(AdminService {
                 ctx: Arc::clone(&ctx),
             })
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),
-        );
+            CheckVersion,
+        ));
     let incoming = {
         let weak = Arc::downgrade(&slot);
         TcpListenerStream::new(listener).map(move |r| r.map(|t| ConnIo::for_slot(t, weak.clone())))
@@ -313,6 +341,15 @@ pub async fn start(
         slot,
         raft,
     })
+}
+
+/// Whether `memory-graph.ready` is `SERVING`: a leader is known (and the
+/// test hook does not hide it).
+fn raft_ready(
+    raft: &RaftNode,
+    m: &openraft::RaftMetrics<crate::raft::NodeId, openraft::impls::BasicNode>,
+) -> bool {
+    !raft.withhold_leader && m.current_leader.is_some()
 }
 
 /// Shutdown step 1: report `""` and [`READY_SERVICE`] as `NOT_SERVING`.

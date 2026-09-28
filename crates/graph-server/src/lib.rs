@@ -42,6 +42,7 @@ pub use extractors::{extractors_hash, SharedExtractor};
 pub use lock::LockFile;
 pub use server::{
     run_blocking, run_blocking_with, start, Running, ServeConfig, ShutdownHandle, SysInfoFn,
+    TestingHooks,
 };
 pub use slot::StoreSlot;
 

@@ -575,16 +575,27 @@ proptest! {
         Just(Code::InvalidArgument), Just(Code::Unavailable), Just(Code::FailedPrecondition),
         Just(Code::DataLoss), Just(Code::ResourceExhausted), Just(Code::Internal),
         Just(Code::Unimplemented), Just(Code::DeadlineExceeded), Just(Code::Unknown),
+        Just(Code::Cancelled), Just(Code::Aborted),
     ]) {
         let status = Status::new(code, msg.clone());
         let e = WireError::from(&status);
         let expected_code = match code {
             Code::ResourceExhausted => Code::Internal, // plain text: not a disk-full message
-            Code::Unimplemented | Code::DeadlineExceeded | Code::Unknown => Code::FailedPrecondition,
+            // A bare FAILED_PRECONDITION is a refusal, not a protocol error.
+            Code::FailedPrecondition => Code::InvalidArgument,
+            // Only a missing method is a protocol mismatch.
+            Code::Unimplemented => Code::FailedPrecondition,
+            // A lost connection is a storage-class error, never Protocol.
+            Code::DeadlineExceeded | Code::Unknown | Code::Cancelled | Code::Aborted => Code::Internal,
             c => c,
         };
         prop_assert_eq!(e.code(), expected_code);
         prop_assert!(e.to_string().contains(&msg), "{e} lacks {msg:?}");
+        prop_assert_eq!(
+            matches!(e, WireError::Protocol(_)),
+            code == Code::Unimplemented,
+            "only Unimplemented maps to Protocol without a detail"
+        );
     }
 
     /// A garbage `grpc-status-details-bin` payload falls back to the code
@@ -872,6 +883,25 @@ fn unspecified_enums_and_missing_fields_are_errors_not_defaults() {
     let st: Status = ConvertError("x".into()).into();
     assert_eq!(st.code(), Code::FailedPrecondition);
     assert!(matches!(WireError::from(&st), WireError::Protocol(_)));
+}
+
+/// Review items 13 and 15: the exact variants for detail-less statuses.
+#[test]
+fn detail_less_failed_precondition_and_transport_loss_are_not_protocol() {
+    let e: StoreError = WireError::from(&Status::failed_precondition("nope")).into();
+    assert!(
+        matches!(e, StoreError::Rejected(ref m) if m == "nope"),
+        "{e:?}"
+    );
+    let e: StoreError = WireError::from(&Status::unknown("transport error")).into();
+    assert!(
+        matches!(e, StoreError::Storage(ref m) if m.contains("connection lost") && m.contains("transport error")),
+        "{e:?}"
+    );
+    for code in [Code::Cancelled, Code::DeadlineExceeded, Code::Aborted] {
+        let e: StoreError = WireError::from(&Status::new(code, "x")).into();
+        assert!(matches!(e, StoreError::Storage(_)), "{code:?}: {e:?}");
+    }
 }
 
 #[test]

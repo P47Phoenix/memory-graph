@@ -44,6 +44,16 @@ pub fn holder(db: &Path) -> Option<(LockInfo, bool)> {
     Some((info, alive))
 }
 
+/// Remove the sidecar next to `db` when its pid is dead (a crashed
+/// server's leftover); `true` when one was removed. Called after an
+/// embedded open succeeded, which proves no server holds the store.
+pub fn remove_stale(db: &Path) -> bool {
+    match holder(db) {
+        Some((_, false)) => std::fs::remove_file(lock_path(db)).is_ok(),
+        _ => false,
+    }
+}
+
 impl LockFile {
     /// Write the sidecar for the running server. A stale sidecar (its pid
     /// is dead) is overwritten silently; a live one is reported (redb's
@@ -169,6 +179,38 @@ mod tests {
         let lock = LockFile::create(&db, "new:2").unwrap();
         assert_eq!(read(&db).unwrap().listen, "new:2");
         drop(lock);
+    }
+
+    #[test]
+    fn remove_stale_removes_only_a_dead_holder() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        let dead = LockInfo {
+            pid: dead_pid(),
+            listen: "old:1".into(),
+            started: String::new(),
+        };
+        std::fs::write(lock_path(&db), serde_json::to_string(&dead).unwrap()).unwrap();
+        assert!(remove_stale(&db));
+        assert!(!lock_path(&db).exists());
+        let live = LockFile::create(&db, "h:1").unwrap();
+        assert!(!remove_stale(&db), "a live holder's sidecar stays");
+        assert!(lock_path(&db).exists());
+        drop(live);
+    }
+
+    /// The pid of a process that has exited (spawned and waited for).
+    pub(crate) fn dead_pid() -> u32 {
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
     }
 
     #[test]

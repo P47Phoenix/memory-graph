@@ -23,6 +23,8 @@ pub struct RaftNode {
     pub log_store: RedbLogStore,
     pub node_id: NodeId,
     pub addr: String,
+    /// Test hook ([`crate::server::TestingHooks::withhold_leader`]).
+    pub withhold_leader: bool,
 }
 
 /// The leader as this node knows it: id and advertised address.
@@ -85,6 +87,7 @@ impl RaftNode {
             log_store,
             node_id,
             addr,
+            withhold_leader: false,
         })
     }
 
@@ -93,6 +96,9 @@ impl RaftNode {
     }
 
     pub fn leader(&self) -> LeaderInfo {
+        if self.withhold_leader {
+            return LeaderInfo::default();
+        }
         let m = self.metrics();
         let id = m.current_leader;
         let addr = id.and_then(|id| {
@@ -107,6 +113,11 @@ impl RaftNode {
     /// Propose one command and wait for it to be applied on this node
     /// (ADR 0004 D7): returns the entry's response and its log index.
     pub async fn propose(&self, req: LogRequest) -> Result<(LogResponse, u64), StoreError> {
+        if self.withhold_leader {
+            return Err(StoreError::NoLeader {
+                retry_after_ms: NO_LEADER_RETRY_MS,
+            });
+        }
         match self.raft.client_write(req).await {
             Ok(resp) => {
                 let index = resp.log_id().index;
@@ -127,6 +138,11 @@ impl RaftNode {
     /// leadership with a quorum and waits for the applied index to reach
     /// the read index.
     pub async fn ensure_linearizable(&self) -> Result<(), StoreError> {
+        if self.withhold_leader {
+            return Err(StoreError::NoLeader {
+                retry_after_ms: NO_LEADER_RETRY_MS,
+            });
+        }
         match self.raft.ensure_linearizable().await {
             Ok(_) => Ok(()),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {

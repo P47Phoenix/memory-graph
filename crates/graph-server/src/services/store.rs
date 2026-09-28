@@ -58,7 +58,7 @@ impl pb::store_server::Store for StoreService {
         tracing::debug!(client = %r.client_version, "hello");
         let leader = self.ctx.raft.leader();
         Ok(Response::new(pb::HelloResponse {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.ctx.info.hello_protocol_version,
             server_version: SERVER_VERSION.into(),
             store_format_version: graph_store::SCHEMA_VERSION,
             extractors_hash: self.ctx.info.extractors_hash.clone(),

@@ -23,6 +23,8 @@ pub struct ServerInfo {
     pub db_path: String,
     pub listen_addr: String,
     pub started: Instant,
+    /// The protocol version `Hello` reports (the real one outside tests).
+    pub hello_protocol_version: u32,
 }
 
 pub struct Ctx {

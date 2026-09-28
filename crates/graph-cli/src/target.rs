@@ -62,6 +62,22 @@ pub fn exit_code(e: &anyhow::Error) -> i32 {
     }
 }
 
+/// Add what a remote exit-4 failure means to its message: the write never
+/// got an answer from a leader within the write deadline, whether the
+/// server was unreachable, the connection was lost mid-call, or no leader
+/// was elected. Other failures are returned unchanged.
+pub fn explain_remote_failure(e: anyhow::Error, addr: &str, code: i32) -> anyhow::Error {
+    if code == exit::WRITE_DEADLINE {
+        e.context(format!(
+            "server {addr}: the write was not acknowledged within the write deadline \
+             (connection lost, server unreachable, or no leader); it may or may not have \
+             been applied, and rerunning it is safe"
+        ))
+    } else {
+        e
+    }
+}
+
 /// Where the store is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -186,17 +202,25 @@ pub fn open_embedded<T>(db: &Path, mut open: impl FnMut() -> Result<T, StoreErro
                 std::thread::sleep(backoff(attempt).min(wait - spent));
                 attempt += 1;
             }
-            r => return r.map_err(anyhow::Error::from),
+            Ok(v) => {
+                // The open succeeded, so no server holds the file: a
+                // sidecar left by a crashed server is stale.
+                graph_server::lock::remove_stale(db);
+                return Ok(v);
+            }
+            Err(e) => return Err(anyhow::Error::from(e)),
         }
     }
 }
 
 /// The message for a database file another process holds: names the
-/// `memory-graph serve` from the `<db>.LOCK` sidecar when its pid is alive,
-/// else says what else could hold it.
+/// `memory-graph serve` from the `<db>.LOCK` sidecar when its pid is alive
+/// **and** its listen address answers `Hello` (a short probe: on Windows a
+/// dead server's pid can be reused by an unrelated process), else says
+/// what else could hold it. A dead or unanswering holder is never named.
 pub fn locked_error(db: &Path, why: &str) -> anyhow::Error {
     match graph_server::lock::holder(db) {
-        Some((info, true)) => {
+        Some((info, true)) if answers_hello(&connectable(&info.listen)) => {
             let addr = connectable(&info.listen);
             anyhow!(
                 "database {} is locked by pid {} (memory-graph serve on {}); use --server {addr} or stop it",
@@ -210,6 +234,22 @@ pub fn locked_error(db: &Path, why: &str) -> anyhow::Error {
              or a `memory-graph serve` owns it (then use --server <host:port> instead)",
             db.display()
         ),
+    }
+}
+
+/// How long [`answers_hello`] waits for a server.
+const HOLDER_PROBE: Duration = Duration::from_millis(500);
+
+/// Whether a memory-graph server answers `Hello` at `addr` (a server of
+/// another protocol version counts: it is a server).
+fn answers_hello(addr: &str) -> bool {
+    let mut cfg = ClientConfig::new(addr);
+    cfg.retry.budget = HOLDER_PROBE;
+    cfg.connect_timeout = HOLDER_PROBE;
+    match RemoteStore::connect(cfg) {
+        Ok(_) => true,
+        Err(StoreError::Protocol(_) | StoreError::SchemaMismatch { .. }) => true,
+        Err(_) => false,
     }
 }
 
@@ -401,6 +441,90 @@ mod tests {
             exit_code(&anyhow::Error::from(StoreError::Locked("x".into()))),
             1
         );
+    }
+
+    #[test]
+    fn a_remote_write_deadline_names_the_server_and_the_lost_connection() {
+        let e = anyhow::Error::from(StoreError::NoLeader { retry_after_ms: 5 });
+        let code = exit_code(&e);
+        let e = explain_remote_failure(e, "h:7", code);
+        assert_eq!(exit_code(&e), exit::WRITE_DEADLINE, "the code survives");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("server h:7") && msg.contains("connection lost"),
+            "{msg}"
+        );
+        let e = explain_remote_failure(anyhow!("plain"), "h:7", 1);
+        assert_eq!(e.to_string(), "plain");
+    }
+
+    fn write_sidecar(db: &Path, pid: u32, listen: &str) {
+        let info = graph_server::lock::LockInfo {
+            pid,
+            listen: listen.into(),
+            started: String::new(),
+        };
+        std::fs::write(
+            graph_server::lock::lock_path(db),
+            serde_json::to_string(&info).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A pid that exited: a child spawned and waited for.
+    fn dead_pid() -> u32 {
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// An address nothing listens on (bound, then released).
+    fn dead_addr() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap().to_string();
+        drop(l);
+        a
+    }
+
+    #[test]
+    fn a_dead_holder_is_never_named_and_its_sidecar_goes_on_open() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        write_sidecar(&db, dead_pid(), "127.0.0.1:7000");
+        let msg = locked_error(&db, "already open").to_string();
+        assert!(
+            msg.contains("locked by another process") && !msg.contains("pid"),
+            "{msg}"
+        );
+        open_embedded(&db, || Ok::<_, StoreError>(())).unwrap();
+        assert!(
+            !graph_server::lock::lock_path(&db).exists(),
+            "the stale sidecar is removed after a successful open"
+        );
+    }
+
+    /// Windows pid reuse: the pid is alive (here: our own), but nothing
+    /// answers at the sidecar's address, so it is not named.
+    #[test]
+    fn a_live_pid_whose_address_does_not_answer_is_not_named() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        write_sidecar(&db, std::process::id(), &dead_addr());
+        let msg = locked_error(&db, "already open").to_string();
+        assert!(
+            msg.contains("locked by another process") && !msg.contains("pid"),
+            "{msg}"
+        );
+        // A live sidecar is never removed by an open.
+        open_embedded(&db, || Ok::<_, StoreError>(())).unwrap();
+        assert!(graph_server::lock::lock_path(&db).exists());
     }
 
     #[test]

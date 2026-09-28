@@ -519,8 +519,13 @@ fn main() {
             if broken {
                 std::process::exit(0);
             }
+            let code = graph_cli::target::exit_code(&e);
+            let e = match REMOTE_ADDR.get() {
+                Some(addr) => graph_cli::target::explain_remote_failure(e, addr, code),
+                None => e,
+            };
             eprintln!("Error: {e:?}");
-            std::process::exit(graph_cli::target::exit_code(&e));
+            std::process::exit(code);
         }
     }
 }
@@ -544,6 +549,9 @@ fn server_header(addr: &str, st: &graph_proto::pb::StatusResponse) -> String {
             .map_or_else(|| "none".to_string(), |l| l.to_string())
     )
 }
+
+/// The server a command talks to, once resolved (for the error message).
+static REMOTE_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
@@ -598,7 +606,10 @@ fn run() -> Result<i32> {
     }
     let target = cli.target()?;
     let remote_addr = match &target {
-        Target::Remote { addr, read } => Some((addr.clone(), *read)),
+        Target::Remote { addr, read } => {
+            let _ = REMOTE_ADDR.set(addr.clone());
+            Some((addr.clone(), *read))
+        }
         Target::Embedded(_) => None,
     };
     let need_server = |what: &str| -> Result<(String, ReadMode)> {

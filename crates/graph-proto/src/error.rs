@@ -127,6 +127,16 @@ pub fn is_disk_full(msg: &str) -> bool {
         || m.ends_with("os error 112")
 }
 
+/// Codes a status carries, without a typed detail, when the connection
+/// under a call was lost (the server died, a reset, a client-side
+/// timeout): the call may or may not have reached the server.
+pub fn is_transport_loss(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unknown | Code::Cancelled | Code::DeadlineExceeded | Code::Aborted
+    )
+}
+
 impl WireError {
     /// The gRPC status code for this error (the table in the module doc).
     pub fn code(&self) -> Code {
@@ -229,15 +239,28 @@ impl WireError {
     }
 
     /// Map a status without a usable detail by its code alone.
+    ///
+    /// `Protocol` is reserved for what really is a protocol mismatch (the
+    /// typed detail, `Unimplemented` from a server without the method, and
+    /// the client's own `Hello` version check): a bare `FAILED_PRECONDITION`
+    /// (a proxy, a foreign server) is a refusal (`Rejected`), and a
+    /// transport-level loss (`UNKNOWN` "transport error", `CANCELLED`,
+    /// `DEADLINE_EXCEEDED`, `ABORTED`) is a `Storage` error naming the lost
+    /// connection, never a protocol error.
     pub fn from_code(code: Code, message: &str) -> Self {
         let msg = message.to_string();
         match code {
-            Code::InvalidArgument => WireError::Store(StoreError::Rejected(msg)),
+            Code::InvalidArgument | Code::FailedPrecondition => {
+                WireError::Store(StoreError::Rejected(msg))
+            }
             Code::Unavailable => WireError::Store(StoreError::Locked(msg)),
-            Code::FailedPrecondition => WireError::Protocol(msg),
             Code::DataLoss => WireError::Store(StoreError::Corrupt(msg)),
             Code::ResourceExhausted | Code::Internal => WireError::Store(StoreError::Storage(msg)),
-            other => WireError::Protocol(format!("{other:?}: {msg}")),
+            Code::Unimplemented => WireError::Protocol(format!("{code:?}: {msg}")),
+            other if is_transport_loss(other) => WireError::Store(StoreError::Storage(format!(
+                "connection lost ({other:?}): {msg}"
+            ))),
+            other => WireError::Store(StoreError::Storage(format!("{other:?}: {msg}"))),
         }
     }
 }

@@ -550,3 +550,109 @@ fn sigterm_shuts_down_gracefully() {
     server.wait_exit();
     assert!(!lock.exists(), "SIGTERM removes the LOCK sidecar");
 }
+
+/// Exit codes 3, 4 and 5 through the real binary, against an in-process
+/// server whose test hooks withhold the leader or answer `Hello` with a
+/// foreign protocol version.
+#[test]
+fn exit_codes_3_4_5_end_to_end() {
+    use graph_server::testing::TestServer;
+    let d = tempfile::tempdir().unwrap();
+    let no_leader = TestServer::start_with(&d.path().join("a.redb"), vec![], |c| {
+        c.testing.withhold_leader = true;
+    });
+    let addr = no_leader.endpoint();
+    // 3: `cluster leader` finds none.
+    let o = run(&["--server", &addr, "cluster", "leader"]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    // 4: a write gets no leader within its deadline.
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), "alpha beta").unwrap();
+    let t0 = Instant::now();
+    let o = run(&[
+        "--server",
+        &addr,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--no-progress",
+        src.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
+    assert!(t0.elapsed() >= Duration::from_secs(5), "it retried first");
+    assert!(
+        stderr(&o).contains(&format!("server {addr}")),
+        "{}",
+        stderr(&o)
+    );
+    // Reads still work without a leader (LOCAL).
+    ok(&["--server", &addr, "describe"]);
+    drop(no_leader);
+
+    // 5: the server speaks another protocol version.
+    let foreign = TestServer::start_with(&d.path().join("b.redb"), vec![], |c| {
+        c.testing.hello_protocol_version = Some(99);
+    });
+    let o = run(&["--server", &foreign.endpoint(), "describe"]);
+    assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
+    assert!(stderr(&o).contains("protocol version 99"), "{}", stderr(&o));
+}
+
+/// The server dies in the middle of an index run: the client does not
+/// call that a protocol error (exit 5); it retries the write until its
+/// deadline and then fails naming the server and the lost connection.
+#[test]
+fn server_killed_mid_index_is_a_lost_connection_not_a_protocol_error() {
+    let d = tempfile::tempdir().unwrap();
+    let mut server = Server::start(&d.path().join("g.redb"));
+    let addr = server.addr.clone();
+    let mut writer = cmd()
+        .args([
+            "--server",
+            &addr,
+            "index",
+            "--org",
+            "corpus",
+            "--repo",
+            "all",
+            "--no-progress",
+        ])
+        .arg(corpus())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Wait until the run has written something, then kill the server
+    // (only this test's own child process).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(
+            writer.try_wait().unwrap().is_none(),
+            "the index run finished before the server could be killed"
+        );
+        let o = run(&["--server", &addr, "describe", "--json"]);
+        let files = serde_json::from_str::<serde_json::Value>(&stdout(&o))
+            .ok()
+            .and_then(|v| v["repos"][0]["files"].as_u64())
+            .unwrap_or(0);
+        if files > 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no file was ever indexed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    let out = writer.wait_with_output().unwrap();
+    let code = out.status.code();
+    let err = stderr(&out);
+    assert_ne!(code, Some(5), "not a protocol error: {err}");
+    assert_ne!(code, Some(0), "the run cannot have succeeded: {err}");
+    assert!(
+        err.contains(&format!("server {addr}")) && err.contains("connection lost"),
+        "the message names the server and the lost connection: {err}"
+    );
+}

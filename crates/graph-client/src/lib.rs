@@ -18,8 +18,13 @@
 //!   `PreparedFile::remote`, `index_prepared` streams one `Write.Index`
 //!   RPC (a header, then one `FileBytes` per file); the server parses.
 //! * Retries: `UNAVAILABLE` is retried with jittered back-off within the
-//!   [`RetryConfig`] budget (writes: [`ClientConfig::write_deadline`]); a
-//!   `NotLeader` that names the leader switches the connection there.
+//!   [`RetryConfig`] budget (writes: [`ClientConfig::write_deadline`], and
+//!   a write also retries a connection lost mid-call, since every write is
+//!   idempotent on a retry); a `NotLeader` that names the leader switches
+//!   the connection there (with back-off from the second switch in a
+//!   row). A write that runs out of deadline fails with `NoLeader`; a read
+//!   whose connection was lost fails with a `Storage` error naming the
+//!   server. Every call carries the `mg-protocol-version` header.
 //!
 //! [`Store::snapshot`]: graph_store::Store::snapshot
 
@@ -84,8 +89,11 @@ pub struct ClientConfig {
     pub endpoints: Vec<String>,
     pub read_mode: ReadMode,
     pub retry: RetryConfig,
-    /// How long a write keeps retrying while no leader is known.
+    /// How long a write keeps retrying while no leader is known (or the
+    /// server is unreachable); past it the write fails with `NoLeader`.
     pub write_deadline: Duration,
+    /// TCP connect timeout per attempt (default 5 s).
+    pub connect_timeout: Duration,
     /// Reported in `Hello` for the server's logs.
     pub client_version: String,
 }
@@ -97,6 +105,7 @@ impl ClientConfig {
             read_mode: ReadMode::Local,
             retry: RetryConfig::default(),
             write_deadline: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(5),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
