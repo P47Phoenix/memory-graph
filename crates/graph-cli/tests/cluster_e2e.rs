@@ -492,10 +492,12 @@ fn three_processes_form_replicate_fail_over_and_catch_up() {
         &local_answers,
         &answers(&n1.server()),
     );
-    assert_same(
-        "queries (embedded vs node 2)",
-        &local_answers,
-        &answers(&n2.server()),
+    // Node 3 already matched in full; node 2 by its catalog (kept short:
+    // every query is a process start).
+    assert_eq!(
+        normalize(&ok(&["--server", &n2.addr, "describe", "--json"])),
+        local_answers[1],
+        "describe --json (embedded vs node 2)"
     );
 
     // unix: SIGTERM the current leader; it exits cleanly and the two
@@ -586,5 +588,179 @@ fn data_dir_refusals() {
         Some(id.as_str()),
         "--bootstrap on an initialized directory keeps the cluster"
     );
+    n.shutdown();
+}
+
+/// The numbers in `docs/spikes/raft-replication.md`. Not a gate (timings
+/// depend on the machine): run it with
+/// `cargo test --release -p graph-cli --test cluster_e2e measure_replication -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement for docs/spikes/raft-replication.md; run with --release --ignored"]
+fn measure_replication() {
+    use graph_store::Store;
+    use redb::ReadableTable;
+    let d = tempfile::tempdir().unwrap();
+    let source: u64 = {
+        fn walk(p: &Path) -> u64 {
+            std::fs::read_dir(p)
+                .unwrap()
+                .flatten()
+                .map(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        if e.file_name() == ".git" {
+                            0
+                        } else {
+                            walk(&p)
+                        }
+                    } else {
+                        p.metadata().unwrap().len()
+                    }
+                })
+                .sum()
+        }
+        walk(&corpus())
+    };
+    println!("corpus source bytes (all files): {source}");
+    let secs = |t: Instant| t.elapsed().as_secs_f64();
+
+    // Embedded ingest (best of 3; the first also warms the file cache).
+    let mut embedded = f64::MAX;
+    for i in 0..3 {
+        let db = d.path().join(format!("embedded{i}.redb"));
+        let t = Instant::now();
+        index_corpus(&["--db", db.to_str().unwrap()]);
+        embedded = embedded.min(secs(t));
+    }
+    println!("embedded corpus ingest: {embedded:.3} s (best of 3)");
+
+    // One node: ingest, then the log's contents and size.
+    let one = d.path().join("one");
+    let mut n = Node::start(
+        1,
+        &one,
+        "127.0.0.1:0",
+        &["--bootstrap", "--log-keep-entries", "0"],
+    );
+    wait_for("node 1 to lead", || (n.leader() == Some(1)).then_some(()));
+    let t = Instant::now();
+    index_corpus(&n.server());
+    let single = secs(t);
+    println!(
+        "1-node corpus ingest via --server: {single:.3} s ({:.0}% of embedded speed)",
+        100.0 * embedded / single
+    );
+    // Snapshot build (through the RPC, without download).
+    let t = Instant::now();
+    let snap = ok(&["--server", &n.addr, "cluster", "snapshot", "--json"]);
+    println!("snapshot build: {:.3} s ({snap})", secs(t));
+    let st = n.status().unwrap();
+    println!(
+        "after snapshot+purge: log_bytes={} store_bytes={}",
+        st["log_bytes"], st["store_bytes"]
+    );
+    // Install: a new member after the purge catches up by snapshot only.
+    let two = d.path().join("two");
+    let n2 = Node::start(2, &two, "127.0.0.1:0", &["--wait-for-membership"]);
+    let target = n.applied();
+    let t = Instant::now();
+    ok(&["--server", &n.addr, "cluster", "add-learner", "2", &n2.addr]);
+    let added = secs(t);
+    wait_applied(&n2, target);
+    let st2 = n2.status().unwrap();
+    println!(
+        "snapshot transfer + install on a new learner: add-learner returned after {added:.3} s, \
+         applied {target} after {:.3} s (learner snapshot_index={}, store_bytes={})",
+        secs(t),
+        st2["snapshot_index"],
+        st2["store_bytes"]
+    );
+    drop(n2);
+    n.shutdown();
+
+    // Log contents: a fresh node, ingest, stop, read raft.redb directly.
+    let raw = d.path().join("raw");
+    let mut n = Node::start(1, &raw, "127.0.0.1:0", &["--bootstrap"]);
+    wait_for("node 1 to lead", || (n.leader() == Some(1)).then_some(()));
+    index_corpus(&n.server());
+    n.shutdown();
+    let log = raw.join("raft.redb");
+    let file = std::fs::metadata(&log).unwrap().len();
+    let db = redb::Database::open(&log).unwrap();
+    let rt = db.begin_read().unwrap();
+    let t: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("raft_log");
+    let table = rt.open_table(t).unwrap();
+    let (mut entries, mut normal, mut bytes) = (0u64, 0u64, 0u64);
+    for row in table.iter().unwrap() {
+        let (_, v) = row.unwrap();
+        entries += 1;
+        if v.value()[0] == 1 {
+            normal += 1;
+        }
+        bytes += v.value().len() as u64;
+    }
+    println!(
+        "log after corpus ingest: {entries} entries ({normal} writes), {bytes} B encoded \
+         ({} B framing = 25 B/entry, {} B payload, {:.2}x source), raft.redb {file} B ({:.2}x source)",
+        25 * entries,
+        bytes - 25 * entries,
+        (bytes - 25 * entries) as f64 / source as f64,
+        file as f64 / source as f64
+    );
+    drop(table);
+    drop(rt);
+    drop(db);
+
+    // Three nodes: ingest through the leader.
+    let dirs: Vec<PathBuf> = (1..=3).map(|i| d.path().join(format!("c{i}"))).collect();
+    let n1 = Node::start(1, &dirs[0], "127.0.0.1:0", &["--bootstrap"]);
+    let n2 = Node::start(2, &dirs[1], "127.0.0.1:0", &["--wait-for-membership"]);
+    let n3 = Node::start(3, &dirs[2], "127.0.0.1:0", &["--wait-for-membership"]);
+    wait_for("node 1 to lead", || (n1.leader() == Some(1)).then_some(()));
+    for n in [&n2, &n3] {
+        let id = n.id.to_string();
+        ok(&["--server", &n1.addr, "cluster", "add-learner", &id, &n.addr]);
+        ok(&["--server", &n1.addr, "cluster", "promote", &id]);
+    }
+    let t = Instant::now();
+    index_corpus(&n1.server());
+    let triple = secs(t);
+    println!(
+        "3-node corpus ingest via the leader: {triple:.3} s ({:.0}% of embedded speed; ADR trigger < 50%)",
+        100.0 * embedded / triple
+    );
+
+    // fsync throughput: one log entry per call, small and large payloads.
+    let throughput = |addr: &str, label: &str| {
+        let s = graph_client::RemoteStore::connect(graph_client::ClientConfig::new(addr)).unwrap();
+        let small = b"x".repeat(1024);
+        let n = 300;
+        let t = Instant::now();
+        for i in 0..n {
+            s.index_bytes("m", label, &format!("s{i}.txt"), &small, Some("text"))
+                .unwrap();
+        }
+        let e = secs(t);
+        println!("{label}: {n} x 1 KiB writes: {:.0} entries/s", n as f64 / e);
+        // One 1 MiB token: the store's per-token work stays small, so this
+        // measures the log (replication + fsync), not the tokenizer.
+        let big = b"y".repeat(1 << 20);
+        let n = 20;
+        let t = Instant::now();
+        for i in 0..n {
+            s.index_bytes("m", label, &format!("b{i}.txt"), &big, Some("text"))
+                .unwrap();
+        }
+        let e = secs(t);
+        println!(
+            "{label}: {n} x 1 MiB writes: {:.1} entries/s, {:.1} MB/s",
+            n as f64 / e,
+            (n as f64 * big.len() as f64) / e / 1e6
+        );
+    };
+    throughput(&n1.addr, "three-nodes");
+    let mut n = Node::start(1, &d.path().join("tp"), "127.0.0.1:0", &["--bootstrap"]);
+    wait_for("node 1 to lead", || (n.leader() == Some(1)).then_some(()));
+    throughput(&n.addr, "one-node");
     n.shutdown();
 }

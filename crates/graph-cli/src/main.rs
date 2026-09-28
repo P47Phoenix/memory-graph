@@ -160,13 +160,15 @@ enum ClusterCmd {
         #[arg(long)]
         json: bool,
     },
-    /// PREVIEW, stage B: add node <ID> at <ADDR> (host:port) as a non-voting learner and wait
-    /// until it has caught up. Stage C completes membership (guards, remove, transfer, --join)
+    /// PREVIEW, stage B: add node <ID> at <ADDR> (host:port) as a non-voting learner. Waits for
+    /// the leader's catch-up acknowledgement; a learner that needs a snapshot may still be
+    /// installing it (`cluster status` shows its lag). Stage C completes membership (guards,
+    /// remove, transfer, --join)
     #[command(hide = true)]
     AddLearner {
         id: u64,
         addr: String,
-        /// Return once the change is committed, without waiting for the learner to catch up
+        /// Return once the change is committed, without the catch-up acknowledgement
         #[arg(long)]
         no_wait: bool,
     },
@@ -658,7 +660,7 @@ fn run() -> Result<i32> {
     } = &cli.cmd
     {
         if let Some(s) = &cli.server {
-            bail!("serve takes --data-dir <dir> or --db <file> to serve, not --server {s}");
+            bail!("serve takes --db <file> or --data-dir <dir> to serve, not --server {s}");
         }
         if cli.chunk_bytes.is_some() {
             bail!("--chunk-bytes does not apply to serve: the server cuts replicated log entries at {} MiB", graph_client::RAFT_ENTRY_MAX_BYTES >> 20);
