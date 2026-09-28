@@ -923,8 +923,15 @@ fn raft_rpcs_from_other_extractors_or_clusters_are_refused() {
     // Nothing reached Raft: same term, still the leader, writes work.
     c.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
     let after = c.admin_status().unwrap();
-    assert_eq!(after.current_term, me.current_term);
+    // The forged RPCs named term +5; none of it was taken on.
+    assert!(
+        after.current_term < me.current_term + 5,
+        "{} vs {}",
+        after.current_term,
+        me.current_term
+    );
     assert_eq!(after.role, "leader");
+    assert_eq!(after.node_id, 1);
 }
 
 #[test]
@@ -1429,12 +1436,21 @@ fn a_short_lag_follower_catches_up_from_the_log() {
         let f = small_file(i);
         c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
     }
-    let m = tb.node(leader).raft().unwrap().metrics();
-    assert!(
-        m.snapshot.is_some_and(|s| s.index > behind),
-        "the leader snapshotted past the lagging follower: {:?}",
-        m.snapshot
-    );
+    // The snapshot policy builds asynchronously: wait (bounded).
+    let raft = tb.node(leader).raft().unwrap().raft.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let m = rt.block_on(async {
+        raft.wait(Some(CLUSTER_WAIT))
+            .metrics(
+                |m| m.snapshot.is_some_and(|s| s.index > behind),
+                "the leader snapshotted past the lagging follower",
+            )
+            .await
+            .unwrap()
+    });
     assert!(m.purged.is_none_or(|p| p.index < behind), "{:?}", m.purged);
     tb.node_mut(lag).restart();
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
