@@ -1,0 +1,337 @@
+// memory-graph wire types (ADR 0004 D1). Mirrors the public types of
+// graph-core (`Node`, `Span`, `Extraction`, ...) and graph-store (`Query`,
+// `Hit`, `RepoInfo`, `IngestStats`, `StoreError`, ...); `graph-proto`'s
+// `convert.rs` is the one place that maps between the two.
+//
+// Conventions: every enum has an UNSPECIFIED zero value that the converter
+// rejects (proto3 defaults must never be mistaken for a real value); `usize`
+// fields travel as uint64; Rust `Option` fields are `optional`.
+syntax = "proto3";
+
+package memory_graph.v1;
+
+// graph_core::NodeKind. Hierarchy: Org > Repo > File > Symbol* > Token.
+enum NodeKind {
+  NODE_KIND_UNSPECIFIED = 0;
+  NODE_KIND_ORG = 1;
+  NODE_KIND_REPO = 2;
+  NODE_KIND_FILE = 3;
+  NODE_KIND_SYMBOL = 4;
+  NODE_KIND_TOKEN = 5;
+}
+
+// graph_core::SymbolKind, the generic symbol vocabulary.
+enum SymbolKind {
+  SYMBOL_KIND_UNSPECIFIED = 0;
+  SYMBOL_KIND_MODULE = 1;
+  SYMBOL_KIND_TYPE = 2;
+  SYMBOL_KIND_FUNCTION = 3;
+  SYMBOL_KIND_METHOD = 4;
+  SYMBOL_KIND_VARIABLE = 5;
+  SYMBOL_KIND_CONSTANT = 6;
+  SYMBOL_KIND_OTHER = 7;
+}
+
+// graph_core::TokenClass.
+enum TokenClass {
+  TOKEN_CLASS_UNSPECIFIED = 0;
+  TOKEN_CLASS_IDENTIFIER = 1;
+  TOKEN_CLASS_KEYWORD = 2;
+  TOKEN_CLASS_LITERAL = 3;
+  TOKEN_CLASS_OPERATOR = 4;
+  TOKEN_CLASS_PUNCTUATION = 5;
+  TOKEN_CLASS_COMMENT = 6;
+  TOKEN_CLASS_OTHER = 7;
+}
+
+// graph_store::Grain, the search roll-up.
+enum Grain {
+  GRAIN_UNSPECIFIED = 0;
+  GRAIN_TOKEN = 1;
+  GRAIN_SYMBOL = 2;
+  GRAIN_METHOD = 3;
+  GRAIN_CLASS = 4;
+  GRAIN_FILE = 5;
+  GRAIN_REPO = 6;
+  GRAIN_ORG = 7;
+}
+
+// graph_core::Span: byte offsets `[start, end)`, 1-based lines, 1-based
+// columns counted in Unicode scalar values.
+message Span {
+  uint32 start = 1;
+  uint32 end = 2;
+  uint32 start_line = 3;
+  uint32 start_col = 4;
+  uint32 end_line = 5;
+  uint32 end_col = 6;
+}
+
+// graph_core::Node. Fields not relevant to a kind are absent.
+message Node {
+  uint64 id = 1;
+  optional uint64 parent = 2;
+  NodeKind kind = 3;
+  // Org/repo label, file path, symbol name or token text.
+  string name = 4;
+  // File only.
+  optional string language = 5;
+  // Symbol only.
+  optional SymbolKind symbol_kind = 6;
+  // Symbol only: language-specific kind string (`struct`, `trait`, ...).
+  optional string lang_kind = 7;
+  // Token only.
+  optional TokenClass token_class = 8;
+  // File only.
+  bool has_errors = 9;
+  // File only: how the last ingest was requested (`directory`).
+  optional string origin = 10;
+  // File only: fingerprint of what was indexed.
+  optional string fingerprint = 11;
+  // Symbol and token.
+  optional Span span = 12;
+}
+
+// A batch of nodes on a server stream (`Descendants`, `FileTokens`): at most
+// 4096 nodes each, in the order the unstreamed call would return them.
+message NodeBatch {
+  repeated Node nodes = 1;
+  // `FileTokens` only: the file is not indexed (`file_tokens` returned
+  // `None`). Sent as the only batch, with no nodes.
+  bool not_found = 2;
+}
+
+// graph_store::Page<Node> (`ChildrenPage`, `DescendantsPage`).
+message NodePage {
+  repeated Node items = 1;
+  // Whether `offset + items.len()` would return a non-empty page from the
+  // same call on the same snapshot.
+  bool has_more = 2;
+}
+
+// graph_store::Query: token-text search with roll-up to `grain`.
+message Query {
+  string text = 1;
+  optional string language = 2;
+  optional string org = 3;
+  optional string repo = 4;
+  optional TokenClass class = 5;
+  Grain grain = 6;
+  // Restrict the symbol, method or class grain to this kind: generic
+  // (`method`) or language-specific (`struct`).
+  optional string symbol_kind = 7;
+  // Keep at most this many rows (after deterministic ordering).
+  optional uint64 limit = 8;
+  // Skip this many rows before collecting `limit` rows.
+  optional uint64 offset = 9;
+}
+
+// graph_store::SymbolQuery: symbol lookup by name (exact, or a prefix with a
+// trailing `*`).
+message SymbolQuery {
+  string pattern = 1;
+  // Generic kind (`method`) or language-specific kind (`struct`, `trait`).
+  optional string kind = 2;
+  optional string language = 3;
+  optional string org = 4;
+  optional string repo = 5;
+  // Restrict to one file path (normalized, relative as indexed).
+  optional string file = 6;
+  optional uint64 limit = 7;
+  optional uint64 offset = 8;
+}
+
+// graph_store::Hit: one search result row at the requested grain.
+message Hit {
+  Grain grain = 1;
+  string org = 2;
+  optional string repo = 3;
+  optional string file = 4;
+  optional string language = 5;
+  // Qualified enclosing symbol path, e.g. `Foo::bar`.
+  optional string symbol = 6;
+  optional SymbolKind symbol_kind = 7;
+  optional string lang_kind = 8;
+  // Token grain: the token's class.
+  optional TokenClass token_class = 9;
+  // Token grain: the token; symbolic grains: the picked symbol's full span.
+  optional Span span = 10;
+  // Number of matching tokens contained in this node.
+  uint64 count = 11;
+  // Symbolic grains only: the file has no symbols at all.
+  bool no_symbols = 12;
+  // Symbolic grains only: the file has symbols, but none enclosing the match
+  // satisfies the grain; rolled up to the file.
+  bool no_matching_symbol = 13;
+}
+
+// graph_store::SymbolHit: a symbol with its containment path.
+message SymbolHit {
+  string org = 1;
+  string repo = 2;
+  string file = 3;
+  optional string language = 4;
+  string name = 5;
+  // Qualified path from the outermost enclosing symbol, e.g. `S::a`.
+  string qualified = 6;
+  SymbolKind kind = 7;
+  optional string lang_kind = 8;
+  optional Span span = 9;
+}
+
+// graph_store::LanguageInfo: per-language contents of a repo.
+message LanguageInfo {
+  uint64 files = 1;
+  uint64 symbols = 2;
+  uint64 tokens = 3;
+  // Keys are `generic` or `generic/language-specific` (`type/struct`).
+  map<string, uint64> symbol_kinds = 4;
+}
+
+// graph_store::RepoInfo: what `describe` reports for one repo.
+message RepoInfo {
+  string org = 1;
+  string repo = 2;
+  uint64 files = 3;
+  map<string, LanguageInfo> languages = 4;
+  map<string, uint64> token_classes = 5;
+  // The repo has an open (in-progress or crashed) chunked ingest batch.
+  bool open_batch = 6;
+}
+
+// graph_store::IngestStats: the outcome of indexing one file.
+message IngestStats {
+  uint64 file_id = 1;
+  uint64 symbols = 2;
+  uint64 tokens = 3;
+  // An existing file was replaced.
+  bool replaced = 4;
+  // The stored file had an identical fingerprint; nothing was re-indexed.
+  bool unchanged = 5;
+  bool has_errors = 6;
+  // Normalized path and language actually stored.
+  string path = 7;
+  string language = 8;
+}
+
+// One source file as raw bytes (`graph_store::BatchFile`), for `Write.Index`
+// and the replicated `LogCommand.IndexChunk`.
+message FileBytes {
+  string path = 1;
+  bytes bytes = 2;
+  // Language override; absent means the server detects it.
+  optional string language = 3;
+  // `Node::origin` to record (`directory` for a directory run).
+  optional string origin = 4;
+}
+
+// graph_store::IndexOptions.
+message IndexOptions {
+  // Re-index files even when their fingerprint is unchanged.
+  bool reindex = 1;
+}
+
+// graph_store::SnapshotStats.
+message SnapshotStats {
+  uint64 open_count = 1;
+  // Age of the oldest open snapshot, if any; whole milliseconds.
+  optional uint64 oldest_age_ms = 2;
+  uint64 store_size_bytes = 3;
+}
+
+// graph_store::VacuumStats.
+message VacuumStats {
+  uint64 terms_removed = 1;
+  uint64 terms_kept = 2;
+}
+
+// graph_store::CompactStats.
+message CompactStats {
+  uint64 before_bytes = 1;
+  uint64 after_bytes = 2;
+}
+
+// graph_core::SymbolDecl: a symbol declared by an extractor.
+message SymbolDecl {
+  string name = 1;
+  SymbolKind kind = 2;
+  optional string lang_kind = 3;
+  Span span = 4;
+}
+
+// graph_core::TokenDecl.
+message TokenDecl {
+  string text = 1;
+  TokenClass class = 2;
+  Span span = 3;
+}
+
+// graph_core::Extraction: what an extractor produced for one source file.
+message Extraction {
+  repeated SymbolDecl symbols = 1;
+  repeated TokenDecl tokens = 2;
+  // The source had syntax errors; the extractor fell back to tokens only.
+  bool has_errors = 3;
+}
+
+// graph_store::StoreError, carried prost-encoded in `Status.details` so the
+// typed error survives the wire (ADR 0004 D1). The gRPC status code is
+// derived from the variant; see graph-proto's `error.rs` for the table.
+message StoreErrorDetail {
+  message Locked { string msg = 1; }
+  message SchemaMismatch { uint64 found = 1; }
+  message LegacyFormat { string path = 1; uint64 version = 2; }
+  message OpenFailed { string path = 1; string reason = 2; }
+  message Rejected { string msg = 1; }
+  message NotUtf8 { string path = 1; }
+  message TooLarge { string path = 1; }
+  message InvalidSpan { string msg = 1; }
+  message Corrupt { string msg = 1; }
+  // graph_core::SchemaError::InvalidContainment(parent, child); `msg` is its
+  // rendered text.
+  message Schema { string msg = 1; NodeKind parent = 2; NodeKind child = 3; }
+  message Storage { string msg = 1; }
+  message SnapshotExpired { uint64 age_secs = 1; uint64 max_age_secs = 2; }
+  // This node is not the leader; the known leader, when there is one.
+  message NotLeader { optional uint64 leader_id = 1; optional string leader_addr = 2; }
+  // No leader is known; retry after this many milliseconds.
+  message NoLeader { uint64 retry_after_ms = 1; }
+  // Protocol or version mismatch (`Hello`), or a malformed message.
+  message Protocol { string msg = 1; }
+
+  oneof kind {
+    Locked locked = 1;
+    SchemaMismatch schema_mismatch = 2;
+    LegacyFormat legacy_format = 3;
+    OpenFailed open_failed = 4;
+    Rejected rejected = 5;
+    NotUtf8 not_utf8 = 6;
+    TooLarge too_large = 7;
+    InvalidSpan invalid_span = 8;
+    Corrupt corrupt = 9;
+    Schema schema = 10;
+    Storage storage = 11;
+    SnapshotExpired snapshot_expired = 12;
+    NotLeader not_leader = 13;
+    NoLeader no_leader = 14;
+    Protocol protocol = 15;
+  }
+}
+
+// How a read is served (ADR 0004 D1).
+enum ReadMode {
+  // Read this node's store as it is (may lag the leader).
+  READ_MODE_LOCAL = 0;
+  // Confirm leadership (`ensure_linearizable`) before reading.
+  READ_MODE_LINEARIZABLE = 1;
+}
+
+// The view every read request carries: a read mode, or a snapshot handle
+// from `Store.OpenSnapshot` (a frozen, consistent view). An absent `View`
+// means LOCAL.
+message View {
+  oneof v {
+    ReadMode mode = 1;
+    uint64 snapshot_id = 2;
+  }
+}

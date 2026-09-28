@@ -1,0 +1,101 @@
+// Node-to-node Raft transport (ADR 0004 D5) and the replicated log entry.
+//
+// Stage A: the three RPCs carry the openraft request/response types
+// serde_json-encoded in `payload` (openraft's types are generic over the
+// application's `RaftTypeConfig`, and stage A has one node, so the loopback
+// network never sends them). Stage B may replace the payloads with typed
+// messages under a new `protocol_version`.
+syntax = "proto3";
+
+package memory_graph.v1;
+
+import "memory_graph/v1/common.proto";
+
+service Raft {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc Vote(VoteRequest) returns (VoteResponse);
+  // Snapshot transfer: an `InstallSnapshotHeader` then the snapshot file in
+  // chunks.
+  rpc InstallSnapshot(stream InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+message AppendEntriesRequest {
+  // serde_json `openraft::raft::AppendEntriesRequest<TypeConfig>`.
+  bytes payload = 1;
+}
+message AppendEntriesResponse {
+  // serde_json `openraft::raft::AppendEntriesResponse<NodeId>`.
+  bytes payload = 1;
+}
+
+message VoteRequest {
+  // serde_json `openraft::raft::VoteRequest<NodeId>`.
+  bytes payload = 1;
+}
+message VoteResponse {
+  // serde_json `openraft::raft::VoteResponse<NodeId>`.
+  bytes payload = 1;
+}
+
+message InstallSnapshotHeader {
+  // serde_json `openraft::Vote<NodeId>` of the sending leader.
+  bytes vote = 1;
+  // serde_json `openraft::SnapshotMeta<NodeId, Node>`.
+  bytes meta = 2;
+  // The store format version of the snapshot file (`graph_store::SCHEMA_VERSION`).
+  uint64 store_format_version = 3;
+  // The extractor version set hash the snapshot was built with (D5).
+  string extractors_hash = 4;
+}
+
+message InstallSnapshotRequest {
+  oneof msg {
+    InstallSnapshotHeader header = 1;
+    // A chunk of the exported store file, in order.
+    bytes chunk = 2;
+  }
+}
+message InstallSnapshotResponse {
+  // serde_json `openraft::raft::InstallSnapshotResponse<NodeId>`.
+  bytes payload = 1;
+}
+
+// One replicated log entry (ADR 0004 D5): what the state machine applies in
+// one marked transaction (`V2Store::index_prepared_marked` and friends).
+message LogCommand {
+  // Raw bytes of some files of one repo, cut by the leader at
+  // `RAFT_ENTRY_MAX_BYTES` (8 MiB; a single larger file is an entry alone).
+  message IndexChunk {
+    string org = 1;
+    string repo = 2;
+    // `IndexOptions::reindex`.
+    bool reindex = 3;
+    repeated FileBytes files = 4;
+  }
+  // A caller-supplied extraction (the one command that ships one).
+  message IngestExtraction {
+    string org = 1;
+    string repo = 2;
+    string path = 3;
+    string language = 4;
+    Extraction extraction = 5;
+    optional string origin = 6;
+  }
+  // `Store::prune_files` (never a dry run; those are node-local).
+  message Prune {
+    string org = 1;
+    string repo = 2;
+    repeated string keep = 3;
+  }
+  message Vacuum {}
+  // Blank/membership entries: nothing to apply, only the marker moves.
+  message Noop {}
+
+  oneof cmd {
+    IndexChunk index_chunk = 1;
+    IngestExtraction ingest_extraction = 2;
+    Prune prune = 3;
+    Vacuum vacuum = 4;
+    Noop noop = 5;
+  }
+}

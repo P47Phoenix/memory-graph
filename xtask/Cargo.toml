@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Dev tooling for memory-graph (not a workspace member, never shipped): `cargo run --manifest-path xtask/Cargo.toml -- proto` regenerates crates/graph-proto/src/gen."
+
+# Deliberately its own workspace so the root workspace (and its pure-Rust
+# gate) never sees prost-build / tonic-prost-build / prettyplease.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+protox = "=0.9.1"
+tonic-prost-build = { version = "=0.14.6", default-features = false }
+prost-build = "0.14"

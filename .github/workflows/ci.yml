@@ -16,6 +16,18 @@ jobs:
       - run: python3 scripts/test_gate.py
       - name: Pure-Rust gate (no -sys / C build scripts)
         run: python3 scripts/check-no-c-deps.py
+  proto-regen:
+    # The generated gRPC code under crates/graph-proto/src/gen is checked in
+    # (ADR 0004 D1). Regenerate it with the pure-Rust compiler (protox, no
+    # protoc installed) and fail on any drift from the .proto files.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "xtask -> target" }
+      - run: cargo run --manifest-path xtask/Cargo.toml --locked -- proto
+      - run: git diff --exit-code -- crates/graph-proto/src/gen
   disk-full:
     # Real ENOSPC: index into a size-capped tmpfs, stop cleanly, resume.
     runs-on: ubuntu-latest
