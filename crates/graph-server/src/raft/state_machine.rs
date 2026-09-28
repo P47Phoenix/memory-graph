@@ -10,8 +10,10 @@
 //!
 //! Errors: a deterministic refusal by the store (a NUL in a language, an
 //! invalid span: `Rejected` and its kin) is the entry's outcome
-//! (`LogResponse::Failed`), the same on every replica, and the marker does
-//! not move for it. An I/O-class error (`Storage`, `Corrupt`, `Locked`) is
+//! (`LogResponse::Failed`), the same on every replica; the refused write
+//! rolls back and the marker alone then moves to the entry in its own
+//! transaction, so the store's marker always equals openraft's
+//! `last_applied`. An I/O-class error (`Storage`, `Corrupt`, `Locked`) is
 //! returned to openraft as a `StorageError`: it stops the node rather than
 //! let one replica silently diverge; a restart replays from the marker.
 //!
@@ -141,8 +143,25 @@ impl StoreStateMachine {
             }
             Err(e) if is_refusal(&e) => {
                 tracing::warn!(index = marker.index, error = %e, "entry refused by the store");
+                // The refused write rolled back; the entry is still applied
+                // (its outcome is the refusal), so move the marker to it in
+                // a transaction of its own. Otherwise openraft's
+                // `last_applied` would run ahead of the store's marker: a
+                // snapshot's `last_log_id` would be too low and a restart
+                // after a purge would find `applied_state < last_purged`.
+                Self::mark_refused(store, marker)?;
                 Ok(LogResponse::Failed(ErrDetail::of(&e)))
             }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Stamp `marker` alone after a refused entry. Already-applied (a
+    /// concurrent replay stamped it) is fine; an I/O error is fatal.
+    fn mark_refused(store: &V2Store, marker: RaftMarker) -> Result<(), StoreError> {
+        match store.mark_only(marker, None) {
+            Ok(()) => Ok(()),
+            Err(StoreError::Rejected(m)) if m.starts_with("raft marker ") => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -409,5 +428,81 @@ mod tests {
         assert!(!is_refusal(&StoreError::Storage("x".into())));
         assert!(!is_refusal(&StoreError::Corrupt("x".into())));
         assert!(!is_refusal(&StoreError::Locked("x".into())));
+    }
+
+    fn log_id(index: u64) -> LogId {
+        LogId::new(openraft::CommittedLeaderId::new(1, 1), index)
+    }
+
+    fn blank(index: u64) -> Entry {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    /// A normal entry the store refuses deterministically (undecodable).
+    fn refused(index: u64) -> Entry {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(super::super::types::LogRequest {
+                command: vec![0x0a, 0xff],
+            }),
+        }
+    }
+
+    fn open_slot(db: &Path) -> Arc<StoreSlot> {
+        StoreSlot::open(db, vec![], None, Duration::from_secs(900)).unwrap()
+    }
+
+    #[test]
+    fn a_refused_entry_moves_the_marker_to_its_log_id() {
+        let d = tempfile::tempdir().unwrap();
+        let slot = open_slot(&d.path().join("g.redb"));
+        let out = StoreStateMachine::apply_all(&slot, vec![blank(1), refused(2)]).unwrap();
+        assert_eq!(out[0], LogResponse::Marked);
+        assert!(matches!(out[1], LogResponse::Failed(_)), "{:?}", out[1]);
+        let marker = slot.with_store(|s| s.raft_marker()).unwrap().unwrap();
+        assert_eq!(log_id_of(marker), log_id(2));
+        // A replay of the refused entry is a skip, not a second refusal.
+        let again = StoreStateMachine::apply_all(&slot, vec![refused(2)]).unwrap();
+        assert_eq!(again, vec![LogResponse::Skipped]);
+    }
+
+    /// The review's blocker scenario: a refusal is the last applied entry,
+    /// then a snapshot is built, the log purged up to it, and the node
+    /// restarted: the store's applied state, openraft's last applied and
+    /// the snapshot's last log id all agree, and none is below the purge.
+    #[tokio::test]
+    async fn refusal_then_snapshot_purge_restart_keeps_applied_state_consistent() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        let lp = crate::raft::log_store::log_path(&db);
+        {
+            let slot = open_slot(&db);
+            let mut sm = StoreStateMachine::new(Arc::clone(&slot));
+            let out = sm.apply(vec![blank(1), refused(2)]).await.unwrap();
+            assert!(matches!(out[1], LogResponse::Failed(_)));
+            let mut b = sm.get_snapshot_builder().await;
+            let snap = b.build_snapshot().await.unwrap();
+            assert_eq!(snap.meta.last_log_id, Some(log_id(2)));
+            let mut log = RedbLogStore::open(&lp).unwrap();
+            openraft::storage::RaftLogStorage::purge(&mut log, log_id(2))
+                .await
+                .unwrap();
+            slot.close();
+        }
+        // Restart.
+        let slot = open_slot(&db);
+        let mut sm = StoreStateMachine::new(slot);
+        let (applied, _) = sm.applied_state().await.unwrap();
+        let mut log = RedbLogStore::open(&lp).unwrap();
+        let state = openraft::storage::RaftLogStorage::get_log_state(&mut log)
+            .await
+            .unwrap();
+        let snap = sm.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(applied, Some(log_id(2)));
+        assert_eq!(state.last_purged_log_id, Some(log_id(2)));
+        assert_eq!(snap.meta.last_log_id, Some(log_id(2)));
     }
 }

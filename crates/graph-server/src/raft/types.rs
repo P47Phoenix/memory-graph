@@ -94,7 +94,8 @@ pub enum LogResponse {
     Vacuum(VacuumOutcome),
     /// The entry's write was refused as a whole by the store (a validation
     /// error such as a NUL in a language: deterministic, so every replica
-    /// refuses it the same way) and the marker did not move.
+    /// refuses it the same way); nothing was written but the marker, which
+    /// moved to this entry like any other.
     Failed(ErrDetail),
 }
 
