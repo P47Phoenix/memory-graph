@@ -40,7 +40,7 @@ A **content hash** is a short code computed from a file's bytes. Change one lett
 Rust's word for a package of code. Think of it as one box of a bigger toy set. Used in: [ADR 0002](adr/0002-parsing-and-crate-layout.md).
 
 ## Daemon
-A program that keeps running in the background and does work for other programs. Here, `memory-graph serve` is the daemon: it is the only program that opens the database file, and it also acts as the MCP server. The command line asks it instead of opening the file itself. Decided (not built yet). Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
+A program that keeps running in the background and does work for other programs. Here, `memory-graph serve` is the daemon: it is the only program that opens the database file, and it may also host the MCP server (open, issue #109). The command line asks it instead of opening the file itself. Decided (not built yet); [ADR 0004](adr/0004-client-server-and-replication.md) makes it reachable over the network (gRPC) and lets several of them form a cluster (epic story 20 builds it). Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md), [architecture diagrams](architecture-diagrams.md).
 
 ## Dictionary
 A table that gives each distinct piece of text one small number (its id). Like a school register: instead of writing "Alexandra Petrovna" everywhere, you write "17". Used in: [ADR 0003](adr/0003-data-model.md).
@@ -64,13 +64,16 @@ The simple splitter that works for any language. It cuts text into tokens withou
 The three levels above a symbol. A **file** is one source file. A **repo** (repository) is a project folder tracked by git. An **org** (organization) is the group that owns several repos. Like: org = a school, repo = a class, file = a student's notebook. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0003](adr/0003-data-model.md).
 
 ## fsync
-An operating-system call that forces data out of memory onto the disk, so it survives a power cut. Used in: [ADR 0003](adr/0003-data-model.md).
+An operating-system call that forces data out of memory onto the disk, so it survives a power cut. Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md).
 
 ## Grain / roll-up
 The **grain** is the level you count at: token, symbol (the nearest enclosing symbol), method (the nearest enclosing method or function), class (the nearest enclosing type, or a Rust impl block), file, repo or org. A **roll-up** adds up hits from small things into bigger things. Example: "the word `foo` appears 40 times in this repo" is a roll-up to repo grain. Used in: [ADR 0003](adr/0003-data-model.md), [learnings](learnings.md).
 
 ## Graph / node / parent
 A **graph** is a set of things (**nodes**) plus links between them. Today the nodes are org, repo, file, symbol and token (ADR 0003's v2 proposal stops storing tokens as nodes). A node's **parent** is the thing that contains it: a file's parent is its repo. Like a family tree. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0003](adr/0003-data-model.md).
+
+## gRPC / protobuf
+**gRPC** is a widely used way for one program to call another over the network, with the messages described in `.proto` files (**protobuf**, a compact binary encoding). The `.proto` files are the contract between the command line and `memory-graph serve`; they carry a `protocol_version` so old and new programs can tell whether they understand each other. Used in: [ADR 0004](adr/0004-client-server-and-replication.md).
 
 ## Index / indexing
 To **index** is to read source files and store what we found so we can search fast later. An **index** (the result) is like the one at the back of a book. Used in: [ADR 0001](adr/0001-storage.md).
@@ -108,11 +111,14 @@ Wasted space inside the fixed-size blocks ("pages") a database stores data in. L
 ## proptest / property test
 A test that makes many random inputs and checks that a rule always holds (for example "saving then loading gives back the same thing"). Used in: [ADR 0003](adr/0003-data-model.md).
 
+## Raft (leader, follower, learner, log, snapshot, linearizable read)
+**Raft** is a recipe for keeping several copies of a database in agreement. One node is the **leader**: it writes every change into a numbered **log** and sends it to the **followers**; a change counts as committed once more than half the nodes have it on disk, and only then is it acknowledged. If the leader disappears the followers elect a new one. A **learner** receives the log but does not vote (used while a new node catches up). A **snapshot** here is a copy of the whole database file at one committed log position, so a node that fell far behind can catch up in one step. A **linearizable read** is a read that the leader confirms with a majority before answering, so it is guaranteed to include every acknowledged write; a **local read** answers from the node's own copy and may lag slightly. Used in: [ADR 0004](adr/0004-client-server-and-replication.md).
+
 ## redb
 The pure-Rust database library we use. It stores data in one file, supports transactions, and lets only one process open the file at a time (an exclusive lock). Used in: [ADR 0001](adr/0001-storage.md), [learnings](learnings.md).
 
 ## RemoteStore
-The piece of the command line that has the same shape as the local database code (the `Store` trait) but sends each request to the daemon over a socket. Because it has the same shape, the same tests can check both. Decided (not built yet). Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
+The piece of the command line that has the same shape as the local database code (the `Store` trait) but sends each request to the daemon over the network (gRPC, [ADR 0004](adr/0004-client-server-and-replication.md); ADR 0003 first said a local socket). Because it has the same shape, the same tests can check both. Decided (not built yet; epic story 20). Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md), [architecture diagrams](architecture-diagrams.md).
 
 ## Store trait
 The list of things any database back end must be able to do (index a file, search, describe, prune, take a snapshot), written as a Rust `trait`. The command line only knows this list, so the back end (today redb) can be swapped. `StoreRead` is the read-only half, which a snapshot also offers. Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
@@ -127,7 +133,7 @@ One slice of a database that is split up so it can grow bigger. Like several fil
 A **snapshot** is a frozen view of the data at one moment. **Snapshot isolation** means a reader keeps seeing that frozen view even while a writer changes the database. This holds within one process only: another process holding the file blocks other processes' readers (see ADR 0003 Q5; the decided fix is the daemon). Used in: [ADR 0003](adr/0003-data-model.md), [learnings](learnings.md).
 
 ## Socket (local socket)
-A private channel between two programs on the same computer, here a Unix socket file next to the database (for example `<db>.sock`). Like an internal phone line: nothing goes over the network. The messages carry a `protocol_version` so old and new programs can tell whether they understand each other. Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
+A private channel between two programs on the same computer, here a Unix socket file next to the database (for example `<db>.sock`). Like an internal phone line: nothing goes over the network. The messages carry a `protocol_version` so old and new programs can tell whether they understand each other. Superseded by a network connection (gRPC over TCP) in [ADR 0004](adr/0004-client-server-and-replication.md). Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
 
 ## Span
 The exact place in a file where something sits: start and end byte offsets, plus line and column. Like "page 3, line 5, letters 2 to 9". Used in: [ADR 0002](adr/0002-parsing-and-crate-layout.md), [ADR 0003](adr/0003-data-model.md).

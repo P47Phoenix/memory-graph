@@ -4,7 +4,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 
 ## Suggested reading order for a newcomer
 1. [Glossary](glossary.md): plain meanings of every technical word. Skim it, and come back when a word is unclear.
-2. The "In plain words" box at the top of [ADR 0001](adr/0001-storage.md) and [ADR 0002](adr/0002-parsing-and-crate-layout.md). [ADR 0003](adr/0003-data-model.md) also opens with an "In plain words" section (no special vocabulary, then a table of the decisions made and the questions still open).
+2. The "In plain words" box at the top of [ADR 0001](adr/0001-storage.md) and [ADR 0002](adr/0002-parsing-and-crate-layout.md). [ADR 0003](adr/0003-data-model.md) and [ADR 0004](adr/0004-client-server-and-replication.md) also open with an "In plain words" section (no special vocabulary, then a table of the decisions made and the questions still open).
 3. The [epic](epic-code-memory-graph.md), to see the goal and the planned stories.
 4. The technical sections of the ADRs, then the [spikes](#spikes-evidence) for evidence.
 5. [Learnings](learnings.md) as a quick list of key facts and pitfalls.
@@ -13,7 +13,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 - [glossary.md](glossary.md): every technical term in plain words, in alphabetical order.
 
 ## Product
-- [Epic: Language-agnostic code memory graph](epic-code-memory-graph.md): the goal, how we measure success, and the list of planned stories (1-19).
+- [Epic: Language-agnostic code memory graph](epic-code-memory-graph.md): the goal, how we measure success, and the list of planned stories (1-19, plus 20-25 for the client/server and cluster work proposed by ADR 0004).
 
 ## Architecture decision records
 | ADR | Status | One line |
@@ -21,6 +21,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 | [0001 Storage engine](adr/0001-storage.md) | Accepted (provisional); JSON-node part proposed to be superseded by 0003 | Where the data lives: the redb database with our own graph on top, each node knowing its `parent`. |
 | [0002 Parsing and crate layout](adr/0002-parsing-and-crate-layout.md) | Accepted | How the code is split into three crates, how language readers report spans, the fallback tokenizer for any language, and the pure-Rust check in CI. |
 | [0003 Data model](adr/0003-data-model.md) | **Proposed** (not accepted; Q4 and Q5 decided by the user 2026-09-20) | A proposal to store tokens in a much smaller form (a dictionary, one stream per file, and count postings) instead of one record per token; also covers sharding, snapshots and migration. Opens with an "In plain words" section. Decided: an owning daemon for cross-process access, and shard by (org, repo) with the sharding build deferred. |
+| [0004 Client/server and replication](adr/0004-client-server-and-replication.md) | **Proposed** (decisions taken with the user 2026-09-28; not accepted) | A proposal to run memory-graph as a real database: `memory-graph serve` reached over gRPC from any machine, hostable as a Raft cluster where every node serves reads, any node accepts writes, and a write is acknowledged only once a majority has it on disk. Supersedes the Unix-socket transport of ADR 0003 Q5. Opens with an "In plain words" section. |
 
 ## Spikes (evidence)
 | Spike | TL;DR | Raw data |

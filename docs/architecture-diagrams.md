@@ -492,7 +492,7 @@ sequenceDiagram
     redb-->>Srch: opened
 ```
 
-Decided, not built (`memory-graph serve`, socket, `RemoteStore`, fallback):
+Decided, not built (`memory-graph serve`, socket, `RemoteStore`, fallback). *2026-09-28: the transport is superseded by gRPC over TCP and the daemon can be a Raft cluster, [ADR 0004](adr/0004-client-server-and-replication.md) (Proposed); the shape below (owner, `RemoteStore: Store`, direct-open fallback) still holds.*
 
 ```mermaid
 sequenceDiagram
