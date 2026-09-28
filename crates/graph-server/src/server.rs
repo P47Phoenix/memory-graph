@@ -1,7 +1,9 @@
 //! Start-up and shutdown (ADR 0004 D4/D10): open the store, bind, write the
-//! LOCK sidecar, start the Raft node, serve until told to stop, then stop
-//! accepting, finish in-flight requests (bounded by the grace period), shut
-//! the Raft node down, close the store and remove the sidecar.
+//! LOCK sidecar, start the Raft node, serve until told to stop. Shutdown
+//! order: health `""` and `memory-graph.ready` go `NOT_SERVING` at once; stop
+//! accepting and finish in-flight requests (bounded by the grace period);
+//! shut the Raft node down (bounded by the grace period too, logged on
+//! expiry); close the store; remove the sidecar last.
 use crate::conn::ConnIo;
 use crate::extractors::{extractors_hash, share};
 use crate::lock::LockFile;
@@ -190,10 +192,25 @@ pub async fn start(
         .set_service_status("", ServingStatus::Serving)
         .await;
     {
+        // Shutdown step 1: the moment shutdown starts, both health names
+        // go NOT_SERVING (load balancers stop routing here during the
+        // drain), before anything else is torn down.
         let reporter = reporter.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown.wait().await;
+            mark_not_serving(&reporter).await;
+        });
+    }
+    {
+        let reporter = reporter.clone();
+        let shutdown = shutdown.clone();
         let mut rx = raft.raft.metrics();
         tokio::spawn(async move {
             loop {
+                if shutdown.is_triggered() {
+                    return;
+                }
                 let ready = rx.borrow().current_leader.is_some();
                 reporter
                     .set_service_status(
@@ -205,6 +222,11 @@ pub async fn start(
                         },
                     )
                     .await;
+                if shutdown.is_triggered() {
+                    // Raced the shutdown watcher: never leave SERVING behind.
+                    mark_not_serving(&reporter).await;
+                    return;
+                }
                 if rx.changed().await.is_err() {
                     return;
                 }
@@ -252,6 +274,7 @@ pub async fn start(
         let shutdown = shutdown.clone();
         let slot = Arc::clone(&slot);
         let raft = raft.clone();
+        let reporter = reporter.clone();
         let grace = cfg.shutdown_grace;
         tokio::spawn(async move {
             let result = tokio::select! {
@@ -266,8 +289,18 @@ pub async fn start(
                     Ok(())
                 }
             };
-            raft.shutdown().await;
+            // Health already went NOT_SERVING when shutdown began (above);
+            // re-assert it in case serving ended on its own.
+            mark_not_serving(&reporter).await;
+            if tokio::time::timeout(grace, raft.shutdown()).await.is_err() {
+                tracing::warn!(
+                    ?grace,
+                    "raft node did not shut down within the grace period; continuing"
+                );
+            }
             slot.close();
+            // Last: the sidecar names this process as the holder until the
+            // store is closed.
             drop(lock);
             tracing::info!("stopped");
             result
@@ -280,6 +313,16 @@ pub async fn start(
         slot,
         raft,
     })
+}
+
+/// Shutdown step 1: report `""` and [`READY_SERVICE`] as `NOT_SERVING`.
+pub(crate) async fn mark_not_serving(reporter: &tonic_health::server::HealthReporter) {
+    reporter
+        .set_service_status("", ServingStatus::NotServing)
+        .await;
+    reporter
+        .set_service_status(READY_SERVICE, ServingStatus::NotServing)
+        .await;
 }
 
 /// The blocking entry point (`memory-graph serve`): builds a multi-thread
@@ -330,5 +373,38 @@ async fn wait_for_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic_health::pb::health_server::Health;
+    use tonic_health::pb::{health_check_response::ServingStatus as Pb, HealthCheckRequest};
+    use tonic_health::server::{HealthReporter, HealthService};
+
+    async fn status(svc: &HealthService, name: &str) -> i32 {
+        svc.check(tonic::Request::new(HealthCheckRequest {
+            service: name.into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+    }
+
+    /// Shutdown step 1 reports both health names NOT_SERVING.
+    #[tokio::test]
+    async fn mark_not_serving_flips_both_health_names() {
+        let reporter = HealthReporter::new();
+        let svc = HealthService::from_health_reporter(reporter.clone());
+        reporter
+            .set_service_status(READY_SERVICE, ServingStatus::Serving)
+            .await;
+        assert_eq!(status(&svc, "").await, Pb::Serving as i32);
+        assert_eq!(status(&svc, READY_SERVICE).await, Pb::Serving as i32);
+        mark_not_serving(&reporter).await;
+        assert_eq!(status(&svc, "").await, Pb::NotServing as i32);
+        assert_eq!(status(&svc, READY_SERVICE).await, Pb::NotServing as i32);
     }
 }
