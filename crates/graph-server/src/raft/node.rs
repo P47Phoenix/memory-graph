@@ -408,6 +408,17 @@ impl RaftNode {
         if let Err(e) = self.raft.shutdown().await {
             tracing::warn!(error = %e, "raft shutdown");
         }
+        // A background compaction after a purge keeps `raft.redb` open;
+        // wait for it so a restart in this process can reopen the file.
+        let log = self.log_store.clone();
+        let drained = tokio::task::spawn_blocking(move || {
+            log.wait_compaction(super::log_store::COMPACT_DRAIN)
+        })
+        .await
+        .unwrap_or(false);
+        if !drained {
+            tracing::warn!("raft shutdown: the log compaction did not end in time");
+        }
     }
 
     /// The log file's size.
@@ -532,6 +543,12 @@ pub fn repair_stale_snapshot(
         "the store is ahead of the current snapshot and the log (an interrupted snapshot \
          install); building a snapshot of the store before starting"
     );
+    let started = std::time::Instant::now();
     snaps.build(slot)?;
+    tracing::info!(
+        marker,
+        took_ms = started.elapsed().as_millis() as u64,
+        "built a snapshot of the store at start-up"
+    );
     Ok(true)
 }

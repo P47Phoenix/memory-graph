@@ -1257,6 +1257,50 @@ fn a_slow_append_longer_than_the_heartbeat_still_replicates() {
     assert_eq!(l.metrics().current_term, term, "no election");
 }
 
+/// Final review 1: while a slow follower's transfer is under way the
+/// leader's log keeps growing, so openraft's retries ask for more entries
+/// than the transfer carries. They join it (a partial success up to what
+/// it carried) rather than starting a second, overlapping transfer that
+/// would split the link; nothing stale keeps running. The follower
+/// converges with no election. The writer stops as soon as a retry joined
+/// a shorter transfer (bounded at 200 writes), so the test waits on the
+/// event, not on a guess of how long it takes.
+#[test]
+fn a_growing_log_joins_the_slow_transfer_instead_of_overlapping_it() {
+    let delay = TEST_RAFT.heartbeat_ms * 4;
+    let mut tb = ClusterTestbed::with_config(3, exts(), move |id, c| {
+        if id == 3 {
+            c.testing.delay_append_entries_ms = Some(delay);
+        }
+    });
+    tb.form();
+    let leader = tb.leader();
+    let l = tb.node(leader).raft().unwrap();
+    let term = l.metrics().current_term;
+    let c = tb.client(leader);
+    // Forming the cluster changes the membership twice while node 3 is
+    // still receiving: openraft drops those replication streams, and the
+    // connection's drop aborts their transfers (measured: 3 here). Not
+    // asserted, as it depends on timing; the unit test
+    // `stale_transfers_are_aborted_and_a_vote_change_never_joins` pins it.
+    let aborted_at_form = l.net_stats.inflight_aborted();
+    let mut written = 0;
+    while l.net_stats.partial_joins() == 0 {
+        assert!(written < 200, "no retry joined a shorter transfer");
+        let f = small_file(written);
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+        written += 1;
+    }
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    assert_eq!(tb.client(3).count_nodes(NodeKind::File).unwrap(), written);
+    assert_eq!(l.metrics().current_term, term, "no election");
+    assert!(l.net_stats.joined_transfers() >= l.net_stats.partial_joins());
+    // While the log grew nothing superseded a transfer (same vote, same
+    // place in the log), so nothing needed aborting: the retries joined.
+    // Before this fix each longer retry started a second transfer.
+    assert_eq!(l.net_stats.inflight_aborted(), aborted_at_form);
+}
+
 /// QA 2: `AddLearner` asks the server it is about to add who it is, and
 /// refuses one of another cluster, one running other extractors, and one
 /// that is another node; the membership is unchanged.

@@ -26,17 +26,22 @@
 //!   link and be fsynced; if dropping our future cancelled the RPC, such an
 //!   entry would never arrive (a livelock). So an `AppendEntries` that
 //!   carries entries runs as its own task ([`APPEND_TRANSFER_TIMEOUT`]
-//!   bounds it), and openraft's timeout only stops the wait: its retry of
-//!   the same entries (same vote, previous log id and entry ids) joins the
-//!   transfer still under way instead of starting over. Heartbeats (no
-//!   entries) are sent directly and meanwhile still reach the follower, so
-//!   a long transfer does not cause an election.
+//!   bounds it), and openraft's timeout only stops the wait: its retry
+//!   with the same vote, previous log id and first entry joins the
+//!   transfer still under way instead of starting over (a retry asking
+//!   for more entries, the log having grown, gets `PartialSuccess` up to
+//!   the last entry the transfer carried; see [`plan`]). Any other
+//!   request, and any request under another vote, aborts the transfer
+//!   first, so at most one runs per peer and stale ones never split the
+//!   link's bandwidth; dropping the connection aborts it too. Heartbeats
+//!   (no entries) are sent directly and meanwhile still reach the
+//!   follower, so a long transfer does not cause an election.
 //! * Channels are cached per target node id and rebuilt when the member's
 //!   address changes or a transport call failed.
 //! * [`FaultPlan`] / [`FaultyNetwork`]: test fault injection (partitions,
 //!   dropped `AppendEntries`), a wrapper that stage C/D tests reuse.
 use super::snapshot_dir::read_sidecar;
-use super::types::{NodeId, TypeConfig};
+use super::types::{LogId, NodeId, TypeConfig};
 use super::wire;
 use crate::paths::{ClusterIdentity, CLUSTER_ID_HEADER, EXTRACTORS_HASH_HEADER};
 use graph_proto::pb;
@@ -85,6 +90,8 @@ struct NetStatsInner {
     peers: HashMap<NodeId, PeerStats>,
     payload_too_large: u64,
     joined_transfers: u64,
+    partial_joins: u64,
+    inflight_aborted: u64,
 }
 
 #[derive(Default)]
@@ -162,6 +169,19 @@ impl NetStats {
     /// openraft retries that joined a transfer still under way.
     pub fn joined_transfers(&self) -> u64 {
         self.with(|s| s.joined_transfers)
+    }
+
+    /// Joins of a transfer that carried fewer entries than the retry asked
+    /// for (the log grew meanwhile), answered as a partial success.
+    pub fn partial_joins(&self) -> u64 {
+        self.with(|s| s.partial_joins)
+    }
+
+    /// Transfers still under way that were aborted: superseded by a
+    /// request for another vote or another place in the log, or their
+    /// connection dropped.
+    pub fn inflight_aborted(&self) -> u64 {
+        self.with(|s| s.inflight_aborted)
     }
 }
 
@@ -274,25 +294,66 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
     }
 }
 
-/// What makes two `AppendEntries` the same transfer: the leader's vote,
-/// the previous log id, and the first and last entry ids with the count.
-type AppendKey = (
-    pb::RaftVote,
-    Option<pb::RaftLogId>,
-    Option<(u64, u64)>,
-    Option<(u64, u64)>,
-    usize,
-);
+/// What identifies an `AppendEntries` transfer: the leader's vote, the
+/// previous log id, the first entry's id and the last one's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendKey {
+    vote: pb::RaftVote,
+    prev: Option<pb::RaftLogId>,
+    first: Option<pb::RaftLogId>,
+    last: Option<LogId>,
+}
 
-fn append_key(r: &AppendEntriesRequest<TypeConfig>) -> AppendKey {
-    let id = |e: &super::types::Entry| (e.log_id.leader_id.term, e.log_id.index);
-    (
-        wire::vote_to_pb(&r.vote),
-        r.prev_log_id.as_ref().map(wire::log_id_to_pb),
-        r.entries.first().map(id),
-        r.entries.last().map(id),
-        r.entries.len(),
-    )
+impl AppendKey {
+    pub fn of(r: &AppendEntriesRequest<TypeConfig>) -> Self {
+        Self {
+            vote: wire::vote_to_pb(&r.vote),
+            prev: r.prev_log_id.as_ref().map(wire::log_id_to_pb),
+            first: r.entries.first().map(|e| wire::log_id_to_pb(&e.log_id)),
+            last: r.entries.last().map(|e| e.log_id),
+        }
+    }
+}
+
+/// What a new `AppendEntries` does about the transfer still under way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    /// Wait for it: same vote, same previous log id, same first entry.
+    /// `upto`: it carries fewer entries than asked (openraft's log grew
+    /// between the tries), so its success only proves the follower matches
+    /// up to this id and is answered as `PartialSuccess(upto)`.
+    Join { upto: Option<LogId> },
+    /// Abort it (stale: another vote or another place in the log) and send
+    /// this one.
+    Replace,
+}
+
+/// See [`Plan`]. A differing vote never joins: an answer to the old
+/// leader term's request is not an answer to this one.
+pub fn plan(inflight: &AppendKey, new: &AppendKey) -> Plan {
+    if inflight.vote != new.vote || inflight.prev != new.prev || inflight.first != new.first {
+        return Plan::Replace;
+    }
+    let shorter = match (&inflight.last, &new.last) {
+        (Some(a), Some(b)) => a.index < b.index,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    Plan::Join {
+        upto: if shorter { inflight.last } else { None },
+    }
+}
+
+/// A joined transfer's answer for the request that joined it (see
+/// [`Plan::Join`]): a success of fewer entries is partial.
+pub fn joined_response(
+    r: AppendEntriesResponse<NodeId>,
+    upto: Option<LogId>,
+) -> AppendEntriesResponse<NodeId> {
+    match (r, upto) {
+        (AppendEntriesResponse::Success, Some(u)) => AppendEntriesResponse::PartialSuccess(Some(u)),
+        (r, _) => r,
+    }
 }
 
 type Transfer = tokio::task::JoinHandle<Result<pb::AppendEntriesResponse, String>>;
@@ -304,6 +365,20 @@ pub struct GrpcConnection {
     net: GrpcNetwork,
     /// The last `AppendEntries` with entries, possibly still under way.
     inflight: Option<(AppendKey, Transfer)>,
+}
+
+impl Drop for GrpcConnection {
+    /// openraft drops a connection when it stops replicating to the peer
+    /// (a new leader term, a membership change): its transfer must not
+    /// keep sending.
+    fn drop(&mut self) {
+        if let Some((_, t)) = self.inflight.take() {
+            if !t.is_finished() {
+                t.abort();
+                self.net.stats.with(|s| s.inflight_aborted += 1);
+            }
+        }
+    }
 }
 
 /// Whether a status is the transport failing (reconnect) rather than the
@@ -368,18 +443,31 @@ impl GrpcConnection {
 
     /// Send (or join) an `AppendEntries` that carries entries, as a task
     /// that outlives openraft's timeout on this call.
+    /// Returns the answer and, when it joined a transfer of fewer entries,
+    /// the last entry that transfer carried (see [`Plan::Join`]).
     async fn transfer(
         &mut self,
         key: AppendKey,
         req: pb::AppendEntriesRequest,
-    ) -> Result<pb::AppendEntriesResponse, Unreachable> {
-        let joined = matches!(&self.inflight, Some((k, _)) if *k == key);
-        if joined {
-            self.net.stats.with(|s| s.joined_transfers += 1);
+    ) -> Result<(pb::AppendEntriesResponse, Option<LogId>), Unreachable> {
+        let decided = self.inflight.as_ref().map(|(k, _)| plan(k, &key));
+        let upto = if let Some(Plan::Join { upto }) = decided {
+            self.net.stats.with(|s| {
+                s.joined_transfers += 1;
+                if upto.is_some() {
+                    s.partial_joins += 1;
+                }
+            });
+            upto
         } else {
-            // Another transfer (older entries, an older vote) may still be
-            // running: it finishes or times out on its own; its answer is
-            // not this call's.
+            // A stale transfer (another vote, another place in the log)
+            // would split the link's bandwidth with this one: stop it.
+            if let Some((_, old)) = self.inflight.take() {
+                if !old.is_finished() {
+                    old.abort();
+                    self.net.stats.with(|s| s.inflight_aborted += 1);
+                }
+            }
             let mut c = self.client()?;
             let net = self.net.clone();
             let target = self.target;
@@ -398,7 +486,8 @@ impl GrpcConnection {
                 }
             });
             self.inflight = Some((key, task));
-        }
+            None
+        };
         let (_, task) = self.inflight.as_mut().expect("set above");
         // Cancel-safe: if openraft's timeout drops this future, the task
         // (and the handle in `inflight`) stays for the retry to join.
@@ -407,7 +496,7 @@ impl GrpcConnection {
         match out {
             Ok(Ok(r)) => {
                 self.net.stats.succeeded(self.target, true);
-                Ok(r)
+                Ok((r, upto))
             }
             Ok(Err(e)) => Err(self.failed(e)),
             Err(e) => Err(self.failed(format!("append task: {e}"))),
@@ -444,13 +533,15 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
                 PayloadTooLarge::new_entries_hint(fit as u64),
             ));
         }
-        let resp = if req.entries.is_empty() {
+        let (resp, upto) = if req.entries.is_empty() {
             let mut c = self.client()?;
-            self.unary(&option, c.append_entries(req)).await?
+            (self.unary(&option, c.append_entries(req)).await?, None)
         } else {
-            self.transfer(append_key(&rpc), req).await?
+            self.transfer(AppendKey::of(&rpc), req).await?
         };
-        wire::append_resp_from_pb(resp).map_err(|e| RPCError::Unreachable(self.failed(e)))
+        wire::append_resp_from_pb(resp)
+            .map(|r| joined_response(r, upto))
+            .map_err(|e| RPCError::Unreachable(self.failed(e)))
     }
 
     async fn vote(
@@ -691,6 +782,140 @@ mod tests {
         assert_eq!(entries_that_fit(&[4, 4], 10), 2);
         assert_eq!(entries_that_fit(&[4, 4, 4], 10), 2);
         assert_eq!(entries_that_fit(&[40, 4], 10), 1);
+    }
+
+    fn lid(term: u64, index: u64) -> LogId {
+        LogId::new(openraft::CommittedLeaderId::new(term, 1), index)
+    }
+
+    fn req(term: u64, prev: u64, first: u64, last: u64) -> AppendEntriesRequest<TypeConfig> {
+        AppendEntriesRequest {
+            vote: Vote::new_committed(term, 1),
+            prev_log_id: Some(lid(1, prev)),
+            leader_commit: None,
+            entries: (first..=last)
+                .map(|i| super::super::types::Entry {
+                    log_id: lid(1, i),
+                    payload: openraft::EntryPayload::Blank,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_retry_joins_only_the_same_transfer() {
+        let k = |t, p, f, l| AppendKey::of(&req(t, p, f, l));
+        // The same request, or a longer one (the log grew): join; the
+        // longer one's success is partial, up to what was sent.
+        assert_eq!(
+            plan(&k(2, 4, 5, 8), &k(2, 4, 5, 8)),
+            Plan::Join { upto: None }
+        );
+        assert_eq!(
+            plan(&k(2, 4, 5, 8), &k(2, 4, 5, 12)),
+            Plan::Join {
+                upto: Some(lid(1, 8))
+            }
+        );
+        assert_eq!(
+            plan(&k(2, 4, 5, 12), &k(2, 4, 5, 8)),
+            Plan::Join { upto: None }
+        );
+        // Another place in the log: replace.
+        assert_eq!(plan(&k(2, 4, 5, 8), &k(2, 8, 9, 12)), Plan::Replace);
+        // A vote change never reuses the old answer, same entries or not.
+        assert_eq!(plan(&k(2, 4, 5, 8), &k(3, 4, 5, 8)), Plan::Replace);
+        // A joined success of fewer entries is partial; other answers pass.
+        assert_eq!(
+            joined_response(AppendEntriesResponse::Success, Some(lid(1, 8))),
+            AppendEntriesResponse::PartialSuccess(Some(lid(1, 8)))
+        );
+        assert_eq!(
+            joined_response(AppendEntriesResponse::Conflict, Some(lid(1, 8))),
+            AppendEntriesResponse::Conflict
+        );
+        assert_eq!(
+            joined_response(AppendEntriesResponse::Success, None),
+            AppendEntriesResponse::Success
+        );
+    }
+
+    /// A peer that accepts TCP connections and never answers: every
+    /// transfer to it stays under way until aborted.
+    async fn silent_peer() -> (String, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        (addr, h)
+    }
+
+    fn connection(addr: &str, stats: &NetStats) -> GrpcConnection {
+        GrpcConnection {
+            target: 2,
+            addr: addr.to_string(),
+            net: GrpcNetwork::new(
+                Arc::new(crate::paths::ClusterIdentity::fixed("c")),
+                "h",
+                stats.clone(),
+            ),
+            inflight: None,
+        }
+    }
+
+    /// Start `r` as openraft does and give up waiting after a moment (its
+    /// per-call timeout): the transfer stays under way in `inflight`.
+    async fn start(c: &mut GrpcConnection, r: AppendEntriesRequest<TypeConfig>) {
+        let key = AppendKey::of(&r);
+        let pb = wire::append_to_pb(&r);
+        let waited = tokio::time::timeout(Duration::from_millis(50), c.transfer(key, pb)).await;
+        assert!(waited.is_err(), "a silent peer never answers");
+    }
+
+    fn inflight_handle(c: &GrpcConnection) -> tokio::task::AbortHandle {
+        c.inflight.as_ref().expect("under way").1.abort_handle()
+    }
+
+    async fn wait_finished(h: &tokio::task::AbortHandle) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !h.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the aborted transfer ended");
+    }
+
+    /// A retry after a vote change does not join (and so never takes) the
+    /// old term's answer: the old transfer is aborted and a new one sent.
+    /// A retry of the same request joins. Dropping the connection aborts
+    /// what is under way.
+    #[tokio::test]
+    async fn stale_transfers_are_aborted_and_a_vote_change_never_joins() {
+        let (addr, peer) = silent_peer().await;
+        let stats = NetStats::default();
+        let mut c = connection(&addr, &stats);
+        start(&mut c, req(2, 4, 5, 8)).await;
+        let first = inflight_handle(&c);
+        start(&mut c, req(2, 4, 5, 10)).await;
+        assert_eq!(stats.joined_transfers(), 1);
+        assert_eq!(stats.partial_joins(), 1);
+        assert_eq!(inflight_handle(&c).id(), first.id(), "joined, not resent");
+        assert!(!first.is_finished());
+        start(&mut c, req(3, 4, 5, 8)).await;
+        wait_finished(&first).await;
+        assert_eq!(stats.inflight_aborted(), 1);
+        assert_eq!(stats.joined_transfers(), 1, "a new vote did not join");
+        let second = inflight_handle(&c);
+        assert_ne!(second.id(), first.id());
+        drop(c);
+        wait_finished(&second).await;
+        assert_eq!(stats.inflight_aborted(), 2, "the drop aborted it");
+        peer.abort();
     }
 
     #[test]

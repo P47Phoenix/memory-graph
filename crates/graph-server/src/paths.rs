@@ -392,6 +392,14 @@ pub fn plan(
             restore: None,
         });
     }
+    if !paths.is_empty() && matches!(init, InitMode::Restart) && failed_first_start(paths) {
+        return Err(StoreError::Rejected(format!(
+            "`{}` holds only what a failed first start leaves (a blank Raft log, an empty \
+             store, no node.json); retry that first start with its flags (--bootstrap, or \
+             --join from stage C) rather than a plain restart",
+            dir.display()
+        )));
+    }
     if !paths.is_empty() && (matches!(init, InitMode::Restart) || !failed_first_start(paths)) {
         return Err(StoreError::Rejected(format!(
             "`{}` holds a store or a Raft log but no node.json; it was not created by \
@@ -434,6 +442,14 @@ pub fn plan(
 /// (a `--bootstrap` or uninitialized first start retried after, say, the
 /// port was in use); anything else is refused, because its identity cannot
 /// be known.
+///
+/// Only an explicit first-start mode (`--bootstrap`, or an uninitialized
+/// start waiting for a join) takes this path; a plain restart is refused
+/// with an error saying to retry with those flags. That is safe because a
+/// blank log holds no vote, no entries and no purge point, and the store
+/// no marker and no data: nothing that a node with an identity could have
+/// promised a cluster is lost by treating the directory as new, and the
+/// explicit flag is the operator saying this is a first start.
 pub fn failed_first_start(paths: &NodePaths) -> bool {
     use graph_store::StoreRead;
     let log_blank = matches!(
@@ -605,7 +621,12 @@ mod tests {
                 .unwrap()
                 .bootstrap
         );
-        assert!(plan(&p, &InitMode::Restart, Some(1)).is_err());
+        let e = plan(&p, &InitMode::Restart, Some(1)).unwrap_err();
+        assert!(
+            matches!(e, StoreError::Rejected(ref m) if m.contains("failed first start")
+                && m.contains("--bootstrap")),
+            "{e:?}"
+        );
         // A store with data is somebody's store.
         let d2 = tempfile::tempdir().unwrap();
         let p2 = NodePaths::for_data_dir(d2.path());

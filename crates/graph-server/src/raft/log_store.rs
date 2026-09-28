@@ -27,7 +27,7 @@ use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
@@ -38,6 +38,16 @@ const K_PURGED: &str = "last_purged";
 /// Free space a purge may leave in `raft.redb` before it is compacted
 /// (beyond the live pages again): see [`RedbLogStore::compact_if_sparse`].
 const COMPACT_SLACK: u64 = 1 << 20;
+
+/// The most live log a compaction may rewrite (the stall bound): above it
+/// the purge skips compacting and a later purge, with less left, tries
+/// again. See [`RedbLogStore::compact_if_sparse`].
+pub const COMPACT_MAX_LIVE: u64 = 64 << 20;
+
+/// How long dropping the last handle of a log store waits for a
+/// background compaction to end (it cannot be interrupted, and the file
+/// stays open until it ends).
+pub const COMPACT_DRAIN: std::time::Duration = std::time::Duration::from_secs(120);
 
 const KIND_BLANK: u8 = 0;
 const KIND_NORMAL: u8 = 1;
@@ -97,6 +107,75 @@ fn open_err(path: &Path, e: redb::DatabaseError) -> StoreError {
     }
 }
 
+/// Whether a background compaction runs, waitable.
+#[derive(Default)]
+struct Busy {
+    running: Mutex<bool>,
+    idle: Condvar,
+}
+
+impl Busy {
+    fn lock(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mark it running; false if it already was.
+    fn start(&self) -> bool {
+        !std::mem::replace(&mut *self.lock(), true)
+    }
+
+    fn stop(&self) {
+        *self.lock() = false;
+        self.idle.notify_all();
+    }
+
+    fn is_running(&self) -> bool {
+        *self.lock()
+    }
+
+    /// Wait until no compaction runs; false on timeout.
+    fn wait_idle(&self, timeout: std::time::Duration) -> bool {
+        let g = self.lock();
+        let (g, _) = self
+            .idle
+            .wait_timeout_while(g, timeout, |r| *r)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !*g
+    }
+}
+
+/// Clears [`Busy`] when the background compaction ends, also when its
+/// task is dropped unrun (a runtime shutting down).
+struct BusyGuard(Arc<Busy>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+/// Shared by the handles callers hold (not by the background
+/// compaction's clone): when the last one goes, the store is closing, and
+/// that drop waits for a running compaction, whose clone keeps the file
+/// open, so a reopen right after never finds it locked.
+struct Owner {
+    busy: Arc<Busy>,
+    closing: Arc<AtomicBool>,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.closing.store(true, Ordering::SeqCst);
+        if !self.busy.wait_idle(COMPACT_DRAIN) {
+            tracing::warn!(
+                "raft log: a compaction still runs {COMPACT_DRAIN:?} after the log was closed"
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RedbLogStore {
     /// Every transaction holds the read side; the post-purge compaction
@@ -110,7 +189,13 @@ pub struct RedbLogStore {
     /// The file size right after the last compaction (0: none yet).
     compacted_bytes: Arc<AtomicU64>,
     /// A background compaction is running.
-    compacting: Arc<AtomicBool>,
+    compacting: Arc<Busy>,
+    /// The last caller-held handle was dropped: a compaction skips.
+    closing: Arc<AtomicBool>,
+    /// `None` only in the background compaction's own clone.
+    owner: Option<Arc<Owner>>,
+    /// See [`COMPACT_MAX_LIVE`] (tests lower it).
+    max_live: Arc<AtomicU64>,
     observer: Option<AppendObserver>,
     #[cfg(test)]
     compact_gate: Arc<std::sync::Mutex<Option<CompactGate>>>,
@@ -225,12 +310,20 @@ impl RedbLogStore {
         wt.open_table(LOG)?;
         wt.open_table(META)?;
         wt.commit()?;
+        let compacting = Arc::new(Busy::default());
+        let closing = Arc::new(AtomicBool::new(false));
         let s = Self {
             db: Arc::new(RwLock::new(db)),
             path: path.to_path_buf(),
             appended_bytes: Arc::new(AtomicU64::new(0)),
             compacted_bytes: Arc::new(AtomicU64::new(0)),
-            compacting: Arc::new(AtomicBool::new(false)),
+            owner: Some(Arc::new(Owner {
+                busy: Arc::clone(&compacting),
+                closing: Arc::clone(&closing),
+            })),
+            compacting,
+            closing,
+            max_live: Arc::new(AtomicU64::new(COMPACT_MAX_LIVE)),
             observer: None,
             #[cfg(test)]
             compact_gate: Arc::default(),
@@ -327,13 +420,24 @@ impl RedbLogStore {
     /// `stat`. Otherwise it compacts only when the file is at least twice
     /// its live pages plus [`COMPACT_SLACK`], so a steady state does not
     /// compact on every purge. `Database::compact` commits with two-phase
-    /// commits (crash safe: an interrupted compaction leaves a valid file);
-    /// it holds the write side of the lock, so log reads and writes wait
-    /// for it (bounded by the entries left after the purge,
-    /// `--log-keep-entries`). `purge` runs it in the background, so the
-    /// Raft core never awaits it. Returns whether it compacted; a failure
-    /// is logged, never fatal (the log is intact either way).
+    /// commits (crash safe: an interrupted compaction leaves a valid file).
+    ///
+    /// **Stall bound.** It holds the write side of the lock, so every log
+    /// read and write (`append`, `save_vote`, `save_committed`) waits for
+    /// it, and the Raft core awaits those. `purge` runs it in the
+    /// background, so the core never awaits the compaction itself, but it
+    /// may await an append queued behind it. So it runs only when the live
+    /// log after the purge is at most [`COMPACT_MAX_LIVE`] (64 MiB): redb
+    /// then rewrites at most that much plus a few fsynced commits, well
+    /// under a second on a disk writing 100 MB/s, below the 1 s minimum
+    /// election timeout. A larger live log is skipped (logged at info) and
+    /// the next purge, with less left, tries again. Returns whether it
+    /// compacted; a failure is logged, never fatal (the log is intact
+    /// either way).
     pub fn compact_if_sparse(&self) -> bool {
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
         let file = self.file_bytes();
         let floor = self.compacted_bytes.load(Ordering::Relaxed);
         if file < floor.saturating_add(COMPACT_SLACK) {
@@ -369,6 +473,17 @@ impl RedbLogStore {
         if file < live.saturating_mul(2).saturating_add(COMPACT_SLACK) {
             return false;
         }
+        let max_live = self.max_live.load(Ordering::Relaxed);
+        if live > max_live {
+            tracing::info!(
+                file,
+                live,
+                max_live,
+                "raft log: compaction skipped, the live log is too large to rewrite without \
+                 stalling appends (a later purge retries)"
+            );
+            return false;
+        }
         let mut db = self.db.write().unwrap_or_else(|p| p.into_inner());
         #[cfg(test)]
         {
@@ -381,7 +496,11 @@ impl RedbLogStore {
                 g();
             }
         }
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
         // `compact` itself loops until a pass makes no progress.
+        let started = std::time::Instant::now();
         if let Err(e) = db.compact() {
             tracing::warn!(error = %e, "raft log: compaction skipped");
         }
@@ -392,6 +511,7 @@ impl RedbLogStore {
             before = file,
             after,
             live,
+            took_ms = started.elapsed().as_millis() as u64,
             "raft log compacted after a purge"
         );
         true
@@ -399,7 +519,19 @@ impl RedbLogStore {
 
     /// Whether a background compaction (started by a purge) is running.
     pub fn is_compacting(&self) -> bool {
-        self.compacting.load(Ordering::SeqCst)
+        self.compacting.is_running()
+    }
+
+    /// Wait (blocking) until no background compaction runs; false on
+    /// timeout. Shutdown calls it, so the file can be reopened after.
+    pub fn wait_compaction(&self, timeout: std::time::Duration) -> bool {
+        self.compacting.wait_idle(timeout)
+    }
+
+    /// Test-only: lower [`COMPACT_MAX_LIVE`].
+    #[doc(hidden)]
+    pub fn set_compact_max_live(&self, bytes: u64) {
+        self.max_live.store(bytes, Ordering::Relaxed);
     }
 
     /// Record every append's commit and flush callback (tests only).
@@ -654,14 +786,17 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         // In the background: the Raft core awaits `purge`, and a
         // compaction may take long enough to delay its heartbeats past an
         // election timeout. At most one runs at a time.
-        if !self.compacting.swap(true, Ordering::SeqCst) {
-            let s = self.clone();
+        // Its clone holds no `Owner`: dropping the caller's last handle
+        // waits for it (see `Owner`), so the file is closed on return.
+        if self.compacting.start() {
+            let mut s = self.clone();
+            s.owner = None;
+            let done = BusyGuard(Arc::clone(&self.compacting));
             tokio::task::spawn_blocking(move || {
-                let flag = Arc::clone(&s.compacting);
                 s.compact_if_sparse();
                 // Release the database before saying it is done.
                 drop(s);
-                flag.store(false, Ordering::SeqCst);
+                drop(done);
             });
         }
         Ok(())
@@ -780,9 +915,10 @@ mod tests {
         wait_compacted(&log);
         let after = log.file_bytes();
         // redb rounds a 1 MiB value up to a 2 MiB allocation and keeps its
-        // region layout: measured 84 MB -> 11.7 MB.
+        // region layout: measured 84 MB -> 11.7 MB (the two live entries
+        // take 4 MiB of it).
         assert!(
-            after < 16 << 20,
+            after < 12 << 20,
             "a purge of 22 of 24 MiB entries leaves {after} B (was {before} B)"
         );
         // Compacting again right away is not worth it.
@@ -857,6 +993,89 @@ mod tests {
             [23, 24, 25]
         );
         log.set_compact_gate(None);
+    }
+
+    /// The stall bound: a purge that leaves more live log than the cap
+    /// does not compact (the write lock would be held for a long rewrite);
+    /// once the cap allows it, the next attempt does.
+    #[test]
+    fn a_live_log_above_the_cap_is_not_compacted() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("raft.redb");
+        let mut log = RedbLogStore::open(&path).unwrap();
+        fill_24_mib(&log);
+        // 4 entries (8 MiB of pages) stay live; the cap is 1 MiB.
+        log.set_compact_max_live(1 << 20);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(log.purge(LogId::new(CommittedLeaderId::new(1, 1), 20)))
+            .unwrap();
+        wait_compacted(&log);
+        let before = log.file_bytes();
+        assert!(before > 24 << 20, "not compacted: {before} B");
+        assert!(!log.compact_if_sparse(), "skipped above the cap");
+        assert_eq!(log.file_bytes(), before);
+        log.set_compact_max_live(COMPACT_MAX_LIVE);
+        assert!(log.compact_if_sparse(), "compacts within the cap");
+        assert!(log.file_bytes() < before / 2);
+    }
+
+    /// CI (Linux): dropping the log right after a purge, while its
+    /// background compaction runs, must close the file before the drop
+    /// returns, or a reopen finds it `Locked`. Deterministic: the gate
+    /// holds the compaction open until the drop has begun waiting.
+    #[test]
+    fn dropping_the_log_during_a_compaction_closes_it_before_returning() {
+        use std::sync::mpsc;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("raft.redb");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut log = RedbLogStore::open(&path).unwrap();
+        fill_24_mib(&log);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        log.set_compact_gate(Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        })));
+        rt.block_on(log.purge(LogId::new(CommittedLeaderId::new(1, 1), 22)))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the compaction started");
+        let (dropped_tx, dropped_rx) = mpsc::channel::<()>();
+        let dropper = std::thread::spawn(move || {
+            drop(log);
+            dropped_tx.send(()).unwrap();
+        });
+        // The drop cannot return while the compaction holds the file.
+        assert!(dropped_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err());
+        release_tx.send(()).unwrap();
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the drop returned once the compaction ended");
+        dropper.join().unwrap();
+        let log = RedbLogStore::open(&path).expect("reopened, not Locked");
+        assert_eq!(log.len().unwrap(), 2);
+        drop(log);
+        // Without the gate: drop at once after each purge, reopen at once.
+        for round in 0..5u64 {
+            let mut log = RedbLogStore::open(&path).unwrap();
+            fill_24_mib(&log);
+            rt.block_on(log.purge(LogId::new(CommittedLeaderId::new(1, 1), 22)))
+                .unwrap();
+            drop(log);
+            RedbLogStore::open(&path)
+                .unwrap_or_else(|e| panic!("round {round}: reopen after a purge: {e:?}"));
+        }
     }
 
     /// The snapshot policy's byte trigger survives a restart: a reopened
