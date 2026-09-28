@@ -142,6 +142,9 @@ pub struct TestingHooks {
     /// The default deadline of a request this node forwards to the leader
     /// (when the client sent none) instead of `forward::FORWARD_*_TIMEOUT`.
     pub forward_timeout_ms: Option<u64>,
+    /// A `TransferLeader` holds its slot (writes refused, heartbeats on)
+    /// this long before it starts, so a test can act while one runs.
+    pub transfer_hold_ms: Option<u64>,
 }
 
 impl ServeConfig {
@@ -528,10 +531,12 @@ pub async fn start(
         shutdown: shutdown.clone(),
         sysinfo: cfg.sysinfo.clone(),
         stall_writes_after: cfg.testing.stall_writes_after,
+        transfer_hold: cfg.testing.transfer_hold_ms.map(Duration::from_millis),
         writes_proposed: std::sync::atomic::AtomicUsize::new(0),
         fwd: crate::forward::Forwarder::new(node_id, cfg.fault_plan.clone())
             .with_default_timeout(cfg.testing.forward_timeout_ms.map(Duration::from_millis)),
         auto_promoting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        last_elect: std::sync::Mutex::new(None),
     });
 
     // Health (D10): "" is SERVING once the store is open (now);

@@ -48,6 +48,8 @@ pub struct Ctx {
     pub sysinfo: Option<SysInfoFn>,
     /// [`crate::server::TestingHooks::stall_writes_after`].
     pub stall_writes_after: Option<usize>,
+    /// [`crate::server::TestingHooks::transfer_hold_ms`].
+    pub transfer_hold: Option<std::time::Duration>,
     /// Write proposals seen so far (counted only with a stall hook set).
     pub writes_proposed: std::sync::atomic::AtomicUsize,
     /// Forwarding to the leader (writes, membership changes, the
@@ -56,6 +58,8 @@ pub struct Ctx {
     /// Joiners the leader promotes once they caught up (`--auto-promote`);
     /// one task per node id.
     pub auto_promoting: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// When this node last started an election on `Admin.TriggerElect`.
+    pub last_elect: std::sync::Mutex<Option<Instant>>,
 }
 
 /// How long a follower's `LINEARIZABLE` read waits to apply the leader's

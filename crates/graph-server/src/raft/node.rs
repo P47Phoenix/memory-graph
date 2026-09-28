@@ -15,7 +15,7 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::impls::BasicNode;
 use openraft::{Config, Raft, RaftMetrics, ServerState, SnapshotPolicy};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,6 +132,19 @@ pub struct RaftNode {
     /// up, gets the old leader's vote. Taken with a compare-exchange: one
     /// transfer at a time.
     pub transferring: Arc<AtomicBool>,
+    /// Proposals (writes and membership changes) between their check of
+    /// `transferring` and their end: a transfer waits for zero after it
+    /// set the flag, so no entry can be appended behind its back.
+    pub in_flight: Arc<AtomicUsize>,
+}
+
+/// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
+pub struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The leader as this node knows it: id and advertised address.
@@ -256,6 +269,7 @@ impl RaftNode {
             withhold_leader: false,
             settings: s,
             transferring: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         };
         if node.sole_voter() {
             node.raft
@@ -330,6 +344,16 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Enter a proposal: counted in [`in_flight`](Self::in_flight) first,
+    /// then refused (`NoLeader`) while a transfer runs. The count drops
+    /// when the returned guard does.
+    fn proposal(&self) -> Result<InFlight, StoreError> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let guard = InFlight(Arc::clone(&self.in_flight));
+        self.no_leader_while_transferring()?;
+        Ok(guard)
+    }
+
     /// Snapshots this node installed from a leader since it started.
     pub fn snapshots_installed(&self) -> u64 {
         self.snapshots.installed()
@@ -339,7 +363,7 @@ impl RaftNode {
     /// (ADR 0004 D7): returns the entry's response and its log index. The
     /// disk guard runs first (`RESOURCE_EXHAUSTED` on the wire).
     pub async fn propose(&self, req: LogRequest) -> Result<(LogResponse, u64), StoreError> {
-        self.no_leader_while_transferring()?;
+        let _in_flight = self.proposal()?;
         // Only the node that would append checks its disk; a follower
         // answers `NotLeader` naming the leader, whatever its disk.
         if self.metrics().state == ServerState::Leader {
@@ -362,7 +386,7 @@ impl RaftNode {
         addr: &str,
         blocking: bool,
     ) -> Result<u64, StoreError> {
-        self.no_leader_while_transferring()?;
+        let _in_flight = self.proposal()?;
         // openraft's own `blocking` waits only its default half second and
         // then answers success whatever the learner's state, so the wait
         // for catch-up is ours, with a real timeout and a real error.
@@ -395,7 +419,7 @@ impl RaftNode {
     /// Make exactly `voters` the voters (joint consensus, learners kept).
     /// Returns the final membership entry's index.
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<u64, StoreError> {
-        self.no_leader_while_transferring()?;
+        let _in_flight = self.proposal()?;
         let r = committed(self.raft.change_membership(voters, true)).await?;
         Ok(r.log_id().index)
     }
@@ -405,7 +429,7 @@ impl RaftNode {
     /// replacement of the voter set, so two promotes racing each other
     /// both take effect. Returns the final membership entry's index.
     pub async fn promote(&self, id: NodeId) -> Result<u64, StoreError> {
-        self.no_leader_while_transferring()?;
+        let _in_flight = self.proposal()?;
         let r = committed(self.raft.change_membership(
             openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
             true,
@@ -418,7 +442,7 @@ impl RaftNode {
     /// is not kept as a learner). The guards are the caller's
     /// (`Admin.Remove`). Returns the final membership entry's index.
     pub async fn remove(&self, id: NodeId, voter: bool) -> Result<u64, StoreError> {
-        self.no_leader_while_transferring()?;
+        let _in_flight = self.proposal()?;
         let ids = BTreeSet::from([id]);
         let change = if voter {
             openraft::ChangeMembers::RemoveVoters(ids)

@@ -21,24 +21,28 @@
 //!   the old one (joint consensus needs both), or no voter would be left,
 //!   are refused.
 //!
-//! TransferLeader (openraft 0.9 has no transfer of its own): the leader
+//! `TransferLeader` (openraft 0.9 has no transfer of its own): the leader
 //! checks the target is a voter with a replication lag of zero, takes the
 //! one transfer slot (a concurrent second transfer is refused), refuses new
-//! writes and membership changes (NoLeader, the client retries) so its
-//! log stops growing, checks the lag again, then asks the target to
-//! campaign every [TRANSFER_POLL] (Admin.TriggerElect ->
-//! Raft::trigger().elect()) until it leads or [TRANSFER_WAIT] passes.
-//! Heartbeats stay on (openraft 0.9 can switch off heartbeats, but not
-//! appends alone, and appends are what the write refusal stops): the
-//! followers keep their leader lease, so a transfer that fails (the target
-//! is down) disturbs nobody and leadership simply stays. The leader's own
-//! vote is not leased by its heartbeats, so it grants the target's vote
-//! (the target's log is as long as its own) and steps down; in a larger
-//! cluster the other followers' leases then run out (lection_timeout_max
-//! after the last heartbeat) before any of them campaigns on its own (lease
-//! plus at least lection_timeout_min), and the target, asking every
-//! poll, collects their votes first. The leader's own elections are off
-//! during the transfer and switched back on whatever the outcome.
+//! writes and membership changes (`NoLeader`, the client retries), waits
+//! until no proposal that passed its check earlier is still in flight, and
+//! checks the target's lag again (an entry appended behind the transfer's
+//! back leaves the target a shorter log, and nobody votes for it). It then
+//! waits, best effort, for every reachable voter's appends to settle, stops
+//! its heartbeats and its own elections, and asks the target to campaign
+//! every [`TRANSFER_POLL`] (`Admin.TriggerElect` -> `Raft::trigger().elect()`)
+//! until it leads or [`TRANSFER_WAIT`] passes. Voters grant the vote once
+//! their leader lease (`election_timeout_max` since the last heartbeat or
+//! acknowledged append) runs out, before any of them campaigns on its own
+//! (the lease plus at least `election_timeout_min`), so the target, asking
+//! every poll, wins. A campaigning target ignores requests for
+//! [`ELECT_SETTLE`] after its own election starts, so the votes of a
+//! campaign (each persisted with an fsync) can come back before the next.
+//! A `TriggerElect` that fails or takes over [`TRIGGER_TIMEOUT`] ends the
+//! transfer at once, well within a lease: heartbeats resume before any
+//! follower's lease runs out, so a transfer to a dead target disturbs
+//! nobody. Heartbeats, elections and writes are switched back on whatever
+//! the outcome (a guard).
 use super::{status, Ctx};
 use crate::forward::{forward_error, Route};
 use crate::raft::NodeId;
@@ -295,8 +299,9 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Statu
 }
 
 /// Holds the transfer slot (new writes and membership changes answer
-/// `NoLeader`) and switches this node's own elections off, both undone when
-/// dropped, whatever the outcome.
+/// `NoLeader`) and switches this node's own elections off (the transfer
+/// switches its heartbeats off later); all undone when dropped, whatever
+/// the outcome.
 struct TransferGuard<'a> {
     ctx: &'a Ctx,
 }
@@ -321,10 +326,26 @@ impl<'a> TransferGuard<'a> {
 
 impl Drop for TransferGuard<'_> {
     fn drop(&mut self) {
-        self.ctx.raft.raft.runtime_config().elect(true);
+        let rc = self.ctx.raft.raft.runtime_config();
+        rc.heartbeat(true);
+        rc.elect(true);
         self.ctx.raft.transferring.store(false, Ordering::SeqCst);
     }
 }
+
+/// How long one `TriggerElect` to the transfer target may take: well under
+/// a leader lease (heartbeats are off meanwhile).
+/// How long `TransferLeader` waits for the other voters' in-flight appends
+/// to settle before it asks the target to campaign.
+pub const TRANSFER_SETTLE: Duration = Duration::from_secs(5);
+
+/// A transfer target that is campaigning ignores a new `TriggerElect` for
+/// this long after the election it started (see `trigger_elect`): well
+/// under `election_timeout_min`, so the target still campaigns before any
+/// other follower's own timer fires.
+pub const ELECT_SETTLE: Duration = Duration::from_millis(300);
+
+pub const TRIGGER_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How often `TransferLeader` asks the target to campaign, and checks
 /// whether it won.
@@ -376,22 +397,90 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
     let addr = node.addr.clone();
     wait_caught_up(ctx, to).await?;
     let _guard = TransferGuard::new(ctx)?;
+    // A proposal that passed its check before the flag went up may still
+    // append: wait until none is in flight (each ends once applied), so
+    // the lag check below sees every entry this leader will append.
+    let drained = Instant::now() + TRANSFER_CATCH_UP;
+    while ctx.raft.in_flight.load(Ordering::SeqCst) > 0 {
+        if Instant::now() >= drained {
+            return Err(rejected(format!(
+                "writes in flight did not finish within {TRANSFER_CATCH_UP:?}; leadership \
+                 stays here"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Re-check under the guard: no new write is accepted now, so what was
     // in flight when the first check passed must reach the target too.
     wait_caught_up(ctx, to).await?;
-    tracing::info!(to, "transferring leadership: asking the target to campaign");
+    // Every append a voter acknowledges renews leases (the followers', and
+    // this leader's own through the quorum ack), and openraft re-sends an
+    // append that timed out. So wait, best effort, until no append is in
+    // flight to any reachable voter: then, with writes refused and
+    // heartbeats off, nothing renews a lease.
+    let voters: BTreeSet<NodeId> = ctx
+        .raft
+        .metrics()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .collect();
+    let settled = ctx
+        .raft
+        .raft
+        .wait(Some(TRANSFER_SETTLE))
+        .metrics(
+            |m| {
+                let last = m.last_log_index;
+                let repl = m.replication.clone().unwrap_or_default();
+                voters.iter().all(|v| {
+                    *v == m.id
+                        || repl.get(v).is_some_and(|l| l.map(|l| l.index) == last)
+                        || ctx.raft.net_stats.last_error(*v, 1).is_some()
+                })
+            },
+            "every reachable voter caught up",
+        )
+        .await
+        .is_ok();
+    if !settled {
+        tracing::warn!("transfer: a voter still lags; transferring anyway");
+    }
+    if let Some(hold) = ctx.transfer_hold {
+        // Test hook: the slot is held (writes refused, heartbeats still on)
+        // this long before the transfer proper starts.
+        tokio::time::sleep(hold).await;
+    }
+    tracing::info!(
+        to,
+        "transferring leadership: heartbeats off, asking the target to campaign"
+    );
+    ctx.raft.raft.runtime_config().heartbeat(false);
     let deadline = Instant::now() + TRANSFER_WAIT;
     loop {
         let mut client = ctx.fwd.admin_client(&addr)?;
         match tokio::time::timeout(
-            PROBE_TIMEOUT,
+            TRIGGER_TIMEOUT,
             client.trigger_elect(pb::TriggerElectRequest {}),
         )
         .await
         {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!(to, error = %e, "TriggerElect failed"),
-            Err(_) => tracing::debug!(to, "TriggerElect timed out"),
+            // The target cannot be asked: give up at once, well within one
+            // lease, so the heartbeats resume (the guard) before any
+            // follower's lease runs out and nobody else campaigns.
+            Ok(Err(e)) => {
+                return Err(rejected(format!(
+                    "node {to} did not answer TriggerElect ({}); node {me} keeps leadership",
+                    e.message()
+                )))
+            }
+            Err(_) => {
+                return Err(rejected(format!(
+                    "node {to} did not answer TriggerElect within {TRIGGER_TIMEOUT:?}; node {me} \
+                     keeps leadership"
+                )))
+            }
         }
         let won = ctx
             .raft
@@ -818,7 +907,24 @@ impl pb::admin_server::Admin for AdminService {
         &self,
         _req: Request<pb::TriggerElectRequest>,
     ) -> Result<Response<pb::TriggerElectResponse>, Status> {
-        // openraft ignores it on a leader and on a learner.
+        // openraft ignores it on a leader and on a learner. The transferring
+        // leader asks every `TRANSFER_POLL`; a new election every time would
+        // restart this node's campaign before the votes of the last one
+        // (each persisted with an fsync on the voter) came back, so while
+        // an election it started is younger than `ELECT_SETTLE` the request
+        // is a no-op.
+        {
+            let mut last = self
+                .ctx
+                .last_elect
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let campaigning = self.ctx.raft.metrics().state == ServerState::Candidate;
+            if campaigning && last.is_some_and(|t| t.elapsed() < ELECT_SETTLE) {
+                return Ok(Response::new(pb::TriggerElectResponse {}));
+            }
+            *last = Some(Instant::now());
+        }
         tracing::info!("campaigning on request (a leadership transfer)");
         self.ctx
             .raft

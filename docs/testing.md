@@ -241,30 +241,31 @@ well under 30 s (the slowest, the partition, about 5 s):
   below quorum (a voter killed, the leader's `Status` showing its
   `last_error`) even with `--force` are refused; with every voter back and
   caught up, `--force` works.
-- 	ransfer_leader_moves_leadership (3 nodes) and ..._five_nodes: sent
+- `transfer_leader_moves_leadership` (3 nodes) and `..._five_nodes`: sent
   to a follower, forwarded; exactly the target leads (never a third node),
   the old leader follows it, writes work through both; the 3-node case runs
   a writer through the old leader during the transfer (refused with
-  NoLeader and retried), refuses a second concurrent transfer and a
-  membership change, and moves leadership twice more.
-- _failed_transfer_disturbs_nobody: a transfer to a killed target is
-  refused after 20 s with the leader and the term unchanged on every node.
-- emove_needs_a_quorum_of_the_old_voter_set_too: 4 voters, 2 down;
+  `NoLeader` and retried) and moves leadership twice more.
+- `a_failed_transfer_disturbs_nobody`: a transfer to a killed target ends
+  at once with the leader and the term unchanged on every node; while it
+  holds its slot (the `transfer_hold_ms` hook, 3 s) a second transfer is
+  refused and a membership change answers `NoLeader`.
+- `remove_needs_a_quorum_of_the_old_voter_set_too`: 4 voters, 2 down;
   removing a dead one is refused (joint consensus needs the old set too).
-- _removed_auto_promote_learner_stays_removed: its ejoin is refused
+- `a_removed_auto_promote_learner_stays_removed`: its `rejoin` is refused
   and its own re-join loop does not bring it back.
-- ollower_linearizable_read_never_misses_an_acknowledged_write: a
-  follower whose appends are dropped answers a LINEARIZABLE read with
-  NoLeader, never stale data, and the new write once healed.
-- _forward_to_a_hung_leader_times_out, _forward_to_a_dead_leader_is_no_leader,
-  _forwarded_request_is_never_forwarded_again,
-  prune_and_vacuum_sent_twice_are_idempotent: forwarding's deadline, its
+- `follower_linearizable_read_never_misses_an_acknowledged_write`: a
+  follower whose appends are dropped answers a `LINEARIZABLE` read with
+  `NoLeader`, never stale data, and the new write once healed.
+- `a_forward_to_a_hung_leader_times_out`, `a_forward_to_a_dead_leader_is_no_leader`,
+  `a_forwarded_request_is_never_forwarded_again`,
+  `prune_and_vacuum_sent_twice_are_idempotent`: forwarding's deadline, its
   real transport-failure path (no fault plan), the loop guard, and
   idempotent re-sends.
-- join_request_with_other_extractors_is_refused_without_a_probe,
-  join_probe_catches_a_node_running_other_extractors,
-  _join_that_times_out_names_the_cleanup: each join guard on its own.
-- Every test here arms support::watchdog (5 min): a hung test exits the
+- `join_request_with_other_extractors_is_refused_without_a_probe`,
+  `join_probe_catches_a_node_running_other_extractors`,
+  `a_join_that_times_out_names_the_cleanup`: each join guard on its own.
+- Every test here arms `support::watchdog` (5 min): a hung test exits the
   binary with its name instead of holding CI.
 - `partition_minority_serves_local_reads_refuses_writes_and_converges`:
   `FaultPlan::partition([m], majority)` (the plan also gates forwarding);

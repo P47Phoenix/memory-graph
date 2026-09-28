@@ -550,6 +550,12 @@ fn transfer_leader_moves_leadership() {
         })
     };
     let (now, took) = transfer.join().unwrap();
+    if now.is_err() {
+        for id in tb.ids() {
+            let m = tb.node(id).raft().unwrap().metrics();
+            eprintln!("DBG node {id}: state {:?} term {} leader {:?} vote {:?} last {:?} applied {:?} repl {:?}", m.state, m.current_term, m.current_leader, m.vote, m.last_log_index, m.last_applied, m.replication);
+        }
+    }
     assert_eq!(now.unwrap(), target);
     eprintln!("transfer 1 (under writes) took {took:?}");
     stop.store(true, Ordering::SeqCst);
@@ -1180,7 +1186,11 @@ fn a_join_that_times_out_names_the_cleanup() {
 #[test]
 fn a_failed_transfer_disturbs_nobody() {
     let _w = watchdog("a_failed_transfer_disturbs_nobody", TEST_LIMIT);
-    let mut tb = ClusterTestbed::new(3, exts());
+    // The transfer holds its slot 3 s before starting: a deterministic
+    // window for the concurrent requests below.
+    let mut tb = ClusterTestbed::with_config(3, exts(), |_, cfg| {
+        cfg.testing.transfer_hold_ms = Some(3000);
+    });
     tb.form();
     let leader = tb.leader();
     let target = node_ids_other_than(&tb, &[leader])[0];
@@ -1193,8 +1203,8 @@ fn a_failed_transfer_disturbs_nobody() {
         let c = tb.client(leader);
         std::thread::spawn(move || c.admin_transfer_leader(target))
     });
-    // While the transfer runs (the target is dead, so it runs its full
-    // 20 s: deterministic), a second transfer and a membership
+    // While the transfer holds its slot (the test hook, 3 s), a second
+    // transfer and a membership
     // change sent straight to the old leader are refused.
     let flag = Arc::clone(&tb.node(old).raft().unwrap().transferring);
     wait_until("the old leader to start the transfer", || {
@@ -1227,7 +1237,7 @@ fn a_failed_transfer_disturbs_nobody() {
         "{change:?}"
     );
     let e = transfer.join().unwrap().unwrap_err();
-    assert!(e.to_string().contains("did not take over"), "{e}");
+    assert!(e.to_string().contains("keeps leadership"), "{e}");
     assert_eq!(tb.leader(), leader);
     for id in node_ids_other_than(&tb, &[target]) {
         let m = tb.node(id).raft().unwrap().metrics();

@@ -286,5 +286,5 @@ pub struct Watchdog {
     _tx: std::sync::mpsc::Sender<()>,
 }
 
-/// The default [watchdog] limit of a cluster test.
+/// The default [`watchdog`] limit of a cluster test.
 pub const TEST_LIMIT: Duration = Duration::from_secs(300);
