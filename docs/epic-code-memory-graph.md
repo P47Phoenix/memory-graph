@@ -10,7 +10,7 @@
 - (e) p95 search latency is under 100 ms on 1,000+ files. This target is a placeholder until story 18.
 - (f) Re-indexing an unchanged repo re-parses 0 files.
 
-**Out of Scope:** MCP interface, auth, TLS on the wire, semantic or embedding search, cross-file reference resolution (call graphs, type resolution), GUI, git history, a query language (fixed query functions only), and bundled extractors beyond Rust and Python in this epic. *Amended 2026-09-28 ([ADR 0004](adr/0004-client-server-and-replication.md), Proposed):* a network server (`memory-graph serve` over gRPC) and replicated storage (a Raft cluster with durable writes, reads on every node) are now in scope as stories 20-25; "distributed storage" in the sense of sharding a database across nodes stays out of scope (ADR 0003 Q4, build deferred).
+**Out of Scope:** MCP interface, auth, TLS on the wire, semantic or embedding search, cross-file reference resolution (call graphs, type resolution), GUI, git history, a query language (fixed query functions only), and bundled extractors beyond Rust and Python in this epic. *Amended 2026-09-28 ([ADR 0004](adr/0004-client-server-and-replication.md), Accepted):* a network server (`memory-graph serve` over gRPC) and replicated storage (a Raft cluster with durable writes, reads on every node) are now in scope as stories 20-25; "distributed storage" in the sense of sharding a database across nodes stays out of scope (ADR 0003 Q4, build deferred).
 
 ### Story Map
 
@@ -35,14 +35,14 @@
 | 17 | Error tolerance and JSON output with stable API | Medium | 5 | P3 | 10, 8 |
 | 18 | Remove data and benchmark at scale | Medium | 5 | P3 | 15 |
 | 19 | Spike: WASM-hosted extractor plugins (wasmi) | Risk reduction | 3 | P4 | 4 |
-| 20 | Single-node server and client (gRPC, `serve`, `--server`) | High | 8 | P2 | ADR 0004 accepted |
+| 20 | Single-node server and client (gRPC, `serve`, `--server`) | High | 8 | P2 | ADR 0004 (accepted 2026-09-28) |
 | 21 | Replication: Raft log, snapshots, `--bootstrap` | High | 8 | P2 | 20 |
 | 22 | Membership and write forwarding | High | 8 | P2 | 21 |
 | 23 | Linearizable reads and crash tests | High | 5 | P3 | 22 |
 | 24 | Observability and packaging (metrics, health, Compose, Kubernetes) | Medium | 5 | P3 | 22 |
 | 25 | Cluster hardening (benchmarks, soak, `--update-advertise`) | Medium | 3 | P4 | 23, 24 |
 
-Total: 25 stories, 126 pts (average about 5.0). Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md) (Proposed); they start only once that ADR is accepted.
+Total: 25 stories, 126 pts (average about 5.0). Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
