@@ -398,6 +398,7 @@ fn store_error() -> impl Strategy<Value = StoreError> {
         }),
         any::<u64>().prop_map(|retry_after_ms| StoreError::NoLeader { retry_after_ms }),
         text().prop_map(StoreError::Protocol),
+        (text(), text()).prop_map(|(expected, found)| StoreError::WrongCluster { expected, found }),
     ]
 }
 
@@ -726,6 +727,14 @@ fn code_table_matches_adr_0004() {
             Code::Unavailable,
         ),
         (WireError::Protocol("v9".into()), Code::FailedPrecondition),
+        (
+            E::WrongCluster {
+                expected: "a".into(),
+                found: "b".into(),
+            }
+            .into(),
+            Code::FailedPrecondition,
+        ),
     ];
     for (e, code) in cases {
         assert_eq!(e.code(), code, "{e:?}");

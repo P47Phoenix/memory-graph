@@ -1,10 +1,35 @@
-//! `memory_graph.v1.Admin` (ADR 0004 D10): `Status`, `SysInfo`, `Compact`
-//! and `Shutdown` (stage A); `Members`, `Leader`, `TriggerSnapshot` and
-//! minimal `AddLearner` / `Promote` (stage B: no guards yet, stage C adds
-//! them together with `Remove` and `TransferLeader`, UNIMPLEMENTED until
-//! then). Membership changes must reach the leader: a follower answers
-//! `NotLeader` naming it.
+//! `memory_graph.v1.Admin` (ADR 0004 D9/D10): `Status`, `SysInfo`,
+//! `Compact` and `Shutdown` (stage A); `Members`, `Leader`,
+//! `TriggerSnapshot` (stage B); membership administration with its guards
+//! (stage C): `AddLearner`, `Promote`, `Remove`, `TransferLeader`, `Join`,
+//! plus `TriggerElect` (the transfer's second half) and `ReadIndex` (a
+//! follower's linearizable read barrier).
+//!
+//! Membership changes may be sent to any node: a follower forwards them to
+//! the leader ([`crate::forward`]), which enforces the guards:
+//!
+//! * `AddLearner` / `Join`: the new node is asked who it is (`Status`) and
+//!   refused when it is another node, belongs to another cluster
+//!   (`WrongCluster`) or runs other extractors; `Join` also checks the
+//!   store format and protocol versions, and refuses a node id that is a
+//!   member at another address or already a voter.
+//! * `Promote`: an unknown id, a voter, or a node whose extractor version
+//!   set hash differs (asked again at promotion time) is refused.
+//! * `Remove`: the leader itself ("transfer leadership first"), 3 voters
+//!   down to 2 without `force`, and any removal after which the voters that
+//!   are reachable now would be fewer than a quorum of the new voter set
+//!   (or no voter would be left) are refused.
+//!
+//! `TransferLeader` (openraft 0.9 has no transfer of its own): the leader
+//! checks the target is a voter with a replication lag of zero, stops its
+//! heartbeats and its own elections and refuses new writes (`NoLeader`, the
+//! client retries) so no append renews the followers' leader lease, waits
+//! the lease out (`election_timeout_max`), then asks the target to campaign
+//! (`Admin.TriggerElect` -> `Raft::trigger().elect()`), repeating until the
+//! target leads or [`TRANSFER_WAIT`] passes; its heartbeats and elections
+//! are switched back on whatever the outcome.
 use super::{status, Ctx};
+use crate::forward::{forward_error, Route};
 use crate::raft::NodeId;
 use crate::SERVER_VERSION;
 use graph_proto::{pb, PROTOCOL_VERSION};
@@ -13,22 +38,33 @@ use openraft::ServerState;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
 
 pub struct AdminService {
     pub ctx: Arc<Ctx>,
 }
 
-fn later(what: &str) -> Status {
-    Status::unimplemented(format!(
-        "Admin.{what} arrives with membership administration (stage C)"
-    ))
-}
-
 /// How long `TriggerSnapshot` waits for the build.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(600);
+
+/// How long a membership change waits for the node it names to answer
+/// `Status`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long `TransferLeader` waits for the target to catch up before it
+/// refuses.
+pub const TRANSFER_CATCH_UP: Duration = Duration::from_secs(10);
+
+/// How long `TransferLeader` keeps asking the target to campaign.
+pub const TRANSFER_WAIT: Duration = Duration::from_secs(20);
+
+/// How long the leader keeps trying to promote an `--auto-promote` joiner
+/// (it waits for the joiner's lag to reach zero). The joiner asks again
+/// while it is a learner, so a leader change does not lose the intent.
+pub const AUTO_PROMOTE_WAIT: Duration = Duration::from_secs(3600);
 
 fn role(s: ServerState) -> &'static str {
     match s {
@@ -40,97 +76,451 @@ fn role(s: ServerState) -> &'static str {
     }
 }
 
-/// How long `AddLearner` waits for the node it is about to add to answer
-/// `Status`.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+fn rejected(msg: String) -> Status {
+    status(StoreError::Rejected(msg))
+}
 
-impl AdminService {
-    /// Before a membership change names `id` at `addr`, ask that server
-    /// who it is (`Admin.Status`) and refuse (`FAILED_PRECONDITION`) a
-    /// server that is another node, belongs to another cluster, or runs
-    /// other extractors; `UNAVAILABLE` when it cannot be asked. Otherwise a
-    /// foreign or dead member would sit in the membership, and a leader
-    /// would replicate to it forever. (Stage C adds a typed `WrongCluster`
-    /// and the promotion gate on top.)
-    async fn probe_new_member(&self, id: NodeId, addr: &str) -> Result<(), Status> {
-        let uri = if addr.contains("://") {
-            addr.to_string()
-        } else {
-            format!("http://{addr}")
-        };
-        let st = async {
-            let ch = tonic::transport::Endpoint::from_shared(uri)
-                .map_err(|e| Status::invalid_argument(format!("bad address `{addr}`: {e}")))?
-                .connect_timeout(PROBE_TIMEOUT)
-                .connect()
-                .await
-                .map_err(|e| {
-                    Status::unavailable(format!("cannot reach node {id} at {addr}: {e}"))
-                })?;
-            pb::admin_client::AdminClient::with_interceptor(ch, graph_proto::SendVersion)
-                .status(pb::StatusRequest {})
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|e| {
-                    Status::unavailable(format!(
-                        "node {id} at {addr} did not answer Status: {}",
-                        e.message()
-                    ))
-                })
-        };
-        let st = tokio::time::timeout(PROBE_TIMEOUT, st)
-            .await
-            .map_err(|_| {
-                Status::unavailable(format!(
-                    "node {id} at {addr} did not answer within {PROBE_TIMEOUT:?}"
-                ))
-            })??;
-        if st.node_id != id {
-            return Err(Status::failed_precondition(format!(
-                "the server at {addr} is node {}, not node {id}",
-                st.node_id
-            )));
-        }
-        let ours = self.ctx.info.cluster_id();
-        if !st.cluster_id.is_empty() && st.cluster_id != ours {
-            return Err(Status::failed_precondition(format!(
-                "wrong cluster: node {id} at {addr} belongs to cluster {}, this one is {ours}",
-                st.cluster_id
-            )));
-        }
-        if st.extractors_hash != self.ctx.info.extractors_hash {
-            return Err(Status::failed_precondition(format!(
-                "node {id} at {addr} runs extractor version set `{}`, this cluster `{}`: a \
-                 replica must extract identically (ADR 0004 D5)",
-                st.extractors_hash, self.ctx.info.extractors_hash
-            )));
-        }
+/// Refuse a leader-only operation on another node (the forwarded case:
+/// the client goes to the leader itself).
+fn ensure_leader(ctx: &Ctx) -> Result<(), Status> {
+    if ctx.raft.is_leader() {
         Ok(())
+    } else {
+        Err(status(ctx.raft.not_leader()))
     }
+}
 
-    fn members(&self) -> Vec<pb::Member> {
-        let m = self.ctx.raft.metrics();
-        let mem = m.membership_config.membership();
-        let voters: BTreeSet<NodeId> = mem.voter_ids().collect();
-        mem.nodes()
-            .map(|(id, n)| pb::Member {
-                node_id: *id,
-                addr: n.addr.clone(),
-                role: if voters.contains(id) {
-                    "voter".into()
-                } else {
-                    "learner".into()
-                },
-                // Per-member hashes are exchanged in stage C (the
-                // AddLearner/promotion gate); this node knows its own.
-                extractors_hash: if *id == self.ctx.info.node_id {
-                    self.ctx.info.extractors_hash.clone()
-                } else {
-                    String::new()
-                },
+/// Ask the server at `addr` who it is (`Admin.Status`) and refuse
+/// (`FAILED_PRECONDITION`) a server that is another node, belongs to
+/// another cluster (`WrongCluster`), or runs other extractors;
+/// `UNAVAILABLE` when it cannot be asked. Otherwise a foreign or dead
+/// member would sit in the membership, and a leader would replicate to it
+/// forever.
+async fn probe_node(ctx: &Ctx, id: NodeId, addr: &str) -> Result<pb::StatusResponse, Status> {
+    let uri = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let st = async {
+        let ch = tonic::transport::Endpoint::from_shared(uri)
+            .map_err(|e| Status::invalid_argument(format!("bad address `{addr}`: {e}")))?
+            .connect_timeout(PROBE_TIMEOUT)
+            .connect()
+            .await
+            .map_err(|e| Status::unavailable(format!("cannot reach node {id} at {addr}: {e}")))?;
+        pb::admin_client::AdminClient::with_interceptor(ch, graph_proto::SendVersion)
+            .status(pb::StatusRequest {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| {
+                Status::unavailable(format!(
+                    "node {id} at {addr} did not answer Status: {}",
+                    e.message()
+                ))
             })
-            .collect()
+    };
+    let st = tokio::time::timeout(PROBE_TIMEOUT, st)
+        .await
+        .map_err(|_| {
+            Status::unavailable(format!(
+                "node {id} at {addr} did not answer within {PROBE_TIMEOUT:?}"
+            ))
+        })??;
+    if st.node_id != id {
+        return Err(Status::failed_precondition(format!(
+            "the server at {addr} is node {}, not node {id}",
+            st.node_id
+        )));
     }
+    let ours = ctx.info.cluster_id();
+    if !st.cluster_id.is_empty() && st.cluster_id != ours {
+        return Err(status(StoreError::WrongCluster {
+            expected: ours,
+            found: st.cluster_id,
+        }));
+    }
+    check_extractors(ctx, id, addr, &st.extractors_hash)?;
+    Ok(st)
+}
+
+fn check_extractors(ctx: &Ctx, id: NodeId, addr: &str, theirs: &str) -> Result<(), Status> {
+    if theirs != ctx.info.extractors_hash {
+        return Err(Status::failed_precondition(format!(
+            "node {id} at {addr} runs extractor version set `{theirs}`, this cluster `{}`: a \
+             replica must extract identically (ADR 0004 D5)",
+            ctx.info.extractors_hash
+        )));
+    }
+    Ok(())
+}
+
+fn members_of(ctx: &Ctx) -> Vec<pb::Member> {
+    let m = ctx.raft.metrics();
+    let mem = m.membership_config.membership();
+    let voters: BTreeSet<NodeId> = mem.voter_ids().collect();
+    mem.nodes()
+        .map(|(id, n)| pb::Member {
+            node_id: *id,
+            addr: n.addr.clone(),
+            role: if voters.contains(id) {
+                "voter".into()
+            } else {
+                "learner".into()
+            },
+            // Only this node's own hash is known here; the others are
+            // checked (asked) at add, join and promotion time.
+            extractors_hash: if *id == ctx.info.node_id {
+                ctx.info.extractors_hash.clone()
+            } else {
+                String::new()
+            },
+        })
+        .collect()
+}
+
+/// `Promote` on the leader, with its guards.
+async fn promote_guarded(ctx: &Ctx, id: NodeId) -> Result<u64, Status> {
+    ensure_leader(ctx)?;
+    let m = ctx.raft.metrics();
+    let mem = m.membership_config.membership();
+    let Some(node) = mem.get_node(&id) else {
+        return Err(rejected(format!(
+            "node {id} is not a member; add it as a learner first (`serve --join`, or \
+             `cluster add-learner`)"
+        )));
+    };
+    if mem.voter_ids().any(|v| v == id) {
+        return Err(rejected(format!("node {id} is already a voter")));
+    }
+    let addr = node.addr.clone();
+    // The promotion gate (ADR 0004 D9): asked now, not remembered from the
+    // join, so a learner restarted with other extractors is caught.
+    probe_node(ctx, id, &addr).await?;
+    // An add of one voter (not "these are the voters"), so concurrent
+    // promotes do not undo each other.
+    ctx.raft.promote(id).await.map_err(status)
+}
+
+/// The voters (other than this leader) that are reachable right now: RPCs
+/// to them succeed (no `last_error`) and something was matched.
+fn reachable_voters(ctx: &Ctx, voters: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
+    let m = ctx.raft.metrics();
+    let last = m.last_log_index.unwrap_or(0);
+    let repl = m.replication.clone().unwrap_or_default();
+    voters
+        .iter()
+        .copied()
+        .filter(|id| {
+            if *id == ctx.info.node_id {
+                return true;
+            }
+            let Some(Some(matched)) = repl.get(id) else {
+                return false;
+            };
+            let lag = last.saturating_sub(matched.index);
+            ctx.raft.net_stats.last_error(*id, lag).is_none()
+        })
+        .collect()
+}
+
+/// `Remove` on the leader, with its guards.
+async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Status> {
+    ensure_leader(ctx)?;
+    if id == ctx.info.node_id {
+        return Err(rejected(format!(
+            "node {id} is the leader; transfer leadership first (`cluster transfer-leader \
+             <other voter>`), then remove it"
+        )));
+    }
+    let m = ctx.raft.metrics();
+    let mem = m.membership_config.membership();
+    if mem.get_node(&id).is_none() {
+        return Err(rejected(format!("node {id} is not a member")));
+    }
+    let voters: BTreeSet<NodeId> = mem.voter_ids().collect();
+    if !voters.contains(&id) {
+        // A learner: no quorum is affected.
+        return ctx.raft.remove(id, false).await.map_err(status);
+    }
+    let after: BTreeSet<NodeId> = voters.iter().copied().filter(|v| *v != id).collect();
+    if after.is_empty() {
+        return Err(rejected(format!("removing node {id} would leave no voter")));
+    }
+    let quorum = after.len() / 2 + 1;
+    let up = reachable_voters(ctx, &after);
+    if up.len() < quorum {
+        let down: Vec<NodeId> = after.difference(&up).copied().collect();
+        return Err(rejected(format!(
+            "removing node {id} would drop below quorum: {} voters would remain ({after:?}), \
+             a quorum is {quorum}, and only {} of them are reachable now ({down:?} are not); \
+             bring them back first. --force does not override this",
+            after.len(),
+            up.len()
+        )));
+    }
+    if voters.len() == 3 && after.len() == 2 && !force {
+        return Err(rejected(format!(
+            "removing node {id} takes the cluster from 3 voters to 2, which tolerates no \
+             failure (a quorum of 2 is 2); pass --force to do it anyway, or add a voter first"
+        )));
+    }
+    ctx.raft.remove(id, true).await.map_err(status)
+}
+
+/// Switches a leader's heartbeats and elections off (and refuses new
+/// writes) for a transfer, and back on when dropped, whatever the outcome.
+struct TransferGuard<'a> {
+    ctx: &'a Ctx,
+}
+
+impl<'a> TransferGuard<'a> {
+    fn new(ctx: &'a Ctx) -> Self {
+        ctx.raft.transferring.store(true, Ordering::SeqCst);
+        let rc = ctx.raft.raft.runtime_config();
+        rc.heartbeat(false);
+        rc.elect(false);
+        Self { ctx }
+    }
+}
+
+impl Drop for TransferGuard<'_> {
+    fn drop(&mut self) {
+        let rc = self.ctx.raft.raft.runtime_config();
+        rc.heartbeat(true);
+        rc.elect(true);
+        self.ctx.raft.transferring.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `TransferLeader` on the leader (see the module doc).
+async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
+    ensure_leader(ctx)?;
+    let me = ctx.info.node_id;
+    if to == me {
+        return Ok(me);
+    }
+    let m = ctx.raft.metrics();
+    let mem = m.membership_config.membership();
+    let Some(node) = mem.get_node(&to) else {
+        return Err(rejected(format!("node {to} is not a member")));
+    };
+    if !mem.voter_ids().any(|v| v == to) {
+        return Err(rejected(format!(
+            "node {to} is a learner; promote it before transferring leadership to it"
+        )));
+    }
+    let addr = node.addr.clone();
+    ctx.raft
+        .raft
+        .wait(Some(TRANSFER_CATCH_UP))
+        .metrics(
+            |m| {
+                let last = m.last_log_index;
+                m.replication
+                    .as_ref()
+                    .and_then(|r| r.get(&to))
+                    .is_some_and(|l| l.map(|l| l.index) == last)
+            },
+            "the transfer target caught up",
+        )
+        .await
+        .map_err(|_| {
+            rejected(format!(
+                "node {to} did not catch up with the leader within {TRANSFER_CATCH_UP:?}; \
+                 leadership stays here"
+            ))
+        })?;
+    let lease = Duration::from_millis(ctx.raft.settings.election_max_ms);
+    let _guard = TransferGuard::new(ctx);
+    tracing::info!(
+        to,
+        ?lease,
+        "transferring leadership: waiting out the leader lease"
+    );
+    tokio::time::sleep(lease + Duration::from_millis(100)).await;
+    let deadline = Instant::now() + TRANSFER_WAIT;
+    let round = lease * 2;
+    loop {
+        let mut client = ctx.fwd.admin_client(&addr)?;
+        match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            client.trigger_elect(pb::TriggerElectRequest {}),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(to, error = %e, "TriggerElect failed"),
+            Err(_) => tracing::warn!(to, "TriggerElect timed out"),
+        }
+        let won = ctx
+            .raft
+            .raft
+            .wait(Some(round))
+            .metrics(|m| m.current_leader == Some(to), "the target leads")
+            .await
+            .is_ok();
+        if won {
+            tracing::info!(from = me, to, "leadership transferred");
+            return Ok(to);
+        }
+        let now = ctx.raft.metrics().current_leader;
+        if let Some(other) = now.filter(|l| *l != me && *l != to) {
+            return Err(rejected(format!(
+                "leadership moved to node {other} instead of node {to}; run the transfer again \
+                 on the new leader"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(rejected(format!(
+                "node {to} did not take over leadership within {TRANSFER_WAIT:?}; node {me} \
+                 keeps it"
+            )));
+        }
+    }
+}
+
+/// The leader's side of `--auto-promote`: promote `id` once its matched
+/// log index equals this leader's last log index (lag zero), retrying a
+/// refused change (another membership change in progress) until
+/// [`AUTO_PROMOTE_WAIT`]. Ends early when this node stops leading, `id`
+/// leaves the membership or becomes a voter. One task per node id.
+pub fn spawn_auto_promote(ctx: Arc<Ctx>, id: NodeId) {
+    {
+        let mut set = ctx
+            .auto_promoting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !set.insert(id) {
+            return;
+        }
+    }
+    tokio::spawn(async move {
+        let deadline = Instant::now() + AUTO_PROMOTE_WAIT;
+        let mut rx = ctx.raft.raft.metrics();
+        loop {
+            if ctx.shutdown.is_triggered() || !ctx.raft.is_leader() || Instant::now() >= deadline {
+                break;
+            }
+            let (member, voter, caught_up) = {
+                let m = rx.borrow();
+                let mem = m.membership_config.membership();
+                let matched = m
+                    .replication
+                    .as_ref()
+                    .and_then(|r| r.get(&id))
+                    .and_then(|l| l.map(|l| l.index));
+                (
+                    mem.get_node(&id).is_some(),
+                    mem.voter_ids().any(|v| v == id),
+                    matched.is_some() && matched == m.last_log_index,
+                )
+            };
+            if !member || voter {
+                break;
+            }
+            if caught_up {
+                match promote_guarded(&ctx, id).await {
+                    Ok(index) => {
+                        tracing::info!(id, index, "auto-promoted the joiner to voter");
+                        break;
+                    }
+                    Err(e) => tracing::warn!(id, error = %e.message(), "auto-promote; retrying"),
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            tokio::select! {
+                r = rx.changed() => if r.is_err() { break },
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+        }
+        ctx.auto_promoting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    });
+}
+
+/// `Join` on the leader.
+async fn join_guarded(ctx: &Arc<Ctx>, r: pb::JoinRequest) -> Result<pb::JoinResponse, Status> {
+    ensure_leader(ctx)?;
+    let (id, addr) = (r.node_id, r.advertise.clone());
+    if id == 0 || addr.is_empty() {
+        return Err(rejected(
+            "Join needs a node id (>= 1) and an advertised address".into(),
+        ));
+    }
+    check_extractors(ctx, id, &addr, &r.extractors_hash)?;
+    if r.store_format_version != graph_store::SCHEMA_VERSION {
+        return Err(status(StoreError::SchemaMismatch {
+            found: r.store_format_version,
+        }));
+    }
+    if r.protocol_version != PROTOCOL_VERSION {
+        return Err(status(StoreError::Protocol(format!(
+            "node {id} speaks protocol version {}, this cluster {PROTOCOL_VERSION}",
+            r.protocol_version
+        ))));
+    }
+    let m = ctx.raft.metrics();
+    let mem = m.membership_config.membership();
+    let mut log_index = 0;
+    match mem.get_node(&id) {
+        Some(n) if n.addr != addr => {
+            return Err(rejected(format!(
+                "node {id} is already a member at {}, not {addr}; remove it first (`cluster \
+                 remove {id}`) or join with another --node-id",
+                n.addr
+            )))
+        }
+        Some(_) if mem.voter_ids().any(|v| v == id) => {
+            return Err(rejected(format!(
+                "node {id} is already a voter; a voter restarts from its data directory and \
+                 never joins again (an empty directory under a voter's id would have lost its \
+                 vote and log: remove the node first)"
+            )))
+        }
+        // Already a learner at this address: a restarted joiner asking
+        // again. Nothing to add.
+        Some(_) => {}
+        None => {
+            probe_node(ctx, id, &addr).await?;
+            log_index = ctx
+                .raft
+                .add_learner(id, &addr, false)
+                .await
+                .map_err(status)?;
+            tracing::info!(id, %addr, log_index, "added a joining node as a learner");
+        }
+    }
+    if r.auto_promote {
+        spawn_auto_promote(Arc::clone(ctx), id);
+    }
+    Ok(pb::JoinResponse {
+        cluster_id: ctx.info.cluster_id(),
+        members: members_of(ctx),
+        leader_id: Some(ctx.info.node_id),
+        log_index,
+    })
+}
+
+/// Forward an admin request to the leader when this node is not it
+/// (counted like a forwarded write), else fall through to the local body.
+macro_rules! on_leader {
+    ($self:ident, $req:ident, $method:ident) => {
+        if let Route::Leader { addr, .. } = $self.ctx.fwd.route(&$self.ctx.raft, &$req)? {
+            let resp = $self
+                .ctx
+                .fwd
+                .admin_client(&addr)?
+                .$method($req.into_inner())
+                .await
+                .map_err(forward_error)?;
+            $self.ctx.fwd.count();
+            return Ok(Response::new(resp.into_inner()));
+        }
+    };
 }
 
 type SnapshotStream =
@@ -213,12 +603,13 @@ impl pb::admin_server::Admin for AdminService {
             role: role(m.state).into(),
             snapshot_index: m.snapshot.map_or(0, |s| s.index),
             purged_index: m.purged.map_or(0, |p| p.index),
-            members: self.members(),
+            members: members_of(&self.ctx),
             replication,
             log_bytes: self.ctx.raft.log_bytes(),
             store_bytes,
             data_dir: self.ctx.info.data_dir.clone(),
             advertise: self.ctx.info.advertise.clone(),
+            writes_forwarded_total: self.ctx.fwd.forwarded_total(),
         }))
     }
 
@@ -277,7 +668,7 @@ impl pb::admin_server::Admin for AdminService {
         _req: Request<pb::MembersRequest>,
     ) -> Result<Response<pb::MembersResponse>, Status> {
         Ok(Response::new(pb::MembersResponse {
-            members: self.members(),
+            members: members_of(&self.ctx),
             leader_id: self.ctx.raft.leader().id,
         }))
     }
@@ -297,13 +688,30 @@ impl pb::admin_server::Admin for AdminService {
         &self,
         req: Request<pb::AddLearnerRequest>,
     ) -> Result<Response<pb::AddLearnerResponse>, Status> {
+        on_leader!(self, req, add_learner);
         let r = req.into_inner();
         if r.node_id == 0 || r.addr.is_empty() {
-            return Err(status(StoreError::Rejected(
+            return Err(rejected(
                 "AddLearner needs a node id (>= 1) and an address".into(),
-            )));
+            ));
         }
-        self.probe_new_member(r.node_id, &r.addr).await?;
+        ensure_leader(&self.ctx)?;
+        if let Some(n) = self
+            .ctx
+            .raft
+            .metrics()
+            .membership_config
+            .membership()
+            .get_node(&r.node_id)
+        {
+            if n.addr != r.addr {
+                return Err(rejected(format!(
+                    "node {} is already a member at {}, not {}",
+                    r.node_id, n.addr, r.addr
+                )));
+            }
+        }
+        probe_node(&self.ctx, r.node_id, &r.addr).await?;
         let log_index = self
             .ctx
             .raft
@@ -317,32 +725,64 @@ impl pb::admin_server::Admin for AdminService {
         &self,
         req: Request<pb::PromoteRequest>,
     ) -> Result<Response<pb::PromoteResponse>, Status> {
-        let id = req.into_inner().node_id;
-        let m = self.ctx.raft.metrics();
-        let mem = m.membership_config.membership();
-        if mem.get_node(&id).is_none() {
-            return Err(status(StoreError::Rejected(format!(
-                "node {id} is not a member; add it as a learner first"
-            ))));
-        }
-        // An add of one voter (not "these are the voters"), so concurrent
-        // promotes do not undo each other.
-        let log_index = self.ctx.raft.promote(id).await.map_err(status)?;
+        on_leader!(self, req, promote);
+        let log_index = promote_guarded(&self.ctx, req.into_inner().node_id).await?;
         Ok(Response::new(pb::PromoteResponse { log_index }))
     }
 
     async fn remove(
         &self,
-        _req: Request<pb::RemoveRequest>,
+        req: Request<pb::RemoveRequest>,
     ) -> Result<Response<pb::RemoveResponse>, Status> {
-        Err(later("Remove"))
+        on_leader!(self, req, remove);
+        let r = req.into_inner();
+        let log_index = remove_guarded(&self.ctx, r.node_id, r.force).await?;
+        tracing::info!(node = r.node_id, log_index, "removed a member");
+        Ok(Response::new(pb::RemoveResponse { log_index }))
     }
 
     async fn transfer_leader(
         &self,
-        _req: Request<pb::TransferLeaderRequest>,
+        req: Request<pb::TransferLeaderRequest>,
     ) -> Result<Response<pb::TransferLeaderResponse>, Status> {
-        Err(later("TransferLeader"))
+        on_leader!(self, req, transfer_leader);
+        let leader_id = transfer_guarded(&self.ctx, req.into_inner().to_node_id).await?;
+        Ok(Response::new(pb::TransferLeaderResponse { leader_id }))
+    }
+
+    async fn join(
+        &self,
+        req: Request<pb::JoinRequest>,
+    ) -> Result<Response<pb::JoinResponse>, Status> {
+        on_leader!(self, req, join);
+        Ok(Response::new(
+            join_guarded(&self.ctx, req.into_inner()).await?,
+        ))
+    }
+
+    async fn trigger_elect(
+        &self,
+        _req: Request<pb::TriggerElectRequest>,
+    ) -> Result<Response<pb::TriggerElectResponse>, Status> {
+        // openraft ignores it on a leader and on a learner.
+        tracing::info!("campaigning on request (a leadership transfer)");
+        self.ctx
+            .raft
+            .raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| status(StoreError::Storage(format!("raft: {e}"))))?;
+        Ok(Response::new(pb::TriggerElectResponse {}))
+    }
+
+    async fn read_index(
+        &self,
+        _req: Request<pb::ReadIndexRequest>,
+    ) -> Result<Response<pb::ReadIndexResponse>, Status> {
+        ensure_leader(&self.ctx)?;
+        let read_index = self.ctx.raft.ensure_linearizable().await.map_err(status)?;
+        Ok(Response::new(pb::ReadIndexResponse { read_index }))
     }
 
     type TriggerSnapshotStream = SnapshotStream;

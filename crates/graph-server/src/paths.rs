@@ -18,7 +18,8 @@
 //!
 //! [`InitMode`] says what to do with a data directory at start-up:
 //! bootstrap a new cluster (idempotent on restart), restart from persisted
-//! state, or start as an uninitialized member that a leader adds.
+//! state, start as an uninitialized member that a leader adds, or join a
+//! cluster through a peer (`--join`, idempotent on restart).
 use graph_store::StoreError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -94,14 +95,53 @@ pub enum InitMode {
     /// new cluster's log starts at 0).
     Bootstrap { restore: Option<PathBuf> },
     /// Neither flag: restart from persisted state; an empty directory is
-    /// refused (pass `--bootstrap`, or in stage C `--join`).
+    /// refused (pass `--bootstrap`, or `--join`).
     #[default]
     Restart,
     /// Start empty and wait to be added by a leader (`AddLearner`); the
     /// cluster id is adopted from the first leader that contacts this
     /// node. On a directory that already has a `node.json`, a restart.
-    /// Stage C's `--join <peer>` builds on this.
+    /// (Library and test use; the CLI's `--join` is [`InitMode::Join`].)
     Uninitialized,
+    /// `--join <peer>` (ADR 0004 D6/D9): on an empty directory start as
+    /// [`InitMode::Uninitialized`], then ask `peer` (any member; it
+    /// forwards to the leader) to add this node as a learner
+    /// (`Admin.Join`), retrying until a leader answers or the timeout
+    /// passes. On a directory that already has a `node.json`, a restart
+    /// (refused with `WrongCluster` when the peer belongs to another
+    /// cluster).
+    Join(JoinSpec),
+}
+
+/// The `--join` flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSpec {
+    /// `host:port` of any member.
+    pub peer: String,
+    /// `--auto-promote`: the leader promotes this node to voter once its
+    /// replication lag is zero. Without it (`--standby`, or neither flag)
+    /// the node stays a learner until `cluster promote`.
+    pub auto_promote: bool,
+    /// `--accept-snapshot-overwrite`: a directory holding a store (or a
+    /// Raft log) but no `node.json` is joined anyway; what it held is moved
+    /// aside into `replaced-<secs>/` and the node catches up from the
+    /// leader.
+    pub accept_snapshot_overwrite: bool,
+    /// `--join-timeout`: how long the first join keeps retrying (no leader
+    /// yet, the peer unreachable) before the start fails.
+    pub timeout: std::time::Duration,
+}
+
+impl JoinSpec {
+    /// Join `peer` with the defaults: no auto-promote, a 2 minute timeout.
+    pub fn new(peer: impl Into<String>) -> Self {
+        Self {
+            peer: peer.into(),
+            auto_promote: false,
+            accept_snapshot_overwrite: false,
+            timeout: std::time::Duration::from_secs(120),
+        }
+    }
 }
 
 /// `node.json`: the node's identity, written once (and again only when the
@@ -344,6 +384,9 @@ pub struct StartPlan {
     pub bootstrap: bool,
     /// Seed the store from this snapshot file first.
     pub restore: Option<PathBuf>,
+    /// `--join --accept-snapshot-overwrite` on a directory that holds a
+    /// store or a log but no `node.json`: move them aside first.
+    pub overwrite: bool,
 }
 
 /// Decide what to do with `paths` for `init` and the requested node id,
@@ -390,33 +433,51 @@ pub fn plan(
             existing: Some(found),
             bootstrap: false,
             restore: None,
+            overwrite: false,
         });
     }
-    if !paths.is_empty() && matches!(init, InitMode::Restart) && failed_first_start(paths) {
-        return Err(StoreError::Rejected(format!(
-            "`{}` holds only what a failed first start leaves (a blank Raft log, an empty \
-             store, no node.json); retry that first start with its flags (--bootstrap, or \
-             --join from stage C) rather than a plain restart",
-            dir.display()
-        )));
-    }
-    if !paths.is_empty() && (matches!(init, InitMode::Restart) || !failed_first_start(paths)) {
-        return Err(StoreError::Rejected(format!(
-            "`{}` holds a store or a Raft log but no node.json; it was not created by \
-             `serve --data-dir` (or node.json was lost). Refusing to guess its identity",
-            dir.display()
-        )));
+    let mut overwrite = false;
+    if !paths.is_empty() {
+        let failed = failed_first_start(paths);
+        match init {
+            InitMode::Restart if failed => {
+                return Err(StoreError::Rejected(format!(
+                    "`{}` holds only what a failed first start leaves (a blank Raft log, an \
+                     empty store, no node.json); retry that first start with its flags \
+                     (--bootstrap, or --join <peer>) rather than a plain restart",
+                    dir.display()
+                )))
+            }
+            _ if failed => {}
+            InitMode::Join(j) if j.accept_snapshot_overwrite => overwrite = true,
+            InitMode::Join(_) => {
+                return Err(StoreError::Rejected(format!(
+                    "`{}` holds a store or a Raft log but no node.json (a store copied in, \
+                     say); --join would replace it with the cluster's data. Pass \
+                     --accept-snapshot-overwrite to join anyway (what it holds is moved \
+                     aside into replaced-<time>/), or clear the directory",
+                    dir.display()
+                )))
+            }
+            _ => {
+                return Err(StoreError::Rejected(format!(
+                    "`{}` holds a store or a Raft log but no node.json; it was not created by \
+                     `serve --data-dir` (or node.json was lost). Refusing to guess its identity",
+                    dir.display()
+                )))
+            }
+        }
     }
     let restore = match init {
         InitMode::Restart => {
             return Err(StoreError::Rejected(format!(
-                "`{}` is not initialized: pass --bootstrap to create a new cluster \
-                 (or, from stage C, --join <peer> to join one)",
+                "`{}` is not initialized: pass --bootstrap to create a new cluster, or \
+                 --join <peer> to join one",
                 dir.display()
             )))
         }
         InitMode::Bootstrap { restore } => restore.clone(),
-        InitMode::Uninitialized => None,
+        InitMode::Uninitialized | InitMode::Join(_) => None,
     };
     let node_id = node_id.ok_or_else(|| {
         StoreError::Rejected(format!(
@@ -432,7 +493,41 @@ pub fn plan(
         existing: None,
         bootstrap: matches!(init, InitMode::Bootstrap { .. }),
         restore,
+        overwrite,
     })
+}
+
+/// `--join --accept-snapshot-overwrite`: move the store, the Raft log and
+/// the snapshots of a directory without `node.json` into
+/// `<dir>/replaced-<secs>/` (nothing is deleted), so the node starts empty
+/// and catches up from the leader. Returns where they went.
+pub fn move_aside(paths: &NodePaths) -> Result<PathBuf, StoreError> {
+    let dir = paths
+        .data_dir
+        .as_deref()
+        .expect("move_aside is for --data-dir mode");
+    let mut to = dir.join(format!("replaced-{}", now_secs()));
+    let mut n = 1;
+    while to.exists() {
+        to = dir.join(format!("replaced-{}-{n}", now_secs()));
+        n += 1;
+    }
+    std::fs::create_dir_all(&to)
+        .map_err(|e| StoreError::Storage(format!("creating `{}`: {e}", to.display())))?;
+    for p in [&paths.store, &paths.log, &paths.snapshots_dir] {
+        if p.exists() {
+            let name = p.file_name().expect("a file name");
+            std::fs::rename(p, to.join(name)).map_err(|e| {
+                StoreError::Storage(format!(
+                    "moving `{}` into `{}`: {e}",
+                    p.display(),
+                    to.display()
+                ))
+            })?;
+        }
+    }
+    sync_parent(&to);
+    Ok(to)
 }
 
 /// Whether a data directory without `node.json` holds only what a first
@@ -641,6 +736,42 @@ mod tests {
         .unwrap();
         assert!(!failed_first_start(&p2));
         assert!(plan(&p2, &boot, Some(1)).is_err());
+    }
+
+    /// Stage C: `--join` plans like an uninitialized start on an empty
+    /// directory, restarts on an initialized one, and takes a directory
+    /// holding a store without node.json only with
+    /// `--accept-snapshot-overwrite` (which moves it aside).
+    #[test]
+    fn join_plans_and_the_overwrite_flag() {
+        let d = tempfile::tempdir().unwrap();
+        let p = NodePaths::for_data_dir(d.path());
+        let join = InitMode::Join(JoinSpec::new("h:1"));
+        let pl = plan(&p, &join, Some(2)).unwrap();
+        assert!(!pl.bootstrap && !pl.overwrite && pl.existing.is_none());
+        graph_store::Store::index_bytes(
+            &graph_store::V2Store::open(&p.store).unwrap(),
+            "o",
+            "r",
+            "a.rs",
+            b"fn a() {}",
+            None,
+        )
+        .unwrap();
+        let e = plan(&p, &join, Some(2)).unwrap_err().to_string();
+        assert!(e.contains("--accept-snapshot-overwrite"), "{e}");
+        let mut spec = JoinSpec::new("h:1");
+        spec.accept_snapshot_overwrite = true;
+        let pl = plan(&p, &InitMode::Join(spec.clone()), Some(2)).unwrap();
+        assert!(pl.overwrite);
+        let to = move_aside(&p).unwrap();
+        assert!(to.join("graph.redb").exists() && !p.store.exists());
+        assert!(p.is_empty());
+        let pl = plan(&p, &InitMode::Join(spec), Some(2)).unwrap();
+        assert!(!pl.overwrite, "nothing left to move");
+        json(2).write(p.node_json.as_ref().unwrap()).unwrap();
+        let pl = plan(&p, &join, None).unwrap();
+        assert!(pl.existing.is_some(), "an initialized directory restarts");
     }
 
     /// QA 1: the log and the store must agree once a node is initialized.

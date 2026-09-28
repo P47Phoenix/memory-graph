@@ -152,6 +152,32 @@ impl RemoteStore {
         .map(|r| r.into_inner().log_index)
     }
 
+    /// `Admin.Remove`: remove `node_id` from the membership (any node
+    /// forwards it to the leader, which enforces the guards: not the
+    /// leader, not below quorum, 3 voters to 2 only with `force`). Returns
+    /// the membership entry's log index.
+    pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<u64> {
+        self.run(self.conn.call(Kind::Write, |ch| async move {
+            admin_client(ch)
+                .remove(pb::RemoveRequest { node_id, force })
+                .await
+        }))
+        .map(|r| r.into_inner().log_index)
+    }
+
+    /// `Admin.TransferLeader`: make voter `node_id` the leader (forwarded
+    /// to the leader by any node). Returns the new leader's id.
+    pub fn admin_transfer_leader(&self, node_id: u64) -> Result<u64> {
+        self.run(self.conn.call(Kind::Write, |ch| async move {
+            admin_client(ch)
+                .transfer_leader(pb::TransferLeaderRequest {
+                    to_node_id: node_id,
+                })
+                .await
+        }))
+        .map(|r| r.into_inner().leader_id)
+    }
+
     /// `Admin.TriggerSnapshot`: build a snapshot on the connected node and,
     /// with `out`, download it there (`cluster snapshot --out`): written to
     /// `<out>.part`, checked against the size and SHA-256 the server

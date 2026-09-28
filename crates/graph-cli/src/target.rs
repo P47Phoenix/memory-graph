@@ -35,6 +35,10 @@ pub mod exit {
     pub const WRITE_DEADLINE: i32 = 4;
     /// The server speaks another protocol or store format version.
     pub const PROTOCOL: i32 = 5;
+    /// A data directory (or a node named in a membership change) belongs to
+    /// another cluster (`WrongCluster`): `serve --join` a peer of another
+    /// cluster, say.
+    pub const WRONG_CLUSTER: i32 = 6;
 }
 
 /// An error that carries its own exit code.
@@ -53,7 +57,8 @@ impl std::fmt::Display for Exit {
 impl std::error::Error for Exit {}
 
 /// The exit code for a failed command: an [`Exit`] anywhere in the chain
-/// wins; then `NoLeader` (4) and `Protocol` (5) store errors; else 1.
+/// wins; then `NoLeader` (4), `Protocol` (5) and `WrongCluster` (6) store
+/// errors; else 1.
 pub fn exit_code(e: &anyhow::Error) -> i32 {
     if let Some(x) = e.chain().find_map(|c| c.downcast_ref::<Exit>()) {
         return x.code;
@@ -61,6 +66,7 @@ pub fn exit_code(e: &anyhow::Error) -> i32 {
     match e.chain().find_map(|c| c.downcast_ref::<StoreError>()) {
         Some(StoreError::NoLeader { .. }) => exit::WRITE_DEADLINE,
         Some(StoreError::Protocol(_)) => exit::PROTOCOL,
+        Some(StoreError::WrongCluster { .. }) => exit::WRONG_CLUSTER,
         _ => 1,
     }
 }
@@ -483,6 +489,12 @@ mod tests {
         assert_eq!(exit_code(&e), exit::WRITE_DEADLINE);
         let e = anyhow::Error::from(StoreError::Protocol("v2".into()));
         assert_eq!(exit_code(&e), exit::PROTOCOL);
+        let e = anyhow::Error::from(StoreError::WrongCluster {
+            expected: "a".into(),
+            found: "b".into(),
+        })
+        .context("serving `dir`");
+        assert_eq!(exit_code(&e), exit::WRONG_CLUSTER);
         let e = anyhow::Error::new(Exit {
             code: 3,
             message: "x".into(),

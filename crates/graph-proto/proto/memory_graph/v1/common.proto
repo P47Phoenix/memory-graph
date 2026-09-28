@@ -298,6 +298,10 @@ message StoreErrorDetail {
   message NoLeader { uint64 retry_after_ms = 1; }
   // Protocol or version mismatch (`Hello`), or a malformed message.
   message Protocol { string msg = 1; }
+  // A node's data directory belongs to another cluster (ADR 0004 D6):
+  // `expected` is the cluster it was asked to take part in, `found` the one
+  // it belongs to.
+  message WrongCluster { string expected = 1; string found = 2; }
 
   oneof kind {
     Locked locked = 1;
@@ -315,6 +319,7 @@ message StoreErrorDetail {
     NotLeader not_leader = 13;
     NoLeader no_leader = 14;
     Protocol protocol = 15;
+    WrongCluster wrong_cluster = 16;
   }
 }
 

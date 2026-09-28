@@ -105,6 +105,12 @@ pub enum StoreError {
     /// mismatch, malformed response, ...).
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// A node's data directory belongs to another cluster than the one it
+    /// was asked to take part in (ADR 0004 D6: `serve --join` on a
+    /// directory of another cluster, or a membership change naming a node
+    /// of another cluster). Nothing was changed.
+    #[error("wrong cluster: expected cluster {expected}, found cluster {found}; nothing was changed (a data directory belongs to one cluster for life: clear it to join another)")]
+    WrongCluster { expected: String, found: String },
     /// A raft-marked write (ADR 0004 D5, `V2Store::*_marked`) whose marker
     /// index is at or below the stored one: already applied, nothing was
     /// written. The server's state machine consumes it (a replay is a

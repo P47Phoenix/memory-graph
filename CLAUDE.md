@@ -19,7 +19,8 @@ cargo test -p graph-cli --test e2e                          # CLI end-to-end tes
 cargo test -p graph-cli --test serve_e2e                    # memory-graph serve + --server end to end (real binary, free port)
 cargo test -p graph-client --test conformance               # run_all / run_differential against RemoteStore over an in-process server
 cargo test -p graph-server --test cluster                   # replication through the in-process ClusterTestbed (failpoints, fault plan)
-cargo test -p graph-cli --test cluster_e2e                  # three real `serve --data-dir` processes: form, replicate, fail over, catch up
+cargo test -p graph-server --test membership                # join/auto-promote, forwarding, remove guards, transfer, partition (ClusterTestbed)
+cargo test -p graph-cli --test cluster_e2e                  # three real `serve --data-dir` processes: form, replicate, fail over, catch up, join, remove, exit 6
 cargo test --release -p graph-cli --test cluster_e2e measure_replication -- --ignored --nocapture   # docs/spikes/raft-replication.md
 cargo run --manifest-path xtask/Cargo.toml -- proto          # regenerate crates/graph-proto/src/gen from the .proto files (pure Rust, no protoc)
 cargo run --release -p graph-client --example rpc_bench -- <db>   # RPC overhead vs embedded (docs/spikes/rpc-overhead.md)
@@ -54,16 +55,17 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
     - `network.rs`: `GrpcNetwork` over the peers' `Raft` service, and the test `FaultPlan`.
     - `wire.rs`: openraft RPC types on the wire.
     - `node.rs`: `RaftSettings`, the snapshot policy and membership.
-  - `services/` holds the tonic services, including `raft.rs` (the peer side, with streamed `InstallSnapshot`) and the `Admin` membership and snapshot RPCs.
+  - `services/` holds the tonic services, including `raft.rs` (the peer side, with streamed `InstallSnapshot`) and the `Admin` membership (join, promote, remove, transfer-leader, with their guards) and snapshot RPCs.
+  - `forward.rs`: a node that is not the leader forwards writes (`Index` as a bounded stream), membership changes and the linearizable read barrier (`Admin.ReadIndex`) to the leader; `mg-forwarded-by` stops loops. `join.rs`: the joiner's side of `serve --join` (join with retries, the `WrongCluster` restart check, the `--auto-promote` re-join).
   - `disk.rs` is the `--min-free-disk` guard, and `lock.rs` the LOCK sidecar.
   - Also: snapshot handles per connection and `grpc.health.v1`.
   - `testing::TestServer` is an in-process server for other crates' tests, and `testing::ClusterTestbed` is n in-process nodes with stop, kill, restart and fault injection.
 - **graph-client**: `RemoteStore`, a `Store` + `StoreRead` over gRPC with a synchronous facade (it owns a small tokio runtime and panics if called from inside one), retries, read modes and snapshot paging.
 - **graph-cli**: the `memory-graph` binary. `lib.rs` holds the testable logic (`index_dir`, etc.); `target.rs` resolves `--db` / `--server` / env into a `Target`, opens it (embedded with a lock retry, or a `RemoteStore`) and maps errors to exit codes; `main.rs` is argument parsing (clap) and wiring. That includes:
-  - `serve`: `--db`, or `--data-dir` with `--bootstrap`, `--restore`, `--node-id`, `--advertise`, the snapshot, log and election knobs, and `--min-free-disk`;
+  - `serve`: `--db`, or `--data-dir` with `--bootstrap`, `--restore`, `--join <peer>` (`--auto-promote` / `--standby`, `--accept-snapshot-overwrite`, `--join-timeout`), `--node-id`, `--advertise`, the snapshot, log and election knobs, and `--min-free-disk`;
   - `health`;
-  - `cluster status/leader/snapshot`;
-  - the hidden stage B previews `cluster add-learner/promote` and `serve --wait-for-membership`, which stage C replaces with `--join` and guarded membership commands.
+  - `cluster status/leader/snapshot/members/add-learner/promote/remove/transfer-leader` (membership changes are forwarded to the leader by any node; the guards live on the leader, `services/admin.rs`);
+  - exit codes in `target.rs`: 3 no leader (`cluster leader`), 4 write deadline (`NoLeader`), 5 protocol/format, 6 `WrongCluster`.
 
   Depends on the `graph-store` traits, not on redb directly.
 - **xtask** (not a workspace member; own `Cargo.toml` and lockfile): dev tooling, today only `proto` (`protox` + `tonic-prost-build`). Never shipped and not seen by the pure-Rust gate.

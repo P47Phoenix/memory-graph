@@ -301,6 +301,14 @@ pub async fn start(
         Some(p) => p.node_id,
         None => cfg.node_id.unwrap_or(1),
     };
+    // `--join` on a directory that already belongs to a cluster is a
+    // restart, but not into another cluster: refused before anything is
+    // opened (ADR 0004 D6).
+    if let (InitMode::Join(spec), Some(p)) = (&cfg.init, &plan) {
+        if let Some(mine) = p.existing.as_ref().and_then(|j| j.cluster_id.as_deref()) {
+            crate::join::check_peer_cluster(&spec.peer, mine).await?;
+        }
+    }
     // Bind before anything is written: a port in use must not leave a store
     // behind (the next start would find a store and no node.json). A store
     // held by another server is still refused below, by redb's lock.
@@ -316,6 +324,17 @@ pub async fn start(
     }
     if let Some(snap) = plan.as_ref().and_then(|p| p.restore.as_deref()) {
         paths::restore_into(snap, &paths.store)?;
+    }
+    if plan.as_ref().is_some_and(|p| p.overwrite) {
+        let to = paths::move_aside(&paths)?;
+        eprintln!(
+            "memory-graph serve: WARNING: --accept-snapshot-overwrite: the store and Raft log \
+             found in `{}` (no node.json) were moved aside to `{}`; this node joins empty and \
+             catches up from the leader",
+            paths.data_dir.as_deref().unwrap_or(Path::new("")).display(),
+            to.display()
+        );
+        tracing::warn!(to = %to.display(), "moved an unowned store aside before joining");
     }
     let store_existed = cfg.storage_backend.is_some() || paths.store.exists();
     let log_probe = match &cfg.storage_backend {
@@ -507,6 +526,8 @@ pub async fn start(
         sysinfo: cfg.sysinfo.clone(),
         stall_writes_after: cfg.testing.stall_writes_after,
         writes_proposed: std::sync::atomic::AtomicUsize::new(0),
+        fwd: crate::forward::Forwarder::new(node_id, cfg.fault_plan.clone()),
+        auto_promoting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     });
 
     // Health (D10): "" is SERVING once the store is open (now);
@@ -649,6 +670,27 @@ pub async fn start(
             result
         })
     };
+    // `--join`: serving now (the leader asks this node who it is before
+    // adding it), so ask to be added; a refusal or the timeout stops the
+    // server again and fails the start.
+    if let InitMode::Join(spec) = &cfg.init {
+        let req = crate::join::join_request(
+            node_id,
+            &ctx.info.advertise,
+            &ctx.info.extractors_hash,
+            spec.auto_promote,
+        );
+        if identity.get().is_none() {
+            if let Err(e) = crate::join::join(spec, req.clone(), &identity).await {
+                shutdown.trigger();
+                let _ = task.await;
+                return Err(e);
+            }
+        }
+        if spec.auto_promote {
+            crate::join::spawn_rejoin(raft.clone(), spec.peer.clone(), req, shutdown.clone());
+        }
+    }
     Ok(Running {
         addr,
         shutdown,

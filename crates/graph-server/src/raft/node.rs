@@ -15,6 +15,7 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::impls::BasicNode;
 use openraft::{Config, Raft, RaftMetrics, ServerState, SnapshotPolicy};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -123,6 +124,13 @@ pub struct RaftNode {
     pub net_stats: NetStats,
     /// Test hook ([`crate::server::TestingHooks::withhold_leader`]).
     pub withhold_leader: bool,
+    /// The timings this node runs with (a leadership transfer waits out
+    /// the leader lease, `election_max_ms`).
+    pub settings: RaftSettings,
+    /// Set while this leader hands leadership over (`TransferLeader`): new
+    /// proposals and read barriers answer `NoLeader` (the client retries)
+    /// so no append renews the followers' leader lease meanwhile.
+    pub transferring: Arc<AtomicBool>,
 }
 
 /// The leader as this node knows it: id and advertised address.
@@ -224,6 +232,8 @@ impl RaftNode {
             disk: p.disk,
             net_stats,
             withhold_leader: false,
+            settings: s,
+            transferring: Arc::new(AtomicBool::new(false)),
         };
         if node.sole_voter() {
             node.raft
@@ -262,6 +272,40 @@ impl RaftNode {
         LeaderInfo { id, addr }
     }
 
+    /// Whether this node leads right now (as far as it knows; a proposal
+    /// is what confirms it).
+    pub fn is_leader(&self) -> bool {
+        if self.withhold_leader {
+            return false;
+        }
+        let m = self.metrics();
+        m.state == ServerState::Leader && m.current_leader == Some(self.node_id)
+    }
+
+    /// The error a leader-only operation answers on another node:
+    /// `NotLeader` naming the leader when one is known, else `NoLeader`.
+    pub fn not_leader(&self) -> StoreError {
+        let l = self.leader();
+        match l.id {
+            Some(_) if l.addr.is_some() => StoreError::NotLeader {
+                leader_id: l.id,
+                leader_addr: l.addr,
+            },
+            _ => StoreError::NoLeader {
+                retry_after_ms: NO_LEADER_RETRY_MS,
+            },
+        }
+    }
+
+    fn no_leader_while_transferring(&self) -> Result<(), StoreError> {
+        if self.withhold_leader || self.transferring.load(Ordering::SeqCst) {
+            return Err(StoreError::NoLeader {
+                retry_after_ms: NO_LEADER_RETRY_MS,
+            });
+        }
+        Ok(())
+    }
+
     /// Snapshots this node installed from a leader since it started.
     pub fn snapshots_installed(&self) -> u64 {
         self.snapshots.installed()
@@ -271,11 +315,7 @@ impl RaftNode {
     /// (ADR 0004 D7): returns the entry's response and its log index. The
     /// disk guard runs first (`RESOURCE_EXHAUSTED` on the wire).
     pub async fn propose(&self, req: LogRequest) -> Result<(LogResponse, u64), StoreError> {
-        if self.withhold_leader {
-            return Err(StoreError::NoLeader {
-                retry_after_ms: NO_LEADER_RETRY_MS,
-            });
-        }
+        self.no_leader_while_transferring()?;
         // Only the node that would append checks its disk; a follower
         // answers `NotLeader` naming the leader, whatever its disk.
         if self.metrics().state == ServerState::Leader {
@@ -358,6 +398,24 @@ impl RaftNode {
         Ok(r.log_id().index)
     }
 
+    /// Remove `id` from the membership (joint consensus for a voter, which
+    /// is not kept as a learner). The guards are the caller's
+    /// (`Admin.Remove`). Returns the final membership entry's index.
+    pub async fn remove(&self, id: NodeId, voter: bool) -> Result<u64, StoreError> {
+        let ids = BTreeSet::from([id]);
+        let change = if voter {
+            openraft::ChangeMembers::RemoveVoters(ids)
+        } else {
+            openraft::ChangeMembers::RemoveNodes(ids)
+        };
+        let r = self
+            .raft
+            .change_membership(change, false)
+            .await
+            .map_err(write_err)?;
+        Ok(r.log_id().index)
+    }
+
     /// Build a snapshot now (after the disk guard) and wait until the
     /// current snapshot covers what was applied when asked; returns its
     /// `(index, term)`.
@@ -380,15 +438,12 @@ impl RaftNode {
 
     /// openraft's read barrier (ADR 0004 D8, `LINEARIZABLE`): confirms
     /// leadership with a quorum and waits for the applied index to reach
-    /// the read index.
-    pub async fn ensure_linearizable(&self) -> Result<(), StoreError> {
-        if self.withhold_leader {
-            return Err(StoreError::NoLeader {
-                retry_after_ms: NO_LEADER_RETRY_MS,
-            });
-        }
+    /// the read index, which it returns (a follower's read waits until it
+    /// applied that index: `Admin.ReadIndex`).
+    pub async fn ensure_linearizable(&self) -> Result<u64, StoreError> {
+        self.no_leader_while_transferring()?;
         match self.raft.ensure_linearizable().await {
-            Ok(_) => Ok(()),
+            Ok(read) => Ok(read.map_or(0, |l| l.index)),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                 Err(StoreError::NotLeader {
                     leader_id: f.leader_id,

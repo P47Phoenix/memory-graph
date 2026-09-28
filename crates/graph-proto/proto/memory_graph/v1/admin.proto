@@ -1,8 +1,10 @@
-// Operator surface of a memory-graph server (ADR 0004 D1/D10). Stage A
+// Operator surface of a memory-graph server (ADR 0004 D1/D9/D10). Stage A
 // implements `Status`, `SysInfo`, `Compact` and `Shutdown`; stage B adds
-// `Members`, `Leader`, `TriggerSnapshot` and minimal `AddLearner` /
-// `Promote` (no guards yet: stage C adds them, with `Remove` and
-// `TransferLeader`, which answer UNIMPLEMENTED until then).
+// `Members`, `Leader`, `TriggerSnapshot`, `AddLearner` and `Promote`;
+// stage C adds the guards, `Remove`, `TransferLeader`, `Join`,
+// `TriggerElect` and `ReadIndex`. Membership changes (`AddLearner`,
+// `Promote`, `Remove`, `TransferLeader`, `Join`) may be sent to any node:
+// a follower forwards them to the leader.
 syntax = "proto3";
 
 package memory_graph.v1;
@@ -26,6 +28,16 @@ service Admin {
   rpc Promote(PromoteRequest) returns (PromoteResponse);
   rpc Remove(RemoveRequest) returns (RemoveResponse);
   rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
+  // `serve --join`: a new (or restarted, still learner) node asks to be
+  // added as a learner; the leader validates it and answers the cluster id.
+  rpc Join(JoinRequest) returns (JoinResponse);
+  // Campaign now (`Raft::trigger().elect()` on this node): the second half
+  // of `TransferLeader`, sent by the leader to the target.
+  rpc TriggerElect(TriggerElectRequest) returns (TriggerElectResponse);
+  // The leader's read barrier for a follower's `LINEARIZABLE` read: the
+  // leader confirms its leadership with a quorum and answers the log index
+  // the follower must have applied before it serves the read.
+  rpc ReadIndex(ReadIndexRequest) returns (ReadIndexResponse);
   // Build a snapshot now; with `download`, stream the snapshot file back
   // (a `SnapshotInfo` first, then the file in 1 MiB chunks) so a remote
   // client can keep a backup (`cluster snapshot --out`).
@@ -78,6 +90,9 @@ message StatusResponse {
   string data_dir = 27;
   // This node's advertised address (`--advertise`).
   string advertise = 28;
+  // Writes (and membership changes) this node forwarded to the leader
+  // since it started (ADR 0004 D8; stage E exports it as a metric).
+  uint64 writes_forwarded_total = 29;
 }
 
 // Replication progress of one peer, as the leader sees it.
@@ -145,11 +160,48 @@ message AddLearnerResponse {
 message PromoteRequest { uint64 node_id = 1; }
 message PromoteResponse { uint64 log_index = 1; }
 
-message RemoveRequest { uint64 node_id = 1; }
+message RemoveRequest {
+  uint64 node_id = 1;
+  // Allow taking 3 voters down to 2 (a cluster that then tolerates no
+  // failure). Never allows removing the leader or dropping below quorum.
+  bool force = 2;
+}
 message RemoveResponse { uint64 log_index = 1; }
 
 message TransferLeaderRequest { uint64 to_node_id = 1; }
-message TransferLeaderResponse {}
+message TransferLeaderResponse {
+  // The leader once the transfer finished (the target).
+  uint64 leader_id = 1;
+}
+
+message JoinRequest {
+  uint64 node_id = 1;
+  // `host:port` the leader and the other members reach the joiner at.
+  string advertise = 2;
+  // Must equal the cluster's (ADR 0004 D5).
+  string extractors_hash = 3;
+  uint64 store_format_version = 4;
+  uint32 protocol_version = 5;
+  // Promote to voter once the joiner's replication lag is zero
+  // (`--auto-promote`); otherwise it stays a learner.
+  bool auto_promote = 6;
+}
+message JoinResponse {
+  string cluster_id = 1;
+  repeated Member members = 2;
+  optional uint64 leader_id = 3;
+  // Log index of the membership change (0: already a learner).
+  uint64 log_index = 4;
+}
+
+message TriggerElectRequest {}
+message TriggerElectResponse {}
+
+message ReadIndexRequest {}
+message ReadIndexResponse {
+  // The follower serves the read once it has applied this index.
+  uint64 read_index = 1;
+}
 
 message TriggerSnapshotRequest {
   // Stream the snapshot file back after the `SnapshotInfo`.

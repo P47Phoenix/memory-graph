@@ -334,7 +334,7 @@ pub struct Extraction {
 pub struct StoreErrorDetail {
     #[prost(
         oneof = "store_error_detail::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
     )]
     pub kind: ::core::option::Option<store_error_detail::Kind>,
 }
@@ -432,6 +432,16 @@ pub mod store_error_detail {
         #[prost(string, tag = "1")]
         pub msg: ::prost::alloc::string::String,
     }
+    /// A node's data directory belongs to another cluster (ADR 0004 D6):
+    /// `expected` is the cluster it was asked to take part in, `found` the one
+    /// it belongs to.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct WrongCluster {
+        #[prost(string, tag = "1")]
+        pub expected: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub found: ::prost::alloc::string::String,
+    }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
@@ -464,6 +474,8 @@ pub mod store_error_detail {
         NoLeader(NoLeader),
         #[prost(message, tag = "15")]
         Protocol(Protocol),
+        #[prost(message, tag = "16")]
+        WrongCluster(WrongCluster),
     }
 }
 /// The view every read request carries: a read mode, or a snapshot handle
@@ -3231,6 +3243,10 @@ pub struct StatusResponse {
     /// This node's advertised address (`--advertise`).
     #[prost(string, tag = "28")]
     pub advertise: ::prost::alloc::string::String,
+    /// Writes (and membership changes) this node forwarded to the leader
+    /// since it started (ADR 0004 D8; stage E exports it as a metric).
+    #[prost(uint64, tag = "29")]
+    pub writes_forwarded_total: u64,
 }
 /// Replication progress of one peer, as the leader sees it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3335,6 +3351,10 @@ pub struct PromoteResponse {
 pub struct RemoveRequest {
     #[prost(uint64, tag = "1")]
     pub node_id: u64,
+    /// Allow taking 3 voters down to 2 (a cluster that then tolerates no
+    /// failure). Never allows removing the leader or dropping below quorum.
+    #[prost(bool, tag = "2")]
+    pub force: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveResponse {
@@ -3347,7 +3367,54 @@ pub struct TransferLeaderRequest {
     pub to_node_id: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TransferLeaderResponse {}
+pub struct TransferLeaderResponse {
+    /// The leader once the transfer finished (the target).
+    #[prost(uint64, tag = "1")]
+    pub leader_id: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JoinRequest {
+    #[prost(uint64, tag = "1")]
+    pub node_id: u64,
+    /// `host:port` the leader and the other members reach the joiner at.
+    #[prost(string, tag = "2")]
+    pub advertise: ::prost::alloc::string::String,
+    /// Must equal the cluster's (ADR 0004 D5).
+    #[prost(string, tag = "3")]
+    pub extractors_hash: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub store_format_version: u64,
+    #[prost(uint32, tag = "5")]
+    pub protocol_version: u32,
+    /// Promote to voter once the joiner's replication lag is zero
+    /// (`--auto-promote`); otherwise it stays a learner.
+    #[prost(bool, tag = "6")]
+    pub auto_promote: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JoinResponse {
+    #[prost(string, tag = "1")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub members: ::prost::alloc::vec::Vec<Member>,
+    #[prost(uint64, optional, tag = "3")]
+    pub leader_id: ::core::option::Option<u64>,
+    /// Log index of the membership change (0: already a learner).
+    #[prost(uint64, tag = "4")]
+    pub log_index: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TriggerElectRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TriggerElectResponse {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadIndexRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadIndexResponse {
+    /// The follower serves the read once it has applied this index.
+    #[prost(uint64, tag = "1")]
+    pub read_index: u64,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TriggerSnapshotRequest {
     /// Stream the snapshot file back after the `SnapshotInfo`.
@@ -3712,6 +3779,82 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Admin", "TransferLeader"));
             self.inner.unary(req, path, codec).await
         }
+        /// `serve --join`: a new (or restarted, still learner) node asks to be
+        /// added as a learner; the leader validates it and answers the cluster id.
+        pub async fn join(
+            &mut self,
+            request: impl tonic::IntoRequest<super::JoinRequest>,
+        ) -> std::result::Result<tonic::Response<super::JoinResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Admin/Join",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Admin", "Join"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Campaign now (`Raft::trigger().elect()` on this node): the second half
+        /// of `TransferLeader`, sent by the leader to the target.
+        pub async fn trigger_elect(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TriggerElectRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TriggerElectResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Admin/TriggerElect",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Admin", "TriggerElect"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The leader's read barrier for a follower's `LINEARIZABLE` read: the
+        /// leader confirms its leadership with a quorum and answers the log index
+        /// the follower must have applied before it serves the read.
+        pub async fn read_index(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReadIndexRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReadIndexResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Admin/ReadIndex",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Admin", "ReadIndex"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Build a snapshot now; with `download`, stream the snapshot file back
         /// (a `SnapshotInfo` first, then the file in 1 MiB chunks) so a remote
         /// client can keep a backup (`cluster snapshot --out`).
@@ -3831,6 +3974,31 @@ pub mod admin_server {
             request: tonic::Request<super::TransferLeaderRequest>,
         ) -> std::result::Result<
             tonic::Response<super::TransferLeaderResponse>,
+            tonic::Status,
+        >;
+        /// `serve --join`: a new (or restarted, still learner) node asks to be
+        /// added as a learner; the leader validates it and answers the cluster id.
+        async fn join(
+            &self,
+            request: tonic::Request<super::JoinRequest>,
+        ) -> std::result::Result<tonic::Response<super::JoinResponse>, tonic::Status>;
+        /// Campaign now (`Raft::trigger().elect()` on this node): the second half
+        /// of `TransferLeader`, sent by the leader to the target.
+        async fn trigger_elect(
+            &self,
+            request: tonic::Request<super::TriggerElectRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TriggerElectResponse>,
+            tonic::Status,
+        >;
+        /// The leader's read barrier for a follower's `LINEARIZABLE` read: the
+        /// leader confirms its leadership with a quorum and answers the log index
+        /// the follower must have applied before it serves the read.
+        async fn read_index(
+            &self,
+            request: tonic::Request<super::ReadIndexRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReadIndexResponse>,
             tonic::Status,
         >;
         /// Server streaming response type for the TriggerSnapshot method.
@@ -4348,6 +4516,137 @@ pub mod admin_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = TransferLeaderSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Admin/Join" => {
+                    #[allow(non_camel_case_types)]
+                    struct JoinSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::JoinRequest>
+                    for JoinSvc<T> {
+                        type Response = super::JoinResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::JoinRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::join(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = JoinSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Admin/TriggerElect" => {
+                    #[allow(non_camel_case_types)]
+                    struct TriggerElectSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::UnaryService<super::TriggerElectRequest>
+                    for TriggerElectSvc<T> {
+                        type Response = super::TriggerElectResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TriggerElectRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::trigger_elect(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TriggerElectSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Admin/ReadIndex" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadIndexSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::ReadIndexRequest>
+                    for ReadIndexSvc<T> {
+                        type Response = super::ReadIndexResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReadIndexRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::read_index(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadIndexSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -154,21 +154,35 @@ impl TestNode {
     /// errors a just-stopped node can cause (the port or the files still
     /// held for a moment), within [`CLUSTER_WAIT`].
     pub fn restart(&mut self) {
+        if let Err(e) = self.try_restart() {
+            panic!("node {} restart: {e}", self.id);
+        }
+    }
+
+    /// [`restart`](Self::restart), returning a start-up refusal instead
+    /// of panicking.
+    pub fn try_restart(&mut self) -> Result<(), StoreError> {
         assert!(self.running.is_none(), "node {} is running", self.id);
         let deadline = Instant::now() + CLUSTER_WAIT;
         loop {
             match self.launch() {
-                Ok(()) => return,
+                Ok(()) => return Ok(()),
                 Err(e) => {
                     let transient = matches!(e, StoreError::Locked(_))
                         || e.to_string().contains("cannot listen");
                     if !transient || Instant::now() >= deadline {
-                        panic!("node {} restart: {e}", self.id);
+                        return Err(e);
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
         }
+    }
+
+    /// The extractors the next [`restart`](Self::restart) uses (a node
+    /// rebuilt with another extractor version set).
+    pub fn set_extractors(&mut self, extractors: Vec<Box<dyn Extractor>>) {
+        self.extractors = share(extractors);
     }
 
     /// Wait until this node's Raft stopped with a fatal error (a failpoint
@@ -268,6 +282,82 @@ impl ClusterTestbed {
 
     pub fn ids(&self) -> Vec<NodeId> {
         self.nodes.keys().copied().collect()
+    }
+
+    /// Where the nodes' data directories live (`node<id>` under it).
+    pub fn root(&self) -> &Path {
+        self._root.path()
+    }
+
+    /// The configuration a new node `id` gets: a data directory
+    /// `node<id>` under [`root`](Self::root), `init`, [`TEST_RAFT`] and
+    /// the shared fault plan.
+    pub fn node_config(&self, id: NodeId, init: InitMode) -> ServeConfig {
+        let mut cfg = ServeConfig::for_data_dir(
+            self.root().join(format!("node{id}")),
+            "127.0.0.1:0".parse().unwrap(),
+            init,
+            Some(id),
+        );
+        cfg.shutdown_grace = Duration::from_secs(5);
+        cfg.raft = Some(TEST_RAFT);
+        cfg.fault_plan = Some(self.plan.clone());
+        cfg
+    }
+
+    /// Start one more node with `cfg` (see [`node_config`](Self::node_config))
+    /// and these extractors; on success it is part of the testbed. A
+    /// start-up refusal (a `--join` the leader refused, `WrongCluster`) is
+    /// returned and the node is not added.
+    pub fn add_node(
+        &mut self,
+        id: NodeId,
+        cfg: ServeConfig,
+        extractors: Vec<Box<dyn Extractor>>,
+    ) -> Result<(), StoreError> {
+        assert!(!self.nodes.contains_key(&id), "node {id} exists");
+        let mut node = TestNode {
+            id,
+            cfg,
+            extractors: share(extractors),
+            addr: "127.0.0.1:0".parse().unwrap(),
+            rt: None,
+            running: None,
+        };
+        node.launch()?;
+        self.nodes.insert(id, node);
+        Ok(())
+    }
+
+    /// The `(voters, learners)` node `id` sees in its membership.
+    pub fn membership(&self, id: NodeId) -> (BTreeSet<NodeId>, BTreeSet<NodeId>) {
+        let m = self.node(id).raft().expect("node is running").metrics();
+        let mem = m.membership_config.membership();
+        let voters: BTreeSet<NodeId> = mem.voter_ids().collect();
+        let learners = mem
+            .nodes()
+            .map(|(id, _)| *id)
+            .filter(|id| !voters.contains(id))
+            .collect();
+        (voters, learners)
+    }
+
+    /// Wait until the current leader sees exactly `voters` as its voters.
+    pub fn wait_voters(&self, voters: &[NodeId], timeout: Duration) {
+        let want: BTreeSet<NodeId> = voters.iter().copied().collect();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let l = self.wait_leader(timeout);
+            let (v, _) = self.membership(l);
+            if v == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the voters are {v:?}, not {want:?}, after {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     pub fn node(&self, id: NodeId) -> &TestNode {
