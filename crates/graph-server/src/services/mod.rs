@@ -33,6 +33,10 @@ pub struct Ctx {
     pub info: ServerInfo,
     pub shutdown: ShutdownHandle,
     pub sysinfo: Option<SysInfoFn>,
+    /// [`crate::server::TestingHooks::stall_writes_after`].
+    pub stall_writes_after: Option<usize>,
+    /// Write proposals seen so far (counted only with a stall hook set).
+    pub writes_proposed: std::sync::atomic::AtomicUsize,
 }
 
 pub fn status(e: StoreError) -> Status {

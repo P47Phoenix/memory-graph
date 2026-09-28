@@ -28,6 +28,12 @@
 //! file's own marker, and `get_current_snapshot` checks exactly that and
 //! answers "no snapshot" (logged) rather than pair them.
 //!
+//! Where `rename` cannot replace an existing file (`replace_file`'s
+//! fallback), the target is removed and then renamed into place: that pair
+//! is not atomic, and a crash between the two leaves no current snapshot
+//! file. `read_meta` treats a missing data file (or meta) as "no snapshot",
+//! which is safe: openraft then builds a fresh one or ships the log.
+//!
 //! A snapshot build runs `export_snapshot` under the slot's **read** lock
 //! for the length of the copy, so it blocks `compact` and a snapshot
 //! install (which take the write lock) until it finishes; reads and writes

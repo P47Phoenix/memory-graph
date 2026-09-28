@@ -39,6 +39,8 @@ fn cmd() -> Command {
     let mut c = Command::new(BIN);
     c.env_remove("MEMORY_GRAPH_SERVER")
         .env_remove("MEMORY_GRAPH_READ")
+        .env_remove("MEMORY_GRAPH_WRITE_DEADLINE")
+        .env_remove("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER")
         .env("MEMORY_GRAPH_LOCK_WAIT_MS", "300");
     c
 }
@@ -91,11 +93,20 @@ struct Server {
     child: Child,
     addr: String,
     db: PathBuf,
+    /// Every later stdout line of the server (the reader thread keeps
+    /// draining the pipe so the server never blocks on, or fails, a print).
+    lines: std::sync::mpsc::Receiver<String>,
 }
 
 impl Server {
     fn start(db: &Path) -> Server {
-        let mut child = cmd()
+        Self::start_env(db, &[])
+    }
+
+    fn start_env(db: &Path, env: &[(&str, &str)]) -> Server {
+        let mut c = cmd();
+        c.envs(env.iter().copied());
+        let mut child = c
             .args(["serve", "--db"])
             .arg(db)
             .args(["--listen", "127.0.0.1:0"])
@@ -106,9 +117,17 @@ impl Server {
         let out = child.stdout.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = BufReader::new(out).read_line(&mut line);
-            let _ = tx.send(line);
+            for line in BufReader::new(out).lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            // Nobody listens any more; keep draining.
+                            continue;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
         });
         let line = rx
             .recv_timeout(Duration::from_secs(60))
@@ -123,6 +142,7 @@ impl Server {
             child,
             addr,
             db: db.to_path_buf(),
+            lines: rx,
         }
     }
 
@@ -573,6 +593,8 @@ fn exit_codes_3_4_5_end_to_end() {
     let o = run(&[
         "--server",
         &addr,
+        "--write-deadline",
+        "500ms",
         "index",
         "--org",
         "o",
@@ -582,7 +604,10 @@ fn exit_codes_3_4_5_end_to_end() {
         src.to_str().unwrap(),
     ]);
     assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
-    assert!(t0.elapsed() >= Duration::from_secs(5), "it retried first");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(500),
+        "it retried until its --write-deadline first"
+    );
     assert!(
         stderr(&o).contains(&format!("server {addr}")),
         "{}",
@@ -604,48 +629,50 @@ fn exit_codes_3_4_5_end_to_end() {
 /// The server dies in the middle of an index run: the client does not
 /// call that a protocol error (exit 5); it retries the write until its
 /// deadline and then fails naming the server and the lost connection.
+///
+/// Deterministic: the server's test hook
+/// (`MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER=0`) parks every write
+/// proposal, so the run's `Index` call is in flight and can never finish;
+/// the test waits for the server's "writes stalled" line, then kills it.
 #[test]
 fn server_killed_mid_index_is_a_lost_connection_not_a_protocol_error() {
     let d = tempfile::tempdir().unwrap();
-    let mut server = Server::start(&d.path().join("g.redb"));
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), "alpha beta").unwrap();
+    std::fs::write(src.join("b.rs"), "fn b() {}").unwrap();
+    let mut server = Server::start_env(
+        &d.path().join("g.redb"),
+        &[("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER", "0")],
+    );
     let addr = server.addr.clone();
-    let mut writer = cmd()
+    let writer = cmd()
         .args([
             "--server",
             &addr,
+            "--write-deadline",
+            "500ms",
             "index",
             "--org",
-            "corpus",
+            "o",
             "--repo",
-            "all",
+            "r",
             "--no-progress",
         ])
-        .arg(corpus())
+        .arg(&src)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Wait until the run has written something, then kill the server
-    // (only this test's own child process).
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        assert!(
-            writer.try_wait().unwrap().is_none(),
-            "the index run finished before the server could be killed"
-        );
-        let o = run(&["--server", &addr, "describe", "--json"]);
-        let files = serde_json::from_str::<serde_json::Value>(&stdout(&o))
-            .ok()
-            .and_then(|v| v["repos"][0]["files"].as_u64())
-            .unwrap_or(0);
-        if files > 0 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "no file was ever indexed");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let line = server
+        .lines
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the server reached its write stall");
+    assert!(line.contains("writes stalled after 0"), "{line}");
+    // Only this test's own child process.
     server.child.kill().unwrap();
     server.child.wait().unwrap();
+    let t0 = Instant::now();
     let out = writer.wait_with_output().unwrap();
     let code = out.status.code();
     let err = stderr(&out);
@@ -654,5 +681,9 @@ fn server_killed_mid_index_is_a_lost_connection_not_a_protocol_error() {
     assert!(
         err.contains(&format!("server {addr}")) && err.contains("connection lost"),
         "the message names the server and the lost connection: {err}"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(8),
+        "--write-deadline 500ms bounds the retries"
     );
 }

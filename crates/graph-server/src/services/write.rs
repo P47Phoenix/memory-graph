@@ -18,6 +18,20 @@ pub struct WriteService {
 
 impl WriteService {
     async fn propose(&self, cmd: Cmd) -> Result<(LogResponse, u64), Status> {
+        if let Some(after) = self.ctx.stall_writes_after {
+            let seen = self
+                .ctx
+                .writes_proposed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if seen >= after {
+                if seen == after {
+                    use std::io::Write;
+                    println!("memory-graph serve: testing: writes stalled after {after}");
+                    let _ = std::io::stdout().flush();
+                }
+                std::future::pending::<()>().await;
+            }
+        }
         let req = LogRequest::new(&pb::LogCommand { cmd: Some(cmd) });
         let (resp, index) = self.ctx.raft.propose(req).await.map_err(status)?;
         match resp {

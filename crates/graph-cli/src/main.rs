@@ -31,6 +31,12 @@ struct Cli {
     /// (sees every acknowledged write). Also read from MEMORY_GRAPH_READ. Default local
     #[arg(long, global = true, value_parser = graph_cli::target::parse_read_mode)]
     read: Option<ReadMode>,
+    /// With --server: how long a write keeps retrying (no leader, a lost connection) before it
+    /// fails with exit code 4, e.g. `500ms`, `10s`, `2m`. Also read from MEMORY_GRAPH_WRITE_DEADLINE.
+    /// Default 10s
+    #[arg(long, global = true, env = "MEMORY_GRAPH_WRITE_DEADLINE", value_name = "DURATION",
+          value_parser = graph_cli::target::parse_write_deadline)]
+    write_deadline: Option<std::time::Duration>,
     /// Deprecated, hidden: there is one storage format now. `--backend v2` is accepted as a no-op for old
     /// scripts; `--backend v1` is an error that says where the retired format went
     #[arg(long, global = true, hide = true, value_enum)]
@@ -555,6 +561,9 @@ static REMOTE_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
+    if let Some(d) = cli.write_deadline {
+        graph_cli::target::set_write_deadline(d);
+    }
     reject_legacy_backend(cli.backend)?;
     let overrides = cli.overrides();
     // `serve` owns a file; everything else resolves --db / --server.
@@ -591,6 +600,13 @@ fn run() -> Result<i32> {
         cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
+        // Test-only fault injection (serve_e2e): park writes after N
+        // proposals so a test can kill the server mid-run. Not a feature.
+        if let Ok(v) = std::env::var("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER") {
+            cfg.testing.stall_writes_after = Some(v.trim().parse().with_context(|| {
+                format!("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER={v}: not a count")
+            })?);
+        }
         let shown = db.display().to_string();
         let node = *node_id;
         graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |a| {

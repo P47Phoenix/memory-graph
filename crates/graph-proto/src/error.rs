@@ -127,14 +127,32 @@ pub fn is_disk_full(msg: &str) -> bool {
         || m.ends_with("os error 112")
 }
 
-/// Codes a status carries, without a typed detail, when the connection
-/// under a call was lost (the server died, a reset, a client-side
-/// timeout): the call may or may not have reached the server.
-pub fn is_transport_loss(code: Code) -> bool {
-    matches!(
-        code,
-        Code::Unknown | Code::Cancelled | Code::DeadlineExceeded | Code::Aborted
-    )
+/// Whether a status without a typed detail means the connection under a
+/// call was lost (the server died, a reset, a client-side timeout): the
+/// call may or may not have reached the server.
+///
+/// `CANCELLED`, `DEADLINE_EXCEEDED` and `ABORTED` always count. `UNKNOWN`
+/// counts only when its message looks like a transport failure ("transport
+/// error", "connection", "broken pipe", "reset", "closed", any case): tonic
+/// also answers `UNKNOWN` for a server handler that panicked, and that must
+/// surface as a storage error, not be retried as a lost connection.
+pub fn is_transport_loss(code: Code, message: &str) -> bool {
+    match code {
+        Code::Cancelled | Code::DeadlineExceeded | Code::Aborted => true,
+        Code::Unknown => {
+            let m = message.to_ascii_lowercase();
+            [
+                "transport error",
+                "connection",
+                "broken pipe",
+                "reset",
+                "closed",
+            ]
+            .iter()
+            .any(|w| m.contains(w))
+        }
+        _ => false,
+    }
 }
 
 impl WireError {
@@ -244,7 +262,7 @@ impl WireError {
     /// typed detail, `Unimplemented` from a server without the method, and
     /// the client's own `Hello` version check): a bare `FAILED_PRECONDITION`
     /// (a proxy, a foreign server) is a refusal (`Rejected`), and a
-    /// transport-level loss (`UNKNOWN` "transport error", `CANCELLED`,
+    /// transport-level loss (`UNKNOWN` "transport error" and the like, `CANCELLED`,
     /// `DEADLINE_EXCEEDED`, `ABORTED`) is a `Storage` error naming the lost
     /// connection, never a protocol error.
     pub fn from_code(code: Code, message: &str) -> Self {
@@ -257,9 +275,9 @@ impl WireError {
             Code::DataLoss => WireError::Store(StoreError::Corrupt(msg)),
             Code::ResourceExhausted | Code::Internal => WireError::Store(StoreError::Storage(msg)),
             Code::Unimplemented => WireError::Protocol(format!("{code:?}: {msg}")),
-            other if is_transport_loss(other) => WireError::Store(StoreError::Storage(format!(
-                "connection lost ({other:?}): {msg}"
-            ))),
+            other if is_transport_loss(other, &msg) => WireError::Store(StoreError::Storage(
+                format!("connection lost ({other:?}): {msg}"),
+            )),
             other => WireError::Store(StoreError::Storage(format!("{other:?}: {msg}"))),
         }
     }
@@ -418,4 +436,47 @@ pub fn wire_view(e: &StoreError) -> WireError {
         }
         StoreError::Protocol(m) => return WireError::Protocol(m.clone()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_is_a_transport_loss_only_when_it_reads_like_one() {
+        for m in [
+            "transport error",
+            "error trying to connect: Connection refused",
+            "Broken pipe (os error 32)",
+            "connection RESET by peer",
+            "stream closed because of a broken pipe",
+            "h2 protocol error: channel closed",
+        ] {
+            assert!(is_transport_loss(Code::Unknown, m), "{m}");
+            let e: StoreError = WireError::from_code(Code::Unknown, m).into();
+            assert!(
+                matches!(&e, StoreError::Storage(s) if s.starts_with("connection lost")),
+                "{e:?}"
+            );
+        }
+        for c in [Code::Cancelled, Code::DeadlineExceeded, Code::Aborted] {
+            assert!(is_transport_loss(c, ""));
+        }
+        assert!(!is_transport_loss(Code::Internal, "connection reset"));
+    }
+
+    #[test]
+    fn a_handler_panic_is_a_storage_error_not_a_lost_connection() {
+        let m = "panicked at crates/x.rs:1:1: index out of bounds";
+        assert!(!is_transport_loss(Code::Unknown, m));
+        assert!(!is_transport_loss(Code::Unknown, ""));
+        let e: StoreError = WireError::from_code(Code::Unknown, m).into();
+        match e {
+            StoreError::Storage(s) => {
+                assert!(!s.contains("connection lost"), "{s}");
+                assert!(s.contains("panicked"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

@@ -71,6 +71,13 @@ pub struct TestingHooks {
     pub withhold_leader: bool,
     /// Answer `Hello` with this protocol version instead of the real one.
     pub hello_protocol_version: Option<u32>,
+    /// Let this many write proposals through, then park every later one
+    /// forever (a future that never resolves), so a run cannot finish and a
+    /// test can kill the server mid-write deterministically. The first
+    /// parked proposal prints `memory-graph serve: testing: writes stalled
+    /// after N` on stdout. `serve` sets it only from the test-only
+    /// `MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER` environment variable.
+    pub stall_writes_after: Option<usize>,
 }
 
 impl ServeConfig {
@@ -207,6 +214,8 @@ pub async fn start(
         },
         shutdown: shutdown.clone(),
         sysinfo: cfg.sysinfo.clone(),
+        stall_writes_after: cfg.testing.stall_writes_after,
+        writes_proposed: std::sync::atomic::AtomicUsize::new(0),
     });
 
     // Health (D10): "" is SERVING once the store is open (now);

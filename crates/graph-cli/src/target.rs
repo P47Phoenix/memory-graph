@@ -17,6 +17,9 @@ pub const ENV_READ: &str = "MEMORY_GRAPH_READ";
 /// How long an embedded open keeps retrying a locked file, in
 /// milliseconds (default 5000). Tests set it low.
 pub const ENV_LOCK_WAIT_MS: &str = "MEMORY_GRAPH_LOCK_WAIT_MS";
+/// The client write deadline when `--write-deadline` is not given
+/// (`--write-deadline` also reads it).
+pub const ENV_WRITE_DEADLINE: &str = "MEMORY_GRAPH_WRITE_DEADLINE";
 /// The database file when neither `--db` nor a server is given.
 pub const DEFAULT_DB: &str = "./graph.redb";
 /// Default retry window for a locked database file.
@@ -265,6 +268,38 @@ fn connectable(listen: &str) -> String {
     }
 }
 
+/// The `--write-deadline` of this process, applied to every [`connect`].
+static WRITE_DEADLINE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Set the write deadline every later [`connect`] uses (once per process;
+/// a second call is ignored). Unset, [`ClientConfig`]'s default (10 s).
+pub fn set_write_deadline(d: Duration) {
+    let _ = WRITE_DEADLINE.set(d);
+}
+
+/// Parse a `--write-deadline`: `<n>ms`, `<n>s`, `<n>m`, or bare seconds;
+/// positive.
+pub fn parse_write_deadline(s: &str) -> std::result::Result<Duration, String> {
+    let t = s.trim();
+    let (num, unit_ms) = if let Some(n) = t.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = t.strip_suffix('s') {
+        (n, 1000)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 60_000)
+    } else {
+        (t, 1000)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{s}` is not a duration (e.g. 500ms, 10s, 2m)"))?;
+    if n == 0 {
+        return Err("the write deadline must be positive".into());
+    }
+    Ok(Duration::from_millis(n.saturating_mul(unit_ms)))
+}
+
 /// Connect to a server. A protocol or store-format mismatch is exit code 5.
 pub fn connect(addr: &str, read: ReadMode) -> Result<RemoteStore> {
     connect_with(addr, read, None)
@@ -275,6 +310,9 @@ pub fn connect(addr: &str, read: ReadMode) -> Result<RemoteStore> {
 pub fn connect_with(addr: &str, read: ReadMode, budget: Option<Duration>) -> Result<RemoteStore> {
     let mut cfg = ClientConfig::new(addr);
     cfg.read_mode = read;
+    if let Some(d) = WRITE_DEADLINE.get() {
+        cfg.write_deadline = *d;
+    }
     if let Some(b) = budget {
         cfg.retry.budget = b;
     }
@@ -290,6 +328,20 @@ pub fn connect_with(addr: &str, read: ReadMode, budget: Option<Duration>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_deadline_parses_units_and_refuses_zero() {
+        assert_eq!(
+            parse_write_deadline("500ms"),
+            Ok(Duration::from_millis(500))
+        );
+        assert_eq!(parse_write_deadline("10s"), Ok(Duration::from_secs(10)));
+        assert_eq!(parse_write_deadline("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_write_deadline(" 3 "), Ok(Duration::from_secs(3)));
+        assert!(parse_write_deadline("0ms").is_err());
+        assert!(parse_write_deadline("soon").is_err());
+        assert!(parse_write_deadline("").is_err());
+    }
 
     fn args<'a>() -> TargetArgs<'a> {
         TargetArgs::default()

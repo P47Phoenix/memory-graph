@@ -97,7 +97,8 @@ fn endpoint_for(addr: &str, connect_timeout: Duration) -> Result<Endpoint, Store
 
 /// A status without a typed detail from the transport layer (connection
 /// refused, reset) is `UNAVAILABLE`; a connection lost under a call in
-/// flight (the server died mid-stream) is `UNKNOWN` "transport error",
+/// flight (the server died mid-stream) is `UNKNOWN` "transport error" (a
+/// bare `UNKNOWN`, e.g. a handler panic, is not),
 /// `CANCELLED` or `DEADLINE_EXCEEDED`. Both name the endpoint, and neither
 /// is ever a protocol error.
 fn map_status(endpoint: &str, s: &Status) -> StoreError {
@@ -105,7 +106,7 @@ fn map_status(endpoint: &str, s: &Status) -> StoreError {
         if s.code() == Code::Unavailable {
             return StoreError::Storage(format!("server {endpoint} unavailable: {}", s.message()));
         }
-        if is_transport_loss(s.code()) {
+        if is_transport_loss(s.code(), s.message()) {
             return StoreError::Storage(format!(
                 "server {endpoint} connection lost: {}",
                 s.message()
@@ -121,7 +122,9 @@ fn map_status(endpoint: &str, s: &Status) -> StoreError {
 /// request, ADR 0004 D2/D7, so a write that did land is safe to resend).
 fn retryable(kind: Kind, s: &Status) -> bool {
     s.code() == Code::Unavailable
-        || (kind == Kind::Write && s.details().is_empty() && is_transport_loss(s.code()))
+        || (kind == Kind::Write
+            && s.details().is_empty()
+            && is_transport_loss(s.code(), s.message()))
 }
 
 /// Consecutive `NotLeader` switches after which the client backs off
