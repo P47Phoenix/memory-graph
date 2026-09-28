@@ -39,7 +39,7 @@ pub(crate) use common::{
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
 pub use v2::V2_SCHEMA_VERSION as SCHEMA_VERSION;
-pub use v2::{CompactStats, V2Snapshot, V2Store, VacuumStats};
+pub use v2::{CompactStats, RaftMarker, V2Snapshot, V2Store, VacuumStats};
 
 /// Schema versions stamped by the retired per-node format. A file carrying
 /// one of these is refused with [`StoreError::LegacyFormat`]; the range is
@@ -382,6 +382,8 @@ mod detect_tests;
 mod tests;
 #[cfg(test)]
 mod v2_policy_tests;
+#[cfg(test)]
+mod v2_raft_tests;
 #[cfg(test)]
 mod v2_random;
 #[cfg(test)]
