@@ -7,9 +7,9 @@
 use crate::extractors::register_all;
 use crate::snapshots::SnapshotTable;
 use graph_core::Extractor;
-use graph_store::{CompactStats, StoreError, V2Store};
+use graph_store::{CompactStats, MarkedCommitHook, StoreError, V2Store};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 pub struct StoreSlot {
@@ -19,6 +19,8 @@ pub struct StoreSlot {
     cache_bytes: Option<usize>,
     max_snapshot_age: Duration,
     snapshots: SnapshotTable,
+    /// Test-only failpoint kept across reopenings (compact, install).
+    marked_commit_hook: Mutex<Option<MarkedCommitHook>>,
 }
 
 impl StoreSlot {
@@ -30,7 +32,7 @@ impl StoreSlot {
         cache_bytes: Option<usize>,
         max_snapshot_age: Duration,
     ) -> Result<Arc<Self>, StoreError> {
-        let store = Self::open_store(path, &extractors, cache_bytes, max_snapshot_age)?;
+        let store = Self::open_store(path, &extractors, cache_bytes, max_snapshot_age, None)?;
         Ok(Arc::new(Self {
             store: RwLock::new(Some(store)),
             path: path.to_path_buf(),
@@ -38,6 +40,7 @@ impl StoreSlot {
             cache_bytes,
             max_snapshot_age,
             snapshots: SnapshotTable::new(max_snapshot_age),
+            marked_commit_hook: Mutex::new(None),
         }))
     }
 
@@ -46,11 +49,46 @@ impl StoreSlot {
         extractors: &[Arc<dyn Extractor>],
         cache_bytes: Option<usize>,
         max_snapshot_age: Duration,
+        hook: Option<MarkedCommitHook>,
     ) -> Result<V2Store, StoreError> {
         let mut store = V2Store::open_with_cache_bytes(path, cache_bytes)?;
         store.set_max_snapshot_age(max_snapshot_age);
+        store.set_marked_commit_hook(hook);
         register_all(&mut store, extractors);
         Ok(store)
+    }
+
+    fn reopen(&self) -> Result<V2Store, StoreError> {
+        Self::open_store(
+            &self.path,
+            &self.extractors,
+            self.cache_bytes,
+            self.max_snapshot_age,
+            self.hook(),
+        )
+    }
+
+    fn hook(&self) -> Option<MarkedCommitHook> {
+        self.marked_commit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install (or clear) the store's test-only [`MarkedCommitHook`], now
+    /// and on every reopening.
+    pub fn set_marked_commit_hook(&self, hook: Option<MarkedCommitHook>) {
+        *self
+            .marked_commit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook.clone();
+        let mut g = self
+            .store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(s) = g.as_mut() {
+            s.set_marked_commit_hook(hook);
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -114,12 +152,7 @@ impl StoreSlot {
                 Ok(out)
             }
             Err(e) => {
-                match Self::open_store(
-                    &self.path,
-                    &self.extractors,
-                    self.cache_bytes,
-                    self.max_snapshot_age,
-                ) {
+                match self.reopen() {
                     Ok(store) => *g = Some(store),
                     Err(re) => tracing::error!(error = %re, "store could not be reopened"),
                 }
@@ -140,12 +173,7 @@ impl StoreSlot {
         self.replace(|store| {
             drop(store);
             V2Store::install_snapshot(&self.path, src)?;
-            let store = Self::open_store(
-                &self.path,
-                &self.extractors,
-                self.cache_bytes,
-                self.max_snapshot_age,
-            )?;
+            let store = self.reopen()?;
             Ok((store, ()))
         })
     }

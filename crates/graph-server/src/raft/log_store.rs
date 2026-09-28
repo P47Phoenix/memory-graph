@@ -23,6 +23,7 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
@@ -42,9 +43,26 @@ pub fn log_path(db: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// What a test-only observer of [`RedbLogStore::append`] sees, in order
+/// (`durability_order_log_flushed_after_commit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendEvent {
+    /// The redb commit of the entries up to `last_index` returned.
+    Committed { last_index: u64 },
+    /// openraft's `LogFlushed` callback for them is about to be invoked.
+    Flushed { last_index: u64 },
+}
+
+pub type AppendObserver = Arc<dyn Fn(AppendEvent) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RedbLogStore {
     db: Arc<Database>,
+    path: PathBuf,
+    /// Encoded bytes appended since this process opened the log (the
+    /// snapshot policy's byte trigger, `--snapshot-log-bytes`).
+    appended_bytes: Arc<AtomicU64>,
+    observer: Option<AppendObserver>,
 }
 
 impl Debug for RedbLogStore {
@@ -123,7 +141,36 @@ impl RedbLogStore {
         wt.open_table(LOG)?;
         wt.open_table(META)?;
         wt.commit()?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            path: path.to_path_buf(),
+            appended_bytes: Arc::new(AtomicU64::new(0)),
+            observer: None,
+        })
+    }
+
+    /// Record every append's commit and flush callback (tests only).
+    pub fn set_observer(&mut self, observer: Option<AppendObserver>) {
+        self.observer = observer;
+    }
+
+    /// Encoded entry bytes appended since the log was opened.
+    pub fn appended_bytes(&self) -> u64 {
+        self.appended_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The last committed index this node persisted (`save_committed`).
+    pub fn committed_index(&self) -> Option<u64> {
+        self.meta::<Option<LogId>>(K_COMMITTED)
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|l| l.index)
+    }
+
+    /// The log file's size on disk.
+    pub fn file_bytes(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
     fn meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, StorageError> {
@@ -253,21 +300,32 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         I: IntoIterator<Item = <TypeConfig as RaftTypeConfig>::Entry> + Send,
         I::IntoIter: Send,
     {
-        let write = || -> Result<(), StorageError> {
+        let write = || -> Result<(u64, u64), StorageError> {
             let wt = self.db.begin_write().map_err(write_err)?;
+            let mut bytes = 0u64;
+            let mut last = 0u64;
             {
                 let mut t = wt.open_table(LOG).map_err(write_err)?;
                 for e in entries {
-                    t.insert(e.log_id.index, encode_entry(&e).as_slice())
+                    let enc = encode_entry(&e);
+                    bytes += enc.len() as u64;
+                    last = e.log_id.index;
+                    t.insert(e.log_id.index, enc.as_slice())
                         .map_err(write_err)?;
                 }
             }
             // `Immediate` durability: the commit returns once the entries
             // are fsynced, and only then is the flush reported (D7).
-            wt.commit().map_err(write_err)
+            wt.commit().map_err(write_err)?;
+            Ok((bytes, last))
         };
         match write() {
-            Ok(()) => {
+            Ok((bytes, last_index)) => {
+                self.appended_bytes.fetch_add(bytes, Ordering::Relaxed);
+                if let Some(o) = &self.observer {
+                    o(AppendEvent::Committed { last_index });
+                    o(AppendEvent::Flushed { last_index });
+                }
                 callback.log_io_completed(Ok(()));
                 Ok(())
             }

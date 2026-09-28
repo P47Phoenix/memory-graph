@@ -11,6 +11,7 @@ use graph_store::{
     SnapshotStats, Store, StoreError, StoreRead, SymbolHit, SymbolQuery, VacuumStats,
 };
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +103,67 @@ impl RemoteStore {
         Ok(())
     }
 
+    /// `Admin.Members`: every member with its role and address, and the
+    /// leader this node knows.
+    pub fn admin_members(&self) -> Result<pb::MembersResponse> {
+        self.run(self.conn.call(Kind::Read, |ch| async move {
+            admin_client(ch).members(pb::MembersRequest {}).await
+        }))
+        .map(|r| r.into_inner())
+    }
+
+    /// `Admin.Leader`: the leader this node knows (id and address).
+    pub fn admin_leader(&self) -> Result<pb::LeaderResponse> {
+        self.run(self.conn.call(Kind::Read, |ch| async move {
+            admin_client(ch).leader(pb::LeaderRequest {}).await
+        }))
+        .map(|r| r.into_inner())
+    }
+
+    /// `Admin.AddLearner`: add `node_id` at `addr` as a learner (on the
+    /// leader: a `NotLeader` answer moves the connection there, like a
+    /// write); with `blocking`, return once it caught up. Returns the
+    /// membership entry's log index.
+    pub fn admin_add_learner(&self, node_id: u64, addr: &str, blocking: bool) -> Result<u64> {
+        let addr = addr.to_string();
+        self.run(self.conn.call(Kind::Write, |ch| {
+            let addr = addr.clone();
+            async move {
+                admin_client(ch)
+                    .add_learner(pb::AddLearnerRequest {
+                        node_id,
+                        addr,
+                        blocking,
+                    })
+                    .await
+            }
+        }))
+        .map(|r| r.into_inner().log_index)
+    }
+
+    /// `Admin.Promote`: make learner `node_id` a voter (on the leader).
+    /// Returns the membership entry's log index.
+    pub fn admin_promote(&self, node_id: u64) -> Result<u64> {
+        self.run(self.conn.call(Kind::Write, |ch| async move {
+            admin_client(ch)
+                .promote(pb::PromoteRequest { node_id })
+                .await
+        }))
+        .map(|r| r.into_inner().log_index)
+    }
+
+    /// `Admin.TriggerSnapshot`: build a snapshot on the connected node and,
+    /// with `out`, download it there (`cluster snapshot --out`): written to
+    /// `<out>.part`, checked against the size and SHA-256 the server
+    /// announced, then renamed into place. Returns what the server built.
+    pub fn admin_trigger_snapshot(&self, out: Option<&Path>) -> Result<pb::SnapshotInfo> {
+        let out = out.map(Path::to_path_buf);
+        self.run(self.conn.call(Kind::Read, |ch| {
+            let out = out.clone();
+            async move { download_snapshot(ch, out).await }
+        }))
+    }
+
     /// `grpc.health.v1.Health/Check` for `service` (`""` for the server,
     /// `memory-graph.ready` for "a leader is known"): `Ok(true)` when
     /// SERVING.
@@ -184,6 +246,85 @@ impl RemoteStore {
             })
             .collect()
     }
+}
+
+/// One `TriggerSnapshot` call: the info message, then (with `out`) the
+/// chunks into `<out>.part`, verified and renamed to `out`.
+async fn download_snapshot(
+    ch: tonic::transport::Channel,
+    out: Option<std::path::PathBuf>,
+) -> std::result::Result<pb::SnapshotInfo, tonic::Status> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use tokio_stream::StreamExt;
+    let local = |what: &str, e: std::io::Error| tonic::Status::internal(format!("{what}: {e}"));
+    let mut stream = admin_client(ch)
+        .trigger_snapshot(pb::TriggerSnapshotRequest {
+            download: out.is_some(),
+        })
+        .await?
+        .into_inner();
+    let info = match stream.next().await {
+        Some(Ok(pb::TriggerSnapshotResponse {
+            msg: Some(pb::trigger_snapshot_response::Msg::Info(i)),
+        })) => i,
+        Some(Ok(_)) => {
+            return Err(tonic::Status::internal(
+                "TriggerSnapshot did not start with a SnapshotInfo",
+            ))
+        }
+        Some(Err(e)) => return Err(e),
+        None => return Err(tonic::Status::internal("empty TriggerSnapshot stream")),
+    };
+    let Some(out) = out else {
+        return Ok(info);
+    };
+    let mut part = out.as_os_str().to_owned();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let mut file = std::fs::File::create(&part).map_err(|e| local("creating the download", e))?;
+    let mut h = Sha256::new();
+    let mut n = 0u64;
+    let r = async {
+        while let Some(msg) = stream.next().await {
+            match msg?.msg {
+                Some(pb::trigger_snapshot_response::Msg::Chunk(c)) => {
+                    n += c.len() as u64;
+                    h.update(&c);
+                    file.write_all(&c)
+                        .map_err(|e| local("writing the download", e))?;
+                }
+                _ => {
+                    return Err(tonic::Status::internal(
+                        "a second SnapshotInfo in the TriggerSnapshot stream",
+                    ))
+                }
+            }
+        }
+        file.sync_all()
+            .map_err(|e| local("syncing the download", e))?;
+        let sha: String = h
+            .finalize_reset()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if n != info.size || sha != info.sha256 {
+            return Err(tonic::Status::data_loss(format!(
+                "snapshot download is {n} bytes with sha256 {sha}, the server announced {} \
+                 bytes with {}",
+                info.size, info.sha256
+            )));
+        }
+        Ok(())
+    }
+    .await;
+    drop(file);
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, &out).map_err(|e| local("placing the download", e))?;
+    Ok(info)
 }
 
 impl StoreRead for RemoteStore {

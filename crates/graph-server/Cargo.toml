@@ -3,12 +3,14 @@ name = "graph-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "memory-graph server (ADR 0004): the tonic services over a store owned by a one-member openraft node."
+description = "memory-graph server (ADR 0004): the tonic services over a store replicated by an openraft node."
 
 [dependencies]
 graph-core = { path = "../graph-core" }
 graph-store = { path = "../graph-store" }
 graph-proto = { path = "../graph-proto" }
+# `testing::ClusterTestbed::client` hands tests a RemoteStore.
+graph-client = { path = "../graph-client" }
 tokio.workspace = true
 tokio-stream.workspace = true
 openraft.workspace = true
@@ -21,14 +23,19 @@ tracing.workspace = true
 redb.workspace = true
 sha2.workspace = true
 rand.workspace = true
+# `testing::ClusterTestbed` keeps its nodes in a temp dir.
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
 # `kill(pid, 0)` for the stale-LOCK check: pure Rust bindings, gate-clean.
 libc = "0.2"
+# `statvfs` for the disk guard (pure Rust, as in graph-cli).
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
-tempfile.workspace = true
 graph-lang-rust = { path = "../graph-lang-rust" }
+graph-lang-csharp = { path = "../graph-lang-csharp" }
+graph-lang-javascript = { path = "../graph-lang-javascript" }

@@ -3159,7 +3159,7 @@ pub mod write_server {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StatusRequest {}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StatusResponse {
     #[prost(uint64, tag = "1")]
     pub node_id: u64,
@@ -3203,6 +3203,46 @@ pub struct StatusResponse {
     /// Open snapshot handles held for clients (`Store.OpenSnapshot`).
     #[prost(uint64, tag = "19")]
     pub snapshot_handles: u64,
+    /// Raft role, lower case: `leader`, `follower`, `candidate`, `learner`,
+    /// `shutdown`.
+    #[prost(string, tag = "20")]
+    pub role: ::prost::alloc::string::String,
+    /// Log index of the current snapshot (0: none) and of the last purged
+    /// entry (0: none purged).
+    #[prost(uint64, tag = "21")]
+    pub snapshot_index: u64,
+    #[prost(uint64, tag = "22")]
+    pub purged_index: u64,
+    /// Every member with its role and address.
+    #[prost(message, repeated, tag = "23")]
+    pub members: ::prost::alloc::vec::Vec<Member>,
+    /// The leader only: how far each peer's matched log index is behind this
+    /// node's last log index.
+    #[prost(message, repeated, tag = "24")]
+    pub replication: ::prost::alloc::vec::Vec<PeerLag>,
+    /// Bytes of the Raft log file and of the store file on disk.
+    #[prost(uint64, tag = "25")]
+    pub log_bytes: u64,
+    #[prost(uint64, tag = "26")]
+    pub store_bytes: u64,
+    /// The data directory (`serve --data-dir`); empty in `--db` mode.
+    #[prost(string, tag = "27")]
+    pub data_dir: ::prost::alloc::string::String,
+    /// This node's advertised address (`--advertise`).
+    #[prost(string, tag = "28")]
+    pub advertise: ::prost::alloc::string::String,
+}
+/// Replication progress of one peer, as the leader sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PeerLag {
+    #[prost(uint64, tag = "1")]
+    pub node_id: u64,
+    /// The highest log index known to match on the peer (absent: none yet).
+    #[prost(uint64, optional, tag = "2")]
+    pub matched_index: ::core::option::Option<u64>,
+    /// `last_log_index - matched_index` on the leader.
+    #[prost(uint64, tag = "3")]
+    pub lag: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SysInfoRequest {}
@@ -3265,6 +3305,10 @@ pub struct AddLearnerRequest {
     pub node_id: u64,
     #[prost(string, tag = "2")]
     pub addr: ::prost::alloc::string::String,
+    /// Wait until the learner has caught up with the leader's log before
+    /// answering.
+    #[prost(bool, tag = "3")]
+    pub blocking: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AddLearnerResponse {
@@ -3300,14 +3344,44 @@ pub struct TransferLeaderRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransferLeaderResponse {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TriggerSnapshotRequest {}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TriggerSnapshotResponse {
-    /// Index/term of the snapshot taken.
+pub struct TriggerSnapshotRequest {
+    /// Stream the snapshot file back after the `SnapshotInfo`.
+    #[prost(bool, tag = "1")]
+    pub download: bool,
+}
+/// What the snapshot is: always the first message of the stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SnapshotInfo {
+    /// Index/term of the last entry the snapshot contains.
     #[prost(uint64, tag = "1")]
     pub last_applied_index: u64,
     #[prost(uint64, tag = "2")]
     pub last_applied_term: u64,
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    /// Lowercase hex SHA-256 of the file.
+    #[prost(string, tag = "4")]
+    pub sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub extractors_hash: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub store_format_version: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TriggerSnapshotResponse {
+    #[prost(oneof = "trigger_snapshot_response::Msg", tags = "1, 2")]
+    pub msg: ::core::option::Option<trigger_snapshot_response::Msg>,
+}
+/// Nested message and enum types in `TriggerSnapshotResponse`.
+pub mod trigger_snapshot_response {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Msg {
+        #[prost(message, tag = "1")]
+        Info(super::SnapshotInfo),
+        /// A chunk of the snapshot file, in order (only with `download`).
+        #[prost(bytes, tag = "2")]
+        Chunk(::prost::alloc::vec::Vec<u8>),
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MetricsRequest {}
@@ -3494,7 +3568,7 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Admin", "Shutdown"));
             self.inner.unary(req, path, codec).await
         }
-        /// Cluster operations (stage B/C): UNIMPLEMENTED in stage A.
+        /// Cluster operations (stage B/C).
         pub async fn members(
             &mut self,
             request: impl tonic::IntoRequest<super::MembersRequest>,
@@ -3633,11 +3707,14 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Admin", "TransferLeader"));
             self.inner.unary(req, path, codec).await
         }
+        /// Build a snapshot now; with `download`, stream the snapshot file back
+        /// (a `SnapshotInfo` first, then the file in 1 MiB chunks) so a remote
+        /// client can keep a backup (`cluster snapshot --out`).
         pub async fn trigger_snapshot(
             &mut self,
             request: impl tonic::IntoRequest<super::TriggerSnapshotRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::TriggerSnapshotResponse>,
+            tonic::Response<tonic::codec::Streaming<super::TriggerSnapshotResponse>>,
             tonic::Status,
         > {
             self.inner
@@ -3655,7 +3732,7 @@ pub mod admin_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("memory_graph.v1.Admin", "TriggerSnapshot"));
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         /// Prometheus text exposition of the server's metrics.
         pub async fn metrics(
@@ -3720,7 +3797,7 @@ pub mod admin_server {
             tonic::Response<super::ShutdownResponse>,
             tonic::Status,
         >;
-        /// Cluster operations (stage B/C): UNIMPLEMENTED in stage A.
+        /// Cluster operations (stage B/C).
         async fn members(
             &self,
             request: tonic::Request<super::MembersRequest>,
@@ -3751,11 +3828,20 @@ pub mod admin_server {
             tonic::Response<super::TransferLeaderResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the TriggerSnapshot method.
+        type TriggerSnapshotStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::TriggerSnapshotResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Build a snapshot now; with `download`, stream the snapshot file back
+        /// (a `SnapshotInfo` first, then the file in 1 MiB chunks) so a remote
+        /// client can keep a backup (`cluster snapshot --out`).
         async fn trigger_snapshot(
             &self,
             request: tonic::Request<super::TriggerSnapshotRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::TriggerSnapshotResponse>,
+            tonic::Response<Self::TriggerSnapshotStream>,
             tonic::Status,
         >;
         /// Prometheus text exposition of the server's metrics.
@@ -4277,11 +4363,13 @@ pub mod admin_server {
                     struct TriggerSnapshotSvc<T: Admin>(pub Arc<T>);
                     impl<
                         T: Admin,
-                    > tonic::server::UnaryService<super::TriggerSnapshotRequest>
-                    for TriggerSnapshotSvc<T> {
+                    > tonic::server::ServerStreamingService<
+                        super::TriggerSnapshotRequest,
+                    > for TriggerSnapshotSvc<T> {
                         type Response = super::TriggerSnapshotResponse;
+                        type ResponseStream = T::TriggerSnapshotStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -4312,7 +4400,7 @@ pub mod admin_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -4400,44 +4488,114 @@ pub mod admin_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+/// `openraft::Vote<u64>`: the leader id (term, node) and whether it is
+/// committed (granted by a quorum).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RaftVote {
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
+    #[prost(uint64, tag = "2")]
+    pub node_id: u64,
+    #[prost(bool, tag = "3")]
+    pub committed: bool,
+}
+/// `openraft::LogId<u64>`: the leader id that proposed the entry and its
+/// index.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RaftLogId {
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
+    #[prost(uint64, tag = "2")]
+    pub node_id: u64,
+    #[prost(uint64, tag = "3")]
+    pub index: u64,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AppendEntriesRequest {
-    /// serde_json `openraft::raft::AppendEntriesRequest<TypeConfig>`.
-    #[prost(bytes = "vec", tag = "1")]
-    pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "1")]
+    pub vote: ::core::option::Option<RaftVote>,
+    /// Absent: the entries start at the beginning of the log.
+    #[prost(message, optional, tag = "2")]
+    pub prev_log_id: ::core::option::Option<RaftLogId>,
+    #[prost(message, optional, tag = "3")]
+    pub leader_commit: ::core::option::Option<RaftLogId>,
+    /// Each entry in the log store's binary framing (see the file comment).
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub entries: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AppendEntriesResponse {
-    /// serde_json `openraft::raft::AppendEntriesResponse<NodeId>`.
-    #[prost(bytes = "vec", tag = "1")]
-    pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(oneof = "append_entries_response::Result", tags = "1, 2, 3, 4")]
+    pub result: ::core::option::Option<append_entries_response::Result>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// Nested message and enum types in `AppendEntriesResponse`.
+pub mod append_entries_response {
+    /// `PartialSuccess` with no matching log id.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Partial {
+        #[prost(message, optional, tag = "1")]
+        pub matching: ::core::option::Option<super::RaftLogId>,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Result {
+        /// All entries were appended.
+        #[prost(message, tag = "1")]
+        Success(super::RaftEmpty),
+        /// Only a prefix up to `matching` was appended.
+        #[prost(message, tag = "2")]
+        PartialSuccess(Partial),
+        /// `prev_log_id` does not match on the receiver.
+        #[prost(message, tag = "3")]
+        Conflict(super::RaftEmpty),
+        /// The receiver has seen a higher vote.
+        #[prost(message, tag = "4")]
+        HigherVote(super::RaftVote),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RaftEmpty {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VoteRequest {
-    /// serde_json `openraft::raft::VoteRequest<NodeId>`.
-    #[prost(bytes = "vec", tag = "1")]
-    pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "1")]
+    pub vote: ::core::option::Option<RaftVote>,
+    #[prost(message, optional, tag = "2")]
+    pub last_log_id: ::core::option::Option<RaftLogId>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VoteResponse {
-    /// serde_json `openraft::raft::VoteResponse<NodeId>`.
-    #[prost(bytes = "vec", tag = "1")]
-    pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "1")]
+    pub vote: ::core::option::Option<RaftVote>,
+    #[prost(bool, tag = "2")]
+    pub vote_granted: bool,
+    #[prost(message, optional, tag = "3")]
+    pub last_log_id: ::core::option::Option<RaftLogId>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InstallSnapshotHeader {
-    /// serde_json `openraft::Vote<NodeId>` of the sending leader.
-    #[prost(bytes = "vec", tag = "1")]
-    pub vote: ::prost::alloc::vec::Vec<u8>,
-    /// serde_json `openraft::SnapshotMeta<NodeId, Node>`.
-    #[prost(bytes = "vec", tag = "2")]
-    pub meta: ::prost::alloc::vec::Vec<u8>,
+    /// The sending leader's vote.
+    #[prost(message, optional, tag = "1")]
+    pub vote: ::core::option::Option<RaftVote>,
+    /// `SnapshotMeta.last_log_id`.
+    #[prost(message, optional, tag = "2")]
+    pub last_log_id: ::core::option::Option<RaftLogId>,
+    /// `SnapshotMeta.last_membership`: serde_json `openraft::StoredMembership`
+    /// (a few hundred bytes).
+    #[prost(bytes = "vec", tag = "3")]
+    pub membership_json: ::prost::alloc::vec::Vec<u8>,
+    /// `SnapshotMeta.snapshot_id`.
+    #[prost(string, tag = "4")]
+    pub snapshot_id: ::prost::alloc::string::String,
     /// The store format version of the snapshot file (`graph_store::SCHEMA_VERSION`).
-    #[prost(uint64, tag = "3")]
+    #[prost(uint64, tag = "5")]
     pub store_format_version: u64,
     /// The extractor version set hash the snapshot was built with (D5).
-    #[prost(string, tag = "4")]
+    #[prost(string, tag = "6")]
     pub extractors_hash: ::prost::alloc::string::String,
+    /// Byte length and lowercase hex SHA-256 of the file that follows.
+    #[prost(uint64, tag = "7")]
+    pub size: u64,
+    #[prost(string, tag = "8")]
+    pub sha256: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InstallSnapshotRequest {
@@ -4455,11 +4613,11 @@ pub mod install_snapshot_request {
         Chunk(::prost::alloc::vec::Vec<u8>),
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InstallSnapshotResponse {
-    /// serde_json `openraft::raft::InstallSnapshotResponse<NodeId>`.
-    #[prost(bytes = "vec", tag = "1")]
-    pub payload: ::prost::alloc::vec::Vec<u8>,
+    /// The receiver's vote after the install.
+    #[prost(message, optional, tag = "1")]
+    pub vote: ::core::option::Option<RaftVote>,
 }
 /// One replicated log entry (ADR 0004 D5): what the state machine applies in
 /// one marked transaction (`V2Store::index_prepared_marked` and friends).
@@ -4654,7 +4812,9 @@ pub mod raft_client {
             self.inner.unary(req, path, codec).await
         }
         /// Snapshot transfer: an `InstallSnapshotHeader` then the snapshot file in
-        /// chunks.
+        /// chunks (1 MiB each), in order. The receiver checks the size and the
+        /// SHA-256 against the header and refuses another store format or
+        /// extractor version set hash with FAILED_PRECONDITION.
         pub async fn install_snapshot(
             &mut self,
             request: impl tonic::IntoStreamingRequest<
@@ -4708,7 +4868,9 @@ pub mod raft_server {
             request: tonic::Request<super::VoteRequest>,
         ) -> std::result::Result<tonic::Response<super::VoteResponse>, tonic::Status>;
         /// Snapshot transfer: an `InstallSnapshotHeader` then the snapshot file in
-        /// chunks.
+        /// chunks (1 MiB each), in order. The receiver checks the size and the
+        /// SHA-256 against the header and refuses another store format or
+        /// extractor version set hash with FAILED_PRECONDITION.
         async fn install_snapshot(
             &self,
             request: tonic::Request<tonic::Streaming<super::InstallSnapshotRequest>>,

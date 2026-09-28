@@ -247,7 +247,7 @@ Time-boxed to 1 day. Output: documented findings + story estimate.
 - Given the recommendation, When the spike closes, Then it must state go or no-go and the follow-up stories needed.
 
 **20. Single-node server and client (8 pts)**
-Status: Delivered on branch `stage-a` (PR pending). RPC overhead: [spikes/rpc-overhead.md](spikes/rpc-overhead.md).
+Status: Delivered in PR #113 (squash 0780415). RPC overhead: [spikes/rpc-overhead.md](spikes/rpc-overhead.md).
 As a developer or agent
 I want a `memory-graph serve` process to own the database and the command line to talk to it over gRPC
 So that many readers and one index run share a database without fighting over the file lock, from any machine.

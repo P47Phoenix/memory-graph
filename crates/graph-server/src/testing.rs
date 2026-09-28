@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod cluster;
+pub use cluster::{ClusterTestbed, TestNode, CLUSTER_WAIT, TEST_RAFT};
+
 pub struct TestServer {
     db: PathBuf,
     extractors: Vec<Arc<dyn Extractor>>,
@@ -39,6 +42,26 @@ impl TestServer {
         tweak: impl FnOnce(&mut ServeConfig),
     ) -> TestServer {
         Self::try_start_with(db, extractors, tweak).expect("test server starts")
+    }
+
+    /// Start with a complete configuration (a `--data-dir` node, say);
+    /// `db()` then answers the store path the configuration resolves to.
+    pub fn try_start_config(
+        cfg: ServeConfig,
+        extractors: Vec<Box<dyn Extractor>>,
+    ) -> Result<TestServer, StoreError> {
+        let extractors = share(extractors);
+        let rt = runtime();
+        let running = rt.block_on(start(cfg.clone(), extractors.clone()))?;
+        let addr = running.addr;
+        Ok(TestServer {
+            db: running.paths.store.clone(),
+            extractors,
+            cfg,
+            rt,
+            running: Some(running),
+            addr,
+        })
     }
 
     /// Fallible `start_with` (a second server on the same file is `Locked`).

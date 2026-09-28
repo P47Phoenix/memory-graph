@@ -60,8 +60,20 @@ impl LockFile {
     /// lock would already have refused the open, so this is belt and
     /// braces for a sidecar left by a server on another store copy).
     pub fn create(db: &Path, listen: &str) -> std::io::Result<LockFile> {
-        let path = lock_path(db);
-        if let Some((info, true)) = holder(db) {
+        Self::create_at(&lock_path(db), listen)
+    }
+
+    /// [`create`](Self::create) at an explicit sidecar path (`<data-dir>/LOCK`).
+    pub fn create_at(path: &Path, listen: &str) -> std::io::Result<LockFile> {
+        let path = path.to_path_buf();
+        let found = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<LockInfo>(&t).ok())
+            .map(|i| {
+                let alive = pid_alive(i.pid);
+                (i, alive)
+            });
+        if let Some((info, true)) = found {
             if info.pid != std::process::id() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,

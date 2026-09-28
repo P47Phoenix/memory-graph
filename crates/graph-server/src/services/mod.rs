@@ -12,19 +12,32 @@ use std::time::Instant;
 use tonic::Status;
 
 pub mod admin;
+pub mod raft;
 pub mod store;
 pub mod write;
 
 /// Facts about this server that never change while it runs.
 pub struct ServerInfo {
     pub node_id: u64,
-    pub cluster_id: String,
+    /// The cluster id (learned later by an uninitialized member).
+    pub identity: Arc<crate::paths::ClusterIdentity>,
     pub extractors_hash: String,
     pub db_path: String,
     pub listen_addr: String,
     pub started: Instant,
     /// The protocol version `Hello` reports (the real one outside tests).
     pub hello_protocol_version: u32,
+    /// `serve --data-dir` (empty in `--db` mode).
+    pub data_dir: String,
+    /// This node's advertised address.
+    pub advertise: String,
+}
+
+impl ServerInfo {
+    /// The cluster id, empty while an uninitialized member has none.
+    pub fn cluster_id(&self) -> String {
+        self.identity.get().unwrap_or_default()
+    }
 }
 
 pub struct Ctx {

@@ -65,7 +65,7 @@ impl pb::store_server::Store for StoreService {
             node_id: self.ctx.info.node_id,
             leader_id: leader.id,
             leader_addr: leader.addr,
-            cluster_id: self.ctx.info.cluster_id.clone(),
+            cluster_id: self.ctx.info.cluster_id(),
         }))
     }
 

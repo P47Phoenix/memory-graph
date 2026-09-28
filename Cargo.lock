@@ -672,6 +672,7 @@ dependencies = [
  "prost",
  "rand 0.8.8",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -752,7 +753,10 @@ dependencies = [
 name = "graph-server"
 version = "0.1.0"
 dependencies = [
+ "graph-client",
  "graph-core",
+ "graph-lang-csharp",
+ "graph-lang-javascript",
  "graph-lang-rust",
  "graph-proto",
  "graph-store",
@@ -761,6 +765,7 @@ dependencies = [
  "prost",
  "rand 0.8.8",
  "redb",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

@@ -17,27 +17,16 @@
 //! returned to openraft as a `StorageError`: it stops the node rather than
 //! let one replica silently diverge; a restart replays from the marker.
 //!
-//! Snapshots: `build_snapshot` = `export_snapshot` to `<db>.snapshot.redb`
-//! (one read transaction, so the copy is consistent and carries its own
-//! marker, from which the metadata is read) plus a `<db>.snapshot.meta`
-//! JSON; `install_snapshot` = `StoreSlot::install_snapshot` (close, rename,
+//! Snapshots live in a [`SnapshotDir`] (`snapshots/snap-<term>-<index>.redb`
+//! plus a `.meta`; see that module for the crash-safety argument):
+//! `build_snapshot` = `export_snapshot` (one read transaction, so the copy
+//! is consistent and carries its own marker, from which the metadata is
+//! read); `install_snapshot` = `StoreSlot::install_snapshot` (close, rename,
 //! reopen under the slot's write lock) and, only once that succeeded, the
-//! installed file becomes the current snapshot and its meta is written. The
-//! data file and the meta are each put in place by rename, data first; a
-//! crash between the two leaves a meta whose `last_log_id` differs from the
-//! file's own marker, and `get_current_snapshot` checks exactly that and
-//! answers "no snapshot" (logged) rather than pair them.
-//!
-//! Where `rename` cannot replace an existing file (`replace_file`'s
-//! fallback), the target is removed and then renamed into place: that pair
-//! is not atomic, and a crash between the two leaves no current snapshot
-//! file. `read_meta` treats a missing data file (or meta) as "no snapshot",
-//! which is safe: openraft then builds a fresh one or ships the log.
-//!
-//! A snapshot build runs `export_snapshot` under the slot's **read** lock
-//! for the length of the copy, so it blocks `compact` and a snapshot
-//! install (which take the write lock) until it finishes; reads and writes
-//! proceed.
+//! received file becomes the current snapshot. A build runs
+//! `export_snapshot` under the slot's **read** lock for the length of the
+//! copy, so it blocks `compact` and a snapshot install (which take the
+//! write lock) until it finishes; reads and writes proceed.
 //!
 //! A mid-batch I/O error: `apply` gets entries in batches, and an I/O-class
 //! error on one entry fails the whole call, so the responses already
@@ -48,6 +37,7 @@
 //! fingerprints (an unchanged file is a no-op), `Prune` and `Vacuum` by
 //! construction, and `IngestExtraction` when the extraction is identical,
 //! which a retry of the same request is (ADR 0004 D2/D7).
+use super::snapshot_dir::SnapshotDir;
 use super::types::{
     log_id_of, marker_of, Entry, ErrDetail, LogId, LogResponse, SnapshotFile, SnapshotMeta,
     StorageError, StorageIOError, StoredMembership, TypeConfig,
@@ -58,44 +48,24 @@ use graph_store::{IndexOptions, RaftMarker, StoreError, V2Store};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{AnyError, EntryPayload, RaftTypeConfig, Snapshot};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Test-only failpoints of the state machine ([`crate::TestingHooks`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SmFailpoints {
+    /// Fail `apply` (an I/O-class error: openraft stops the node) just
+    /// before the entry at this index is applied: it is in the log and
+    /// committed, and nothing of it is in the store.
+    pub fail_before_apply: Option<u64>,
+}
 
 pub struct StoreStateMachine {
     slot: Arc<StoreSlot>,
+    snapshots: Arc<SnapshotDir>,
+    failpoints: SmFailpoints,
 }
 
-/// Where a store's current snapshot and its metadata live.
-pub fn snapshot_path(db: &Path) -> PathBuf {
-    with_suffix(db, ".snapshot.redb")
-}
-
-fn meta_path(db: &Path) -> PathBuf {
-    with_suffix(db, ".snapshot.meta")
-}
-
-fn incoming_path(db: &Path) -> PathBuf {
-    with_suffix(db, ".snapshot.incoming.redb")
-}
-
-fn with_suffix(db: &Path, suffix: &str) -> PathBuf {
-    let mut p = db.as_os_str().to_owned();
-    p.push(suffix);
-    PathBuf::from(p)
-}
-
-/// Rename `from` over `to` (removing `to` first where the platform's
-/// rename refuses to replace an existing file).
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    match std::fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) if to.exists() => {
-            std::fs::remove_file(to)?;
-            std::fs::rename(from, to)
-        }
-        Err(e) => Err(e),
-    }
-}
+pub use super::snapshot_dir::replace_file;
 
 fn sm_err(e: impl std::error::Error + 'static) -> StorageError {
     StorageIOError::write_state_machine(AnyError::new(&e)).into()
@@ -120,8 +90,17 @@ fn is_refusal(e: &StoreError) -> bool {
 }
 
 impl StoreStateMachine {
-    pub fn new(slot: Arc<StoreSlot>) -> Self {
-        Self { slot }
+    pub fn new(slot: Arc<StoreSlot>, snapshots: Arc<SnapshotDir>) -> Self {
+        Self {
+            slot,
+            snapshots,
+            failpoints: SmFailpoints::default(),
+        }
+    }
+
+    pub fn with_failpoints(mut self, failpoints: SmFailpoints) -> Self {
+        self.failpoints = failpoints;
+        self
     }
 
     /// The state the marker records: `(last applied, membership)`.
@@ -136,9 +115,21 @@ impl StoreStateMachine {
     }
 
     /// Apply `entries` in order; the blocking body of `apply`.
-    fn apply_all(slot: &StoreSlot, entries: Vec<Entry>) -> Result<Vec<LogResponse>, StorageError> {
+    fn apply_all(
+        slot: &StoreSlot,
+        entries: Vec<Entry>,
+        failpoints: SmFailpoints,
+    ) -> Result<Vec<LogResponse>, StorageError> {
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
+            if failpoints.fail_before_apply == Some(e.log_id.index) {
+                tracing::warn!(index = e.log_id.index, "testing: failpoint before apply");
+                let err = StoreError::Storage(format!(
+                    "testing: failpoint before applying entry {}",
+                    e.log_id.index
+                ));
+                return Err(StorageIOError::apply(e.log_id, AnyError::new(&err)).into());
+            }
             let r = slot.with_store(|s| Self::apply_one(s, &e)).map_err(|err| {
                 StorageError::from(StorageIOError::apply(e.log_id, AnyError::new(&err)))
             })?;
@@ -268,111 +259,6 @@ impl StoreStateMachine {
             Cmd::Noop(_) => store.mark_only(marker, None).map(|()| LogResponse::Marked),
         }
     }
-
-    /// The current snapshot's metadata, validated against the file it
-    /// describes: a meta whose `last_log_id` differs from the snapshot
-    /// file's own marker (a crash between the two renames of a build or an
-    /// install) is treated as no snapshot, and logged, so a meta is never
-    /// paired with a file it does not describe.
-    fn read_meta(db: &Path) -> Result<Option<SnapshotMeta>, StorageError> {
-        let path = meta_path(db);
-        let file = snapshot_path(db);
-        if !path.exists() || !file.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(&path).map_err(sm_read_err)?;
-        let meta: SnapshotMeta = serde_json::from_str(&text).map_err(sm_read_err)?;
-        let on_file = match V2Store::open(&file).and_then(|s| Self::read_applied(&s)) {
-            Ok((last, _)) => last,
-            Err(e) => {
-                tracing::warn!(error = %e, file = %file.display(), "snapshot file unreadable; treated as no snapshot");
-                return Ok(None);
-            }
-        };
-        if on_file != meta.last_log_id {
-            tracing::warn!(
-                meta = ?meta.last_log_id,
-                file = ?on_file,
-                "snapshot meta does not match its file (interrupted build or install); treated as no snapshot"
-            );
-            return Ok(None);
-        }
-        Ok(Some(meta))
-    }
-
-    /// Write the meta to a temp file and rename it into place, so a crash
-    /// never leaves a half-written meta.
-    fn write_meta(db: &Path, meta: &SnapshotMeta) -> Result<(), StorageError> {
-        let text = serde_json::to_string_pretty(meta).map_err(sm_err)?;
-        let tmp = with_suffix(db, ".snapshot.meta.tmp");
-        std::fs::write(&tmp, text).map_err(sm_err)?;
-        replace_file(&tmp, &meta_path(db)).map_err(sm_err)
-    }
-
-    /// Blocking body of `install_snapshot`.
-    fn install(
-        slot: &StoreSlot,
-        meta: &SnapshotMeta,
-        data: &SnapshotFile,
-    ) -> Result<(), StorageError> {
-        Self::install_with(slot.path(), meta, data, |staged| {
-            slot.install_snapshot(staged)
-        })
-    }
-
-    /// `install` with the store swap as a parameter (tests inject a
-    /// failure). The received file becomes the current snapshot, and its
-    /// meta is written, only after the swap succeeded: a failed install
-    /// leaves the previous current snapshot and meta untouched.
-    fn install_with(
-        db: &Path,
-        meta: &SnapshotMeta,
-        data: &SnapshotFile,
-        swap: impl FnOnce(&Path) -> Result<(), StoreError>,
-    ) -> Result<(), StorageError> {
-        let cleanup_incoming = || {
-            if data.path == incoming_path(db) {
-                let _ = std::fs::remove_file(&data.path);
-            }
-        };
-        let valid = graph_store::detect_format(&data.path)
-            .map_err(sm_err)
-            .and_then(|v| {
-                v.ok_or_else(|| {
-                    sm_err(StoreError::Rejected(format!(
-                        "`{}` is not a store file",
-                        data.path.display()
-                    )))
-                })
-            });
-        if let Err(e) = valid {
-            cleanup_incoming();
-            return Err(e);
-        }
-        // The swap consumes its source: install a copy.
-        let staged = with_suffix(db, ".snapshot.install.redb");
-        let _ = std::fs::remove_file(&staged);
-        let r = std::fs::copy(&data.path, &staged)
-            .map_err(sm_err)
-            .and_then(|_| swap(&staged).map_err(sm_err));
-        let _ = std::fs::remove_file(&staged);
-        if let Err(e) = r {
-            cleanup_incoming();
-            return Err(e);
-        }
-        // Promote: data file first, then its meta (each by rename).
-        let current = snapshot_path(db);
-        if data.path != current {
-            let tmp = with_suffix(db, ".snapshot.promote.redb");
-            let _ = std::fs::remove_file(&tmp);
-            let promoted = std::fs::copy(&data.path, &tmp)
-                .and_then(|_| replace_file(&tmp, &current))
-                .map_err(sm_err);
-            cleanup_incoming();
-            promoted?;
-        }
-        Self::write_meta(db, meta)
-    }
 }
 
 impl RaftStateMachine<TypeConfig> for StoreStateMachine {
@@ -391,8 +277,9 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
     {
         let entries: Vec<Entry> = entries.into_iter().collect();
         let slot = Arc::clone(&self.slot);
+        let fp = self.failpoints;
         // Parsing and committing block; keep them off the runtime workers.
-        tokio::task::spawn_blocking(move || Self::apply_all(&slot, entries))
+        tokio::task::spawn_blocking(move || Self::apply_all(&slot, entries, fp))
             .await
             .map_err(|e| sm_err(std::io::Error::other(format!("apply task: {e}"))))?
     }
@@ -400,13 +287,14 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         SnapshotBuilder {
             slot: Arc::clone(&self.slot),
+            snapshots: Arc::clone(&self.snapshots),
         }
     }
 
     async fn begin_receiving_snapshot(&mut self) -> Result<Box<SnapshotFile>, StorageError> {
-        let path = incoming_path(self.slot.path());
-        let _ = std::fs::remove_file(&path);
-        Ok(Box::new(SnapshotFile { path }))
+        Ok(Box::new(SnapshotFile {
+            path: self.snapshots.incoming_path(),
+        }))
     }
 
     async fn install_snapshot(
@@ -415,74 +303,37 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
         snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError> {
         let slot = Arc::clone(&self.slot);
+        let snaps = Arc::clone(&self.snapshots);
         let meta = meta.clone();
-        tokio::task::spawn_blocking(move || Self::install(&slot, &meta, &snapshot))
-            .await
-            .map_err(|e| sm_err(std::io::Error::other(format!("install task: {e}"))))?
+        tokio::task::spawn_blocking(move || {
+            snaps
+                .install_with(slot.path(), &meta, &snapshot, |staged| {
+                    slot.install_snapshot(staged)
+                })
+                .map_err(sm_err)
+        })
+        .await
+        .map_err(|e| sm_err(std::io::Error::other(format!("install task: {e}"))))?
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError> {
-        let db = self.slot.path();
-        Ok(Self::read_meta(db)?.map(|meta| Snapshot {
-            meta,
-            snapshot: Box::new(SnapshotFile {
-                path: snapshot_path(db),
-            }),
-        }))
+        let snaps = Arc::clone(&self.snapshots);
+        tokio::task::spawn_blocking(move || snaps.current_snapshot())
+            .await
+            .map_err(|e| sm_read_err(std::io::Error::other(format!("snapshot task: {e}"))))
     }
 }
 
 pub struct SnapshotBuilder {
     slot: Arc<StoreSlot>,
-}
-
-impl SnapshotBuilder {
-    /// Blocking body of `build_snapshot`.
-    fn build(slot: &StoreSlot) -> Result<Snapshot<TypeConfig>, StorageError> {
-        let db = slot.path();
-        let tmp = with_suffix(db, ".snapshot.tmp.redb");
-        let _ = std::fs::remove_file(&tmp);
-        slot.with_store(|s| s.export_snapshot(&tmp))
-            .map_err(sm_err)?;
-        // The copy's own marker is the snapshot's state (the live store
-        // may already have moved on).
-        let (last_log_id, last_membership) = {
-            let copy = V2Store::open(&tmp).map_err(sm_read_err)?;
-            StoreStateMachine::read_applied(&copy).map_err(sm_read_err)?
-        };
-        let current = snapshot_path(db);
-        // Data file first, then its meta, each by rename; a crash between
-        // the two leaves a meta that no longer matches the file, which
-        // `read_meta` detects and treats as no snapshot.
-        replace_file(&tmp, &current).map_err(sm_err)?;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let snapshot_id = match &last_log_id {
-            Some(id) => format!(
-                "{}-{}-{}-{nanos}",
-                id.leader_id.term, id.leader_id.node_id, id.index
-            ),
-            None => format!("empty-{nanos}"),
-        };
-        let meta = SnapshotMeta {
-            last_log_id,
-            last_membership,
-            snapshot_id,
-        };
-        StoreStateMachine::write_meta(db, &meta)?;
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(SnapshotFile { path: current }),
-        })
-    }
+    snapshots: Arc<SnapshotDir>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError> {
         let slot = Arc::clone(&self.slot);
-        tokio::task::spawn_blocking(move || Self::build(&slot))
+        let snaps = Arc::clone(&self.snapshots);
+        tokio::task::spawn_blocking(move || snaps.build(&slot).map_err(sm_err))
             .await
             .map_err(|e| sm_err(std::io::Error::other(format!("snapshot task: {e}"))))?
     }
@@ -493,20 +344,27 @@ mod tests {
     use super::*;
     use crate::raft::log_store::RedbLogStore;
     use openraft::testing::{StoreBuilder, Suite};
+    use std::path::Path;
     use std::time::Duration;
 
     /// One fresh store pair per test, in its own temp dir.
     struct Builder;
+
+    fn sm_at(d: &Path) -> (Arc<StoreSlot>, StoreStateMachine) {
+        let db = d.join("g.redb");
+        let slot = StoreSlot::open(&db, vec![], None, Duration::from_secs(900)).unwrap();
+        let snaps = Arc::new(SnapshotDir::open(&d.join("snapshots"), "h").unwrap());
+        (Arc::clone(&slot), StoreStateMachine::new(slot, snaps))
+    }
 
     impl StoreBuilder<TypeConfig, RedbLogStore, StoreStateMachine, tempfile::TempDir> for Builder {
         async fn build(
             &self,
         ) -> Result<(tempfile::TempDir, RedbLogStore, StoreStateMachine), StorageError> {
             let d = tempfile::tempdir().unwrap();
-            let db = d.path().join("g.redb");
-            let log = RedbLogStore::open(&crate::raft::log_store::log_path(&db)).unwrap();
-            let slot = StoreSlot::open(&db, vec![], None, Duration::from_secs(900)).unwrap();
-            Ok((d, log, StoreStateMachine::new(slot)))
+            let log = RedbLogStore::open(&d.path().join("raft.redb")).unwrap();
+            let (_, sm) = sm_at(d.path());
+            Ok((d, log, sm))
         }
     }
 
@@ -547,36 +405,46 @@ mod tests {
         }
     }
 
-    fn open_slot(db: &Path) -> Arc<StoreSlot> {
-        StoreSlot::open(db, vec![], None, Duration::from_secs(900)).unwrap()
-    }
+    const NO_FP: SmFailpoints = SmFailpoints {
+        fail_before_apply: None,
+    };
 
     #[test]
     fn a_refused_entry_moves_the_marker_to_its_log_id() {
         let d = tempfile::tempdir().unwrap();
-        let slot = open_slot(&d.path().join("g.redb"));
-        let out = StoreStateMachine::apply_all(&slot, vec![blank(1), refused(2)]).unwrap();
+        let (slot, _) = sm_at(d.path());
+        let out = StoreStateMachine::apply_all(&slot, vec![blank(1), refused(2)], NO_FP).unwrap();
         assert_eq!(out[0], LogResponse::Marked);
         assert!(matches!(out[1], LogResponse::Failed(_)), "{:?}", out[1]);
         let marker = slot.with_store(|s| s.raft_marker()).unwrap().unwrap();
         assert_eq!(log_id_of(marker), log_id(2));
         // A replay of the refused entry is a skip, not a second refusal.
-        let again = StoreStateMachine::apply_all(&slot, vec![refused(2)]).unwrap();
+        let again = StoreStateMachine::apply_all(&slot, vec![refused(2)], NO_FP).unwrap();
         assert_eq!(again, vec![LogResponse::Skipped]);
     }
 
-    /// The review's blocker scenario: a refusal is the last applied entry,
-    /// then a snapshot is built, the log purged up to it, and the node
-    /// restarted: the store's applied state, openraft's last applied and
-    /// the snapshot's last log id all agree, and none is below the purge.
+    #[test]
+    fn the_before_apply_failpoint_stops_before_the_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, _) = sm_at(d.path());
+        let fp = SmFailpoints {
+            fail_before_apply: Some(2),
+        };
+        assert!(StoreStateMachine::apply_all(&slot, vec![blank(1), blank(2)], fp).is_err());
+        let marker = slot.with_store(|s| s.raft_marker()).unwrap().unwrap();
+        assert_eq!(log_id_of(marker), log_id(1), "entry 1 applied, 2 not");
+    }
+
+    /// A refusal is the last applied entry, then a snapshot is built, the
+    /// log purged up to it, and the node restarted: the store's applied
+    /// state, openraft's last applied and the snapshot's last log id all
+    /// agree, and none is below the purge.
     #[tokio::test]
     async fn refusal_then_snapshot_purge_restart_keeps_applied_state_consistent() {
         let d = tempfile::tempdir().unwrap();
-        let db = d.path().join("g.redb");
-        let lp = crate::raft::log_store::log_path(&db);
+        let lp = d.path().join("raft.redb");
         {
-            let slot = open_slot(&db);
-            let mut sm = StoreStateMachine::new(Arc::clone(&slot));
+            let (slot, mut sm) = sm_at(d.path());
             let out = sm.apply(vec![blank(1), refused(2)]).await.unwrap();
             assert!(matches!(out[1], LogResponse::Failed(_)));
             let mut b = sm.get_snapshot_builder().await;
@@ -589,8 +457,7 @@ mod tests {
             slot.close();
         }
         // Restart.
-        let slot = open_slot(&db);
-        let mut sm = StoreStateMachine::new(slot);
+        let (_slot, mut sm) = sm_at(d.path());
         let (applied, _) = sm.applied_state().await.unwrap();
         let mut log = RedbLogStore::open(&lp).unwrap();
         let state = openraft::storage::RaftLogStorage::get_log_state(&mut log)
@@ -617,24 +484,61 @@ mod tests {
     }
 
     /// A slot whose current snapshot (built) is at index 1.
-    fn slot_with_snapshot_at_1(db: &Path) -> Arc<StoreSlot> {
-        let slot = open_slot(db);
-        StoreStateMachine::apply_all(&slot, vec![blank(1)]).unwrap();
-        let snap = SnapshotBuilder::build(&slot).unwrap();
+    fn with_snapshot_at_1(d: &Path) -> (Arc<StoreSlot>, Arc<SnapshotDir>) {
+        let (slot, _) = sm_at(d);
+        StoreStateMachine::apply_all(&slot, vec![blank(1)], NO_FP).unwrap();
+        let snaps = Arc::new(SnapshotDir::open(&d.join("snapshots"), "h").unwrap());
+        let snap = snaps.build(&slot).unwrap();
         assert_eq!(snap.meta.last_log_id, Some(log_id(1)));
-        slot
+        (slot, snaps)
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_build_names_the_pair_by_term_and_index_and_keeps_one() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        assert_eq!(
+            files_in(snaps.dir()),
+            vec!["snap-1-1.meta".to_string(), "snap-1-1.redb".to_string()]
+        );
+        let (side, path) = snaps.current().unwrap();
+        assert_eq!(
+            (side.term, side.index, side.extractors_hash.as_str()),
+            (1, 1, "h")
+        );
+        let (sha, size) = super::super::snapshot_dir::sha256_file(&path).unwrap();
+        assert_eq!((side.sha256, side.size), (sha, size));
+        StoreStateMachine::apply_all(&slot, vec![blank(2)], NO_FP).unwrap();
+        snaps.build(&slot).unwrap();
+        assert_eq!(
+            files_in(snaps.dir()),
+            vec!["snap-1-2.meta".to_string(), "snap-1-2.redb".to_string()],
+            "the older pair is removed once the new one is complete"
+        );
+        // Building again at the same index reuses the pair.
+        let before = snaps.built();
+        snaps.build(&slot).unwrap();
+        assert_eq!(snaps.built(), before);
     }
 
     #[test]
     fn a_failed_install_leaves_the_current_snapshot_and_meta_untouched() {
         let d = tempfile::tempdir().unwrap();
-        let db = d.path().join("g.redb");
-        let _slot = slot_with_snapshot_at_1(&db);
-        let meta_before = std::fs::read(meta_path(&db)).unwrap();
-        let incoming = incoming_path(&db);
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let meta_before = std::fs::read(snaps.dir().join("snap-1-1.meta")).unwrap();
+        let incoming = snaps.incoming_path();
         marked_file(&incoming, 5);
-        let r = StoreStateMachine::install_with(
-            &db,
+        let r = snaps.install_with(
+            slot.path(),
             &meta_at(5),
             &SnapshotFile {
                 path: incoming.clone(),
@@ -642,39 +546,56 @@ mod tests {
             |_| Err(StoreError::Storage("injected install failure".into())),
         );
         assert!(r.is_err());
-        assert_eq!(std::fs::read(meta_path(&db)).unwrap(), meta_before);
-        let meta = StoreStateMachine::read_meta(&db).unwrap().unwrap();
-        assert_eq!(meta.last_log_id, Some(log_id(1)));
+        assert_eq!(
+            std::fs::read(snaps.dir().join("snap-1-1.meta")).unwrap(),
+            meta_before
+        );
+        let (side, _) = snaps.current().unwrap();
+        assert_eq!(side.last_log_id, Some(log_id(1)));
         assert!(!incoming.exists(), "the received file is cleaned up");
+        assert_eq!(snaps.installed(), 0);
     }
 
     #[test]
     fn a_successful_install_promotes_the_file_then_its_meta() {
         let d = tempfile::tempdir().unwrap();
-        let db = d.path().join("g.redb");
-        let _slot = slot_with_snapshot_at_1(&db);
-        let incoming = incoming_path(&db);
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let incoming = snaps.incoming_path();
         marked_file(&incoming, 5);
         let mut swapped = false;
-        StoreStateMachine::install_with(&db, &meta_at(5), &SnapshotFile { path: incoming }, |_| {
-            swapped = true;
-            Ok(())
-        })
-        .unwrap();
+        snaps
+            .install_with(
+                slot.path(),
+                &meta_at(5),
+                &SnapshotFile { path: incoming },
+                |_| {
+                    swapped = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
         assert!(swapped);
-        let meta = StoreStateMachine::read_meta(&db).unwrap().unwrap();
-        assert_eq!(meta.last_log_id, Some(log_id(5)));
+        let (side, _) = snaps.current().unwrap();
+        assert_eq!(side.last_log_id, Some(log_id(5)));
+        assert_eq!(snaps.installed(), 1);
+        assert_eq!(
+            files_in(snaps.dir()),
+            vec!["snap-1-5.meta".to_string(), "snap-1-5.redb".to_string()]
+        );
     }
 
-    /// The crash window of a build or install (data renamed, meta not yet):
-    /// the stale meta is never paired with the new file.
+    /// The crash windows of a build or install: a data file without its
+    /// meta, or a meta whose file is not the recorded size, is no snapshot;
+    /// the previous complete pair still is.
     #[test]
-    fn a_meta_that_does_not_match_its_file_is_no_snapshot() {
+    fn an_incomplete_pair_is_no_snapshot() {
         let d = tempfile::tempdir().unwrap();
-        let db = d.path().join("g.redb");
-        let _slot = slot_with_snapshot_at_1(&db);
-        std::fs::remove_file(snapshot_path(&db)).unwrap();
-        marked_file(&snapshot_path(&db), 5);
-        assert!(StoreStateMachine::read_meta(&db).unwrap().is_none());
+        let (_slot, snaps) = with_snapshot_at_1(d.path());
+        // A newer data file with no meta (crash between the renames).
+        marked_file(&snaps.dir().join("snap-1-9.redb"), 9);
+        assert_eq!(snaps.current().unwrap().0.index, 1);
+        // The current file truncated: no snapshot at all.
+        std::fs::write(snaps.dir().join("snap-1-1.redb"), b"x").unwrap();
+        assert!(snaps.current().is_none());
     }
 }

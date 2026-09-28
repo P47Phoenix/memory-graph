@@ -596,7 +596,7 @@ fn run() -> Result<i32> {
             .next()
             .ok_or_else(|| anyhow::anyhow!("--listen {listen}: resolves to no address"))?;
         let mut cfg = graph_server::ServeConfig::new(&db, addr);
-        cfg.node_id = *node_id;
+        cfg.node_id = Some(*node_id);
         cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));

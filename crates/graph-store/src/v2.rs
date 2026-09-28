@@ -355,7 +355,15 @@ pub struct V2Store {
     path: PathBuf,
     max_snapshot_age: Duration,
     snapshot_tracker: SharedSnapshotTracker,
+    marked_commit_hook: Option<MarkedCommitHook>,
 }
+
+/// A test hook the server's failpoints use (ADR 0004 stage B): called by
+/// every marked write inside its write transaction, after the data and the
+/// marker are staged and before the commit, with the entry's marker. An
+/// `Err` aborts the transaction (nothing of the entry is written) and is
+/// returned to the caller, exactly as an I/O failure at that point would.
+pub type MarkedCommitHook = Arc<dyn Fn(&RaftMarker) -> Result<()> + Send + Sync>;
 
 pub struct V2Snapshot {
     rt: ReadTransaction,
@@ -2268,7 +2276,40 @@ impl V2Store {
             path: path.as_ref().to_path_buf(),
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
             snapshot_tracker: Arc::new(Mutex::new(SnapshotTracker::default())),
+            marked_commit_hook: None,
         })
+    }
+
+    /// Install (or clear) the [`MarkedCommitHook`]. Test-only fault
+    /// injection; never set outside tests.
+    pub fn set_marked_commit_hook(&mut self, hook: Option<MarkedCommitHook>) {
+        self.marked_commit_hook = hook;
+    }
+
+    fn before_marked_commit(&self, marker: &RaftMarker) -> Result<()> {
+        match &self.marked_commit_hook {
+            Some(h) => h(marker),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove the Raft state (`RAFT_SM`: marker and membership) from this
+    /// store, so a server restoring it with `--bootstrap --restore` starts a
+    /// new cluster whose log begins at 0 (ADR 0004 D6). A store without the
+    /// table is left untouched (no write at all).
+    pub fn clear_raft_state(&self) -> Result<()> {
+        {
+            let rt = self.db.begin_read()?;
+            match rt.open_table(RAFT_SM) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let wt = self.db.begin_write()?;
+        wt.delete_table(RAFT_SM)?;
+        wt.commit()?;
+        Ok(())
     }
 
     /// Set the chunk cap of `index_batch`: the write transaction commits once
@@ -2471,6 +2512,7 @@ impl V2Store {
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
         let removed = Self::prune_in(&wt, org, repo, keep, false)?;
+        self.before_marked_commit(&marker)?;
         wt.commit()?;
         Ok(removed)
     }
@@ -2486,6 +2528,7 @@ impl V2Store {
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
         let (stats, _) = Self::vacuum_in(&wt)?;
+        self.before_marked_commit(&marker)?;
         wt.commit()?;
         Ok(stats)
     }
@@ -2509,6 +2552,7 @@ impl V2Store {
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
         let stats = Self::ingest_validated(&wt, org, repo, path, language, ex, (origin, None))?;
+        self.before_marked_commit(&marker)?;
         wt.commit()?;
         Ok(stats)
     }
@@ -2519,6 +2563,7 @@ impl V2Store {
     pub fn mark_only(&self, marker: RaftMarker, membership: Option<&[u8]>) -> Result<()> {
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
+        self.before_marked_commit(&marker)?;
         wt.commit()?;
         Ok(())
     }
@@ -2627,6 +2672,7 @@ impl V2Store {
             path,
             max_snapshot_age,
             snapshot_tracker: _,
+            marked_commit_hook,
         } = self;
         // Drop the old handle before renaming over its path (Windows will
         // not allow the rename while any `Database` still has it open).
@@ -2644,6 +2690,7 @@ impl V2Store {
         // caller can still hold one); the reopened store's tracker starts
         // empty and carries over only the configured max age.
         reopened.max_snapshot_age = max_snapshot_age;
+        reopened.marked_commit_hook = marked_commit_hook;
         let after_bytes = std::fs::metadata(&path).map_err(io)?.len();
         Ok((
             reopened,
@@ -2959,6 +3006,9 @@ impl V2Store {
         // atomically with (or, if the last data chunk just committed above,
         // immediately after) the last chunk's data.
         Self::clear_open_batch(&wt)?;
+        if let Some((m, _)) = &marker {
+            self.before_marked_commit(m)?;
+        }
         wt.commit()?;
         Ok(out)
     }

@@ -554,3 +554,73 @@ fn install_snapshot_then_open_answers_identically() {
     ));
     assert_eq!(std::fs::read(&other).unwrap(), before);
 }
+
+/// The failpoint hook runs inside every marked write's transaction, before
+/// its commit: an `Err` leaves neither data nor marker behind, and the
+/// same entry applies normally once the hook is gone (stage B's
+/// `kill_during_apply_reapplies_exactly_once` relies on exactly this).
+#[test]
+fn marked_commit_hook_aborts_the_whole_entry() {
+    use std::sync::{Arc, Mutex};
+    let d = tempfile::tempdir().unwrap();
+    let mut s = V2Store::open(d.path().join("g.redb")).unwrap();
+    s.mark_only(marker(1), None).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    s.set_marked_commit_hook(Some(Arc::new(move |m: &RaftMarker| {
+        seen2.lock().unwrap().push(m.index);
+        if m.index == 2 {
+            Err(StoreError::Storage("failpoint".into()))
+        } else {
+            Ok(())
+        }
+    })));
+    let files = [bf("a.rs", b"fn a() {}", "rust")];
+    let p = prepared(&s, &files);
+    let e = s
+        .index_prepared_marked("o", "r", p, IndexOptions::default(), marker(2), None)
+        .unwrap_err();
+    assert!(matches!(e, StoreError::Storage(_)), "{e:?}");
+    assert_eq!(s.raft_marker().unwrap(), Some(marker(1)));
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
+    assert!(s
+        .prune_files_marked("o", "r", &HashSet::new(), marker(2), None)
+        .is_err());
+    assert!(s.vacuum_marked(marker(2), None).is_err());
+    assert!(s.mark_only(marker(2), None).is_err());
+    assert_eq!(s.raft_marker().unwrap(), Some(marker(1)));
+    s.set_marked_commit_hook(None);
+    let p = prepared(&s, &files);
+    s.index_prepared_marked("o", "r", p, IndexOptions::default(), marker(2), None)
+        .unwrap();
+    assert_eq!(s.raft_marker().unwrap(), Some(marker(2)));
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+    assert_eq!(*seen.lock().unwrap(), vec![2, 2, 2, 2]);
+}
+
+/// `clear_raft_state` drops the marker and membership (a restored store
+/// starts a new log) and is a no-op without the table.
+#[test]
+fn clear_raft_state_drops_the_table_and_is_a_noop_without_it() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g.redb")).unwrap();
+    s.clear_raft_state().unwrap();
+    assert!(!has_raft_table(&s));
+    let files = [bf("a.rs", b"fn a() {}", "rust")];
+    let p = prepared(&s, &files);
+    s.index_prepared_marked(
+        "o",
+        "r",
+        p,
+        IndexOptions::default(),
+        marker(3),
+        Some(b"m".as_slice()),
+    )
+    .unwrap();
+    assert!(has_raft_table(&s));
+    s.clear_raft_state().unwrap();
+    assert!(!has_raft_table(&s));
+    assert_eq!(s.raft_marker().unwrap(), None);
+    assert_eq!(s.raft_membership().unwrap(), None);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
+}

@@ -1,10 +1,11 @@
 // Node-to-node Raft transport (ADR 0004 D5) and the replicated log entry.
 //
-// Stage A: the three RPCs carry the openraft request/response types
-// serde_json-encoded in `payload` (openraft's types are generic over the
-// application's `RaftTypeConfig`, and stage A has one node, so the loopback
-// network never sends them). Stage B may replace the payloads with typed
-// messages under a new `protocol_version`.
+// Stage B: the RPCs carry openraft's request/response types as small typed
+// fields; log entries travel in the log store's own binary framing
+// (`encode_entry` in graph-server's `raft/log_store.rs`: `kind:u8 | term:u64
+// | node_id:u64 | index:u64 | payload`, little endian), never as JSON, so an
+// `IndexChunk` of 8 MiB of source bytes costs 8 MiB plus 25 bytes on the
+// wire. Served on the same port as the client services.
 syntax = "proto3";
 
 package memory_graph.v1;
@@ -15,37 +16,81 @@ service Raft {
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc Vote(VoteRequest) returns (VoteResponse);
   // Snapshot transfer: an `InstallSnapshotHeader` then the snapshot file in
-  // chunks.
+  // chunks (1 MiB each), in order. The receiver checks the size and the
+  // SHA-256 against the header and refuses another store format or
+  // extractor version set hash with FAILED_PRECONDITION.
   rpc InstallSnapshot(stream InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
-message AppendEntriesRequest {
-  // serde_json `openraft::raft::AppendEntriesRequest<TypeConfig>`.
-  bytes payload = 1;
-}
-message AppendEntriesResponse {
-  // serde_json `openraft::raft::AppendEntriesResponse<NodeId>`.
-  bytes payload = 1;
+// `openraft::Vote<u64>`: the leader id (term, node) and whether it is
+// committed (granted by a quorum).
+message RaftVote {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  bool committed = 3;
 }
 
+// `openraft::LogId<u64>`: the leader id that proposed the entry and its
+// index.
+message RaftLogId {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  uint64 index = 3;
+}
+
+message AppendEntriesRequest {
+  RaftVote vote = 1;
+  // Absent: the entries start at the beginning of the log.
+  optional RaftLogId prev_log_id = 2;
+  optional RaftLogId leader_commit = 3;
+  // Each entry in the log store's binary framing (see the file comment).
+  repeated bytes entries = 4;
+}
+message AppendEntriesResponse {
+  // `PartialSuccess` with no matching log id.
+  message Partial {
+    optional RaftLogId matching = 1;
+  }
+  oneof result {
+    // All entries were appended.
+    RaftEmpty success = 1;
+    // Only a prefix up to `matching` was appended.
+    Partial partial_success = 2;
+    // `prev_log_id` does not match on the receiver.
+    RaftEmpty conflict = 3;
+    // The receiver has seen a higher vote.
+    RaftVote higher_vote = 4;
+  }
+}
+message RaftEmpty {}
+
 message VoteRequest {
-  // serde_json `openraft::raft::VoteRequest<NodeId>`.
-  bytes payload = 1;
+  RaftVote vote = 1;
+  optional RaftLogId last_log_id = 2;
 }
 message VoteResponse {
-  // serde_json `openraft::raft::VoteResponse<NodeId>`.
-  bytes payload = 1;
+  RaftVote vote = 1;
+  bool vote_granted = 2;
+  optional RaftLogId last_log_id = 3;
 }
 
 message InstallSnapshotHeader {
-  // serde_json `openraft::Vote<NodeId>` of the sending leader.
-  bytes vote = 1;
-  // serde_json `openraft::SnapshotMeta<NodeId, Node>`.
-  bytes meta = 2;
+  // The sending leader's vote.
+  RaftVote vote = 1;
+  // `SnapshotMeta.last_log_id`.
+  optional RaftLogId last_log_id = 2;
+  // `SnapshotMeta.last_membership`: serde_json `openraft::StoredMembership`
+  // (a few hundred bytes).
+  bytes membership_json = 3;
+  // `SnapshotMeta.snapshot_id`.
+  string snapshot_id = 4;
   // The store format version of the snapshot file (`graph_store::SCHEMA_VERSION`).
-  uint64 store_format_version = 3;
+  uint64 store_format_version = 5;
   // The extractor version set hash the snapshot was built with (D5).
-  string extractors_hash = 4;
+  string extractors_hash = 6;
+  // Byte length and lowercase hex SHA-256 of the file that follows.
+  uint64 size = 7;
+  string sha256 = 8;
 }
 
 message InstallSnapshotRequest {
@@ -56,8 +101,8 @@ message InstallSnapshotRequest {
   }
 }
 message InstallSnapshotResponse {
-  // serde_json `openraft::raft::InstallSnapshotResponse<NodeId>`.
-  bytes payload = 1;
+  // The receiver's vote after the install.
+  RaftVote vote = 1;
 }
 
 // One replicated log entry (ADR 0004 D5): what the state machine applies in
