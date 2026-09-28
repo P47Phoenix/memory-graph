@@ -133,10 +133,14 @@ impl TestNode {
         }
     }
 
-    /// As close to a crash as in-process allows: no graceful shutdown;
-    /// the node's runtime is torn down, which drops every task (the
-    /// server, the Raft core, in-flight applies) where it stands, and with
-    /// them the store and the log (redb keeps only what was committed).
+    /// An abrupt stop, but not a crash: no graceful shutdown (no drain, no
+    /// Raft shutdown), and the node's runtime is torn down, which drops
+    /// every async task at its next await point; blocking work already
+    /// running (an apply, a log append on the blocking pool) finishes, and
+    /// redb then closes the store and the log cleanly. What a crash loses
+    /// on top of that (writes not yet synced) is what the power-cut tests
+    /// cover ([`crate::powercut::PowerCutDisk`], `tests/durability.rs`),
+    /// and `tests/process_kill.rs` kills a real server process.
     pub fn kill(&mut self) {
         if let Some(r) = self.running.take() {
             drop(r);

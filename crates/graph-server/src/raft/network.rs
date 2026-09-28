@@ -89,7 +89,10 @@ struct NetStatsInner {
 
 #[derive(Default)]
 struct PeerStats {
+    /// The last failure, until entries or a snapshot reach the peer again.
     last_error: Option<String>,
+    /// No RPC of any kind (a heartbeat, say) succeeded since that failure.
+    failing: bool,
     last_warned: Option<std::time::Instant>,
     suppressed: u64,
 }
@@ -107,6 +110,7 @@ impl NetStats {
         self.with(|s| {
             let p = s.peers.entry(target).or_default();
             p.last_error = Some(what.to_string());
+            p.failing = true;
             let now = std::time::Instant::now();
             if p.last_warned.is_none_or(|t| now.duration_since(t) >= WARN_EVERY) {
                 tracing::warn!(
@@ -123,18 +127,29 @@ impl NetStats {
         });
     }
 
-    fn succeeded(&self, target: NodeId) {
+    /// An RPC to `target` succeeded; `delivered`: it carried entries or a
+    /// snapshot (a heartbeat does not clear a replication error).
+    fn succeeded(&self, target: NodeId, delivered: bool) {
         self.with(|s| {
             if let Some(p) = s.peers.get_mut(&target) {
-                p.last_error = None;
+                p.failing = false;
+                if delivered {
+                    p.last_error = None;
+                }
             }
         });
     }
 
-    /// The last error of the last failed RPC to `target`, unless an RPC
-    /// succeeded since.
-    pub fn last_error(&self, target: NodeId) -> Option<String> {
-        self.with(|s| s.peers.get(&target).and_then(|p| p.last_error.clone()))
+    /// The last replication error to `target` worth reporting: while RPCs
+    /// to it keep failing, or while it lags (`lag > 0`) and no entries or
+    /// snapshot reached it since the error.
+    pub fn last_error(&self, target: NodeId, lag: u64) -> Option<String> {
+        self.with(|s| {
+            s.peers
+                .get(&target)
+                .filter(|p| p.failing || lag > 0)
+                .and_then(|p| p.last_error.clone())
+        })
     }
 
     /// `AppendEntries` answered locally with `PayloadTooLarge`.
@@ -338,7 +353,7 @@ impl GrpcConnection {
     ) -> Result<T, Unreachable> {
         match tokio::time::timeout(option.hard_ttl(), fut).await {
             Ok(Ok(r)) => {
-                self.net.stats.succeeded(self.target);
+                self.net.stats.succeeded(self.target, false);
                 Ok(r.into_inner())
             }
             Ok(Err(st)) => Err(self.failed_status(&st)),
@@ -389,7 +404,7 @@ impl GrpcConnection {
         self.inflight = None;
         match out {
             Ok(Ok(r)) => {
-                self.net.stats.succeeded(self.target);
+                self.net.stats.succeeded(self.target, true);
                 Ok(r)
             }
             Ok(Err(e)) => Err(self.failed(e)),
@@ -511,7 +526,7 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
             .map_err(|st| self.failed_status(&st))?
             .into_inner();
         let vote = wire::vote_from_pb(resp.vote).map_err(|e| self.failed(e))?;
-        self.net.stats.succeeded(self.target);
+        self.net.stats.succeeded(self.target, true);
         Ok(SnapshotResponse::new(vote))
     }
 }

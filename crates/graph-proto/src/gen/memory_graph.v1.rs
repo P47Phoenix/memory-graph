@@ -3243,8 +3243,9 @@ pub struct PeerLag {
     /// `last_log_index - matched_index` on the leader.
     #[prost(uint64, tag = "3")]
     pub lag: u64,
-    /// The last error replicating to this peer (its gRPC code and message),
-    /// empty once a later RPC to it succeeded.
+    /// The last error replicating to this peer (its gRPC code and message):
+    /// set while RPCs to it keep failing, or while it lags and no entries or
+    /// snapshot reached it since the error; empty otherwise.
     #[prost(string, tag = "4")]
     pub last_error: ::prost::alloc::string::String,
 }

@@ -322,6 +322,18 @@ pub async fn start(
         Some(_) => None,
         None => Some(RedbLogStore::probe(&paths.log)?),
     };
+    // A lost store is refused before opening one would create it (and
+    // make the next start look consistent).
+    if let (Some(probe), Some(p)) = (log_probe, &plan) {
+        if p.existing.is_some() && !store_existed {
+            paths::check_log_and_store(
+                paths.data_dir.as_deref().unwrap_or(Path::new("")),
+                probe,
+                false,
+                0,
+            )?;
+        }
+    }
     // redb's exclusive lock is the ownership check (`Locked` for a second
     // server on the same file); everything else follows.
     let slot = StoreSlot::open_with(

@@ -485,16 +485,52 @@ fn laggard_catches_up_by_install_snapshot() {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async {
+    let m = rt.block_on(async {
         raft.wait(Some(CLUSTER_WAIT))
             .metrics(
                 |m| m.purged.is_some_and(|p| p.index > behind),
                 "the leader purged past the laggard",
             )
             .await
-            .unwrap();
+            .unwrap()
     });
+    // QA 6: the purge keeps `log_keep_entries` entries below the snapshot.
+    let (purged, snap) = (m.purged.unwrap().index, m.snapshot.unwrap().index);
+    assert!(
+        purged + snappy().log_keep_entries <= snap,
+        "purged {purged} with the snapshot at {snap} keeps fewer than {} entries",
+        snappy().log_keep_entries
+    );
+    // QA 9 / D8: while the laggard installs the snapshot, its LOCAL reads
+    // answer UNAVAILABLE (the client moves on) instead of waiting. The
+    // install is held at a gate to observe that deterministically.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let gate_state = Mutex::new(Some((entered_tx, release_rx)));
+    tb.node_mut(laggard).config_mut().install_gate = Some(Arc::new(move || {
+        // Only the first install waits.
+        if let Some((entered, release)) = gate_state.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    }));
     tb.node_mut(laggard).restart();
+    entered_rx
+        .recv_timeout(CLUSTER_WAIT)
+        .expect("the laggard started installing the snapshot");
+    let mut cfg = graph_client::ClientConfig::new(tb.node(laggard).endpoint());
+    // One endpoint: the client retries UNAVAILABLE for its read budget,
+    // then reports it (the gate holds the install for all of it).
+    cfg.retry.budget = Duration::from_millis(300);
+    let e = RemoteStore::connect(cfg)
+        .unwrap()
+        .count_nodes(NodeKind::File)
+        .unwrap_err();
+    assert!(
+        matches!(e, StoreError::Locked(ref m) if m.contains("snapshot")),
+        "a read during the install: {e:?}"
+    );
+    release_tx.send(()).unwrap();
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
     assert!(
         tb.node(laggard).raft().unwrap().snapshots_installed() >= 1,
@@ -621,12 +657,16 @@ fn acked_write_survives_killing_every_node() {
     let mut tb = ClusterTestbed::new(3, exts());
     tb.form();
     let files: Vec<_> = (0..6).map(small_file).collect();
-    // Acknowledged: the call returned.
-    index_files(&tb.client(tb.leader()), "o", "r", &files);
-    let acked = tb.client(tb.leader()).admin_status().unwrap().applied_index;
+    // Acknowledged: the call returned, with the log index of its entry.
+    let c = tb.client(tb.leader());
+    index_files(&c, "o", "r", &files);
+    let acked = c.applied_index().load(Ordering::SeqCst);
+    assert!(acked > 0, "the write reported its log index");
+    // Killed the moment the write returned (no status call in between).
     for id in tb.ids() {
         tb.node_mut(id).kill();
     }
+    drop(c);
     for id in tb.ids() {
         tb.node_mut(id).restart();
     }
@@ -781,6 +821,104 @@ fn node_id_mismatch_is_refused() {
     );
 }
 
+/// The headers a Raft peer sends (protocol version, cluster id, extractor
+/// version set hash), for raw `Raft` RPCs in tests.
+#[derive(Clone)]
+struct PeerHeaders {
+    cluster: String,
+    hash: String,
+}
+
+impl tonic::service::Interceptor for PeerHeaders {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        let md = req.metadata_mut();
+        md.insert(
+            graph_proto::PROTOCOL_VERSION_HEADER,
+            graph_proto::PROTOCOL_VERSION.to_string().parse().unwrap(),
+        );
+        if !self.cluster.is_empty() {
+            md.insert("mg-cluster-id", self.cluster.parse().unwrap());
+        }
+        if !self.hash.is_empty() {
+            md.insert("mg-extractors-hash", self.hash.parse().unwrap());
+        }
+        Ok(req)
+    }
+}
+
+/// Dev review 12 and 7: Raft traffic from a node with other extractors,
+/// from another cluster, or naming no cluster at all is refused
+/// (`FAILED_PRECONDITION`) before Raft sees it; the node keeps leading.
+#[test]
+fn raft_rpcs_from_other_extractors_or_clusters_are_refused() {
+    use graph_proto::pb;
+    let d = tempfile::tempdir().unwrap();
+    let s = TestServer::try_start_config(
+        ServeConfig::for_data_dir(
+            d.path().join("n"),
+            "127.0.0.1:0".parse().unwrap(),
+            InitMode::Bootstrap { restore: None },
+            Some(1),
+        ),
+        exts(),
+    )
+    .unwrap();
+    let c = RemoteStore::connect(graph_client::ClientConfig::new(s.endpoint())).unwrap();
+    let me = c.admin_status().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = format!("http://{}", s.endpoint());
+    let vote = pb::VoteRequest {
+        vote: Some(pb::RaftVote {
+            term: me.current_term + 5,
+            node_id: 9,
+            committed: false,
+        }),
+        last_log_id: None,
+    };
+    let append = pb::AppendEntriesRequest {
+        vote: Some(pb::RaftVote {
+            term: me.current_term + 5,
+            node_id: 9,
+            committed: true,
+        }),
+        prev_log_id: None,
+        leader_commit: None,
+        entries: vec![],
+    };
+    for (cluster, hash, what) in [
+        (me.cluster_id.clone(), "other-extractors".to_string(), "extractor"),
+        (me.cluster_id.clone(), String::new(), "extractor"),
+        ("another-cluster".to_string(), me.extractors_hash.clone(), "wrong cluster"),
+        (String::new(), me.extractors_hash.clone(), "named none"),
+    ] {
+        let peer = PeerHeaders { cluster, hash };
+        let (v, a) = rt.block_on(async {
+            let ch = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut c = pb::raft_client::RaftClient::with_interceptor(ch, peer);
+            (
+                c.vote(vote.clone()).await.unwrap_err(),
+                c.append_entries(append.clone()).await.unwrap_err(),
+            )
+        });
+        for st in [v, a] {
+            assert_eq!(st.code(), tonic::Code::FailedPrecondition, "{st:?}");
+            assert!(st.message().contains(what), "{what}: {st:?}");
+        }
+    }
+    // Nothing reached Raft: same term, still the leader, writes work.
+    c.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
+    let after = c.admin_status().unwrap();
+    assert_eq!(after.current_term, me.current_term);
+    assert_eq!(after.role, "leader");
+}
+
 #[test]
 fn install_snapshot_refuses_other_extractors_hash() {
     use graph_proto::pb;
@@ -800,7 +938,17 @@ fn install_snapshot_refuses_other_extractors_hash() {
         .build()
         .unwrap();
     let endpoint = format!("http://{}", s.endpoint());
-    let header = |hash: &str, format: u64| pb::InstallSnapshotRequest {
+    let me = RemoteStore::connect(graph_client::ClientConfig::new(s.endpoint()))
+        .unwrap()
+        .admin_status()
+        .unwrap();
+    // A well-formed peer: this node's cluster id and extractors hash in
+    // the headers, so each refusal below is about the snapshot itself.
+    let peer = PeerHeaders {
+        cluster: me.cluster_id.clone(),
+        hash: me.extractors_hash.clone(),
+    };
+    let header = |hash: &str, format: u64, size: u64, sha: &str| pb::InstallSnapshotRequest {
         msg: Some(pb::install_snapshot_request::Msg::Header(
             pb::InstallSnapshotHeader {
                 vote: Some(pb::RaftVote {
@@ -809,39 +957,64 @@ fn install_snapshot_refuses_other_extractors_hash() {
                     committed: true,
                 }),
                 last_log_id: None,
-                membership_json: b"{}".to_vec(),
+                membership_json: serde_json::to_vec(
+                    &graph_server::raft::types::StoredMembership::default(),
+                )
+                .unwrap(),
                 snapshot_id: "x".into(),
                 store_format_version: format,
                 extractors_hash: hash.into(),
-                size: 3,
-                sha256: "00".into(),
+                size,
+                sha256: sha.into(),
             },
         )),
     };
     let chunk = pb::InstallSnapshotRequest {
         msg: Some(pb::install_snapshot_request::Msg::Chunk(vec![1, 2, 3])),
     };
+    let send = |msgs: Vec<pb::InstallSnapshotRequest>| {
+        rt.block_on(async {
+            let ch = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut c = pb::raft_client::RaftClient::with_interceptor(ch, peer.clone());
+            c.install_snapshot(tokio_stream::iter(msgs)).await
+        })
+        .unwrap_err()
+    };
+    let sha_of_123 = "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81";
     for (hash, format) in [
         ("another-extractor-set", graph_store::SCHEMA_VERSION),
-        ("whatever", graph_store::SCHEMA_VERSION + 1),
+        (me.extractors_hash.as_str(), graph_store::SCHEMA_VERSION + 1),
     ] {
-        let st = rt
-            .block_on(async {
-                let ch = tonic::transport::Endpoint::from_shared(endpoint.clone())
-                    .unwrap()
-                    .connect()
-                    .await
-                    .unwrap();
-                let mut c = pb::raft_client::RaftClient::new(ch);
-                c.install_snapshot(tokio_stream::iter(vec![
-                    header(hash, format),
-                    chunk.clone(),
-                ]))
-                .await
-            })
-            .unwrap_err();
+        let st = send(vec![header(hash, format, 3, sha_of_123), chunk.clone()]);
         assert_eq!(st.code(), tonic::Code::FailedPrecondition, "{st:?}");
     }
+    // QA 3: matching hash and format, but the bytes are not what the
+    // header says: DATA_LOSS for a wrong digest, INVALID_ARGUMENT for a
+    // stream longer than its declared size; nothing is left behind.
+    let ok_hash = me.extractors_hash.as_str();
+    let st = send(vec![
+        header(ok_hash, graph_store::SCHEMA_VERSION, 3, &"0".repeat(64)),
+        chunk.clone(),
+    ]);
+    assert_eq!(st.code(), tonic::Code::DataLoss, "{st:?}");
+    let st = send(vec![
+        header(ok_hash, graph_store::SCHEMA_VERSION, 3, sha_of_123),
+        chunk.clone(),
+        chunk.clone(),
+    ]);
+    assert_eq!(st.code(), tonic::Code::InvalidArgument, "{st:?}");
+    // A short stream is DATA_LOSS too (size differs).
+    let st = send(vec![header(
+        ok_hash,
+        graph_store::SCHEMA_VERSION,
+        3,
+        sha_of_123,
+    )]);
+    assert_eq!(st.code(), tonic::Code::DataLoss, "{st:?}");
     // The node is untouched and still leads.
     let c = RemoteStore::connect(graph_client::ClientConfig::new(s.endpoint())).unwrap();
     c.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
@@ -911,4 +1084,497 @@ fn disk_guard_refuses_write_with_resource_exhausted() {
     free.store(u64::MAX, Ordering::SeqCst);
     c.index_bytes("o", "r", "b.rs", b"fn b() {}", None).unwrap();
     assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 2);
+}
+
+/// A `--data-dir` node that bootstraps on `listen`, as `TestServer`.
+fn bootstrap_cfg(dir: &Path, listen: &str, node_id: u64) -> ServeConfig {
+    let mut cfg = ServeConfig::for_data_dir(
+        dir,
+        listen.parse().unwrap(),
+        InitMode::Bootstrap { restore: None },
+        Some(node_id),
+    );
+    cfg.raft = Some(RaftSettings::standalone());
+    cfg.shutdown_grace = Duration::from_secs(5);
+    cfg
+}
+
+fn connect(endpoint: String) -> RemoteStore {
+    let mut cfg = graph_client::ClientConfig::new(endpoint);
+    cfg.write_deadline = Duration::from_secs(5);
+    RemoteStore::connect(cfg).unwrap()
+}
+
+/// Dev review 1: a port already in use fails the first start before
+/// anything is written, and the retry on a free port starts normally.
+#[test]
+fn a_failed_bind_leaves_the_data_dir_startable() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("n");
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let cfg = bootstrap_cfg(&dir, &taken.local_addr().unwrap().to_string(), 1);
+    let e = TestServer::try_start_config(cfg, exts())
+        .err()
+        .expect("the port is taken");
+    assert!(e.to_string().contains("cannot listen"), "{e}");
+    for f in ["node.json", "graph.redb", "raft.redb"] {
+        assert!(!dir.join(f).exists(), "{f} was written by a failed start");
+    }
+    let s = TestServer::try_start_config(bootstrap_cfg(&dir, "127.0.0.1:0", 1), exts()).unwrap();
+    let c = connect(s.endpoint());
+    c.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
+    assert_eq!(c.admin_status().unwrap().role, "leader");
+}
+
+/// Dev review 2: a crash between writing node.json and initializing the
+/// Raft node (a failpoint) is finished by the next start, with or without
+/// `--bootstrap`: the node initializes, leads and takes writes.
+#[test]
+fn a_crash_between_node_json_and_initialize_is_finished_on_restart() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("n");
+    let mut cfg = bootstrap_cfg(&dir, "127.0.0.1:0", 1);
+    cfg.testing.fail_after_node_json = true;
+    let e = TestServer::try_start_config(cfg, exts())
+        .err()
+        .expect("failpoint");
+    assert!(e.to_string().contains("failpoint"), "{e}");
+    let json = graph_server::NodeJson::read(&dir.join("node.json"))
+        .unwrap()
+        .expect("node.json was written");
+    assert!(json.bootstrapped && json.cluster_id.is_some());
+    let mut cfg = bootstrap_cfg(&dir, "127.0.0.1:0", 1);
+    cfg.init = InitMode::Restart;
+    cfg.node_id = None;
+    let s = TestServer::try_start_config(cfg, exts()).unwrap();
+    let c = connect(s.endpoint());
+    c.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
+    let st = c.admin_status().unwrap();
+    assert_eq!(st.role, "leader");
+    assert_eq!(st.cluster_id, json.cluster_id.unwrap());
+}
+
+/// QA 1: a node whose raft.redb was lost (deleted, or replaced by an empty
+/// one) while its store says entries were applied refuses to start (it
+/// would forget its vote), and so does one whose store was lost while its
+/// log has state. Put back, it starts.
+#[test]
+fn restart_refuses_missing_raft_log() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("n");
+    let backup = d.path().join("backup");
+    std::fs::create_dir_all(&backup).unwrap();
+    {
+        let s = TestServer::try_start_config(bootstrap_cfg(&dir, "127.0.0.1:0", 1), exts())
+            .unwrap();
+        connect(s.endpoint())
+            .index_bytes("o", "r", "a.rs", b"fn a() {}", None)
+            .unwrap();
+    }
+    for f in ["raft.redb", "graph.redb"] {
+        std::fs::copy(dir.join(f), backup.join(f)).unwrap();
+    }
+    let start = |init: InitMode| {
+        let mut cfg = bootstrap_cfg(&dir, "127.0.0.1:0", 1);
+        cfg.init = init;
+        TestServer::try_start_config(cfg, exts())
+    };
+    let refused = |what: &str| {
+        for init in [
+            InitMode::Restart,
+            InitMode::Bootstrap { restore: None },
+            InitMode::Uninitialized,
+        ] {
+            let e = start(init.clone()).err().expect("refused");
+            assert!(
+                matches!(e, StoreError::Rejected(ref m) if m.contains(what)),
+                "{init:?}: {e:?}"
+            );
+        }
+    };
+    std::fs::remove_file(dir.join("raft.redb")).unwrap();
+    refused("vote twice");
+    // A blank log (as a fresh `raft.redb` would be) is no better.
+    drop(graph_server::raft::log_store::RedbLogStore::open(&dir.join("raft.redb")).unwrap());
+    refused("vote twice");
+    std::fs::copy(backup.join("raft.redb"), dir.join("raft.redb")).unwrap();
+    std::fs::remove_file(dir.join("graph.redb")).unwrap();
+    refused("store (graph.redb) is missing");
+    assert!(!dir.join("graph.redb").exists(), "a refused start creates no store");
+    std::fs::copy(backup.join("graph.redb"), dir.join("graph.redb")).unwrap();
+    let s = start(InitMode::Restart).unwrap();
+    assert_eq!(connect(s.endpoint()).count_nodes(NodeKind::File).unwrap(), 1);
+}
+
+/// Dev review 3: a follower whose `AppendEntries` take longer than the
+/// leader's heartbeat (the per-call timeout openraft imposes) still gets
+/// every entry: the leader's retry joins the transfer under way instead of
+/// cancelling it, and heartbeats keep flowing, so there is no election.
+#[test]
+fn a_slow_append_longer_than_the_heartbeat_still_replicates() {
+    let delay = TEST_RAFT.heartbeat_ms * 4;
+    let mut tb = ClusterTestbed::with_config(3, exts(), move |id, c| {
+        if id == 3 {
+            c.testing.delay_append_entries_ms = Some(delay);
+        }
+    });
+    tb.form();
+    let leader = tb.leader();
+    let term = tb.node(leader).raft().unwrap().metrics().current_term;
+    let c = tb.client(leader);
+    for i in 0..3 {
+        let f = small_file(i);
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    }
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    assert_eq!(tb.client(3).count_nodes(NodeKind::File).unwrap(), 3);
+    let l = tb.node(leader).raft().unwrap();
+    assert!(
+        l.net_stats.joined_transfers() > 0,
+        "the leader's retries joined the slow transfers"
+    );
+    assert_eq!(l.metrics().current_term, term, "no election");
+}
+
+/// QA 2: `AddLearner` asks the server it is about to add who it is, and
+/// refuses one of another cluster, one running other extractors, and one
+/// that is another node; the membership is unchanged.
+#[test]
+fn adding_a_node_of_another_cluster_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let a = TestServer::try_start_config(bootstrap_cfg(&d.path().join("a"), "127.0.0.1:0", 1), exts())
+        .unwrap();
+    let b = TestServer::try_start_config(bootstrap_cfg(&d.path().join("b"), "127.0.0.1:0", 2), exts())
+        .unwrap();
+    let mut other = ServeConfig::for_data_dir(
+        d.path().join("c"),
+        "127.0.0.1:0".parse().unwrap(),
+        InitMode::Uninitialized,
+        Some(3),
+    );
+    other.raft = Some(RaftSettings::standalone());
+    let c = TestServer::try_start_config(
+        other,
+        vec![Box::new(graph_lang_rust::RustExtractor) as Box<dyn Extractor>],
+    )
+    .unwrap();
+    let ca = connect(a.endpoint());
+    for (id, addr, what) in [
+        (2, b.endpoint(), "wrong cluster"),
+        (3, c.endpoint(), "extractor"),
+        (5, b.endpoint(), "is node 2"),
+    ] {
+        let e = ca.admin_add_learner(id, &addr, true).unwrap_err();
+        assert!(e.to_string().contains(what), "{what}: {e}");
+    }
+    assert_eq!(member_list(&ca).len(), 1, "nothing was added");
+    // The refused clusters are untouched too.
+    assert_eq!(member_list(&connect(b.endpoint())).len(), 1);
+}
+
+/// Dev review 8: two promotes racing each other both take effect (each is
+/// "add this voter", not "these are the voters").
+#[test]
+fn concurrent_promotes_both_take_effect() {
+    let tb = ClusterTestbed::new(3, exts());
+    let leader = tb.leader();
+    let c = tb.client(leader);
+    for id in [2, 3] {
+        c.admin_add_learner(id, &tb.node(id).endpoint(), true)
+            .unwrap();
+    }
+    let promoters: Vec<_> = [2u64, 3]
+        .into_iter()
+        .map(|id| {
+            let c = tb.client(leader);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + CLUSTER_WAIT;
+                loop {
+                    match c.admin_promote(id) {
+                        Ok(_) => return,
+                        // One change at a time: the other one's joint
+                        // configuration may still be in progress.
+                        Err(e) if Instant::now() < deadline => {
+                            eprintln!("promote {id}: {e}; retrying");
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(e) => panic!("promote {id}: {e}"),
+                    }
+                }
+            })
+        })
+        .collect();
+    for p in promoters {
+        p.join().unwrap();
+    }
+    let voters: Vec<u64> = member_list(&c)
+        .into_iter()
+        .filter(|(_, _, role)| role == "voter")
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(voters, vec![1, 2, 3]);
+}
+
+/// A JavaScript file of about `bytes` bytes that is one block comment (a
+/// handful of tokens, so a 20 MiB file indexes quickly).
+fn comment_js(bytes: usize, fill: u8) -> Vec<u8> {
+    let mut v = b"/*".to_vec();
+    v.extend(std::iter::repeat_n(b'a' + fill % 26, bytes));
+    v.extend_from_slice(b"*/\nfunction f() { return 1; }\n");
+    v
+}
+
+/// QA 5: a follower that was away while a backlog bigger than one
+/// `AppendEntries` (`RAFT_RPC_MAX_BYTES`) built up (several MiB-sized
+/// entries, a 20 MiB file that is an entry alone, and a 100-file batch)
+/// catches up through `PayloadTooLarge` splitting and answers the same.
+#[test]
+fn payload_too_large_backlog_and_a_20_mib_file_replicate() {
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let leader = tb.leader();
+    let away = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    tb.node_mut(away).stop();
+    let c = tb.client(leader);
+    for i in 0..6u8 {
+        c.index_bytes(
+            "o",
+            "big",
+            &format!("m{i}.js"),
+            &comment_js(1536 << 10, i),
+            None,
+        )
+        .unwrap();
+    }
+    let huge = comment_js(20 << 20, 7);
+    c.index_bytes("o", "big", "huge.js", &huge, None).unwrap();
+    let batch: Vec<_> = (0..100).map(small_file).collect();
+    let chunk: Vec<BatchFile<'_>> = batch
+        .iter()
+        .map(|(p, b)| BatchFile {
+            path: p,
+            bytes: b,
+            language: None,
+            origin: Some(ORIGIN_DIRECTORY),
+        })
+        .collect();
+    c.index_batch("o", "r", &chunk, IndexOptions::default())
+        .unwrap();
+    tb.node_mut(away).restart();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    assert!(
+        tb.node(leader).raft().unwrap().net_stats.payload_too_large() > 0,
+        "the backlog was split by PayloadTooLarge"
+    );
+    let (ca, cl) = (tb.client(away), tb.client(leader));
+    assert_eq!(summary(&ca), summary(&cl));
+    assert_eq!(ca.count_nodes(NodeKind::File).unwrap(), 107);
+    let toks = |s: &RemoteStore| {
+        s.file_tokens("o", "big", "huge.js")
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name.len(), n.span))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(toks(&ca), toks(&cl));
+}
+
+/// QA 6: a follower that lags by fewer entries than `log_keep_entries`
+/// catches up from the log (no snapshot install), although the leader
+/// snapshotted and purged meanwhile.
+#[test]
+fn a_short_lag_follower_catches_up_from_the_log() {
+    let settings = RaftSettings {
+        log_keep_entries: 50,
+        ..snappy()
+    };
+    let mut tb = ClusterTestbed::with_config(3, exts(), move |_, c| c.raft = Some(settings));
+    tb.form();
+    let leader = tb.leader();
+    let lag = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    let c = tb.client(leader);
+    index_files(&c, "o", "r", &[small_file(0)]);
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let behind = tb.node(lag).raft().unwrap().metrics().last_log_index.unwrap();
+    tb.node_mut(lag).stop();
+    for i in 1..12 {
+        let f = small_file(i);
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    }
+    let m = tb.node(leader).raft().unwrap().metrics();
+    assert!(
+        m.snapshot.is_some_and(|s| s.index > behind),
+        "the leader snapshotted past the lagging follower: {:?}",
+        m.snapshot
+    );
+    assert!(m.purged.is_none_or(|p| p.index < behind), "{:?}", m.purged);
+    tb.node_mut(lag).restart();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    assert_eq!(tb.node(lag).raft().unwrap().snapshots_installed(), 0);
+    assert_eq!(tb.client(lag).count_nodes(NodeKind::File).unwrap(), 12);
+}
+
+/// QA 7: a follower whose disk guard trips refuses appends before writing
+/// anything (RESOURCE_EXHAUSTED, visible in the leader's Status), the
+/// others keep committing, and it catches up once space is freed.
+#[test]
+fn a_follower_with_a_full_disk_lags_and_catches_up() {
+    let free = Arc::new(AtomicU64::new(u64::MAX));
+    let f3 = Arc::clone(&free);
+    let mut tb = ClusterTestbed::with_config(3, exts(), move |id, c| {
+        if id == 3 {
+            let f = Arc::clone(&f3);
+            c.min_free_disk = 1 << 30;
+            c.free_space_probe = Some(Arc::new(move |_| Some(f.load(Ordering::SeqCst))));
+        }
+    });
+    tb.form();
+    assert_ne!(tb.leader(), 3);
+    free.store(1 << 20, Ordering::SeqCst);
+    let c = tb.client(tb.leader());
+    let files: Vec<_> = (0..4).map(small_file).collect();
+    for f in &files {
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    }
+    let committed = c.admin_status().unwrap().applied_index;
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    loop {
+        let st = c.admin_status().unwrap();
+        let peer = st.replication.iter().find(|p| p.node_id == 3).cloned();
+        if peer.as_ref().is_some_and(|p| p.last_error.contains("ResourceExhausted")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no disk-full error for node 3: {peer:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        tb.node(3).applied_index() < committed,
+        "node 3 appended nothing while its disk was full: {} vs {committed}",
+        tb.node(3).applied_index()
+    );
+    free.store(u64::MAX, Ordering::SeqCst);
+    tb.wait_applied(committed, CLUSTER_WAIT);
+    assert_eq!(tb.client(3).count_nodes(NodeKind::File).unwrap(), 4);
+}
+
+/// QA 8: a leader cut off from the majority cannot commit (its client's
+/// write fails at the deadline); the majority elects a leader and commits;
+/// after healing every node converges on the majority's history.
+#[test]
+fn a_minority_partition_cannot_commit_and_heals() {
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let old = tb.leader();
+    let others: Vec<u64> = tb.ids().into_iter().filter(|i| *i != old).collect();
+    tb.partition(&[old], &others);
+    let mut cfg = graph_client::ClientConfig::new(tb.node(old).endpoint());
+    cfg.write_deadline = Duration::from_secs(2);
+    let lonely = RemoteStore::connect(cfg).unwrap();
+    // The cut-off leader accepts the proposal but can never commit it: the
+    // call does not return (the client's deadline bounds its retries, not
+    // a call in flight), so it runs on its own thread and must not have
+    // succeeded 2 s later.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let r = lonely.index_bytes("o", "r", "lost.rs", b"fn lost() {}", None);
+        let _ = done_tx.send(r.is_ok());
+    });
+    match done_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(ok) => assert!(!ok, "a minority committed a write"),
+        Err(_) => {} // still pending: not committed
+    }
+    // The old leader may still believe it leads; wait for the majority's.
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    let new = loop {
+        let found = others.iter().copied().find(|i| {
+            let m = tb.node(*i).raft().unwrap().metrics();
+            m.state == openraft::ServerState::Leader && m.current_leader == Some(*i)
+        });
+        if let Some(id) = found {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "the majority elected no leader");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let files: Vec<_> = (0..3).map(small_file).collect();
+    index_files(&tb.client(new), "o", "r", &files);
+    tb.heal();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    // Healed, the old leader learns the new term and truncates its
+    // uncommitted proposal; the client, told `NotLeader`, may retry it
+    // through the new leader. Either way the call ends, and then every
+    // node holds the same history.
+    if matches!(
+        done_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ) {
+        done_rx
+            .recv_timeout(CLUSTER_WAIT)
+            .expect("the pending write ended after healing");
+    }
+    writer.join().unwrap();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let want = summary(&tb.client(new));
+    for id in tb.ids() {
+        assert_eq!(summary(&tb.client(id)), want, "node {id}");
+    }
+}
+
+/// QA 10 / Dev review 14: a snapshot the disk guard postponed is built
+/// once space is freed, on an idle node (no writes to wake the policy).
+#[test]
+fn a_postponed_snapshot_is_built_on_an_idle_node() {
+    let free = Arc::new(AtomicU64::new(u64::MAX));
+    let f2 = Arc::clone(&free);
+    let mut tb = ClusterTestbed::with_config(1, exts(), move |_, c| {
+        c.raft = Some(RaftSettings {
+            snapshot_log_entries: 1000,
+            ..snappy()
+        });
+        let f = Arc::clone(&f2);
+        c.min_free_disk = 1 << 30;
+        c.free_space_probe = Some(Arc::new(move |_| Some(f.load(Ordering::SeqCst))));
+    });
+    let c = tb.client(1);
+    for i in 0..6 {
+        let f = small_file(i);
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    }
+    drop(c);
+    tb.node_mut(1).stop();
+    // Due at once on the next start, but the disk is "full".
+    free.store(1 << 20, Ordering::SeqCst);
+    tb.node_mut(1).config_mut().raft = Some(snappy());
+    tb.node_mut(1).restart();
+    let raft = tb.node(1).raft().unwrap().raft.clone();
+    assert!(raft.metrics().borrow().snapshot.is_none());
+    free.store(u64::MAX, Ordering::SeqCst);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        raft.wait(Some(CLUSTER_WAIT))
+            .metrics(|m| m.snapshot.is_some(), "the postponed snapshot")
+            .await
+            .unwrap();
+    });
+}
+
+/// QA 11: `Admin.Compact` (`vacuum --compact`) is node-local: it writes
+/// no log entry and leaves the applied state as it was.
+#[test]
+fn compact_writes_no_log_entry() {
+    let d = tempfile::tempdir().unwrap();
+    let s = TestServer::try_start_config(bootstrap_cfg(&d.path().join("n"), "127.0.0.1:0", 1), exts())
+        .unwrap();
+    let c = connect(s.endpoint());
+    index_files(&c, "o", "r", &(0..5).map(small_file).collect::<Vec<_>>());
+    let before = c.admin_status().unwrap();
+    c.admin_compact().unwrap();
+    let after = c.admin_status().unwrap();
+    assert_eq!(after.last_log_index, before.last_log_index);
+    assert_eq!(after.applied_index, before.applied_index);
+    assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 5);
 }

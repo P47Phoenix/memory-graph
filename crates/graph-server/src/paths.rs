@@ -585,6 +585,127 @@ mod tests {
         );
     }
 
+    /// Dev review 1: a first start that failed before writing node.json
+    /// (the port was in use, say) leaves at most an empty store and a
+    /// blank log; the retry with the same flags goes ahead, a start
+    /// without flags is still refused, and a store with data or a log with
+    /// Raft state is never adopted.
+    #[test]
+    fn a_failed_first_start_can_be_retried() {
+        use crate::raft::log_store::RedbLogStore;
+        let d = tempfile::tempdir().unwrap();
+        let p = NodePaths::for_data_dir(d.path());
+        let boot = InitMode::Bootstrap { restore: None };
+        drop(graph_store::V2Store::open(&p.store).unwrap());
+        drop(RedbLogStore::open(&p.log).unwrap());
+        assert!(failed_first_start(&p));
+        assert!(plan(&p, &boot, Some(1)).unwrap().bootstrap);
+        assert!(!plan(&p, &InitMode::Uninitialized, Some(2))
+            .unwrap()
+            .bootstrap);
+        assert!(plan(&p, &InitMode::Restart, Some(1)).is_err());
+        // A store with data is somebody's store.
+        let d2 = tempfile::tempdir().unwrap();
+        let p2 = NodePaths::for_data_dir(d2.path());
+        graph_store::Store::index_bytes(
+            &graph_store::V2Store::open(&p2.store).unwrap(),
+            "o",
+            "r",
+            "a.rs",
+            b"fn a() {}",
+            None,
+        )
+        .unwrap();
+        assert!(!failed_first_start(&p2));
+        assert!(plan(&p2, &boot, Some(1)).is_err());
+    }
+
+    /// QA 1: the log and the store must agree once a node is initialized.
+    #[test]
+    fn a_lost_log_or_store_is_refused() {
+        use crate::raft::log_store::LogProbe;
+        let dir = Path::new("/d");
+        let blank = LogProbe::default();
+        let voted = LogProbe {
+            exists: true,
+            vote: true,
+            entries: 3,
+            purged: false,
+        };
+        // A lost (or blank) log beside a store that applied entries.
+        let e = check_log_and_store(dir, blank, true, 5).unwrap_err().to_string();
+        assert!(e.contains("vote twice") && e.contains("missing"), "{e}");
+        let empty = LogProbe {
+            exists: true,
+            ..LogProbe::default()
+        };
+        let e = check_log_and_store(dir, empty, true, 5).unwrap_err().to_string();
+        assert!(e.contains("empty"), "{e}");
+        // A lost store beside a log with state.
+        let e = check_log_and_store(dir, voted, false, 0).unwrap_err().to_string();
+        assert!(e.contains("store (graph.redb) is missing"), "{e}");
+        // Consistent states.
+        check_log_and_store(dir, voted, true, 5).unwrap();
+        check_log_and_store(dir, blank, true, 0).unwrap();
+        check_log_and_store(dir, blank, false, 0).unwrap();
+    }
+
+    /// Dev review 7: an uninitialized node adopts a cluster id only from
+    /// an RPC that makes it a member (not a Vote); once it has one, the
+    /// header is required and must match.
+    #[test]
+    fn cluster_ids_are_adopted_only_from_a_leader_and_then_required() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("node.json");
+        let mut j = json(2);
+        j.cluster_id = None;
+        j.write(&path).unwrap();
+        let id = ClusterIdentity::for_node(&path, j);
+        // No header, no id: nothing to check.
+        id.check_or_adopt(None, true).unwrap();
+        // A Vote does not make this node a member.
+        id.check_or_adopt(Some("A"), false).unwrap();
+        assert_eq!(id.get(), None);
+        // An AppendEntries does, and is persisted.
+        id.check_or_adopt(Some("A"), true).unwrap();
+        assert_eq!(id.get().as_deref(), Some("A"));
+        assert_eq!(
+            NodeJson::read(&path).unwrap().unwrap().cluster_id.as_deref(),
+            Some("A")
+        );
+        // Now the header is required and must match, for every RPC.
+        for adopt in [true, false] {
+            id.check_or_adopt(Some("A"), adopt).unwrap();
+            let e = id.check_or_adopt(Some("B"), adopt).unwrap_err();
+            assert!(e.contains("wrong cluster"), "{e}");
+            let e = id.check_or_adopt(None, adopt).unwrap_err();
+            assert!(e.contains("named none"), "{e}");
+            let e = id.check_or_adopt(Some(""), adopt).unwrap_err();
+            assert!(e.contains("named none"), "{e}");
+        }
+    }
+
+    /// Dev review 13: node.json survives as either the old or the new
+    /// file, and no temp file is left behind.
+    #[test]
+    fn node_json_is_written_durably_via_a_temp_file() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("node.json");
+        json(1).write(&path).unwrap();
+        json(1).write(&path).unwrap();
+        assert_eq!(NodeJson::read(&path).unwrap(), Some(json(1)));
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["node.json".to_string()]);
+        // A node.json from before `bootstrapped` existed reads as false.
+        let old = r#"{"node_id":1,"cluster_id":"c","advertise":"h:1","binary_version":"0",
+            "protocol_version":1,"store_format_version":1,"extractors_hash":"x","created":0}"#;
+        std::fs::write(&path, old).unwrap();
+        assert!(!NodeJson::read(&path).unwrap().unwrap().bootstrapped);
+    }
+
     #[test]
     fn default_advertise_replaces_wildcards() {
         let a: std::net::SocketAddr = "127.0.0.1:7".parse().unwrap();

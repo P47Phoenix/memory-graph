@@ -171,15 +171,16 @@ impl pb::admin_server::Admin for AdminService {
                     .filter(|(id, _)| **id != self.ctx.info.node_id)
                     .map(|(id, matched)| {
                         let matched_index = matched.as_ref().map(|l| l.index);
+                        let lag = last_log_index.saturating_sub(matched_index.unwrap_or(0));
                         pb::PeerLag {
                             node_id: *id,
                             matched_index,
-                            lag: last_log_index.saturating_sub(matched_index.unwrap_or(0)),
+                            lag,
                             last_error: self
                                 .ctx
                                 .raft
                                 .net_stats
-                                .last_error(*id)
+                                .last_error(*id, lag)
                                 .unwrap_or_default(),
                         }
                     })
