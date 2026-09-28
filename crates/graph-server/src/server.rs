@@ -145,6 +145,10 @@ pub struct TestingHooks {
     /// A `TransferLeader` holds its slot (writes refused, heartbeats on)
     /// this long before it starts, so a test can act while one runs.
     pub transfer_hold_ms: Option<u64>,
+    /// Every write proposal, once counted as in flight, waits this long
+    /// before it reaches Raft, so a test can start a `TransferLeader`
+    /// while a write is in flight (the transfer's drain).
+    pub hold_proposal_ms: Option<u64>,
 }
 
 impl ServeConfig {
@@ -506,6 +510,7 @@ pub async fn start(
     })
     .await?;
     raft.withhold_leader = cfg.testing.withhold_leader;
+    raft.hold_proposal = cfg.testing.hold_proposal_ms.map(Duration::from_millis);
     let shutdown = ShutdownHandle::new();
     let ctx = Arc::new(Ctx {
         slot: Arc::clone(&slot),

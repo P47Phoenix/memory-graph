@@ -1249,3 +1249,52 @@ fn a_failed_transfer_disturbs_nobody() {
         .index_bytes("o", "r", &p, &b, None)
         .unwrap();
 }
+
+/// Dev review (stage C): a transfer waits for a write that passed its check
+/// before the transfer's flag went up (the in-flight drain). The test hook
+/// holds every write proposal 4 s after it was counted in flight, well past
+/// the time a transfer takes without the drain (a lease, about 1.2 s): so
+/// the write must finish before the transfer answers, the target must win,
+/// and the write must be on the target.
+#[test]
+fn a_transfer_waits_for_a_write_in_flight() {
+    let _w = watchdog("a_transfer_waits_for_a_write_in_flight", TEST_LIMIT);
+    const HOLD: Duration = Duration::from_secs(4);
+    let mut tb = ClusterTestbed::with_config(3, exts(), |_, cfg| {
+        cfg.testing.hold_proposal_ms = Some(HOLD.as_millis() as u64);
+    });
+    tb.form();
+    let old = tb.leader();
+    let target = node_ids_other_than(&tb, &[old])[0];
+    let in_flight = Arc::clone(&tb.node(old).raft().unwrap().in_flight);
+    let writer = {
+        let c = tb.client(old);
+        std::thread::spawn(move || {
+            let (p, b) = small_file(0);
+            let r = c.index_bytes("o", "r", &p, &b, None);
+            (r, Instant::now())
+        })
+    };
+    wait_until("the write to be in flight on the leader", || {
+        in_flight.load(Ordering::SeqCst) > 0
+    });
+    let t0 = Instant::now();
+    let now = tb.client(old).admin_transfer_leader(target);
+    let transfer_done = Instant::now();
+    let (written, write_done) = writer.join().unwrap();
+    written.unwrap_or_else(|e| panic!("the write in flight: {e}"));
+    assert_eq!(now.unwrap(), target, "the transfer answered another leader");
+    eprintln!("transfer took {:?}", transfer_done - t0);
+    assert!(
+        write_done <= transfer_done,
+        "the transfer answered {:?} before the write in flight finished",
+        write_done - transfer_done
+    );
+    assert_eq!(tb.leader(), target, "the TARGET must lead");
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    assert_eq!(
+        tb.client(target).count_nodes(NodeKind::File).unwrap(),
+        1,
+        "the write is on the target"
+    );
+}

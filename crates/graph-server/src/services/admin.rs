@@ -333,8 +333,6 @@ impl Drop for TransferGuard<'_> {
     }
 }
 
-/// How long one `TriggerElect` to the transfer target may take: well under
-/// a leader lease (heartbeats are off meanwhile).
 /// How long `TransferLeader` waits for the other voters' in-flight appends
 /// to settle before it asks the target to campaign.
 pub const TRANSFER_SETTLE: Duration = Duration::from_secs(5);
@@ -345,6 +343,8 @@ pub const TRANSFER_SETTLE: Duration = Duration::from_secs(5);
 /// other follower's own timer fires.
 pub const ELECT_SETTLE: Duration = Duration::from_millis(300);
 
+/// How long one `TriggerElect` to the transfer target may take: well under
+/// a leader lease (heartbeats are off meanwhile).
 pub const TRIGGER_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How often `TransferLeader` asks the target to campaign, and checks
@@ -436,6 +436,9 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
                 voters.iter().all(|v| {
                     *v == m.id
                         || repl.get(v).is_some_and(|l| l.map(|l| l.index) == last)
+                        // Best effort: a voter whose last append failed
+                        // counts as unreachable and is skipped, so one
+                        // that has just recovered may be skipped too.
                         || ctx.raft.net_stats.last_error(*v, 1).is_some()
                 })
             },

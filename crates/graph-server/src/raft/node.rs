@@ -136,6 +136,10 @@ pub struct RaftNode {
     /// `transferring` and their end: a transfer waits for zero after it
     /// set the flag, so no entry can be appended behind its back.
     pub in_flight: Arc<AtomicUsize>,
+    /// Test hook ([`crate::server::TestingHooks::hold_proposal_ms`]): a
+    /// write proposal waits this long after it was counted in
+    /// [`in_flight`](Self::in_flight), before it reaches Raft.
+    pub hold_proposal: Option<Duration>,
 }
 
 /// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
@@ -270,11 +274,36 @@ impl RaftNode {
             settings: s,
             transferring: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            hold_proposal: None,
         };
-        if node.sole_voter() {
+        // The metrics are published by the Raft task, so right after
+        // `Raft::new`/`initialize` they may not show the membership yet:
+        // wait for it on an initialized node before asking `sole_voter`,
+        // or a single node could serve before it knows it leads.
+        if node.raft.is_initialized().await.map_err(fatal)? {
             node.raft
                 .wait(Some(Duration::from_secs(30)))
-                .state(ServerState::Leader, "single-voter leader")
+                .metrics(
+                    |m| {
+                        m.membership_config
+                            .membership()
+                            .voter_ids()
+                            .next()
+                            .is_some()
+                    },
+                    "membership loaded",
+                )
+                .await
+                .map_err(|e| fatal(format!("waiting for the membership: {e}")))?;
+        }
+        if node.sole_voter() {
+            let me = node.node_id;
+            node.raft
+                .wait(Some(Duration::from_secs(30)))
+                .metrics(
+                    |m| m.state == ServerState::Leader && m.current_leader == Some(me),
+                    "single-voter leader",
+                )
                 .await
                 .map_err(|e| fatal(format!("waiting to become leader: {e}")))?;
         }
@@ -364,6 +393,9 @@ impl RaftNode {
     /// disk guard runs first (`RESOURCE_EXHAUSTED` on the wire).
     pub async fn propose(&self, req: LogRequest) -> Result<(LogResponse, u64), StoreError> {
         let _in_flight = self.proposal()?;
+        if let Some(hold) = self.hold_proposal {
+            tokio::time::sleep(hold).await;
+        }
         // Only the node that would append checks its disk; a follower
         // answers `NotLeader` naming the leader, whatever its disk.
         if self.metrics().state == ServerState::Leader {
@@ -386,12 +418,15 @@ impl RaftNode {
         addr: &str,
         blocking: bool,
     ) -> Result<u64, StoreError> {
-        let _in_flight = self.proposal()?;
+        let in_flight = self.proposal()?;
         // openraft's own `blocking` waits only its default half second and
         // then answers success whatever the learner's state, so the wait
         // for catch-up is ours, with a real timeout and a real error.
         let r = committed(self.raft.add_learner(id, BasicNode::new(addr), false)).await?;
         let index = r.log_id().index;
+        // The entry is committed; the catch-up wait below appends nothing,
+        // so it must not hold up a transfer's drain.
+        drop(in_flight);
         if blocking && id != self.node_id {
             self.raft
                 .wait(Some(ADD_LEARNER_CATCH_UP))
