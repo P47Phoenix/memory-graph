@@ -204,7 +204,10 @@ fn every_marked_write_refuses_a_non_increasing_marker_without_writing() {
         ) {
             Err(e @ StoreError::AlreadyApplied { index: got }) => {
                 assert_eq!(got, index);
-                assert_eq!(e.to_string(), format!("raft marker {index} already applied"));
+                assert_eq!(
+                    e.to_string(),
+                    format!("raft marker {index} already applied")
+                );
             }
             other => panic!("expected the marker rejection, got {other:?}"),
         }

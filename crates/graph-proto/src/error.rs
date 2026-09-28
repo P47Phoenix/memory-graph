@@ -179,7 +179,9 @@ impl WireError {
                 StoreError::Rejected(msg) => K::Rejected(d::Rejected { msg: msg.clone() }),
                 // Server-internal (the state machine consumes it); should one
                 // ever leak it travels as the refusal it is, in its class.
-                StoreError::AlreadyApplied { .. } => K::Rejected(d::Rejected { msg: e.to_string() }),
+                StoreError::AlreadyApplied { .. } => {
+                    K::Rejected(d::Rejected { msg: e.to_string() })
+                }
                 StoreError::NotUtf8(path) => K::NotUtf8(d::NotUtf8 { path: path.clone() }),
                 StoreError::TooLarge(path) => K::TooLarge(d::TooLarge { path: path.clone() }),
                 StoreError::InvalidSpan(msg) => K::InvalidSpan(d::InvalidSpan { msg: msg.clone() }),
