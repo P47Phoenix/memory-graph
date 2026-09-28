@@ -759,6 +759,36 @@ fn cluster_errors_map_to_the_real_store_error_variants() {
     }
 }
 
+/// `store_error_to_status` keeps the cluster-level variants in their own
+/// class (mutation M5: `Protocol` must stay FAILED_PRECONDITION, not fall
+/// into the `Store` arm).
+#[test]
+fn store_error_to_status_codes_the_cluster_level_variants() {
+    use crate::error::store_error_to_status;
+    assert_eq!(
+        store_error_to_status(&StoreError::Protocol("v9".into())).code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        store_error_to_status(&StoreError::NoLeader { retry_after_ms: 1 }).code(),
+        Code::Unavailable
+    );
+}
+
+/// `AlreadyApplied` is server-internal; should it ever reach the wire it
+/// travels as a `Rejected` refusal (INVALID_ARGUMENT) with its text.
+#[test]
+fn already_applied_travels_as_a_rejection() {
+    use crate::error::{status_to_store_error, store_error_to_status};
+    let s = store_error_to_status(&StoreError::AlreadyApplied { index: 7 });
+    assert_eq!(s.code(), Code::InvalidArgument);
+    let back = status_to_store_error(&s);
+    assert!(
+        matches!(back, StoreError::Rejected(ref m) if m == "raft marker 7 already applied"),
+        "{back:?}"
+    );
+}
+
 #[test]
 fn schema_detail_with_unknown_kinds_keeps_the_text() {
     let d = pb::StoreErrorDetail {

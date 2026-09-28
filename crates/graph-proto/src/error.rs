@@ -9,7 +9,7 @@
 //!
 //! | `StoreError`                                                | gRPC code             |
 //! |-------------------------------------------------------------|-----------------------|
-//! | `Rejected`, `NotUtf8`, `TooLarge`, `InvalidSpan`, `Schema`  | `INVALID_ARGUMENT`    |
+//! | `Rejected`, `NotUtf8`, `TooLarge`, `InvalidSpan`, `Schema`, `AlreadyApplied` | `INVALID_ARGUMENT` |
 //! | `Locked`, not-leader, no-leader                             | `UNAVAILABLE`         |
 //! | `SchemaMismatch`, `LegacyFormat`, `SnapshotExpired`, protocol | `FAILED_PRECONDITION` |
 //! | `Corrupt`                                                   | `DATA_LOSS`           |
@@ -136,7 +136,8 @@ impl WireError {
                 | StoreError::NotUtf8(_)
                 | StoreError::TooLarge(_)
                 | StoreError::InvalidSpan(_)
-                | StoreError::Schema(_) => Code::InvalidArgument,
+                | StoreError::Schema(_)
+                | StoreError::AlreadyApplied { .. } => Code::InvalidArgument,
                 StoreError::Locked(_) => Code::Unavailable,
                 StoreError::SchemaMismatch { .. }
                 | StoreError::LegacyFormat { .. }
@@ -176,6 +177,9 @@ impl WireError {
                     reason: reason.clone(),
                 }),
                 StoreError::Rejected(msg) => K::Rejected(d::Rejected { msg: msg.clone() }),
+                // Server-internal (the state machine consumes it); should one
+                // ever leak it travels as the refusal it is, in its class.
+                StoreError::AlreadyApplied { .. } => K::Rejected(d::Rejected { msg: e.to_string() }),
                 StoreError::NotUtf8(path) => K::NotUtf8(d::NotUtf8 { path: path.clone() }),
                 StoreError::TooLarge(path) => K::TooLarge(d::TooLarge { path: path.clone() }),
                 StoreError::InvalidSpan(msg) => K::InvalidSpan(d::InvalidSpan { msg: msg.clone() }),
@@ -357,6 +361,7 @@ pub fn wire_view(e: &StoreError) -> WireError {
             reason: reason.clone(),
         },
         StoreError::Rejected(m) => StoreError::Rejected(m.clone()),
+        StoreError::AlreadyApplied { index } => StoreError::AlreadyApplied { index: *index },
         StoreError::NotUtf8(p) => StoreError::NotUtf8(p.clone()),
         StoreError::TooLarge(p) => StoreError::TooLarge(p.clone()),
         StoreError::InvalidSpan(m) => StoreError::InvalidSpan(m.clone()),

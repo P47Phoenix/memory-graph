@@ -138,9 +138,7 @@ impl StoreStateMachine {
         match r {
             Ok(resp) => Ok(resp),
             // A concurrent replay stamped it first: same as skipped.
-            Err(StoreError::Rejected(m)) if m.starts_with("raft marker ") => {
-                Ok(LogResponse::Skipped)
-            }
+            Err(StoreError::AlreadyApplied { .. }) => Ok(LogResponse::Skipped),
             Err(e) if is_refusal(&e) => {
                 tracing::warn!(index = marker.index, error = %e, "entry refused by the store");
                 // The refused write rolled back; the entry is still applied
@@ -161,7 +159,7 @@ impl StoreStateMachine {
     fn mark_refused(store: &V2Store, marker: RaftMarker) -> Result<(), StoreError> {
         match store.mark_only(marker, None) {
             Ok(()) => Ok(()),
-            Err(StoreError::Rejected(m)) if m.starts_with("raft marker ") => Ok(()),
+            Err(StoreError::AlreadyApplied { .. }) => Ok(()),
             Err(e) => Err(e),
         }
     }

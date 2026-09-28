@@ -2417,10 +2417,9 @@ impl V2Store {
         if let Some(cur) = t.get(RAFT_LAST_APPLIED)? {
             let cur = RaftMarker::decode(cur.value())?;
             if cur.index >= marker.index {
-                return Err(StoreError::Rejected(format!(
-                    "raft marker {} already applied",
-                    marker.index
-                )));
+                return Err(StoreError::AlreadyApplied {
+                    index: marker.index,
+                });
             }
         }
         t.insert(RAFT_LAST_APPLIED, marker.encode().as_slice())?;
@@ -2434,8 +2433,8 @@ impl V2Store {
     /// cap is `usize::MAX` for this call whatever the store's setting) that
     /// also records `marker` and `membership` (ADR 0004 D5: apply is
     /// all-or-nothing with its marker, and transaction boundaries never
-    /// depend on a per-node setting). `Rejected("raft marker N already
-    /// applied")` without writing when the stored marker's index is `>=
+    /// depend on a per-node setting). [`StoreError::AlreadyApplied`]
+    /// without writing when the stored marker's index is `>=
     /// marker.index`.
     pub fn index_prepared_marked(
         &self,
@@ -2896,7 +2895,7 @@ impl V2Store {
     /// that transaction first, and refused before anything is written when
     /// it is not above the stored one.
     #[allow(clippy::too_many_arguments)]
-    fn commit_each(
+    pub(crate) fn commit_each(
         &self,
         org: &str,
         repo: &str,
@@ -2906,9 +2905,15 @@ impl V2Store {
         marker: Option<(RaftMarker, Option<&[u8]>)>,
         mut next: impl FnMut(&redb::WriteTransaction, usize) -> Result<PreparedFile>,
     ) -> Result<Vec<Result<IngestStats>>> {
+        // A marked batch is one transaction whatever the caller passed: its
+        // marker must commit atomically with all of its data.
+        let chunk_bytes = if marker.is_some() {
+            usize::MAX
+        } else {
+            chunk_bytes
+        };
         let mut wt = self.db.begin_write()?;
         if let Some((marker, membership)) = marker {
-            debug_assert_eq!(chunk_bytes, usize::MAX, "a marked batch is one transaction");
             Self::stamp_marker(&wt, marker, membership)?;
         }
         let batch_id = Self::next_batch_id(&wt)?;

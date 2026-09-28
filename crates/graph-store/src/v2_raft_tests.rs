@@ -187,15 +187,12 @@ fn every_marked_write_refuses_a_non_increasing_marker_without_writing() {
     s.mark_only(marker(10), Some(b"m1")).unwrap();
     let ex = span_ext(&[("S", SymbolKind::Function, 0, 5)], &[("gamma", 1, 2)]);
     let refused = |r: Result<()>| match r {
-        Err(StoreError::Rejected(msg)) => assert_eq!(msg, "raft marker 10 already applied"),
+        Err(StoreError::AlreadyApplied { index }) => assert_eq!(index, 10),
         other => panic!("expected the marker rejection, got {other:?}"),
     };
-    // Equal and lower indexes are both refused (the message names the
+    // Equal and lower indexes are both refused (the error names the
     // refused entry's index).
-    for (index, want) in [
-        (10, "raft marker 10 already applied"),
-        (3, "raft marker 3 already applied"),
-    ] {
+    for index in [10, 3] {
         let files = prepared(&s, &[bf("a.txt", b"alpha", "text")]);
         match s.index_prepared_marked(
             "o",
@@ -205,7 +202,10 @@ fn every_marked_write_refuses_a_non_increasing_marker_without_writing() {
             marker(index),
             Some(b"m2"),
         ) {
-            Err(StoreError::Rejected(msg)) => assert_eq!(msg, want),
+            Err(e @ StoreError::AlreadyApplied { index: got }) => {
+                assert_eq!(got, index);
+                assert_eq!(e.to_string(), format!("raft marker {index} already applied"));
+            }
             other => panic!("expected the marker rejection, got {other:?}"),
         }
     }
@@ -349,6 +349,35 @@ fn marked_index_is_one_transaction_whatever_the_chunk_cap() {
     assert_eq!(s.raft_marker().unwrap(), Some(marker(1)));
     assert!(!s.describe(None, None).unwrap().iter().any(|r| r.open_batch));
     s.check_consistency(false);
+}
+
+/// `commit_each` itself forces one transaction for a marked batch even when
+/// a caller passes a small chunk cap (the guarantee is not a debug-only
+/// assertion): a poison part-way leaves nothing committed.
+#[test]
+fn commit_each_ignores_the_chunk_cap_for_a_marked_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g.redb")).unwrap();
+    let files = [
+        bf("a.txt", b"alpha", "text"),
+        bf("b.txt", b"beta", "text"),
+        bf("bad.txt", b"gamma", "poi\0son"),
+    ];
+    let mut it = prepared(&s, &files).into_iter();
+    let err = s
+        .commit_each(
+            "o",
+            "r",
+            files.len(),
+            IndexOptions::default(),
+            1,
+            Some((marker(1), None)),
+            |_, _| Ok(it.next().unwrap()),
+        )
+        .expect_err("the poisoned batch must fail");
+    assert!(matches!(err, StoreError::Rejected(_)), "{err}");
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
+    assert_eq!(s.raft_marker().unwrap(), None);
 }
 
 #[test]

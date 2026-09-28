@@ -105,6 +105,12 @@ pub enum StoreError {
     /// mismatch, malformed response, ...).
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// A raft-marked write (ADR 0004 D5, `V2Store::*_marked`) whose marker
+    /// index is at or below the stored one: already applied, nothing was
+    /// written. The server's state machine consumes it (a replay is a
+    /// skip); it never reaches a client.
+    #[error("raft marker {index} already applied")]
+    AlreadyApplied { index: u64 },
 }
 
 fn not_leader_hint(id: &Option<u64>, addr: &Option<String>) -> String {
