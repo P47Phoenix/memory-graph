@@ -17,6 +17,9 @@ build mechanism (a pure-Rust rewrite would need the name removed here first).
 Exceptions: one crate name per line in scripts/c-deps-exceptions.txt (initially empty), or
 the file named by C_DEPS_EXCEPTIONS. An excepted crate is printed and allowed, for both
 the mechanism check and the deny-list.
+
+Not gated: `xtask/` (dev-only proto codegen, excluded from the workspace, with its own
+lockfile; never shipped). Only the workspace's own dependency graph is checked.
 """
 import argparse, json, os, subprocess, sys
 
@@ -27,6 +30,8 @@ TARGETS = [
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "aarch64-pc-windows-msvc",
     "x86_64-pc-windows-msvc",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",

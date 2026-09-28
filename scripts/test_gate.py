@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory() as d:
     write(f"{d}/windows-only/Cargo.toml", '[package]\nname="windows-only"\nversion="0.1.0"\nedition="2021"\n[target.\'cfg(windows)\'.dependencies]\nnative-sys={path="../native-sys"}\n')
     write(f"{d}/windows-only/src/lib.rs", "")
     r = run(f"{d}/windows-only")
-    assert r.returncode == 1 and "native-sys" in r.stdout and "targets x86_64-pc-windows-msvc" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 1 and "native-sys" in r.stdout and "targets aarch64-pc-windows-msvc, x86_64-pc-windows-msvc" in r.stdout, r.stdout + r.stderr
     # Deny-list: a crate named like a native TLS/zlib binding fails by name even
     # when it has no `links` key and no build script at all.
     write(f"{d}/libz-sys/Cargo.toml", '[package]\nname="libz-sys"\nversion="0.1.0"\nedition="2021"\n')
@@ -60,8 +60,30 @@ with tempfile.TemporaryDirectory() as d:
     assert r.returncode == 1 and "libz-sys" in r.stdout and "deny-listed" in r.stdout, r.stdout + r.stderr
 
 # The workspace itself must not pull a deny-listed crate on any platform
-# (`cargo tree -i` inverts the tree: with no such crate it prints nothing).
+# (`cargo tree -i` inverts the tree). Absent means: cargo refuses the spec with
+# "did not match any packages", or succeeds printing nothing. Anything else,
+# including cargo failing for another reason (no network, a broken lockfile),
+# fails the gate rather than passing it by accident.
+def crate_absent(r):
+    if r.returncode == 0:
+        return r.stdout.strip() == ""
+    return "did not match any packages" in r.stderr
+
+
+class _R:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+assert crate_absent(_R(0, "", ""))
+assert crate_absent(_R(101, "", "error: package ID specification `ring` did not match any packages"))
+assert not crate_absent(_R(0, "ring v0.17.0\n", ""))
+assert not crate_absent(_R(101, "", "error: failed to load manifest"))
+
 for crate in ["ring", "aws-lc-sys"]:
     r = subprocess.run(["cargo", "tree", "-i", crate, "--target", "all"], cwd=ROOT, capture_output=True, text=True)
-    assert r.stdout.strip() == "", f"`cargo tree -i {crate}` must print nothing:\n{r.stdout}"
+    assert crate_absent(r), (
+        f"`cargo tree -i {crate}` must report the crate absent "
+        f"(exit {r.returncode}):\n{r.stdout}{r.stderr}"
+    )
 print("gate tests passed")
