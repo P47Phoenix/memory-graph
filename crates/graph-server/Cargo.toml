@@ -1,0 +1,34 @@
+[package]
+name = "graph-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "memory-graph server (ADR 0004): the tonic services over a store owned by a one-member openraft node."
+
+[dependencies]
+graph-core = { path = "../graph-core" }
+graph-store = { path = "../graph-store" }
+graph-proto = { path = "../graph-proto" }
+tokio.workspace = true
+tokio-stream.workspace = true
+futures-util.workspace = true
+openraft.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+redb.workspace = true
+sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+# `kill(pid, 0)` for the stale-LOCK check: pure Rust bindings, gate-clean.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+graph-lang-rust = { path = "../graph-lang-rust" }
