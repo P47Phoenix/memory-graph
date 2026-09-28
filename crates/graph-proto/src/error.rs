@@ -11,7 +11,7 @@
 //! |-------------------------------------------------------------|-----------------------|
 //! | `Rejected`, `NotUtf8`, `TooLarge`, `InvalidSpan`, `Schema`, `AlreadyApplied` | `INVALID_ARGUMENT` |
 //! | `Locked`, not-leader, no-leader                             | `UNAVAILABLE`         |
-//! | `SchemaMismatch`, `LegacyFormat`, `SnapshotExpired`, protocol | `FAILED_PRECONDITION` |
+//! | `SchemaMismatch`, `LegacyFormat`, `SnapshotExpired`, `WrongCluster`, protocol | `FAILED_PRECONDITION` |
 //! | `Corrupt`                                                   | `DATA_LOSS`           |
 //! | `Storage` (disk full)                                       | `RESOURCE_EXHAUSTED`  |
 //! | `Storage` (other), `OpenFailed`                             | `INTERNAL`            |
@@ -169,7 +169,8 @@ impl WireError {
                 StoreError::Locked(_) => Code::Unavailable,
                 StoreError::SchemaMismatch { .. }
                 | StoreError::LegacyFormat { .. }
-                | StoreError::SnapshotExpired { .. } => Code::FailedPrecondition,
+                | StoreError::SnapshotExpired { .. }
+                | StoreError::WrongCluster { .. } => Code::FailedPrecondition,
                 StoreError::Corrupt(_) => Code::DataLoss,
                 StoreError::Storage(msg) => {
                     if is_disk_full(msg) {
@@ -240,6 +241,10 @@ impl WireError {
                     retry_after_ms: *retry_after_ms,
                 }),
                 StoreError::Protocol(msg) => K::Protocol(d::Protocol { msg: msg.clone() }),
+                StoreError::WrongCluster { expected, found } => K::WrongCluster(d::WrongCluster {
+                    expected: expected.clone(),
+                    found: found.clone(),
+                }),
             },
             WireError::NotLeader {
                 leader_id,
@@ -334,6 +339,11 @@ impl TryFrom<pb::StoreErrorDetail> for WireError {
                 retry_after_ms: x.retry_after_ms,
             },
             K::Protocol(x) => WireError::Protocol(x.msg),
+            K::WrongCluster(x) => StoreError::WrongCluster {
+                expected: x.expected,
+                found: x.found,
+            }
+            .into(),
         })
     }
 }
@@ -413,6 +423,10 @@ pub fn wire_view(e: &StoreError) -> WireError {
             StoreError::Schema(SchemaError::InvalidContainment(*p, *c))
         }
         StoreError::Storage(m) => StoreError::Storage(m.clone()),
+        StoreError::WrongCluster { expected, found } => StoreError::WrongCluster {
+            expected: expected.clone(),
+            found: found.clone(),
+        },
         StoreError::SnapshotExpired {
             age_secs,
             max_age_secs,

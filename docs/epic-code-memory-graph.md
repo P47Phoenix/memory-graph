@@ -285,6 +285,7 @@ Design: ADR 0004 D5-D7.
 - Given a corpus index plus a snapshot, When the size gate runs, Then Raft log bytes must be at most 1.5x the source, and bytes per entry and fsync throughput must be recorded in `docs/spikes/raft-replication.md`.
 
 **22. Membership and write forwarding (8 pts)**
+Status: Delivered in PR #118. Settled details: [ADR 0004](adr/0004-client-server-and-replication.md) D9 ("Settled in stage C").
 As a database operator or agent
 I want to add, promote and remove nodes safely and to write through any node
 So that the cluster grows and shrinks without downtime and clients need not find the leader.

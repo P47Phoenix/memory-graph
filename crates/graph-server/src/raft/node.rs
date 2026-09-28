@@ -15,6 +15,7 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::impls::BasicNode;
 use openraft::{Config, Raft, RaftMetrics, ServerState, SnapshotPolicy};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -123,6 +124,31 @@ pub struct RaftNode {
     pub net_stats: NetStats,
     /// Test hook ([`crate::server::TestingHooks::withhold_leader`]).
     pub withhold_leader: bool,
+    /// The timings this node runs with.
+    pub settings: RaftSettings,
+    /// Set while this leader hands leadership over (`TransferLeader`): new
+    /// proposals, membership changes and read barriers answer `NoLeader`
+    /// (the client retries) so the log stops growing and the target, caught
+    /// up, gets the old leader's vote. Taken with a compare-exchange: one
+    /// transfer at a time.
+    pub transferring: Arc<AtomicBool>,
+    /// Proposals (writes and membership changes) between their check of
+    /// `transferring` and their end: a transfer waits for zero after it
+    /// set the flag, so no entry can be appended behind its back.
+    pub in_flight: Arc<AtomicUsize>,
+    /// Test hook ([`crate::server::TestingHooks::hold_proposal_ms`]): a
+    /// write proposal waits this long after it was counted in
+    /// [`in_flight`](Self::in_flight), before it reaches Raft.
+    pub hold_proposal: Option<Duration>,
+}
+
+/// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
+pub struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The leader as this node knows it: id and advertised address.
@@ -146,6 +172,27 @@ fn write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Store
             StoreError::Rejected(format!("membership change: {e}"))
         }
         RaftError::Fatal(e) => fatal(e),
+    }
+}
+
+/// How long a membership change waits for its entries to commit. A change
+/// that cannot commit (a new voter that refuses every append, a lost
+/// quorum) fails with this instead of holding the request forever; its
+/// entry stays in the log and commits if the cluster recovers.
+pub const MEMBERSHIP_COMMIT_WAIT: Duration = Duration::from_secs(60);
+
+async fn committed<T>(
+    change: impl std::future::Future<
+        Output = Result<T, RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>>,
+    >,
+) -> Result<T, StoreError> {
+    match tokio::time::timeout(MEMBERSHIP_COMMIT_WAIT, change).await {
+        Ok(r) => r.map_err(write_err),
+        Err(_) => Err(StoreError::Rejected(format!(
+            "the membership change did not commit within {MEMBERSHIP_COMMIT_WAIT:?} (a node \
+             it adds does not accept the leader's log, or a quorum is unreachable); it may \
+             still commit if the cluster recovers: check `cluster members`"
+        ))),
     }
 }
 
@@ -224,11 +271,39 @@ impl RaftNode {
             disk: p.disk,
             net_stats,
             withhold_leader: false,
+            settings: s,
+            transferring: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            hold_proposal: None,
         };
-        if node.sole_voter() {
+        // The metrics are published by the Raft task, so right after
+        // `Raft::new`/`initialize` they may not show the membership yet:
+        // wait for it on an initialized node before asking `sole_voter`,
+        // or a single node could serve before it knows it leads.
+        if node.raft.is_initialized().await.map_err(fatal)? {
             node.raft
                 .wait(Some(Duration::from_secs(30)))
-                .state(ServerState::Leader, "single-voter leader")
+                .metrics(
+                    |m| {
+                        m.membership_config
+                            .membership()
+                            .voter_ids()
+                            .next()
+                            .is_some()
+                    },
+                    "membership loaded",
+                )
+                .await
+                .map_err(|e| fatal(format!("waiting for the membership: {e}")))?;
+        }
+        if node.sole_voter() {
+            let me = node.node_id;
+            node.raft
+                .wait(Some(Duration::from_secs(30)))
+                .metrics(
+                    |m| m.state == ServerState::Leader && m.current_leader == Some(me),
+                    "single-voter leader",
+                )
                 .await
                 .map_err(|e| fatal(format!("waiting to become leader: {e}")))?;
         }
@@ -262,6 +337,52 @@ impl RaftNode {
         LeaderInfo { id, addr }
     }
 
+    /// Whether this node leads right now (as far as it knows; a proposal
+    /// is what confirms it).
+    pub fn is_leader(&self) -> bool {
+        if self.withhold_leader {
+            return false;
+        }
+        let m = self.metrics();
+        m.state == ServerState::Leader && m.current_leader == Some(self.node_id)
+    }
+
+    /// The error a leader-only operation answers on another node:
+    /// `NotLeader` naming the leader when one is known, else `NoLeader`.
+    pub fn not_leader(&self) -> StoreError {
+        let l = self.leader();
+        match l.id {
+            Some(_) if l.addr.is_some() => StoreError::NotLeader {
+                leader_id: l.id,
+                leader_addr: l.addr,
+            },
+            _ => StoreError::NoLeader {
+                retry_after_ms: NO_LEADER_RETRY_MS,
+            },
+        }
+    }
+
+    /// `NoLeader` while a leadership transfer runs (or the test hook
+    /// withholds the leader).
+    pub fn no_leader_while_transferring(&self) -> Result<(), StoreError> {
+        if self.withhold_leader || self.transferring.load(Ordering::SeqCst) {
+            return Err(StoreError::NoLeader {
+                retry_after_ms: NO_LEADER_RETRY_MS,
+            });
+        }
+        Ok(())
+    }
+
+    /// Enter a proposal: counted in [`in_flight`](Self::in_flight) first,
+    /// then refused (`NoLeader`) while a transfer runs. The count drops
+    /// when the returned guard does.
+    fn proposal(&self) -> Result<InFlight, StoreError> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let guard = InFlight(Arc::clone(&self.in_flight));
+        self.no_leader_while_transferring()?;
+        Ok(guard)
+    }
+
     /// Snapshots this node installed from a leader since it started.
     pub fn snapshots_installed(&self) -> u64 {
         self.snapshots.installed()
@@ -271,10 +392,9 @@ impl RaftNode {
     /// (ADR 0004 D7): returns the entry's response and its log index. The
     /// disk guard runs first (`RESOURCE_EXHAUSTED` on the wire).
     pub async fn propose(&self, req: LogRequest) -> Result<(LogResponse, u64), StoreError> {
-        if self.withhold_leader {
-            return Err(StoreError::NoLeader {
-                retry_after_ms: NO_LEADER_RETRY_MS,
-            });
+        let _in_flight = self.proposal()?;
+        if let Some(hold) = self.hold_proposal {
+            tokio::time::sleep(hold).await;
         }
         // Only the node that would append checks its disk; a follower
         // answers `NotLeader` naming the leader, whatever its disk.
@@ -298,15 +418,15 @@ impl RaftNode {
         addr: &str,
         blocking: bool,
     ) -> Result<u64, StoreError> {
+        let in_flight = self.proposal()?;
         // openraft's own `blocking` waits only its default half second and
         // then answers success whatever the learner's state, so the wait
         // for catch-up is ours, with a real timeout and a real error.
-        let r = self
-            .raft
-            .add_learner(id, BasicNode::new(addr), false)
-            .await
-            .map_err(write_err)?;
+        let r = committed(self.raft.add_learner(id, BasicNode::new(addr), false)).await?;
         let index = r.log_id().index;
+        // The entry is committed; the catch-up wait below appends nothing,
+        // so it must not hold up a transfer's drain.
+        drop(in_flight);
         if blocking && id != self.node_id {
             self.raft
                 .wait(Some(ADD_LEARNER_CATCH_UP))
@@ -334,11 +454,8 @@ impl RaftNode {
     /// Make exactly `voters` the voters (joint consensus, learners kept).
     /// Returns the final membership entry's index.
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<u64, StoreError> {
-        let r = self
-            .raft
-            .change_membership(voters, true)
-            .await
-            .map_err(write_err)?;
+        let _in_flight = self.proposal()?;
+        let r = committed(self.raft.change_membership(voters, true)).await?;
         Ok(r.log_id().index)
     }
 
@@ -347,14 +464,27 @@ impl RaftNode {
     /// replacement of the voter set, so two promotes racing each other
     /// both take effect. Returns the final membership entry's index.
     pub async fn promote(&self, id: NodeId) -> Result<u64, StoreError> {
-        let r = self
-            .raft
-            .change_membership(
-                openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
-                true,
-            )
-            .await
-            .map_err(write_err)?;
+        let _in_flight = self.proposal()?;
+        let r = committed(self.raft.change_membership(
+            openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
+            true,
+        ))
+        .await?;
+        Ok(r.log_id().index)
+    }
+
+    /// Remove `id` from the membership (joint consensus for a voter, which
+    /// is not kept as a learner). The guards are the caller's
+    /// (`Admin.Remove`). Returns the final membership entry's index.
+    pub async fn remove(&self, id: NodeId, voter: bool) -> Result<u64, StoreError> {
+        let _in_flight = self.proposal()?;
+        let ids = BTreeSet::from([id]);
+        let change = if voter {
+            openraft::ChangeMembers::RemoveVoters(ids)
+        } else {
+            openraft::ChangeMembers::RemoveNodes(ids)
+        };
+        let r = committed(self.raft.change_membership(change, false)).await?;
         Ok(r.log_id().index)
     }
 
@@ -380,15 +510,12 @@ impl RaftNode {
 
     /// openraft's read barrier (ADR 0004 D8, `LINEARIZABLE`): confirms
     /// leadership with a quorum and waits for the applied index to reach
-    /// the read index.
-    pub async fn ensure_linearizable(&self) -> Result<(), StoreError> {
-        if self.withhold_leader {
-            return Err(StoreError::NoLeader {
-                retry_after_ms: NO_LEADER_RETRY_MS,
-            });
-        }
+    /// the read index, which it returns (a follower's read waits until it
+    /// applied that index: `Admin.ReadIndex`).
+    pub async fn ensure_linearizable(&self) -> Result<u64, StoreError> {
+        self.no_leader_while_transferring()?;
         match self.raft.ensure_linearizable().await {
-            Ok(_) => Ok(()),
+            Ok(read) => Ok(read.map_or(0, |l| l.index)),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                 Err(StoreError::NotLeader {
                     leader_id: f.leader_id,

@@ -126,7 +126,7 @@ Four layers, from the wire up:
    and the verdict against the 5 ms trigger are in
    [spikes/rpc-overhead.md](spikes/rpc-overhead.md).
 
-## Cluster (ADR 0004 stage B)
+## Cluster (ADR 0004 stages B and C)
 
 Two more layers on top of the four above. Every wait polls a condition with
 a hard timeout and a message naming what it waited for. Faults are injected
@@ -166,10 +166,10 @@ through deterministic hooks (failpoints in `TestingHooks`, the network
 6. **Three processes** (`cargo test -p graph-cli --test cluster_e2e`): three
    real `memory-graph serve --data-dir ... --node-id N --listen 127.0.0.1:0`
    processes run in these steps:
-   1. Node 1 starts with `--bootstrap`, and nodes 2 and 3 with the hidden
-      `--wait-for-membership`. They form a cluster through the CLI's preview
-      `cluster add-learner` / `cluster promote`, and `cluster status` shows
-      every member and the leader's lag.
+   1. Node 1 starts with `--bootstrap`, and nodes 2 and 3 with `--join
+      <node 1> --standby` (learners). `cluster add-learner` (idempotent for
+      a learner already there) and `cluster promote` make them voters, and
+      `cluster status` shows every member and the leader's lag.
    2. The vendored corpus is indexed through node 1 with `--server`. Node 3,
       a follower serving local reads, answers `describe`, `search`,
       `symbols` and `export` byte for byte as an embedded run does.
@@ -185,7 +185,18 @@ through deterministic hooks (failpoints in `TestingHooks`, the network
    A second test covers the `serve --data-dir` refusals (an empty directory
    without `--bootstrap`, `--restore` without `--bootstrap`, `--db` with
    `--data-dir`, a different `--node-id` on restart) and `--bootstrap` on
-   an initialized directory keeping its cluster id. The ignored
+   an initialized directory keeping its cluster id. A third,
+   `join_forward_remove_transfer_and_wrong_cluster` (stage C, about 2 s),
+   starts nodes 2 and 3 with `--join <node 1> --auto-promote` and waits for
+   `cluster members --json` to list three voters; indexes a directory
+   through node 2 (a follower: forwarded, `writes_forwarded_total` counts
+   it, the output equals an embedded run) and reads it from node 3; checks
+   that `cluster remove` of the leader and 3 -> 2 without `--force` exit 1
+   with the reason on stderr; moves leadership with `cluster
+   transfer-leader 2` (sent to node 3); removes node 3 with `--force`; and
+   restarts a data directory of another cluster with `--join`, which must
+   exit with code 6 (`WrongCluster`; run with a hard timeout, and only the
+   process the test spawned is ever killed). The ignored
    `measure_replication` in the same file produces
    [spikes/raft-replication.md](spikes/raft-replication.md) (run it with
    `--release --ignored --nocapture`).
@@ -195,6 +206,80 @@ three corpus passes, `cluster snapshot` and the purge, `raft.redb` must be at
 most 1.5x the source indexed. The Docker smoke (above) serves
 `--data-dir /data --bootstrap` and checks that `docker start` after a stop is
 an idempotent restart.
+
+## Membership and forwarding (ADR 0004 stage C)
+
+`cargo test -p graph-server --test membership` runs on the same
+`ClusterTestbed` (helpers shared with `tests/cluster.rs` live in
+`tests/support/mod.rs`). `ClusterTestbed::add_node` starts one more node
+from `node_config(id, InitMode::Join(..))` (or any `ServeConfig`) and returns
+a start-up refusal instead of panicking; `TestNode::set_extractors` rebuilds
+a node with another extractor set for its next restart. Each test runs in
+well under 30 s (the slowest, the partition, about 5 s):
+
+- `write_via_follower_is_forwarded`: `IndexFile` and a streamed `Index` sent
+  to a follower answer `forwarded_to_leader` with the leader's applied
+  index; the leader's own write does not; every node holds the data; the
+  follower's `writes_forwarded_total` is 2; a linearizable read on the
+  follower (the leader's read index) sees a write made on the leader.
+- `join_auto_promote_from_empty`, `standby_stays_learner`: a joiner adopts
+  the cluster id and becomes a voter once caught up; a standby stays a
+  learner with lag zero, serves reads and forwards writes.
+- `join_refuses_other_extractor_hash`, `promote_refuses_other_extractor_hash`:
+  the leader refuses a joiner with other extractors (nothing is added), and
+  a learner restarted with other extractors is refused promotion; unknown
+  ids and voters too.
+- `restart_with_same_bootstrap_or_join_flags_is_idempotent`,
+  `wrong_cluster_is_refused`,
+  `join_into_non_empty_store_requires_accept_snapshot_overwrite`: the same
+  command lines restart with the same cluster id, members and data; a
+  directory of cluster B joining cluster A fails with a typed
+  `WrongCluster { expected: A, found: B }` and `node.json` untouched; a
+  stray store is refused without `--accept-snapshot-overwrite` and moved
+  into `replaced-<secs>/` with it.
+- `remove_guards`: the leader, 3 -> 2 without `--force`, an unknown id, and
+  below quorum (a voter killed, the leader's `Status` showing its
+  `last_error`) even with `--force` are refused; with every voter back and
+  caught up, `--force` works.
+- `transfer_leader_moves_leadership` (3 nodes) and `..._five_nodes`: sent
+  to a follower, forwarded; exactly the target leads (never a third node),
+  the old leader follows it, writes work through both; the 3-node case runs
+  a writer through the old leader during the transfer (refused with
+  `NoLeader` and retried) and moves leadership twice more.
+- `a_failed_transfer_disturbs_nobody`: a transfer to a killed target ends
+  at once with the leader and the term unchanged on every node; while it
+  holds its slot (the `transfer_hold_ms` hook, 3 s) a second transfer is
+  refused and a membership change answers `NoLeader`.
+- `remove_needs_a_quorum_of_the_old_voter_set_too`: 4 voters, 2 down;
+  removing a dead one is refused (joint consensus needs the old set too).
+- `a_removed_auto_promote_learner_stays_removed`: its `rejoin` is refused
+  and its own re-join loop does not bring it back.
+- `follower_linearizable_read_never_misses_an_acknowledged_write`: a
+  follower whose appends are dropped answers a `LINEARIZABLE` read with
+  `NoLeader`, never stale data, and the new write once healed.
+- `a_forward_to_a_hung_leader_times_out`, `a_forward_to_a_dead_leader_is_no_leader`,
+  `a_forwarded_request_is_never_forwarded_again`,
+  `prune_and_vacuum_sent_twice_are_idempotent`: forwarding's deadline, its
+  real transport-failure path (no fault plan), the loop guard, and
+  idempotent re-sends.
+- `join_request_with_other_extractors_is_refused_without_a_probe`,
+  `join_probe_catches_a_node_running_other_extractors`,
+  `a_join_that_times_out_names_the_cleanup`: each join guard on its own.
+- Every test here arms `support::watchdog` (5 min): a hung test exits the
+  binary with its name instead of holding CI.
+- `partition_minority_serves_local_reads_refuses_writes_and_converges`:
+  `FaultPlan::partition([m], majority)` (the plan also gates forwarding);
+  on `m` a write fails with `NoLeader` at the client's 2 s deadline, a
+  local read succeeds, a linearizable one fails; the majority keeps
+  writing; after `heal()` `m` converges and `run_differential` passes.
+- `membership_change_under_load_loses_no_acked_write`: a writer thread
+  indexes two-file batches through the leader while a learner is added,
+  promoted and a voter removed; every acknowledged batch is on every voter.
+- `duplicate_index_chunk_after_leader_change_is_idempotent`: the same batch
+  re-sent after a leadership transfer (through the old leader, so it is
+  forwarded) is a new log entry that applies as `unchanged`; counts and
+  `describe` are unchanged on every node, and `run_differential` against an
+  embedded oracle passes.
 
 ## Database size
 

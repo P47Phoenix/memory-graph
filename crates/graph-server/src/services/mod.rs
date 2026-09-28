@@ -48,9 +48,23 @@ pub struct Ctx {
     pub sysinfo: Option<SysInfoFn>,
     /// [`crate::server::TestingHooks::stall_writes_after`].
     pub stall_writes_after: Option<usize>,
+    /// [`crate::server::TestingHooks::transfer_hold_ms`].
+    pub transfer_hold: Option<std::time::Duration>,
     /// Write proposals seen so far (counted only with a stall hook set).
     pub writes_proposed: std::sync::atomic::AtomicUsize,
+    /// Forwarding to the leader (writes, membership changes, the
+    /// linearizable read barrier) and its counter.
+    pub fwd: crate::forward::Forwarder,
+    /// Joiners the leader promotes once they caught up (`--auto-promote`);
+    /// one task per node id.
+    pub auto_promoting: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// When this node last started an election on `Admin.TriggerElect`.
+    pub last_elect: std::sync::Mutex<Option<Instant>>,
 }
+
+/// How long a follower's `LINEARIZABLE` read waits to apply the leader's
+/// read index before it answers `NoLeader`.
+pub const READ_INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn status(e: StoreError) -> Status {
     store_error_to_status(&e)
@@ -61,8 +75,63 @@ fn join_err(e: tokio::task::JoinError) -> Status {
 }
 
 impl Ctx {
+    /// The read barrier of a `LINEARIZABLE` read (ADR 0004 D8). On the
+    /// leader, openraft's own (`ensure_linearizable`). On any other node it
+    /// is forwarded: the leader runs its barrier and answers its read index
+    /// (`Admin.ReadIndex`), and this node serves the read once it has
+    /// applied that index itself, so the read sees every write acknowledged
+    /// before it began. No leader, or none reachable: `NoLeader`.
+    ///
+    /// The forwarded `ReadIndex` gets the bounded default deadline; the
+    /// client's own `grpc-timeout` is enforced on this handler by tonic's
+    /// server (which drops, and so cancels, the forwarded call with it).
+    pub async fn linearizable_barrier(&self) -> Result<(), Status> {
+        use crate::forward::{within, Forwarder, Route, FORWARD_UNARY_TIMEOUT};
+        if self.raft.withhold_leader {
+            self.raft.ensure_linearizable().await.map_err(status)?;
+            return Ok(());
+        }
+        // One routing decision: `Local` exactly when this node leads (a
+        // fresh request is never marked forwarded).
+        let addr = match self.fwd.route(&self.raft, &tonic::Request::new(()))? {
+            Route::Local => {
+                self.raft.ensure_linearizable().await.map_err(status)?;
+                return Ok(());
+            }
+            Route::Leader { addr, .. } => addr,
+        };
+        let deadline = self
+            .fwd
+            .deadline(&tonic::metadata::MetadataMap::new(), FORWARD_UNARY_TIMEOUT);
+        let mut client = self.fwd.admin_client(&addr)?;
+        let index = within(
+            deadline,
+            client.read_index(Forwarder::request(
+                graph_proto::pb::ReadIndexRequest {},
+                deadline,
+            )),
+        )
+        .await
+        .map_err(crate::forward::forward_error)?
+        .into_inner()
+        .read_index;
+        self.raft
+            .raft
+            .wait(Some(READ_INDEX_WAIT))
+            .applied_index_at_least(Some(index), "the leader's read index")
+            .await
+            .map_err(|e| {
+                tracing::debug!(index, error = %e, "read index not applied in time");
+                status(StoreError::NoLeader {
+                    retry_after_ms: crate::raft::node::NO_LEADER_RETRY_MS,
+                })
+            })?;
+        Ok(())
+    }
+
     /// Run a read against the requested view (ADR 0004 D8): `Local` on the
-    /// store as it is, `Linearizable` after openraft's read barrier, or a
+    /// store as it is, `Linearizable` after the read barrier
+    /// ([`linearizable_barrier`](Self::linearizable_barrier)), or a
     /// snapshot handle. The read itself runs on the blocking pool.
     pub async fn read<T, F>(&self, view: Option<graph_proto::pb::View>, f: F) -> Result<T, Status>
     where
@@ -74,7 +143,7 @@ impl Ctx {
         match view {
             View::Local | View::Linearizable => {
                 if view == View::Linearizable {
-                    self.raft.ensure_linearizable().await.map_err(status)?;
+                    self.linearizable_barrier().await?;
                 }
                 // Fails fast (UNAVAILABLE) while a snapshot install swaps
                 // the file (D8): the client moves to its next endpoint.

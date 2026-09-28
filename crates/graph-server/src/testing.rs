@@ -29,6 +29,28 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("test runtime")
 }
 
+/// A single-voter server leads before `start` returns; wait, bounded, until
+/// its metrics name the leader too, so a test's first `Hello` sees it.
+/// Other nodes (members of a cluster, a join) are left alone.
+async fn leader_known(running: &Running) {
+    let raft = &running.raft;
+    let me = raft.node_id;
+    let m = raft.metrics();
+    if m.membership_config
+        .membership()
+        .voter_ids()
+        .collect::<Vec<_>>()
+        != [me]
+    {
+        return;
+    }
+    let _ = raft
+        .raft
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(|m| m.current_leader == Some(me), "a known leader")
+        .await;
+}
+
 impl TestServer {
     /// Start on a free port with these extractors; panics on failure.
     pub fn start(db: &Path, extractors: Vec<Box<dyn Extractor>>) -> TestServer {
@@ -53,6 +75,7 @@ impl TestServer {
         let extractors = share(extractors);
         let rt = runtime();
         let running = rt.block_on(start(cfg.clone(), extractors.clone()))?;
+        rt.block_on(leader_known(&running));
         let addr = running.addr;
         Ok(TestServer {
             db: running.paths.store.clone(),
@@ -76,6 +99,7 @@ impl TestServer {
         let extractors = share(extractors);
         let rt = runtime();
         let running = rt.block_on(start(cfg.clone(), extractors.clone()))?;
+        rt.block_on(leader_known(&running));
         let addr = running.addr;
         Ok(TestServer {
             db: db.to_path_buf(),

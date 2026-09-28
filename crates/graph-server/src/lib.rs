@@ -22,6 +22,8 @@
 //!   RPC types on the wire) and `node` (start, initialize, snapshot policy,
 //!   membership, leader info).
 //! * [`services`]: the four tonic services (`raft` is the peers' side).
+//! * [`forward`]: a follower forwards writes, membership changes and the
+//!   linearizable read barrier to the leader (stage C, ADR 0004 D8/D9).
 //! * [`disk`]: the disk guard (`--min-free-disk`).
 //! * [`lock`]: the LOCK sidecar naming the holder.
 //! * [`powercut`]: a test-only in-memory redb storage backend that can
@@ -40,6 +42,8 @@
 pub mod conn;
 pub mod disk;
 pub mod extractors;
+pub mod forward;
+pub mod join;
 pub mod lock;
 pub mod paths;
 pub mod powercut;
@@ -53,7 +57,7 @@ pub mod testing;
 pub use disk::{DiskGuard, FreeSpaceProbe};
 pub use extractors::{extractors_hash, SharedExtractor};
 pub use lock::LockFile;
-pub use paths::{InitMode, NodeJson, NodePaths};
+pub use paths::{InitMode, JoinSpec, NodeJson, NodePaths};
 pub use raft::network::FaultPlan;
 pub use raft::RaftSettings;
 pub use server::{

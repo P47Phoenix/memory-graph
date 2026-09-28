@@ -2,7 +2,16 @@
 //! proposed through Raft (ADR 0004 D5). `Index` cuts its files into
 //! `IndexChunk` entries at `RAFT_ENTRY_MAX_BYTES` (a single larger file is
 //! an entry of its own); a dry-run `Prune` is node-local and never logged.
+//!
+//! On a node that is not the leader every write is forwarded to the leader
+//! (ADR 0004 D8, [`crate::forward`]): the answer is the leader's, with
+//! `forwarded_to_leader` set. `Index` is forwarded as a stream through a
+//! channel of [`FORWARD_BUFFER`] messages, so the follower holds at most a
+//! few files at a time; a client stream that fails mid-way cancels the
+//! forwarded call (the leader sees an error, never a clean end, so it does
+//! not commit a truncated batch as if it were whole).
 use super::{status, Ctx};
+use crate::forward::{forward_error, Forwarder, Route};
 use crate::raft::{LogRequest, LogResponse};
 use graph_proto::pb::log_command::Cmd;
 use graph_proto::{pb, ConvertError, RAFT_ENTRY_MAX_BYTES};
@@ -12,11 +21,90 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
+/// Messages of a forwarded `Index` stream buffered between the client and
+/// the leader.
+pub const FORWARD_BUFFER: usize = 2;
+
 pub struct WriteService {
     pub ctx: Arc<Ctx>,
 }
 
+/// Forward one unary write to the leader at `addr` and mark the answer.
+macro_rules! forward_unary {
+    ($self:ident, $addr:expr, $method:ident, $req:expr) => {{
+        let req = $req;
+        let deadline = $self
+            .ctx
+            .fwd
+            .deadline(req.metadata(), crate::forward::FORWARD_UNARY_TIMEOUT);
+        let mut client = $self.ctx.fwd.write_client(&$addr)?;
+        let resp = crate::forward::within(
+            deadline,
+            client.$method(Forwarder::request(req.into_inner(), deadline)),
+        )
+        .await
+        .map_err(forward_error)?;
+        $self.ctx.fwd.count();
+        let mut resp = resp.into_inner();
+        resp.forwarded_to_leader = true;
+        return Ok(Response::new(resp));
+    }};
+}
+
 impl WriteService {
+    /// Forward a whole `Index` stream to the leader at `addr`, message by
+    /// message (bounded memory).
+    async fn forward_index(
+        &self,
+        addr: &str,
+        req: Request<Streaming<pb::IndexRequest>>,
+    ) -> Result<Response<pb::IndexResponse>, Status> {
+        let deadline = self
+            .ctx
+            .fwd
+            .deadline(req.metadata(), crate::forward::FORWARD_INDEX_TIMEOUT);
+        let mut incoming = req.into_inner();
+        let mut client = self.ctx.fwd.write_client(addr)?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<pb::IndexRequest>(FORWARD_BUFFER);
+        let call = crate::forward::within(
+            deadline,
+            client.index(Forwarder::request(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+                deadline,
+            )),
+        );
+        tokio::pin!(call);
+        // The pump owns the sender: when the client's stream ends the
+        // sender is dropped and the forwarded stream ends too.
+        let pump = async move {
+            while let Some(msg) = incoming.next().await {
+                if tx.send(msg?).await.is_err() {
+                    // The leader answered already (an early error); the
+                    // call below carries it.
+                    break;
+                }
+            }
+            Ok::<(), Status>(())
+        };
+        tokio::pin!(pump);
+        let mut pumped = false;
+        let resp = loop {
+            tokio::select! {
+                r = &mut call => break r.map_err(forward_error)?,
+                p = &mut pump, if !pumped => match p {
+                    Ok(()) => pumped = true,
+                    // Returning drops the call: the forwarded stream is
+                    // cancelled, not ended cleanly.
+                    Err(e) => return Err(e),
+                },
+            }
+        };
+        self.ctx.fwd.count();
+        let mut resp = resp.into_inner();
+        resp.forwarded_to_leader = true;
+        Ok(Response::new(resp))
+    }
+
     async fn propose(&self, cmd: Cmd) -> Result<(LogResponse, u64), Status> {
         if let Some(after) = self.ctx.stall_writes_after {
             let seen = self
@@ -101,6 +189,9 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<Streaming<pb::IndexRequest>>,
     ) -> Result<Response<pb::IndexResponse>, Status> {
+        if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+            return self.forward_index(&addr, req).await;
+        }
         let mut stream = req.into_inner();
         let header = match stream.next().await {
             Some(Ok(pb::IndexRequest {
@@ -161,6 +252,9 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<pb::IndexFileRequest>,
     ) -> Result<Response<pb::IndexFileResponse>, Status> {
+        if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+            forward_unary!(self, addr, index_file, req);
+        }
         let r = req.into_inner();
         let file = r.file.ok_or_else(|| {
             ConvertError("required field `IndexFileRequest.file` is missing".into())
@@ -182,6 +276,9 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<pb::IngestExtractionRequest>,
     ) -> Result<Response<pb::IngestExtractionResponse>, Status> {
+        if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+            forward_unary!(self, addr, ingest_extraction, req);
+        }
         let r = req.into_inner();
         let (resp, applied_index) = self
             .propose(Cmd::IngestExtraction(pb::log_command::IngestExtraction {
@@ -209,6 +306,11 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<pb::PruneRequest>,
     ) -> Result<Response<pb::PruneResponse>, Status> {
+        if !req.get_ref().dry_run {
+            if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+                forward_unary!(self, addr, prune, req);
+            }
+        }
         let r = req.into_inner();
         if r.dry_run {
             let keep: HashSet<String> = r.keep.into_iter().collect();
@@ -245,8 +347,11 @@ impl pb::write_server::Write for WriteService {
 
     async fn vacuum(
         &self,
-        _req: Request<pb::VacuumRequest>,
+        req: Request<pb::VacuumRequest>,
     ) -> Result<Response<pb::VacuumResponse>, Status> {
+        if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+            forward_unary!(self, addr, vacuum, req);
+        }
         let (resp, applied_index) = self
             .propose(Cmd::Vacuum(pb::log_command::Vacuum {}))
             .await?;

@@ -12,17 +12,28 @@ use graph_store::{
 };
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, StoreError>;
+
+/// A request carrying `msg` with `deadline` as its `grpc-timeout` (the
+/// channel enforces it, and the server stops working on it).
+fn timed<T>(msg: T, deadline: Duration) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(msg);
+    r.set_timeout(deadline);
+    r
+}
 
 pub struct RemoteStore {
     rt: Arc<tokio::runtime::Runtime>,
     conn: Arc<Conn>,
     /// Highest `applied_index` a `Write.Index` answered (0 before any).
     applied: Arc<AtomicU64>,
+    /// Whether any `Write.Index` answer came from a node that forwarded it
+    /// to the leader (`forwarded_to_leader`).
+    forwarded: Arc<AtomicBool>,
 }
 
 impl RemoteStore {
@@ -41,6 +52,7 @@ impl RemoteStore {
             rt,
             conn: Arc::new(conn),
             applied: Arc::new(AtomicU64::new(0)),
+            forwarded: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -58,6 +70,13 @@ impl RemoteStore {
     /// it while the store itself is boxed as `dyn Store`.
     pub fn applied_index(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.applied)
+    }
+
+    /// Whether an `Index` RPC of this store was answered through a node
+    /// that forwarded it to the leader (the connected node is a follower).
+    /// Shared like [`applied_index`](Self::applied_index).
+    pub fn forwarded_to_leader(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.forwarded)
     }
 
     fn run<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -126,15 +145,19 @@ impl RemoteStore {
     /// membership entry's log index.
     pub fn admin_add_learner(&self, node_id: u64, addr: &str, blocking: bool) -> Result<u64> {
         let addr = addr.to_string();
+        let d = self.config().admin_deadline;
         self.run(self.conn.call(Kind::Write, |ch| {
             let addr = addr.clone();
             async move {
                 admin_client(ch)
-                    .add_learner(pb::AddLearnerRequest {
-                        node_id,
-                        addr,
-                        blocking,
-                    })
+                    .add_learner(timed(
+                        pb::AddLearnerRequest {
+                            node_id,
+                            addr,
+                            blocking,
+                        },
+                        d,
+                    ))
                     .await
             }
         }))
@@ -144,12 +167,44 @@ impl RemoteStore {
     /// `Admin.Promote`: make learner `node_id` a voter (on the leader).
     /// Returns the membership entry's log index.
     pub fn admin_promote(&self, node_id: u64) -> Result<u64> {
+        let d = self.config().admin_deadline;
         self.run(self.conn.call(Kind::Write, |ch| async move {
             admin_client(ch)
-                .promote(pb::PromoteRequest { node_id })
+                .promote(timed(pb::PromoteRequest { node_id }, d))
                 .await
         }))
         .map(|r| r.into_inner().log_index)
+    }
+
+    /// `Admin.Remove`: remove `node_id` from the membership (any node
+    /// forwards it to the leader, which enforces the guards: not the
+    /// leader, not below quorum, 3 voters to 2 only with `force`). Returns
+    /// the membership entry's log index.
+    pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<u64> {
+        let d = self.config().admin_deadline;
+        self.run(self.conn.call(Kind::Write, |ch| async move {
+            admin_client(ch)
+                .remove(timed(pb::RemoveRequest { node_id, force }, d))
+                .await
+        }))
+        .map(|r| r.into_inner().log_index)
+    }
+
+    /// `Admin.TransferLeader`: make voter `node_id` the leader (forwarded
+    /// to the leader by any node). Returns the new leader's id.
+    pub fn admin_transfer_leader(&self, node_id: u64) -> Result<u64> {
+        let d = self.config().admin_deadline;
+        self.run(self.conn.call(Kind::Write, |ch| async move {
+            admin_client(ch)
+                .transfer_leader(timed(
+                    pb::TransferLeaderRequest {
+                        to_node_id: node_id,
+                    },
+                    d,
+                ))
+                .await
+        }))
+        .map(|r| r.into_inner().leader_id)
     }
 
     /// `Admin.TriggerSnapshot`: build a snapshot on the connected node and,
@@ -231,6 +286,9 @@ impl RemoteStore {
         let resp = resp.into_inner();
         self.applied
             .fetch_max(resp.applied_index, Ordering::Relaxed);
+        if resp.forwarded_to_leader {
+            self.forwarded.store(true, Ordering::Relaxed);
+        }
         if resp.results.len() != files.len() {
             return Err(StoreError::Protocol(format!(
                 "Index answered {} results for {} files",

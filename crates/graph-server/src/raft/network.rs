@@ -677,6 +677,19 @@ impl FaultPlan {
         });
     }
 
+    /// Whether a partition leaves `from` and `to` connected (the
+    /// forwarding of client requests to the leader consults it too, so a
+    /// partitioned node cannot reach the leader by the back door).
+    pub fn connected(&self, from: NodeId, to: NodeId) -> bool {
+        self.with(|f| {
+            let group = |n: NodeId| f.groups.iter().position(|g| g.contains(&n));
+            match (group(from), group(to)) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        })
+    }
+
     /// Whether `from` may send `kind` to `to` right now.
     pub fn allows(&self, from: NodeId, to: NodeId, kind: RpcKind) -> bool {
         self.with(|f| {

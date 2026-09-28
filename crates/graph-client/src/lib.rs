@@ -94,6 +94,10 @@ pub struct ClientConfig {
     pub write_deadline: Duration,
     /// TCP connect timeout per attempt (default 5 s).
     pub connect_timeout: Duration,
+    /// The deadline (`grpc-timeout`) of each membership-change attempt
+    /// (`AddLearner`, `Promote`, `Remove`, `TransferLeader`; default 180 s),
+    /// so a change that can never commit fails instead of hanging.
+    pub admin_deadline: Duration,
     /// Reported in `Hello` for the server's logs.
     pub client_version: String,
 }
@@ -106,6 +110,7 @@ impl ClientConfig {
             retry: RetryConfig::default(),
             write_deadline: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(5),
+            admin_deadline: Duration::from_secs(180),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }

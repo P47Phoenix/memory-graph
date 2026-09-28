@@ -255,7 +255,7 @@ enum Item {
 
 /// What a worker made of one `Item`.
 enum Outcome {
-    Prepared(String, PreparedFile),
+    Prepared(String, Box<PreparedFile>),
     Skip {
         reason: &'static str,
         what: String,
@@ -330,7 +330,7 @@ fn read_and_prepare(
             store.prepare(o.org, o.repo, &file, IndexOptions { reindex: o.reindex })
         })
         .with_context(|| format!("database error while preparing `{rel}`"))?;
-    Ok(Outcome::Prepared(rel.clone(), p))
+    Ok(Outcome::Prepared(rel.clone(), Box::new(p)))
 }
 
 /// `read_and_prepare` with any panic turned into an error, so one bad file
@@ -778,7 +778,7 @@ fn commit_all(
                     held += len;
                     held_prepared += len;
                     pending_bytes += p.bytes_len() as u64;
-                    pending.push((rel, p));
+                    pending.push((rel, *p));
                 }
             }
             let full = if o.deterministic {
@@ -1045,6 +1045,11 @@ pub fn index_dir_with(
             "failed_files": failed.iter().map(|(p, r)| serde_json::json!({"path": p, "reason": r})).collect::<Vec<_>>(),
         });
         let mut summary = summary;
+        if let Some(r) = &view.remote {
+            // `--server`: whether the connected node forwarded the writes
+            // to the leader (it is a follower).
+            summary["forwarded_to_leader"] = r.forwarded_to_leader.into();
+        }
         if o.stats {
             summary["stats"] = view.stats_json();
         }

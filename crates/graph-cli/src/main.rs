@@ -160,29 +160,48 @@ enum ClusterCmd {
         #[arg(long)]
         json: bool,
     },
-    /// PREVIEW, stage B: add node <ID> at <ADDR> (host:port) as a non-voting learner. Waits for
-    /// the leader's catch-up acknowledgement; a learner that needs a snapshot may still be
-    /// installing it (`cluster status` shows its lag). Stage C completes membership (guards,
-    /// remove, transfer, --join)
-    #[command(hide = true)]
+    /// Every member: id, role (voter or learner), address, and which one leads
+    Members {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add node <ID>, already serving at <ADDR> (host:port), as a non-voting learner (a node
+    /// started with `serve --join` asks for this itself). The node is asked who it is first:
+    /// another node id, another cluster (exit code 6) or other extractors are refused. Waits
+    /// until it caught up with the leader's log
     AddLearner {
         id: u64,
         addr: String,
-        /// Return once the change is committed, without the catch-up acknowledgement
+        /// Return once the change is committed, without waiting for the catch-up
         #[arg(long)]
         no_wait: bool,
     },
-    /// PREVIEW, stage B: make learner <ID> a voter. Stage C completes membership (guards)
-    #[command(hide = true)]
+    /// Make learner <ID> a voter (joint consensus). Refused for an unknown node, a voter, or a
+    /// node whose extractor version set differs from the cluster's
     Promote { id: u64 },
+    /// Remove node <ID> from the cluster. Refused for the leader (transfer leadership first),
+    /// for anything that would leave fewer reachable voters than a quorum, and for 3 voters down
+    /// to 2 unless --force
+    Remove {
+        id: u64,
+        /// Allow going from 3 voters to 2 (a cluster that then tolerates no failure). Never
+        /// overrides the other guards
+        #[arg(long)]
+        force: bool,
+    },
+    /// Make voter <ID> the leader: the leader waits until <ID> caught up, pauses its heartbeats
+    /// and writes (clients retry) until its lease runs out, and asks <ID> to call an election
+    TransferLeader { id: u64 },
 }
 
 #[derive(Subcommand)]
 enum Cmd {
     /// Serve a database over gRPC; other processes, machines and containers then use it with
-    /// --server. `--data-dir <dir> --bootstrap` starts a one-node cluster in a data directory;
-    /// `--db <file>` serves a single file (stage A). Prints `listening on <addr>` once ready; stops
-    /// on Ctrl-C / SIGTERM
+    /// --server. `--data-dir <dir> --bootstrap` starts a one-node cluster in a data directory,
+    /// `--data-dir <dir> --join <peer>` joins an existing one; `--db <file>` serves a single file.
+    /// Prints `listening on <addr>` once ready (after joining, with --join); stops on Ctrl-C /
+    /// SIGTERM. Exit code 6: the data directory belongs to another cluster than --join's peer
     Serve {
         /// Address to listen on (port 0 picks a free port; the line printed on start names it)
         #[arg(long, default_value = "127.0.0.1:7000", value_name = "HOST:PORT")]
@@ -199,10 +218,34 @@ enum Cmd {
         /// (`cluster snapshot --out`); the new cluster gets a new id and a fresh log
         #[arg(long, requires = "bootstrap", value_name = "FILE")]
         restore: Option<PathBuf>,
-        /// Stage B only: start empty and wait for a leader to add this node (`cluster
-        /// add-learner`). Stage C replaces it with --join
-        #[arg(long, hide = true, requires = "data_dir", conflicts_with = "bootstrap")]
-        wait_for_membership: bool,
+        /// With --data-dir: join the cluster that the node at this host:port belongs to (any
+        /// member; it forwards to the leader). On an empty directory the node asks to be added as
+        /// a learner and catches up; on one that already belongs to that cluster it is a plain
+        /// restart; one of another cluster is refused (exit code 6)
+        #[arg(
+            long,
+            value_name = "HOST:PORT",
+            requires = "data_dir",
+            conflicts_with = "bootstrap"
+        )]
+        join: Option<String>,
+        /// With --join: become a voter once caught up (the leader promotes the node when its
+        /// replication lag is zero)
+        #[arg(long, requires = "join", conflicts_with = "standby")]
+        auto_promote: bool,
+        /// With --join: stay a learner (a read replica) until `cluster promote`; the default
+        /// without --auto-promote, said explicitly
+        #[arg(long, requires = "join")]
+        standby: bool,
+        /// With --join: a directory that holds a store (or a Raft log) but no node.json is joined
+        /// anyway; what it holds is moved aside into replaced-<time>/ and the leader's data
+        /// replaces it
+        #[arg(long, requires = "join")]
+        accept_snapshot_overwrite: bool,
+        /// With --join: how long the first join keeps retrying while no leader answers, e.g.
+        /// `30s`, `2m` (default 2m)
+        #[arg(long, requires = "join", value_parser = parse_duration, default_value = "2m")]
+        join_timeout: std::time::Duration,
         /// host:port peers and clients reach this node at (default: the listen address with a
         /// wildcard IP replaced by the host name). Stored in node.json
         #[arg(long, value_name = "HOST:PORT")]
@@ -247,8 +290,8 @@ enum Cmd {
         #[arg(long)]
         ready: bool,
     },
-    /// Cluster information from a server (needs --server). Membership changes arrive with
-    /// replication (ADR 0004 stage C)
+    /// Cluster information and membership (needs --server; any node: membership changes are
+    /// forwarded to the leader)
     Cluster {
         #[command(subcommand)]
         cmd: ClusterCmd,
@@ -646,7 +689,11 @@ fn run() -> Result<i32> {
         data_dir,
         bootstrap,
         restore,
-        wait_for_membership,
+        join,
+        auto_promote,
+        standby: _,
+        accept_snapshot_overwrite,
+        join_timeout,
         advertise,
         node_id,
         snapshot_log_entries,
@@ -693,8 +740,13 @@ fn run() -> Result<i32> {
                     graph_server::InitMode::Bootstrap {
                         restore: restore.clone(),
                     }
-                } else if *wait_for_membership {
-                    graph_server::InitMode::Uninitialized
+                } else if let Some(peer) = join {
+                    graph_server::InitMode::Join(graph_server::JoinSpec {
+                        peer: peer.clone(),
+                        auto_promote: *auto_promote,
+                        accept_snapshot_overwrite: *accept_snapshot_overwrite,
+                        timeout: *join_timeout,
+                    })
                 } else {
                     graph_server::InitMode::Restart
                 };
@@ -898,6 +950,7 @@ fn run() -> Result<i32> {
                                 "purged_index": st.purged_index,
                                 "log_bytes": st.log_bytes,
                                 "store_bytes": st.store_bytes,
+                                "writes_forwarded_total": st.writes_forwarded_total,
                                 "members": st.members.iter().map(|m| serde_json::json!({
                                     "node_id": m.node_id,
                                     "addr": m.addr,
@@ -1032,6 +1085,33 @@ fn run() -> Result<i32> {
                         }
                     }
                 }
+                ClusterCmd::Members { json } => {
+                    let m = s.admin_members().context("cluster members")?;
+                    if json {
+                        out!(
+                            "{}",
+                            serde_json::json!({
+                                "server": addr,
+                                "leader_id": m.leader_id,
+                                "members": m.members.iter().map(|x| serde_json::json!({
+                                    "node_id": x.node_id,
+                                    "addr": x.addr,
+                                    "role": x.role,
+                                    "leader": Some(x.node_id) == m.leader_id,
+                                })).collect::<Vec<_>>(),
+                            })
+                        );
+                    } else {
+                        for x in &m.members {
+                            let lead = if Some(x.node_id) == m.leader_id {
+                                "  (leader)"
+                            } else {
+                                ""
+                            };
+                            out!("{} {} {}{lead}", x.node_id, x.role, x.addr);
+                        }
+                    }
+                }
                 ClusterCmd::AddLearner {
                     id,
                     addr: at,
@@ -1047,6 +1127,18 @@ fn run() -> Result<i32> {
                         .admin_promote(id)
                         .with_context(|| format!("cluster promote {id}"))?;
                     out!("node {id} is now a voter (log index {index})");
+                }
+                ClusterCmd::Remove { id, force } => {
+                    let index = s
+                        .admin_remove(id, force)
+                        .with_context(|| format!("cluster remove {id}"))?;
+                    out!("node {id} was removed from the cluster (log index {index})");
+                }
+                ClusterCmd::TransferLeader { id } => {
+                    let leader = s
+                        .admin_transfer_leader(id)
+                        .with_context(|| format!("cluster transfer-leader {id}"))?;
+                    out!("node {leader} is now the leader");
                 }
             }
         }
@@ -1131,6 +1223,7 @@ fn run() -> Result<i32> {
                         addr,
                         s.hello().leader_id,
                         s.applied_index(),
+                        s.forwarded_to_leader(),
                     );
                     (PathBuf::new(), Some(s), Some(board))
                 }

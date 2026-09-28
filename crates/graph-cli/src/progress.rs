@@ -70,6 +70,9 @@ pub struct RemoteBoard {
     /// The highest applied log index the server reported (shared with the
     /// client, which updates it on every `Index` answer).
     pub applied_index: std::sync::Arc<AtomicU64>,
+    /// Set by the client when an `Index` answer came through a follower
+    /// that forwarded it to the leader.
+    pub forwarded_to_leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub rpc_calls: AtomicU64,
     pub rpc_micros: AtomicU64,
     pub rpc_bytes: AtomicU64,
@@ -80,11 +83,13 @@ impl RemoteBoard {
         server: &str,
         leader_id: Option<u64>,
         applied_index: std::sync::Arc<AtomicU64>,
+        forwarded_to_leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             server: server.to_string(),
             leader_id,
             applied_index,
+            forwarded_to_leader,
             rpc_calls: AtomicU64::new(0),
             rpc_micros: AtomicU64::new(0),
             rpc_bytes: AtomicU64::new(0),
@@ -103,6 +108,7 @@ impl RemoteBoard {
             server: self.server.clone(),
             leader_id: self.leader_id,
             applied_index: self.applied_index.load(Relaxed),
+            forwarded_to_leader: self.forwarded_to_leader.load(Relaxed),
             rpc_calls: self.rpc_calls.load(Relaxed),
             rpc_time: Duration::from_micros(self.rpc_micros.load(Relaxed)),
             rpc_bytes: self.rpc_bytes.load(Relaxed),
@@ -116,19 +122,26 @@ pub struct RemoteView {
     pub server: String,
     pub leader_id: Option<u64>,
     pub applied_index: u64,
+    pub forwarded_to_leader: bool,
     pub rpc_calls: u64,
     pub rpc_time: Duration,
     pub rpc_bytes: u64,
 }
 
 impl RemoteView {
-    /// `acked by leader N (idx K)`, the replicate stage's summary.
+    /// `acked by leader N (idx K)`, the replicate stage's summary, with
+    /// `, forwarded by <server>` when the connected node is a follower.
     pub fn ack(&self) -> String {
         format!(
-            "acked by leader {} (idx {})",
+            "acked by leader {} (idx {}){}",
             self.leader_id
                 .map_or_else(|| "?".to_string(), |l| l.to_string()),
-            self.applied_index
+            self.applied_index,
+            if self.forwarded_to_leader {
+                format!(", forwarded by {}", self.server)
+            } else {
+                String::new()
+            }
         )
     }
 }
@@ -644,6 +657,7 @@ impl BoardView {
                 "server": r.server,
                 "leader_id": r.leader_id,
                 "applied_index": r.applied_index,
+                "forwarded_to_leader": r.forwarded_to_leader,
                 "calls": r.rpc_calls,
                 "busy_ms": r.rpc_time.as_millis() as u64,
                 "bytes": r.rpc_bytes,
@@ -861,6 +875,7 @@ mod tests {
             server: "127.0.0.1:7000".into(),
             leader_id: Some(1),
             applied_index: 17,
+            forwarded_to_leader: false,
             rpc_calls: 4,
             rpc_time: Duration::from_millis(800),
             rpc_bytes: 10 << 20,
@@ -868,6 +883,16 @@ mod tests {
         let t = v.render(250).join("\n");
         assert!(t.contains("  send    ▶ 2/3 busy"), "{t}");
         assert!(t.contains("  replicate: acked by leader 1 (idx 17)"), "{t}");
+        assert!(!t.contains("forwarded by"), "{t}");
+        assert_eq!(v.stats_json()["rpc"]["forwarded_to_leader"], false);
+        v.remote.as_mut().unwrap().forwarded_to_leader = true;
+        let t = v.render(250).join("\n");
+        assert!(
+            t.contains("  replicate: acked by leader 1 (idx 17), forwarded by 127.0.0.1:7000"),
+            "{t}"
+        );
+        assert_eq!(v.stats_json()["rpc"]["forwarded_to_leader"], true);
+        v.remote.as_mut().unwrap().forwarded_to_leader = false;
         let s = v.stats_table();
         assert!(s.contains("\nrpc "), "{s}");
         assert!(

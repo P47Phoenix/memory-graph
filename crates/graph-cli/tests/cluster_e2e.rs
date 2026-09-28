@@ -1,9 +1,9 @@
 //! Three real `memory-graph serve --data-dir` processes form a cluster
-//! through the CLI (ADR 0004 stage B, epic story 21):
+//! through the CLI (ADR 0004 stages B and C, epic stories 21 and 22):
 //!
-//! * node 1 `--bootstrap`, nodes 2 and 3 `--wait-for-membership` (stage B's
-//!   stand-in for stage C's `--join`), joined with the preview `cluster
-//!   add-learner` / `cluster promote` commands;
+//! * node 1 `--bootstrap`, nodes 2 and 3 `--join <node 1> --standby`
+//!   (learners), made voters with `cluster add-learner` (idempotent for a
+//!   learner already there) and `cluster promote`;
 //! * the vendored corpus indexed through node 1 with `--server`, and node 3
 //!   (a follower, local reads) answering byte for byte what an embedded run
 //!   answers;
@@ -368,8 +368,6 @@ fn three_processes_form_replicate_fail_over_and_catch_up() {
 
     let dir = |i: u64| d.path().join(format!("n{i}"));
     let mut n1 = Node::start(1, &dir(1), "127.0.0.1:0", &["--bootstrap"]);
-    let n2 = Node::start(2, &dir(2), "127.0.0.1:0", &["--wait-for-membership"]);
-    let n3 = Node::start(3, &dir(3), "127.0.0.1:0", &["--wait-for-membership"]);
     wait_for("node 1 to elect itself", || {
         (n1.leader() == Some(1)).then_some(())
     });
@@ -377,10 +375,25 @@ fn three_processes_form_replicate_fail_over_and_catch_up() {
     let cluster_id = st["cluster_id"].as_str().unwrap().to_string();
     assert!(!cluster_id.is_empty(), "{st}");
     assert_eq!(st["role"], "leader", "{st}");
-    // An uninitialized member has no leader and no cluster id yet.
-    assert_eq!(n2.leader(), None);
+    let n2 = Node::start(
+        2,
+        &dir(2),
+        "127.0.0.1:0",
+        &["--join", &n1.addr, "--standby"],
+    );
+    let n3 = Node::start(
+        3,
+        &dir(3),
+        "127.0.0.1:0",
+        &["--join", &n1.addr, "--standby"],
+    );
+    // A joined standby is a learner of the cluster.
+    assert_eq!(
+        n2.status().unwrap()["cluster_id"].as_str(),
+        Some(cluster_id.as_str())
+    );
 
-    // Form the cluster through the preview membership commands.
+    // Make them voters through the membership commands.
     for n in [&n2, &n3] {
         let id = n.id.to_string();
         let added = ok(&["--server", &n1.addr, "cluster", "add-learner", &id, &n.addr]);
@@ -606,6 +619,194 @@ fn data_dir_refusals() {
     n.shutdown();
 }
 
+/// The voters `cluster members --json` on `n` lists (empty while it does
+/// not answer).
+fn voters(n: &Node) -> Vec<u64> {
+    let o = run(&["--server", &n.addr, "cluster", "members", "--json"]);
+    if !o.status.success() {
+        return Vec::new();
+    }
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+    v["members"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|m| m["role"] == "voter")
+                .filter_map(|m| m["node_id"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run the CLI and wait at most [`WAIT`] for it to exit (a `serve` that
+/// should have been refused must not hang the test); kills only the
+/// process it spawned.
+fn run_bounded(args: &[&str]) -> Output {
+    let mut child = cmd()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let o = child.wait_with_output().unwrap();
+            panic!(
+                "{args:?} did not exit within {WAIT:?}:\n{}{}",
+                text(&o.stdout),
+                text(&o.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Stage C through the CLI (epic story 22): nodes 2 and 3 `--join
+/// --auto-promote` and become voters; `cluster members` from any node;
+/// an index sent to a follower is forwarded and readable on the third
+/// node; `cluster remove` refuses the leader and 3 -> 2 without `--force`
+/// (exit 1, the reason on stderr); `cluster transfer-leader` moves
+/// leadership; `--force` removes; a data directory of another cluster
+/// joining exits with code 6.
+#[test]
+fn join_forward_remove_transfer_and_wrong_cluster() {
+    let t0 = Instant::now();
+    let d = tempfile::tempdir().unwrap();
+    let dir = |i: u64| d.path().join(format!("n{i}"));
+    let n1 = Node::start(1, &dir(1), "127.0.0.1:0", &["--bootstrap"]);
+    wait_for("node 1 to elect itself", || {
+        (n1.leader() == Some(1)).then_some(())
+    });
+    let join = ["--join", n1.addr.as_str(), "--auto-promote"];
+    let n2 = Node::start(2, &dir(2), "127.0.0.1:0", &join);
+    let n3 = Node::start(3, &dir(3), "127.0.0.1:0", &join);
+    wait_for("nodes 2 and 3 to be auto-promoted", || {
+        (voters(&n1) == [1, 2, 3]).then_some(())
+    });
+    let members = ok(&["--server", &n3.addr, "cluster", "members"]);
+    for want in ["1 voter", "2 voter", "3 voter", "(leader)"] {
+        assert!(members.contains(want), "{want}: {members}");
+    }
+    eprintln!("joined and promoted at {:?}", t0.elapsed());
+
+    // Index through node 2 (a follower): forwarded to node 1.
+    let src = d.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.rs"), "pub fn forwarded_marker() -> u8 { 1 }\n").unwrap();
+    std::fs::write(src.join("b.rs"), "pub fn second() {}\n").unwrap();
+    let index = |target: &[&str]| {
+        let mut a = target.to_vec();
+        a.extend([
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--no-progress",
+            src.to_str().unwrap(),
+        ]);
+        normalize(&ok(&a))
+    };
+    let local = d.path().join("local.redb");
+    assert_eq!(
+        index(&n2.server()),
+        index(&["--db", local.to_str().unwrap()])
+    );
+    let st2 = n2.status().unwrap();
+    assert!(
+        st2["writes_forwarded_total"].as_u64().unwrap() >= 1,
+        "{st2}"
+    );
+    wait_applied(&n3, committed(&n1));
+    let hit = ok(&["--server", &n3.addr, "search", "forwarded_marker"]);
+    assert!(hit.contains("a.rs"), "{hit}");
+    // `index --json` says whether the connected node forwarded the writes.
+    for (i, (node, forwarded)) in [(&n2, true), (&n1, false)].into_iter().enumerate() {
+        std::fs::write(
+            src.join(format!("json{i}.rs")),
+            format!("pub fn j{i}() {{}}\n"),
+        )
+        .unwrap();
+        let mut a = node.server().to_vec();
+        a.extend([
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--no-progress",
+            "--json",
+            src.to_str().unwrap(),
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&ok(&a)).unwrap();
+        assert_eq!(
+            v["forwarded_to_leader"], forwarded,
+            "node {}: {v}",
+            node.addr
+        );
+    }
+
+    // Remove guards: refused with the reason, exit code 1.
+    let o = run(&["--server", &n2.addr, "cluster", "remove", "1"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("transfer leadership first"),
+        "{}",
+        text(&o.stderr)
+    );
+    let o = run(&["--server", &n3.addr, "cluster", "remove", "3"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("--force"), "{}", text(&o.stderr));
+    assert_eq!(voters(&n1), [1, 2, 3]);
+
+    // Transfer leadership to node 2 (asked through node 3), then remove
+    // node 3 with --force.
+    let moved = ok(&["--server", &n3.addr, "cluster", "transfer-leader", "2"]);
+    assert!(moved.contains("node 2 is now the leader"), "{moved}");
+    wait_for("node 1 to follow node 2", || {
+        (n1.leader() == Some(2)).then_some(())
+    });
+    let removed = ok(&["--server", &n1.addr, "cluster", "remove", "3", "--force"]);
+    assert!(removed.contains("was removed"), "{removed}");
+    wait_for("two voters", || (voters(&n2) == [1, 2]).then_some(()));
+    eprintln!("guards, transfer and remove done at {:?}", t0.elapsed());
+
+    // Another cluster's data directory joining: exit code 6.
+    let mut other = Node::start(4, &dir(4), "127.0.0.1:0", &["--bootstrap"]);
+    wait_for("node 4 to elect itself", || {
+        (other.leader() == Some(4)).then_some(())
+    });
+    other.shutdown();
+    let dir4 = dir(4);
+    let mut args = vec![
+        "serve",
+        "--data-dir",
+        dir4.to_str().unwrap(),
+        "--listen",
+        "127.0.0.1:0",
+        "--min-free-disk",
+        "1",
+        "--join",
+        &n1.addr,
+        "--auto-promote",
+    ];
+    args.extend(RAFT_TIMING);
+    let o = run_bounded(&args);
+    assert_eq!(o.status.code(), Some(6), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("wrong cluster"),
+        "{}",
+        text(&o.stderr)
+    );
+    drop((n2, n3));
+    eprintln!("cluster stage C e2e done in {:?}", t0.elapsed());
+}
+
 /// The numbers in `docs/spikes/raft-replication.md`. Not a gate (timings
 /// depend on the machine): run it with
 /// `cargo test --release -p graph-cli --test cluster_e2e measure_replication -- --ignored --nocapture`.
@@ -676,15 +877,14 @@ fn measure_replication() {
     );
     // Install: a new member after the purge catches up by snapshot only.
     let two = d.path().join("two");
-    let n2 = Node::start(2, &two, "127.0.0.1:0", &["--wait-for-membership"]);
     let target = n.applied();
     let t = Instant::now();
-    ok(&["--server", &n.addr, "cluster", "add-learner", "2", &n2.addr]);
+    let n2 = Node::start(2, &two, "127.0.0.1:0", &["--join", &n.addr, "--standby"]);
     let added = secs(t);
     wait_applied(&n2, target);
     let st2 = n2.status().unwrap();
     println!(
-        "snapshot transfer + install on a new learner: add-learner returned after {added:.3} s, \
+        "snapshot transfer + install on a new learner: joined after {added:.3} s, \
          applied {target} after {:.3} s (learner snapshot_index={}, store_bytes={})",
         secs(t),
         st2["snapshot_index"],
@@ -729,14 +929,12 @@ fn measure_replication() {
     // Three nodes: ingest through the leader.
     let dirs: Vec<PathBuf> = (1..=3).map(|i| d.path().join(format!("c{i}"))).collect();
     let n1 = Node::start(1, &dirs[0], "127.0.0.1:0", &["--bootstrap"]);
-    let n2 = Node::start(2, &dirs[1], "127.0.0.1:0", &["--wait-for-membership"]);
-    let n3 = Node::start(3, &dirs[2], "127.0.0.1:0", &["--wait-for-membership"]);
     wait_for("node 1 to lead", || (n1.leader() == Some(1)).then_some(()));
-    for n in [&n2, &n3] {
-        let id = n.id.to_string();
-        ok(&["--server", &n1.addr, "cluster", "add-learner", &id, &n.addr]);
-        ok(&["--server", &n1.addr, "cluster", "promote", &id]);
-    }
+    let join = ["--join", n1.addr.as_str(), "--auto-promote"];
+    let n2 = Node::start(2, &dirs[1], "127.0.0.1:0", &join);
+    let n3 = Node::start(3, &dirs[2], "127.0.0.1:0", &join);
+    wait_for("three voters", || (voters(&n1).len() == 3).then_some(()));
+    let _ = (&n2, &n3);
     let t = Instant::now();
     index_corpus(&n1.server());
     let triple = secs(t);

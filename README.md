@@ -85,9 +85,10 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 | `sysinfo` | What `index` sizes itself from on this machine: CPUs, memory and its source, the starting budget, free disk on the database's volume. |
 | `vacuum [--compact]` | Drop dictionary terms no file uses; `--compact` rebuilds the file to give the space back. |
 | `export [--out FILE]` | Dump every node (org, repo, file, symbol, token, with spans) as newline-delimited JSON. An escape hatch; there is no importer yet. |
-| `serve --db FILE` / `serve --data-dir DIR [--bootstrap]` `[--listen HOST:PORT]` | Serve a database file, or a cluster node's data directory, over gRPC for `--server` clients ([Server mode](#server-mode), [Cluster](#cluster-preview)). |
+| `serve --db FILE` / `serve --data-dir DIR [--bootstrap \| --join PEER [--auto-promote \| --standby]]` `[--listen HOST:PORT]` | Serve a database file, or a cluster node's data directory, over gRPC for `--server` clients ([Server mode](#server-mode), [Cluster](#cluster)). |
 | `health [--ready]` | With `--server`: exit 0 when the server is serving (`--ready`: and has a leader), 1 when not. |
 | `cluster status` / `cluster leader` / `cluster snapshot [--out FILE]` | With `--server`: the node's role, term, leader, log indexes, members and replication lag; `leader` exits 3 when there is none; `snapshot` builds a Raft snapshot and can download it. |
+| `cluster members` / `add-learner ID ADDR` / `promote ID` / `remove ID [--force]` / `transfer-leader ID` | With `--server` (any node; forwarded to the leader): list, grow and shrink the membership, with guards ([More nodes](#more-nodes-join-promote-remove)). |
 
 `search`, `symbols` and `describe` take `--json` (an object on stdout); `search` and `symbols` also take `--limit`/`--offset` for paging, with results ordered by org, repo, file, position.
 
@@ -155,14 +156,14 @@ memory-graph health && echo up                            # exit 0 when serving,
 - **`serve`.** `--listen` defaults to `127.0.0.1:7000` (`0.0.0.0:7000` to accept other machines; port `0` picks a free port and the printed line names it). `--node-id` (default 1 with `--db`), `--cache-bytes`, `--snapshot-max-age` (how long a paging client's frozen view may live, default `15m`). With `--db` it writes `<db>.LOCK` (`{"pid", "listen", "started"}`) next to the file and removes it on a graceful stop (Ctrl-C, SIGTERM, `docker stop`); the Raft log lives in `<db>.raft.redb`. `--data-dir` (below) keeps everything in one directory instead.
 - **A served file opened directly** waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_WAIT_MS` changes that), then says who holds it: `database ./g is locked by pid 4242 (memory-graph serve on 127.0.0.1:7000); use --server 127.0.0.1:7000 or stop it`. Once the server stops, the file opens directly again and answers exactly as the server did.
 - **Also over `--server`:** `sysinfo` prints the server machine's report under `server <addr> node N (leader: M)`; `vacuum --compact` compacts the server's file; `health [--ready]` and `cluster status [--json]` / `cluster leader` report on the node.
-- **Exit codes:** 0 success; 1 failure (and `health`: not serving; a read whose server is unreachable or whose connection was lost); 3 `cluster leader` found no leader; 4 a write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write; 5 the server speaks another protocol or store format version.
+- **Exit codes:** 0 success; 1 failure (and `health`: not serving; a read whose server is unreachable or whose connection was lost); 3 `cluster leader` found no leader; 4 a write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write; 5 the server speaks another protocol or store format version; 6 a data directory (or a node named in a membership change) belongs to another cluster (`WrongCluster`).
 - **An error does not prove a write failed.** A write that fails with a lost connection or exit code 4 may still have been applied (the server can commit it and die before answering). Rerunning it is safe: `index` skips unchanged files by fingerprint, `prune` and `vacuum` are idempotent, and `ingest` of the same extraction stores the same thing. A retried write reports what the retry did: a `prune` that landed before the connection was lost reports 0 removed on the retry, though the stored state is correct.
 - **Write deadline.** `--write-deadline <duration>` (or `MEMORY_GRAPH_WRITE_DEADLINE`; e.g. `500ms`, `10s`, `2m`; default `10s`) is how long a write keeps retrying through no leader or a lost connection before it fails with exit code 4.
 - **Not yet:** TLS and authentication come with a later stage of [ADR 0004](docs/adr/0004-client-server-and-replication.md); bind to loopback or a private network meanwhile.
 
-### Cluster (preview)
+### Cluster
 
-`serve --data-dir` runs a node that replicates through Raft (ADR 0004 D5-D7). Every write is a log entry that a majority fsyncs before it is acknowledged, and every node answers reads from its own copy.
+`serve --data-dir` runs a node that replicates through Raft (ADR 0004 D5-D9). Every write is a log entry that a majority fsyncs before it is acknowledged, and every node answers reads from its own copy. Nodes join with `--join`, and any node takes writes and membership commands (forwarding them to the leader).
 
 ```sh
 memory-graph serve --data-dir ./n1 --bootstrap --node-id 1 --listen 127.0.0.1:7001   # a NEW one-node cluster (prints a warning saying so)
@@ -179,15 +180,28 @@ memory-graph serve --data-dir ./n1 --listen 127.0.0.1:7001   # later: a restart 
 - **`cluster status [--json]`** adds, for a data-dir node: role, cluster id, advertised address, snapshot and purged indexes, every member with its role and address, the leader's per-peer replication lag, and the log and store file sizes. **`cluster snapshot [--out FILE] [--json]`** builds a snapshot now. With `--out` it downloads the file to this machine and verifies its SHA-256 and size.
 - **Log and snapshots.** A snapshot is built after `--snapshot-log-entries` (default 10000) applied entries or `--snapshot-log-bytes` (default 1G) of log. The log below it is then purged, keeping `--log-keep-entries` (default 1000) so a briefly lagging follower catches up from the log, and `raft.redb` is compacted. Timing: `--heartbeat-interval` (ms, default 250), `--election-timeout-min` / `--election-timeout-max` (ms, default 1000 / 2000).
 - **Disk guard.** `--min-free-disk` (a size, or a percentage of the volume; the default for a data directory is 5% of it, between 2G and 32G, and off for `--db`). Writes and snapshot builds are refused with `RESOURCE_EXHAUSTED` while less than that plus one snapshot copy is free.
-- **More nodes (preview).** Stage B can form a cluster by hand. Start the others with the hidden `--wait-for-membership` flag, then add each from the leader with the hidden `cluster add-learner <id> <host:port>` and `cluster promote <id>`:
+Measurements: [docs/spikes/raft-replication.md](docs/spikes/raft-replication.md).
 
-  ```sh
-  memory-graph serve --data-dir ./n2 --node-id 2 --listen 127.0.0.1:7002 --wait-for-membership
-  memory-graph --server 127.0.0.1:7001 cluster add-learner 2 127.0.0.1:7002
-  memory-graph --server 127.0.0.1:7001 cluster promote 2
-  ```
+#### More nodes: join, promote, remove
 
-  Writes must go to the leader. The client follows a `NotLeader` answer to it, and `cluster leader` names it. **Stage C** completes this with `serve --join <peer>` (replacing `--wait-for-membership`), write forwarding from followers, the membership guards and the rest of the membership commands (`remove`, leader transfer). Until then, treat multi-node clusters as a preview. Measurements: [docs/spikes/raft-replication.md](docs/spikes/raft-replication.md).
+```sh
+memory-graph serve --data-dir ./n2 --node-id 2 --listen 127.0.0.1:7002 --join 127.0.0.1:7001 --auto-promote
+memory-graph serve --data-dir ./n3 --node-id 3 --listen 127.0.0.1:7003 --join 127.0.0.1:7001 --auto-promote
+memory-graph --server 127.0.0.1:7003 cluster members          # 1 voter ... (leader), 2 voter ..., 3 voter ...
+memory-graph --server 127.0.0.1:7002 index --org acme --repo api ./api   # a follower: forwarded to the leader
+memory-graph --server 127.0.0.1:7002 cluster transfer-leader 2
+memory-graph --server 127.0.0.1:7001 cluster remove 3 --force
+```
+
+- **`--join <host:port>`** names any member (it forwards to the leader). On an empty directory the node asks to be added as a learner, takes the cluster id, and catches up from the leader's log or snapshot; it prints its `listening on` line once it is in. It retries while no leader answers, up to `--join-timeout` (default `2m`). The leader refuses a node with another extractor version set, store format or protocol version, a node id that is already a member at another address, and a node id that is already a voter (an empty directory under a voter's id would have lost its vote and log: `cluster remove` it first).
+- **`--auto-promote`** makes the node a voter once its replication lag is zero (the leader does it; a node restarted while still a learner asks again). **`--standby`**, the default without `--auto-promote`, keeps it a learner: a read replica that replicates everything, answers reads and forwards writes, until `cluster promote <id>`.
+- **Idempotent restarts.** `--bootstrap` and `--join` on a directory that already belongs to the cluster are plain restarts, so a container keeps the same command line. A directory of another cluster is refused with `WrongCluster` (exit code 6) before anything is opened. A directory that holds a store or a log but no `node.json` (a `--db` file copied in, say) is refused unless `--accept-snapshot-overwrite`, which moves what it holds into `replaced-<time>/` and joins empty.
+- **Writes through any node.** A write sent to a follower or learner is forwarded to the leader by the server (an `index` streams through, a few files at a time), and the answer is the leader's (`forwarded_to_leader`; `cluster status --json` counts `writes_forwarded_total`). With no leader known the server answers `NoLeader` and the client retries until `--write-deadline` (then exit code 4); a node cut off from the majority refuses writes this way while it keeps answering `local` reads. `--read linearizable` on a follower asks the leader for its read index and answers once it has applied it. Membership commands are forwarded the same way, so `--server` may name any node.
+- **`cluster members [--json]`** lists every member with its role and address and marks the leader. **`cluster add-learner <id> <host:port> [--no-wait]`** adds a node that is already serving (the node is asked who it is first: another node id, another cluster or other extractors are refused). **`cluster promote <id>`** makes a learner a voter; it is refused for an unknown node, a voter, or a node whose extractor version set differs (asked again at promotion time).
+- **`cluster remove <id> [--force]`** is refused for the leader ("transfer leadership first"), for any removal after which the voters reachable right now would be fewer than a quorum of the remaining voters or of the current ones (`--force` does not override this), and for 3 voters down to 2 unless `--force` (two voters tolerate no failure). A learner is removed without these checks.
+- A membership change (`add-learner`, `promote`, `remove`) that times out may still commit later: check `cluster members` before retrying.
+- **`cluster transfer-leader <id>`** hands leadership to a voter that has caught up. openraft 0.9 has no transfer of its own, so the leader pauses new writes and membership changes (clients retry, as in an election), lets what is in flight finish, pauses its heartbeats and asks the target to call an election every 50 ms; the target wins as soon as the leader lease (`--election-timeout-max`) runs out, before any other node campaigns. Only one transfer runs at a time; if the target cannot be reached the transfer ends at once and the old leader keeps leading undisturbed, and if it does not take over within 20 s the old leader resumes.
+- **Exit codes** add 6: the data directory belongs to another cluster than `--join`'s peer (or a node named in `add-learner` does).
 
 ## Docker
 
