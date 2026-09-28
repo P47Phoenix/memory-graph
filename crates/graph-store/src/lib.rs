@@ -28,7 +28,9 @@ mod common;
 pub mod conformance;
 pub mod export;
 mod v2;
-pub use api::{detect_format, open_store, Page, PreparedFile, SnapshotStats, Store, StoreRead};
+pub use api::{
+    detect_format, open_store, Page, PreparedFile, RemoteParts, SnapshotStats, Store, StoreRead,
+};
 pub use codec::{encode_posting, POSTING_BLOCK};
 pub(crate) use common::{
     check_unchanged, commit_prepared, dec, describe_in, enc, fingerprint, grain_accepts,
@@ -86,6 +88,32 @@ pub enum StoreError {
         "snapshot expired after {age_secs}s (max age {max_age_secs}s); open a new snapshot with Store::snapshot"
     )]
     SnapshotExpired { age_secs: u64, max_age_secs: u64 },
+    /// A write reached a replica that is not the leader (ADR 0004 D8): the
+    /// leader, when known, is named so a client can retry there. Never
+    /// produced by the embedded store; surfaced through the `Store` trait
+    /// by a remote backend.
+    #[error("not the leader{}", not_leader_hint(.leader_id, .leader_addr))]
+    NotLeader {
+        leader_id: Option<u64>,
+        leader_addr: Option<String>,
+    },
+    /// No leader is currently known (election in progress or quorum lost);
+    /// retry after the suggested delay.
+    #[error("no leader is currently known; retry after {retry_after_ms} ms")]
+    NoLeader { retry_after_ms: u64 },
+    /// The client and server do not speak the same protocol (version
+    /// mismatch, malformed response, ...).
+    #[error("protocol error: {0}")]
+    Protocol(String),
+}
+
+fn not_leader_hint(id: &Option<u64>, addr: &Option<String>) -> String {
+    match (id, addr) {
+        (Some(id), Some(addr)) => format!(" (leader is node {id} at {addr})"),
+        (Some(id), None) => format!(" (leader is node {id})"),
+        (None, Some(addr)) => format!(" (leader is at {addr})"),
+        (None, None) => String::new(),
+    }
 }
 
 impl<E: Into<redb::Error>> From<E> for StoreError {
