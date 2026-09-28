@@ -141,3 +141,129 @@ fn database_size_stays_within_bounds_of_source_and_tokens() {
     let (ok, out, _) = run(&["--db", db, "describe"]);
     assert!(ok && out.contains("o/r1") && out.contains("o/r2"), "{out}");
 }
+
+/// The Raft log (ADR 0004 D7): every write is a log entry that carries the
+/// source bytes, so before a snapshot `raft.redb` holds the source again
+/// (and more: redb rounds large values up). After `cluster snapshot`
+/// purges the log (`--log-keep-entries 0`), the log store compacts the
+/// file, which must end at most 1.5x the source indexed, or a node's disk
+/// keeps the high-water mark of every log between two snapshots (redb
+/// reuses freed pages but never shrinks the file on its own).
+#[test]
+fn raft_log_after_snapshot_and_purge_stays_within_bounds_of_source() {
+    use std::io::BufRead;
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("node");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+        .env_remove("MEMORY_GRAPH_SERVER")
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--bootstrap",
+            "--node-id",
+            "1",
+            "--listen",
+            "127.0.0.1:0",
+            "--log-keep-entries",
+            "0",
+            "--min-free-disk",
+            "1",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let out = child.stdout.take().unwrap();
+    let mut child = Kill(child);
+    let mut lines = std::io::BufReader::new(out).lines();
+    let line = lines.next().expect("serve prints a line").unwrap();
+    std::thread::spawn(move || lines.for_each(drop));
+    let addr = line
+        .split("listening on ")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no address in {line:?}"))
+        .to_string();
+
+    // Three passes (three repos) so the ratio measures the log, not redb's
+    // fixed floor: an empty redb file is already 1.6 MB, about one pass of
+    // this corpus (one pass measured 1.58x, all of it that floor plus one
+    // growth region).
+    let corpus = corpus_dir();
+    let mut source_bytes = 0;
+    for repo in ["r1", "r2", "r3"] {
+        let (ok, out, err) = run(&[
+            "--server",
+            &addr,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            repo,
+            "--json",
+            "--no-progress",
+            corpus.to_str().unwrap(),
+        ]);
+        assert!(ok, "{out}{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let skipped: std::collections::HashSet<String> = v["skipped_by_reason"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|paths| paths.as_array().unwrap().iter())
+            .map(|p| p.as_str().unwrap().to_string())
+            .collect();
+        source_bytes += source_size(&corpus, &skipped).1;
+    }
+    let log = dir.join("raft.redb");
+    let before = std::fs::metadata(&log).unwrap().len();
+
+    let (ok, out, err) = run(&["--server", &addr, "cluster", "snapshot", "--json"]);
+    assert!(ok, "{out}{err}");
+    let snap: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let snap_index = snap["last_applied_index"].as_u64().unwrap();
+    // The purge runs after the snapshot is built; wait for it (bounded).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (ok, out, _) = run(&["--server", &addr, "cluster", "status", "--json"]);
+        let st: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_default();
+        if ok && st["purged_index"].as_u64().unwrap_or(0) >= snap_index {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the log was not purged up to the snapshot at {snap_index}: {out}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let s = graph_client::RemoteStore::connect(graph_client::ClientConfig::new(&addr)).unwrap();
+    s.admin_shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    drop(s);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline, "serve did not stop");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let after = std::fs::metadata(&log).unwrap().len();
+    let ratio = after as f64 / source_bytes as f64;
+    println!(
+        "raft size gate: source={source_bytes} B, raft.redb before snapshot={before} B ({:.2}x), \
+         after snapshot at {snap_index} + purge={after} B ({ratio:.2}x)",
+        before as f64 / source_bytes as f64
+    );
+    assert!(
+        ratio <= 1.5,
+        "raft.redb is {ratio:.2}x its source after a snapshot and purge ({after} B for \
+         {source_bytes} B); limit 1.5x"
+    );
+}

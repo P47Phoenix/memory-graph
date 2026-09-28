@@ -40,7 +40,7 @@ pub struct RaftSettings {
     /// default 1000), so a briefly lagging follower catches up from the
     /// log rather than by a snapshot.
     pub log_keep_entries: u64,
-    /// Purge only once this many entries can go at once.
+    /// Purge only once this many entries can go at once (default 1).
     pub purge_batch_size: u64,
     /// At most this many entries per `AppendEntries` (the byte cap in the
     /// network also applies).
@@ -58,7 +58,11 @@ impl RaftSettings {
             snapshot_log_entries: 10_000,
             snapshot_log_bytes: 1 << 30,
             log_keep_entries: 1000,
-            purge_batch_size: 64,
+            // 1, not a bigger batch: an entry carries up to 8 MiB of
+            // source, so waiting for 64 purgeable entries could keep
+            // 512 MiB of log after a snapshot (a whole corpus index is a
+            // handful of entries). A purge is one range delete.
+            purge_batch_size: 1,
             max_payload_entries: 64,
         }
     }
