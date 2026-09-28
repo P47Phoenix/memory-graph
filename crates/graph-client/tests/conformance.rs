@@ -1,0 +1,434 @@
+//! `RemoteStore` against an in-process `TestServer` (ADR 0004 stage A test
+//! plan): the store conformance suite, the two differential harnesses
+//! against an embedded store, a server restart mid-batch, snapshot handle
+//! expiry and cap, default-limit paging, typed errors through a real RPC,
+//! protocol version refusal, and two servers on one file.
+use graph_client::{ClientConfig, ReadMode, RemoteStore};
+use graph_core::Extractor;
+use graph_proto::{pb, status_to_store_error, PROTOCOL_VERSION};
+use graph_server::testing::TestServer;
+use graph_store::conformance::{self, Harness};
+use graph_store::{
+    open_store, BatchFile, IndexOptions, Query, Store, StoreError, StoreRead, ORIGIN_DIRECTORY,
+};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+fn rust() -> Vec<Box<dyn Extractor>> {
+    vec![Box::new(graph_lang_rust::RustExtractor)]
+}
+
+fn connect(server: &TestServer) -> RemoteStore {
+    RemoteStore::connect(ClientConfig::new(server.endpoint())).expect("connect")
+}
+
+fn connect_mode(server: &TestServer, mode: ReadMode) -> RemoteStore {
+    let mut cfg = ClientConfig::new(server.endpoint());
+    cfg.read_mode = mode;
+    RemoteStore::connect(cfg).expect("connect")
+}
+
+/// A harness whose `open` (re)starts one server on the same file with the
+/// call's extractors and connects a fresh `RemoteStore` to it.
+fn remote_harness() -> Harness {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let server: Arc<Mutex<Option<TestServer>>> = Arc::new(Mutex::new(None));
+    let s2 = Arc::clone(&server);
+    Harness {
+        open: Box::new(move |ex| {
+            let mut g = s2.lock().unwrap();
+            if let Some(mut old) = g.take() {
+                old.stop();
+            }
+            let ts = TestServer::start(&db, ex);
+            let store = RemoteStore::connect(ClientConfig::new(ts.endpoint()))?;
+            *g = Some(ts);
+            Ok(Box::new(store) as Box<dyn Store>)
+        }),
+        exclusive: false,
+        accepts_remote_prepared: true,
+        guard: Some(Box::new((d, server))),
+    }
+}
+
+#[test]
+fn remote_store_passes_conformance_suite() {
+    conformance::run_all(&remote_harness);
+}
+
+#[test]
+fn remote_matches_embedded_differential() {
+    let d = tempfile::tempdir().unwrap();
+    let embedded = open_store(&d.path().join("e.redb"), rust()).unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), rust());
+    let remote = connect(&server);
+    conformance::run_differential(&*embedded, &remote);
+}
+
+#[test]
+fn remote_matches_embedded_differential_linearizable_reads() {
+    let d = tempfile::tempdir().unwrap();
+    let embedded = open_store(&d.path().join("e.redb"), rust()).unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), rust());
+    let remote = connect_mode(&server, ReadMode::Linearizable);
+    conformance::run_differential(&*embedded, &remote);
+}
+
+#[test]
+fn crash_rerun_differential_remote_vs_embedded() {
+    let d = tempfile::tempdir().unwrap();
+    let fresh = open_store(&d.path().join("e.redb"), rust()).unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), rust());
+    let crashed = connect(&server);
+    conformance::run_crash_rerun_differential(&*fresh, &crashed);
+
+    let d = tempfile::tempdir().unwrap();
+    let crashed = open_store(&d.path().join("e.redb"), rust()).unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), rust());
+    let fresh = connect(&server);
+    conformance::run_crash_rerun_differential(&fresh, &*crashed);
+}
+
+/// The poisoned batch (a NUL in a language) fails on the server, the server
+/// is restarted (the store closes and reopens, the Raft log is replayed),
+/// the good batch is re-run through the same client, and the result equals
+/// a fresh embedded index. Also: the served file reopened embedded answers
+/// identically.
+#[test]
+fn server_restart_mid_batch_equals_fresh() {
+    let d = tempfile::tempdir().unwrap();
+    let fresh = open_store(&d.path().join("e.redb"), rust()).unwrap();
+    let served = d.path().join("s.redb");
+    let mut server = TestServer::start(&served, rust());
+    let remote = connect(&server);
+
+    let names = ["a.txt", "b.txt", "c.txt", "d.txt"];
+    let bodies: [&[u8]; 4] = [
+        b"foo bar",
+        b"foo (bar) qux",
+        b"let x = foo;",
+        b"fn dup() { dup(); }",
+    ];
+    let good: Vec<BatchFile<'_>> = names
+        .iter()
+        .zip(bodies)
+        .map(|(n, b)| BatchFile {
+            path: n,
+            bytes: b,
+            language: Some("text"),
+            origin: Some(ORIGIN_DIRECTORY),
+        })
+        .collect();
+    let mut poisoned = good[..2].to_vec();
+    poisoned.push(BatchFile {
+        path: "nul.txt",
+        bytes: b"foo",
+        language: Some("a\0b"),
+        origin: Some(ORIGIN_DIRECTORY),
+    });
+    poisoned.extend_from_slice(&good[2..]);
+    let err = remote
+        .index_batch("o", "r", &poisoned, IndexOptions::default())
+        .expect_err("the poisoned batch must fail");
+    assert!(matches!(err, StoreError::Rejected(_)), "{err:?}");
+
+    server.restart();
+    assert!(server.is_running());
+
+    let rerun = remote
+        .index_batch("o", "r", &good, IndexOptions::default())
+        .unwrap();
+    assert!(rerun.iter().all(|r| r.is_ok()), "{rerun:?}");
+    let once = fresh
+        .index_batch("o", "r", &good, IndexOptions::default())
+        .unwrap();
+    assert!(once.iter().all(|r| r.is_ok()));
+    conformance::run_differential(&*fresh, &remote);
+
+    // The served file, reopened embedded, answers the same.
+    drop(remote);
+    server.stop();
+    let reopened = open_store(&served, rust()).unwrap();
+    conformance::run_differential(&*fresh, &*reopened);
+}
+
+#[test]
+fn snapshot_handle_expires_at_the_max_age() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(&d.path().join("s.redb"), vec![], |cfg| {
+        cfg.snapshot_max_age = Duration::from_millis(600);
+    });
+    let remote = connect(&server);
+    remote.index_bytes("o", "r", "a.txt", b"foo", None).unwrap();
+    let snap = remote.snapshot().unwrap();
+    assert_eq!(snap.search(&Query::new("foo")).unwrap().len(), 1);
+    std::thread::sleep(Duration::from_millis(900));
+    let err = snap.search(&Query::new("foo")).unwrap_err();
+    assert!(matches!(err, StoreError::SnapshotExpired { .. }), "{err:?}");
+    // A fresh handle works.
+    let snap2 = remote.snapshot().unwrap();
+    assert_eq!(snap2.search(&Query::new("foo")).unwrap().len(), 1);
+}
+
+#[test]
+fn sixty_fifth_snapshot_handle_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), vec![]);
+    let remote = connect(&server);
+    remote.index_bytes("o", "r", "a.txt", b"foo", None).unwrap();
+    let mut held = Vec::new();
+    for _ in 0..graph_server::SNAPSHOT_HANDLES_PER_CONNECTION {
+        held.push(remote.snapshot().unwrap());
+    }
+    let err = remote.snapshot().err().expect("65th handle refused");
+    assert!(
+        matches!(&err, StoreError::Rejected(m) if m.contains("64")),
+        "{err:?}"
+    );
+    // Closing one frees a slot.
+    drop(held.pop());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match remote.snapshot() {
+            Ok(s) => {
+                held.push(s);
+                break;
+            }
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(e) => panic!("slot not freed: {e}"),
+        }
+    }
+    assert_eq!(remote.snapshot_stats().open_count, 64);
+    drop(held);
+}
+
+/// A search without a limit returns every hit (>1000), paged under one
+/// snapshot handle, and equals the embedded answer.
+#[test]
+fn default_limit_paging_returns_everything() {
+    let d = tempfile::tempdir().unwrap();
+    let embedded = open_store(&d.path().join("e.redb"), vec![]).unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), vec![]);
+    let remote = connect(&server);
+    let src: String = (0..2500).map(|i| format!("foo v{i}\n")).collect();
+    for s in [&*embedded, &remote as &dyn Store] {
+        s.index_bytes("o", "r", "big.txt", src.as_bytes(), Some("text"))
+            .unwrap();
+    }
+    let q = Query::new("foo");
+    let e = embedded.search(&q).unwrap();
+    let r = remote.search(&q).unwrap();
+    assert_eq!(e.len(), 2500);
+    assert_eq!(e, r);
+    // With an offset and no limit: the tail.
+    let mut q2 = Query::new("foo");
+    q2.offset = Some(1234);
+    assert_eq!(embedded.search(&q2).unwrap(), remote.search(&q2).unwrap());
+    assert_eq!(remote.search(&q2).unwrap().len(), 2500 - 1234);
+    // An explicit limit above the default is honoured as given.
+    let mut q3 = Query::new("foo");
+    q3.limit = Some(1500);
+    assert_eq!(remote.search(&q3).unwrap().len(), 1500);
+    // Under a snapshot handle, the same.
+    let snap = remote.snapshot().unwrap();
+    assert_eq!(snap.search(&q).unwrap().len(), 2500);
+    assert_eq!(
+        remote.snapshot_stats().open_count,
+        1,
+        "paging closed its own handle"
+    );
+}
+
+#[test]
+fn store_errors_round_trip_through_a_real_rpc() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), vec![]);
+    let remote = connect(&server);
+    // Per-file rejection in its slot.
+    let out = remote
+        .index_batch(
+            "o",
+            "r",
+            &[BatchFile {
+                path: "bin.c",
+                bytes: b"\xff",
+                language: None,
+                origin: None,
+            }],
+            IndexOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        matches!(&out[0], Err(StoreError::NotUtf8(m)) if m.contains("bin.c")),
+        "{out:?}"
+    );
+    // A whole-call refusal.
+    let err = remote
+        .index_bytes("", "r", "a.txt", b"foo", None)
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Rejected(m) if m.contains("org and repo")),
+        "{err:?}"
+    );
+    // An invalid span in a caller-supplied extraction.
+    let ex = graph_core::Extraction {
+        symbols: vec![],
+        tokens: vec![graph_core::TokenDecl {
+            text: "x".into(),
+            class: graph_core::TokenClass::Identifier,
+            span: graph_core::Span {
+                start: 5,
+                end: 2,
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 1,
+            },
+        }],
+        has_errors: false,
+    };
+    let err = remote
+        .ingest_file("o", "r", "x.txt", "text", &ex)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidSpan(_)), "{err:?}");
+}
+
+#[test]
+fn unknown_protocol_version_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), vec![]);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let status = rt.block_on(async {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{}", server.endpoint()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut c = pb::store_client::StoreClient::new(ch);
+        c.hello(pb::HelloRequest {
+            protocol_version: PROTOCOL_VERSION + 1,
+            client_version: "test".into(),
+        })
+        .await
+        .unwrap_err()
+    });
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    let e = status_to_store_error(&status);
+    assert!(
+        matches!(&e, StoreError::Protocol(m) if m.contains("protocol version")),
+        "{e:?}"
+    );
+    // The right version is welcome, and says who answered.
+    let remote = connect(&server);
+    let h = remote.hello();
+    assert_eq!(h.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(h.node_id, 1);
+    assert_eq!(h.leader_id, Some(1));
+    assert_eq!(h.store_format_version, graph_store::SCHEMA_VERSION);
+    assert_eq!(h.extractors_hash.len(), 64);
+}
+
+#[test]
+fn two_servers_on_one_file_the_second_is_locked() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("s.redb");
+    let first = TestServer::start(&db, vec![]);
+    let err = TestServer::try_start_with(&db, vec![], |_| {})
+        .err()
+        .expect("second refused");
+    assert!(matches!(err, StoreError::Locked(_)), "{err:?}");
+    // An embedded open is refused too, and the sidecar names the holder.
+    let err = open_store(&db, vec![])
+        .err()
+        .expect("embedded open refused");
+    assert!(matches!(err, StoreError::Locked(_)), "{err:?}");
+    let (info, alive) = graph_server::lock::holder(&db).expect("LOCK sidecar");
+    assert!(alive);
+    assert_eq!(info.pid, std::process::id());
+    assert_eq!(info.listen, first.endpoint());
+    drop(first);
+    assert!(
+        !graph_server::lock::lock_path(&db).exists(),
+        "sidecar removed on stop"
+    );
+    assert!(
+        open_store(&db, vec![]).is_ok(),
+        "free once the server stopped"
+    );
+}
+
+#[test]
+fn admin_and_health_surface() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), rust());
+    let remote = connect(&server);
+    assert!(remote.health("").unwrap());
+    assert!(remote.health(graph_server::READY_SERVICE).unwrap());
+    remote
+        .index_bytes("o", "r", "lib.rs", b"fn a() { foo(); }", None)
+        .unwrap();
+    let st = remote.admin_status().unwrap();
+    assert_eq!(st.node_id, 1);
+    assert_eq!(st.leader_id, Some(1));
+    assert!(st.applied_index >= 1, "{st:?}");
+    assert_eq!(st.state, "Leader");
+    assert_eq!(st.protocol_version, PROTOCOL_VERSION);
+    let json: serde_json::Value = serde_json::from_str(&remote.admin_sysinfo().unwrap()).unwrap();
+    assert!(json.get("db").is_some());
+    let before = remote.search(&Query::new("foo")).unwrap();
+    let stats = remote.admin_compact().unwrap();
+    assert!(stats.after_bytes > 0);
+    assert_eq!(
+        remote.search(&Query::new("foo")).unwrap(),
+        before,
+        "compact keeps the data"
+    );
+    assert_eq!(remote.count_nodes(graph_core::NodeKind::File).unwrap(), 1);
+    // Shutdown over Admin stops the server: the LOCK sidecar goes away.
+    remote.admin_shutdown(Duration::from_secs(1)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while graph_server::lock::read(server.db()).is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        graph_server::lock::read(server.db()).is_none(),
+        "LOCK removed after shutdown"
+    );
+}
+
+#[test]
+fn a_second_client_reads_while_another_indexes() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), vec![]);
+    let writer = connect(&server);
+    let reader = connect(&server);
+    let src: String = (0..20000).map(|i| format!("foo w{i}\n")).collect();
+    let files: Vec<(String, Vec<u8>)> = (0..8)
+        .map(|i| (format!("f{i}.txt"), src.as_bytes().to_vec()))
+        .collect();
+    let t = std::thread::spawn(move || {
+        let batch: Vec<BatchFile<'_>> = files
+            .iter()
+            .map(|(p, b)| BatchFile {
+                path: p,
+                bytes: b,
+                language: Some("text"),
+                origin: None,
+            })
+            .collect();
+        writer
+            .index_batch("o", "r", &batch, IndexOptions::default())
+            .unwrap()
+    });
+    let mut seen = Vec::new();
+    while !t.is_finished() {
+        seen.push(reader.count_nodes(graph_core::NodeKind::File).unwrap());
+    }
+    let out = t.join().unwrap();
+    assert!(out.iter().all(|r| r.is_ok()));
+    assert_eq!(reader.count_nodes(graph_core::NodeKind::File).unwrap(), 8);
+    assert!(!seen.is_empty(), "reads were answered during the index run");
+}
