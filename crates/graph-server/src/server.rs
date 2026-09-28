@@ -286,12 +286,24 @@ pub fn run_blocking(
     cfg: ServeConfig,
     extractors: Vec<Box<dyn Extractor>>,
 ) -> Result<(), StoreError> {
+    run_blocking_with(cfg, extractors, |_| {})
+}
+
+/// [`run_blocking`], calling `on_ready` with the bound address once the
+/// store is open, the LOCK sidecar written and the listener accepting (the
+/// CLI prints it, so `--listen 127.0.0.1:0` is usable by scripts and tests).
+pub fn run_blocking_with(
+    cfg: ServeConfig,
+    extractors: Vec<Box<dyn Extractor>>,
+    on_ready: impl FnOnce(SocketAddr) + Send + 'static,
+) -> Result<(), StoreError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| io_err("tokio runtime", e))?;
     rt.block_on(async move {
         let running = start(cfg, share(extractors)).await?;
+        on_ready(running.addr);
         let handle = running.shutdown_handle();
         tokio::spawn(async move {
             wait_for_signal().await;

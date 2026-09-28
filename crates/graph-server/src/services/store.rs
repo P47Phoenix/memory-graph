@@ -233,14 +233,17 @@ impl pb::store_server::Store for StoreService {
                 ConvertError("required field `SearchSymbolsRequest.query` is missing".into())
             })?
             .try_into()?;
-        let applied_default_limit = q.limit.is_none();
-        if applied_default_limit {
+        // Only a page the default limit filled is reported, so a small answer
+        // needs no paging round trips (a full one may have more behind it).
+        let defaulted = q.limit.is_none();
+        if defaulted {
             q.limit = Some(DEFAULT_SEARCH_LIMIT);
         }
         let hits = self.ctx.read(r.view, move |s| s.search_symbols(&q)).await?;
+        let hits_len = hits.len();
         Ok(Response::new(pb::SearchSymbolsResponse {
             hits: hits.into_iter().map(Into::into).collect(),
-            applied_default_limit,
+            applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
         }))
     }
 
@@ -253,14 +256,17 @@ impl pb::store_server::Store for StoreService {
             .query
             .ok_or_else(|| ConvertError("required field `SearchRequest.query` is missing".into()))?
             .try_into()?;
-        let applied_default_limit = q.limit.is_none();
-        if applied_default_limit {
+        // Only a page the default limit filled is reported, so a small answer
+        // needs no paging round trips (a full one may have more behind it).
+        let defaulted = q.limit.is_none();
+        if defaulted {
             q.limit = Some(DEFAULT_SEARCH_LIMIT);
         }
         let hits = self.ctx.read(r.view, move |s| s.search(&q)).await?;
+        let hits_len = hits.len();
         Ok(Response::new(pb::SearchResponse {
             hits: hits.into_iter().map(Into::into).collect(),
-            applied_default_limit,
+            applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
         }))
     }
 

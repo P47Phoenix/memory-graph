@@ -11,6 +11,7 @@ use graph_store::{
     SnapshotStats, Store, StoreError, StoreRead, SymbolHit, SymbolQuery, VacuumStats,
 };
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,8 @@ type Result<T> = std::result::Result<T, StoreError>;
 pub struct RemoteStore {
     rt: Arc<tokio::runtime::Runtime>,
     conn: Arc<Conn>,
+    /// Highest `applied_index` a `Write.Index` answered (0 before any).
+    applied: Arc<AtomicU64>,
 }
 
 impl RemoteStore {
@@ -36,6 +39,7 @@ impl RemoteStore {
         Ok(RemoteStore {
             rt,
             conn: Arc::new(conn),
+            applied: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -46,6 +50,13 @@ impl RemoteStore {
 
     pub fn config(&self) -> &ClientConfig {
         self.conn.config()
+    }
+
+    /// The highest Raft log index an `Index` RPC of this store reported as
+    /// applied (0 before the first). Shared, so a progress display can read
+    /// it while the store itself is boxed as `dyn Store`.
+    pub fn applied_index(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.applied)
     }
 
     fn run<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -156,6 +167,8 @@ impl RemoteStore {
             }
         }))?;
         let resp = resp.into_inner();
+        self.applied
+            .fetch_max(resp.applied_index, Ordering::Relaxed);
         if resp.results.len() != files.len() {
             return Err(StoreError::Protocol(format!(
                 "Index answered {} results for {} files",

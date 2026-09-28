@@ -30,8 +30,8 @@ service Store {
   rpc Describe(DescribeRequest) returns (DescribeResponse);
   // The reference scan behind `describe` (conformance oracle).
   rpc DescribeByScan(DescribeRequest) returns (DescribeResponse);
-  // A request without `limit` gets the server's default limit (1000) and
-  // `applied_default_limit` set, so the client pages to completion.
+  // A request without `limit` gets the server's default limit (1000); when that
+  // fills the page, `applied_default_limit` is set and the client pages to completion.
   rpc SearchSymbols(SearchSymbolsRequest) returns (SearchSymbolsResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
 
@@ -134,8 +134,8 @@ message SearchSymbolsRequest {
 }
 message SearchSymbolsResponse {
   repeated SymbolHit hits = 1;
-  // The request had no `limit`, so the server applied its default; page
-  // with `offset` under a snapshot handle to get the rest.
+  // The request had no `limit` and the server's default filled this page;
+  // page with `offset` under a snapshot handle to get the rest.
   bool applied_default_limit = 2;
 }
 
@@ -145,6 +145,7 @@ message SearchRequest {
 }
 message SearchResponse {
   repeated Hit hits = 1;
+  // As in `SearchSymbolsResponse`.
   bool applied_default_limit = 2;
 }
 

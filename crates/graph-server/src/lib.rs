@@ -40,7 +40,9 @@ pub mod testing;
 
 pub use extractors::{extractors_hash, SharedExtractor};
 pub use lock::LockFile;
-pub use server::{run_blocking, start, Running, ServeConfig, ShutdownHandle, SysInfoFn};
+pub use server::{
+    run_blocking, run_blocking_with, start, Running, ServeConfig, ShutdownHandle, SysInfoFn,
+};
 pub use slot::StoreSlot;
 
 /// The server's own version, reported in `Hello` and `Admin.Status`.

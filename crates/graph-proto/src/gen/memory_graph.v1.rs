@@ -852,8 +852,8 @@ pub struct SearchSymbolsRequest {
 pub struct SearchSymbolsResponse {
     #[prost(message, repeated, tag = "1")]
     pub hits: ::prost::alloc::vec::Vec<SymbolHit>,
-    /// The request had no `limit`, so the server applied its default; page
-    /// with `offset` under a snapshot handle to get the rest.
+    /// The request had no `limit` and the server's default filled this page;
+    /// page with `offset` under a snapshot handle to get the rest.
     #[prost(bool, tag = "2")]
     pub applied_default_limit: bool,
 }
@@ -868,6 +868,7 @@ pub struct SearchRequest {
 pub struct SearchResponse {
     #[prost(message, repeated, tag = "1")]
     pub hits: ::prost::alloc::vec::Vec<Hit>,
+    /// As in `SearchSymbolsResponse`.
     #[prost(bool, tag = "2")]
     pub applied_default_limit: bool,
 }
@@ -1273,8 +1274,8 @@ pub mod store_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Store", "DescribeByScan"));
             self.inner.unary(req, path, codec).await
         }
-        /// A request without `limit` gets the server's default limit (1000) and
-        /// `applied_default_limit` set, so the client pages to completion.
+        /// A request without `limit` gets the server's default limit (1000); when that
+        /// fills the page, `applied_default_limit` is set and the client pages to completion.
         pub async fn search_symbols(
             &mut self,
             request: impl tonic::IntoRequest<super::SearchSymbolsRequest>,
@@ -1499,8 +1500,8 @@ pub mod store_server {
             tonic::Response<super::DescribeResponse>,
             tonic::Status,
         >;
-        /// A request without `limit` gets the server's default limit (1000) and
-        /// `applied_default_limit` set, so the client pages to completion.
+        /// A request without `limit` gets the server's default limit (1000); when that
+        /// fills the page, `applied_default_limit` is set and the client pages to completion.
         async fn search_symbols(
             &self,
             request: tonic::Request<super::SearchSymbolsRequest>,
