@@ -120,6 +120,43 @@ pub struct NodeJson {
     pub extractors_hash: String,
     /// Seconds since the Unix epoch at creation.
     pub created: u64,
+    /// This node minted the cluster (`--bootstrap` on an empty directory)
+    /// and must initialize the one-member Raft cluster if its log is not
+    /// initialized yet: set before the first initialization, so a crash
+    /// between writing `node.json` and initializing is finished by the next
+    /// start instead of leaving a node that never elects. Absent in files
+    /// written before this field existed (`false`: they were initialized).
+    #[serde(default)]
+    pub bootstrapped: bool,
+}
+
+/// Write `bytes` to `path` durably: a temp file beside it, fsynced, renamed
+/// over `path`, and the directory fsynced (where the platform can), so a
+/// crash leaves either the old or the new file, never a torn or lost one.
+pub fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = with_suffix(path, ".tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    crate::raft::snapshot_dir::replace_file(&tmp, path)?;
+    sync_parent(path);
+    Ok(())
+}
+
+/// fsync the directory holding `path` (Unix; Windows has no directory
+/// handle to sync, and NTFS journals the rename's metadata itself).
+pub fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 impl NodeJson {
@@ -139,15 +176,12 @@ impl NodeJson {
         }
     }
 
-    /// Write via a temp file and a rename, so a crash never leaves a torn
+    /// Write via [`durable_write`], so a crash never leaves a torn or lost
     /// `node.json`.
     pub fn write(&self, path: &Path) -> Result<(), StoreError> {
-        let io =
-            |e: std::io::Error| StoreError::Storage(format!("writing `{}`: {e}", path.display()));
         let text = serde_json::to_string_pretty(self).expect("NodeJson serializes");
-        let tmp = with_suffix(path, ".tmp");
-        std::fs::write(&tmp, text).map_err(io)?;
-        crate::raft::state_machine::replace_file(&tmp, path).map_err(io)
+        durable_write(path, text.as_bytes())
+            .map_err(|e| StoreError::Storage(format!("writing `{}`: {e}", path.display())))
     }
 }
 
@@ -163,6 +197,11 @@ pub struct ClusterIdentity {
 
 /// The Raft RPC header naming the sender's cluster.
 pub const CLUSTER_ID_HEADER: &str = "mg-cluster-id";
+
+/// The Raft RPC header naming the sender's extractor version set hash: a
+/// replica must extract identically (ADR 0004 D5), so a node refuses Raft
+/// traffic from a node built with other extractors.
+pub const EXTRACTORS_HASH_HEADER: &str = "mg-extractors-hash";
 
 impl ClusterIdentity {
     /// A fixed id with nothing to persist (`--db` mode: `standalone`).
@@ -188,12 +227,42 @@ impl ClusterIdentity {
             .clone()
     }
 
-    /// Accept an RPC from a sender in cluster `remote`: adopt it (and
-    /// persist it) if this node has none yet, refuse a different one.
-    pub fn check_or_adopt(&self, remote: Option<&str>) -> Result<(), String> {
-        let Some(remote) = remote.filter(|r| !r.is_empty()) else {
+    /// Accept a Raft RPC from a sender in cluster `remote` (its
+    /// `mg-cluster-id` header):
+    ///
+    /// * this node has an id: the header is required and must match;
+    /// * it has none (an uninitialized member): with `adopt` (a leader's
+    ///   `AppendEntries` or `InstallSnapshot`, which make it a member) the
+    ///   sender's id is adopted and persisted to `node.json`; without (a
+    ///   `Vote`, which a candidate of any cluster may send and which never
+    ///   makes this node a member) nothing is adopted.
+    pub fn check_or_adopt(&self, remote: Option<&str>, adopt: bool) -> Result<(), String> {
+        let remote = remote.filter(|r| !r.is_empty());
+        // Fast path: a member checks under the read lock only.
+        {
+            let g = self
+                .id
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mine) = g.as_deref() {
+                return match remote {
+                    Some(r) if r == mine => Ok(()),
+                    Some(r) => Err(format!(
+                        "wrong cluster: this node belongs to cluster {mine}, the sender to {r}"
+                    )),
+                    None => Err(format!(
+                        "wrong cluster: this node belongs to cluster {mine} and the sender \
+                         named none (no `{CLUSTER_ID_HEADER}` header)"
+                    )),
+                };
+            }
+        }
+        let Some(remote) = remote else {
             return Ok(());
         };
+        if !adopt {
+            return Ok(());
+        }
         let mut g = self
             .id
             .write()
@@ -323,7 +392,7 @@ pub fn plan(
             restore: None,
         });
     }
-    if !paths.is_empty() {
+    if !paths.is_empty() && (matches!(init, InitMode::Restart) || !failed_first_start(paths)) {
         return Err(StoreError::Rejected(format!(
             "`{}` holds a store or a Raft log but no node.json; it was not created by \
              `serve --data-dir` (or node.json was lost). Refusing to guess its identity",
@@ -356,6 +425,71 @@ pub fn plan(
         bootstrap: matches!(init, InitMode::Bootstrap { .. }),
         restore,
     })
+}
+
+/// Whether a data directory without `node.json` holds only what a first
+/// start that failed before writing `node.json` leaves behind: a log with
+/// no Raft state at all, and a store (if any) with no Raft marker and no
+/// data. Such a directory is started as the empty one it effectively is
+/// (a `--bootstrap` or uninitialized first start retried after, say, the
+/// port was in use); anything else is refused, because its identity cannot
+/// be known.
+pub fn failed_first_start(paths: &NodePaths) -> bool {
+    use graph_store::StoreRead;
+    let log_blank = matches!(
+        crate::raft::log_store::RedbLogStore::probe(&paths.log),
+        Ok(p) if p.is_blank()
+    );
+    if !log_blank {
+        return false;
+    }
+    if !paths.store.exists() {
+        return true;
+    }
+    match graph_store::V2Store::open(&paths.store) {
+        Ok(s) => {
+            matches!(s.raft_marker(), Ok(None))
+                && matches!(s.count_nodes(graph_core::NodeKind::Org), Ok(0))
+        }
+        Err(_) => false,
+    }
+}
+
+/// The start-up consistency check of an initialized data directory (one
+/// with a `node.json`) between its Raft log and its store (ADR 0004 D6).
+/// The log holds the node's vote and term; losing it while keeping the
+/// store would let the node vote a second time in a term it already voted
+/// in, and losing the store while keeping a log that was purged (or whose
+/// entries the old store had applied) would silently diverge. Refused:
+///
+/// * a log with no Raft state (missing or blank) beside a store whose
+///   marker says entries were applied;
+/// * a store that did not exist at start beside a log that has state.
+pub fn check_log_and_store(
+    dir: &Path,
+    log: crate::raft::log_store::LogProbe,
+    store_existed: bool,
+    marker_index: u64,
+) -> Result<(), StoreError> {
+    if log.is_blank() && marker_index > 0 {
+        return Err(StoreError::Rejected(format!(
+            "`{}`: the Raft log (raft.redb) is {} but the store has applied entries up to \
+             index {marker_index}: this node's vote and log were lost, and starting would let \
+             it vote twice in one term. Refusing to start. Restore raft.redb from the same \
+             backup as the store, or clear the data directory and add the node again",
+            dir.display(),
+            if log.exists { "empty" } else { "missing" },
+        )));
+    }
+    if !store_existed && !log.is_blank() {
+        return Err(StoreError::Rejected(format!(
+            "`{}`: the store (graph.redb) is missing but the Raft log holds state: the store \
+             was lost. Refusing to start. Restore graph.redb from the same backup as the log, \
+             or clear the data directory and add the node again",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// `--restore`: copy `snapshot` into place as the store, check it is a

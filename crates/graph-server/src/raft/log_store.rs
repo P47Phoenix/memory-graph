@@ -19,7 +19,7 @@ use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{
     AnyError, CommittedLeaderId, EntryPayload, Membership, RaftLogReader, RaftTypeConfig, Vote,
 };
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, StorageBackend, TableDefinition};
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -55,11 +55,42 @@ pub enum AppendEvent {
 
 pub type AppendObserver = Arc<dyn Fn(AppendEvent) + Send + Sync>;
 
+/// What [`RedbLogStore::probe`] found in a log file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogProbe {
+    /// The file exists.
+    pub exists: bool,
+    /// A vote was saved (the node was initialized, voted or was contacted
+    /// by a leader).
+    pub vote: bool,
+    /// Entries in the log.
+    pub entries: u64,
+    /// A purge point was saved.
+    pub purged: bool,
+}
+
+impl LogProbe {
+    /// No Raft state at all.
+    pub fn is_blank(&self) -> bool {
+        !self.vote && self.entries == 0 && !self.purged
+    }
+}
+
+fn open_err(path: &Path, e: redb::DatabaseError) -> StoreError {
+    match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => StoreError::Locked(path.display().to_string()),
+        e => StoreError::OpenFailed {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        },
+    }
+}
+
 #[derive(Clone)]
 pub struct RedbLogStore {
     db: Arc<Database>,
     path: PathBuf,
-    /// Encoded bytes appended since this process opened the log (the
+    /// Encoded bytes the log held when opened plus every append since (the
     /// snapshot policy's byte trigger, `--snapshot-log-bytes`).
     appended_bytes: Arc<AtomicU64>,
     observer: Option<AppendObserver>,
@@ -128,24 +159,74 @@ fn write_err(e: impl std::error::Error + 'static) -> StorageError {
 impl RedbLogStore {
     /// Open or create the log file at `path`.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = Database::create(path).map_err(|e| match e {
-            redb::DatabaseError::DatabaseAlreadyOpen => {
-                StoreError::Locked(path.display().to_string())
-            }
-            e => StoreError::OpenFailed {
-                path: path.display().to_string(),
-                reason: e.to_string(),
-            },
-        })?;
+        Self::open_with(path, None)
+    }
+
+    /// [`open`](Self::open), over a test-only redb [`StorageBackend`]
+    /// (the power-cut tests) instead of the file when `backend` is `Some`.
+    pub fn open_with(
+        path: &Path,
+        backend: Option<Box<dyn StorageBackend>>,
+    ) -> Result<Self, StoreError> {
+        let opened = match backend {
+            Some(b) => Database::builder().create_with_backend(b),
+            None => Database::create(path),
+        };
+        let db = opened.map_err(|e| open_err(path, e))?;
         let wt = db.begin_write()?;
         wt.open_table(LOG)?;
         wt.open_table(META)?;
         wt.commit()?;
-        Ok(Self {
+        let s = Self {
             db: Arc::new(db),
             path: path.to_path_buf(),
             appended_bytes: Arc::new(AtomicU64::new(0)),
             observer: None,
+        };
+        // The byte trigger survives a restart: start from what the log
+        // holds (the snapshot policy subtracts what lies at or below the
+        // last snapshot, see `bytes_after`).
+        let held = s.bytes_after(0)?;
+        s.appended_bytes.store(held, Ordering::Relaxed);
+        Ok(s)
+    }
+
+    /// Encoded bytes of the entries above `index` in the log right now.
+    pub fn bytes_after(&self, index: u64) -> Result<u64, StoreError> {
+        let rt = self.db.begin_read()?;
+        let t = rt.open_table(LOG)?;
+        let mut n = 0u64;
+        for row in t.range::<u64>((Bound::Excluded(index), Bound::Unbounded))? {
+            let (_, v) = row?;
+            n += v.value().len() as u64;
+        }
+        Ok(n)
+    }
+
+    /// What the log at `path` holds, read without creating anything (a
+    /// missing file is [`LogProbe::default`]): the start-up consistency
+    /// check between `node.json`, the log and the store (ADR 0004 D6).
+    pub fn probe(path: &Path) -> Result<LogProbe, StoreError> {
+        if !path.exists() {
+            return Ok(LogProbe::default());
+        }
+        let db = Database::open(path).map_err(|e| open_err(path, e))?;
+        let rt = db.begin_read()?;
+        let entries = match rt.open_table(LOG) {
+            Ok(t) => t.len()?,
+            Err(redb::TableError::TableDoesNotExist(_)) => 0,
+            Err(e) => return Err(e.into()),
+        };
+        let (vote, purged) = match rt.open_table(META) {
+            Ok(t) => (t.get(K_VOTE)?.is_some(), t.get(K_PURGED)?.is_some()),
+            Err(redb::TableError::TableDoesNotExist(_)) => (false, false),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(LogProbe {
+            exists: true,
+            vote,
+            entries,
+            purged,
         })
     }
 
@@ -274,8 +355,12 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError> {
-        self.set_meta(K_VOTE, vote)
-            .map_err(|e| StorageIOError::write_vote(AnyError::new(&e)).into())
+        let vote = *vote;
+        self.blocking(move |s| {
+            s.set_meta(K_VOTE, &vote)
+                .map_err(|e| StorageIOError::write_vote(AnyError::new(&e)).into())
+        })
+        .await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError> {
@@ -284,7 +369,8 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
     }
 
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), StorageError> {
-        self.set_meta(K_COMMITTED, &committed)
+        self.blocking(move |s| s.set_meta(K_COMMITTED, &committed))
+            .await
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId>, StorageError> {
@@ -300,30 +386,40 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         I: IntoIterator<Item = <TypeConfig as RaftTypeConfig>::Entry> + Send,
         I::IntoIter: Send,
     {
-        let write = || -> Result<(u64, u64), StorageError> {
-            let wt = self.db.begin_write().map_err(write_err)?;
-            let mut bytes = 0u64;
-            let mut last = 0u64;
-            {
-                let mut t = wt.open_table(LOG).map_err(write_err)?;
-                for e in entries {
-                    let enc = encode_entry(&e);
-                    bytes += enc.len() as u64;
-                    last = e.log_id.index;
-                    t.insert(e.log_id.index, enc.as_slice())
-                        .map_err(write_err)?;
+        let entries: Vec<Entry> = entries.into_iter().collect();
+        // The redb commit fsyncs: off the runtime workers (openraft awaits
+        // this on its own task, so nothing else of the node waits on it).
+        let written = self
+            .blocking(move |s| {
+                let wt = s.db.begin_write().map_err(write_err)?;
+                let mut bytes = 0u64;
+                let mut last = 0u64;
+                {
+                    let mut t = wt.open_table(LOG).map_err(write_err)?;
+                    for e in &entries {
+                        let enc = encode_entry(e);
+                        bytes += enc.len() as u64;
+                        last = e.log_id.index;
+                        t.insert(e.log_id.index, enc.as_slice())
+                            .map_err(write_err)?;
+                    }
                 }
-            }
-            // `Immediate` durability: the commit returns once the entries
-            // are fsynced, and only then is the flush reported (D7).
-            wt.commit().map_err(write_err)?;
-            Ok((bytes, last))
-        };
-        match write() {
-            Ok((bytes, last_index)) => {
-                self.appended_bytes.fetch_add(bytes, Ordering::Relaxed);
+                // `Immediate` durability: the commit returns once the
+                // entries are fsynced, and only then is the flush reported
+                // (D7).
+                wt.commit().map_err(write_err)?;
+                if let Some(o) = &s.observer {
+                    o(AppendEvent::Committed { last_index: last });
+                }
+                s.appended_bytes.fetch_add(bytes, Ordering::Relaxed);
+                Ok(last)
+            })
+            .await;
+        match written {
+            Ok(last_index) => {
+                // The observer sees the flush report as a wrapper around the
+                // callback: after the commit, right before openraft learns.
                 if let Some(o) = &self.observer {
-                    o(AppendEvent::Committed { last_index });
                     o(AppendEvent::Flushed { last_index });
                 }
                 callback.log_io_completed(Ok(()));
@@ -337,28 +433,45 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError> {
-        self.delete_range(Bound::Included(log_id.index), Bound::Unbounded)
+        self.blocking(move |s| s.delete_range(Bound::Included(log_id.index), Bound::Unbounded))
+            .await
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError> {
-        // The purge point and the deletion commit together.
-        let bytes = serde_json::to_vec(&log_id).map_err(write_err)?;
-        let wt = self.db.begin_write().map_err(write_err)?;
-        {
-            let mut meta = wt.open_table(META).map_err(write_err)?;
-            meta.insert(K_PURGED, bytes.as_slice()).map_err(write_err)?;
-            let mut t = wt.open_table(LOG).map_err(write_err)?;
-            let keys: Vec<u64> = t
-                .range::<u64>(..=log_id.index)
-                .map_err(write_err)?
-                .map(|r| r.map(|(k, _)| k.value()))
-                .collect::<Result<_, _>>()
-                .map_err(write_err)?;
-            for k in keys {
-                t.remove(k).map_err(write_err)?;
+        self.blocking(move |s| {
+            // The purge point and the deletion commit together.
+            let bytes = serde_json::to_vec(&log_id).map_err(write_err)?;
+            let wt = s.db.begin_write().map_err(write_err)?;
+            {
+                let mut meta = wt.open_table(META).map_err(write_err)?;
+                meta.insert(K_PURGED, bytes.as_slice()).map_err(write_err)?;
+                let mut t = wt.open_table(LOG).map_err(write_err)?;
+                let keys: Vec<u64> = t
+                    .range::<u64>(..=log_id.index)
+                    .map_err(write_err)?
+                    .map(|r| r.map(|(k, _)| k.value()))
+                    .collect::<Result<_, _>>()
+                    .map_err(write_err)?;
+                for k in keys {
+                    t.remove(k).map_err(write_err)?;
+                }
             }
-        }
-        wt.commit().map_err(write_err)
+            wt.commit().map_err(write_err)
+        })
+        .await
+    }
+}
+
+impl RedbLogStore {
+    /// Run a committing (fsyncing) body on the blocking pool.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(RedbLogStore) -> Result<T, StorageError> + Send + 'static,
+    ) -> Result<T, StorageError> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || f(s))
+            .await
+            .map_err(|e| write_err(std::io::Error::other(format!("log task: {e}"))))?
     }
 }
 
