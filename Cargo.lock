@@ -759,6 +759,7 @@ dependencies = [
  "libc",
  "openraft",
  "prost",
+ "rand 0.8.8",
  "redb",
  "serde",
  "serde_json",

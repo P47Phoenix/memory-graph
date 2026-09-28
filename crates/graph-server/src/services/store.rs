@@ -275,10 +275,13 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::OpenSnapshotRequest>,
     ) -> Result<Response<pb::OpenSnapshotResponse>, Status> {
         let conn = conn_id(&req);
-        let id = self
-            .ctx
-            .blocking(move |slot| slot.with_store(|s| slot.snapshots().open(conn, s)))
-            .await?;
+        let slot = Arc::clone(&self.ctx.slot);
+        let id = tokio::task::spawn_blocking(move || {
+            slot.with_store(|s| Ok(slot.snapshots().open(conn, s)))
+                .map_err(|e| graph_proto::store_error_to_status(&e))?
+        })
+        .await
+        .map_err(|e| Status::internal(format!("blocking task failed: {e}")))??;
         Ok(Response::new(pb::OpenSnapshotResponse { snapshot_id: id }))
     }
 

@@ -55,6 +55,10 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 1000;
 /// Snapshot handles one connection may hold at once (ADR 0004 D1).
 pub const SNAPSHOT_HANDLES_PER_CONNECTION: usize = 64;
 
+/// Snapshot handles the whole server may hold at once (each pins a read
+/// transaction, so old pages cannot be reclaimed while it lives).
+pub const SNAPSHOT_HANDLES_GLOBAL: usize = 1024;
+
 /// How often the idle reaper drops expired snapshot handles.
 pub const SNAPSHOT_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 

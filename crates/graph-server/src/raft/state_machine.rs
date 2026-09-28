@@ -650,15 +650,10 @@ mod tests {
         let incoming = incoming_path(&db);
         marked_file(&incoming, 5);
         let mut swapped = false;
-        StoreStateMachine::install_with(
-            &db,
-            &meta_at(5),
-            &SnapshotFile { path: incoming },
-            |_| {
-                swapped = true;
-                Ok(())
-            },
-        )
+        StoreStateMachine::install_with(&db, &meta_at(5), &SnapshotFile { path: incoming }, |_| {
+            swapped = true;
+            Ok(())
+        })
         .unwrap();
         assert!(swapped);
         let meta = StoreStateMachine::read_meta(&db).unwrap().unwrap();

@@ -237,7 +237,10 @@ pub async fn start(
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),
         );
-    let incoming = TcpListenerStream::new(listener).map(|r| r.map(ConnIo::new));
+    let incoming = {
+        let weak = Arc::downgrade(&slot);
+        TcpListenerStream::new(listener).map(move |r| r.map(|t| ConnIo::for_slot(t, weak.clone())))
+    };
     let signal = {
         let s = shutdown.clone();
         async move { s.wait().await }
