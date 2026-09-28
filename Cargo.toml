@@ -38,9 +38,6 @@ tonic-prost = "=0.14.6"
 # an AsyncRead). rand 0.8 is the line openraft already pulls.
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util"] }
 tokio-stream = { version = "=0.1.19", features = ["net"] }
-futures-util = "=0.3.34"
-bytes = "=1.12.1"
-async-trait = "=0.1.92"
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "generic-snapshot-data"] }
 tonic-health = "=0.14.6"
 rand = "=0.8.8"

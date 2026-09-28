@@ -1,8 +1,12 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use graph_cli::target::{Target, TargetArgs};
 use graph_cli::{index_dir, DirOpts};
+use graph_client::{ReadMode, RemoteStore};
 use graph_core::{Extractor, TokenClass};
-use graph_store::{open_store, Grain, IndexOptions, Query, Store, SymbolQuery, V2Store};
+use graph_store::{
+    open_store, Grain, IndexOptions, Query, Store, StoreError, SymbolQuery, V2Store,
+};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -16,9 +20,17 @@ macro_rules! out {
 #[derive(Parser)]
 #[command(name = "memory-graph", about = "Language-agnostic code memory graph")]
 struct Cli {
-    /// Database file
-    #[arg(long, global = true, default_value = "./graph.redb")]
-    db: PathBuf,
+    /// Database file, opened in this process (default ./graph.redb). Not together with --server
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
+    /// Use the `memory-graph serve` at this host:port instead of a local file (also read from
+    /// MEMORY_GRAPH_SERVER; the flag wins). Not together with --db
+    #[arg(long, global = true, value_name = "HOST:PORT")]
+    server: Option<String>,
+    /// With --server: how reads are served, `local` (the node's store as it is) or `linearizable`
+    /// (sees every acknowledged write). Also read from MEMORY_GRAPH_READ. Default local
+    #[arg(long, global = true, value_parser = graph_cli::target::parse_read_mode)]
+    read: Option<ReadMode>,
     /// Deprecated, hidden: there is one storage format now. `--backend v2` is accepted as a no-op for old
     /// scripts; `--backend v1` is an error that says where the retired format went
     #[arg(long, global = true, hide = true, value_enum)]
@@ -42,6 +54,58 @@ impl Cli {
             cache_bytes: self.cache_bytes,
         }
     }
+
+    /// Where the store is, from the flags and the environment.
+    fn target(&self) -> Result<Target> {
+        let (server_env, read_env) = TargetArgs::env();
+        graph_cli::target::resolve(TargetArgs {
+            db: self.db.as_deref(),
+            server_flag: self.server.as_deref(),
+            server_env: server_env.as_deref(),
+            read_flag: self.read,
+            read_env: read_env.as_deref(),
+        })
+    }
+}
+
+/// Settings that only make sense for a local file are refused with a
+/// server, saying where they belong instead.
+fn refuse_embedded_only_flags(o: Overrides) -> Result<()> {
+    if o.chunk_bytes.is_some() {
+        bail!(
+            "--chunk-bytes does not apply with --server: the server cuts replicated log entries at {} MiB itself",
+            graph_client::RAFT_ENTRY_MAX_BYTES >> 20
+        );
+    }
+    if o.cache_bytes.is_some() {
+        bail!("--cache-bytes does not apply with --server: pass it to `memory-graph serve`");
+    }
+    Ok(())
+}
+
+/// The store a command reads or writes: the local file (with `extractors`
+/// and `overrides`, retrying while it is locked), or a server connection.
+fn open_target(
+    target: &Target,
+    extractors: fn() -> Vec<Box<dyn Extractor>>,
+    overrides: Overrides,
+) -> Result<Box<dyn Store>> {
+    match target {
+        Target::Embedded(db) => graph_cli::target::open_embedded(db, || {
+            open_with_overrides(db, extractors(), overrides)
+        }),
+        Target::Remote { addr, read } => {
+            refuse_embedded_only_flags(overrides)?;
+            Ok(Box::new(graph_cli::target::connect(addr, *read)?))
+        }
+    }
+}
+
+/// A server connection for a command that needs the concrete client
+/// (admin calls), with the embedded-only flags refused.
+fn remote(addr: &str, read: ReadMode, overrides: Overrides) -> Result<RemoteStore> {
+    refuse_embedded_only_flags(overrides)?;
+    graph_cli::target::connect(addr, read)
 }
 
 /// Values the retired `--backend` flag still parses. Kept so `--backend v2`
@@ -66,7 +130,49 @@ fn reject_legacy_backend(backend: Option<LegacyBackend>) -> Result<()> {
 }
 
 #[derive(Subcommand)]
+enum ClusterCmd {
+    /// The node's Raft view: role, term, leader, applied/committed log index, versions
+    Status {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the current leader's id and address; exit code 3 when no leader is known
+    Leader {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
+    /// Serve --db over gRPC (single node in this release): other processes, machines and containers
+    /// then use it with --server. Prints `listening on <addr>` once ready; stops on Ctrl-C / SIGTERM
+    Serve {
+        /// Address to listen on (port 0 picks a free port; the line printed on start names it)
+        #[arg(long, default_value = "127.0.0.1:7000", value_name = "HOST:PORT")]
+        listen: String,
+        /// This node's id in the cluster
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        node_id: u64,
+        /// How long an open snapshot handle (a paging client's frozen view) may live: seconds, or with
+        /// an s/m/h suffix (default 15m)
+        #[arg(long, value_parser = parse_duration, default_value = "15m")]
+        snapshot_max_age: std::time::Duration,
+    },
+    /// Check a server's health (grpc.health.v1): exit 0 when serving, 1 when not (or unreachable).
+    /// With --ready: serving and a leader is known. Needs --server (or MEMORY_GRAPH_SERVER)
+    Health {
+        #[arg(long)]
+        ready: bool,
+    },
+    /// Cluster information from a server (needs --server). Membership changes arrive with
+    /// replication (ADR 0004 stage C)
+    Cluster {
+        #[command(subcommand)]
+        cmd: ClusterCmd,
+    },
     /// Index one file under an org and repo (re-indexing replaces it)
     IndexFile {
         #[arg(long)]
@@ -276,7 +382,7 @@ fn open_with_overrides(
     db: &std::path::Path,
     extractors: Vec<Box<dyn Extractor>>,
     overrides: Overrides,
-) -> Result<Box<dyn Store>> {
+) -> std::result::Result<Box<dyn Store>, StoreError> {
     if overrides.chunk_bytes.is_some() || overrides.cache_bytes.is_some() {
         let mut s = open_v2(db, overrides)?;
         for e in extractors {
@@ -284,12 +390,12 @@ fn open_with_overrides(
         }
         return Ok(Box::new(s));
     }
-    Ok(open_store(db, extractors)?)
+    open_store(db, extractors)
 }
 
 /// A concrete `V2Store` with `overrides` applied (for `vacuum --compact`,
 /// which needs an owned store).
-fn open_v2(db: &std::path::Path, overrides: Overrides) -> Result<V2Store> {
+fn open_v2(db: &std::path::Path, overrides: Overrides) -> std::result::Result<V2Store, StoreError> {
     let mut s = V2Store::open_with_cache_bytes(db, overrides.cache_bytes.map(|b| b as usize))?;
     if let Some(bytes) = overrides.chunk_bytes {
         s.set_chunk_bytes(bytes as usize);
@@ -300,16 +406,21 @@ fn open_v2(db: &std::path::Path, overrides: Overrides) -> Result<V2Store> {
 /// Open the store for a command that indexes, with every shipped extractor
 /// registered: the extractor version is part of a file's fingerprint, so
 /// indexing without one would downgrade already-indexed files to tokens only.
-fn open_for_indexing(db: &std::path::Path, overrides: Overrides) -> Result<Box<dyn Store>> {
-    open_with_overrides(db, graph_cli::shipped_extractors(), overrides)
+/// (A server registers its own extractors; see `serve`.)
+fn open_for_indexing(target: &Target, overrides: Overrides) -> Result<Box<dyn Store>> {
+    open_target(target, graph_cli::shipped_extractors, overrides)
 }
 
-fn open_existing(db: &std::path::Path, overrides: Overrides) -> Result<Box<dyn Store>> {
-    if !db.is_file() {
-        bail!("database `{}` does not exist", db.display());
+/// Open the store for a query: a local file must already exist.
+fn open_existing(target: &Target, overrides: Overrides) -> Result<Box<dyn Store>> {
+    if let Target::Embedded(db) = target {
+        if !db.is_file() {
+            bail!("database `{}` does not exist", db.display());
+        }
+        return open_target(target, Vec::new, overrides)
+            .with_context(|| format!("opening database `{}`", db.display()));
     }
-    open_with_overrides(db, vec![], overrides)
-        .with_context(|| format!("opening database `{}`", db.display()))
+    open_target(target, Vec::new, overrides)
 }
 
 /// Filters are checked against what is actually indexed (in the org/repo
@@ -377,26 +488,248 @@ fn join<'a>(it: impl Iterator<Item = &'a String>) -> String {
     }
 }
 
+/// `--snapshot-max-age`: whole seconds, or a number with an s/m/h suffix.
+fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
+    let s = s.trim();
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, 's')) => (&s[..i], 1),
+        Some((i, 'm')) => (&s[..i], 60),
+        Some((i, 'h')) => (&s[..i], 3600),
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{s}` is not a duration (e.g. 900, 900s, 15m, 1h)"))?;
+    if n == 0 {
+        return Err("the duration must be positive".into());
+    }
+    Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
+}
+
 fn main() {
-    if let Err(e) = run() {
-        // `symbols | head` closes the pipe early: that is not an error.
-        let broken = e
-            .chain()
-            .filter_map(|c| c.downcast_ref::<std::io::Error>())
-            .any(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
-        if broken {
-            std::process::exit(0);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            // `symbols | head` closes the pipe early: that is not an error.
+            let broken = e
+                .chain()
+                .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                .any(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
+            if broken {
+                std::process::exit(0);
+            }
+            eprintln!("Error: {e:?}");
+            std::process::exit(graph_cli::target::exit_code(&e));
         }
-        eprintln!("Error: {e:?}");
-        std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+/// `sysinfo`'s report as the server hands it out (`Admin.SysInfo`): the
+/// JSON document plus its text rendering under `text`, so `sysinfo
+/// --server` prints the same text a local `sysinfo` would.
+fn server_sysinfo(db: &std::path::Path) -> serde_json::Value {
+    let r = graph_cli::report::Report::detect(db, None, graph_cli::diskinfo::MinFree::Default);
+    let mut j = r.json();
+    j["text"] = serde_json::Value::String(r.text());
+    j
+}
+
+/// `server <addr> node N (leader: M)`.
+fn server_header(addr: &str, st: &graph_proto::pb::StatusResponse) -> String {
+    format!(
+        "server {addr} node {} (leader: {})",
+        st.node_id,
+        st.leader_id
+            .map_or_else(|| "none".to_string(), |l| l.to_string())
+    )
+}
+
+fn run() -> Result<i32> {
     let cli = Cli::parse();
     reject_legacy_backend(cli.backend)?;
     let overrides = cli.overrides();
+    // `serve` owns a file; everything else resolves --db / --server.
+    if let Cmd::Serve {
+        listen,
+        node_id,
+        snapshot_max_age,
+    } = &cli.cmd
+    {
+        if let Some(s) = &cli.server {
+            bail!("serve takes --db <file> to serve, not --server {s}");
+        }
+        if cli.chunk_bytes.is_some() {
+            bail!("--chunk-bytes does not apply to serve: the server cuts replicated log entries at {} MiB", graph_client::RAFT_ENTRY_MAX_BYTES >> 20);
+        }
+        let db = cli
+            .db
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(graph_cli::target::DEFAULT_DB));
+        if db.is_dir() {
+            bail!(
+                "--db `{}` is a directory; give a database file path",
+                db.display()
+            );
+        }
+        use std::net::ToSocketAddrs;
+        let addr = listen
+            .to_socket_addrs()
+            .with_context(|| format!("--listen {listen}: not a host:port"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("--listen {listen}: resolves to no address"))?;
+        let mut cfg = graph_server::ServeConfig::new(&db, addr);
+        cfg.node_id = *node_id;
+        cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
+        cfg.snapshot_max_age = *snapshot_max_age;
+        cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
+        let shown = db.display().to_string();
+        let node = *node_id;
+        graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |a| {
+            // Scripts and tests read this line for the bound port.
+            println!("memory-graph serve: listening on {a} (db {shown}, node {node})");
+        })
+        .map_err(|e| match e {
+            StoreError::Locked(why) => graph_cli::target::locked_error(&db, &why),
+            e => anyhow::Error::from(e).context(format!("serving `{}`", db.display())),
+        })?;
+        eprintln!("memory-graph serve: stopped");
+        return Ok(0);
+    }
+    let target = cli.target()?;
+    let remote_addr = match &target {
+        Target::Remote { addr, read } => Some((addr.clone(), *read)),
+        Target::Embedded(_) => None,
+    };
+    let need_server = |what: &str| -> Result<(String, ReadMode)> {
+        remote_addr.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what} needs --server <host:port> (or {})",
+                graph_cli::target::ENV_SERVER
+            )
+        })
+    };
     match cli.cmd {
+        Cmd::Serve { .. } => unreachable!("handled above"),
+        Cmd::Health { ready } => {
+            let (addr, read) = need_server("health")?;
+            let service = if ready {
+                graph_server::READY_SERVICE
+            } else {
+                ""
+            };
+            let r = graph_cli::target::connect_with(
+                &addr,
+                read,
+                Some(std::time::Duration::from_secs(2)),
+            )
+            .and_then(|s| Ok(s.health(service)?));
+            return Ok(match r {
+                Ok(true) => {
+                    out!("SERVING");
+                    0
+                }
+                Ok(false) => {
+                    out!("NOT_SERVING");
+                    graph_cli::target::exit::NOT_SERVING
+                }
+                Err(e) => {
+                    out!("NOT_SERVING");
+                    eprintln!("{e:#}");
+                    graph_cli::target::exit::NOT_SERVING
+                }
+            });
+        }
+        Cmd::Cluster { cmd } => {
+            let (addr, read) = need_server("cluster")?;
+            let s = remote(&addr, read, overrides)?;
+            let st = s.admin_status()?;
+            match cmd {
+                ClusterCmd::Status { json } => {
+                    if json {
+                        out!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "server": addr,
+                                "node_id": st.node_id,
+                                "cluster_id": st.cluster_id,
+                                "state": st.state,
+                                "leader_id": st.leader_id,
+                                "leader_addr": st.leader_addr,
+                                "current_term": st.current_term,
+                                "applied_index": st.applied_index,
+                                "applied_term": st.applied_term,
+                                "committed_index": st.committed_index,
+                                "last_log_index": st.last_log_index,
+                                "server_version": st.server_version,
+                                "protocol_version": st.protocol_version,
+                                "store_format_version": st.store_format_version,
+                                "extractors_hash": st.extractors_hash,
+                                "db_path": st.db_path,
+                                "listen_addr": st.listen_addr,
+                                "uptime_secs": st.uptime_secs,
+                                "snapshot_handles": st.snapshot_handles,
+                            }))?
+                        );
+                    } else {
+                        out!("{}", server_header(&addr, &st));
+                        out!("  cluster   {}", st.cluster_id);
+                        out!(
+                            "  node      {} ({}) listening on {}, term {}",
+                            st.node_id,
+                            st.state,
+                            st.listen_addr,
+                            st.current_term
+                        );
+                        out!(
+                            "  leader    {}",
+                            match (st.leader_id, st.leader_addr.as_deref()) {
+                                (Some(l), Some(a)) => format!("{l} at {a}"),
+                                (Some(l), None) => l.to_string(),
+                                _ => "none".into(),
+                            }
+                        );
+                        out!(
+                            "  log       applied {} (term {}), committed {}, last {}",
+                            st.applied_index,
+                            st.applied_term,
+                            st.committed_index,
+                            st.last_log_index
+                        );
+                        out!(
+                            "  server    {} (protocol {}, store format {}, extractors {})",
+                            st.server_version,
+                            st.protocol_version,
+                            st.store_format_version,
+                            st.extractors_hash
+                        );
+                        out!(
+                            "  store     {} (up {}s, {} snapshot handles)",
+                            st.db_path,
+                            st.uptime_secs,
+                            st.snapshot_handles
+                        );
+                    }
+                }
+                ClusterCmd::Leader { json } => {
+                    let Some(leader) = st.leader_id else {
+                        if json {
+                            out!("{}", serde_json::json!({ "leader_id": null }));
+                        }
+                        eprintln!("no leader is known to server {addr}");
+                        return Ok(graph_cli::target::exit::NO_LEADER);
+                    };
+                    if json {
+                        out!(
+                            "{}",
+                            serde_json::json!({ "leader_id": leader, "leader_addr": st.leader_addr })
+                        );
+                    } else {
+                        out!("{leader} {}", st.leader_addr.as_deref().unwrap_or("-"));
+                    }
+                }
+            }
+        }
         Cmd::IndexFile {
             org,
             repo,
@@ -414,13 +747,15 @@ fn run() -> Result<()> {
             let path_str = path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("`{}` is not a valid UTF-8 path", path.display()))?;
-            if cli.db.is_dir() {
-                bail!(
-                    "--db `{}` is a directory; give a database file path",
-                    cli.db.display()
-                );
+            if let Target::Embedded(db) = &target {
+                if db.is_dir() {
+                    bail!(
+                        "--db `{}` is a directory; give a database file path",
+                        db.display()
+                    );
+                }
             }
-            let store = open_for_indexing(&cli.db, overrides)?;
+            let store = open_for_indexing(&target, overrides)?;
             let st = store.index_bytes_opts(
                 &org,
                 &repo,
@@ -460,69 +795,139 @@ fn run() -> Result<()> {
             min_free_disk,
             no_disk_check,
             dir,
-        } => index_dir(
-            DirOpts {
-                db: &cli.db,
-                org: &org,
-                repo: &repo,
-                dir: &dir,
-                json,
-                max_file_size,
-                prune,
-                force,
-                reindex,
-                jobs,
-                memory,
-                deterministic,
-                stats,
-                trace: trace.as_deref(),
-                progress: match (progress, no_progress) {
-                    (true, _) => Some(true),
-                    (_, true) => Some(false),
-                    _ => None,
+        } => {
+            // With a server: connect first (its leader and applied index
+            // feed the progress board), then hand the connection over.
+            let (db, remote_store, remote_board) = match &target {
+                Target::Embedded(db) => (db.clone(), None, None),
+                Target::Remote { addr, read } => {
+                    let s = remote(addr, *read, overrides)?;
+                    if jobs != 0 {
+                        eprintln!(
+                            "warning: with --server, --jobs sizes the threads that read and send files; the server parses them"
+                        );
+                    }
+                    let board = graph_cli::progress::RemoteBoard::new(
+                        addr,
+                        s.hello().leader_id,
+                        s.applied_index(),
+                    );
+                    (PathBuf::new(), Some(s), Some(board))
+                }
+            };
+            let mut remote_store = remote_store;
+            index_dir(
+                DirOpts {
+                    db: &db,
+                    org: &org,
+                    repo: &repo,
+                    dir: &dir,
+                    json,
+                    max_file_size,
+                    prune,
+                    force,
+                    reindex,
+                    jobs,
+                    memory,
+                    deterministic,
+                    stats,
+                    trace: trace.as_deref(),
+                    progress: match (progress, no_progress) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
+                    disk_probe: None,
+                    min_free_disk: min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
+                    disk_check: !no_disk_check,
+                    chunk_bytes: cli.chunk_bytes.unwrap_or(graph_cli::DEFAULT_CHUNK_BYTES),
+                    remote: remote_board,
                 },
-                disk_probe: None,
-                min_free_disk: min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
-                disk_check: !no_disk_check,
-                chunk_bytes: cli.chunk_bytes.unwrap_or(graph_cli::DEFAULT_CHUNK_BYTES),
-            },
-            |db| open_for_indexing(db, overrides),
-            &mut std::io::stdout().lock(),
-        )?,
+                |_| match remote_store.take() {
+                    Some(s) => Ok(Box::new(s) as Box<dyn Store>),
+                    None => open_for_indexing(&target, overrides),
+                },
+                &mut std::io::stdout().lock(),
+            )?
+        }
         Cmd::Sysinfo {
             json,
             memory,
             min_free_disk,
-        } => {
-            let r = graph_cli::report::Report::detect(
-                &cli.db,
-                memory,
-                min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
-            );
-            if json {
-                out!("{}", serde_json::to_string_pretty(&r.json())?);
-            } else {
-                write!(std::io::stdout().lock(), "{}", r.text())?;
+        } => match &target {
+            Target::Remote { addr, read } => {
+                // The server machine's report: that is where indexing runs.
+                let s = remote(addr, *read, overrides)?;
+                let st = s.admin_status()?;
+                let mut report: serde_json::Value = serde_json::from_str(&s.admin_sysinfo()?)
+                    .context("the server's sysinfo report is not JSON")?;
+                let text = report
+                    .as_object_mut()
+                    .and_then(|o| o.remove("text"))
+                    .and_then(|t| t.as_str().map(str::to_string));
+                if json {
+                    let doc = serde_json::json!({
+                        "server": addr,
+                        "node_id": st.node_id,
+                        "leader_id": st.leader_id,
+                        "report": report,
+                    });
+                    out!("{}", serde_json::to_string_pretty(&doc)?);
+                } else {
+                    out!("{}", server_header(addr, &st));
+                    match text {
+                        Some(t) => write!(std::io::stdout().lock(), "{t}")?,
+                        None => out!("{}", serde_json::to_string_pretty(&report)?),
+                    }
+                }
             }
-        }
+            Target::Embedded(db) => {
+                let r = graph_cli::report::Report::detect(
+                    db,
+                    memory,
+                    min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
+                );
+                if json {
+                    out!("{}", serde_json::to_string_pretty(&r.json())?);
+                } else {
+                    write!(std::io::stdout().lock(), "{}", r.text())?;
+                }
+            }
+        },
         Cmd::Vacuum { compact } => {
-            if !cli.db.is_file() {
-                bail!("database `{}` does not exist", cli.db.display());
-            }
-            // `compact` is `V2Store`-only (it consumes and replaces `self`,
-            // which `Store`'s `&self`-only shape can't express), so this
-            // needs a concrete, owned `V2Store` rather than the `Box<dyn
-            // Store>` the other arms use.
-            let s = open_v2(&cli.db, overrides)
-                .with_context(|| format!("opening database `{}`", cli.db.display()))?;
-            let st = s.vacuum()?;
+            let (vst, cst) = match &target {
+                Target::Remote { addr, read } => {
+                    let s = remote(addr, *read, overrides)?;
+                    let vst = s.vacuum()?;
+                    // The server's own vacuum --compact (`Admin.Compact`).
+                    let cst = if compact {
+                        Some(s.admin_compact()?)
+                    } else {
+                        None
+                    };
+                    (vst, cst)
+                }
+                Target::Embedded(db) => {
+                    if !db.is_file() {
+                        bail!("database `{}` does not exist", db.display());
+                    }
+                    // `compact` is `V2Store`-only (it consumes and replaces
+                    // `self`, which `Store`'s `&self`-only shape can't
+                    // express), so this needs a concrete, owned `V2Store`
+                    // rather than the `Box<dyn Store>` the other arms use.
+                    let s = graph_cli::target::open_embedded(db, || open_v2(db, overrides))
+                        .with_context(|| format!("opening database `{}`", db.display()))?;
+                    let vst = s.vacuum()?;
+                    let cst = if compact { Some(s.compact()?.1) } else { None };
+                    (vst, cst)
+                }
+            };
             out!(
                 "vacuum: removed {} unused dictionary terms, kept {}",
-                st.terms_removed,
-                st.terms_kept
+                vst.terms_removed,
+                vst.terms_kept
             );
-            if compact {
-                let (_, cst) = s.compact()?;
+            if let Some(cst) = cst {
                 out!(
                     "compact: {} bytes -> {} bytes",
                     cst.before_bytes,
@@ -531,7 +936,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Describe { org, repo, json } => {
-            let store = open_existing(&cli.db, overrides)?;
+            let store = open_existing(&target, overrides)?;
             let infos = store.describe(org.as_deref(), repo.as_deref())?;
             if json {
                 out!(
@@ -574,7 +979,7 @@ fn run() -> Result<()> {
             offset,
             json,
         } => {
-            let store = open_existing(&cli.db, overrides)?;
+            let store = open_existing(&target, overrides)?;
             validate_filters(
                 &*store,
                 org.as_deref(),
@@ -610,7 +1015,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Export { out } => {
-            let store = open_existing(&cli.db, overrides)?;
+            let store = open_existing(&target, overrides)?;
             let mut file_writer;
             let mut stdout_writer;
             let writer: &mut dyn std::io::Write = match &out {
@@ -667,7 +1072,7 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            let store = open_existing(&cli.db, overrides)?;
+            let store = open_existing(&target, overrides)?;
             validate_filters(
                 &*store,
                 org.as_deref(),
@@ -722,7 +1127,7 @@ fn run() -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(test)]
