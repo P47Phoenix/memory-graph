@@ -40,7 +40,7 @@ A **content hash** is a short code computed from a file's bytes. Change one lett
 Rust's word for a package of code. Think of it as one box of a bigger toy set. Used in: [ADR 0002](adr/0002-parsing-and-crate-layout.md).
 
 ## Daemon
-A program that keeps running in the background and does work for other programs. Here, `memory-graph serve` is the daemon: it is the only program that opens the database file, and it may also host the MCP server (open, issue #109). The command line asks it instead of opening the file itself. Decided (not built yet); [ADR 0004](adr/0004-client-server-and-replication.md) makes it reachable over the network (gRPC) and lets several of them form a cluster (epic story 20 builds it). Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md), [architecture diagrams](architecture-diagrams.md).
+A program that keeps running in the background and does work for other programs. Here, `memory-graph serve` is the daemon: it is the only program that opens the database file, and it may also host the MCP server (open, issue #109). The command line asks it (`--server`) instead of opening the file itself. A single-node version is built (epic story 20, stage A); [ADR 0004](adr/0004-client-server-and-replication.md) makes it reachable over the network (gRPC) and lets several of them form a cluster (epic story 20 builds it). Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md), [architecture diagrams](architecture-diagrams.md).
 
 ## Dictionary
 A table that gives each distinct piece of text one small number (its id). Like a school register: instead of writing "Alexandra Petrovna" everywhere, you write "17". Used in: [ADR 0003](adr/0003-data-model.md).
@@ -84,6 +84,9 @@ An **inverted index** is a lookup from a word to the places it appears, like a b
 ## Labels [M] and [E]
 Tags on numbers in the docs. **[M]** means measured: we ran something and saw this. **[E]** means estimated: a calculated guess, not yet measured. Used in: [learnings](learnings.md), [ADR 0003](adr/0003-data-model.md).
 
+## LOCK sidecar
+A small file `<db>.LOCK` that `memory-graph serve` writes next to the database while it serves it, holding its process id and listen address. The database's own lock is what keeps other programs out; the sidecar only lets their error message say who holds the file and which `--server` address to use instead. Removed when the server stops cleanly; a leftover one whose process is gone is ignored. Used in: [ADR 0004](adr/0004-client-server-and-replication.md), [README](../README.md#server-mode).
+
 ## LSM-tree
 **Log-structured merge tree**: a database design that buffers writes and merges sorted files in the background (fjall is a pure-Rust example). It is a different on-disk layout from the B-tree that redb uses; a comparison with fjall is still pending. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0003](adr/0003-data-model.md).
 
@@ -118,7 +121,7 @@ A test that makes many random inputs and checks that a rule always holds (for ex
 The pure-Rust database library we use. It stores data in one file, supports transactions, and lets only one process open the file at a time (an exclusive lock). Used in: [ADR 0001](adr/0001-storage.md), [learnings](learnings.md).
 
 ## RemoteStore
-The piece of the command line that has the same shape as the local database code (the `Store` trait) but sends each request to the daemon over the network (gRPC, [ADR 0004](adr/0004-client-server-and-replication.md); ADR 0003 first said a local socket). Because it has the same shape, the same tests can check both. Decided (not built yet; epic story 20). Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md), [architecture diagrams](architecture-diagrams.md).
+The piece of the command line that has the same shape as the local database code (the `Store` trait) but sends each request to the daemon over the network (gRPC, [ADR 0004](adr/0004-client-server-and-replication.md); ADR 0003 first said a local socket). Because it has the same shape, the same tests can check both. Built in epic story 20 (crate `graph-client`). Used in: [ADR 0003](adr/0003-data-model.md), [ADR 0004](adr/0004-client-server-and-replication.md), [architecture diagrams](architecture-diagrams.md).
 
 ## Store trait
 The list of things any database back end must be able to do (index a file, search, describe, prune, take a snapshot), written as a Rust `trait`. The command line only knows this list, so the back end (today redb) can be swapped. `StoreRead` is the read-only half, which a snapshot also offers. Used in: [ADR 0003](adr/0003-data-model.md), [architecture diagrams](architecture-diagrams.md).
