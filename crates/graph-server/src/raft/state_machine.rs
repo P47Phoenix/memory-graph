@@ -21,8 +21,27 @@
 //! (one read transaction, so the copy is consistent and carries its own
 //! marker, from which the metadata is read) plus a `<db>.snapshot.meta`
 //! JSON; `install_snapshot` = `StoreSlot::install_snapshot` (close, rename,
-//! reopen under the slot's write lock) and the installed file becomes the
-//! current snapshot.
+//! reopen under the slot's write lock) and, only once that succeeded, the
+//! installed file becomes the current snapshot and its meta is written. The
+//! data file and the meta are each put in place by rename, data first; a
+//! crash between the two leaves a meta whose `last_log_id` differs from the
+//! file's own marker, and `get_current_snapshot` checks exactly that and
+//! answers "no snapshot" (logged) rather than pair them.
+//!
+//! A snapshot build runs `export_snapshot` under the slot's **read** lock
+//! for the length of the copy, so it blocks `compact` and a snapshot
+//! install (which take the write lock) until it finishes; reads and writes
+//! proceed.
+//!
+//! A mid-batch I/O error: `apply` gets entries in batches, and an I/O-class
+//! error on one entry fails the whole call, so the responses already
+//! produced for earlier entries of that batch (which did commit, with their
+//! markers) are dropped. openraft stops the node; the clients of those
+//! entries see an error (UNAVAILABLE/INTERNAL) for a write that landed.
+//! That is safe to retry: `IndexChunk` is idempotent through file
+//! fingerprints (an unchanged file is a no-op), `Prune` and `Vacuum` by
+//! construction, and `IngestExtraction` when the extraction is identical,
+//! which a retry of the same request is (ADR 0004 D2/D7).
 use super::types::{
     log_id_of, marker_of, Entry, ErrDetail, LogId, LogResponse, SnapshotFile, SnapshotMeta,
     StorageError, StorageIOError, StoredMembership, TypeConfig,
@@ -57,6 +76,19 @@ fn with_suffix(db: &Path, suffix: &str) -> PathBuf {
     let mut p = db.as_os_str().to_owned();
     p.push(suffix);
     PathBuf::from(p)
+}
+
+/// Rename `from` over `to` (removing `to` first where the platform's
+/// rename refuses to replace an existing file).
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) if to.exists() => {
+            std::fs::remove_file(to)?;
+            std::fs::rename(from, to)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn sm_err(e: impl std::error::Error + 'static) -> StorageError {
@@ -231,18 +263,44 @@ impl StoreStateMachine {
         }
     }
 
+    /// The current snapshot's metadata, validated against the file it
+    /// describes: a meta whose `last_log_id` differs from the snapshot
+    /// file's own marker (a crash between the two renames of a build or an
+    /// install) is treated as no snapshot, and logged, so a meta is never
+    /// paired with a file it does not describe.
     fn read_meta(db: &Path) -> Result<Option<SnapshotMeta>, StorageError> {
         let path = meta_path(db);
-        if !path.exists() || !snapshot_path(db).exists() {
+        let file = snapshot_path(db);
+        if !path.exists() || !file.exists() {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&path).map_err(sm_read_err)?;
-        serde_json::from_str(&text).map(Some).map_err(sm_read_err)
+        let meta: SnapshotMeta = serde_json::from_str(&text).map_err(sm_read_err)?;
+        let on_file = match V2Store::open(&file).and_then(|s| Self::read_applied(&s)) {
+            Ok((last, _)) => last,
+            Err(e) => {
+                tracing::warn!(error = %e, file = %file.display(), "snapshot file unreadable; treated as no snapshot");
+                return Ok(None);
+            }
+        };
+        if on_file != meta.last_log_id {
+            tracing::warn!(
+                meta = ?meta.last_log_id,
+                file = ?on_file,
+                "snapshot meta does not match its file (interrupted build or install); treated as no snapshot"
+            );
+            return Ok(None);
+        }
+        Ok(Some(meta))
     }
 
+    /// Write the meta to a temp file and rename it into place, so a crash
+    /// never leaves a half-written meta.
     fn write_meta(db: &Path, meta: &SnapshotMeta) -> Result<(), StorageError> {
         let text = serde_json::to_string_pretty(meta).map_err(sm_err)?;
-        std::fs::write(meta_path(db), text).map_err(sm_err)
+        let tmp = with_suffix(db, ".snapshot.meta.tmp");
+        std::fs::write(&tmp, text).map_err(sm_err)?;
+        replace_file(&tmp, &meta_path(db)).map_err(sm_err)
     }
 
     /// Blocking body of `install_snapshot`.
@@ -251,31 +309,63 @@ impl StoreStateMachine {
         meta: &SnapshotMeta,
         data: &SnapshotFile,
     ) -> Result<(), StorageError> {
-        let db = slot.path();
-        graph_store::detect_format(&data.path)
-            .map_err(sm_err)?
-            .ok_or_else(|| {
-                sm_err(StoreError::Rejected(format!(
-                    "`{}` is not a store file",
-                    data.path.display()
-                )))
-            })?;
-        // Keep the received file as the current snapshot, and install a
-        // copy (the install consumes its source).
-        let current = snapshot_path(db);
-        if data.path != current {
-            std::fs::copy(&data.path, &current).map_err(sm_err)?;
+        Self::install_with(slot.path(), meta, data, |staged| {
+            slot.install_snapshot(staged)
+        })
+    }
+
+    /// `install` with the store swap as a parameter (tests inject a
+    /// failure). The received file becomes the current snapshot, and its
+    /// meta is written, only after the swap succeeded: a failed install
+    /// leaves the previous current snapshot and meta untouched.
+    fn install_with(
+        db: &Path,
+        meta: &SnapshotMeta,
+        data: &SnapshotFile,
+        swap: impl FnOnce(&Path) -> Result<(), StoreError>,
+    ) -> Result<(), StorageError> {
+        let cleanup_incoming = || {
+            if data.path == incoming_path(db) {
+                let _ = std::fs::remove_file(&data.path);
+            }
+        };
+        let valid = graph_store::detect_format(&data.path)
+            .map_err(sm_err)
+            .and_then(|v| {
+                v.ok_or_else(|| {
+                    sm_err(StoreError::Rejected(format!(
+                        "`{}` is not a store file",
+                        data.path.display()
+                    )))
+                })
+            });
+        if let Err(e) = valid {
+            cleanup_incoming();
+            return Err(e);
         }
-        Self::write_meta(db, meta)?;
+        // The swap consumes its source: install a copy.
         let staged = with_suffix(db, ".snapshot.install.redb");
         let _ = std::fs::remove_file(&staged);
-        std::fs::copy(&current, &staged).map_err(sm_err)?;
-        let r = slot.install_snapshot(&staged).map_err(sm_err);
+        let r = std::fs::copy(&data.path, &staged)
+            .map_err(sm_err)
+            .and_then(|_| swap(&staged).map_err(sm_err));
         let _ = std::fs::remove_file(&staged);
-        if data.path == incoming_path(db) {
-            let _ = std::fs::remove_file(&data.path);
+        if let Err(e) = r {
+            cleanup_incoming();
+            return Err(e);
         }
-        r
+        // Promote: data file first, then its meta (each by rename).
+        let current = snapshot_path(db);
+        if data.path != current {
+            let tmp = with_suffix(db, ".snapshot.promote.redb");
+            let _ = std::fs::remove_file(&tmp);
+            let promoted = std::fs::copy(&data.path, &tmp)
+                .and_then(|_| replace_file(&tmp, &current))
+                .map_err(sm_err);
+            cleanup_incoming();
+            promoted?;
+        }
+        Self::write_meta(db, meta)
     }
 }
 
@@ -355,8 +445,10 @@ impl SnapshotBuilder {
             StoreStateMachine::read_applied(&copy).map_err(sm_read_err)?
         };
         let current = snapshot_path(db);
-        let _ = std::fs::remove_file(&current);
-        std::fs::rename(&tmp, &current).map_err(sm_err)?;
+        // Data file first, then its meta, each by rename; a crash between
+        // the two leaves a meta that no longer matches the file, which
+        // `read_meta` detects and treats as no snapshot.
+        replace_file(&tmp, &current).map_err(sm_err)?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -502,5 +594,86 @@ mod tests {
         assert_eq!(applied, Some(log_id(2)));
         assert_eq!(state.last_purged_log_id, Some(log_id(2)));
         assert_eq!(snap.meta.last_log_id, Some(log_id(2)));
+    }
+
+    /// A store file at `path` whose marker is `index`.
+    fn marked_file(path: &Path, index: u64) {
+        let s = V2Store::open(path).unwrap();
+        s.mark_only(marker_of(&log_id(index)), None).unwrap();
+    }
+
+    fn meta_at(index: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            last_log_id: Some(log_id(index)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: format!("s{index}"),
+        }
+    }
+
+    /// A slot whose current snapshot (built) is at index 1.
+    fn slot_with_snapshot_at_1(db: &Path) -> Arc<StoreSlot> {
+        let slot = open_slot(db);
+        StoreStateMachine::apply_all(&slot, vec![blank(1)]).unwrap();
+        let snap = SnapshotBuilder::build(&slot).unwrap();
+        assert_eq!(snap.meta.last_log_id, Some(log_id(1)));
+        slot
+    }
+
+    #[test]
+    fn a_failed_install_leaves_the_current_snapshot_and_meta_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        let _slot = slot_with_snapshot_at_1(&db);
+        let meta_before = std::fs::read(meta_path(&db)).unwrap();
+        let incoming = incoming_path(&db);
+        marked_file(&incoming, 5);
+        let r = StoreStateMachine::install_with(
+            &db,
+            &meta_at(5),
+            &SnapshotFile {
+                path: incoming.clone(),
+            },
+            |_| Err(StoreError::Storage("injected install failure".into())),
+        );
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(meta_path(&db)).unwrap(), meta_before);
+        let meta = StoreStateMachine::read_meta(&db).unwrap().unwrap();
+        assert_eq!(meta.last_log_id, Some(log_id(1)));
+        assert!(!incoming.exists(), "the received file is cleaned up");
+    }
+
+    #[test]
+    fn a_successful_install_promotes_the_file_then_its_meta() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        let _slot = slot_with_snapshot_at_1(&db);
+        let incoming = incoming_path(&db);
+        marked_file(&incoming, 5);
+        let mut swapped = false;
+        StoreStateMachine::install_with(
+            &db,
+            &meta_at(5),
+            &SnapshotFile { path: incoming },
+            |_| {
+                swapped = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(swapped);
+        let meta = StoreStateMachine::read_meta(&db).unwrap().unwrap();
+        assert_eq!(meta.last_log_id, Some(log_id(5)));
+    }
+
+    /// The crash window of a build or install (data renamed, meta not yet):
+    /// the stale meta is never paired with the new file.
+    #[test]
+    fn a_meta_that_does_not_match_its_file_is_no_snapshot() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        let _slot = slot_with_snapshot_at_1(&db);
+        std::fs::remove_file(snapshot_path(&db)).unwrap();
+        marked_file(&snapshot_path(&db), 5);
+        assert!(StoreStateMachine::read_meta(&db).unwrap().is_none());
     }
 }

@@ -283,10 +283,24 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError> {
-        // Record the purge point first, then delete: a crash in between
-        // leaves entries that are simply below the purge point.
-        self.set_meta(K_PURGED, &log_id)?;
-        self.delete_range(Bound::Unbounded, Bound::Included(log_id.index))
+        // The purge point and the deletion commit together.
+        let bytes = serde_json::to_vec(&log_id).map_err(write_err)?;
+        let wt = self.db.begin_write().map_err(write_err)?;
+        {
+            let mut meta = wt.open_table(META).map_err(write_err)?;
+            meta.insert(K_PURGED, bytes.as_slice()).map_err(write_err)?;
+            let mut t = wt.open_table(LOG).map_err(write_err)?;
+            let keys: Vec<u64> = t
+                .range::<u64>(..=log_id.index)
+                .map_err(write_err)?
+                .map(|r| r.map(|(k, _)| k.value()))
+                .collect::<Result<_, _>>()
+                .map_err(write_err)?;
+            for k in keys {
+                t.remove(k).map_err(write_err)?;
+            }
+        }
+        wt.commit().map_err(write_err)
     }
 }
 

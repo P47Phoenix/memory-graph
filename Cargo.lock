@@ -741,6 +741,7 @@ dependencies = [
  "proptest",
  "prost",
  "prost-types",
+ "redb",
  "serde",
  "serde_json",
  "tonic",

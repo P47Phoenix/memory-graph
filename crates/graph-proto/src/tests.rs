@@ -775,6 +775,24 @@ fn store_error_to_status_codes_the_cluster_level_variants() {
     );
 }
 
+/// A full disk as the store actually reports it: an io error wrapped by
+/// redb and converted into `StoreError::Storage` (not a hand-written
+/// string) is RESOURCE_EXHAUSTED. 28 is ENOSPC (Linux/macOS), 112 is
+/// ERROR_DISK_FULL (Windows); only the current platform's code is real.
+#[test]
+fn a_redb_wrapped_disk_full_io_error_is_resource_exhausted() {
+    use crate::error::{is_disk_full, store_error_to_status};
+    let code = if cfg!(windows) { 112 } else { 28 };
+    let io = std::io::Error::from_raw_os_error(code);
+    let e = StoreError::from(redb::StorageError::Io(io));
+    let msg = e.to_string();
+    assert!(matches!(e, StoreError::Storage(_)), "{e:?}");
+    assert!(is_disk_full(&msg), "{msg}");
+    assert_eq!(store_error_to_status(&e).code(), Code::ResourceExhausted);
+    let other = StoreError::from(redb::StorageError::Io(std::io::Error::other("boom")));
+    assert_eq!(store_error_to_status(&other).code(), Code::Internal);
+}
+
 /// `AlreadyApplied` is server-internal; should it ever reach the wire it
 /// travels as a `Rejected` refusal (INVALID_ARGUMENT) with its text.
 #[test]
