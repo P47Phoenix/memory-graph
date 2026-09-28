@@ -17,28 +17,19 @@
 //! | `Storage` (other), `OpenFailed`                             | `INTERNAL`            |
 //!
 //! `NotLeader`, `NoLeader` and `Protocol` are the three cluster-level errors
-//! ADR 0004 adds. Until stage A package 1 (which adds them to `StoreError`)
-//! merges, they live on [`WireError`] here, and folding a `WireError` into a
-//! `StoreError` tags them onto `StoreError::Storage` (see
-//! [`protocol_error`]).
-// TODO(stage-a-merge): once `StoreError::{NotLeader, NoLeader, Protocol}`
-// exist, make `WireError` an alias for (or thin wrapper over) `StoreError`:
-// the three `WireError` variants become the `StoreError` ones, and
-// `From<WireError> for StoreError` / `protocol_error` stop tagging.
+//! ADR 0004 adds; they are real `StoreError` variants. [`WireError`] keeps
+//! them as its own variants so a server can build one without a `StoreError`
+//! in hand, and `WireError <-> StoreError` maps them one to one in both
+//! directions (a `WireError::Store` never wraps one of the three).
 use crate::pb::{self, store_error_detail as d};
 use graph_core::{NodeKind, SchemaError};
 use graph_store::StoreError;
 use prost::Message;
 use tonic::{Code, Status};
 
-/// Prefix of the message a folded cluster-level error carries on
-/// `StoreError::Storage` until the merge (see the module doc).
-pub const FOLDED_PREFIX: &str = "[wire] ";
-
-/// A `StoreError::Protocol(msg)` stand-in (see the module doc).
+/// `StoreError::Protocol(msg)`.
 pub fn protocol_error(msg: String) -> StoreError {
-    // TODO(stage-a-merge): `StoreError::Protocol(msg)`.
-    StoreError::Storage(format!("{FOLDED_PREFIX}protocol: {msg}"))
+    StoreError::Protocol(msg)
 }
 
 /// Every error a memory-graph server can answer with: a `StoreError`, or
@@ -63,21 +54,27 @@ impl std::fmt::Display for WireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WireError::Store(e) => write!(f, "{e}"),
+            // The same text as the `StoreError` variant, so a message is
+            // identical whichever side rendered it.
             WireError::NotLeader {
                 leader_id,
                 leader_addr,
-            } => match (leader_id, leader_addr) {
-                (Some(id), Some(addr)) => {
-                    write!(f, "not the leader: leader is node {id} at {addr}")
+            } => write!(
+                f,
+                "{}",
+                StoreError::NotLeader {
+                    leader_id: *leader_id,
+                    leader_addr: leader_addr.clone(),
                 }
-                (Some(id), None) => write!(f, "not the leader: leader is node {id}"),
-                (None, Some(addr)) => write!(f, "not the leader: leader is at {addr}"),
-                (None, None) => write!(f, "not the leader"),
-            },
-            WireError::NoLeader { retry_after_ms } => {
-                write!(f, "no leader known; retry after {retry_after_ms} ms")
-            }
-            WireError::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            ),
+            WireError::NoLeader { retry_after_ms } => write!(
+                f,
+                "{}",
+                StoreError::NoLeader {
+                    retry_after_ms: *retry_after_ms
+                }
+            ),
+            WireError::Protocol(msg) => write!(f, "{}", StoreError::Protocol(msg.clone())),
         }
     }
 }
@@ -86,7 +83,18 @@ impl std::error::Error for WireError {}
 
 impl From<StoreError> for WireError {
     fn from(e: StoreError) -> Self {
-        WireError::Store(e)
+        match e {
+            StoreError::NotLeader {
+                leader_id,
+                leader_addr,
+            } => WireError::NotLeader {
+                leader_id,
+                leader_addr,
+            },
+            StoreError::NoLeader { retry_after_ms } => WireError::NoLeader { retry_after_ms },
+            StoreError::Protocol(msg) => WireError::Protocol(msg),
+            e => WireError::Store(e),
+        }
     }
 }
 
@@ -94,11 +102,15 @@ impl From<WireError> for StoreError {
     fn from(e: WireError) -> Self {
         match e {
             WireError::Store(e) => e,
-            // TODO(stage-a-merge): the three real variants.
-            WireError::NotLeader { .. } | WireError::NoLeader { .. } => {
-                StoreError::Storage(format!("{FOLDED_PREFIX}{e}"))
-            }
-            WireError::Protocol(msg) => protocol_error(msg),
+            WireError::NotLeader {
+                leader_id,
+                leader_addr,
+            } => StoreError::NotLeader {
+                leader_id,
+                leader_addr,
+            },
+            WireError::NoLeader { retry_after_ms } => StoreError::NoLeader { retry_after_ms },
+            WireError::Protocol(msg) => StoreError::Protocol(msg),
         }
     }
 }
@@ -138,6 +150,8 @@ impl WireError {
                     }
                 }
                 StoreError::OpenFailed { .. } => Code::Internal,
+                StoreError::NotLeader { .. } | StoreError::NoLeader { .. } => Code::Unavailable,
+                StoreError::Protocol(_) => Code::FailedPrecondition,
             },
             WireError::NotLeader { .. } | WireError::NoLeader { .. } => Code::Unavailable,
             WireError::Protocol(_) => Code::FailedPrecondition,
@@ -181,6 +195,17 @@ impl WireError {
                     age_secs: *age_secs,
                     max_age_secs: *max_age_secs,
                 }),
+                StoreError::NotLeader {
+                    leader_id,
+                    leader_addr,
+                } => K::NotLeader(d::NotLeader {
+                    leader_id: *leader_id,
+                    leader_addr: leader_addr.clone(),
+                }),
+                StoreError::NoLeader { retry_after_ms } => K::NoLeader(d::NoLeader {
+                    retry_after_ms: *retry_after_ms,
+                }),
+                StoreError::Protocol(msg) => K::Protocol(d::Protocol { msg: msg.clone() }),
             },
             WireError::NotLeader {
                 leader_id,
@@ -312,13 +337,13 @@ pub fn store_error_to_status(e: &StoreError) -> Status {
 }
 
 /// `Status -> StoreError`: the typed detail when present, else by code.
-/// Cluster-level errors fold onto `Storage` until the merge (module doc).
 pub fn status_to_store_error(s: &Status) -> StoreError {
     WireError::from(s).into()
 }
 
-/// A `WireError::Store` over a borrowed `StoreError` (which is not
-/// `Clone`): re-creates the variant field by field.
+/// A `WireError` over a borrowed `StoreError` (which is not `Clone`):
+/// re-creates the variant field by field; the three cluster-level variants
+/// become their `WireError` counterparts.
 pub fn wire_view(e: &StoreError) -> WireError {
     WireError::Store(match e {
         StoreError::Locked(m) => StoreError::Locked(m.clone()),
@@ -347,5 +372,20 @@ pub fn wire_view(e: &StoreError) -> WireError {
             age_secs: *age_secs,
             max_age_secs: *max_age_secs,
         },
+        StoreError::NotLeader {
+            leader_id,
+            leader_addr,
+        } => {
+            return WireError::NotLeader {
+                leader_id: *leader_id,
+                leader_addr: leader_addr.clone(),
+            }
+        }
+        StoreError::NoLeader { retry_after_ms } => {
+            return WireError::NoLeader {
+                retry_after_ms: *retry_after_ms,
+            }
+        }
+        StoreError::Protocol(m) => return WireError::Protocol(m.clone()),
     })
 }

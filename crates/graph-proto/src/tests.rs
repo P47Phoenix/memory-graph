@@ -1,7 +1,7 @@
 //! Property tests: every converted type round-trips through its message
 //! (and through prost bytes), `StoreError` / `WireError` round-trip through
 //! `tonic::Status`, and prost's decoder never panics on arbitrary bytes.
-use crate::error::{status_to_store_error, store_error_to_status, FOLDED_PREFIX};
+use crate::error::{status_to_store_error, store_error_to_status};
 use crate::{pb, ConvertError, View, WireError};
 use graph_core::{
     Extraction, Node, NodeKind, SchemaError, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl,
@@ -390,12 +390,20 @@ fn store_error() -> impl Strategy<Value = StoreError> {
                 max_age_secs,
             }
         }),
+        (option::of(any::<u64>()), option::of(text())).prop_map(|(leader_id, leader_addr)| {
+            StoreError::NotLeader {
+                leader_id,
+                leader_addr,
+            }
+        }),
+        any::<u64>().prop_map(|retry_after_ms| StoreError::NoLeader { retry_after_ms }),
+        text().prop_map(StoreError::Protocol),
     ]
 }
 
 fn wire_error() -> impl Strategy<Value = WireError> {
     prop_oneof![
-        store_error().prop_map(WireError::Store),
+        store_error().prop_map(WireError::from),
         (option::of(any::<u64>()), option::of(text())).prop_map(|(leader_id, leader_addr)| {
             WireError::NotLeader {
                 leader_id,
@@ -715,26 +723,40 @@ fn code_table_matches_adr_0004() {
 }
 
 #[test]
-fn folded_cluster_errors_are_tagged_storage_until_merge() {
-    // TODO(stage-a-merge): assert the real variants instead.
+fn cluster_errors_map_to_the_real_store_error_variants() {
     let e: StoreError = WireError::NotLeader {
         leader_id: Some(3),
         leader_addr: Some("h:1".into()),
     }
     .into();
-    match e {
-        StoreError::Storage(m) => {
-            assert!(
-                m.starts_with(FOLDED_PREFIX) && m.contains("node 3 at h:1"),
-                "{m}"
-            )
-        }
-        other => panic!("{other:?}"),
-    }
+    assert!(
+        matches!(
+            &e,
+            StoreError::NotLeader { leader_id: Some(3), leader_addr: Some(a) } if a == "h:1"
+        ),
+        "{e:?}"
+    );
+    assert!(e.to_string().contains("node 3 at h:1"), "{e}");
+    let e: StoreError = WireError::NoLeader { retry_after_ms: 7 }.into();
+    assert!(matches!(e, StoreError::NoLeader { retry_after_ms: 7 }));
     let e: StoreError = WireError::Protocol("v9".into()).into();
-    assert!(matches!(e, StoreError::Storage(ref m) if m.contains("protocol: v9")));
+    assert!(matches!(e, StoreError::Protocol(ref m) if m == "v9"));
     let e: StoreError = ConvertError("bad".into()).into();
-    assert!(matches!(e, StoreError::Storage(ref m) if m.contains("malformed message: bad")));
+    assert!(matches!(e, StoreError::Protocol(ref m) if m.contains("malformed message: bad")));
+    // And back: a `WireError::Store` never wraps one of the three.
+    for e in [
+        StoreError::NotLeader {
+            leader_id: None,
+            leader_addr: None,
+        },
+        StoreError::NoLeader { retry_after_ms: 1 },
+        StoreError::Protocol("p".into()),
+    ] {
+        let text = e.to_string();
+        let w = WireError::from(e);
+        assert!(!matches!(w, WireError::Store(_)), "{w:?}");
+        assert_eq!(w.to_string(), text, "same text either way");
+    }
 }
 
 #[test]
