@@ -67,7 +67,8 @@ fn version_includes_tokenizer_version() {
 /// keywords and raw identifiers) stay `identifier`; broken files too.
 #[test]
 fn keywords_are_classed_keyword() {
-    let src = "use std::fmt;\npub fn f(x: &'static str) -> Self { let union = r#use; }\n";
+    let src =
+        "use std::fmt;\npub fn f(x: &'static str) -> Self { let union = r#use; rng.gen(); }\n";
     for src in [src, "use a; fn {"] {
         let toks = RustExtractor.extract(src).tokens;
         let class = |text: &str| {
@@ -86,12 +87,25 @@ fn keywords_are_classed_keyword() {
             assert_eq!(class("union"), [TokenClass::Identifier]);
             // The lifetime `'static`.
             assert_eq!(class("static"), [TokenClass::Identifier]);
-            // `r#use` (however the tokenizer splits it) is no keyword.
-            let raw = src.find("r#use").unwrap() as u32;
-            assert!(toks
-                .iter()
-                .filter(|t| t.span.start >= raw && t.span.end <= raw + 5)
-                .all(|t| t.class != TokenClass::Keyword));
+            // `gen` is reserved only in edition 2024: `rng.gen()` is a call.
+            assert_eq!(class("gen"), [TokenClass::Identifier]);
+            // The `use` of `r#use` is an identifier.
+            let raw = src.find("r#use").unwrap() as u32 + 2;
+            let t = toks.iter().find(|t| t.span.start == raw).unwrap();
+            assert_eq!((t.text.as_str(), t.class), ("use", TokenClass::Identifier));
         }
     }
+}
+
+/// The `+kw1` marker changes the fingerprint of every Rust file, so a store
+/// indexed before keyword classing re-indexes them; dropping it must fail.
+#[test]
+fn version_pins_keyword_classing() {
+    assert_eq!(
+        RustExtractor.version(),
+        format!(
+            "rust-syn-2+kw1+tok{}",
+            graph_core::tokenizer::TOKENIZER_VERSION
+        )
+    );
 }

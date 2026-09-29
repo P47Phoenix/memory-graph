@@ -80,7 +80,8 @@ impl Extractor for RustExtractor {
 
 /// Rust's strict and reserved keywords (the Reference, edition 2018 and
 /// later). Weak keywords (`union`, `macro_rules`, `raw`, `safe`) are also
-/// ordinary identifiers, so they stay identifiers.
+/// ordinary identifiers, so they stay identifiers; so does `gen`, reserved
+/// only in edition 2024 and a common method name before it (`rng.gen()`).
 fn is_keyword(s: &str) -> bool {
     matches!(
         s,
@@ -126,7 +127,6 @@ fn is_keyword(s: &str) -> bool {
             | "box"
             | "do"
             | "final"
-            | "gen"
             | "macro"
             | "override"
             | "priv"
