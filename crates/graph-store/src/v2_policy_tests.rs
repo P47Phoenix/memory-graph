@@ -453,9 +453,10 @@ fn open_batch_marker_is_cleared_after_a_completed_batch() {
 /// commit, so unlike slice 3h/3l's byte-growth gates there is no separate
 /// "before" binary to diff against in this same test process -- instead this
 /// asserts a generous wall-clock ceiling on indexing this repo's own
-/// `crates/` tree (27 files) chunked finely enough that nearly every file is
-/// its own chunk (worst case for marker-write overhead), so a real
-/// regression in the marker bookkeeping would blow well past it.
+/// `crates/` tree chunked finely enough that nearly every file is its own
+/// chunk (worst case for marker-write overhead), so a real regression in the
+/// marker bookkeeping would blow well past it. The ceiling scales with the
+/// number of files, because the tree grows (issue #125).
 #[test]
 fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_own_corpus() {
     let files = this_repos_rust_corpus();
@@ -497,11 +498,20 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
         bf.len(),
         elapsed.as_secs_f64() * 1000.0
     );
+    // The corpus is this repo's own tree, which keeps growing (27 files when
+    // this gate was written; several times that after ADR 0004), and every
+    // file is its own fsync'd commit here. So the ceiling scales with the
+    // file count: 50 ms per chunk commit, never below the original 5 s. A
+    // real regression in the per-chunk marker bookkeeping still blows past
+    // it; the corpus growing does not (issue #125).
+    let ceiling = (0.05 * bf.len() as f64).max(5.0);
     assert!(
-        elapsed.as_secs_f64() < 5.0,
-        "indexing this repo's own corpus, one file per chunk, took {:.1} ms; expected well under \
-         5 s even with the added marker write per chunk",
-        elapsed.as_secs_f64() * 1000.0
+        elapsed.as_secs_f64() < ceiling,
+        "indexing this repo's own corpus ({} files, one per chunk) took {:.1} ms; expected under \
+         {:.1} s (50 ms per chunk commit, at least 5 s) even with the added marker write per chunk",
+        bf.len(),
+        elapsed.as_secs_f64() * 1000.0,
+        ceiling
     );
 }
 
