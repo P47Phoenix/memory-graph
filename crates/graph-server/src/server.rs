@@ -310,8 +310,16 @@ pub async fn start(
     cfg: ServeConfig,
     extractors: Vec<Arc<dyn Extractor>>,
 ) -> Result<Running, StoreError> {
+    if cfg.testing != TestingHooks::default() {
+        eprintln!("memory-graph serve: WARNING: test-only fault injection hooks are active");
+        tracing::warn!(hooks = ?cfg.testing, "test-only fault injection hooks are active");
+    }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
+    if let Some(r) = &cfg.raft {
+        r.validate(paths.data_dir.is_some())
+            .map_err(|e| StoreError::Rejected(format!("Raft settings: {e}")))?;
+    }
     let node_id = match &plan {
         Some(p) => p.node_id,
         None => cfg.node_id.unwrap_or(1),

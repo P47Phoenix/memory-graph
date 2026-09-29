@@ -133,6 +133,16 @@ a hard timeout and a message naming what it waited for. Faults are injected
 through deterministic hooks (failpoints in `TestingHooks`, the network
 `FaultPlan`, a fake free-space probe), never by sleeping and hoping.
 
+**Test-only environment variables.** `memory-graph serve` reads two
+variables that exist only for `serve_e2e` and are not features; a server
+started with any `TestingHooks` set logs a warning at start:
+
+- `MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER=<n>`: let n write proposals
+  through, then park every later one, so a test can kill the server
+  mid-write.
+- `MEMORY_GRAPH_TESTING_WITHHOLD_LEADER` (any value): act as if no leader
+  were known (writes and linearizable reads answer `NoLeader`).
+
 5. **Cluster testbed** (`cargo test -p graph-server --test cluster`):
    `graph_server::testing::ClusterTestbed` runs n in-process nodes on
    `127.0.0.1:0` with temporary data directories and fast Raft timing. It

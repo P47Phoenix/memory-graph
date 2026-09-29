@@ -326,10 +326,14 @@ fn follower_is_stale_soon_after_the_leader_dies() {
         local.read_log().last().unwrap().stale_possible
     });
     let took = t0.elapsed();
-    let bound = Duration::from_millis(TEST_RAFT.election_max_ms);
+    // The last contact was at most one heartbeat before the kill, so the
+    // lease ends within lease + heartbeat of `t0`; 250 ms of slack covers
+    // polling and scheduling (about 700 ms with TEST_RAFT). The old window
+    // (election_timeout_max, 1200 ms) would fail this.
+    let bound = lease() + Duration::from_millis(TEST_RAFT.heartbeat_ms + 250);
     assert!(
         took <= bound,
-        "stale_possible took {took:?}, more than election_timeout_max {bound:?} (lease {:?})",
+        "stale_possible took {took:?}, more than lease + heartbeat + slack {bound:?} (lease {:?})",
         lease()
     );
 }

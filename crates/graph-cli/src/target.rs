@@ -313,7 +313,7 @@ pub fn set_write_deadline(d: Duration) {
 
 /// Parse a `--write-deadline`: `<n>ms`, `<n>s`, `<n>m`, or bare seconds;
 /// positive.
-pub fn parse_write_deadline(s: &str) -> std::result::Result<Duration, String> {
+pub fn parse_deadline(s: &str) -> std::result::Result<Duration, String> {
     let t = s.trim();
     let (num, unit_ms) = if let Some(n) = t.strip_suffix("ms") {
         (n, 1u64)
@@ -427,16 +427,13 @@ mod tests {
 
     #[test]
     fn write_deadline_parses_units_and_refuses_zero() {
-        assert_eq!(
-            parse_write_deadline("500ms"),
-            Ok(Duration::from_millis(500))
-        );
-        assert_eq!(parse_write_deadline("10s"), Ok(Duration::from_secs(10)));
-        assert_eq!(parse_write_deadline("2m"), Ok(Duration::from_secs(120)));
-        assert_eq!(parse_write_deadline(" 3 "), Ok(Duration::from_secs(3)));
-        assert!(parse_write_deadline("0ms").is_err());
-        assert!(parse_write_deadline("soon").is_err());
-        assert!(parse_write_deadline("").is_err());
+        assert_eq!(parse_deadline("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_deadline("10s"), Ok(Duration::from_secs(10)));
+        assert_eq!(parse_deadline("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_deadline(" 3 "), Ok(Duration::from_secs(3)));
+        assert!(parse_deadline("0ms").is_err());
+        assert!(parse_deadline("soon").is_err());
+        assert!(parse_deadline("").is_err());
     }
 
     fn args<'a>() -> TargetArgs<'a> {

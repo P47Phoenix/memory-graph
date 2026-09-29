@@ -83,6 +83,45 @@ impl RaftSettings {
     }
 }
 
+impl RaftSettings {
+    /// Checks the timings. Always: `election_min_ms < election_max_ms` and
+    /// `heartbeat_ms < election_min_ms` (or followers call elections while
+    /// the leader is alive). For a cluster (`multi_member`, the
+    /// `--data-dir` mode) also `3 * heartbeat_ms < election_min_ms`: the
+    /// freshness lease ([`freshness_lease`]) is `election_min_ms - 2 *
+    /// heartbeat_ms`, so it must outlast one heartbeat, or every local read
+    /// says `stale_possible` (lease 0) or the flag flickers between
+    /// heartbeats. A sole voter (`--db`) is always fresh, so that rule does
+    /// not apply to it.
+    pub fn validate(&self, multi_member: bool) -> Result<(), String> {
+        if self.election_min_ms >= self.election_max_ms {
+            return Err(format!(
+                "election timeout min ({} ms) must be below election timeout max ({} ms)",
+                self.election_min_ms, self.election_max_ms
+            ));
+        }
+        if self.heartbeat_ms >= self.election_min_ms {
+            return Err(format!(
+                "heartbeat interval ({} ms) must be below election timeout min ({} ms), \
+                 or followers call elections while the leader is alive",
+                self.heartbeat_ms, self.election_min_ms
+            ));
+        }
+        if multi_member && self.heartbeat_ms.saturating_mul(3) >= self.election_min_ms {
+            return Err(format!(
+                "heartbeat interval ({} ms) must be below a third of election timeout min \
+                 ({} ms): the read freshness lease is election_min - 2 * heartbeat ({} ms) \
+                 and must outlast one heartbeat, or local reads report stale_possible \
+                 always or intermittently",
+                self.heartbeat_ms,
+                self.election_min_ms,
+                freshness_lease(self).as_millis()
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for RaftSettings {
     fn default() -> Self {
         Self::cluster()
@@ -814,6 +853,46 @@ mod tests {
             ..RaftSettings::cluster()
         };
         assert_eq!(freshness_lease(&s), Duration::ZERO);
+    }
+
+    /// Every timing `validate` accepts for a cluster has a lease longer
+    /// than one heartbeat (exhaustive over a small grid); the shipped
+    /// presets pass in their own modes.
+    #[test]
+    fn validated_cluster_settings_have_a_lease_above_one_heartbeat() {
+        let mut accepted = 0;
+        for heartbeat_ms in 0..=120u64 {
+            for election_min_ms in 0..=300u64 {
+                for election_max_ms in [election_min_ms, election_min_ms + 1, 1000] {
+                    let s = RaftSettings {
+                        heartbeat_ms,
+                        election_min_ms,
+                        election_max_ms,
+                        ..RaftSettings::cluster()
+                    };
+                    if s.validate(true).is_ok() {
+                        accepted += 1;
+                        assert!(
+                            freshness_lease(&s) > Duration::from_millis(heartbeat_ms),
+                            "{s:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(accepted > 0);
+        assert!(RaftSettings::cluster().validate(true).is_ok());
+        assert!(crate::testing::TEST_RAFT.validate(true).is_ok());
+        assert!(RaftSettings::standalone().validate(false).is_ok());
+        // The boundary: 3 * heartbeat == election_min is refused.
+        let edge = RaftSettings {
+            heartbeat_ms: 200,
+            election_min_ms: 600,
+            election_max_ms: 1200,
+            ..RaftSettings::cluster()
+        };
+        assert!(edge.validate(true).unwrap_err().contains("lease"));
+        assert!(edge.validate(false).is_ok());
     }
 
     /// The window the review found: an ack older than the lease but younger

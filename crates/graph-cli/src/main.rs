@@ -37,14 +37,14 @@ struct Cli {
     /// fails with exit code 4, e.g. `500ms`, `10s`, `2m`. Also read from MEMORY_GRAPH_WRITE_DEADLINE.
     /// Default 10s
     #[arg(long, global = true, env = "MEMORY_GRAPH_WRITE_DEADLINE", value_name = "DURATION",
-          value_parser = graph_cli::target::parse_write_deadline)]
+          value_parser = graph_cli::target::parse_deadline)]
     write_deadline: Option<std::time::Duration>,
     /// With --server: how long a read keeps retrying (no leader for a linearizable read, a node
     /// unreachable) before it fails, with exit code 4 when no leader answered, e.g. `500ms`,
     /// `10s`. It also bounds the first connect. Also read from MEMORY_GRAPH_READ_DEADLINE.
     /// Default 5s
     #[arg(long, global = true, env = "MEMORY_GRAPH_READ_DEADLINE", value_name = "DURATION",
-          value_parser = graph_cli::target::parse_write_deadline)]
+          value_parser = graph_cli::target::parse_deadline)]
     read_deadline: Option<std::time::Duration>,
     /// Deprecated, hidden: there is one storage format now. `--backend v2` is accepted as a no-op for old
     /// scripts; `--backend v1` is an error that says where the retired format went
@@ -826,20 +826,11 @@ fn run() -> Result<i32> {
             if let Some(v) = heartbeat_interval {
                 r.heartbeat_ms = *v;
             }
-            if r.election_min_ms >= r.election_max_ms {
-                bail!(
-                    "--election-timeout-min ({} ms) must be below --election-timeout-max ({} ms)",
-                    r.election_min_ms,
-                    r.election_max_ms
-                );
-            }
-            if r.heartbeat_ms >= r.election_min_ms {
-                bail!(
-                    "--heartbeat-interval ({} ms) must be below --election-timeout-min ({} ms), \
-                     or followers call elections while the leader is alive",
-                    r.heartbeat_ms,
-                    r.election_min_ms
-                );
+            // In cluster mode also 3 * heartbeat < election min: the read
+            // freshness lease (election min - 2 * heartbeat) must outlast
+            // one heartbeat.
+            if let Err(e) = r.validate(cluster_mode) {
+                bail!("invalid timings (--heartbeat-interval, --election-timeout-min/-max): {e}");
             }
             cfg.raft = Some(r);
         }
