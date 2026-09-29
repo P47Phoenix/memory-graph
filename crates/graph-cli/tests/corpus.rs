@@ -477,6 +477,14 @@ fn every_parsed_token_is_stored() {
     assert!(sql_hits
         .iter()
         .all(|h| h.repo.as_deref() == Some("conduit-sql")));
+    // SQL `CREATE TABLE` statements are symbols.
+    let mut q = graph_store::SymbolQuery::new("articles");
+    q.language = Some("sql".into());
+    let hits = store.search_symbols(&q).unwrap();
+    assert!(
+        hits.iter().any(|h| h.lang_kind.as_deref() == Some("table")),
+        "{hits:?}"
+    );
 }
 
 /// Classification spot-checks on real code: the tokenizer should keep string

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/graph-lang-rust", "crates/graph-core", "crates/graph-store", "crates/graph-cli", "examples/toy-extractor", "crates/graph-lang-csharp", "crates/graph-lang-javascript", "crates/graph-lang-html", "crates/graph-lang-aspx", "crates/graph-proto", "crates/graph-server", "crates/graph-client", "crates/graph-lang-cobol", "crates/graph-lang-rpg", "crates/graph-lang-asm"]
+members = ["crates/graph-lang-rust", "crates/graph-core", "crates/graph-store", "crates/graph-cli", "examples/toy-extractor", "crates/graph-lang-csharp", "crates/graph-lang-javascript", "crates/graph-lang-html", "crates/graph-lang-aspx", "crates/graph-lang-sql", "crates/graph-lang-shell", "crates/graph-lang-r", "crates/graph-lang-cobol", "crates/graph-lang-rpg", "crates/graph-lang-asm", "crates/graph-proto", "crates/graph-server", "crates/graph-client"]
 # Dev tooling with its own workspace and lockfile (proto codegen: prost-build,
 # tonic-prost-build, protox); never shipped, never seen by the pure-Rust gate.
 exclude = ["xtask"]

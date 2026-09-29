@@ -2,7 +2,7 @@
 
 An embedded graph database for source code. It indexes one or more repositories into a single file and answers questions such as "where is the token `Node` used?" or "which methods start with `parse`?" with exact byte, line and column spans.
 
-- **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor (Rust, C#, JavaScript, HTML, ASP.NET markup) additionally get symbols: functions, types, methods and so on.
+- **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor (Rust, C#, JavaScript, HTML, ASP.NET markup, SQL, shell, R) additionally get symbols: functions, types, methods and so on.
 - **One file, optionally served.** The database is a single [redb](https://github.com/cberner/redb) file, about 8-10x the size of the indexed source. Opened in-process by default; `memory-graph serve` shares it with other processes, machines and containers over gRPC ([Server mode](#server-mode)).
 - **Pure Rust.** No C dependencies (enforced in CI), so it builds anywhere Rust does and ships as a 7 MB static container image.
 - **Incremental.** Unchanged files are skipped on re-index; deleted files can be pruned.
@@ -417,11 +417,14 @@ Languages are detected per file from the extension, the filename (`Makefile`) or
 | JavaScript | `js`, `mjs`, `cjs`, `jsx` | token-stream scanner |
 | HTML | `html`, `htm`, `xhtml` | element scanner |
 | ASP.NET markup | `aspx`, `ascx`, `master` | HTML scanner plus directives, server controls, code blocks and bindings |
+| SQL | `sql` | `CREATE` statement scanner (ANSI, T-SQL, PL/pgSQL, PL/SQL, MySQL) |
+| Shell | `sh`, `bash`, `zsh`, `ksh` (and `#!` lines) | token-stream scanner: functions, `export` / `readonly` |
+| R | `r`, `rmd`, `qmd` | token-stream scanner (R chunks only in R Markdown / Quarto) |
 | COBOL | `cbl`, `cob`, `cpy` | sentence scanner: programs, divisions, sections, paragraphs, level-01/77 items (fixed and free format) |
 | RPG IV / RPGLE | `rpgle`, `sqlrpgle`, `rpgleinc`, `rpg` | token-stream scanner: procedures, subroutines, prototypes, interfaces, data structures, standalone fields, constants, tags (`**FREE`, mixed and fixed form) |
-| Assembly | `asm`, `s`, `inc` | line scanner (NASM, MASM, GNU as; x86 and ARM): labels, procs, macros, sections, segments, structs, constants |
+| Assembly | `asm`, `s` (not `inc`: PHP, Pascal and POV-Ray use it too) | line scanner (NASM, MASM, GNU as; x86 and ARM): labels, procs, macros, sections, segments, structs, constants |
 
-Everything else (Python, Go, SQL, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
+Everything else (Python, Go, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
 
 Tokenizer dialects: the generic tokenizer treats `r"a\"b"` as an identifier `r` and a string with Python-style escapes. The Rust extractor uses the `rust_literals` dialect, where raw strings (`r"..."`, `r#"..."#`, `br#"..."#`) and byte literals (`b"..."`, `b'x'`) are single literal tokens and an unterminated raw string runs to end of input.
 

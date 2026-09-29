@@ -13,12 +13,15 @@ name = "memory-graph"
 path = "src/main.rs"
 
 [features]
-default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-cobol", "lang-rpg", "lang-asm"]
+default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-sql", "lang-shell", "lang-r", "lang-cobol", "lang-rpg", "lang-asm"]
 lang-rust = ["dep:graph-lang-rust"]
 lang-csharp = ["dep:graph-lang-csharp"]
 lang-javascript = ["dep:graph-lang-javascript"]
 lang-aspx = ["dep:graph-lang-aspx"]
 lang-html = ["dep:graph-lang-html"]
+lang-sql = ["dep:graph-lang-sql"]
+lang-shell = ["dep:graph-lang-shell"]
+lang-r = ["dep:graph-lang-r"]
 lang-cobol = ["dep:graph-lang-cobol"]
 lang-rpg = ["dep:graph-lang-rpg"]
 lang-asm = ["dep:graph-lang-asm"]
@@ -34,6 +37,9 @@ graph-lang-csharp = { path = "../graph-lang-csharp", optional = true }
 graph-lang-javascript = { path = "../graph-lang-javascript", optional = true }
 graph-lang-aspx = { path = "../graph-lang-aspx", optional = true }
 graph-lang-html = { path = "../graph-lang-html", optional = true }
+graph-lang-sql = { path = "../graph-lang-sql", optional = true }
+graph-lang-shell = { path = "../graph-lang-shell", optional = true }
+graph-lang-r = { path = "../graph-lang-r", optional = true }
 graph-lang-cobol = { path = "../graph-lang-cobol", optional = true }
 graph-lang-rpg = { path = "../graph-lang-rpg", optional = true }
 graph-lang-asm = { path = "../graph-lang-asm", optional = true }

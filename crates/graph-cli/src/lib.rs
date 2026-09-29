@@ -33,6 +33,12 @@ pub fn shipped_extractors() -> Vec<Box<dyn graph_core::Extractor>> {
     v.push(Box::new(graph_lang_aspx::AspxExtractor));
     #[cfg(feature = "lang-html")]
     v.push(Box::new(graph_lang_html::HtmlExtractor));
+    #[cfg(feature = "lang-sql")]
+    v.push(Box::new(graph_lang_sql::SqlExtractor));
+    #[cfg(feature = "lang-shell")]
+    v.push(Box::new(graph_lang_shell::ShellExtractor));
+    #[cfg(feature = "lang-r")]
+    v.push(Box::new(graph_lang_r::RExtractor));
     #[cfg(feature = "lang-cobol")]
     v.push(Box::new(graph_lang_cobol::CobolExtractor));
     #[cfg(feature = "lang-rpg")]
