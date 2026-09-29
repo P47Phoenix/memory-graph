@@ -44,7 +44,7 @@ impl Extractor for RExtractor {
     }
 
     fn version(&self) -> String {
-        format!("r-scan-1+tok{TOKENIZER_VERSION}")
+        format!("r-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {

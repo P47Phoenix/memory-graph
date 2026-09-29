@@ -40,7 +40,7 @@ impl Extractor for TypeScriptExtractor {
     }
 
     fn version(&self) -> String {
-        format!("typescript-scan-1+tok{TOKENIZER_VERSION}")
+        format!("typescript-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -130,6 +130,17 @@ impl Scanner<'_> {
         for c in 0..hi {
             // `a.type`, `x.module`: member accesses, not declarations.
             if c > 0 && matches!(self.text(c - 1), "." | "?.") {
+                continue;
+            }
+            // `class type ...`, `function module(...)`: a declared name, not
+            // a keyword (#145: `class type A = {};` made a type alias that
+            // ran past the class).
+            if c > 0
+                && matches!(
+                    self.text(c - 1),
+                    "class" | "interface" | "enum" | "function" | "namespace" | "module" | "type"
+                )
+            {
                 continue;
             }
             if !self.is_ident(c) || c + 1 >= hi {

@@ -419,7 +419,7 @@ Languages are detected per file from the extension, the filename (`Makefile`) or
 | Python | `py`, `pyw`, `pyi` | indentation scanner (classes, functions, methods, lambdas, module constants); a file with unbalanced brackets or broken indentation is flagged `has_errors` and gets tokens only |
 | Java | `java` | token-stream scanner (package, classes, interfaces, enums, records, annotation types, methods, fields, constants) |
 | HTML | `html`, `htm`, `xhtml` | element scanner |
-| ASP.NET markup | `aspx`, `ascx`, `master` | HTML scanner plus directives, server controls, code blocks and bindings |
+| ASP.NET markup | `aspx`, `ascx`, `master` | HTML scanner plus directives, server controls, code blocks and bindings; C# symbols in `<script runat="server">` |
 | SQL | `sql` | `CREATE` statement scanner (ANSI, T-SQL, PL/pgSQL, PL/SQL, MySQL) |
 | Shell | `sh`, `bash`, `zsh`, `ksh` (and `#!` lines) | token-stream scanner: functions, `export` / `readonly` |
 | R | `r`, `rmd`, `qmd` | token-stream scanner (R chunks only in R Markdown / Quarto) |

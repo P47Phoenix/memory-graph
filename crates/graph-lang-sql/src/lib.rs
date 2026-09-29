@@ -48,7 +48,7 @@ impl Extractor for SqlExtractor {
     }
 
     fn version(&self) -> String {
-        format!("sql-scan-1+tok{TOKENIZER_VERSION}")
+        format!("sql-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
