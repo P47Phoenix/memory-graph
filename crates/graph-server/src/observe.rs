@@ -123,10 +123,14 @@ pub struct Observability {
     /// with on a follower or learner.
     leader_commit: AtomicU64,
     leader_commit_changed: tokio::sync::Notify,
-    /// When a leader last reached this node (`AppendEntries`, heartbeats
-    /// included, or `InstallSnapshot`): a follower or learner that has not
-    /// heard from one for a while is partitioned and not ready.
-    last_heard: Mutex<Option<Instant>>,
+    /// The last leader contact: when a leader last reached this node (an
+    /// accepted `AppendEntries`, heartbeats included, or `InstallSnapshot`)
+    /// and the `leader_commit` the last accepted `AppendEntries` carried.
+    /// The one record both readiness (D10: a follower or learner that has
+    /// not heard from a leader for a while is partitioned and not ready)
+    /// and a `LOCAL` read's `stale_possible` (D8, see
+    /// [`crate::raft::node::RaftNode::read_meta`]) judge by.
+    last_contact: Mutex<Option<(Instant, Option<u64>)>>,
 }
 
 impl Observability {
@@ -173,20 +177,42 @@ impl Observability {
         self.leader_commit.load(Ordering::SeqCst)
     }
 
-    /// A leader's `AppendEntries` or `InstallSnapshot` arrived just now.
-    pub fn note_heard_from_leader(&self) {
+    /// This node accepted a leader's `AppendEntries` (heartbeats included)
+    /// just now, carrying `leader_commit`: record the contact and note the
+    /// commit index ([`note_leader_commit`](Self::note_leader_commit)).
+    pub fn note_leader_contact(&self, leader_commit: Option<u64>) {
         *self
-            .last_heard
+            .last_contact
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+            .unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), leader_commit));
+        if let Some(c) = leader_commit {
+            self.note_leader_commit(c);
+        }
+    }
+
+    /// A leader's `InstallSnapshot` arrived just now (it carries no commit
+    /// index: the last one heard is kept).
+    pub fn note_heard_from_leader(&self) {
+        let mut last = self
+            .last_contact
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let commit = last.and_then(|(_, c)| c);
+        *last = Some((Instant::now(), commit));
+    }
+
+    /// When a leader last reached this node, and the commit index its last
+    /// accepted `AppendEntries` carried (`None`: never).
+    pub fn last_leader_contact(&self) -> Option<(Instant, Option<u64>)> {
+        *self
+            .last_contact
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Time since a leader last reached this node (`None`: never).
     pub fn since_heard_from_leader(&self) -> Option<Duration> {
-        self.last_heard
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .map(|t| t.elapsed())
+        self.last_leader_contact().map(|(t, _)| t.elapsed())
     }
 
     /// Resolves the next time [`note_leader_commit`](Self::note_leader_commit)

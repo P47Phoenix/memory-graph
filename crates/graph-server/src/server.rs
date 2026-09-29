@@ -324,6 +324,14 @@ pub async fn start(
     mut cfg: ServeConfig,
     extractors: Vec<Arc<dyn Extractor>>,
 ) -> Result<Running, StoreError> {
+    if cfg.testing != TestingHooks::default() || cfg.testing_apply_gate.is_some() {
+        eprintln!("memory-graph serve: WARNING: test-only fault injection hooks are active");
+        tracing::warn!(
+            hooks = ?cfg.testing,
+            apply_gate = cfg.testing_apply_gate.is_some(),
+            "test-only fault injection hooks are active"
+        );
+    }
     // `--bootstrap-or-join` becomes a bootstrap or a join first (ordinal
     // 0 on an empty directory asks its siblings; a lost volume must not
     // create a second cluster).
@@ -338,6 +346,10 @@ pub async fn start(
     }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
+    if let Some(r) = &cfg.raft {
+        r.validate(paths.data_dir.is_some())
+            .map_err(|e| StoreError::Rejected(format!("Raft settings: {e}")))?;
+    }
     let node_id = match &plan {
         Some(p) => p.node_id,
         None => cfg.node_id.unwrap_or(1),

@@ -83,6 +83,45 @@ impl RaftSettings {
     }
 }
 
+impl RaftSettings {
+    /// Checks the timings. Always: `election_min_ms < election_max_ms` and
+    /// `heartbeat_ms < election_min_ms` (or followers call elections while
+    /// the leader is alive). For a cluster (`multi_member`, the
+    /// `--data-dir` mode) also `3 * heartbeat_ms < election_min_ms`: the
+    /// freshness lease ([`freshness_lease`]) is `election_min_ms - 2 *
+    /// heartbeat_ms`, so it must outlast one heartbeat, or every local read
+    /// says `stale_possible` (lease 0) or the flag flickers between
+    /// heartbeats. A sole voter (`--db`) is always fresh, so that rule does
+    /// not apply to it.
+    pub fn validate(&self, multi_member: bool) -> Result<(), String> {
+        if self.election_min_ms >= self.election_max_ms {
+            return Err(format!(
+                "election timeout min ({} ms) must be below election timeout max ({} ms)",
+                self.election_min_ms, self.election_max_ms
+            ));
+        }
+        if self.heartbeat_ms >= self.election_min_ms {
+            return Err(format!(
+                "heartbeat interval ({} ms) must be below election timeout min ({} ms), \
+                 or followers call elections while the leader is alive",
+                self.heartbeat_ms, self.election_min_ms
+            ));
+        }
+        if multi_member && self.heartbeat_ms.saturating_mul(3) >= self.election_min_ms {
+            return Err(format!(
+                "heartbeat interval ({} ms) must be below a third of election timeout min \
+                 ({} ms): the read freshness lease is election_min - 2 * heartbeat ({} ms) \
+                 and must outlast one heartbeat, or local reads report stale_possible \
+                 always or intermittently",
+                self.heartbeat_ms,
+                self.election_min_ms,
+                freshness_lease(self).as_millis()
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for RaftSettings {
     fn default() -> Self {
         Self::cluster()
@@ -145,9 +184,14 @@ pub struct RaftNode {
     /// write proposal waits this long after it was counted in
     /// [`in_flight`](Self::in_flight), before it reaches Raft.
     pub hold_proposal: Option<Duration>,
-    /// Metrics and readiness inputs (apply timings, RPC timings, the
-    /// leader's committed index as heard over `AppendEntries`).
+    /// Metrics and readiness inputs (apply timings, RPC timings, the last
+    /// leader contact and the leader's committed index as heard over
+    /// `AppendEntries`): what readiness (D10) and a `LOCAL` read's
+    /// [`ReadMeta`](graph_proto::ReadMeta) (D8) both judge by.
     pub obs: Arc<crate::observe::Observability>,
+    /// Linearizable reads on this node waiting to apply the leader's read
+    /// index right now (a test observes a read parked there).
+    pub read_index_waits: Arc<AtomicUsize>,
 }
 
 /// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
@@ -285,6 +329,7 @@ impl RaftNode {
             transferring: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             hold_proposal: None,
+            read_index_waits: Arc::default(),
             obs: p.obs,
         };
         // The metrics are published by the Raft task, so right after
@@ -542,6 +587,36 @@ impl RaftNode {
         }
     }
 
+    /// How fresh a `LOCAL` read on this node is (ADR 0004 D8), a
+    /// best-effort hint (see [`freshness_lease`]). The leader is fresh
+    /// while a quorum acknowledged it within the lease (a sole voter always
+    /// is); a follower while it heard from a leader within the lease and
+    /// has applied the commit index that leader sent. No known leader:
+    /// stale possible.
+    pub fn read_meta(&self) -> graph_proto::ReadMeta {
+        let m = self.metrics();
+        let applied = m.last_applied.map_or(0, |l| l.index);
+        let lease = freshness_lease(&self.settings);
+        let known = !self.withhold_leader && m.current_leader.is_some();
+        if known && m.state == ServerState::Leader && m.current_leader == Some(self.node_id) {
+            let voters = m.membership_config.membership().voter_ids().count();
+            let acked = leader_within_lease(voters, m.millis_since_quorum_ack, lease);
+            return graph_proto::ReadMeta {
+                applied_index: applied,
+                leader_committed_index: Some(applied),
+                stale_possible: !acked || self.transferring.load(Ordering::SeqCst),
+            };
+        }
+        let last = self.obs.last_leader_contact();
+        let committed = last.and_then(|(_, c)| c);
+        let recent = last.is_some_and(|(at, _)| at.elapsed() < lease);
+        graph_proto::ReadMeta {
+            applied_index: applied,
+            leader_committed_index: committed,
+            stale_possible: follower_stale(known, recent, applied, committed),
+        }
+    }
+
     pub async fn shutdown(&self) {
         if let Err(e) = self.raft.shutdown().await {
             tracing::warn!(error = %e, "raft shutdown");
@@ -689,4 +764,150 @@ pub fn repair_stale_snapshot(
         "built a snapshot of the store at start-up"
     );
     Ok(true)
+}
+
+/// How long a leader's last quorum acknowledgement (or a follower's last
+/// `AppendEntries` from its leader) keeps a `LOCAL` read "fresh"
+/// (`stale_possible = false`, ADR 0004 D8): `election_timeout_min` minus
+/// two heartbeats. openraft measures a leader's quorum ack from the send
+/// time of the acknowledged request, and a follower that received it
+/// neither campaigns nor grants a vote for at least
+/// `election_timeout_min` after (openraft 0.9 is stricter still: a
+/// follower of a known leader refuses votes for `election_timeout_max`
+/// after its last heartbeat and campaigns only after that plus an election
+/// timeout), so within the lease no other leader, and no write committed
+/// elsewhere, can exist. The two-heartbeat margin covers the leader's
+/// metrics being published once per core tick (every 1.5 heartbeats, so
+/// the age read here can be that much low) plus clock drift; the
+/// `election_timeout_min` base keeps the hint sound even if openraft's
+/// vote lease were shortened. It stays a hint, not a
+/// guarantee: only `--read linearizable` guarantees freshness (a follower
+/// that still hears from a deposed leader cut off from the majority, for
+/// one, stays "fresh" while it does).
+pub fn freshness_lease(s: &RaftSettings) -> Duration {
+    Duration::from_millis(
+        s.election_min_ms
+            .saturating_sub(s.heartbeat_ms.saturating_mul(2)),
+    )
+}
+
+/// Whether a leader's quorum acknowledgement `millis_since_quorum_ack` ago
+/// is within `lease` ([`freshness_lease`]); a sole voter always is.
+pub fn leader_within_lease(
+    voters: usize,
+    millis_since_quorum_ack: Option<u64>,
+    lease: Duration,
+) -> bool {
+    voters <= 1 || millis_since_quorum_ack.is_some_and(|ms| u128::from(ms) < lease.as_millis())
+}
+
+/// A follower's `stale_possible`: no known leader, no contact within the
+/// lease, or the applied index below the leader's commit index as last
+/// received.
+pub fn follower_stale(known: bool, recent: bool, applied: u64, leader_commit: Option<u64>) -> bool {
+    !known || !recent || leader_commit.is_some_and(|c| applied < c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lease ends before any other node can have been elected: below
+    /// `election_timeout_min` by two heartbeats, for every shipped timing.
+    #[test]
+    fn freshness_lease_ends_before_an_election_can() {
+        // `standalone` (`--db`) is a one-member cluster: its sole voter is
+        // always fresh, whatever the lease.
+        for s in [RaftSettings::cluster(), crate::testing::TEST_RAFT] {
+            let lease = freshness_lease(&s);
+            assert_eq!(
+                lease,
+                Duration::from_millis(s.election_min_ms - 2 * s.heartbeat_ms),
+                "{s:?}"
+            );
+            assert!(lease.as_millis() < u128::from(s.election_min_ms), "{s:?}");
+            // A healthy leader (acked by the last heartbeat) is inside it.
+            assert!(lease > Duration::from_millis(s.heartbeat_ms), "{s:?}");
+        }
+        // Misconfigured timings: no lease, never "fresh" (the hint errs safe).
+        let s = RaftSettings {
+            heartbeat_ms: 600,
+            election_min_ms: 1000,
+            ..RaftSettings::cluster()
+        };
+        assert_eq!(freshness_lease(&s), Duration::ZERO);
+    }
+
+    /// Every timing `validate` accepts for a cluster has a lease longer
+    /// than one heartbeat (exhaustive over a small grid); the shipped
+    /// presets pass in their own modes.
+    #[test]
+    fn validated_cluster_settings_have_a_lease_above_one_heartbeat() {
+        let mut accepted = 0;
+        for heartbeat_ms in 0..=120u64 {
+            for election_min_ms in 0..=300u64 {
+                for election_max_ms in [election_min_ms, election_min_ms + 1, 1000] {
+                    let s = RaftSettings {
+                        heartbeat_ms,
+                        election_min_ms,
+                        election_max_ms,
+                        ..RaftSettings::cluster()
+                    };
+                    if s.validate(true).is_ok() {
+                        accepted += 1;
+                        assert!(
+                            freshness_lease(&s) > Duration::from_millis(heartbeat_ms),
+                            "{s:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(accepted > 0);
+        assert!(RaftSettings::cluster().validate(true).is_ok());
+        assert!(crate::testing::TEST_RAFT.validate(true).is_ok());
+        assert!(RaftSettings::standalone().validate(false).is_ok());
+        // The boundary: 3 * heartbeat == election_min is refused.
+        let edge = RaftSettings {
+            heartbeat_ms: 200,
+            election_min_ms: 600,
+            election_max_ms: 1200,
+            ..RaftSettings::cluster()
+        };
+        assert!(edge.validate(true).unwrap_err().contains("lease"));
+        assert!(edge.validate(false).is_ok());
+    }
+
+    /// The window the review found: an ack older than the lease but younger
+    /// than `election_timeout_max` (the old window) is stale now, including
+    /// between `election_timeout_min` and the max, when another node may
+    /// already lead.
+    #[test]
+    fn leader_is_stale_past_the_lease() {
+        let s = crate::testing::TEST_RAFT;
+        let lease = freshness_lease(&s);
+        let ms = lease.as_millis() as u64;
+        assert!(leader_within_lease(3, Some(0), lease));
+        assert!(leader_within_lease(3, Some(ms - 1), lease));
+        assert!(!leader_within_lease(3, Some(ms), lease));
+        assert!(!leader_within_lease(3, Some(s.election_min_ms), lease));
+        assert!(!leader_within_lease(3, Some(s.election_max_ms - 1), lease));
+        assert!(!leader_within_lease(3, None, lease));
+        // A sole voter cannot be deposed: always fresh.
+        assert!(leader_within_lease(1, None, lease));
+        assert!(leader_within_lease(1, Some(u64::MAX), lease));
+    }
+
+    #[test]
+    fn follower_staleness_rules() {
+        assert!(!follower_stale(true, true, 5, Some(5)));
+        assert!(!follower_stale(true, true, 6, Some(5)));
+        assert!(!follower_stale(true, true, 5, None));
+        assert!(
+            follower_stale(true, true, 4, Some(5)),
+            "applied < leader_commit"
+        );
+        assert!(follower_stale(true, false, 5, Some(5)), "no recent contact");
+        assert!(follower_stale(false, true, 5, Some(5)), "no known leader");
+    }
 }

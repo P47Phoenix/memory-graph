@@ -50,7 +50,8 @@ pub struct RaftService {
     pub disk: DiskGuard,
     /// Test hook ([`crate::TestingHooks::delay_append_entries_ms`]).
     pub delay_append: Option<std::time::Duration>,
-    /// Where the leader's committed index is noted (readiness, D10).
+    /// Where leader contact and the leader's committed index are recorded:
+    /// read staleness (D8) and readiness (D10) both judge by it.
     pub obs: Arc<crate::observe::Observability>,
 }
 
@@ -93,13 +94,6 @@ impl pb::raft_server::Raft for RaftService {
     ) -> Result<Response<pb::AppendEntriesResponse>, Status> {
         self.check_headers(&req, true)?;
         let req = req.into_inner();
-        // Heartbeats included: a leader reaches this node (readiness of a
-        // partitioned node), and what it has committed, so a node far
-        // behind (a learner catching up) knows it is not ready.
-        self.obs.note_heard_from_leader();
-        if let Some(c) = &req.leader_commit {
-            self.obs.note_leader_commit(c.index);
-        }
         if !req.entries.is_empty() {
             self.disk.check("replicated append").map_err(disk_full)?;
             if let Some(d) = self.delay_append {
@@ -107,7 +101,17 @@ impl pb::raft_server::Raft for RaftService {
             }
         }
         let rpc = wire::append_from_pb(req).map_err(bad)?;
+        let leader_commit = rpc.leader_commit.map(|l| l.index);
         let resp = self.raft.append_entries(rpc).await.map_err(raft_status)?;
+        // Any answer but a higher vote means a live leader of this term
+        // reached us (a conflict or partial success only means we lag,
+        // which the recorded commit index shows). Heartbeats included: the
+        // contact keeps a follower fresh (D8) and ready (D10), and the
+        // commit index tells a node far behind (a learner catching up)
+        // that it is neither.
+        if !matches!(resp, openraft::raft::AppendEntriesResponse::HigherVote(_)) {
+            self.obs.note_leader_contact(leader_commit);
+        }
         Ok(Response::new(wire::append_resp_to_pb(&resp)))
     }
 

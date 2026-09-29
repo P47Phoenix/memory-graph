@@ -1,6 +1,6 @@
 //! `memory_graph.v1.Store`: `Hello`, every `StoreRead` method under a
 //! `View`, and the snapshot handles (ADR 0004 D1/D8).
-use super::Ctx;
+use super::{reply, Ctx};
 use crate::conn::conn_id;
 use crate::{DEFAULT_SEARCH_LIMIT, SERVER_VERSION};
 use graph_core::{Node, NodeKind};
@@ -71,10 +71,13 @@ impl pb::store_server::Store for StoreService {
 
     async fn get(&self, req: Request<pb::GetRequest>) -> Result<Response<pb::GetResponse>, Status> {
         let r = req.into_inner();
-        let node = self.ctx.read(r.view, move |s| s.get(r.id)).await?;
-        Ok(Response::new(pb::GetResponse {
-            node: node.map(Into::into),
-        }))
+        let (node, meta) = self.ctx.read(r.view, move |s| s.get(r.id)).await?;
+        Ok(reply(
+            pb::GetResponse {
+                node: node.map(Into::into),
+            },
+            meta,
+        ))
     }
 
     async fn parent(
@@ -82,10 +85,13 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::ParentRequest>,
     ) -> Result<Response<pb::ParentResponse>, Status> {
         let r = req.into_inner();
-        let node = self.ctx.read(r.view, move |s| s.parent(r.id)).await?;
-        Ok(Response::new(pb::ParentResponse {
-            node: node.map(Into::into),
-        }))
+        let (node, meta) = self.ctx.read(r.view, move |s| s.parent(r.id)).await?;
+        Ok(reply(
+            pb::ParentResponse {
+                node: node.map(Into::into),
+            },
+            meta,
+        ))
     }
 
     async fn count_nodes(
@@ -94,10 +100,13 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::CountNodesResponse>, Status> {
         let r = req.into_inner();
         let kind = Wire::<NodeKind>::try_from(r.kind)?.0;
-        let count = self.ctx.read(r.view, move |s| s.count_nodes(kind)).await?;
-        Ok(Response::new(pb::CountNodesResponse {
-            count: count as u64,
-        }))
+        let (count, meta) = self.ctx.read(r.view, move |s| s.count_nodes(kind)).await?;
+        Ok(reply(
+            pb::CountNodesResponse {
+                count: count as u64,
+            },
+            meta,
+        ))
     }
 
     async fn roots(
@@ -105,10 +114,13 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::RootsRequest>,
     ) -> Result<Response<pb::RootsResponse>, Status> {
         let r = req.into_inner();
-        let nodes = self.ctx.read(r.view, |s| s.roots()).await?;
-        Ok(Response::new(pb::RootsResponse {
-            nodes: nodes_into(nodes),
-        }))
+        let (nodes, meta) = self.ctx.read(r.view, |s| s.roots()).await?;
+        Ok(reply(
+            pb::RootsResponse {
+                nodes: nodes_into(nodes),
+            },
+            meta,
+        ))
     }
 
     async fn children(
@@ -116,10 +128,13 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::ChildrenRequest>,
     ) -> Result<Response<pb::ChildrenResponse>, Status> {
         let r = req.into_inner();
-        let nodes = self.ctx.read(r.view, move |s| s.children(r.id)).await?;
-        Ok(Response::new(pb::ChildrenResponse {
-            nodes: nodes_into(nodes),
-        }))
+        let (nodes, meta) = self.ctx.read(r.view, move |s| s.children(r.id)).await?;
+        Ok(reply(
+            pb::ChildrenResponse {
+                nodes: nodes_into(nodes),
+            },
+            meta,
+        ))
     }
 
     async fn children_page(
@@ -128,11 +143,11 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::NodePage>, Status> {
         let r = req.into_inner();
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
-        let page = self
+        let (page, meta) = self
             .ctx
             .read(r.view, move |s| s.children_page(r.id, offset, limit))
             .await?;
-        Ok(Response::new(page.into()))
+        Ok(reply(page.into(), meta))
     }
 
     type DescendantsStream = NodeStream;
@@ -142,8 +157,8 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::DescendantsRequest>,
     ) -> Result<Response<Self::DescendantsStream>, Status> {
         let r = req.into_inner();
-        let nodes = self.ctx.read(r.view, move |s| s.descendants(r.id)).await?;
-        Ok(Response::new(batches(nodes)))
+        let (nodes, meta) = self.ctx.read(r.view, move |s| s.descendants(r.id)).await?;
+        Ok(reply(batches(nodes), meta))
     }
 
     async fn descendants_page(
@@ -152,11 +167,11 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::NodePage>, Status> {
         let r = req.into_inner();
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
-        let page = self
+        let (page, meta) = self
             .ctx
             .read(r.view, move |s| s.descendants_page(r.id, offset, limit))
             .await?;
-        Ok(Response::new(page.into()))
+        Ok(reply(page.into(), meta))
     }
 
     async fn ancestors(
@@ -164,10 +179,13 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::AncestorsRequest>,
     ) -> Result<Response<pb::AncestorsResponse>, Status> {
         let r = req.into_inner();
-        let nodes = self.ctx.read(r.view, move |s| s.ancestors(r.id)).await?;
-        Ok(Response::new(pb::AncestorsResponse {
-            nodes: nodes_into(nodes),
-        }))
+        let (nodes, meta) = self.ctx.read(r.view, move |s| s.ancestors(r.id)).await?;
+        Ok(reply(
+            pb::AncestorsResponse {
+                nodes: nodes_into(nodes),
+            },
+            meta,
+        ))
     }
 
     type FileTokensStream = NodeStream;
@@ -177,17 +195,20 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::FileTokensRequest>,
     ) -> Result<Response<Self::FileTokensStream>, Status> {
         let r = req.into_inner();
-        let toks = self
+        let (toks, meta) = self
             .ctx
             .read(r.view, move |s| s.file_tokens(&r.org, &r.repo, &r.path))
             .await?;
-        Ok(Response::new(match toks {
-            Some(nodes) => batches(nodes),
-            None => Box::pin(tokio_stream::iter([Ok(pb::NodeBatch {
-                nodes: vec![],
-                not_found: true,
-            })])),
-        }))
+        Ok(reply(
+            match toks {
+                Some(nodes) => batches(nodes),
+                None => Box::pin(tokio_stream::iter([Ok(pb::NodeBatch {
+                    nodes: vec![],
+                    not_found: true,
+                })])),
+            },
+            meta,
+        ))
     }
 
     async fn describe(
@@ -195,15 +216,18 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::DescribeRequest>,
     ) -> Result<Response<pb::DescribeResponse>, Status> {
         let r = req.into_inner();
-        let repos = self
+        let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
                 s.describe(r.org.as_deref(), r.repo.as_deref())
             })
             .await?;
-        Ok(Response::new(pb::DescribeResponse {
-            repos: repos.into_iter().map(Into::into).collect(),
-        }))
+        Ok(reply(
+            pb::DescribeResponse {
+                repos: repos.into_iter().map(Into::into).collect(),
+            },
+            meta,
+        ))
     }
 
     async fn describe_by_scan(
@@ -211,15 +235,18 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::DescribeRequest>,
     ) -> Result<Response<pb::DescribeResponse>, Status> {
         let r = req.into_inner();
-        let repos = self
+        let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
                 s.describe_by_scan(r.org.as_deref(), r.repo.as_deref())
             })
             .await?;
-        Ok(Response::new(pb::DescribeResponse {
-            repos: repos.into_iter().map(Into::into).collect(),
-        }))
+        Ok(reply(
+            pb::DescribeResponse {
+                repos: repos.into_iter().map(Into::into).collect(),
+            },
+            meta,
+        ))
     }
 
     async fn search_symbols(
@@ -239,12 +266,15 @@ impl pb::store_server::Store for StoreService {
         if defaulted {
             q.limit = Some(DEFAULT_SEARCH_LIMIT);
         }
-        let hits = self.ctx.read(r.view, move |s| s.search_symbols(&q)).await?;
+        let (hits, meta) = self.ctx.read(r.view, move |s| s.search_symbols(&q)).await?;
         let hits_len = hits.len();
-        Ok(Response::new(pb::SearchSymbolsResponse {
-            hits: hits.into_iter().map(Into::into).collect(),
-            applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
-        }))
+        Ok(reply(
+            pb::SearchSymbolsResponse {
+                hits: hits.into_iter().map(Into::into).collect(),
+                applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
+            },
+            meta,
+        ))
     }
 
     async fn search(
@@ -262,12 +292,15 @@ impl pb::store_server::Store for StoreService {
         if defaulted {
             q.limit = Some(DEFAULT_SEARCH_LIMIT);
         }
-        let hits = self.ctx.read(r.view, move |s| s.search(&q)).await?;
+        let (hits, meta) = self.ctx.read(r.view, move |s| s.search(&q)).await?;
         let hits_len = hits.len();
-        Ok(Response::new(pb::SearchResponse {
-            hits: hits.into_iter().map(Into::into).collect(),
-            applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
-        }))
+        Ok(reply(
+            pb::SearchResponse {
+                hits: hits.into_iter().map(Into::into).collect(),
+                applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
+            },
+            meta,
+        ))
     }
 
     async fn open_snapshot(
@@ -275,9 +308,22 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::OpenSnapshotRequest>,
     ) -> Result<Response<pb::OpenSnapshotResponse>, Status> {
         let conn = conn_id(&req);
+        // A linearizable handle (D8): the barrier runs first, so the frozen
+        // view holds every write acknowledged before the open.
+        let linearizable = req
+            .metadata()
+            .get(graph_proto::READ_MODE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("linearizable"));
+        if linearizable {
+            self.ctx.linearizable_barrier().await?;
+        }
+        // Frozen into the handle: its reads report the state it opened at.
+        let mut meta = self.ctx.raft.read_meta();
+        meta.stale_possible &= !linearizable;
         let slot = Arc::clone(&self.ctx.slot);
         let id = tokio::task::spawn_blocking(move || {
-            slot.with_store_read(|s| Ok(slot.snapshots().open(conn, s)))
+            slot.with_store_read(|s| Ok(slot.snapshots().open_with_meta(conn, s, Some(meta))))
                 .map_err(|e| graph_proto::store_error_to_status(&e))?
         })
         .await

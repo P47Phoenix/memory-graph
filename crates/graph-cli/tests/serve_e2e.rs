@@ -40,7 +40,9 @@ fn cmd() -> Command {
     c.env_remove("MEMORY_GRAPH_SERVER")
         .env_remove("MEMORY_GRAPH_READ")
         .env_remove("MEMORY_GRAPH_WRITE_DEADLINE")
+        .env_remove("MEMORY_GRAPH_READ_DEADLINE")
         .env_remove("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER")
+        .env_remove("MEMORY_GRAPH_TESTING_WITHHOLD_LEADER")
         .env("MEMORY_GRAPH_LOCK_WAIT_MS", "300");
     c
 }
@@ -70,9 +72,13 @@ fn ok(args: &[&str]) -> String {
     stdout(&o)
 }
 
-/// Drop what differs between two runs of the same work: elapsed times.
+/// Drop what differs between two runs of the same work: elapsed times,
+/// and the `stale_possible` a server adds to JSON read output (checked on
+/// its own in `json_reads_carry_stale_possible_and_server_takes_a_list`).
 fn normalize(s: &str) -> String {
-    let mut s = s.to_string();
+    let mut s = s
+        .replace(",\"stale_possible\":false", "")
+        .replace("\"stale_possible\":false,", "");
     for key in ["elapsed=", "\"elapsed_ms\":"] {
         let mut out = String::with_capacity(s.len());
         let mut rest = s.as_str();
@@ -686,4 +692,136 @@ fn server_killed_mid_index_is_a_lost_connection_not_a_protocol_error() {
         t0.elapsed() < Duration::from_secs(8),
         "--write-deadline 500ms bounds the retries"
     );
+}
+
+/// Stage D (ADR 0004 D8): `--json` read output over a server carries
+/// `stale_possible` (false on a single node, which always leads), an
+/// embedded run's does not; `--server` and `MEMORY_GRAPH_SERVER` take a
+/// comma-separated list and skip a dead endpoint.
+#[test]
+fn json_reads_carry_stale_possible_and_server_takes_a_list() {
+    let d = tempfile::tempdir().unwrap();
+    let embedded = d.path().join("e.redb");
+    let src = d.path().join("a.rs");
+    std::fs::write(&src, "fn a() {}\n").unwrap();
+    let src = src.to_str().unwrap();
+    let e = embedded.to_str().unwrap();
+    ok(&["--db", e, "index-file", "--org", "o", "--repo", "r", src]);
+    for q in [
+        vec!["describe", "--json"],
+        vec!["search", "a", "--json"],
+        vec!["symbols", "a", "--json"],
+    ] {
+        let mut a = vec!["--db", e];
+        a.extend(&q);
+        let j: serde_json::Value = serde_json::from_str(&ok(&a)).unwrap();
+        assert!(j.get("stale_possible").is_none(), "embedded {q:?}: {j}");
+    }
+    let server = Server::start(&d.path().join("s.redb"));
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let list = format!("{dead}, {}", server.addr);
+    ok(&[
+        "--server",
+        &list,
+        "index-file",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src,
+    ]);
+    for q in [
+        vec!["describe", "--json"],
+        vec!["search", "a", "--json"],
+        vec!["symbols", "a", "--json"],
+    ] {
+        let mut a = vec!["--server", list.as_str()];
+        a.extend(&q);
+        let j: serde_json::Value = serde_json::from_str(&ok(&a)).unwrap();
+        assert_eq!(j["stale_possible"], false, "server {q:?}: {j}");
+    }
+    let o = cmd()
+        .env("MEMORY_GRAPH_SERVER", &list)
+        .args(["describe", "--json", "--read", "linearizable"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["repos"][0]["repo"], "r");
+    assert_eq!(j["stale_possible"], false);
+    let o = run(&["--server", " , ", "describe"]);
+    assert!(!o.status.success());
+    server.shutdown();
+}
+
+/// Stage D review (QA 2): a linearizable read that finds no leader fails
+/// with exit code 4, bounded by `--read-deadline`, and explains itself as a
+/// read (never the write's "not acknowledged ... rerunning it is safe");
+/// a local read on the same node still answers, flagged `stale_possible`.
+/// Deterministic: the server's test hook
+/// (`MEMORY_GRAPH_TESTING_WITHHOLD_LEADER`) makes it know no leader.
+#[test]
+fn leaderless_linearizable_read_is_a_bounded_read_failure() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let src = d.path().join("a.rs");
+    std::fs::write(&src, "fn a() {}\n").unwrap();
+    let db_s = db.to_str().unwrap();
+    ok(&[
+        "--db",
+        db_s,
+        "index-file",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        src.to_str().unwrap(),
+    ]);
+    let server = Server::start_env(&db, &[("MEMORY_GRAPH_TESTING_WITHHOLD_LEADER", "1")]);
+    let t0 = Instant::now();
+    let o = run(&[
+        "--server",
+        &server.addr,
+        "--read",
+        "linearizable",
+        "--read-deadline",
+        "300ms",
+        "describe",
+    ]);
+    let took = t0.elapsed();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(4), "{err}");
+    assert!(
+        err.contains("linearizable read found no leader") && err.contains("--read-deadline"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("not acknowledged"),
+        "a read, not a write: {err}"
+    );
+    assert!(
+        took < Duration::from_secs(4),
+        "--read-deadline 300ms bounds the read (default 5 s): {took:?}"
+    );
+    // The same bound from the environment.
+    let o = cmd()
+        .env("MEMORY_GRAPH_READ_DEADLINE", "300ms")
+        .args([
+            "--server",
+            &server.addr,
+            "--read",
+            "linearizable",
+            "describe",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
+    let j: serde_json::Value =
+        serde_json::from_str(&ok(&["--server", &server.addr, "describe", "--json"])).unwrap();
+    assert_eq!(j["repos"][0]["repo"], "r");
+    assert_eq!(j["stale_possible"], true, "no leader known: {j}");
+    server.shutdown();
 }
