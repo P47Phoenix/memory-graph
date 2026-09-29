@@ -13,12 +13,15 @@ name = "memory-graph"
 path = "src/main.rs"
 
 [features]
-default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-sql", "lang-shell", "lang-r", "lang-fsharp", "lang-haskell", "lang-elixir", "lang-gdscript", "lang-c", "lang-go", "lang-scala", "lang-cobol", "lang-rpg", "lang-asm"]
+default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-sql", "lang-shell", "lang-r", "lang-fsharp", "lang-haskell", "lang-elixir", "lang-gdscript", "lang-c", "lang-go", "lang-scala", "lang-cobol", "lang-rpg", "lang-asm", "lang-typescript", "lang-python", "lang-java"]
 lang-rust = ["dep:graph-lang-rust"]
 lang-csharp = ["dep:graph-lang-csharp"]
 lang-javascript = ["dep:graph-lang-javascript"]
 lang-aspx = ["dep:graph-lang-aspx"]
 lang-html = ["dep:graph-lang-html"]
+lang-typescript = ["dep:graph-lang-typescript"]
+lang-python = ["dep:graph-lang-python"]
+lang-java = ["dep:graph-lang-java"]
 lang-sql = ["dep:graph-lang-sql"]
 lang-shell = ["dep:graph-lang-shell"]
 lang-r = ["dep:graph-lang-r"]
@@ -45,6 +48,9 @@ graph-lang-csharp = { path = "../graph-lang-csharp", optional = true }
 graph-lang-javascript = { path = "../graph-lang-javascript", optional = true }
 graph-lang-aspx = { path = "../graph-lang-aspx", optional = true }
 graph-lang-html = { path = "../graph-lang-html", optional = true }
+graph-lang-typescript = { path = "../graph-lang-typescript", optional = true }
+graph-lang-python = { path = "../graph-lang-python", optional = true }
+graph-lang-java = { path = "../graph-lang-java", optional = true }
 graph-lang-sql = { path = "../graph-lang-sql", optional = true }
 graph-lang-shell = { path = "../graph-lang-shell", optional = true }
 graph-lang-r = { path = "../graph-lang-r", optional = true }

@@ -184,3 +184,64 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// Runs `f` on a thread with the indexer's 2 MB stack, so a recursion that
+/// grows with nesting depth overflows here as it would in production.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn deep_nesting_is_capped_not_a_stack_overflow() {
+    let n = 20_000;
+    for (open, close) in [("class A { m() {", "} }"), ("const f = () => {", "};")] {
+        for balanced in [true, false] {
+            let mut src = open.repeat(n);
+            if balanced {
+                src.push_str(&close.repeat(n));
+            }
+            let ex = on_small_stack(move || JavaScriptExtractor.extract(&src));
+            if balanced {
+                // Outer declarations are kept, at most MAX_DEPTH levels deep.
+                assert!(!ex.symbols.is_empty(), "{open}");
+                assert!(ex.symbols.len() <= 2 * MAX_DEPTH + 2, "{open}");
+                assert_eq!(ex.symbols[0].span.start, 0);
+            }
+        }
+    }
+}
+
+proptest! {
+    /// The one-pass close table agrees with `matching_close` everywhere, so
+    /// the scanner's output does not depend on which one it uses.
+    #[test]
+    fn close_table_matches_matching_close(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                Just("("), Just(")"), Just("["), Just("]"), Just("{"), Just("}"), Just("a"),
+                Just("\"(\""), Just("'}'"), Just("/*{*/"), Just("//)\n"), Just("`{`"),
+            ],
+            0..40,
+        )
+    ) {
+        let src = parts.join(" ");
+        let tokens = graph_core::tokenizer::tokenize_with(&src, JS_TOKENIZER);
+        let code: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.class != TokenClass::Comment)
+            .map(|(i, _)| i)
+            .collect();
+        let table = close_table(&tokens, &code);
+        for (c, &i) in code.iter().enumerate() {
+            let expected = graph_core::scan::matching_close(&tokens, i)
+                .and_then(|close| code.binary_search(&close).ok());
+            prop_assert_eq!(table[c], expected, "{} at {}", src, c);
+        }
+    }
+}

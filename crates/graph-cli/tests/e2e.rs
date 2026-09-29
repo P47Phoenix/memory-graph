@@ -75,6 +75,79 @@ fn aspnet_site_symbols() {
     }
 }
 
+/// Epic story 16: a repo with `.rs`, `.py` (and `.ts`, `.java`) files is
+/// searchable by token text across languages, Python classes hold methods,
+/// and a Python syntax error is flagged, not fatal.
+#[test]
+fn mixed_language_repo() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    for (path, src) in [
+        ("lib.rs", "fn shared_name() {}\n"),
+        (
+            "app.py",
+            "class Cart:\n    def shared_name(self):\n        pass\n",
+        ),
+        ("broken.py", "def f(:\n    pass\n"),
+        ("ui.ts", "export interface Shape { shared_name: string }\n"),
+        (
+            "App.java",
+            "package p;\nclass App { void shared_name() {} }\n",
+        ),
+    ] {
+        std::fs::write(root.join(path), src).unwrap();
+    }
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = run(&["--db", &db, "search", "shared_name", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let langs: std::collections::BTreeSet<_> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["language"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        langs.into_iter().collect::<Vec<_>>(),
+        ["java", "python", "rust", "typescript"]
+    );
+    for (name, lang_kind) in [("Cart", "class"), ("Shape", "interface"), ("App", "class")] {
+        let (ok, out, err) = run(&["--db", &db, "symbols", "--json", name]);
+        assert!(ok, "{err}");
+        assert!(
+            out.contains(&format!("\"lang_kind\":\"{lang_kind}\"")),
+            "{out}"
+        );
+    }
+    let (ok, out, err) = run(&["--db", &db, "symbols", "--json", "--kind", "method", "*"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("\"Cart::shared_name\""), "{out}");
+    // The broken file is indexed (tokens) and flagged.
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "search",
+        "pass",
+        "--language",
+        "python",
+        "--json",
+    ]);
+    assert!(ok, "{err}");
+    assert!(out.contains("broken.py"), "{out}");
+}
+
 #[test]
 fn index_reopen_search() {
     let d = tempfile::tempdir().unwrap();
@@ -1313,14 +1386,14 @@ fn symbols_command() {
             .unwrap()
             .clone()
     };
-    assert_eq!(q(&["parse"]).len(), 2); // Python's `def parse` has no extractor, so only Rust symbols
+    assert_eq!(q(&["parse"]).len(), 3); // two Rust symbols and Python's `def parse`
     let m = q(&["parse", "--kind", "method"]);
     assert_eq!(m.len(), 1);
     assert_eq!(m[0]["qualified"], "S::parse");
     assert_eq!(m[0]["lang_kind"], "fn");
     assert_eq!(m[0]["file"], "src/lib.rs");
-    assert_eq!(q(&["pars*"]).len(), 3);
-    assert_eq!(q(&["pars*", "--language", "python"]).len(), 0);
+    assert_eq!(q(&["pars*"]).len(), 4);
+    assert_eq!(q(&["pars*", "--language", "python"]).len(), 1);
     assert_eq!(
         q(&["pars*", "--file", "src/lib.rs", "--repo", "r"]).len(),
         3

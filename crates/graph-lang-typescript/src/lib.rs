@@ -1,0 +1,303 @@
+//! TypeScript extractor: the JavaScript scanner in its TypeScript mode
+//! (`graph_lang_javascript::typescript_symbols`) plus a pass for the
+//! declarations JavaScript does not have. A token-stream scanner, not a parser.
+//!
+//! | TypeScript | `SymbolKind` | `lang_kind` |
+//! |---|---|---|
+//! | everything the JavaScript extractor finds (functions, classes, methods, arrow functions) | as JavaScript | as JavaScript |
+//! | `abstract class Name {...}` | Type | `abstract_class` |
+//! | typed class fields (`private x: T = ...;`) | Variable | `field` |
+//! | method signatures (`abstract m(): void;`, overloads) | Method | `method` |
+//! | `declare function f(): T;` | Function | `function` |
+//! | `interface Name {...}` | Type | `interface` |
+//! | `type Name<T> = ...;` | Type | `type` |
+//! | `enum Name {...}` / `const enum` | Type | `enum` |
+//! | `namespace A.B {...}` / `module A {...}` / `declare module "m" {...}` | Module | `namespace` / `module` |
+//!
+//! Spans run from the first keyword (`export`, `declare`, `abstract`, ...)
+//! through the closing `}` (or a type alias's `;`, or the last token of its
+//! type). Decorators are ignored (they are not part of any span). Not
+//! symbols: interface members, enum members, `declare global`, overloads of
+//! arrow-typed variables. TSX is scanned like TypeScript; JSX text that
+//! looks like a regex or unbalanced braces can cut a scan short, never
+//! producing invalid spans or `has_errors`.
+use graph_core::scan::{code_index, span_between};
+use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
+use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+
+pub struct TypeScriptExtractor;
+
+/// Tokenizer dialect used for TypeScript (the JavaScript one).
+pub const TS_TOKENIZER: TokenizerOptions = TokenizerOptions::TYPESCRIPT;
+
+impl Extractor for TypeScriptExtractor {
+    fn language(&self) -> &str {
+        "typescript"
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["ts", "tsx", "mts", "cts"]
+    }
+
+    fn version(&self) -> String {
+        format!("typescript-scan-1+tok{TOKENIZER_VERSION}")
+    }
+
+    fn extract(&self, source: &str) -> Extraction {
+        let tokens = tokenize_with(source, TS_TOKENIZER);
+        let symbols = symbols(&tokens);
+        Extraction {
+            symbols,
+            tokens,
+            has_errors: false,
+        }
+    }
+}
+
+/// Symbols in TypeScript tokens (as produced with [`TS_TOKENIZER`]), in
+/// source order (an enclosing symbol before what it contains).
+pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
+    let mut out = graph_lang_javascript::typescript_symbols(tokens);
+    let code = code_index(tokens, &[TokenClass::Comment]);
+    let s = Scanner {
+        tokens,
+        code: &code,
+        closes: graph_lang_javascript::close_table(tokens, &code),
+    };
+    s.scan(&mut out);
+    out.sort_by(|a, b| {
+        a.span
+            .start
+            .cmp(&b.span.start)
+            .then(b.span.end.cmp(&a.span.end))
+    });
+    out
+}
+
+/// Words that may precede a declaration and belong to its span.
+const PREFIXES: &[&str] = &["export", "default", "declare", "const"];
+
+struct Scanner<'a> {
+    tokens: &'a [TokenDecl],
+    code: &'a [usize],
+    closes: Vec<Option<usize>>,
+}
+
+impl Scanner<'_> {
+    fn tok(&self, c: usize) -> &TokenDecl {
+        &self.tokens[self.code[c]]
+    }
+
+    fn text(&self, c: usize) -> &str {
+        &self.tok(c).text
+    }
+
+    fn is_ident(&self, c: usize) -> bool {
+        self.tok(c).class == TokenClass::Identifier
+    }
+
+    fn close_of(&self, c: usize) -> Option<usize> {
+        self.closes[c]
+    }
+
+    fn start_of(&self, mut c: usize) -> usize {
+        while c > 0 && PREFIXES.contains(&self.text(c - 1)) {
+            c -= 1;
+        }
+        c
+    }
+
+    fn push(
+        &self,
+        out: &mut Vec<SymbolDecl>,
+        name: String,
+        kind: SymbolKind,
+        lang: &str,
+        span: (usize, usize),
+    ) {
+        out.push(SymbolDecl {
+            name,
+            kind,
+            lang_kind: Some(lang.into()),
+            span: span_between(&self.tok(span.0).span, &self.tok(span.1).span),
+        });
+    }
+
+    /// Every TypeScript-only declaration, at any depth.
+    fn scan(&self, out: &mut Vec<SymbolDecl>) {
+        let hi = self.code.len();
+        for c in 0..hi {
+            // `a.type`, `x.module`: member accesses, not declarations.
+            if c > 0 && matches!(self.text(c - 1), "." | "?.") {
+                continue;
+            }
+            if !self.is_ident(c) || c + 1 >= hi {
+                continue;
+            }
+            match self.text(c) {
+                "interface" => self.interface(c, hi, out),
+                "type" => self.type_alias(c, hi, out),
+                "enum" => self.enum_decl(c, hi, out),
+                "namespace" | "module" => self.namespace(c, hi, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// The `{` opening a body after a header starting at `c`: generic lists
+    /// and groups are skipped; `None` at `;`, `=`, a closer or the end.
+    fn body_open(&self, mut c: usize, hi: usize) -> Option<usize> {
+        let mut angle = 0usize;
+        while c < hi {
+            match self.text(c) {
+                "<" => angle += 1,
+                ">" => angle = angle.saturating_sub(1),
+                "{" if angle == 0 => return Some(c),
+                "(" | "[" | "{" => c = self.close_of(c).filter(|&p| p < hi)?,
+                "=" if angle > 0 => {}
+                ";" | "=" | ")" | "]" | "}" => return None,
+                _ => {}
+            }
+            c += 1;
+        }
+        None
+    }
+
+    fn interface(&self, kw: usize, hi: usize, out: &mut Vec<SymbolDecl>) {
+        let name = kw + 1;
+        if !self.is_ident(name) {
+            return;
+        }
+        let Some(open) = self.body_open(name + 1, hi) else {
+            return;
+        };
+        let Some(close) = self.close_of(open) else {
+            return;
+        };
+        let name = self.text(name).to_string();
+        self.push(
+            out,
+            name,
+            SymbolKind::Type,
+            "interface",
+            (self.start_of(kw), close),
+        );
+    }
+
+    fn type_alias(&self, kw: usize, hi: usize, out: &mut Vec<SymbolDecl>) {
+        let name = kw + 1;
+        if !self.is_ident(name) || name + 1 >= hi {
+            return;
+        }
+        let mut eq = name + 1;
+        if self.text(eq) == "<" {
+            let mut depth = 0usize;
+            loop {
+                match self.text(eq) {
+                    "<" => depth += 1,
+                    ">" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    "(" | "[" | "{" => match self.close_of(eq) {
+                        Some(p) => eq = p,
+                        None => return,
+                    },
+                    ";" | ")" | "]" | "}" => return,
+                    _ => {}
+                }
+                eq += 1;
+                if eq >= hi {
+                    return;
+                }
+            }
+            eq += 1;
+        }
+        if eq + 1 >= hi || self.text(eq) != "=" || self.text(eq + 1) == ">" {
+            return;
+        }
+        let after = graph_lang_javascript::type_end(self.tokens, self.code, eq + 1, hi);
+        let last = if after < hi && self.text(after) == ";" {
+            after
+        } else if after > eq + 1 {
+            after - 1
+        } else {
+            return;
+        };
+        let name = self.text(name).to_string();
+        self.push(
+            out,
+            name,
+            SymbolKind::Type,
+            "type",
+            (self.start_of(kw), last),
+        );
+    }
+
+    fn enum_decl(&self, kw: usize, hi: usize, out: &mut Vec<SymbolDecl>) {
+        let name = kw + 1;
+        if !self.is_ident(name) || name + 1 >= hi || self.text(name + 1) != "{" {
+            return;
+        }
+        let Some(close) = self.close_of(name + 1) else {
+            return;
+        };
+        let name = self.text(name).to_string();
+        self.push(
+            out,
+            name,
+            SymbolKind::Type,
+            "enum",
+            (self.start_of(kw), close),
+        );
+    }
+
+    /// `namespace A.B {`, `module A {`, `declare module "m" {`.
+    fn namespace(&self, kw: usize, hi: usize, out: &mut Vec<SymbolDecl>) {
+        let mut c = kw + 1;
+        let mut name = String::new();
+        if self.tok(c).class == TokenClass::Literal {
+            let t = self.text(c);
+            let quoted =
+                t.len() >= 2 && (t.starts_with('"') || t.starts_with('\'')) && t.ends_with(&t[..1]);
+            if !quoted {
+                return;
+            }
+            name.push_str(&t[1..t.len() - 1]);
+            c += 1;
+        } else {
+            loop {
+                if c >= hi || !self.is_ident(c) {
+                    return;
+                }
+                name.push_str(self.text(c));
+                c += 1;
+                if c + 1 < hi && self.text(c) == "." {
+                    name.push('.');
+                    c += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+        if c >= hi || self.text(c) != "{" || name.is_empty() {
+            return;
+        }
+        let Some(close) = self.close_of(c) else {
+            return;
+        };
+        let lang = self.text(kw).to_string();
+        self.push(
+            out,
+            name,
+            SymbolKind::Module,
+            &lang,
+            (self.start_of(kw), close),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests;

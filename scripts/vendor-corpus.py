@@ -69,6 +69,8 @@ def main():
         with tempfile.TemporaryDirectory() as tmp:
             u = tmp + "/u"
             subprocess.check_call(["git", "init", "-q", u])
+            # Byte-identical to upstream even where core.autocrlf is on.
+            subprocess.check_call(["git", "-C", u, "config", "core.autocrlf", "false"])
             subprocess.check_call(["git", "-C", u, "fetch", "-q", "--depth", "1", repo["upstream"], repo["commit"]])
             subprocess.check_call(["git", "-C", u, "checkout", "-q", "FETCH_HEAD"])
             shutil.rmtree(dest, ignore_errors=True)  # only after a successful fetch
@@ -83,7 +85,7 @@ def main():
                     shutil.copyfile(src, os.path.join(dest, inc))
                 else:
                     sys.exit(f"{repo['dir']}: {inc} not found upstream")
-        with open(os.path.join(dest, "UPSTREAM.md"), "w") as f:
+        with open(os.path.join(dest, "UPSTREAM.md"), "w", newline="\n") as f:
             f.write(f"# {repo['dir']}\n\nVendored subset of {repo['upstream']}\n\n"
                     f"- commit: `{repo['commit']}`\n- license: {repo['license']} (license file(s) included)\n"
                     f"- kind: {repo['kind']}\n")

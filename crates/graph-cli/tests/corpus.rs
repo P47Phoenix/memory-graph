@@ -414,6 +414,82 @@ fn every_parsed_token_is_stored() {
     for k in ["directive", "control", "binding"] {
         assert!(kinds.contains(k), "no aspx {k} symbol: {kinds:?}");
     }
+    // Java: classes nest in their package, methods in their class.
+    let mut q = graph_store::SymbolQuery::new("ArticleApi");
+    q.language = Some("java".into());
+    let hits = store.search_symbols(&q).unwrap();
+    let class = hits
+        .iter()
+        .find(|h| h.lang_kind.as_deref() == Some("class"))
+        .expect("ArticleApi class");
+    assert_eq!(class.file, "src/main/java/io/spring/api/ArticleApi.java");
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("java".into());
+    q.kind = Some("method".into());
+    let methods = store.search_symbols(&q).unwrap();
+    assert!(
+        methods
+            .iter()
+            .any(|h| h.qualified.starts_with("io.spring.api::ArticleApi::")),
+        "no methods nested in io.spring.api::ArticleApi"
+    );
+    // TypeScript: Angular services, their methods, and interfaces.
+    let mut q = graph_store::SymbolQuery::new("ArticlesService");
+    q.language = Some("typescript".into());
+    let hits = store.search_symbols(&q).unwrap();
+    let class = hits
+        .iter()
+        .find(|h| h.lang_kind.as_deref() == Some("class"))
+        .expect("ArticlesService class");
+    assert_eq!(
+        class.file,
+        "src/app/features/article/services/articles.service.ts"
+    );
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("typescript".into());
+    q.kind = Some("method".into());
+    let methods = store.search_symbols(&q).unwrap();
+    for m in ["ArticlesService::query", "ArticlesService::get"] {
+        assert!(
+            methods.iter().any(|h| h.qualified == m),
+            "no TypeScript method {m}"
+        );
+    }
+    let mut q = graph_store::SymbolQuery::new("User");
+    q.language = Some("typescript".into());
+    let hits = store.search_symbols(&q).unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.lang_kind.as_deref() == Some("interface")
+                && h.file == "src/app/core/auth/user.model.ts"),
+        "{hits:?}"
+    );
+    // Python: methods nest in their class, functions and constants at module
+    // level.
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("python".into());
+    q.repo = Some("requests".into());
+    let py = store.search_symbols(&q).unwrap();
+    let has = |qualified: &str, kind: &str, file: &str| {
+        py.iter().any(|h| {
+            h.qualified == qualified && h.lang_kind.as_deref() == Some(kind) && h.file == file
+        })
+    };
+    for (qualified, kind, file) in [
+        ("CaseInsensitiveDict", "class", "src/requests/structures.py"),
+        (
+            "CaseInsensitiveDict::__init__",
+            "method",
+            "src/requests/structures.py",
+        ),
+        ("request", "function", "src/requests/api.py"),
+        ("HOOKS", "constant", "src/requests/hooks.py"),
+    ] {
+        assert!(
+            has(qualified, kind, file),
+            "no Python {kind} {qualified} in {file}"
+        );
+    }
     // C, C++, Go and Scala scanners on real code: exact files and kinds,
     // and nesting (methods under their class, members under the package).
     let one = |name: &str, lang: &str, kind: &str| {
@@ -666,8 +742,8 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 /// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
-    const EXPECTED_FILES: usize = 695;
-    const EXPECTED_HASH: u64 = 4510152911230985546;
+    const EXPECTED_FILES: usize = 704;
+    const EXPECTED_HASH: u64 = 2636213689751639222;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());

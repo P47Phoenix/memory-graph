@@ -1,0 +1,12 @@
+[package]
+name = "graph-lang-typescript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+graph-core = { path = "../graph-core" }
+graph-lang-javascript = { path = "../graph-lang-javascript" }
+
+[dev-dependencies]
+proptest.workspace = true

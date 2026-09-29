@@ -17,6 +17,11 @@
       "repos": ["anyhow"]
     },
     {
+      "name": "python-library",
+      "description": "A slice of a stand-alone Python HTTP library; exercises the Python extractor (classes, methods, functions, constants) on real code.",
+      "repos": ["requests"]
+    },
+    {
       "name": "webforms",
       "description": "A small ASP.NET Web Forms site (.aspx/.ascx/.asax pages, user controls and code-behind); exercises the ASP.NET markup and C# extractors.",
       "repos": ["webforms"]
@@ -169,6 +174,24 @@
       "license": "MIT OR Apache-2.0",
       "include": ["src", "tests", "Cargo.toml", "build.rs", "LICENSE-MIT", "LICENSE-APACHE", "README.md"],
       "languages": ["rust"]
+    },
+    {
+      "dir": "requests",
+      "kind": "python library",
+      "upstream": "https://github.com/psf/requests",
+      "commit": "611c6162cbc4ac2020a2f91c7cfa4f3abf9bbb60",
+      "license": "Apache-2.0",
+      "include": [
+        "src/requests/api.py",
+        "src/requests/auth.py",
+        "src/requests/exceptions.py",
+        "src/requests/hooks.py",
+        "src/requests/status_codes.py",
+        "src/requests/structures.py",
+        "LICENSE",
+        "NOTICE"
+      ],
+      "languages": ["python"]
     },
     {
       "dir": "webforms",
