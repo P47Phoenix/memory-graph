@@ -5,7 +5,7 @@ Beginner-friendly pictures of how memory-graph is built and how it behaves. Ever
 ## Legend
 
 - **"Built today" means `main` as of commit 5bedd03** (ADR 0001, ADR 0002, the code in `crates/`, including story 0: the `describe` catalog and `schema_version` 2). Where a diagram still shows the older behaviour (a `describe` scan of every token), it is labelled as the state before story 0 or as a measured baseline.
-- **In a diagram with "Proposed" in its title, every line and box is proposed**; line style there only separates different kinds of edge (stated under each diagram). In a mixed diagram, dashed lines / dashed boxes = proposed or not decided. ADR 0003 is **Proposed** (not accepted). Diagram 15's right side and diagrams 14 and 17 reflect the user's decisions of 2026-09-20 on Q4 and Q5 (recorded in ADR 0003 and the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md)): the daemon path is **decided, not built**; sharding has a **decided key, build deferred**. The ADR itself is still not accepted.
+- **In a diagram with "Proposed" in its title, every line and box is proposed**; line style there only separates different kinds of edge (stated under each diagram). In a mixed diagram, dashed lines / dashed boxes = proposed or not decided. ADR 0003 is **Proposed** (not accepted). Diagram 15's right side and diagrams 14 and 17 reflect the user's decisions of 2026-09-20 on Q4 and Q5 (recorded in ADR 0003 and the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md)): the daemon path was **decided, not built** then, and has since been built as [ADR 0004](adr/0004-client-server-and-replication.md) (`serve`, `RemoteStore` over gRPC, Raft replication; stages A-F, PRs #113, #114, #118, #119, #121, #124, 2026-09-28; the MCP host inside `serve` is still open, #109); sharding has a **decided key, build deferred**. The ADR itself is still not accepted.
 - Sizes: **[M]** measured, **[E]** estimated (same tags as the ADR).
 - **v1 is retired (ADR 0003 D5, 2026-09-25).** Diagrams labelled "current (v1)" or "Today (v1)" describe the original per-node layout as it was when they were drawn; it no longer exists in the code (`RedbStore`, `Backend`, `--backend`, `migrate` are gone, see git tag `v1-last`). The v2 layout in diagrams 2-4 is what is built, and it is the only storage format; a v1 file is refused with `StoreError::LegacyFormat` and never modified.
 
@@ -152,7 +152,7 @@ flowchart LR
 
 **Built today.** The workspace (ADR 0002) has a core crate with no storage, a store crate on redb, a CLI, and a language extractor. Arrows point from a crate to a crate it depends on (from the `Cargo.toml` files). Everything is pure Rust; CI enforces it.
 
-**How to read it:** follow arrows downward; `graph-core` depends on nothing in the workspace. Dashed items are decided (Q5, 2026-09-20) but not built.
+**How to read it:** follow arrows downward; `graph-core` depends on nothing in the workspace. Dashed items were decided (Q5, 2026-09-20) but not built when this diagram was drawn; `serve` and `RemoteStore` have since shipped under ADR 0004 (PRs #113-#124), in the crates `graph-proto`, `graph-server` and `graph-client`.
 
 ```mermaid
 flowchart TD
@@ -171,8 +171,8 @@ flowchart TD
         LANG --> CORE
         STORE --> REDB
     end
-    SERVE["memory-graph serve (daemon, MCP): decided (Q5), not built"]
-    REMOTE["RemoteStore implements Store over a socket: decided (Q5), not built"]
+    SERVE["memory-graph serve: built under ADR 0004 (PRs 113-124); MCP host still open (issue 109)"]
+    REMOTE["RemoteStore implements Store over gRPC: built under ADR 0004 (PR 113)"]
     V2["v2 store (packed dictionary, streams) and partitioned store (Q4): decided, not built"]
     SERVE -.-> STORE
     REMOTE -.->|"implements"| TRAIT
@@ -471,7 +471,7 @@ Ids (ADR): entities `tag(1) | shard(10) | local(53)`; tokens `1 | shard(10) | fi
 
 ## 15. Cross-process access: today versus the decided daemon
 
-**First diagram: built today. Second: decided by the user on 2026-09-20 (Q5), not built (ADR story 12a).** redb takes an exclusive `flock(LOCK_EX | LOCK_NB)` on open, so a second process cannot even read while another holds the file; it gets `DatabaseAlreadyOpen`, which `graph-store` reports as `StoreError::Locked`. The user chose (a) an owning daemon with (b) retry as the no-daemon fallback; evidence and alternatives are in the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md) and ADR 0003.
+**First diagram: built today. Second: decided by the user on 2026-09-20 (Q5), not built then (ADR story 12a); since built as ADR 0004 (PRs #113-#124).** redb takes an exclusive `flock(LOCK_EX | LOCK_NB)` on open, so a second process cannot even read while another holds the file; it gets `DatabaseAlreadyOpen`, which `graph-store` reports as `StoreError::Locked`. The user chose (a) an owning daemon with (b) retry as the no-daemon fallback; evidence and alternatives are in the [Q4/Q5 decision paper](spikes/q4-q5-decision-paper.md) and ADR 0003.
 
 **How to read it:** first diagram is today; second is the decided design, where the CLI talks to one owner process and falls back to opening the file itself if none is running.
 
@@ -492,7 +492,7 @@ sequenceDiagram
     redb-->>Srch: opened
 ```
 
-Decided, not built (`memory-graph serve`, socket, `RemoteStore`, fallback). *2026-09-28: the transport is superseded by gRPC over TCP and the daemon can be a Raft cluster, [ADR 0004](adr/0004-client-server-and-replication.md) (Accepted 2026-09-28); the shape below (owner, `RemoteStore: Store`, direct-open fallback) still holds.*
+Decided, not built at the time (`memory-graph serve`, socket, `RemoteStore`, fallback); built since under ADR 0004 (PRs #113-#124). *2026-09-28: the transport is superseded by gRPC over TCP and the daemon can be a Raft cluster, [ADR 0004](adr/0004-client-server-and-replication.md) (Accepted 2026-09-28); the shape below (owner, `RemoteStore: Store`, direct-open fallback) still holds.*
 
 ```mermaid
 sequenceDiagram
@@ -586,7 +586,7 @@ flowchart TD
     S10["10: Snapshots, single shard (3 d)"]
     S11["11: Paging and traversal (2 d)"]
     S12["12: Migration framework, GATE before 1.0 (6 d)"]
-    S12A["12a: Daemon and RemoteStore, decided not built (6-9 d)"]
+    S12A["12a: Daemon and RemoteStore, built as ADR 0004, PRs 113-124 (6-9 d)"]
     S18["18 optional: Content sharing by digest (4 d)"]
     S19["19 optional: Stream checkpoints (2 d)"]
     S0 --> S1 --> S2 --> S3 --> S4

@@ -238,7 +238,7 @@ Verified facts the design rests on (2026-09-28, from the code):
 | C | 22 | Membership and forwarding: `--join/--auto-promote/--standby`, `cluster add-learner/promote/remove/members/leader/transfer-leader`, guards, idempotent bootstrap/join, `WrongCluster`, server-side forwarding, `NoLeader` retry, extractor-hash gate. **Status: delivered in PR #118; the settled details are under D9.** | 8 |
 | D | 23 | Consistency and durability: `--read linearizable`, crash tests, a `cluster` CI job that kills the leader mid-batch. **Status: delivered in PR #119; the settled details are under D8.** | 5 |
 | E | 24 | Observability and packaging: tracing, `/metrics`, ready service, `health` command, Compose file and CI smoke, Kubernetes doc. **Status: delivered in PR #121: `--log-format`/`--log-level`, RPC and apply spans, `--metrics-listen` and `Admin.Metrics`, readiness with `--ready-max-lag`, `deploy/compose/` with the `compose` CI job, `deploy/kubernetes/` with `serve --node-id-from-hostname --bootstrap-or-join`, [docs/deploy/](../deploy/kubernetes.md).** | 5 |
-| F | 25 | Hardening: replication benchmarks, soak, `--update-advertise`, config file or issue. **Status: delivered on branch stage-f (PR pending): benchmarks at the corpus and 10 M tokens and a 60-minute soak in [spikes/raft-replication.md](../spikes/raft-replication.md) ("Stage F at scale"), `scripts/cluster_soak.py` (weekly in the `cluster` workflow), `serve --update-advertise`, `serve --config`.** | 3 |
+| F | 25 | Hardening: replication benchmarks, soak, `--update-advertise`, config file or issue. **Status: delivered in PR #124: benchmarks at the corpus and 10 M tokens and a 60-minute soak in [spikes/raft-replication.md](../spikes/raft-replication.md) ("Stage F at scale"), `scripts/cluster_soak.py` (weekly in the `cluster` workflow), `serve --update-advertise`, `serve --config`.** | 3 |
 
 Acceptance criteria per story are in the [epic](../epic-code-memory-graph.md#full-story-definitions).
 
@@ -261,7 +261,7 @@ TLS once a pure-Rust provider passes the gate (#104); authentication (#105); a T
 
 What shipped against the decisions:
 
-- **D1:** the `.proto` contract `memory_graph.v1`, with checked-in code and a CI regen diff (`xtask`, `protox`, no `protoc`), and `protocol_version` in `Hello`. The measured RPC overhead is 0.2-1.6 ms p50 up to 10 M tokens. There is no TLS yet (#104).
+- **D1:** the `.proto` contract `memory_graph.v1`, with checked-in code and a CI regen diff (`xtask`, `protox`, no `protoc`), and `protocol_version` in `Hello`. The measured RPC overhead (p50 over in-process) is 0.2-0.4 ms on the corpus and 0.4-1.6 ms at 10 M tokens, under the 5 ms trigger. There is no TLS yet (#104).
 - **D2:** `RemoteStore: Store`, which passes `run_all`, `run_differential` and `run_crash_rerun_differential`. `index --server` sends raw bytes and the server parses them (stage A, PR #113).
 - **D3:** `--db` or `--server` (with `MEMORY_GRAPH_SERVER`), several endpoints (`a,b,c`), `--read local|linearizable`, `--write-deadline` and `--read-deadline`, and exit codes 3-6 (stages A, C, D).
 - **D4:** `serve` owns the file. The `LOCK` sidecar names the holder, and an embedded open retries, then names `serve` (stage A).
@@ -274,3 +274,11 @@ What shipped against the decisions:
 - **Q2:** `serve --config <file.toml>` (stage F, #106).
 - **Q3:** `--update-advertise` (stage F, #107).
 - **Still open:** Q1 authentication (#105), Q4 object storage (#110), Q5 lease reads (#111), TLS (#104), sharding (#108), and the MCP host (#109).
+
+Stages by PR: A #113, B #114, C #118, D #119, E #121, F #124.
+
+### Deviations and follow-ups
+
+- **Size gate methodology (D7, stage B/F).** The gate `raft.redb <= 1.5x source` after an index, a snapshot and a purge is measured over three corpus passes with `--log-keep-entries 0`, not one pass at the default: an empty redb file is already about 1.59 MB against a 1.68 MB corpus, so one pass measures redb's floor rather than the log. Three passes (5.05 MB) measure 0.53x after snapshot, purge and compaction ([spikes/raft-replication.md](../spikes/raft-replication.md)). With the default `--log-keep-entries` a purge on the small corpus removes nothing. The epic's wording of the criterion is unchanged; whether to amend it is the user's call.
+- **Open issues found during the stages:** a full disk at leader-append or apply time stops the node instead of answering `RESOURCE_EXHAUSTED` (#115); the write deadline does not bound a call already in flight (#116); tidying the `AppendEntries` join plan (#117); backslash paths from a Windows client change language detection on a Linux server (#120); `cluster remove` of a non-member succeeds silently (#122); one 10 M-token three-node ingest ran at 43% of embedded under concurrent build load, below the D5 50% trigger, not reproduced on an idle machine (#123).
+- **Security follow-ups:** TLS (#104) and authentication (#105). Until they land, bind to loopback or a private network.

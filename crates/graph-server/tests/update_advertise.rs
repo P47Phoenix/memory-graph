@@ -139,6 +139,121 @@ fn a_member_moves_to_a_new_address_with_update_advertise() {
     eprintln!("update-advertise test done in {:?}", t0.elapsed());
 }
 
+/// Dev review 3: a crash between the cluster committing the new address and
+/// node.json being rewritten (failpoint). A plain restart would serve at the
+/// old address while the leader replicates to the new one, so it is refused
+/// and names the flag that finishes the move; that flag then succeeds.
+#[test]
+fn a_crash_between_commit_and_node_json_rewrite_is_refused_then_finished() {
+    let mut tb = ClusterTestbed::new(3, rust_only());
+    tb.form();
+    let idx = write(&tb, 0);
+    tb.wait_applied(idx, CLUSTER_WAIT);
+    let old = tb.node(3).endpoint();
+    let json_path = tb.data_dir(3).join("node.json");
+    tb.node_mut(3).stop();
+    let new = free_addr();
+    {
+        let cfg = tb.node_mut(3).config_mut();
+        cfg.listen = new.parse().unwrap();
+        cfg.update_advertise = Some(new.clone());
+        cfg.update_advertise_timeout = CLUSTER_WAIT;
+        cfg.testing.fail_before_advertise_rewrite = true;
+    }
+    let e = tb.node_mut(3).try_restart().unwrap_err().to_string();
+    // The error says the cluster has it and how to finish (QA 5).
+    assert!(
+        e.contains("failpoint")
+            && e.contains("was not rewritten")
+            && e.contains(&format!("--update-advertise {new}")),
+        "{e}"
+    );
+    // Committed in the cluster, node.json still the old address.
+    let l = tb.wait_leader(CLUSTER_WAIT);
+    assert_eq!(addr_in_membership(&tb, l, 3), Some(new.clone()));
+    assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, old);
+
+    // A plain restart: refused, naming the recovery flag.
+    {
+        let cfg = tb.node_mut(3).config_mut();
+        cfg.testing.fail_before_advertise_rewrite = false;
+        cfg.update_advertise = None;
+    }
+    let e = tb.node_mut(3).try_restart().unwrap_err().to_string();
+    assert!(
+        e.contains(&format!("--update-advertise {new}")) && e.contains(&old),
+        "{e}"
+    );
+    assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, old);
+
+    // The flag it names finishes the move (the cluster has it already).
+    tb.node_mut(3).config_mut().update_advertise = Some(new.clone());
+    tb.node_mut(3).restart();
+    assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, new);
+    let idx = write(&tb, 1);
+    tb.wait_applied(idx, CLUSTER_WAIT);
+    assert_eq!(files_on(&tb, 3), 2);
+
+    // And a plain restart after that is fine again.
+    tb.node_mut(3).stop();
+    tb.node_mut(3).config_mut().update_advertise = None;
+    tb.node_mut(3).restart();
+    assert_eq!(tb.node(3).endpoint(), new);
+}
+
+/// QA 3 and 4: the leader refuses a new address that is another member's
+/// recorded one (even while that member is down), and one where another
+/// node answers. node.json and the membership stay as they were.
+#[test]
+fn update_advertise_refuses_another_members_or_another_nodes_address() {
+    let mut tb = ClusterTestbed::new(3, rust_only());
+    tb.form();
+    // A learner, then down: its address stays recorded.
+    let mut spec = graph_server::JoinSpec::new(tb.node(1).endpoint());
+    spec.auto_promote = false;
+    spec.timeout = CLUSTER_WAIT;
+    let cfg = tb.node_config(4, InitMode::Join(spec));
+    tb.add_node(4, cfg, rust_only()).unwrap();
+    let four = tb.node(4).endpoint();
+    let l = tb.wait_leader(CLUSTER_WAIT);
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    while addr_in_membership(&tb, l, 4).as_deref() != Some(four.as_str()) {
+        assert!(Instant::now() < deadline, "node 4 never recorded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    tb.node_mut(4).stop();
+
+    let old = tb.node(3).endpoint();
+    let json_path = tb.data_dir(3).join("node.json");
+    tb.node_mut(3).stop();
+    // Node 3 listens at node 4's recorded address and asks for it.
+    {
+        let cfg = tb.node_mut(3).config_mut();
+        cfg.listen = four.parse().unwrap();
+        cfg.update_advertise = Some(four.clone());
+        cfg.update_advertise_timeout = Duration::from_secs(3);
+    }
+    let e = tb.node_mut(3).try_restart().unwrap_err().to_string();
+    assert!(e.contains("recorded address of member 4"), "{e}");
+    assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, old);
+
+    // Another server (node 2 of its own) answers at the new address.
+    let d = tempfile::tempdir().unwrap();
+    let mut other_cfg = ServeConfig::new(d.path().join("g.redb"), "127.0.0.1:0".parse().unwrap());
+    other_cfg.node_id = Some(2);
+    let other = TestServer::try_start_config(other_cfg, rust_only()).unwrap();
+    {
+        let cfg = tb.node_mut(3).config_mut();
+        cfg.listen = free_addr().parse().unwrap();
+        cfg.update_advertise = Some(other.endpoint());
+    }
+    let e = tb.node_mut(3).try_restart().unwrap_err().to_string();
+    assert!(e.contains("is node 2, not node 3"), "{e}");
+    assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, old);
+    let l = tb.wait_leader(CLUSTER_WAIT);
+    assert_eq!(addr_in_membership(&tb, l, 3), Some(old));
+}
+
 #[test]
 fn update_advertise_is_refused_where_there_is_no_member_to_move() {
     let d = tempfile::tempdir().unwrap();

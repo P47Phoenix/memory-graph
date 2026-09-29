@@ -325,7 +325,7 @@ Design: ADR 0004 D10.
 - Given `docs/deploy/kubernetes.md`, When followed, Then it must describe a StatefulSet with a headless service for `--advertise`, node ids from the ordinal, gRPC readiness on `memory-graph.ready`, a PodDisruptionBudget of `minAvailable: 2` and `cluster remove` before scale-down.
 
 **25. Cluster hardening (3 pts)**
-Status: Delivered on branch stage-f (PR pending): the benchmark at the corpus and at 10 M tokens and the 60-minute soak in [spikes/raft-replication.md](spikes/raft-replication.md) ("Stage F at scale"), `scripts/cluster_soak.py` (weekly in the `cluster` CI workflow), `serve --update-advertise` (issue #107) and `serve --config <file.toml>` (issue #106). This closes the epic's client/server stories 20-25.
+Status: Delivered in PR #124: the benchmark at the corpus and at 10 M tokens and the 60-minute soak in [spikes/raft-replication.md](spikes/raft-replication.md) ("Stage F at scale"), `scripts/cluster_soak.py` (weekly in the `cluster` CI workflow), `serve --update-advertise` (issue #107) and `serve --config <file.toml>` (issue #106). This closes the epic's client/server stories 20-25.
 As a database operator
 I want measured replication performance, a soak run and the remaining operator knobs
 So that the cluster can be trusted at the epic's scale target.

@@ -153,6 +153,10 @@ pub struct TestingHooks {
     /// Failpoint: a first start fails right after writing `node.json`,
     /// before the Raft node is initialized (a crash in that window).
     pub fail_after_node_json: bool,
+    /// Failpoint: `--update-advertise` fails right after the cluster
+    /// committed the new address, before `node.json` is rewritten (a crash
+    /// in that window).
+    pub fail_before_advertise_rewrite: bool,
     /// Hold every received `AppendEntries` that carries entries for this
     /// long before handing it to Raft (a slow link or disk, longer than
     /// the leader's heartbeat timeout). Heartbeats are not delayed.
@@ -633,6 +637,30 @@ pub async fn start(
         testing_apply_gate: cfg.testing_apply_gate.clone(),
     })
     .await?;
+    // A restart that keeps node.json's address (no move asked for): the
+    // membership this node loaded must list it there too. They differ after
+    // a `--update-advertise` that stopped between the cluster committing the
+    // new address and node.json being rewritten; serving at the old address
+    // would then leave the leader replicating to the new one. Refused, with
+    // the flag that finishes the move (ADR 0004 Q3, docs/deploy/data-dir.md).
+    if moved.is_none() && plan.as_ref().is_some_and(|p| p.existing.is_some()) {
+        let listed = raft
+            .metrics()
+            .membership_config
+            .membership()
+            .get_node(&node_id)
+            .map(|n| n.addr.clone());
+        if let Some(listed) = listed.filter(|l| *l != advertise) {
+            let _ = tokio::time::timeout(cfg.shutdown_grace, raft.shutdown()).await;
+            slot.close();
+            return Err(StoreError::Rejected(format!(
+                "this node's address in node.json is {advertise}, but the cluster's membership \
+                 records node {node_id} at {listed} (an --update-advertise that stopped after \
+                 the cluster committed it); restart with --update-advertise {listed}, listening \
+                 where {listed} reaches, to finish the move"
+            )));
+        }
+    }
     raft.withhold_leader = cfg.testing.withhold_leader;
     raft.hold_proposal = cfg.testing.hold_proposal_ms.map(Duration::from_millis);
     let shutdown = ShutdownHandle::new();
@@ -885,8 +913,44 @@ pub async fn start(
             &json.advertise,
             cfg.update_advertise_timeout,
         )
-        .await
-        .and_then(|_| json.write(&json_path));
+        .await;
+        // Committed, but node.json not rewritten: say so, and how to finish.
+        let not_rewritten = |e: StoreError| {
+            StoreError::Storage(format!(
+                "the cluster recorded node {node_id} at {new}, but `{}` was not rewritten: {e}; \
+                 fix that, then restart with --update-advertise {new} to finish the move (a \
+                 plain restart is refused until then)",
+                json_path.display(),
+                new = json.advertise,
+            ))
+        };
+        let done = match done {
+            Ok(_) if cfg.testing.fail_before_advertise_rewrite => {
+                // Deterministic: the crash comes once this node's own log
+                // holds the committed address (bounded wait).
+                let want = json.advertise.clone();
+                let _ = raft
+                    .raft
+                    .wait(Some(Duration::from_secs(30)))
+                    .metrics(
+                        move |m| {
+                            m.membership_config
+                                .membership()
+                                .get_node(&node_id)
+                                .is_some_and(|n| n.addr == want)
+                        },
+                        "new address in this node's membership",
+                    )
+                    .await;
+                Err(not_rewritten(StoreError::Storage(
+                    "testing: failpoint after the new address was committed, before node.json \
+                     was rewritten"
+                        .into(),
+                )))
+            }
+            Ok(_) => json.write(&json_path).map_err(not_rewritten),
+            Err(e) => Err(e),
+        };
         if let Err(e) = done {
             shutdown.trigger();
             let _ = task.await;

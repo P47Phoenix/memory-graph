@@ -2158,4 +2158,45 @@ listen = "0.0.0.0:7000"
         let args = graph_cli::serve_config::apply(&Cli::command(), a).unwrap();
         assert!(Cli::command().try_get_matches_from(args).is_err());
     }
+
+    /// QA 1: a flag on the command line whose `requires` target (the data
+    /// directory) comes from the file: the command line alone is incomplete,
+    /// the merged whole is valid and equals the same flags typed.
+    #[test]
+    fn a_command_line_flag_may_need_what_the_file_gives() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("serve.toml");
+        std::fs::write(
+            &f,
+            "data-dir = \"/data\"\nnode-id = 3\nlisten = \"0.0.0.0:7003\"\n",
+        )
+        .unwrap();
+        let base = [
+            "--data-dir",
+            "/data",
+            "--node-id",
+            "3",
+            "--listen",
+            "0.0.0.0:7003",
+        ];
+        for extra in [
+            &["--bootstrap"][..],
+            &["--join", "peer:7000"][..],
+            &["--update-advertise", "new:7003"][..],
+        ] {
+            let mut a = os(&["memory-graph", "serve"]);
+            a.extend(os(extra));
+            // Alone, clap refuses it (the data directory is missing).
+            assert!(
+                Cli::command().try_get_matches_from(a.clone()).is_err(),
+                "{extra:?}"
+            );
+            a.push("--config".into());
+            a.push(f.clone().into_os_string());
+            let mut typed = os(&["memory-graph", "serve"]);
+            typed.extend(os(&base));
+            typed.extend(os(extra));
+            assert_eq!(parsed(a), parsed(typed), "{extra:?}");
+        }
+    }
 }

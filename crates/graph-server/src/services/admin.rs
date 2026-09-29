@@ -171,6 +171,25 @@ async fn probe_node(ctx: &Ctx, id: NodeId, addr: &str) -> Result<pb::StatusRespo
     Ok(st)
 }
 
+/// `UpdateAdvertise`: the server at the new address must already be a
+/// member of this cluster, so it reports this cluster's id. [`probe_node`]
+/// lets an empty id through (a node that is still joining); a member being
+/// moved has one, so an empty id here is a server that is not it.
+fn check_moved_member_cluster(
+    ours: &str,
+    id: NodeId,
+    addr: &str,
+    theirs: &str,
+) -> Result<(), Status> {
+    if theirs.is_empty() || theirs != ours {
+        return Err(Status::failed_precondition(format!(
+            "the server at {addr} reports cluster id `{theirs}`, not this cluster's `{ours}`: \
+             it is not member {id} of this cluster"
+        )));
+    }
+    Ok(())
+}
+
 fn check_extractors(ctx: &Ctx, id: NodeId, addr: &str, theirs: &str) -> Result<(), Status> {
     if theirs != ctx.info.extractors_hash {
         return Err(Status::failed_precondition(format!(
@@ -684,8 +703,22 @@ async fn update_advertise_guarded(ctx: &Ctx, id: NodeId, addr: &str) -> Result<u
         tracing::info!(node = id, addr, "update-advertise: already this address");
         return Ok(membership_index(&m));
     }
+    // Another member's recorded address, even while that member is down:
+    // two members at one address would send one's traffic to the other.
+    if let Some((other, _)) = m
+        .membership_config
+        .membership()
+        .nodes()
+        .find(|(o, n)| **o != id && n.addr == addr)
+    {
+        return Err(Status::failed_precondition(format!(
+            "{addr} is the recorded address of member {other}; a member's address must be its \
+             own (remove member {other} first if it moved away for good)"
+        )));
+    }
     let old = node.addr.clone();
-    probe_node(ctx, id, addr).await?;
+    let st = probe_node(ctx, id, addr).await?;
+    check_moved_member_cluster(&ctx.info.cluster_id(), id, addr, &st.cluster_id)?;
     let log_index = ctx.raft.set_node_addr(id, addr).await.map_err(status)?;
     tracing::info!(node = id, from = %old, to = addr, log_index, "updated a member's address");
     Ok(log_index)
@@ -1103,5 +1136,23 @@ impl pb::admin_server::Admin for AdminService {
         Ok(Response::new(pb::MetricsResponse {
             text: crate::observe::render(&self.ctx),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_moved_member_cluster;
+
+    /// Dev review 4: a moved member must report this cluster's id; an
+    /// empty or a different one is refused.
+    #[test]
+    fn update_advertise_probe_requires_a_matching_cluster_id() {
+        assert!(check_moved_member_cluster("abc", 3, "h:1", "abc").is_ok());
+        for theirs in ["", "other"] {
+            let e = check_moved_member_cluster("abc", 3, "h:1", theirs).unwrap_err();
+            assert_eq!(e.code(), tonic::Code::FailedPrecondition);
+            assert!(e.message().contains("not member 3"), "{}", e.message());
+        }
+        assert!(check_moved_member_cluster("", 3, "h:1", "").is_err());
     }
 }

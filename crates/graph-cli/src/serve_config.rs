@@ -5,7 +5,8 @@
 //! snake_case (`data-dir` or `data_dir`), plus the global `db` and
 //! `cache-bytes` that `serve` uses. Values are what the flag takes: a
 //! string, a number, `true`/`false` for a switch (false: not given), an
-//! array for a list (`peers = ["a:7000", "b:7000"]`). Precedence, highest
+//! array for a list (`peers = ["a:7000", "b:7000"]`, passed as one
+//! `--peers=<item>` per item, like the repeated flag). Precedence, highest
 //! first: a flag on the command line, its environment variable (the few
 //! flags that have one, e.g. `MEMORY_GRAPH_LOG`), the file, the built-in
 //! default. Relative paths in the file are relative to the working
@@ -31,9 +32,12 @@ const GLOBALS: [&str; 2] = ["db", "cache-bytes"];
 
 /// `args` with the settings of `serve --config <file>` appended (see the
 /// module docs); unchanged for any other command, without `--config`, or
-/// when clap rejects `args` as they are (it then reports that itself).
+/// when clap cannot read `args` even leniently (it then reports that
+/// itself). The command line is read with `ignore_errors`: it may be
+/// incomplete on its own (`--bootstrap` requires `--data-dir`, which the
+/// file gives), and the full parse after the merge checks the whole.
 pub fn apply(cmd: &Command, args: Vec<OsString>) -> Result<Vec<OsString>> {
-    let Ok(top) = cmd.clone().try_get_matches_from(&args) else {
+    let Ok(top) = cmd.clone().ignore_errors(true).try_get_matches_from(&args) else {
         return Ok(args);
     };
     let Some(("serve", sm)) = top.subcommand() else {
@@ -116,10 +120,14 @@ fn settings(cmd: &Command, sm: &clap::ArgMatches, text: &str) -> Result<Vec<OsSt
         match value {
             toml::Value::Array(items) => {
                 let items: Vec<String> = items.iter().map(scalar).collect::<Result<_>>()?;
-                match arg.get_value_delimiter() {
-                    Some(d) => out.push(format!("{flag}={}", items.join(&d.to_string())).into()),
-                    None => bail!("`{key}` takes one value, not a list"),
+                // One `--flag=v` per item, as a repeated flag is typed (no
+                // joining, so an item is never re-split or merged).
+                let list = arg.get_value_delimiter().is_some()
+                    || matches!(arg.get_action(), clap::ArgAction::Append);
+                if !list {
+                    bail!("`{key}` takes one value, not a list");
                 }
+                out.extend(items.iter().map(|i| OsString::from(format!("{flag}={i}"))));
             }
             v => out.push(format!("{flag}={}", scalar(v)?).into()),
         }
@@ -199,7 +207,8 @@ mod tests {
                 "--bootstrap",
                 "--db=x.redb",
                 "--listen=0.0.0.0:7000",
-                "--peers=a:1,b:2"
+                "--peers=a:1",
+                "--peers=b:2"
             ]
         );
     }

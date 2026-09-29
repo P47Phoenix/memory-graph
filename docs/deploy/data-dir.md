@@ -78,9 +78,35 @@ memory-graph serve --data-dir ./n3 --listen 0.0.0.0:7013 --update-advertise host
 Once it serves at the new address, the node asks the leader (through itself or any member its
 membership lists) to record the address: the leader asks the server there who it is (it must be
 this node, of this cluster, with the same extractors) and commits one membership entry that
-replaces the address (voters and learners unchanged). Only then is `node.json` rewritten. If no
+replaces the address (voters and learners unchanged). An address another member has recorded,
+even one that is down, is refused. Only then is `node.json` rewritten. If no
 leader accepts it within 2 minutes, the start fails and `node.json` keeps the old address; run the
 same command again. A plain `--advertise` with another address is still refused. Until the leader
 has the new address it cannot reach the node, so move one node at a time and let it rejoin before
 the next. Removing the node (`cluster remove <id>`), wiping its directory and joining again under
 the new address also works, at the cost of a full copy.
+
+**A crash mid-move.** If the node stops after the cluster committed the new address but before
+`node.json` was rewritten, `node.json` still names the old address while the membership (in the
+node's own log) names the new one. A plain restart then refuses to start, because it would serve at
+the old address while the leader replicates to the new one:
+
+```text
+this node's address in node.json is host3:7003, but the cluster's membership records node 3 at
+host3:7013 (an --update-advertise that stopped after the cluster committed it); restart with
+--update-advertise host3:7013, listening where host3:7013 reaches, to finish the move
+```
+
+Run the command it names (the one you ran before, with the same `--update-advertise`). The leader
+already has that address, so it only confirms it, and then `node.json` is rewritten. To go back to
+the old address instead, run `--update-advertise <old address>`.
+
+## Stopping a node
+
+A graceful stop drains in-flight requests, shuts Raft down and closes the store, then removes
+`LOCK`. It is triggered by Ctrl-C or SIGTERM (`docker stop`, Kubernetes) on Unix, and by Ctrl-C or
+Ctrl-Break on Windows. A supervisor on Windows starts the server in its own process group
+(`CREATE_NEW_PROCESS_GROUP`) and sends it Ctrl-Break (Python:
+`proc.send_signal(signal.CTRL_BREAK_EVENT)`), as `scripts/cluster_soak.py` does. `taskkill /F` and
+`TerminateProcess` are kills: the node recovers from its log on the next start, but it does not
+drain.
