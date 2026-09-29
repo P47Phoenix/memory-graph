@@ -27,7 +27,7 @@
 //! Type (it has no name of its own), so its functions and variables have
 //! no class container; anonymous `enum { ... }` is not a symbol; a
 //! statement after `;` on a block header line belongs to that block.
-use graph_core::scan::{code_index, indent_block, matching_close, span_between};
+use graph_core::scan::{code_close_table, code_index, indent_block, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -68,6 +68,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut s = Scanner {
         tokens,
         code: &code,
+        closes: code_close_table(tokens, &code),
         out: Vec::new(),
         class_name: None,
         depth: 0,
@@ -89,6 +90,8 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
+    /// [`code_close_table`] of `code`: closers found in one linear pass.
+    closes: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
     class_name: Option<String>,
     /// Current inner-class nesting.
@@ -179,9 +182,7 @@ impl Scanner<'_> {
                 c += 2;
                 if standalone {
                     if c < hi && self.text(c) == "(" {
-                        match matching_close(self.tokens, self.code[c])
-                            .and_then(|cl| self.code.binary_search(&cl).ok())
-                        {
+                        match self.closes[c] {
                             Some(cl) if cl < hi => c = cl + 1,
                             _ => break,
                         }
@@ -190,9 +191,7 @@ impl Scanner<'_> {
                     continue;
                 }
                 if c < hi && self.text(c) == "(" {
-                    match matching_close(self.tokens, self.code[c])
-                        .and_then(|cl| self.code.binary_search(&cl).ok())
-                    {
+                    match self.closes[c] {
                         Some(cl) if cl < hi => c = cl + 1,
                         _ => break,
                     }

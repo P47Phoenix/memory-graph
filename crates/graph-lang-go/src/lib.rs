@@ -23,7 +23,7 @@
 //! automatic semicolon. Function bodies, struct fields and interface
 //! methods are not scanned. A multi-name spec (`var a, b = 1, 2`) yields one
 //! symbol named by its first name. Odd input never sets `has_errors`.
-use graph_core::scan::{code_index, matching_close, span_between};
+use graph_core::scan::{code_close_table, code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -48,6 +48,7 @@ impl Extractor for GoExtractor {
         let mut s = Scanner {
             tokens: &tokens,
             code: &code,
+            closes: code_close_table(&tokens, &code),
             out: Vec::new(),
         };
         s.file();
@@ -63,6 +64,8 @@ impl Extractor for GoExtractor {
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
+    /// [`code_close_table`] of `code`: closers found in one linear pass.
+    closes: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
 }
 
@@ -80,8 +83,7 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     fn push(&mut self, n: usize, kind: SymbolKind, lang: &str, first: usize, last: usize) {

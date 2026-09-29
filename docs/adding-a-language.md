@@ -19,7 +19,7 @@ These `graph-core` items are the stable surface for extractors:
 | `SymbolDecl` | `name`, `kind: SymbolKind`, `lang_kind: Option<String>`, `span` |
 | `TokenDecl`, `Span`, `TokenClass`, `SymbolKind` | schema types |
 | `tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION}` | the shared tokenizer |
-| `scan::{Cursor, matching_close, span_between, code_index, keyword_block, indent_block, line_iter}` | helpers for token-stream scanners |
+| `scan::{Cursor, matching_close, close_table, code_close_table, span_between, code_index, keyword_block, indent_block, line_iter}` | helpers for token-stream scanners |
 
 ### `Extractor`
 
@@ -119,6 +119,17 @@ generators such as tree-sitter: the pure-Rust gate forbids them).
   comments, and `skip_balanced` to jump over a `(...)`, `[...]` or `{...}` group.
 - `matching_close(tokens, i)` — index of the delimiter closing `tokens[i]`,
   ignoring delimiters inside literals and comments; `None` if unbalanced.
+  It scans forward from `i`, so calling it for every opener is quadratic on
+  long unbalanced runs such as 100k `(`: scanners that look up closers
+  in a loop should build a table once instead.
+- `close_table(tokens)` — `matching_close` for every token in one linear
+  pass (`close_table(tokens)[i] == matching_close(tokens, i)`, proptested).
+- `code_close_table(tokens, code)` — the same, indexed by code position for
+  scanners that walk a `code` index (from `code_index` or their own filter):
+  entry `c` is the code position closing `tokens[code[c]]`, or `None` if it
+  does not close or its closer is not in `code`. Build it once and store it
+  in the scanner; this is what the C#, Go, Scala, F#, GDScript, R, SQL,
+  JavaScript/TypeScript and Java scanners do.
 - `span_between(a, b)` — the span from the start of `a` to the end of `b`.
 - `code_index(tokens, skip)` — indices of tokens whose class is not in
   `skip` (e.g. `&[TokenClass::Comment]`).

@@ -32,7 +32,7 @@
 //! function; a declaration whose continuation lines are indented less than
 //! its first token ends early. Bodies nested deeper than 64 levels are not
 //! scanned.
-use graph_core::scan::{code_index, matching_close, span_between};
+use graph_core::scan::{code_close_table, code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -57,6 +57,7 @@ impl Extractor for ScalaExtractor {
         let mut s = Scanner {
             tokens: &tokens,
             code: &code,
+            closes: code_close_table(&tokens, &code),
             out: Vec::new(),
             depth: 0,
         };
@@ -110,6 +111,8 @@ enum Ctx {
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
+    /// [`code_close_table`] of `code`: closers found in one linear pass.
+    closes: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
     depth: usize,
 }
@@ -128,8 +131,7 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     fn adjacent(&self, a: usize, b: usize) -> bool {

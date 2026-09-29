@@ -29,7 +29,7 @@
 //! reported as its own symbol; a dollar-quoted body is tokenized as SQL code,
 //! so an unbalanced `'` inside it can swallow what follows (a tokenizer
 //! limit); `ALTER` statements and T-SQL `#temp` names are not symbols.
-use graph_core::scan::{matching_close, span_between};
+use graph_core::scan::{code_close_table, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -74,6 +74,7 @@ pub fn symbols(source: &str, tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut s = Scanner {
         tokens,
         code: &code,
+        closes: code_close_table(tokens, &code),
         boundary: &boundary,
         out: Vec::new(),
     };
@@ -182,6 +183,8 @@ const CREATE_MODIFIERS: &[&str] = &[
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
+    /// [`code_close_table`] of `code`: closers found in one linear pass.
+    closes: Vec<Option<usize>>,
     boundary: &'a [bool],
     out: Vec<SymbolDecl>,
 }
@@ -228,8 +231,7 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     /// A dollar-quote opener (`$$` or `$tag$`) at `c`: returns the code

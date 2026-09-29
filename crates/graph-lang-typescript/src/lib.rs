@@ -62,7 +62,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let s = Scanner {
         tokens,
         code: &code,
-        closes: graph_lang_javascript::close_table(tokens, &code),
+        closes: graph_core::scan::code_close_table(tokens, &code),
     };
     s.scan(&mut out);
     out.sort_by(|a, b| {

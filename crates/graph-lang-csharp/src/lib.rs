@@ -25,7 +25,7 @@
 //! fixed-size buffers (`fixed byte b[4];`) and top-level local functions are
 //! not symbols; a string nested inside an interpolation hole (`$"{"x"}"`)
 //! ends the literal early (a tokenizer limit).
-use graph_core::scan::{matching_close, span_between};
+use graph_core::scan::{code_close_table, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -69,7 +69,9 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut s = Scanner {
         tokens,
         code: &code,
+        closes: code_close_table(tokens, &code),
         out: Vec::new(),
+        depth: 0,
     };
     s.body(0, code.len(), &Level::Namespace);
     s.out
@@ -136,8 +138,18 @@ struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     /// Indices into `tokens` of code tokens.
     code: &'a [usize],
+    /// [`code_close_table`] of `code`: closers found in one linear pass.
+    closes: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
+    /// Nesting of `body` calls, capped at [`MAX_DEPTH`].
+    depth: usize,
 }
+
+/// Deepest nesting of namespace and type bodies scanned. Deeper
+/// declarations are not reported, their enclosing ones are: this bounds the
+/// recursion so adversarial input (thousands of nested `namespace a {`)
+/// cannot overflow the indexer thread's stack.
+pub const MAX_DEPTH: usize = 256;
 
 /// How a declaration header ended.
 enum End {
@@ -163,8 +175,7 @@ impl Scanner<'_> {
 
     /// Code position of the token matching the delimiter at code position `c`.
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     /// `=` directly followed by `>`.
@@ -177,6 +188,15 @@ impl Scanner<'_> {
 
     /// Declarations in code positions `[lo, hi)`.
     fn body(&mut self, lo: usize, hi: usize, level: &Level) {
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.depth += 1;
+        self.body_level(lo, hi, level);
+        self.depth -= 1;
+    }
+
+    fn body_level(&mut self, lo: usize, hi: usize, level: &Level) {
         let mut c = lo;
         while c < hi {
             match self.text(c) {

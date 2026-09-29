@@ -235,3 +235,70 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// Run `f` on a thread with the indexer's 2 MB stack, so recursion that
+/// grows with nesting depth overflows here as it would in production.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// #133: 5000 nested `namespace a {` used to overflow the stack.
+#[test]
+fn deep_nesting_is_capped_not_a_stack_overflow() {
+    let n = 20_000;
+    for (open, balanced) in [
+        ("namespace a {", true),
+        ("namespace a {", false),
+        ("class A {", true),
+        ("class A {", false),
+        ("namespace a;", false),
+    ] {
+        let mut src = open.repeat(n);
+        if balanced {
+            src.push_str(&"}".repeat(n));
+        }
+        let ex = on_small_stack(move || CSharpExtractor.extract(&src));
+        assert!(!ex.symbols.is_empty(), "{open}");
+        assert!(
+            ex.symbols.len() <= MAX_DEPTH,
+            "{open}: {}",
+            ex.symbols.len()
+        );
+        assert_eq!(ex.symbols[0].span.start, 0, "{open}");
+    }
+}
+
+/// Nesting just under the cap is still reported in full.
+#[test]
+fn nesting_below_the_cap_is_unchanged() {
+    let n = MAX_DEPTH - 1;
+    let src = format!("{}{}", "namespace a {".repeat(n), "}".repeat(n));
+    let ex = on_small_stack(move || CSharpExtractor.extract(&src));
+    assert_eq!(ex.symbols.len(), n);
+}
+
+/// Nesting at the cap is reported in full; one level deeper drops only the
+/// innermost namespace.
+#[test]
+fn nesting_at_and_past_the_cap() {
+    for (n, expected) in [(MAX_DEPTH, MAX_DEPTH), (MAX_DEPTH + 1, MAX_DEPTH)] {
+        let src = format!("{}{}", "namespace a {".repeat(n), "}".repeat(n));
+        let ex = on_small_stack(move || CSharpExtractor.extract(&src));
+        assert_eq!(ex.symbols.len(), expected, "n = {n}");
+    }
+}
+
+/// Depth is restored after each body: many siblings are all scanned.
+#[test]
+fn siblings_do_not_accumulate_depth() {
+    let n = MAX_DEPTH + 44;
+    let src = format!("namespace N {{ {} }}", "class A { void M(){} } ".repeat(n));
+    let ex = CSharpExtractor.extract(&src);
+    let methods = ex.symbols.iter().filter(|s| s.name.ends_with("M")).count();
+    assert_eq!(methods, n);
+}
