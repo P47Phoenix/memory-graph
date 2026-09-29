@@ -3048,9 +3048,21 @@ impl V2Store {
         files: Vec<PreparedFile>,
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
+        Ok(self.index_prepared_counted(org, repo, files, opts)?.0)
+    }
+
+    /// See [`Store::index_prepared_counted`]: `index_prepared` plus how many
+    /// redb write transactions it committed.
+    fn index_prepared_counted(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<(Vec<Result<IngestStats>>, u64)> {
         let n = files.len();
         let mut it = files.into_iter();
-        self.commit_each(org, repo, n, opts, self.chunk_bytes, None, |_, _| {
+        self.commit_each_counted(org, repo, n, opts, self.chunk_bytes, None, |_, _| {
             Ok(it.next().expect("one prepared file per slot"))
         })
     }
@@ -3071,8 +3083,26 @@ impl V2Store {
         opts: IndexOptions,
         chunk_bytes: usize,
         marker: Option<(RaftMarker, Option<&[u8]>)>,
-        mut next: impl FnMut(&redb::WriteTransaction, usize) -> Result<PreparedFile>,
+        next: impl FnMut(&redb::WriteTransaction, usize) -> Result<PreparedFile>,
     ) -> Result<Vec<Result<IngestStats>>> {
+        Ok(self
+            .commit_each_counted(org, repo, n, opts, chunk_bytes, marker, next)?
+            .0)
+    }
+
+    /// `commit_each`, also returning how many write transactions committed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_each_counted(
+        &self,
+        org: &str,
+        repo: &str,
+        n: usize,
+        opts: IndexOptions,
+        chunk_bytes: usize,
+        marker: Option<(RaftMarker, Option<&[u8]>)>,
+        mut next: impl FnMut(&redb::WriteTransaction, usize) -> Result<PreparedFile>,
+    ) -> Result<(Vec<Result<IngestStats>>, u64)> {
+        let mut commits = 0u64;
         // A marked batch is one transaction whatever the caller passed: its
         // marker must commit atomically with all of its data.
         let chunk_bytes = if marker.is_some() {
@@ -3114,6 +3144,7 @@ impl V2Store {
             in_txn += len;
             if in_txn >= chunk_bytes {
                 wt.commit()?;
+                commits += 1;
                 wt = self.db.begin_write()?;
                 // This chunk is not (yet) known to be the batch's last, so
                 // re-stamp the marker in the new transaction; if it turns out
@@ -3131,7 +3162,7 @@ impl V2Store {
             self.before_marked_commit(m)?;
         }
         wt.commit()?;
-        Ok(out)
+        Ok((out, commits + 1))
     }
 
     /// Allocate the next monotonic batch id from `meta.next_batch_id`,
@@ -3648,6 +3679,15 @@ impl Store for V2Store {
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>> {
         V2Store::index_prepared(self, org, repo, files, opts)
+    }
+    fn index_prepared_counted(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<(Vec<Result<IngestStats>>, u64)> {
+        V2Store::index_prepared_counted(self, org, repo, files, opts)
     }
     fn prune_files(
         &self,

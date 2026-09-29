@@ -426,6 +426,20 @@ pub trait Store: StoreRead + Send + Sync {
         opts: IndexOptions,
     ) -> Result<Vec<Result<IngestStats>>>;
 
+    /// `index_prepared`, also returning how many write transactions it
+    /// committed (a call is split into chunk-sized transactions, so this can
+    /// be more than one). The default counts the call as one: a remote store
+    /// sends it as one request and its commits happen on the server.
+    fn index_prepared_counted(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<PreparedFile>,
+        opts: IndexOptions,
+    ) -> Result<(Vec<Result<IngestStats>>, u64)> {
+        Ok((self.index_prepared(org, repo, files, opts)?, 1))
+    }
+
     /// Remove directory-run files of `org/repo` not in `keep` (or report them
     /// with `dry_run`). Returns the removed paths.
     fn prune_files(

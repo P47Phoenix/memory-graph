@@ -125,10 +125,11 @@ fn invalid_span_fails_one_file_and_exits_nonzero() {
     assert_eq!(v["files"], 1);
 }
 
-/// A panicking extractor mid-run stops the run with an error naming the file,
-/// without hanging, for any `jobs`; the same whole batches stay committed.
+/// A panicking extractor mid-run fails that one file (#82), without hanging,
+/// for any `jobs` and batching: every other file is stored, the run exits
+/// nonzero naming the file, and `--prune` is skipped.
 #[test]
-fn extractor_panic_stops_the_run_for_any_jobs() {
+fn extractor_panic_fails_one_file_for_any_jobs() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path().join("src");
     std::fs::create_dir(&dir).unwrap();
@@ -136,9 +137,8 @@ fn extractor_panic_stops_the_run_for_any_jobs() {
         let body = if i == 400 { "panic" } else { "fine" };
         std::fs::write(dir.join(format!("f{i:04}.zig")), body).unwrap();
     }
-    let mut stored = Vec::new();
-    for jobs in [1, 8] {
-        let db = d.path().join(format!("g{jobs}.redb"));
+    for (jobs, deterministic) in [(1, true), (8, true), (1, false), (8, false)] {
+        let db = d.path().join(format!("g{jobs}{deterministic}.redb"));
         let mut out = Vec::new();
         let r = index_dir(
             DirOpts {
@@ -154,7 +154,7 @@ fn extractor_panic_stops_the_run_for_any_jobs() {
                 jobs,
                 progress: Some(false),
                 memory: None,
-                deterministic: true,
+                deterministic,
                 stats: false,
                 trace: None,
                 disk_probe: None,
@@ -167,12 +167,84 @@ fn extractor_panic_stops_the_run_for_any_jobs() {
             &mut out,
         );
         let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("1 file(s) failed"), "{err}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("failed=1"), "{text}");
         assert!(
-            err.contains("f0400.zig") && err.contains("panicked"),
-            "{err}"
+            text.contains("  failed: f0400.zig: extractor panicked: extractor panics"),
+            "{text}"
         );
         let s = V2Store::open(&db).unwrap();
-        stored.push(s.count_nodes(NodeKind::File).unwrap());
+        assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 599, "jobs {jobs}");
+        assert!(s.file_tokens("o", "r", "f0400.zig").unwrap().is_none());
     }
-    assert_eq!(stored, [256, 256], "whole batches before the panic");
+}
+
+/// Make reading `path` fail for this process: no permissions on unix, an
+/// exclusive (no sharing) handle on Windows. `None` when the platform lets
+/// the read through anyway (running as root).
+fn make_unreadable(path: &Path) -> Option<Box<dyn std::any::Any>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(path).is_ok() {
+            return None;
+        }
+        Some(Box::new(()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let h = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap();
+        assert!(
+            std::fs::read(path).is_err(),
+            "exclusive handle blocks reads"
+        );
+        Some(Box::new(h))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// A file that cannot be read is skipped as unreadable and blocks `--prune`
+/// (#82: the writer's `walk_errors |= unreadable` had no test), so a
+/// transient read failure never deletes stored files.
+#[test]
+fn unreadable_file_blocks_prune() {
+    let d = tempfile::tempdir().unwrap();
+    let (db, dir) = (d.path().join("g.redb"), d.path().join("src"));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("gone.txt"), "gone\n").unwrap();
+    std::fs::write(dir.join("locked.txt"), "locked\n").unwrap();
+    let (r, _) = run(&db, &dir, false, false);
+    r.unwrap();
+    std::fs::remove_file(dir.join("gone.txt")).unwrap();
+    let locked = dir.join("locked.txt");
+    let Some(guard) = make_unreadable(&locked) else {
+        eprintln!("skipped: this process can read any file");
+        return;
+    };
+    let (r, text) = run(&db, &dir, false, true);
+    drop(guard);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644));
+    }
+    r.unwrap();
+    assert!(text.contains("skipped (unreadable): 1"), "{text}");
+    assert!(text.contains("pruned=0"), "{text}");
+    let s = V2Store::open(&db).unwrap();
+    assert!(
+        s.file_tokens("o", "r", "gone.txt").unwrap().is_some(),
+        "--prune was skipped"
+    );
 }
