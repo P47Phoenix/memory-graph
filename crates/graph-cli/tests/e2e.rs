@@ -2464,15 +2464,20 @@ fn memory_share_follows_free_ram() {
             / growth) as u64;
         // `available` is the end-of-run sample: allow free memory to have
         // moved by a quarter meanwhile (other tests run alongside).
+        // The floor scales with the host (#94): 256M on big hosts, else
+        // FLOOR_SHARE of total at the growth estimate (1x..64x over a run).
+        use graph_cli::sysinfo::{FLOOR, FLOOR_SHARE};
+        let floor_at = |x: f64| FLOOR.min((total as f64 * FLOOR_SHARE / x) as u64);
+        let (floor_lo, floor_hi) = (floor_at(64.0), floor_at(1.0));
         assert!(
-            cap <= bound.max(256 << 20) * 5 / 4,
+            cap <= bound.max(floor_hi) * 5 / 4,
             "cap {cap} bound {bound}: {m}"
         );
         let reason = m["reason"].as_str().unwrap();
         // A loaded machine may already be under pressure; then the reason
         // says so and the cap only shrinks.
         if m["pressure_episodes"] == 0 {
-            assert!(cap >= (256 << 20).min(total / 2), "{m}");
+            assert!(cap >= floor_lo.min(total / 2), "{m}");
             assert!(reason.contains("10%"), "{m}");
         } else {
             assert!(reason.contains("pressure"), "{m}");
