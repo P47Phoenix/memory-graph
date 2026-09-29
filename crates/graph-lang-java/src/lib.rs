@@ -23,6 +23,8 @@
 use graph_core::scan::{code_close_table, code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 pub struct JavaExtractor;
 
@@ -62,6 +64,8 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         out: Vec::new(),
         depth: 0,
         closes: code_close_table(tokens, &code),
+        header_fails: RefCell::default(),
+        semis: RefCell::default(),
     };
     s.body(0, code.len(), &Level::File);
     s.out
@@ -102,6 +106,10 @@ struct Scanner<'a> {
     depth: usize,
     /// [`code_close_table`] of `code`.
     closes: Vec<Option<usize>>,
+    /// `(c, hi)` from which [`Scanner::header_end`] fails.
+    header_fails: RefCell<HashSet<(usize, usize)>>,
+    /// `(c, hi)` -> [`Scanner::semi_after`] from `c`.
+    semis: RefCell<HashMap<(usize, usize), Option<usize>>>,
 }
 
 /// Deepest nesting of type bodies scanned. Deeper declarations are not
@@ -167,9 +175,34 @@ impl Scanner<'_> {
 
     /// Where the declaration starting at `start` ends, and the position
     /// after it; `None` if the input is unbalanced or ends first.
+    ///
+    /// The scan depends only on the position and `hi`, so a failed scan
+    /// records every position it passed and a later scan reaching one fails
+    /// at once: resynchronizing one token later stays linear on long runs
+    /// with no terminator (#146).
     fn header_end(&self, start: usize, hi: usize) -> Option<(End, usize)> {
+        let mut visited = Vec::new();
+        let r = self.header_end_scan(start, hi, &mut visited);
+        if r.is_none() {
+            self.header_fails
+                .borrow_mut()
+                .extend(visited.into_iter().map(|c| (c, hi)));
+        }
+        r
+    }
+
+    fn header_end_scan(
+        &self,
+        start: usize,
+        hi: usize,
+        visited: &mut Vec<usize>,
+    ) -> Option<(End, usize)> {
         let mut c = start;
         while c < hi {
+            if self.header_fails.borrow().contains(&(c, hi)) {
+                return None;
+            }
+            visited.push(c);
             match self.text(c) {
                 "(" | "[" => c = self.close_of(c).filter(|&p| p < hi)? + 1,
                 // A field initializer (`int[] a = { 1 };`, anonymous classes).
@@ -193,8 +226,24 @@ impl Scanner<'_> {
     }
 
     /// The `;` ending an expression starting at `c`, groups skipped.
-    fn semi_after(&self, mut c: usize, hi: usize) -> Option<usize> {
+    /// Memoized by position (every position the scan passes has the same
+    /// answer), so repeated calls over one unterminated run stay linear.
+    fn semi_after(&self, c: usize, hi: usize) -> Option<usize> {
+        let mut visited = Vec::new();
+        let r = self.semi_after_scan(c, hi, &mut visited);
+        let mut memo = self.semis.borrow_mut();
+        for v in visited {
+            memo.insert((v, hi), r);
+        }
+        r
+    }
+
+    fn semi_after_scan(&self, mut c: usize, hi: usize, visited: &mut Vec<usize>) -> Option<usize> {
         while c < hi {
+            if let Some(&r) = self.semis.borrow().get(&(c, hi)) {
+                return r;
+            }
+            visited.push(c);
             match self.text(c) {
                 "(" | "[" | "{" => c = self.close_of(c).filter(|&p| p < hi)? + 1,
                 ";" => return Some(c),

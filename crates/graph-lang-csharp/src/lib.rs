@@ -28,6 +28,11 @@
 use graph_core::scan::{code_close_table, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
+/// `(c, hi)` -> `expression_end` from `c`.
+type ExprMemo = RefCell<HashMap<(usize, usize), Option<(usize, usize)>>>;
 
 pub struct CSharpExtractor;
 
@@ -72,6 +77,8 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         closes: code_close_table(tokens, &code),
         out: Vec::new(),
         depth: 0,
+        header_fails: RefCell::default(),
+        expr_ends: RefCell::default(),
     };
     s.body(0, code.len(), &Level::Namespace);
     s.out
@@ -89,6 +96,8 @@ pub fn member_symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         closes: code_close_table(tokens, &code),
         out: Vec::new(),
         depth: 0,
+        header_fails: RefCell::default(),
+        expr_ends: RefCell::default(),
     };
     s.body(0, code.len(), &Level::Type(String::new()));
     s.out
@@ -160,6 +169,10 @@ struct Scanner<'a> {
     out: Vec<SymbolDecl>,
     /// Nesting of `body` calls, capped at [`MAX_DEPTH`].
     depth: usize,
+    /// `(c, hi, operator)` states from which [`Scanner::header_end`] fails.
+    header_fails: RefCell<HashSet<(usize, usize, bool)>>,
+    /// `(c, hi)` -> [`Scanner::expression_end`] from `c`.
+    expr_ends: ExprMemo,
 }
 
 /// Deepest nesting of namespace and type bodies scanned. Deeper
@@ -241,10 +254,38 @@ impl Scanner<'_> {
 
     /// Find where the declaration starting at `start` ends. Returns the end
     /// and the code position after it; `None` if input is unbalanced or ends.
+    ///
+    /// Past `start` the scan depends only on the position, `hi` and whether
+    /// it saw `operator`, so a failed scan records the states it passed and
+    /// a later scan reaching one fails at once: the caller's
+    /// resynchronize-one-token-later loop stays linear on long runs with no
+    /// terminator such as `<div>` or `"` (#146).
     fn header_end(&self, start: usize, hi: usize) -> Option<(End, usize)> {
+        let mut visited = Vec::new();
+        let r = self.header_end_scan(start, hi, &mut visited);
+        if r.is_none() {
+            self.header_fails
+                .borrow_mut()
+                .extend(visited.into_iter().map(|(c, op)| (c, hi, op)));
+        }
+        r
+    }
+
+    fn header_end_scan(
+        &self,
+        start: usize,
+        hi: usize,
+        visited: &mut Vec<(usize, bool)>,
+    ) -> Option<(End, usize)> {
         let mut c = start;
         let mut operator = false;
         while c < hi {
+            if c > start {
+                if self.header_fails.borrow().contains(&(c, hi, operator)) {
+                    return None;
+                }
+                visited.push((c, operator));
+            }
             match self.text(c) {
                 "(" | "[" => c = self.close_of(c)? + 1,
                 "operator" => {
@@ -310,8 +351,29 @@ impl Scanner<'_> {
 
     /// From an `=` or `=>` at `c`, the `;` ending the expression (braces,
     /// brackets and parens skipped as groups). Returns (`;` position, next).
-    fn expression_end(&self, mut c: usize, hi: usize) -> Option<(usize, usize)> {
+    /// Memoized by position (every position the scan passes has the same
+    /// answer), so repeated calls over one unterminated run stay linear.
+    fn expression_end(&self, c: usize, hi: usize) -> Option<(usize, usize)> {
+        let mut visited = Vec::new();
+        let r = self.expression_end_scan(c, hi, &mut visited);
+        let mut memo = self.expr_ends.borrow_mut();
+        for v in visited {
+            memo.insert((v, hi), r);
+        }
+        r
+    }
+
+    fn expression_end_scan(
+        &self,
+        mut c: usize,
+        hi: usize,
+        visited: &mut Vec<usize>,
+    ) -> Option<(usize, usize)> {
         while c < hi {
+            if let Some(&r) = self.expr_ends.borrow().get(&(c, hi)) {
+                return r;
+            }
+            visited.push(c);
             match self.text(c) {
                 "(" | "[" | "{" => c = self.close_of(c)? + 1,
                 ";" => return Some((c, c + 1)),

@@ -34,3 +34,48 @@ fn unbalanced_delimiter_runs_are_linear() {
         }
     }
 }
+
+/// Long runs of other openers that never close, each repeated 100k times
+/// (#142, #146): keyword blocks (`keyword_close_table`), generic lists and
+/// type aliases (`NestedEnds`, `TypeEnds`), and declarations with no
+/// terminator that made the C-family scanners resynchronize one token at a
+/// time, each resync scanning to the end of the file. Before the fix these
+/// took minutes in release (Elixir `def f do` x 40k: 99.5 s; TypeScript
+/// `type a = (` x 40k: 65.7 s; C# `<div>` x 40k: 23 s); linear scanners
+/// take a few seconds in debug. Every extractor gets every shape, so a
+/// quadratic path in any of them shows up here too.
+#[test]
+fn unclosed_keyword_and_declaration_runs_are_linear() {
+    let n = 100_000;
+    let shapes = [
+        "def f do\n",
+        "if x; then\n",
+        "function f() {\n",
+        "type a = (",
+        "type a = <",
+        "type a<",
+        "template <",
+        "a<",
+        "x = ",
+        "struct a {} ",
+        "<div>",
+        "\"",
+        "`",
+        "/*",
+        "if ",
+        "case ",
+        "<%",
+    ];
+    for ex in graph_cli::shipped_extractors() {
+        let lang = ex.language().to_string();
+        for shape in shapes {
+            // Rust is parsed by `syn`, still quadratic on this shape: a
+            // follow-up outside the token scanners.
+            if lang == "rust" && shape == "struct a {} " {
+                continue;
+            }
+            let took = time_extract(ex.as_ref(), shape.repeat(n));
+            assert!(took < Duration::from_secs(20), "{lang} {shape:?}: {took:?}");
+        }
+    }
+}

@@ -21,9 +21,10 @@
 //! arrow-typed variables. TSX is scanned like TypeScript; JSX text that
 //! looks like a regex or unbalanced braces can cut a scan short, never
 //! producing invalid spans or `has_errors`.
-use graph_core::scan::{code_index, span_between};
+use graph_core::scan::{code_index, span_between, NestedEnds, Step};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+use graph_lang_javascript::TypeEnds;
 
 pub struct TypeScriptExtractor;
 
@@ -59,10 +60,13 @@ impl Extractor for TypeScriptExtractor {
 pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut out = graph_lang_javascript::typescript_symbols(tokens);
     let code = code_index(tokens, &[TokenClass::Comment]);
+    let closes = graph_core::scan::code_close_table(tokens, &code);
     let s = Scanner {
         tokens,
         code: &code,
-        closes: graph_core::scan::code_close_table(tokens, &code),
+        closes: &closes,
+        types: TypeEnds::new(tokens, &code, &closes),
+        generics: NestedEnds::new(),
     };
     s.scan(&mut out);
     out.sort_by(|a, b| {
@@ -80,7 +84,11 @@ const PREFIXES: &[&str] = &["export", "default", "declare", "const"];
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
-    closes: Vec<Option<usize>>,
+    closes: &'a [Option<usize>],
+    /// Type ends, sharing their memo across declarations.
+    types: TypeEnds<'a>,
+    /// Ends of type-alias generic parameter lists.
+    generics: NestedEnds,
 }
 
 impl Scanner<'_> {
@@ -203,34 +211,23 @@ impl Scanner<'_> {
         }
         let mut eq = name + 1;
         if self.text(eq) == "<" {
-            let mut depth = 0usize;
-            loop {
-                match self.text(eq) {
-                    "<" => depth += 1,
-                    ">" => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    "(" | "[" | "{" => match self.close_of(eq) {
-                        Some(p) => eq = p,
-                        None => return,
-                    },
-                    ";" | ")" | "]" | "}" => return,
-                    _ => {}
-                }
-                eq += 1;
-                if eq >= hi {
-                    return;
-                }
-            }
-            eq += 1;
+            // Memoized, so a long run of `type a<` stays linear.
+            let close = self.generics.find(eq, hi, |c| match self.text(c) {
+                "<" => Step::Open,
+                ">" => Step::Close,
+                "(" | "[" | "{" => Step::Skip(self.close_of(c)),
+                ";" | ")" | "]" | "}" => Step::Stop,
+                _ => Step::Other,
+            });
+            let Some(close) = close else {
+                return;
+            };
+            eq = close + 1;
         }
         if eq + 1 >= hi || self.text(eq) != "=" || self.text(eq + 1) == ">" {
             return;
         }
-        let after = graph_lang_javascript::type_end(self.tokens, self.code, eq + 1, hi);
+        let after = self.types.type_end(eq + 1, hi);
         let last = if after < hi && self.text(after) == ";" {
             after
         } else if after > eq + 1 {

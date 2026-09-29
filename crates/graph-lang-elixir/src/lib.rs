@@ -32,7 +32,7 @@
 //! inside `~s(...)` can unbalance a block (the block then ends early or is
 //! found by indentation); declarations are recognised only at the start of
 //! a line (or after `;`).
-use graph_core::scan::{code_index, indent_block, keyword_block, span_between};
+use graph_core::scan::{code_index, indent_block, keyword_close_table, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -81,7 +81,7 @@ const FUNCS: &[&str] = &[
 pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let code = code_index(tokens, &[TokenClass::Comment]);
     // Drop block words that are keyword keys (`do:`), atoms (`:end`) or
-    // field names (`x.end`), so `keyword_block` sees only real blocks.
+    // field names (`x.end`), so the keyword block table sees only real blocks.
     let adj = |a: usize, b: usize| tokens[a].span.end == tokens[b].span.start;
     let keep: Vec<usize> = code
         .iter()
@@ -102,6 +102,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let toks: Vec<TokenDecl> = keep.iter().map(|&i| tokens[i].clone()).collect();
     let mut s = Scanner {
         toks: &toks,
+        blocks: keyword_close_table(&toks, PAIRS, false),
         out: Vec::new(),
         depth: 0,
     };
@@ -112,6 +113,8 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
 struct Scanner<'a> {
     /// Code tokens with non-block `do`/`end`/`fn` removed.
     toks: &'a [TokenDecl],
+    /// `keyword_close_table` of `toks` over [`PAIRS`].
+    blocks: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
     /// Current module nesting.
     depth: usize,
@@ -180,7 +183,7 @@ impl Scanner<'_> {
                 "(" | "[" | "{" => depth += 1,
                 ")" | "]" | "}" => depth = depth.saturating_sub(1),
                 "do" if depth == 0 => {
-                    let close = keyword_block(self.toks, q, PAIRS, false)?;
+                    let close = self.blocks[q]?;
                     return (close < hi).then_some((q, close));
                 }
                 _ => {}

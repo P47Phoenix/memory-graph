@@ -20,7 +20,7 @@
 //! computed members (`[Symbol.iterator]() {}`), class-field arrows
 //! (`x = () => {}`), object-literal methods, anonymous
 //! `module.exports = function () {}`.
-use graph_core::scan::{code_close_table, matching_close, span_between};
+use graph_core::scan::{code_close_table, matching_close, span_between, NestedEnds, Step};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::cell::Cell;
@@ -87,8 +87,39 @@ pub fn type_end(tokens: &[TokenDecl], code: &[usize], c: usize, hi: usize) -> us
         ts: true,
         depth: Cell::new(0),
         closes: None,
+        angles: NestedEnds::new(),
     }
     .type_end(c, hi)
+}
+
+/// [`type_end`] for many lookups over the same tokens: closers come from a
+/// [`code_close_table`] and generic-list ends are remembered between calls,
+/// so calling [`TypeEnds::type_end`] once per declaration stays linear on
+/// long unbalanced input (a fresh [`type_end`] call scans forward each
+/// time: `type a = (` x 40k took over a minute, #142).
+pub struct TypeEnds<'a> {
+    scanner: Scanner<'a>,
+}
+
+impl<'a> TypeEnds<'a> {
+    /// `closes` must be [`code_close_table`]`(tokens, code)`.
+    pub fn new(tokens: &'a [TokenDecl], code: &'a [usize], closes: &'a [Option<usize>]) -> Self {
+        Self {
+            scanner: Scanner {
+                tokens,
+                code,
+                ts: true,
+                depth: Cell::new(0),
+                closes: Some(closes),
+                angles: NestedEnds::new(),
+            },
+        }
+    }
+
+    /// See [`type_end`].
+    pub fn type_end(&self, c: usize, hi: usize) -> usize {
+        self.scanner.type_end(c, hi)
+    }
 }
 
 fn scan_tokens(tokens: &[TokenDecl], ts: bool) -> Vec<SymbolDecl> {
@@ -98,12 +129,14 @@ fn scan_tokens(tokens: &[TokenDecl], ts: bool) -> Vec<SymbolDecl> {
         .filter(|(_, t)| t.class != TokenClass::Comment)
         .map(|(i, _)| i)
         .collect();
+    let closes = code_close_table(tokens, &code);
     let s = Scanner {
         tokens,
         code: &code,
         ts,
         depth: Cell::new(0),
-        closes: Some(code_close_table(tokens, &code)),
+        closes: Some(&closes),
+        angles: NestedEnds::new(),
     };
     let mut out = Vec::new();
     s.scan(0, code.len(), &mut out);
@@ -140,7 +173,9 @@ struct Scanner<'a> {
     /// Nesting of `scan` calls, capped at [`MAX_DEPTH`].
     depth: Cell<usize>,
     /// [`code_close_table`], when built (else each lookup scans forward).
-    closes: Option<Vec<Option<usize>>>,
+    closes: Option<&'a [Option<usize>]>,
+    /// `(open, hi)` -> [`Scanner::angle_close`], filled as scans go.
+    angles: NestedEnds,
 }
 
 /// Deepest nesting of declarations scanned (classes in functions in
@@ -163,7 +198,7 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        if let Some(closes) = &self.closes {
+        if let Some(closes) = self.closes {
             return closes[c];
         }
         let close = matching_close(self.tokens, self.code[c])?;
@@ -444,26 +479,17 @@ impl Scanner<'_> {
     /// Code position of the `>` closing the generic list opened by `<` at
     /// `c` (groups skipped, the `>` of `=>` ignored); `None` at a `;`, a
     /// stray closer or the end of the range.
-    fn angle_close(&self, mut c: usize, hi: usize) -> Option<usize> {
-        let mut depth = 0usize;
-        while c < hi {
-            match self.text(c) {
-                "<" => depth += 1,
-                ">" if !(c > 0 && self.is_arrow(c - 1, hi)) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(c);
-                    }
-                }
-                "(" | "[" | "{" => {
-                    c = self.close_of(c).filter(|&p| p < hi)?;
-                }
-                ";" | ")" | "]" | "}" => return None,
-                _ => {}
-            }
-            c += 1;
-        }
-        None
+    ///
+    /// Memoized ([`NestedEnds`]), so looking up every `<` of a long
+    /// unclosed run (`type a = <` x 100k) stays linear.
+    fn angle_close(&self, open: usize, hi: usize) -> Option<usize> {
+        self.angles.find(open, hi, |c| match self.text(c) {
+            "<" => Step::Open,
+            ">" if !(c > 0 && self.is_arrow(c - 1, hi)) => Step::Close,
+            "(" | "[" | "{" => Step::Skip(self.close_of(c).filter(|&p| p < hi)),
+            ";" | ")" | "]" | "}" => Step::Stop,
+            _ => Step::Other,
+        })
     }
 
     /// See [`type_end`].

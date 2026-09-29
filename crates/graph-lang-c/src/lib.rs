@@ -39,9 +39,14 @@
 //! A `.h` file is C unless it uses C++-only syntax (`class X {`,
 //! `namespace X {`, `template <`, `public:`); then it is scanned with the
 //! C++ rules but keeps the language `c`.
-use graph_core::scan::span_between;
+use graph_core::scan::{span_between, NestedEnds, Step};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
+/// `(c, hi)` -> `expression_end` from `c`.
+type ExprMemo = RefCell<HashMap<(usize, usize), Option<(usize, usize)>>>;
 
 /// The C extractor (`.c`, `.h`).
 pub struct CExtractor;
@@ -102,6 +107,7 @@ fn extract(source: &str, dialect: TokenizerOptions, cpp: bool, sniff: bool) -> E
         out: macros,
         cpp,
         depth: 0,
+        memo: Memo::default(),
     };
     s.body(0, code.len(), &Level::File);
     let mut symbols = s.out;
@@ -271,6 +277,23 @@ struct Scanner<'a> {
     pairs: &'a [Option<usize>],
     /// Current body nesting depth (see [`MAX_DEPTH`]).
     depth: usize,
+    /// Memo of the forward scans, so that resynchronizing one token at a
+    /// time over input with no terminator stays linear (#146).
+    memo: Memo,
+}
+
+/// Results of forward scans that depend only on where they are (not on
+/// where they started), keyed by position and the range end `hi`.
+#[derive(Default)]
+struct Memo {
+    /// `(c, hi, flags)`: `header_end`, reaching `c` with these flags, fails.
+    header_fails: RefCell<HashSet<(usize, usize, u8)>>,
+    /// `(c, hi)` -> [`Scanner::expression_end`] from `c`.
+    expr: ExprMemo,
+    /// `(c, hi)` -> [`Scanner::semi_after_block`] from `c`.
+    semi: RefCell<HashMap<(usize, usize), Option<usize>>>,
+    /// `(open, hi)` -> [`Scanner::angle_end`].
+    angle: NestedEnds,
 }
 
 /// How a declaration header ended.
@@ -337,27 +360,17 @@ impl Scanner<'_> {
 
     /// The `>` closing the `<` at `open`, skipping bracket groups; `None`
     /// on `;`, `{`, `}` or the end of the range.
+    ///
+    /// Memoized ([`NestedEnds`]), so looking up every `<` of a long
+    /// unclosed run (`template <` x 100k) stays linear.
     fn angle_end(&self, open: usize, hi: usize) -> Option<usize> {
-        let mut depth = 0usize;
-        let mut c = open;
-        while c < hi {
-            match self.text(c) {
-                "<" => depth += 1,
-                ">" => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(c);
-                    }
-                }
-                "(" | "[" => {
-                    c = self.close_of(c).filter(|&x| x < hi)?;
-                }
-                ";" | "{" | "}" => return None,
-                _ => {}
-            }
-            c += 1;
-        }
-        None
+        self.memo.angle.find(open, hi, |c| match self.text(c) {
+            "<" => Step::Open,
+            ">" => Step::Close,
+            "(" | "[" => Step::Skip(self.close_of(c).filter(|&x| x < hi)),
+            ";" | "{" | "}" => Step::Stop,
+            _ => Step::Other,
+        })
     }
 
     /// Declarations in code positions `[lo, hi)`.
@@ -434,13 +447,46 @@ impl Scanner<'_> {
 
     /// Find where the declaration starting at `start` ends. Returns the end
     /// and the code position after it; `None` if input is unbalanced or ends.
+    ///
+    /// Past `start`, the scan depends only on the position, `hi` and its
+    /// four flags, so a failed scan records every state it passed through
+    /// and a later scan reaching one of them fails at once: the caller's
+    /// resynchronize-one-token-later loop stays linear on input with no
+    /// terminator (#146).
     fn header_end(&self, start: usize, hi: usize) -> Option<(End, usize)> {
+        let mut visited = Vec::new();
+        let r = self.header_end_scan(start, hi, &mut visited);
+        if r.is_none() {
+            self.memo
+                .header_fails
+                .borrow_mut()
+                .extend(visited.into_iter().map(|(c, f)| (c, hi, f)));
+        }
+        r
+    }
+
+    fn header_end_scan(
+        &self,
+        start: usize,
+        hi: usize,
+        visited: &mut Vec<(usize, u8)>,
+    ) -> Option<(End, usize)> {
         let mut c = start;
         let mut operator = false;
         let mut params = false;
         let mut init_list = false;
         let mut namespace = false;
         while c < hi {
+            if c > start {
+                let flags = u8::from(operator)
+                    | u8::from(params) << 1
+                    | u8::from(init_list) << 2
+                    | u8::from(namespace) << 3;
+                if self.memo.header_fails.borrow().contains(&(c, hi, flags)) {
+                    return None;
+                }
+                visited.push((c, flags));
+            }
             match self.text(c) {
                 "template" if c + 1 < hi && self.text(c + 1) == "<" => {
                     c = self.angle_end(c + 1, hi)? + 1;
@@ -499,17 +545,8 @@ impl Scanner<'_> {
                         return Some((block(close), close + 1));
                     }
                     // A type body or brace initializer: runs to its `;`.
-                    let mut k = close + 1;
-                    while k < hi {
-                        match self.text(k) {
-                            "(" | "[" | "{" => match self.close_of(k) {
-                                Some(x) if x < hi => k = x + 1,
-                                _ => break,
-                            },
-                            ";" => return Some((block(k), k + 1)),
-                            "}" => break,
-                            _ => k += 1,
-                        }
+                    if let Some(k) = self.semi_after_block(close + 1, hi) {
+                        return Some((block(k), k + 1));
                     }
                     return Some((block(close), close + 1));
                 }
@@ -531,8 +568,29 @@ impl Scanner<'_> {
 
     /// From an `=` at `c`, the `;` ending the expression (groups skipped).
     /// Returns (`;` position, next).
-    fn expression_end(&self, mut c: usize, hi: usize) -> Option<(usize, usize)> {
+    /// Memoized by position (every position the scan passes has the same
+    /// answer), so repeated calls over one unterminated run stay linear.
+    fn expression_end(&self, c: usize, hi: usize) -> Option<(usize, usize)> {
+        let mut visited = Vec::new();
+        let r = self.expression_end_scan(c, hi, &mut visited);
+        let mut memo = self.memo.expr.borrow_mut();
+        for v in visited {
+            memo.insert((v, hi), r);
+        }
+        r
+    }
+
+    fn expression_end_scan(
+        &self,
+        mut c: usize,
+        hi: usize,
+        visited: &mut Vec<usize>,
+    ) -> Option<(usize, usize)> {
         while c < hi {
+            if let Some(&r) = self.memo.expr.borrow().get(&(c, hi)) {
+                return r;
+            }
+            visited.push(c);
             match self.text(c) {
                 "(" | "[" | "{" => c = self.close_of(c)? + 1,
                 ";" => return Some((c, c + 1)),
@@ -541,6 +599,36 @@ impl Scanner<'_> {
             }
         }
         None
+    }
+
+    /// After a type body or brace initializer closing before `c`, the `;`
+    /// ending it (groups skipped); `None` at a `}`, an unmatched group or
+    /// the end of the range. Memoized like [`Scanner::expression_end`].
+    fn semi_after_block(&self, mut c: usize, hi: usize) -> Option<usize> {
+        let mut visited = Vec::new();
+        let r = loop {
+            if c >= hi {
+                break None;
+            }
+            if let Some(&r) = self.memo.semi.borrow().get(&(c, hi)) {
+                break r;
+            }
+            visited.push(c);
+            match self.text(c) {
+                "(" | "[" | "{" => match self.close_of(c) {
+                    Some(x) if x < hi => c = x + 1,
+                    _ => break None,
+                },
+                ";" => break Some(c),
+                "}" => break None,
+                _ => c += 1,
+            }
+        };
+        let mut memo = self.memo.semi.borrow_mut();
+        for v in visited {
+            memo.insert((v, hi), r);
+        }
+        r
     }
 
     fn words(&self, lo: usize, hi: usize) -> impl Iterator<Item = &str> + '_ {
