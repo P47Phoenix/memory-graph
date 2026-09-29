@@ -65,7 +65,7 @@ Hand-written in `graph-server/src/backup/`:
 - SigV4 with `hmac` + `sha2` (RustCrypto, pure Rust);
 - PUT, GET, HEAD, ListObjectsV2, DELETE and multipart;
 - over the `hyper` and `http` already in the tree;
-- new crates: `hmac`, `quick-xml`, `percent-encoding` (all MIT/Apache);
+- new crates: `hmac` and `quick-xml` (both MIT/Apache); `percent-encoding` is already in the tree through axum/tonic;
 - no AWS SDK. About 600-900 lines.
 
 ### E5. TLS
@@ -88,7 +88,8 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 ### E8. Integrity
 
 - Upload: stream with sha256 in `x-amz-content-sha256` (or per part), then HEAD to check the size.
-- Restore: download to `restore.tmp`, check size and sha256 against `.meta`, and check `store_format_version` and `extractors_hash` against the binary. Refuse on any mismatch before `restore_into`.
+- Restore: download to the existing `<store>.restore.tmp` sibling (the name `paths::restore_into` already uses), check size and sha256 against `.meta`, and check `store_format_version` and `extractors_hash` against the binary. Refuse on any mismatch before `restore_into`.
+- The `extractors_hash` check is strict by default. An explicit `--restore-allow-extractor-mismatch` overrides it, for restoring onto a binary with upgraded extractors: the store stays valid and the affected files re-extract on the next index, because their fingerprints include the extractor version. *Pending owner confirmation.* The format version check has no override.
 - A local `--restore <file>` also verifies a sibling `.meta` when present, and warns when absent.
 
 ### E9. Retention
@@ -108,8 +109,8 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 |---|---|
 | Partial upload | No `.meta`, so the backup is invisible. A multipart upload is aborted on error; the orphan sweep covers a crash. |
 | Upload failure | 3 retries with backoff, then a log line, `mg_backup_failures_total` and `last_backup_error` in `cluster status`. It never blocks or delays a snapshot or purge: uploads are async, one at a time, and a newer snapshot supersedes a queued one. |
-| Local snapshot replaced mid-upload | Keep an open handle (Windows share flags) or copy to `backup.tmp` first; decided in S1 (story 35). |
-| Corrupt download, wrong format or extractors | Refused, with nothing left except `restore.tmp`, which is removed. |
+| Local snapshot replaced mid-upload | Keep an open handle (Windows share flags) or copy to a `<snapshot>.backup.tmp` sibling first; decided in S1 (story 35). |
+| Corrupt download, wrong format or extractors | Refused; the only file written, `<store>.restore.tmp`, is removed. |
 | Clock skew | SigV4 `RequestTimeTooSkewed` is surfaced verbatim. |
 | Disk | The restore download checks `--min-free-disk` plus the object size first. |
 
@@ -148,6 +149,7 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 - A small hand-maintained S3 client in one module.
 - No direct HTTPS to AWS until S5 or #104; the docs must say so.
 - The snapshot format is unchanged, so there is no schema bump.
+- Wire changes: `last_backup_error` (and the backup metrics' values) in `StatusResponse`, and new Admin RPCs behind `cluster snapshot --upload` and `cluster backups`, regenerated with the xtask. All are additive; `PROTOCOL_VERSION` stays unchanged unless a message's meaning changes.
 
 ## Stories (epic 35-39)
 
