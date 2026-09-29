@@ -94,6 +94,52 @@ fn aspnet_site_symbols() {
     }
 }
 
+/// Issue #137: a Go receiver method rolls up under its struct with
+/// `--grain class` (through the extractor's owner hint), and `symbols
+/// --json` reports the owner.
+#[test]
+fn go_method_rolls_up_under_its_struct() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    let src = "package shapes\n\ntype GoBox struct {\n\tw int\n}\n\nfunc (b *GoBox) Width() int {\n\treturn b.w\n}\n\nfunc Free() int { return 0 }\n";
+    std::fs::write(root.join("box.go"), src).unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = run(&["--db", &db, "search", "w", "--grain", "class", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let rows = v["results"].as_array().unwrap();
+    // The field `w` and `b.w` in the method: one row, the struct's full span.
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0]["symbol"], "shapes::GoBox", "{out}");
+    assert_eq!(rows[0]["lang_kind"], "struct", "{out}");
+    assert_eq!(rows[0]["count"], 2, "{out}");
+    let sp = &rows[0]["span"];
+    let (s, e) = (
+        sp["start"].as_u64().unwrap() as usize,
+        sp["end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&src[s..e], "type GoBox struct {\n\tw int\n}");
+    let (ok, out, err) = run(&["--db", &db, "symbols", "--json", "Width"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["results"][0]["owner"], "GoBox", "{out}");
+    let (ok, out, err) = run(&["--db", &db, "symbols", "--json", "Free"]);
+    assert!(ok, "{err}");
+    assert!(!out.contains("\"owner\""), "{out}");
+}
+
 /// Epic story 16: a repo with `.rs`, `.py` (and `.ts`, `.java`) files is
 /// searchable by token text across languages, Python classes hold methods,
 /// and a Python syntax error is flagged, not fatal.

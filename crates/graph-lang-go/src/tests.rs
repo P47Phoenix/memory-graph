@@ -154,6 +154,39 @@ fn declarations() {
     assert!(inv < 60);
 }
 
+/// Issue #137: a method's owner is its receiver's type name, whatever the
+/// receiver's form; everything else has no owner.
+#[test]
+fn methods_are_owned_by_their_receiver_type() {
+    let src = "package p\n\
+               func (i *Invoice) A() {}\n\
+               func (l List[K, V]) B() {}\n\
+               func (Plain) C() {}\n\
+               func (p *Pair[map[string]int]) D() {}\n\
+               func (r Rect) E() {}\n\
+               func () F() {}\n\
+               func G() {}\n";
+    let ex = GoExtractor.extract(src);
+    let owner = |n: &str| {
+        ex.symbols
+            .iter()
+            .find(|s| s.name == n)
+            .unwrap_or_else(|| panic!("{n}"))
+            .owner
+            .clone()
+    };
+    assert_eq!(owner("A").as_deref(), Some("Invoice"));
+    assert_eq!(owner("B").as_deref(), Some("List"));
+    assert_eq!(owner("C").as_deref(), Some("Plain"));
+    assert_eq!(owner("D").as_deref(), Some("Pair"));
+    assert_eq!(owner("E").as_deref(), Some("Rect"));
+    assert_eq!(owner("F"), None);
+    assert_eq!(owner("G"), None);
+    assert_eq!(owner("p"), None);
+    // The version changed with the new output, so stored files re-index.
+    assert!(GoExtractor.version().starts_with("go-scan-2+"));
+}
+
 #[test]
 fn semicolons_and_bodyless_funcs() {
     let s = syms("package p; var a = 1; var b = 2\nfunc asm(x int) int\nfunc g() {}");

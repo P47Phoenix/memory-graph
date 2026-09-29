@@ -92,6 +92,8 @@ struct NetStatsInner {
     joined_transfers: u64,
     partial_joins: u64,
     inflight_aborted: u64,
+    probes_alive: u64,
+    probes_dead: u64,
 }
 
 #[derive(Default)]
@@ -100,6 +102,9 @@ struct PeerStats {
     last_error: Option<String>,
     /// No RPC of any kind (a heartbeat, say) succeeded since that failure.
     failing: bool,
+    /// When the peer last answered an RPC of any kind (heartbeats
+    /// included): whether it is reachable, whatever a slow transfer does.
+    last_answer: Option<std::time::Instant>,
     last_warned: Option<std::time::Instant>,
     suppressed: u64,
 }
@@ -140,13 +145,30 @@ impl NetStats {
     /// snapshot (a heartbeat does not clear a replication error).
     fn succeeded(&self, target: NodeId, delivered: bool) {
         self.with(|s| {
-            if let Some(p) = s.peers.get_mut(&target) {
-                p.failing = false;
-                if delivered {
-                    p.last_error = None;
-                }
+            let p = s.peers.entry(target).or_default();
+            p.failing = false;
+            p.last_answer = Some(std::time::Instant::now());
+            if delivered {
+                p.last_error = None;
             }
         });
+    }
+
+    /// Liveness probes of the quorum-loss check ([`Prober`]): answered
+    /// `SERVING`, and not (any other answer or none).
+    pub fn probes(&self) -> (u64, u64) {
+        self.with(|s| (s.probes_alive, s.probes_dead))
+    }
+
+    /// Whether `target` answered an RPC (a heartbeat counts) within
+    /// `window`: the quorum-loss check of a pending write (issue #116).
+    pub fn answered_within(&self, target: NodeId, window: Duration) -> bool {
+        self.with(|s| {
+            s.peers
+                .get(&target)
+                .and_then(|p| p.last_answer)
+                .is_some_and(|t| t.elapsed() < window)
+        })
     }
 
     /// The last replication error to `target` worth reporting: while RPCs
@@ -182,6 +204,151 @@ impl NetStats {
     /// connection dropped.
     pub fn inflight_aborted(&self) -> u64 {
         self.with(|s| s.inflight_aborted)
+    }
+}
+
+/// Liveness probes for the quorum-loss check of a pending write (issue
+/// #116): openraft 0.9 sends a peer no heartbeat while an `AppendEntries`
+/// to it is under way, so a slow transfer to a live peer looks like
+/// silence to the leader. Before calling a quorum gone the leader asks each
+/// silent voter's `grpc.health.v1` directly, on a connection of its own
+/// (cached per peer, so a partition-long run of probes does not reconnect
+/// each time; dropped after a failure).
+///
+/// One per node, shared by every pending write: probes run one round at a
+/// time ([`Prober::round`]), and a peer probed within the last `fresh` is
+/// not probed again, so many writes waiting at once cost one probe per
+/// peer per tick, not one per write.
+///
+/// Limit: a peer counts as alive when its health service says `SERVING`,
+/// which proves the process and the link, not that its Raft can append
+/// (a full disk, a stuck apply). Such a peer keeps a pending write
+/// waiting, as before this check existed; it is never a wrong answer.
+#[derive(Clone, Default)]
+pub struct Prober {
+    round: Arc<tokio::sync::Mutex<()>>,
+    channels: Arc<Mutex<HashMap<NodeId, (String, Channel)>>>,
+    last_probe: Arc<Mutex<HashMap<NodeId, std::time::Instant>>>,
+}
+
+impl Prober {
+    fn channel(&self, id: NodeId, addr: &str, timeout: Duration) -> Option<Channel> {
+        let mut g = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((a, ch)) = g.get(&id) {
+            if a == addr {
+                return Some(ch.clone());
+            }
+        }
+        let uri = if addr.contains("://") {
+            addr.to_string()
+        } else {
+            format!("http://{addr}")
+        };
+        let ch = Endpoint::from_shared(uri)
+            .ok()?
+            .connect_timeout(timeout)
+            .tcp_nodelay(true)
+            .connect_lazy();
+        g.insert(id, (addr.to_string(), ch.clone()));
+        Some(ch)
+    }
+
+    fn forget(&self, id: NodeId) {
+        self.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    /// Whether `addr` answers `SERVING` within `timeout` (any other status,
+    /// an error or silence: not alive).
+    async fn probe(&self, id: NodeId, addr: &str, timeout: Duration) -> bool {
+        let Some(ch) = self.channel(id, addr, timeout) else {
+            return false;
+        };
+        let mut client = tonic_health::pb::health_client::HealthClient::new(ch);
+        let check = client.check(tonic_health::pb::HealthCheckRequest::default());
+        let alive = matches!(
+            tokio::time::timeout(timeout, check).await,
+            Ok(Ok(r)) if r.get_ref().status
+                == tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+        );
+        if !alive {
+            self.forget(id);
+        }
+        alive
+    }
+
+    /// One probe round over `peers` (id, address): waits for a round
+    /// already under way, then probes, in parallel and each within
+    /// `timeout`, those that did not answer within `window` since and were
+    /// not probed within `fresh`. Records answers and counts in `stats`.
+    ///
+    /// The round runs as a task of its own, which the caller only awaits: a
+    /// write that stops waiting (its request dropped) never cuts a round
+    /// short, and a peer is marked probed only once its probe completed, so
+    /// no later write takes an unfinished probe for a fresh one.
+    pub async fn round(
+        &self,
+        stats: &NetStats,
+        peers: Vec<(NodeId, String)>,
+        window: Duration,
+        fresh: Duration,
+        timeout: Duration,
+    ) {
+        let me = self.clone();
+        let stats = stats.clone();
+        let task = tokio::spawn(async move {
+            me.round_inner(&stats, peers, window, fresh, timeout).await;
+        });
+        let _ = task.await;
+    }
+
+    async fn round_inner(
+        &self,
+        stats: &NetStats,
+        peers: Vec<(NodeId, String)>,
+        window: Duration,
+        fresh: Duration,
+        timeout: Duration,
+    ) {
+        let _one_at_a_time = self.round.lock().await;
+        let due: Vec<(NodeId, String)> = {
+            let last = self
+                .last_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = std::time::Instant::now();
+            peers
+                .into_iter()
+                .filter(|(id, _)| !stats.answered_within(*id, window))
+                .filter(|(id, _)| last.get(id).is_none_or(|t| now.duration_since(*t) >= fresh))
+                .collect()
+        };
+        let mut probes = tokio::task::JoinSet::new();
+        for (id, addr) in due {
+            let me = self.clone();
+            probes.spawn(async move { (id, me.probe(id, &addr, timeout).await) });
+        }
+        while let Some(r) = probes.join_next().await {
+            let Ok((id, alive)) = r else { continue };
+            let now = std::time::Instant::now();
+            self.last_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id, now);
+            stats.with(|s| {
+                if alive {
+                    s.probes_alive += 1;
+                    s.peers.entry(id).or_default().last_answer = Some(now);
+                } else {
+                    s.probes_dead += 1;
+                }
+            });
+        }
     }
 }
 
@@ -937,6 +1104,34 @@ mod tests {
             }
         });
         (addr, h)
+    }
+
+    /// A write that stops waiting mid-round does not cut the round short:
+    /// the probe still completes and is counted, and until it has the peer
+    /// is not marked probed (a later round would probe it).
+    #[tokio::test]
+    async fn a_dropped_waiter_does_not_leave_an_unfinished_probe_marked_fresh() {
+        let (addr, _peer) = silent_peer().await;
+        let prober = Prober::default();
+        let stats = NetStats::default();
+        let window = Duration::from_secs(10);
+        let fresh = Duration::from_secs(10);
+        let timeout = Duration::from_millis(300);
+        let round = prober.round(&stats, vec![(2, addr.clone())], window, fresh, timeout);
+        assert!(tokio::time::timeout(Duration::from_millis(20), round)
+            .await
+            .is_err());
+        // Mid-probe: not marked yet.
+        assert!(!prober.last_probe.lock().unwrap().contains_key(&2));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stats.probes() == (0, 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached round finished its probe");
+        assert_eq!(stats.probes(), (0, 1), "a silent peer is not alive");
+        assert!(prober.last_probe.lock().unwrap().contains_key(&2));
     }
 
     fn connection(addr: &str, stats: &NetStats) -> GrpcConnection {

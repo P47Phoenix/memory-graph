@@ -77,6 +77,23 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     s.out
 }
 
+/// Like [`symbols`], but `tokens` are the members of a type body (fields,
+/// properties, methods, nested types): what an ASP.NET
+/// `<script runat="server">` block holds, which the page class wraps.
+/// Nothing is reported as a constructor (the enclosing type is unnamed).
+pub fn member_symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
+    let code = code_indices(tokens);
+    let mut s = Scanner {
+        tokens,
+        code: &code,
+        closes: code_close_table(tokens, &code),
+        out: Vec::new(),
+        depth: 0,
+    };
+    s.body(0, code.len(), &Level::Type(String::new()));
+    s.out
+}
+
 /// Indices of tokens that matter for structure: no comments, no
 /// preprocessor lines (`#region`, `#if`, ...).
 fn code_indices(tokens: &[TokenDecl]) -> Vec<usize> {
@@ -384,6 +401,7 @@ impl Scanner<'_> {
         let span = span_between(&self.tok(start).span, &self.tok(span_end).span);
         let push = |s: &mut Self, name: String, kind: SymbolKind, lang: &str| {
             s.out.push(SymbolDecl {
+                owner: None,
                 name,
                 kind,
                 lang_kind: Some(lang.to_string()),

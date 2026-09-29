@@ -14,10 +14,10 @@
 //!
 //! The package symbol spans from `package` to the end of the file, so every
 //! other symbol nests in it. A method is not nested under its receiver
-//! type (like a Rust `impl` method, it is a sibling of the type) and is
-//! named without the receiver (`Area`, not `Rect.Area`), so methods do not
-//! roll up under their type with `--grain class`: `--grain method` finds
-//! them, and the `func (r Rect)` receiver is in the span text. A
+//! type (it is a sibling of the type) and is named without the receiver
+//! (`Area`, not `Rect.Area`); instead its `owner` is the receiver's type
+//! name (`Rect` for `func (r *Rect[T]) Area()`), so `--grain class` rolls it
+//! up under that type when the type is declared in the same file. A
 //! declaration runs from its keyword (or, inside a `( ... )` group, from its
 //! first name) through its closing `}` or the last token before Go's
 //! automatic semicolon. Function bodies, struct fields and interface
@@ -39,7 +39,7 @@ impl Extractor for GoExtractor {
     }
 
     fn version(&self) -> String {
-        format!("go-scan-1+tok{TOKENIZER_VERSION}")
+        format!("go-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -87,12 +87,45 @@ impl Scanner<'_> {
     }
 
     fn push(&mut self, n: usize, kind: SymbolKind, lang: &str, first: usize, last: usize) {
+        self.push_owned(n, kind, lang, first, last, None);
+    }
+
+    fn push_owned(
+        &mut self,
+        n: usize,
+        kind: SymbolKind,
+        lang: &str,
+        first: usize,
+        last: usize,
+        owner: Option<String>,
+    ) {
         self.out.push(SymbolDecl {
             name: self.text(n).to_string(),
             kind,
             lang_kind: Some(lang.to_string()),
             span: span_between(&self.tok(first).span, &self.tok(last).span),
+            owner,
         });
+    }
+
+    /// The type name of the receiver list whose `(` is at `open`: its last
+    /// identifier outside `[...]` type arguments (`Rect` in `(r *Rect[T])`,
+    /// `(Rect)` or `(r Rect)`), or `None` when there is none.
+    fn receiver_type(&self, open: usize) -> Option<String> {
+        let close = self.close_of(open)?;
+        let mut name = None;
+        let mut c = open + 1;
+        while c < close {
+            if self.text(c) == "[" {
+                c = self.close_of(c).filter(|&x| x < close)? + 1;
+                continue;
+            }
+            if self.is_ident(c) {
+                name = Some(c);
+            }
+            c += 1;
+        }
+        name.map(|n| self.text(n).to_string())
     }
 
     /// Whether Go inserts a semicolon after the token at `c` if a newline
@@ -146,7 +179,9 @@ impl Scanner<'_> {
                     let end = self.statement_end(c + 1, hi, true);
                     let mut n = c + 1;
                     let mut method = false;
+                    let mut owner = None;
                     if self.text(n) == "(" {
+                        owner = self.receiver_type(n);
                         n = self.close_of(n).map_or(hi, |x| x + 1);
                         method = true;
                     }
@@ -156,7 +191,7 @@ impl Scanner<'_> {
                         } else {
                             (SymbolKind::Function, "func")
                         };
-                        self.push(n, kind, lang, c, end);
+                        self.push_owned(n, kind, lang, c, end, owner);
                     }
                     c = end + 1;
                 }

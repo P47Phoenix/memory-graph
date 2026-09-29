@@ -756,6 +756,7 @@ name = "graph-lang-aspx"
 version = "0.1.0"
 dependencies = [
  "graph-core",
+ "graph-lang-csharp",
  "graph-lang-html",
  "proptest",
 ]

@@ -36,7 +36,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 17] = [
+pub const METRIC_NAMES: [&str; 18] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -52,6 +52,7 @@ pub const METRIC_NAMES: [&str; 17] = [
     "mg_rpc_duration_seconds",
     "mg_rpc_total",
     "mg_writes_forwarded_total",
+    "mg_quorum_probes_total",
     "mg_apply_duration_seconds",
     "mg_build_info",
 ];
@@ -415,6 +416,15 @@ pub fn render(ctx: &Ctx) -> String {
         "mg_writes_forwarded_total {}",
         ctx.fwd.forwarded_total()
     );
+    head(
+        &mut out,
+        "mg_quorum_probes_total",
+        "counter",
+        "Leader liveness probes of silent voters while a write waited (quorum-loss check), by outcome.",
+    );
+    let (alive, dead) = ctx.raft.net_stats.probes();
+    let _ = writeln!(out, "mg_quorum_probes_total{{outcome=\"alive\"}} {alive}");
+    let _ = writeln!(out, "mg_quorum_probes_total{{outcome=\"dead\"}} {dead}");
     head(
         &mut out,
         "mg_apply_duration_seconds",

@@ -48,7 +48,7 @@ impl Extractor for SqlExtractor {
     }
 
     fn version(&self) -> String {
-        format!("sql-scan-1+tok{TOKENIZER_VERSION}")
+        format!("sql-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -350,6 +350,7 @@ impl Scanner<'_> {
         if let Some((name, _)) = name {
             let span = span_between(&self.tok(c).span, &self.tok(last).span);
             self.out.push(SymbolDecl {
+                owner: None,
                 name,
                 kind,
                 lang_kind: Some(lang.to_string()),
@@ -577,6 +578,7 @@ impl Scanner<'_> {
                     let last = self.member_end(after, hi);
                     let span = span_between(&self.tok(c).span, &self.tok(last).span);
                     self.out.push(SymbolDecl {
+                        owner: None,
                         name,
                         kind,
                         lang_kind: Some(lang.into()),

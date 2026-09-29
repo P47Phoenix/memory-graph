@@ -203,6 +203,7 @@ impl Scanner<'_> {
             && self.tok(name - 1).span.end == self.tok(name).span.start;
         let prefix = if private { "#" } else { "" };
         out.push(SymbolDecl {
+            owner: None,
             name: format!("{prefix}{}", self.text(name)),
             kind,
             lang_kind: Some(lang.into()),
@@ -504,6 +505,11 @@ impl Scanner<'_> {
                     None => return c,
                 },
                 ";" | "," | ")" | "]" | "}" | "=" | ">" => return c,
+                // Reserved words that start a declaration, never a type: a
+                // type stops before them, so it cannot end inside the
+                // declaration (`type A = class B {}` must not give a type
+                // span that partially overlaps the class, #145).
+                "class" | "function" | "enum" | "interface" => return c,
                 "|" | "&" | "?" | ":" | "." | "-" | "+" => {
                     c += 1;
                     operand = true;

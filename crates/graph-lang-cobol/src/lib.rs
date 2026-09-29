@@ -217,6 +217,7 @@ pub fn symbols(tokens: &[TokenDecl], free: bool) -> Vec<SymbolDecl> {
     let span = |a: usize, b: usize| span_between(&code[a].span, &code[b].span);
     let mut out = Vec::new();
     let sym = |name: &str, kind, lk: &str, span: Span| SymbolDecl {
+        owner: None,
         name: name.to_string(),
         kind,
         lang_kind: Some(lk.to_string()),

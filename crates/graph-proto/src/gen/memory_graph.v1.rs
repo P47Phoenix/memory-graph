@@ -182,6 +182,9 @@ pub struct SymbolHit {
     pub lang_kind: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "9")]
     pub span: ::core::option::Option<Span>,
+    /// graph_core::SymbolDecl::owner, e.g. a Go method's receiver type.
+    #[prost(string, optional, tag = "10")]
+    pub owner: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// graph_store::LanguageInfo: per-language contents of a repo.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -305,6 +308,10 @@ pub struct SymbolDecl {
     pub lang_kind: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "4")]
     pub span: ::core::option::Option<Span>,
+    /// The owner type's name when it does not enclose the symbol by span
+    /// (e.g. a Go method's receiver type); the class grain resolves it.
+    #[prost(string, optional, tag = "5")]
+    pub owner: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// graph_core::TokenDecl.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

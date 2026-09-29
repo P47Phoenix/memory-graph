@@ -360,7 +360,7 @@ fn check_histograms(types: &BTreeMap<String, String>, samples: &[Sample]) {
     }
 }
 
-const METRIC_NAMES: [&str; 17] = [
+const METRIC_NAMES: [&str; 18] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -376,6 +376,7 @@ const METRIC_NAMES: [&str; 17] = [
     "mg_rpc_duration_seconds",
     "mg_rpc_total",
     "mg_writes_forwarded_total",
+    "mg_quorum_probes_total",
     "mg_apply_duration_seconds",
     "mg_build_info",
 ];

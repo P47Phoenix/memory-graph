@@ -550,6 +550,7 @@ mod tests {
 
     fn sym(name: &str, s: u32, e: u32) -> SymbolDecl {
         SymbolDecl {
+            owner: None,
             name: name.into(),
             kind: SymbolKind::Type,
             lang_kind: None,

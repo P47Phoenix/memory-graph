@@ -211,6 +211,7 @@ fn preprocess(tokens: &[TokenDecl]) -> (Vec<usize>, Vec<SymbolDecl>) {
             if tokens[d].text == "define" && tokens[n].class == TokenClass::Identifier {
                 let last = *words.last().unwrap_or(&n);
                 macros.push(SymbolDecl {
+                    owner: None,
                     name: tokens[n].text.clone(),
                     kind: SymbolKind::Other,
                     lang_kind: Some("macro".into()),
@@ -549,6 +550,7 @@ impl Scanner<'_> {
     fn push(&mut self, name: String, kind: SymbolKind, lang: &str, first: usize, last: usize) {
         let span = span_between(&self.tok(first).span, &self.tok(last).span);
         self.out.push(SymbolDecl {
+            owner: None,
             name,
             kind,
             lang_kind: Some(lang.to_string()),

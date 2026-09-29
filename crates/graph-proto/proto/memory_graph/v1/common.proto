@@ -177,6 +177,8 @@ message SymbolHit {
   SymbolKind kind = 7;
   optional string lang_kind = 8;
   optional Span span = 9;
+  // graph_core::SymbolDecl::owner, e.g. a Go method's receiver type.
+  optional string owner = 10;
 }
 
 // graph_store::LanguageInfo: per-language contents of a repo.
@@ -257,6 +259,9 @@ message SymbolDecl {
   SymbolKind kind = 2;
   optional string lang_kind = 3;
   Span span = 4;
+  // The owner type's name when it does not enclose the symbol by span
+  // (e.g. a Go method's receiver type); the class grain resolves it.
+  optional string owner = 5;
 }
 
 // graph_core::TokenDecl.

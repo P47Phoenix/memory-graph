@@ -94,6 +94,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("remote_prepared_is_rejected", remote_prepared_is_rejected),
     ("backslash_paths", backslash_paths),
     ("prune_backslash_keep", prune_backslash_keep),
+    ("owner_hint_class_grain", owner_hint_class_grain),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -138,6 +139,7 @@ fn span_of(src: &str, needle: &str) -> Span {
 
 fn sym(name: &str, kind: SymbolKind, span: Span) -> SymbolDecl {
     SymbolDecl {
+        owner: None,
         name: name.into(),
         kind,
         lang_kind: None,
@@ -249,6 +251,7 @@ fn method_and_class_grains(h: &Harness) {
     const SRC: &str = "foo();\nstruct T { foo: u32 }\nimpl S {\n    fn a() { foo(); foo(); }\n    fn b() { foo(); }\n}\nfn free() { foo(); }\n";
     const JS: &str = "class C { m() { foo(); } }\n";
     let lk = |name: &str, kind: SymbolKind, lang_kind: &str, needle: &str| SymbolDecl {
+        owner: None,
         name: name.into(),
         kind,
         lang_kind: Some(lang_kind.into()),
@@ -270,12 +273,14 @@ fn method_and_class_grains(h: &Harness) {
         has_errors: false,
         symbols: vec![
             SymbolDecl {
+                owner: None,
                 name: "C".into(),
                 kind: SymbolKind::Type,
                 lang_kind: Some("class".into()),
                 span: span_of(JS, JS.trim_end()),
             },
             SymbolDecl {
+                owner: None,
                 name: "m".into(),
                 kind: SymbolKind::Method,
                 lang_kind: Some("method".into()),
@@ -1218,9 +1223,14 @@ fn nul_handling(h: &Harness) {
     rejected(s.ingest_file("o", "r", "a.txt", "te\0xt", &plain("foo")));
     let mut ex = plain("foo");
     ex.symbols.push(SymbolDecl {
+        owner: None,
         lang_kind: Some("k\0".into()),
         ..sym("f", SymbolKind::Function, span_of("foo", "foo"))
     });
+    rejected(s.ingest_file("o", "r", "a.txt", "text", &ex));
+    let mut ex = plain("foo");
+    ex.symbols
+        .push(sym("f", SymbolKind::Function, span_of("foo", "foo")).with_owner("T\0"));
     rejected(s.ingest_file("o", "r", "a.txt", "text", &ex));
     rejected(s.ingest_file("", "r", "a.txt", "text", &plain("foo")));
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
@@ -1377,7 +1387,9 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
             q.symbol_kind = Some("method".into());
             variants.push(("method", q.clone()));
             q.symbol_kind = Some("function".into());
-            variants.push(("function", q));
+            variants.push(("function", q.clone()));
+            q.symbol_kind = Some("struct".into());
+            variants.push(("struct", q));
             for (tag, q) in variants {
                 assert_eq!(
                     a.search(&q).unwrap(),
@@ -1387,7 +1399,9 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
             }
         }
     }
-    for pat in ["*", "a", "S", "m*", "nope", "dup", "dup*", "z", "q", "b"] {
+    for pat in [
+        "*", "a", "S", "m*", "nope", "dup", "dup*", "z", "q", "b", "T",
+    ] {
         let mut q = SymbolQuery::new(pat);
         let mut variants = vec![q.clone()];
         for n in [0, 2, 4] {
@@ -1590,6 +1604,8 @@ pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
 
 fn differential_seed(s: &dyn Store) {
     seed(s);
+    s.ingest_file("o1", "r1", "own.toy", "toy", &owner_extraction())
+        .unwrap();
     s.index_bytes("o1", "r1", "notes.md", b"# foo\nbar (foo)\n", None)
         .unwrap();
     s.index_bytes("o1", "r2", "m.txt", b"foo mfoo m\n", None)
@@ -1913,6 +1929,7 @@ impl Extractor for ToyExtractor {
         Extraction {
             has_errors: false,
             symbols: vec![SymbolDecl {
+                owner: None,
                 name: "whole".into(),
                 kind: SymbolKind::Other,
                 lang_kind: Some("toy_file".into()),
@@ -2327,4 +2344,225 @@ fn prepared_duplicate_paths(h: &Harness) {
         Err(StoreError::Rejected(_))
     ));
     assert!(s.file_tokens("o", "a", "y.txt").unwrap().is_none());
+}
+
+/// A source where methods name their type by an owner hint instead of
+/// nesting in it (issue #137; the shape of a Go receiver method), in a
+/// language the store knows nothing about.
+const OWNED: &str = "type T struct { foo int }
+                     func (t T) m() { foo() }
+                     func free() { foo() }
+                     func (x Missing) n() { foo() }
+                     func (t free) o() { foo() }
+                     type U struct { k() { foo() } }
+";
+
+fn owner_extraction() -> Extraction {
+    let d = |name: &str, kind, lang_kind: &str, needle: &str, owner: Option<&str>| SymbolDecl {
+        name: name.into(),
+        kind,
+        lang_kind: Some(lang_kind.into()),
+        span: span_of(OWNED, needle),
+        owner: owner.map(Into::into),
+    };
+    Extraction {
+        has_errors: false,
+        symbols: vec![
+            d(
+                "T",
+                SymbolKind::Type,
+                "struct",
+                "type T struct { foo int }",
+                None,
+            ),
+            d(
+                "m",
+                SymbolKind::Method,
+                "method",
+                "func (t T) m() { foo() }",
+                Some("T"),
+            ),
+            d(
+                "free",
+                SymbolKind::Function,
+                "func",
+                "func free() { foo() }",
+                None,
+            ),
+            // An owner with no symbol of that name in the file.
+            d(
+                "n",
+                SymbolKind::Method,
+                "method",
+                "func (x Missing) n() { foo() }",
+                Some("Missing"),
+            ),
+            // An owner naming a symbol that is not type-like.
+            d(
+                "o",
+                SymbolKind::Method,
+                "method",
+                "func (t free) o() { foo() }",
+                Some("free"),
+            ),
+            d(
+                "U",
+                SymbolKind::Type,
+                "struct",
+                "type U struct { k() { foo() } }",
+                None,
+            ),
+            // Nested by span in `U`: the enclosing type wins over the hint.
+            d(
+                "k",
+                SymbolKind::Method,
+                "method",
+                "k() { foo() }",
+                Some("T"),
+            ),
+        ],
+        tokens: tokenize(OWNED),
+    }
+}
+
+/// Issue #137: under the class grain, a hit that no type-like symbol
+/// encloses by span (whatever the kind filter) rolls up under the type its owner hint names in the
+/// same file (full span, qualified name, kind filter applied to the type);
+/// an unresolvable hint is `no_matching_symbol`; span nesting wins over a
+/// hint; the other grains ignore hints; `search_symbols` reports them; and a
+/// hint survives a replace and a reopen.
+fn owner_hint_class_grain(h: &Harness) {
+    let s = open(h);
+    s.ingest_file("o", "r", "own.toy", "toy", &owner_extraction())
+        .unwrap();
+    type Row = (Option<String>, usize, Option<Span>, bool);
+    let rows = |s: &dyn Store, q: &Query| -> Vec<Row> {
+        s.search(q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.symbol, h.count, h.span, h.no_matching_symbol))
+            .collect()
+    };
+    let t = Some(span_of(OWNED, "type T struct { foo int }"));
+    let u = Some(span_of(OWNED, "type U struct { k() { foo() } }"));
+    let mut q = Query::new("foo");
+    q.grain = Grain::Class;
+    let want: Vec<Row> = vec![
+        // `free`, `n` (unknown owner) and `o` (owner is a function).
+        (None, 3, None, true),
+        // The field and the body of `m`, rolled up under `T`.
+        (Some("T".into()), 2, t, false),
+        (Some("U".into()), 1, u, false),
+    ];
+    assert_eq!(rows(&*s, &q), want);
+    let hit = &s.search(&q).unwrap()[1];
+    assert_eq!(hit.symbol_kind, Some(SymbolKind::Type));
+    assert_eq!(hit.lang_kind.as_deref(), Some("struct"));
+
+    // The kind filter applies to the owner type.
+    q.symbol_kind = Some("struct".into());
+    assert_eq!(rows(&*s, &q), want);
+    q.symbol_kind = Some("interface".into());
+    assert_eq!(rows(&*s, &q), [(None, 6, None, true)]);
+    q.symbol_kind = None;
+
+    // The method grain ignores hints: `m` is its own row, unqualified.
+    q.grain = Grain::Method;
+    let got: Vec<_> = s
+        .search(&q)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.symbol)
+        .collect();
+    assert!(got.contains(&Some("m".into())), "{got:?}");
+    assert!(got.contains(&Some("U::k".into())), "{got:?}");
+
+    // `search_symbols` reports the hint.
+    let owner_of = |s: &dyn Store, n: &str| {
+        s.search_symbols(&SymbolQuery::new(n)).unwrap()[0]
+            .owner
+            .clone()
+    };
+    assert_eq!(owner_of(&*s, "m").as_deref(), Some("T"));
+    assert_eq!(owner_of(&*s, "k").as_deref(), Some("T"));
+    assert_eq!(owner_of(&*s, "T"), None);
+
+    // A hint survives a reopen, and a replace without hints drops it.
+    drop(s);
+    let s = open(h);
+    q.grain = Grain::Class;
+    assert_eq!(rows(&*s, &q), want);
+    let mut plain_ex = owner_extraction();
+    for d in &mut plain_ex.symbols {
+        d.owner = None;
+    }
+    s.ingest_file("o", "r", "own.toy", "toy", &plain_ex)
+        .unwrap();
+    assert_eq!(owner_of(&*s, "m"), None);
+    assert_eq!(
+        rows(&*s, &q),
+        [
+            (None, 4, None, true),
+            (Some("T".into()), 1, t, false),
+            (Some("U".into()), 1, u, false),
+        ]
+    );
+    // Nested symbols that both carry owners: the innermost one that
+    // resolves wins; an unresolvable inner owner falls through to the outer.
+    // A hit inside a type that the kind filter rejects does not fall back to
+    // an owner hint: the hint is only for hits with no enclosing type.
+    const NEST: &str = "type A struct {}\ntype B struct {}\nf() { g() { foo } h() { foo } }\ntype C interface { i() { foo } }\n";
+    let n = |name: &str, kind, lk: Option<&str>, needle: &str, owner: Option<&str>| {
+        let d = SymbolDecl::new(name, kind, lk.map(Into::into), span_of(NEST, needle));
+        match owner {
+            Some(o) => d.with_owner(o),
+            None => d,
+        }
+    };
+    let (ty, fun) = (SymbolKind::Type, SymbolKind::Function);
+    let nest = Extraction {
+        has_errors: false,
+        symbols: vec![
+            n("A", ty, Some("struct"), "type A struct {}", None),
+            n("B", ty, Some("struct"), "type B struct {}", None),
+            n("f", fun, None, "f() { g() { foo } h() { foo } }", Some("A")),
+            n("g", fun, None, "g() { foo }", Some("B")),
+            n("h", fun, None, "h() { foo }", Some("Nope")),
+            n(
+                "C",
+                ty,
+                Some("interface"),
+                "type C interface { i() { foo } }",
+                None,
+            ),
+            n("i", fun, None, "i() { foo }", Some("A")),
+        ],
+        tokens: tokenize(NEST),
+    };
+    s.ingest_file("o", "r2", "nest.toy", "toy", &nest).unwrap();
+    let mut nq = q.clone();
+    nq.grain = Grain::Class;
+    nq.repo = Some("r2".into());
+    let (a, b, c) = (
+        Some(span_of(NEST, "type A struct {}")),
+        Some(span_of(NEST, "type B struct {}")),
+        Some(span_of(NEST, "type C interface { i() { foo } }")),
+    );
+    assert_eq!(
+        rows(&*s, &nq),
+        [
+            (Some("A".into()), 1, a, false),
+            (Some("B".into()), 1, b, false),
+            (Some("C".into()), 1, c, false),
+        ]
+    );
+    nq.symbol_kind = Some("struct".into());
+    assert_eq!(
+        rows(&*s, &nq),
+        [
+            (None, 1, None, true),
+            (Some("A".into()), 1, a, false),
+            (Some("B".into()), 1, b, false),
+        ]
+    );
 }

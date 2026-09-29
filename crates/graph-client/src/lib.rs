@@ -29,7 +29,11 @@
 //!   a write also retries a connection lost mid-call, since every write is
 //!   idempotent on a retry); a `NotLeader` that names the leader switches
 //!   the connection there (with back-off from the second switch in a
-//!   row). A write that runs out of deadline fails with `NoLeader`; a read
+//!   row). A write that runs out of deadline fails with `NoLeader` (a
+//!   leader that lost its quorum answers a pending write `NoLeader` too,
+//!   after its `--quorum-loss-timeout`, so the deadline also bounds a
+//!   write sent to a minority leader). `NoLeader` does not mean the write
+//!   was not applied; retries are idempotent. A read
 //!   whose connection was lost fails with a `Storage` error naming the
 //!   server. Every call carries the `mg-protocol-version` header.
 //!
@@ -98,7 +102,9 @@ pub struct ClientConfig {
     pub read_mode: ReadMode,
     pub retry: RetryConfig,
     /// How long a write keeps retrying while no leader is known (or the
-    /// server is unreachable); past it the write fails with `NoLeader`.
+    /// server is unreachable, or the leader lost its quorum); past it the
+    /// write fails with `NoLeader`. `NoLeader` does not mean the write was
+    /// not applied; retries are idempotent.
     pub write_deadline: Duration,
     /// TCP connect timeout per attempt (default 5 s).
     pub connect_timeout: Duration,

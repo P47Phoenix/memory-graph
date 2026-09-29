@@ -58,6 +58,7 @@ fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
             close_section(&mut out, section.take());
             let name: String = line[1..line.len() - 1].iter().map(|t| &*t.text).collect();
             out.push(SymbolDecl {
+                owner: None,
                 name,
                 kind: SymbolKind::Module,
                 lang_kind: Some("section".into()),
@@ -66,6 +67,7 @@ fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
             section = Some((out.len() - 1, last));
         } else if line.len() >= 2 && line[1].text == "=" {
             out.push(SymbolDecl {
+                owner: None,
                 name: first.text.clone(),
                 kind: SymbolKind::Variable,
                 lang_kind: Some("key".into()),

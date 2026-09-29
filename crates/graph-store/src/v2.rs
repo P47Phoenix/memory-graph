@@ -51,7 +51,19 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// block-encoded (`codec::POSTING_BLOCK`-sized, self-contained blocks)
 /// instead of one flat delta-varint run, so old v2 files are refused rather
 /// than misread (v2 is unreleased; no migration is attempted).
-pub const V2_SCHEMA_VERSION: u64 = 9;
+///
+/// Bumped to 10 for issue #137: a stream's flag byte may set bit 1
+/// (`has_owners`, see `codec`), which a version-9 reader would ignore and
+/// then misread the symbol section. Every version-9 stream is still a valid
+/// version-10 stream (bit 1 clear), so a version-9 file is upgraded on open
+/// by restamping `schema_version` only ([`UPGRADABLE_SCHEMA_VERSION`]); no
+/// data is rewritten, and an older binary then refuses the file with
+/// `SchemaMismatch` instead of misreading it.
+pub const V2_SCHEMA_VERSION: u64 = 10;
+
+/// The one earlier layout version [`V2Store`] upgrades in place on open (a
+/// restamp, see [`V2_SCHEMA_VERSION`]); every other version is refused.
+pub const UPGRADABLE_SCHEMA_VERSION: u64 = 9;
 
 /// Version of the `refs`/`content_files` derived tables (ADR 0003 story 9).
 /// Unlike `V2_SCHEMA_VERSION` (a hard gate on the on-disk *layout*), this is
@@ -703,6 +715,29 @@ impl R {
             .map(|t| t.to_string());
         n.span = Some(r.span);
         Ok(n)
+    }
+
+    /// The first symbol (in source order) of `syms` named by dictionary id
+    /// `owner` that the class grain accepts and `symbol_kind` (if given)
+    /// matches: where an owner hint (`SymbolDecl::owner`, issue #137)
+    /// resolves within one file. `None` when the file has no such symbol.
+    fn resolve_owner(
+        &self,
+        file: u64,
+        syms: &[SymRec],
+        owner: u64,
+        symbol_kind: Option<&str>,
+    ) -> Result<Option<usize>> {
+        for (j, r) in syms.iter().enumerate() {
+            if r.name != owner {
+                continue;
+            }
+            let n = self.sym_node(file, j, syms)?;
+            if grain_accepts(Grain::Class, &n) && symbol_kind.is_none_or(|k| kind_matches(&n, k)) {
+                return Ok(Some(j));
+            }
+        }
+        Ok(None)
     }
 
     fn tok_node(&self, file: u64, i: usize, r: &TokRec) -> Result<Node> {
@@ -1477,6 +1512,11 @@ impl R {
                         kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
                         lang_kind: sym.lang_kind,
                         span: sym.span,
+                        owner: syms[i]
+                            .owner
+                            .map(|o| self.text(o))
+                            .transpose()?
+                            .map(|t| t.to_string()),
                     },
                 ));
             }
@@ -1621,13 +1661,18 @@ impl R {
                 Vec::new()
             };
             let syms = &syms;
+            // Owner id -> the type-like symbol it resolves to in this file
+            // (issue #137), cached across this file's matches.
+            let mut owners: HashMap<u64, Option<usize>> = HashMap::new();
             for (ord, t) in matches {
-                // Enclosing symbols, innermost first.
+                // Enclosing symbols, innermost first (with their indexes).
                 let mut chain: Vec<Node> = Vec::new();
+                let mut chain_idx: Vec<usize> = Vec::new();
                 if need_chain {
                     let mut cur = t.parent;
                     while let Some(p) = cur {
                         chain.push(self.sym_node(fid, p as usize, syms)?);
+                        chain_idx.push(p as usize);
                         // In range: `codec::decode_lazy` checks a parent is an earlier symbol.
                         cur = syms[p as usize].parent;
                     }
@@ -1666,6 +1711,45 @@ impl R {
                             grain_accepts(q.grain, s)
                                 && q.symbol_kind.as_deref().is_none_or(|k| kind_matches(s, k))
                         });
+                        // Class grain, nothing type-like encloses the token by
+                        // span (whatever the kind filter): follow the innermost
+                        // resolvable owner hint (issue #137) to a type-like
+                        // symbol in this file.
+                        let mut owned: Vec<Node> = Vec::new();
+                        if pick.is_none()
+                            && q.grain == Grain::Class
+                            && !chain.iter().any(|s| grain_accepts(Grain::Class, s))
+                        {
+                            for &i in &chain_idx {
+                                let Some(o) = syms[i].owner else { continue };
+                                let j = match owners.get(&o) {
+                                    Some(&j) => j,
+                                    None => {
+                                        let j = self.resolve_owner(
+                                            fid,
+                                            syms,
+                                            o,
+                                            q.symbol_kind.as_deref(),
+                                        )?;
+                                        owners.insert(o, j);
+                                        j
+                                    }
+                                };
+                                if let Some(j) = j {
+                                    let mut cur = Some(j as u32);
+                                    while let Some(p) = cur {
+                                        owned.push(self.sym_node(fid, p as usize, syms)?);
+                                        cur = syms[p as usize].parent;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        let (pick, chain) = match pick {
+                            Some(i) => (Some(i), &chain),
+                            None if !owned.is_empty() => (Some(0), &owned),
+                            None => (None, &chain),
+                        };
                         match pick {
                             Some(i) => {
                                 let s = &chain[i];
@@ -1978,6 +2062,7 @@ impl V2Store {
                 ));
                 used.insert(sy.name);
                 used.extend(sy.lang_kind);
+                used.extend(sy.owner);
             }
             // Every live stream owns exactly one refcount (content sharing
             // is off, so `content_id(file) == file`) and one `content_files`
@@ -2232,6 +2317,14 @@ impl V2Store {
         };
         match found {
             Some(V2_SCHEMA_VERSION) => {}
+            Some(UPGRADABLE_SCHEMA_VERSION) => {
+                // Issue #137: the old layout is a subset of the new one, so
+                // the upgrade is the restamp alone (one small commit).
+                let wt = db.begin_write()?;
+                wt.open_table(META)?
+                    .insert("schema_version", V2_SCHEMA_VERSION)?;
+                wt.commit()?;
+            }
             Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => {
                 return Err(StoreError::LegacyFormat {
                     path: path.display().to_string(),
@@ -2388,6 +2481,7 @@ impl V2Store {
                 for s in codec::decode_lazy(r?.1.value())?.symbols()? {
                     live.insert(s.name);
                     live.extend(s.lang_kind);
+                    live.extend(s.owner);
                 }
             }
             let mut all: Vec<(u64, String)> = Vec::new();
@@ -3208,6 +3302,9 @@ impl V2Store {
             if let Some(k) = &sd.lang_kind {
                 nul("symbol lang_kind", k)?;
             }
+            if let Some(o) = &sd.owner {
+                nul("symbol owner", o)?;
+            }
         }
         let language = language.to_ascii_lowercase();
         let language = language.as_str();
@@ -3296,6 +3393,7 @@ impl V2Store {
             )?;
             s.name = ids[s.name as usize];
             s.lang_kind = s.lang_kind.map(|k| ids[k as usize]);
+            s.owner = s.owner.map(|k| ids[k as usize]);
         }
         for t in &mut stream.tokens {
             t.term = ids[t.term as usize];
@@ -3646,12 +3744,17 @@ impl V2Prep {
                     .lang_kind
                     .as_deref()
                     .map(|k| intern_local(k, &mut terms, &mut local));
+                let owner = s
+                    .owner
+                    .as_deref()
+                    .map(|o| intern_local(o, &mut terms, &mut local));
                 sym_counts
                     .entry((s.kind.as_str(), s.lang_kind.clone()))
                     .or_insert((s.kind, 0))
                     .1 += 1;
                 let idx = stream.symbols.len();
                 stream.symbols.push(SymRec {
+                    owner,
                     name,
                     kind: s.kind,
                     lang_kind,

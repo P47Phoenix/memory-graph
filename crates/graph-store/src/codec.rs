@@ -30,9 +30,14 @@
 //! then one flag byte, then `symlen` bytes of symbol records, then `nck`
 //! checkpoints, then `ntok` token records:
 //!
-//! * flag byte: bit 0 is `ranges_dense` (see [`Lazy::ranges_dense`]); the
-//!   other bits are reserved and must be zero.
-//! * symbol: `name_id kind lang_kind+1 parent+1 span tok_len_plus1
+//! * flag byte: bit 0 is `ranges_dense` (see [`Lazy::ranges_dense`]); bit 1
+//!   is `has_owners` (issue #137, schema version 10): every symbol record
+//!   carries an `owner+1` varint (a dictionary id, `0` = none) right after
+//!   `lang_kind+1`. The encoder sets bit 1 only when some symbol has an
+//!   owner, so a stream without owners is byte-identical to the layout before
+//!   #137. The other bits are reserved and must be zero (a decoder rejects
+//!   them).
+//! * symbol: `name_id kind lang_kind+1 [owner+1] parent+1 span tok_len_plus1
 //!   [tok_first_delta]`. `tok_len_plus1` is a varint: `0` means the symbol
 //!   transitively contains no tokens (no `tok_first_delta` follows, and the
 //!   delta base below is left unchanged by this record); otherwise
@@ -97,6 +102,9 @@ pub struct SymRec {
     /// see [`compute_ranges`]) -- so callers building a `Stream` to encode
     /// need not set it. On decode it carries the value actually stored.
     pub toks: Option<(u32, u32)>,
+    /// Dictionary id of the owner type's name (`SymbolDecl::owner`), if any.
+    /// Stored only in a stream whose flag byte has bit 1 set.
+    pub owner: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +247,7 @@ struct Ck {
 
 pub fn encode(st: &Stream) -> Vec<u8> {
     let (ranges, ranges_dense) = compute_ranges(&st.symbols, &st.tokens);
+    let has_owners = st.symbols.iter().any(|s| s.owner.is_some());
     let mut syms = Vec::new();
     let mut prev = ZERO;
     let mut prev_first = 0u32;
@@ -246,6 +255,9 @@ pub fn encode(st: &Stream) -> Vec<u8> {
         put_varint(&mut syms, s.name);
         syms.push(KINDS.iter().position(|k| *k == s.kind).unwrap_or(6) as u8);
         put_varint(&mut syms, s.lang_kind.map_or(0, |k| k + 1));
+        if has_owners {
+            put_varint(&mut syms, s.owner.map_or(0, |k| k + 1));
+        }
         put_varint(&mut syms, s.parent.map_or(0, |p| u64::from(p) + 1));
         put_span(&mut syms, &s.span, &prev);
         prev = s.span;
@@ -286,7 +298,7 @@ pub fn encode(st: &Stream) -> Vec<u8> {
     put_varint(&mut out, st.symbols.len() as u64);
     put_varint(&mut out, st.tokens.len() as u64);
     put_varint(&mut out, syms.len() as u64);
-    out.push(u8::from(ranges_dense));
+    out.push(u8::from(ranges_dense) | (u8::from(has_owners) << 1));
     out.extend_from_slice(&syms);
     out.extend_from_slice(&cks);
     out.extend_from_slice(&toks);
@@ -371,6 +383,7 @@ pub struct Lazy<'a> {
     nsym: usize,
     ntok: usize,
     ranges_dense: bool,
+    has_owners: bool,
     sym_bytes: &'a [u8],
     cks: Vec<Ck>,
     toks: &'a [u8],
@@ -388,7 +401,12 @@ pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
     let nsym = r.varint()? as usize;
     let ntok = r.varint()? as usize;
     let symlen = r.varint()? as usize;
-    let ranges_dense = r.byte()? & 1 != 0;
+    let flags = r.byte()?;
+    if flags & !0b11 != 0 {
+        return Err(bad("reserved stream flag bits set"));
+    }
+    let ranges_dense = flags & 1 != 0;
+    let has_owners = flags & 2 != 0;
     // Every record is several bytes, so a count beyond the input is corrupt
     // (and must not drive a huge allocation).
     if nsym.saturating_add(ntok) > b.len() {
@@ -427,6 +445,7 @@ pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
         nsym,
         ntok,
         ranges_dense,
+        has_owners,
         sym_bytes,
         cks,
         toks,
@@ -471,6 +490,11 @@ impl Lazy<'_> {
                 .get(usize::from(r.byte()?))
                 .ok_or_else(|| bad("bad symbol kind"))?;
             let lang_kind = r.varint()?.checked_sub(1);
+            let owner = if self.has_owners {
+                r.varint()?.checked_sub(1)
+            } else {
+                None
+            };
             let parent = r.parent()?;
             // A parent must be an enclosing (earlier) symbol; readers index by it.
             if parent.is_some_and(|p| p as usize >= i) {
@@ -492,6 +516,7 @@ impl Lazy<'_> {
                 Some((first, last))
             };
             symbols.push(SymRec {
+                owner,
                 name,
                 kind,
                 lang_kind,
@@ -822,6 +847,7 @@ mod tests {
         with_ranges(Stream {
             symbols: vec![
                 SymRec {
+                    owner: None,
                     name: 0,
                     kind: SymbolKind::Type,
                     lang_kind: Some(1),
@@ -830,6 +856,7 @@ mod tests {
                     toks: None,
                 },
                 SymRec {
+                    owner: None,
                     name: 2,
                     kind: SymbolKind::Method,
                     lang_kind: None,
@@ -869,6 +896,30 @@ mod tests {
         ];
         assert_eq!(encode(&sample()), want);
         assert!(decode_lazy(&want).unwrap().ranges_dense());
+    }
+
+    /// Golden bytes with an owner hint (issue #137): flag bit 1 set, and an
+    /// `owner+1` varint after every symbol's `lang_kind+1`. Without any owner
+    /// the bytes are exactly `golden_bytes` above.
+    #[test]
+    fn golden_bytes_with_owner() {
+        let mut s = sample();
+        s.symbols[1].owner = Some(5);
+        let want: Vec<u8> = vec![
+            3, 2, 2, 26, 3, // format, nsym, ntok, symlen, flag (ranges_dense | has_owners)
+            0, 1, 2, 0, 0, 0, 40, 2, 2, 4, 2, 1, 2, // symbol 0: owner+1 = 0 after lang_kind
+            2, 3, 0, 6, 1, 8, 16, 2, 8, 0, 13, 1, 0, // symbol 1: owner+1 = 6
+            3, 1, 0, 0, 4, 2, 2, 0, 3, // token 0
+            4, 0, 2, 10, 2, 2, 10, 0, 7, // token 1
+        ];
+        assert_eq!(encode(&s), want);
+        assert_eq!(decode(&want).unwrap(), s);
+        // Owner-free streams keep the pre-#137 bytes.
+        assert_eq!(encode(&sample())[4], 1);
+        // Unknown flag bits are refused, not ignored.
+        let mut bad_flag = encode(&sample());
+        bad_flag[4] |= 4;
+        assert!(decode_lazy(&bad_flag).is_err());
     }
 
     /// Golden bytes for the `irregular`-span case named in ADR 0003 story 2:
@@ -1537,6 +1588,7 @@ mod tests {
                     si += 1;
                     let idx = stream.symbols.len();
                     stream.symbols.push(SymRec {
+                        owner: None,
                         name: idx as u64,
                         kind: s.kind,
                         lang_kind: None,
@@ -1585,6 +1637,7 @@ mod tests {
         // 0's actual transitive set is {0, 2}, not the contiguous [0, 2].
         let mut s = Stream {
             symbols: vec![SymRec {
+                owner: None,
                 name: 0,
                 kind: SymbolKind::Function,
                 lang_kind: None,
@@ -1841,6 +1894,7 @@ mod props {
             let mut st = Stream::default();
             for (i, (name, kind, lang_kind, f, pidx, has_parent)) in syms.iter().enumerate() {
                 st.symbols.push(SymRec {
+                    owner: None,
                     name: *name,
                     kind: KINDS[*kind],
                     lang_kind: *lang_kind,
@@ -1896,6 +1950,7 @@ mod props {
                     0 => {
                         let idx = st.symbols.len() as u32;
                         st.symbols.push(SymRec {
+                            owner: None,
                             name: idx as u64,
                             kind: SymbolKind::Other,
                             lang_kind: None,

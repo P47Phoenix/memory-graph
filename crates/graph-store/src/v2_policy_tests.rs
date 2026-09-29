@@ -807,6 +807,7 @@ mod consistency {
                 .map(|&(nm, a, b)| {
                     let (a, b) = (a as u32 % n, b as u32 % n);
                     SymbolDecl {
+                        owner: None,
                         name: v[nm % v.len()].clone(),
                         kind: SymbolKind::Function,
                         lang_kind: (nm % 2 == 0).then(|| v[(nm + 1) % v.len()].clone()),
@@ -1978,7 +1979,8 @@ fn schema_version_mismatch_still_hard_refuses() {
     let wt = s.db.begin_write().unwrap();
     {
         let mut meta = wt.open_table(crate::META).unwrap();
-        meta.insert("schema_version", crate::v2::V2_SCHEMA_VERSION - 1)
+        // The version before the upgradable one (#137 upgrades 9 in place).
+        meta.insert("schema_version", crate::v2::UPGRADABLE_SCHEMA_VERSION - 1)
             .unwrap();
     }
     wt.commit().unwrap();
@@ -1987,7 +1989,7 @@ fn schema_version_mismatch_still_hard_refuses() {
 
     match V2Store::open(&p) {
         Err(StoreError::SchemaMismatch { found }) => {
-            assert_eq!(found, crate::v2::V2_SCHEMA_VERSION - 1)
+            assert_eq!(found, crate::v2::UPGRADABLE_SCHEMA_VERSION - 1)
         }
         Err(other) => panic!("expected StoreError::SchemaMismatch, got a different error: {other}"),
         Ok(_) => panic!("expected a hard refusal, got Ok"),
@@ -1996,6 +1998,43 @@ fn schema_version_mismatch_still_hard_refuses() {
         sha(&p),
         before,
         "a schema mismatch must leave the file untouched, not attempt any self-heal"
+    );
+}
+
+/// Issue #137: a version-9 file (no owner hints anywhere) is upgraded in
+/// place on open by a restamp alone, and reads exactly as before.
+#[test]
+fn schema_version_9_is_upgraded_in_place() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "x.rs",
+        "rust",
+        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+    )
+    .unwrap();
+    let want = s.search(&crate::Query::new("alpha")).unwrap();
+    let wt = s.db.begin_write().unwrap();
+    {
+        let mut meta = wt.open_table(crate::META).unwrap();
+        meta.insert("schema_version", crate::v2::UPGRADABLE_SCHEMA_VERSION)
+            .unwrap();
+    }
+    wt.commit().unwrap();
+    drop(s);
+    assert_eq!(
+        crate::detect_format(&p).unwrap(),
+        Some(crate::v2::UPGRADABLE_SCHEMA_VERSION)
+    );
+    let s = V2Store::open(&p).unwrap();
+    assert_eq!(s.search(&crate::Query::new("alpha")).unwrap(), want);
+    drop(s);
+    assert_eq!(
+        crate::detect_format(&p).unwrap(),
+        Some(crate::v2::V2_SCHEMA_VERSION)
     );
 }
 

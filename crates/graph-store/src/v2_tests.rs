@@ -23,6 +23,7 @@ pub(crate) fn span_ext(
         symbols: syms
             .iter()
             .map(|&(n, kind, s, e)| SymbolDecl {
+                owner: None,
                 name: n.into(),
                 kind,
                 lang_kind: None,
@@ -799,6 +800,7 @@ mod ranged_children {
             .iter()
             .enumerate()
             .map(|(idx, &(a, b))| SymbolDecl {
+                owner: None,
                 name: format!("S{idx}_{a}_{b}"),
                 kind: SymbolKind::Function,
                 lang_kind: None,
@@ -1785,4 +1787,43 @@ fn prepared_chunks_count_only_stored_files() {
         s.file_tokens("o", "r", "small.txt").unwrap().is_some(),
         "a full chunk commits before the failing file"
     );
+}
+
+/// Issue #137 owner ids: remapped from file-local to global dictionary ids
+/// on commit (the dictionary is already populated, so they differ), kept
+/// live by vacuum even when the owner text is used nowhere else, and counted
+/// by the consistency oracle.
+#[test]
+fn owner_only_terms_are_remapped_kept_by_vacuum_and_checked() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("o.redb")).unwrap();
+    s.ingest_file(
+        "o",
+        "r",
+        "a.rs",
+        "rust",
+        &span_ext(&[], &[("alpha", 0, 5), ("beta", 6, 10)]),
+    )
+    .unwrap();
+    let mut ex = span_ext(
+        &[
+            ("T", SymbolKind::Type, 0, 5),
+            ("m", SymbolKind::Method, 6, 12),
+        ],
+        &[("gamma", 7, 12)],
+    );
+    ex.symbols[1].owner = Some("Zed".into());
+    s.ingest_file("o", "r", "b.toy", "toy", &ex).unwrap();
+    let owner = |s: &V2Store| {
+        s.search_symbols(&SymbolQuery::new("m")).unwrap()[0]
+            .owner
+            .clone()
+    };
+    assert_eq!(owner(&s).as_deref(), Some("Zed"));
+    // Kill `alpha`/`beta` so vacuum has dead terms to drop.
+    s.ingest_file("o", "r", "a.rs", "rust", &span_ext(&[], &[("delta", 0, 5)]))
+        .unwrap();
+    s.vacuum().unwrap();
+    s.check_consistency(true);
+    assert_eq!(owner(&s).as_deref(), Some("Zed"));
 }

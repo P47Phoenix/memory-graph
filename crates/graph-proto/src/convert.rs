@@ -369,6 +369,7 @@ impl From<SymbolHit> for pb::SymbolHit {
             kind: enum_i32::<_, pb::SymbolKind>(h.kind),
             lang_kind: h.lang_kind,
             span: h.span.map(Into::into),
+            owner: h.owner,
         }
     }
 }
@@ -386,6 +387,7 @@ impl TryFrom<pb::SymbolHit> for SymbolHit {
             kind: enum_field("SymbolHit.kind", h.kind)?,
             lang_kind: h.lang_kind,
             span: h.span.map(Span::try_from).transpose()?,
+            owner: h.owner,
         })
     }
 }
@@ -579,6 +581,7 @@ impl From<SymbolDecl> for pb::SymbolDecl {
             kind: enum_i32::<_, pb::SymbolKind>(s.kind),
             lang_kind: s.lang_kind,
             span: Some(s.span.into()),
+            owner: s.owner,
         }
     }
 }
@@ -594,6 +597,7 @@ impl TryFrom<pb::SymbolDecl> for SymbolDecl {
                 .span
                 .ok_or_else(|| missing("SymbolDecl.span"))?
                 .try_into()?,
+            owner: s.owner,
         })
     }
 }
