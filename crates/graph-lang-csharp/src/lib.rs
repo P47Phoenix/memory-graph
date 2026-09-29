@@ -255,7 +255,7 @@ impl Scanner<'_> {
     /// Find where the declaration starting at `start` ends. Returns the end
     /// and the code position after it; `None` if input is unbalanced or ends.
     ///
-    /// Past `start` the scan depends only on the position, `hi` and whether
+    /// The scan depends only on the position, `hi` and whether
     /// it saw `operator`, so a failed scan records the states it passed and
     /// a later scan reaching one fails at once: the caller's
     /// resynchronize-one-token-later loop stays linear on long runs with no
@@ -280,12 +280,12 @@ impl Scanner<'_> {
         let mut c = start;
         let mut operator = false;
         while c < hi {
-            if c > start {
-                if self.header_fails.borrow().contains(&(c, hi, operator)) {
-                    return None;
-                }
-                visited.push((c, operator));
+            // Nothing depends on `start` itself, so its state is recorded
+            // and checked like any other (as in Java).
+            if memo_on() && self.header_fails.borrow().contains(&(c, hi, operator)) {
+                return None;
             }
+            visited.push((c, operator));
             match self.text(c) {
                 "(" | "[" => c = self.close_of(c)? + 1,
                 "operator" => {
@@ -370,7 +370,7 @@ impl Scanner<'_> {
         visited: &mut Vec<usize>,
     ) -> Option<(usize, usize)> {
         while c < hi {
-            if let Some(&r) = self.expr_ends.borrow().get(&(c, hi)) {
+            if let Some(&r) = self.expr_ends.borrow().get(&(c, hi)).filter(|_| memo_on()) {
                 return r;
             }
             visited.push(c);
@@ -607,3 +607,12 @@ impl Scanner<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether the scan memos are consulted. Tests switch them off to compare
+/// against the plain forward scans; always on outside tests.
+fn memo_on() -> bool {
+    #[cfg(test)]
+    return tests::MEMO.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
+}

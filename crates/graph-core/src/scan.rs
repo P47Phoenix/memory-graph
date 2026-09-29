@@ -219,8 +219,9 @@ pub enum Step {
     Close,
     /// Ends the scan: every list still open fails (e.g. `;`).
     Stop,
-    /// A group to jump over: continue after this position, or fail with
-    /// `None` (e.g. an unmatched `(`).
+    /// A group to jump over: `Some(close)` is the group's closer and the
+    /// scan resumes at `close + 1`; `None` fails the scan (e.g. an
+    /// unmatched `(`).
     Skip(Option<usize>),
     /// Anything else.
     Other,
@@ -233,12 +234,17 @@ pub enum Step {
 /// opener on it and later lookups reuse the answers: looking up every
 /// opener of a long unclosed run (100k `<`) is linear, where a plain
 /// forward scan per lookup is quadratic.
+///
+/// Answers are cached by `(open, hi)` only, so use one instance per step
+/// function (and token sequence): sharing an instance between different
+/// rules returns stale answers.
 #[derive(Debug, Default)]
 pub struct NestedEnds {
     memo: std::cell::RefCell<std::collections::HashMap<(usize, usize), Option<usize>>>,
 }
 
 impl NestedEnds {
+    /// An empty cache, for one step function over one token sequence.
     pub fn new() -> Self {
         Self::default()
     }
@@ -247,6 +253,8 @@ impl NestedEnds {
     /// [`Step::Open`]), scanning `[open, hi)`; `None` if a [`Step::Stop`],
     /// a failed [`Step::Skip`] or `hi` comes first. `step` must give the
     /// same answer for a position every time it is called with this `hi`.
+    /// If `open` is not an opener the answer is meaningless (it may be the
+    /// end of a later list, and is cached as such): callers check first.
     pub fn find(&self, open: usize, hi: usize, step: impl Fn(usize) -> Step) -> Option<usize> {
         if let Some(&r) = self.memo.borrow().get(&(open, hi)) {
             return r;
@@ -739,6 +747,78 @@ mod close_table_tests {
                 let mut b = a.clone();
                 prop_assert_eq!(a.skip_balanced(), b.skip_balanced_with(&ct));
                 prop_assert_eq!(a.pos(), b.pos());
+            }
+        }
+    }
+
+    /// Plain forward scan: the reference for [`NestedEnds::find`].
+    fn nested_reference(s: &[u8], skip: &[Option<usize>], open: usize, hi: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut c = open;
+        while c < hi {
+            match s[c] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(c);
+                    }
+                }
+                b'(' => c = skip[c].filter(|&x| x < hi)?,
+                b';' => return None,
+                _ => {}
+            }
+            c += 1;
+        }
+        None
+    }
+
+    proptest! {
+        /// `NestedEnds::find` equals a plain forward scan for every opener,
+        /// with one memo reused across all calls and several `hi` values,
+        /// queried in random order.
+        #[test]
+        fn nested_ends_match_forward_scan(
+            s in proptest::collection::vec(
+                prop_oneof![Just(b'<'), Just(b'>'), Just(b'('), Just(b')'), Just(b';'), Just(b'x')],
+                0..60,
+            ),
+            order in proptest::collection::vec(any::<prop::sample::Index>(), 0..120),
+            his in proptest::collection::vec(any::<prop::sample::Index>(), 1..4),
+        ) {
+            // `(` skips to its `)` (the next one), like a close table.
+            let skip: Vec<Option<usize>> = (0..s.len())
+                .map(|i| (s[i] == b'(').then(|| (i + 1..s.len()).find(|&j| s[j] == b')')).flatten())
+                .collect();
+            let step = |c: usize| match s[c] {
+                b'<' => Step::Open,
+                b'>' => Step::Close,
+                b'(' => Step::Skip(skip[c]),
+                b';' => Step::Stop,
+                _ => Step::Other,
+            };
+            let his: Vec<usize> = his.iter().map(|h| h.index(s.len() + 1)).collect();
+            // One memo for every `hi`: answers are keyed by `(open, hi)`.
+            let memo = NestedEnds::new();
+            let opens: Vec<usize> = (0..s.len()).filter(|&i| s[i] == b'<').collect();
+            if !opens.is_empty() {
+                for q in order.iter().chain(order.iter()) {
+                    let open = opens[q.index(opens.len())];
+                    for &hi in &his {
+                        if open >= hi {
+                            continue;
+                        }
+                        let step_hi = |c: usize| match step(c) {
+                            Step::Skip(t) => Step::Skip(t.filter(|&x| x < hi)),
+                            other => other,
+                        };
+                        prop_assert_eq!(
+                            memo.find(open, hi, step_hi),
+                            nested_reference(&s, &skip, open, hi),
+                            "{:?} open {} hi {}", String::from_utf8_lossy(&s), open, hi
+                        );
+                    }
+                }
             }
         }
     }

@@ -23,7 +23,8 @@
 use graph_core::scan::{code_close_table, matching_close, span_between, NestedEnds, Step};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 pub struct JavaScriptExtractor;
 
@@ -88,6 +89,7 @@ pub fn type_end(tokens: &[TokenDecl], code: &[usize], c: usize, hi: usize) -> us
         depth: Cell::new(0),
         closes: None,
         angles: NestedEnds::new(),
+        body_braces: RefCell::default(),
     }
     .type_end(c, hi)
 }
@@ -104,6 +106,7 @@ pub struct TypeEnds<'a> {
 impl<'a> TypeEnds<'a> {
     /// `closes` must be [`code_close_table`]`(tokens, code)`.
     pub fn new(tokens: &'a [TokenDecl], code: &'a [usize], closes: &'a [Option<usize>]) -> Self {
+        debug_assert_eq!(closes.len(), code.len());
         Self {
             scanner: Scanner {
                 tokens,
@@ -112,6 +115,7 @@ impl<'a> TypeEnds<'a> {
                 depth: Cell::new(0),
                 closes: Some(closes),
                 angles: NestedEnds::new(),
+                body_braces: RefCell::default(),
             },
         }
     }
@@ -137,6 +141,7 @@ fn scan_tokens(tokens: &[TokenDecl], ts: bool) -> Vec<SymbolDecl> {
         depth: Cell::new(0),
         closes: Some(&closes),
         angles: NestedEnds::new(),
+        body_braces: RefCell::default(),
     };
     let mut out = Vec::new();
     s.scan(0, code.len(), &mut out);
@@ -176,6 +181,8 @@ struct Scanner<'a> {
     closes: Option<&'a [Option<usize>]>,
     /// `(open, hi)` -> [`Scanner::angle_close`], filled as scans go.
     angles: NestedEnds,
+    /// `(c, hi)` -> [`Scanner::body_brace`] from `c`.
+    body_braces: RefCell<HashMap<(usize, usize), Option<usize>>>,
 }
 
 /// Deepest nesting of declarations scanned (classes in functions in
@@ -313,6 +320,42 @@ impl Scanner<'_> {
         Some(open + 1)
     }
 
+    /// The first `{` at or after `c`, skipping `(`/`[` groups; `None` at
+    /// `;`, `}`, an unmatched group or `hi`. Every position the walk passes
+    /// has the same answer, so they are all remembered: a long run of
+    /// `class A ` stays linear instead of one walk to the end per `class`.
+    fn body_brace(&self, mut c: usize, hi: usize) -> Option<usize> {
+        let mut visited = Vec::new();
+        let r = loop {
+            if c >= hi {
+                break None;
+            }
+            if let Some(&r) = self
+                .body_braces
+                .borrow()
+                .get(&(c, hi))
+                .filter(|_| memo_on())
+            {
+                break r;
+            }
+            visited.push(c);
+            match self.text(c) {
+                "{" => break Some(c),
+                ";" | "}" => break None,
+                "(" | "[" => match self.close_of(c) {
+                    Some(p) => c = p + 1,
+                    None => break None,
+                },
+                _ => c += 1,
+            }
+        };
+        let mut memo = self.body_braces.borrow_mut();
+        for v in visited {
+            memo.insert((v, hi), r);
+        }
+        r
+    }
+
     /// `class Name [extends X] {...}` and its methods.
     fn class(&self, kw: usize, lo: usize, hi: usize, out: &mut Vec<SymbolDecl>) -> Option<usize> {
         let name = kw + 1;
@@ -325,17 +368,7 @@ impl Scanner<'_> {
         if self.ts && open < hi && self.text(open) == "<" {
             open = self.angle_close(open, hi)? + 1;
         }
-        loop {
-            if open >= hi {
-                return None;
-            }
-            match self.text(open) {
-                "{" => break,
-                ";" | "}" => return None,
-                "(" | "[" => open = self.close_of(open)? + 1,
-                _ => open += 1,
-            }
-        }
+        let open = self.body_brace(open, hi)?;
         let close = self.close_of(open).filter(|&p| p < hi)?;
         let start = self.start_of(kw, lo);
         let lang = if self.ts && (start..kw).any(|c| self.text(c) == "abstract") {
@@ -749,6 +782,15 @@ impl Scanner<'_> {
         }
         Some(last)
     }
+}
+
+/// Whether the scan memos are consulted. Tests switch them off to compare
+/// against the plain forward scans; always on outside tests.
+fn memo_on() -> bool {
+    #[cfg(test)]
+    return tests::MEMO.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
 }
 
 #[cfg(test)]

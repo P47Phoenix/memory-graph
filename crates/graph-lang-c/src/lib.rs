@@ -482,7 +482,7 @@ impl Scanner<'_> {
                     | u8::from(params) << 1
                     | u8::from(init_list) << 2
                     | u8::from(namespace) << 3;
-                if self.memo.header_fails.borrow().contains(&(c, hi, flags)) {
+                if memo_on() && self.memo.header_fails.borrow().contains(&(c, hi, flags)) {
                     return None;
                 }
                 visited.push((c, flags));
@@ -587,7 +587,7 @@ impl Scanner<'_> {
         visited: &mut Vec<usize>,
     ) -> Option<(usize, usize)> {
         while c < hi {
-            if let Some(&r) = self.memo.expr.borrow().get(&(c, hi)) {
+            if let Some(&r) = self.memo.expr.borrow().get(&(c, hi)).filter(|_| memo_on()) {
                 return r;
             }
             visited.push(c);
@@ -610,7 +610,7 @@ impl Scanner<'_> {
             if c >= hi {
                 break None;
             }
-            if let Some(&r) = self.memo.semi.borrow().get(&(c, hi)) {
+            if let Some(&r) = self.memo.semi.borrow().get(&(c, hi)).filter(|_| memo_on()) {
                 break r;
             }
             visited.push(c);
@@ -1064,3 +1064,12 @@ impl Scanner<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether the scan memos are consulted. Tests switch them off to compare
+/// against the plain forward scans; always on outside tests.
+fn memo_on() -> bool {
+    #[cfg(test)]
+    return tests::MEMO.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
+}

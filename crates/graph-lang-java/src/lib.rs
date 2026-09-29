@@ -199,7 +199,7 @@ impl Scanner<'_> {
     ) -> Option<(End, usize)> {
         let mut c = start;
         while c < hi {
-            if self.header_fails.borrow().contains(&(c, hi)) {
+            if memo_on() && self.header_fails.borrow().contains(&(c, hi)) {
                 return None;
             }
             visited.push(c);
@@ -240,7 +240,7 @@ impl Scanner<'_> {
 
     fn semi_after_scan(&self, mut c: usize, hi: usize, visited: &mut Vec<usize>) -> Option<usize> {
         while c < hi {
-            if let Some(&r) = self.semis.borrow().get(&(c, hi)) {
+            if let Some(&r) = self.semis.borrow().get(&(c, hi)).filter(|_| memo_on()) {
                 return r;
             }
             visited.push(c);
@@ -443,3 +443,12 @@ impl Scanner<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether the scan memos are consulted. Tests switch them off to compare
+/// against the plain forward scans; always on outside tests.
+fn memo_on() -> bool {
+    #[cfg(test)]
+    return tests::MEMO.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
+}
