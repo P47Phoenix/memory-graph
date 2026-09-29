@@ -1345,10 +1345,24 @@ fn run() -> Result<i32> {
                     out!("node {id} is now a voter (log index {index})");
                 }
                 ClusterCmd::Remove { id, force } => {
-                    let index = s
+                    let r = s
                         .admin_remove(id, force)
                         .with_context(|| format!("cluster remove {id}"))?;
-                    out!("node {id} was removed from the cluster (log index {index})");
+                    if !r.not_a_member {
+                        out!(
+                            "node {id} was removed from the cluster (log index {})",
+                            r.log_index
+                        );
+                    } else if r.retried {
+                        // The first attempt may have removed it before its
+                        // answer was lost.
+                        out!(
+                            "node {id} is not a member (now); it may have been removed by an \
+                             earlier attempt of this command"
+                        );
+                    } else {
+                        out!("node {id} is not a member; nothing to remove");
+                    }
                 }
                 ClusterCmd::TransferLeader { id } => {
                     let leader = s

@@ -26,6 +26,21 @@ fn timed<T>(msg: T, deadline: Duration) -> tonic::Request<T> {
     r
 }
 
+/// What [`RemoteStore::admin_remove`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    /// The membership entry's log index (with `not_a_member`, the index of
+    /// the membership in effect).
+    pub log_index: u64,
+    /// The node was not a member: nothing changed (a mistyped id, or an
+    /// earlier attempt already removed it; see `retried`).
+    pub not_a_member: bool,
+    /// The call was sent more than once (a lost answer or a leader
+    /// change), so `not_a_member` may mean an earlier attempt of this same
+    /// call removed the node.
+    pub retried: bool,
+}
+
 pub struct RemoteStore {
     rt: Arc<tokio::runtime::Runtime>,
     conn: Arc<Conn>,
@@ -200,16 +215,26 @@ impl RemoteStore {
 
     /// `Admin.Remove`: remove `node_id` from the membership (any node
     /// forwards it to the leader, which enforces the guards: not the
-    /// leader, not below quorum, 3 voters to 2 only with `force`). Returns
-    /// the membership entry's log index.
-    pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<u64> {
+    /// leader, not below quorum, 3 voters to 2 only with `force`). A node
+    /// that is not a member is no error (a retry of a committed remove must
+    /// succeed) but is reported in [`RemoveOutcome::not_a_member`].
+    pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<RemoveOutcome> {
         let d = self.config().admin_deadline;
-        self.run(self.conn.call(Kind::Write, |ch| async move {
-            admin_client(ch)
-                .remove(timed(pb::RemoveRequest { node_id, force }, d))
-                .await
-        }))
-        .map(|r| r.into_inner().log_index)
+        let attempts = Arc::new(AtomicU64::new(0));
+        let r = self.run(self.conn.call(Kind::Write, |ch| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                admin_client(ch)
+                    .remove(timed(pb::RemoveRequest { node_id, force }, d))
+                    .await
+            }
+        }))?;
+        let r = r.into_inner();
+        Ok(RemoveOutcome {
+            log_index: r.log_index,
+            not_a_member: r.not_a_member,
+            retried: attempts.load(Ordering::Relaxed) > 1,
+        })
     }
 
     /// `Admin.TransferLeader`: make voter `node_id` the leader (forwarded

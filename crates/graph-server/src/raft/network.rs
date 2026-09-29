@@ -334,10 +334,17 @@ pub fn plan(inflight: &AppendKey, new: &AppendKey) -> Plan {
     if inflight.vote != new.vote || inflight.prev != new.prev || inflight.first != new.first {
         return Plan::Replace;
     }
+    // The first entries are equal, so either both requests carry entries or
+    // neither does: a mixed pair cannot happen. Were it to (a bug), joining
+    // could pass a success of no entries off as a success of some, so it is
+    // replaced instead (and trips a debug assertion).
     let shorter = match (&inflight.last, &new.last) {
         (Some(a), Some(b)) => a.index < b.index,
-        (None, Some(_)) => true,
-        _ => false,
+        (None, None) => false,
+        (a, b) => {
+            debug_assert!(false, "same first entry, but last {a:?} vs {b:?}");
+            return Plan::Replace;
+        }
     };
     Plan::Join {
         upto: if shorter { inflight.last } else { None },
@@ -851,6 +858,53 @@ mod tests {
             joined_response(AppendEntriesResponse::Success, None),
             AppendEntriesResponse::Success
         );
+        // A higher vote is passed through as is, partial join or not: the
+        // leader must step down, not count a match.
+        let hv = || AppendEntriesResponse::HigherVote(Vote::new_committed(5, 2));
+        assert_eq!(joined_response(hv(), Some(lid(1, 8))), hv());
+        assert_eq!(joined_response(hv(), None), hv());
+        // A partial answer from the follower itself stays what it was.
+        assert_eq!(
+            joined_response(
+                AppendEntriesResponse::PartialSuccess(Some(lid(1, 6))),
+                Some(lid(1, 8))
+            ),
+            AppendEntriesResponse::PartialSuccess(Some(lid(1, 6)))
+        );
+    }
+
+    /// Two heartbeats (no entries) with the same vote and previous log id
+    /// join with no `upto`.
+    #[test]
+    fn heartbeats_join_as_full() {
+        let hb = || {
+            let mut r = req(2, 4, 5, 4);
+            r.entries.clear();
+            AppendKey::of(&r)
+        };
+        assert_eq!(plan(&hb(), &hb()), Plan::Join { upto: None });
+    }
+
+    /// Entries against none with the same first entry cannot happen; in a
+    /// release build it is replaced, never joined as a success.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn a_mixed_pair_is_replaced() {
+        let with = AppendKey::of(&req(2, 4, 5, 8));
+        let mut without = with.clone();
+        without.last = None;
+        assert_eq!(plan(&without, &with), Plan::Replace);
+        assert_eq!(plan(&with, &without), Plan::Replace);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "same first entry")]
+    fn a_mixed_pair_asserts_in_debug() {
+        let with = AppendKey::of(&req(2, 4, 5, 8));
+        let mut without = with.clone();
+        without.last = None;
+        let _ = plan(&without, &with);
     }
 
     /// A peer that accepts TCP connections and never answers: every
