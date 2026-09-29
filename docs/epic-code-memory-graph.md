@@ -10,7 +10,7 @@
 - (e) p95 search latency is under 100 ms on 1,000+ files. This target is a placeholder until story 18.
 - (f) Re-indexing an unchanged repo re-parses 0 files.
 
-**Out of Scope:** MCP interface, auth, TLS on the wire, semantic or embedding search, cross-file reference resolution (call graphs, type resolution), GUI, git history, a query language (fixed query functions only), and bundled extractors beyond Rust and Python in this epic. *Amended 2026-09-28 ([ADR 0004](adr/0004-client-server-and-replication.md), Accepted):* a network server (`memory-graph serve` over gRPC) and replicated storage (a Raft cluster with durable writes, reads on every node) are now in scope as stories 20-25; "distributed storage" in the sense of sharding a database across nodes stays out of scope (ADR 0003 Q4, build deferred).
+**Out of Scope:** auth, TLS on the wire, semantic or embedding search, cross-file reference resolution (call graphs, type resolution), GUI, git history, a query language (fixed query functions only), and bundled extractors beyond Rust and Python in this epic. *Amended 2026-09-28 ([ADR 0004](adr/0004-client-server-and-replication.md), Accepted):* a network server (`memory-graph serve` over gRPC) and replicated storage (a Raft cluster with durable writes, reads on every node) are now in scope as stories 20-25; "distributed storage" in the sense of sharding a database across nodes stays out of scope (ADR 0003 Q4, build deferred). *Amended 2026-09-29 at the owner's request ([ADR 0005](adr/0005-mcp.md) and [ADR 0006](adr/0006-snapshots-object-storage.md), both Accepted by the owner on 2026-09-29):* a read-only MCP interface (stories 31-34) and snapshot backups to a directory or S3-compatible object storage over plain HTTP (stories 35-39) are now in scope; MCP write tools (33) and native HTTPS to object storage (39) are deferred.
 
 ### Story Map
 
@@ -46,8 +46,17 @@
 | 28 | C, C++, Go and Scala symbol extractors | High | 8 | P2 | 26 |
 | 29 | SQL, shell, R, F#, Haskell, Elixir and GDScript symbol extractors | High | 8 | P3 | 26 |
 | 30 | COBOL, RPG and assembly symbol extractors | Medium | 8 | P3 | 26 |
+| 31 | `graph-mcp` core and `memory-graph mcp` over stdio, read-only | High | 5 | P2 | 20 |
+| 32 | Streamable HTTP MCP endpoint in `serve` with security guards | High | 5 | P2 | 31, 24 |
+| 33 | Opt-in MCP write tools (**Deferred** until auth, #105) | Medium | 3 | P4 | 32, #105 |
+| 34 | MCP real-client e2e and hardening | Medium | 3 | P3 | 31, 32 |
+| 35 | Snapshot backups: `file://` sink and verified restore | High | 5 | P2 | 22 |
+| 36 | S3 client over plain HTTP (SigV4, multipart) | High | 8 | P2 | 35 |
+| 37 | Restore from `s3://` and `latest`, `cluster snapshot --upload`, `cluster backups` | Medium | 3 | P2 | 36 |
+| 38 | MinIO e2e CI job and backup docs | Medium | 3 | P3 | 37 |
+| 39 | Spike: native HTTPS for backups behind `backup-tls` (**Deferred**, shared with #104) | Low | 5 | P4 | 36, #104 |
 
-Total: 30 stories, 163 pts (average about 5.4). Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages.
+Total: 39 stories, 203 pts (average about 5.2); 195 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -367,6 +376,104 @@ So that the `symbol`, `method` and `class` grains and symbol search work across 
 - Given malformed, BOM-prefixed, CRLF, non-ASCII or 20000-level nested input, When indexed, Then there must be no panic or stack overflow and every span must stay valid.
 - Given a suitable MIT or Apache-2.0 public repo, When the corpus test runs, Then a pinned slice must be indexed with spot-checked symbols; languages without one must have a hand-written fixture.
 
+**31. `graph-mcp` core and `memory-graph mcp` over stdio, read-only (5 pts)**
+As an AI-agent integrator
+I want my assistant to start `memory-graph mcp` and call read-only tools over stdio
+So that it can search the graph, find symbols, describe repos and outline files with no network setup.
+Design: [ADR 0005](adr/0005-mcp.md) D1, D2, D3, D5 (Accepted).
+- Given `memory-graph mcp` with `--db` or with `--server`, When a client calls each of the seven tools (`describe`, `list_repos`, `search`, `find_symbols`, `file_outline`, `file_tokens`, `list_files`), Then every tool must work against both targets.
+- Given the same query, When run through MCP and through `--json` / `StoreRead`, Then the results must be equal (differential test).
+- Given every tool, When it answers, Then its `structuredContent` must validate against its declared `outputSchema`, and its input must validate against `inputSchema`.
+- Given a running `memory-graph mcp`, When it logs, Then stdout must carry only protocol messages; logs go to stderr.
+- Given the change, When CI runs, Then `scripts/check-no-c-deps.py` must pass and `cargo tree -i ring` must print nothing.
+- Given `docs/mcp.md`, When followed, Then it must give working client configuration for stdio.
+
+**32. Streamable HTTP MCP endpoint in `serve` with security guards (5 pts)**
+As a database operator
+I want an opt-in MCP endpoint inside `serve`
+So that assistants can query a running cluster without starting a local process, safely without authentication.
+Design: [ADR 0005](adr/0005-mcp.md) D1, D3, D4 (Accepted).
+- Given `serve` without `--mcp-listen`, When it starts, Then no MCP endpoint must be listening.
+- Given a non-loopback `--mcp-listen`, When `serve` starts without `--mcp-allow-remote`, Then it must refuse to start; with the flag, it must start and log a warning at every start.
+- Given a request with an Origin not in `--mcp-allow-origin` or a Host that is not the bound loopback name or address, When received, Then the response must be 403.
+- Given the D4 limits, When exceeded, Then a body over 1 MiB must get 413, a result over 4 MiB must be truncated with `next_offset`, requests past `--mcp-max-inflight` must be refused, and a call past 30 s must time out.
+- Given the in-process service adapter, When a tool runs, Then `stale_possible` and linearizable reads must match what a gRPC client sees.
+- Given `memory-graph health`, When MCP is enabled, Then it must report that and the address.
+- Given the three backends (embedded, `RemoteStore` over `TestServer`, the in-serve adapter over a 3-node `ClusterTestbed`), When the tool conformance suite runs, Then all three must pass.
+
+**33. Opt-in MCP write tools (3 pts)**
+Status: **Deferred** until authentication (#105); the owner decided on 2026-09-29 that an unauthenticated endpoint stays read-only.
+As an AI-agent integrator
+I want `index_path` and `prune` tools
+So that an assistant can keep the graph current without a separate CLI call.
+Design: [ADR 0005](adr/0005-mcp.md) D2 (Accepted).
+- Given no `--mcp-allow-writes`, When a client lists tools, Then the write tools must not appear.
+- Given `--mcp-index-root`, When `index_path` names a path outside it after canonicalisation, Then the call must be refused.
+- Given `prune` with no `dry_run` argument, When called, Then it must run as a dry run.
+
+**34. MCP real-client e2e and hardening (3 pts)**
+As a database operator
+I want MCP proven with a real client, against a cluster under failure, and under fuzzing
+So that the tool surface can be trusted.
+Design: [ADR 0005](adr/0005-mcp.md) test plan (Accepted).
+- Given the real binary over stdio and over HTTP on `127.0.0.1:0`, When a real client (`rmcp` as a dev-dependency if it passes the gate, otherwise our own client plus a recorded MCP Inspector transcript) runs initialize, initialized, `tools/list` and `tools/call search` on the corpus, Then the handshake must succeed and the spans must be exact.
+- Given MCP on a follower of a 3-node cluster, When the leader is killed, Then reads must keep working and report `stale_possible: true`.
+- Given the JSON-RPC framing, When fuzzed, Then there must be no panic.
+- Given metrics, When tools are called, Then per-tool call and error counters must be exported.
+- Given `docs/mcp.md` and `serve --help`, When read, Then both must carry the boxed no-authentication warning.
+
+**35. Snapshot backups: `file://` sink and verified restore (5 pts)**
+As a database operator
+I want the leader to copy each snapshot to a backup directory and restore from it with verification
+So that a cluster can be rebuilt after losing every node.
+Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E1-E3, E7-E10 (Accepted).
+- Given `--backup-url file://<dir>`, When the leader builds a snapshot, Then it must write the data file first and the `.meta` last, under `<cluster_id>/`.
+- Given a kill mid-copy, When the backups are listed, Then nothing from the interrupted copy may be restorable.
+- Given a backup with one corrupt byte, When restored, Then it must be refused before `restore_into`, with nothing left behind.
+- Given `--backup-keep N`, When more than N backups exist, Then only the newest N must remain.
+- Given a failing sink, When snapshots and purges run, Then they must not be blocked or delayed.
+- Given a local `--restore <file>` with a sibling `.meta`, When restored, Then the `.meta` must be verified; without one, a warning must be logged.
+- Given a cluster restored from a backup, When `run_differential` runs against the source, Then the answers must be equal.
+- Given the flags, When configured through TOML, Then they must behave the same; metrics and `cluster status` must report the last backup and the last error.
+
+**36. S3 client over plain HTTP (8 pts)**
+As a database operator
+I want backups written to S3-compatible object storage
+So that they live off the cluster's own disks.
+Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E3-E6 (Accepted).
+- Given the AWS SigV4 test vectors, When signed, Then every vector must match.
+- Given `graph-server::testing::FakeS3` with fault injection (drop after N bytes, 500 on part k, wrong ETag, 403, slow), When the fault matrix runs, Then every case must pass, and uploads over 64 MiB must use multipart and abort it on error.
+- Given credentials in the environment and in a credentials file, When resolved, Then the environment must win, and secrets must never appear in logs or `Debug` output; a secret in TOML must be refused.
+- Given an `https://` endpoint, When configured, Then it must be refused with guidance to a sidecar and #104.
+- Given the change, When CI runs, Then the gate must be clean and every new crate must be MIT or Apache licensed.
+
+**37. Restore from `s3://` and `latest`, `cluster snapshot --upload`, `cluster backups` (3 pts)**
+As a database operator
+I want to restore from object storage by URL and see what backups exist
+So that recovery is one command.
+Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E1, E8, E10 (Accepted).
+- Given `serve --bootstrap --restore s3://…/snap-T-I.redb`, When it completes, Then the restored cluster must answer like the source.
+- Given a size, sha256, `store_format_version` or `extractors_hash` mismatch, When restoring, Then it must be refused with nothing left behind.
+- Given `…/latest`, When resolved, Then it must pick the highest committed index and ignore orphans without a `.meta`.
+- Given `cluster snapshot --upload` and `cluster backups [--json]`, When run, Then a snapshot must be uploaded on demand and the backups listed.
+
+**38. MinIO e2e CI job and backup docs (3 pts)**
+As a database operator
+I want backups tested against a real S3-compatible server and documented
+So that I can set them up with confidence.
+Design: [ADR 0006](adr/0006-snapshots-object-storage.md) testing (Accepted).
+- Given a MinIO service container over plain HTTP on Linux, When the CI job runs upload, retention and restore, Then it must be green.
+- Given the docs, When read, Then they must cover the sidecar TLS recipe, bucket lifecycle rules and a minimal IAM policy, and the README walkthrough must work.
+
+**39. Spike: native HTTPS for backups behind `backup-tls` (5 pts)**
+Status: **Deferred**, shared with #104 (TLS on the wire); it waits for a pure-Rust rustls crypto provider that passes the gate.
+As a database operator
+I want backups sent to AWS over HTTPS without a sidecar
+So that the deployment has one less moving part.
+Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E5 (Accepted).
+- Given candidate providers (rustls-rustcrypto, graviola), When evaluated, Then the spike must record whether one passes `scripts/check-no-c-deps.py` and works against AWS S3.
+- Given a passing provider, When the `backup-tls` feature is enabled, Then `https://` endpoints must be accepted, and the default build must stay unchanged.
+
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
 - **Language-agnostic by construction:** the schema uses a language tag plus a generic kind vocabulary with an optional language-specific kind string. Only extractors know about a language, and story 16 checks this by requiring zero schema, storage or query changes.
@@ -387,9 +494,9 @@ So that the `symbol`, `method` and `class` grains and symbol search work across 
 2. Is org and repo ever derived from a git remote, or always supplied by the user?
 3. Is Python the second built-in language, or would you prefer TypeScript or Go? Pure-Rust parsers for those are less mature.
 4. Should the fixed generic kind vocabulary in story 4 be extended, for example with `enum`, `interface` or `field`?
-5. Is an MCP or server interface wanted soon? Story 17 is the seam. *Server: answered 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md) (stories 20-25); MCP stays open.*
+5. Is an MCP or server interface wanted soon? Story 17 is the seam. *Server: answered 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md) (stories 20-25); MCP: answered 2026-09-29 by [ADR 0005](adr/0005-mcp.md) (Accepted; stories 31-34): read-only MCP over stdio (`memory-graph mcp`) and opt-in HTTP inside `serve`.*
 6. What are your scale targets (largest repo, number of repos)? Story 18 targets are placeholders.
-7. Will the crate be published, and under which license? That constrains dependency licenses.
+7. Will the crate be published, and under which license? That constrains dependency licenses. *Resolved 2026-09-29: the owner chose Apache-2.0 (issue #96, PR #139).*
 
 ### Next Steps
 1. Answer open questions 1, 2 and 4, which affect story 4 (schema) before it starts.
