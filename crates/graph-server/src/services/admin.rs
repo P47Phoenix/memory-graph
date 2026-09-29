@@ -662,6 +662,35 @@ async fn join_guarded(ctx: &Arc<Ctx>, r: pb::JoinRequest) -> Result<pb::JoinResp
     })
 }
 
+/// `UpdateAdvertise` on the leader (`serve --update-advertise`): member
+/// `id` now listens at `addr`. Refused for an unknown node or an empty
+/// address; the server at `addr` must be node `id` of this cluster with
+/// this cluster's extractors (a misdirected update would point the leader's
+/// replication at another process). The address in effect already: a no-op.
+async fn update_advertise_guarded(ctx: &Ctx, id: NodeId, addr: &str) -> Result<u64, Status> {
+    if id == 0 || addr.is_empty() {
+        return Err(rejected(
+            "UpdateAdvertise needs a node id (>= 1) and an address".into(),
+        ));
+    }
+    ensure_leader_idle(ctx)?;
+    let m = ctx.raft.metrics();
+    let Some(node) = m.membership_config.membership().get_node(&id) else {
+        return Err(rejected(format!(
+            "node {id} is not a member of this cluster; a new node joins with `serve --join`"
+        )));
+    };
+    if node.addr == addr {
+        tracing::info!(node = id, addr, "update-advertise: already this address");
+        return Ok(membership_index(&m));
+    }
+    let old = node.addr.clone();
+    probe_node(ctx, id, addr).await?;
+    let log_index = ctx.raft.set_node_addr(id, addr).await.map_err(status)?;
+    tracing::info!(node = id, from = %old, to = addr, log_index, "updated a member's address");
+    Ok(log_index)
+}
+
 /// Forward an admin request to the leader when this node is not it
 /// (counted like a forwarded write), else fall through to the local body.
 macro_rules! on_leader {
@@ -934,6 +963,16 @@ impl pb::admin_server::Admin for AdminService {
         Ok(Response::new(
             join_guarded(&self.ctx, req.into_inner()).await?,
         ))
+    }
+
+    async fn update_advertise(
+        &self,
+        req: Request<pb::UpdateAdvertiseRequest>,
+    ) -> Result<Response<pb::UpdateAdvertiseResponse>, Status> {
+        on_leader!(self, req, update_advertise);
+        let r = req.into_inner();
+        let log_index = update_advertise_guarded(&self.ctx, r.node_id, &r.addr).await?;
+        Ok(Response::new(pb::UpdateAdvertiseResponse { log_index }))
     }
 
     async fn trigger_elect(

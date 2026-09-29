@@ -3478,6 +3478,21 @@ pub struct MetricsResponse {
     #[prost(string, tag = "1")]
     pub text: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateAdvertiseRequest {
+    #[prost(uint64, tag = "1")]
+    pub node_id: u64,
+    /// The new `host:port` the leader and the other members reach it at.
+    #[prost(string, tag = "2")]
+    pub addr: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateAdvertiseResponse {
+    /// Log index of the membership change (the membership in effect when the
+    /// address was already this one).
+    #[prost(uint64, tag = "1")]
+    pub log_index: u64,
+}
 /// Generated client implementations.
 pub mod admin_client {
     #![allow(
@@ -3922,6 +3937,36 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Admin", "Metrics"));
             self.inner.unary(req, path, codec).await
         }
+        /// `serve --update-advertise` (stage F): member `node_id` now listens at
+        /// `addr`. The leader asks the server at `addr` who it is (it must be that
+        /// node, of this cluster, with this cluster's extractors) and replaces the
+        /// node's address in the membership (one membership log entry; voters and
+        /// learners unchanged). Idempotent: the address already in effect changes
+        /// nothing. May be sent to any member: a follower forwards it.
+        pub async fn update_advertise(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateAdvertiseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateAdvertiseResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Admin/UpdateAdvertise",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Admin", "UpdateAdvertise"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -4037,6 +4082,19 @@ pub mod admin_server {
             &self,
             request: tonic::Request<super::MetricsRequest>,
         ) -> std::result::Result<tonic::Response<super::MetricsResponse>, tonic::Status>;
+        /// `serve --update-advertise` (stage F): member `node_id` now listens at
+        /// `addr`. The leader asks the server at `addr` who it is (it must be that
+        /// node, of this cluster, with this cluster's extractors) and replaces the
+        /// node's address in the membership (one membership log entry; voters and
+        /// learners unchanged). Idempotent: the address already in effect changes
+        /// nothing. May be sent to any member: a follower forwards it.
+        async fn update_advertise(
+            &self,
+            request: tonic::Request<super::UpdateAdvertiseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateAdvertiseResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct AdminServer<T> {
@@ -4752,6 +4810,51 @@ pub mod admin_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = MetricsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Admin/UpdateAdvertise" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateAdvertiseSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::UnaryService<super::UpdateAdvertiseRequest>
+                    for UpdateAdvertiseSvc<T> {
+                        type Response = super::UpdateAdvertiseResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateAdvertiseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::update_advertise(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateAdvertiseSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -977,3 +977,312 @@ fn measure_replication() {
     throughput(&n.addr, "one-node");
     n.shutdown();
 }
+
+/// Index every repo (sub-directory) of `root` through `target`, one
+/// `memory-graph index` process per repo.
+fn index_tree(target: &[&str], root: &Path, repos: &[String]) {
+    for repo in repos {
+        let dir = root.join(repo);
+        let mut a: Vec<&str> = target.to_vec();
+        a.extend([
+            "index",
+            "--org",
+            "scale",
+            "--repo",
+            repo,
+            "--no-progress",
+            dir.to_str().unwrap(),
+        ]);
+        ok(&a);
+    }
+}
+
+/// Deterministic synthetic source across five languages (Rust, C#,
+/// JavaScript and HTML with extractors, Python on the fallback tokenizer)
+/// into `root/<repo>/`, about `tokens` tokens in all. Every file is a
+/// function of its index only, so two runs generate the same bytes.
+fn generate_tree(root: &Path, tokens: u64) -> Vec<String> {
+    // A small LCG: deterministic, no dependency.
+    let mut seed: u64 = 0x5eed_2026_0928;
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed >> 33
+    };
+    const WORDS: [&str; 24] = [
+        "value", "count", "index", "buffer", "node", "graph", "token", "span", "reader", "writer",
+        "cache", "entry", "store", "query", "limit", "offset", "state", "leader", "follower",
+        "commit", "apply", "snapshot", "member", "config",
+    ];
+    // About 925 tokens per file (measured: 6,667 files gave 6.17 M).
+    let per_file: u64 = 925;
+    let files = tokens.div_ceil(per_file).max(1);
+    let repos = 10u64;
+    let mut names = Vec::new();
+    for r in 0..repos {
+        let name = format!("gen{r:02}");
+        std::fs::create_dir_all(root.join(&name).join("src")).unwrap();
+        names.push(name);
+    }
+    for f in 0..files {
+        let repo = &names[(f % repos) as usize];
+        let lang = f % 5;
+        let w = |n: u64| WORDS[(n % WORDS.len() as u64) as usize];
+        let mut body = String::new();
+        // ~20 functions of ~75 tokens each.
+        for k in 0..20 {
+            let (a, b, c) = (w(next()), w(next()), w(next()));
+            let n = next() % 1000;
+            match lang {
+                0 => body.push_str(&format!(
+                    "/// {a} {b} {c}\npub fn {a}_{b}_{f}_{k}(x: u64, y: &str) -> u64 {{\n    let {c} = x + {n};\n    if y.len() > {n} {{ return {c} * 2; }}\n    let s = \"{a}-{b}\";\n    {c} + s.len() as u64\n}}\n\n"
+                )),
+                1 => body.push_str(&format!(
+                    "    // {a} {b} {c}\n    public long {a}{b}{f}_{k}(long x, string y) {{\n        var {c} = x + {n};\n        if (y.Length > {n}) {{ return {c} * 2; }}\n        var s = \"{a}-{b}\";\n        return {c} + s.Length;\n    }}\n\n"
+                )),
+                2 => body.push_str(&format!(
+                    "// {a} {b} {c}\nfunction {a}_{b}_{f}_{k}(x, y) {{\n  const {c} = x + {n};\n  if (y.length > {n}) {{ return {c} * 2; }}\n  const s = `{a}-{b}`;\n  return {c} + s.length;\n}}\n\n"
+                )),
+                3 => body.push_str(&format!(
+                    "# {a} {b} {c}\ndef {a}_{b}_{f}_{k}(x, y):\n    {c} = x + {n}\n    if len(y) > {n}:\n        return {c} * 2\n    s = \"{a}-{b}\"\n    return {c} + len(s)\n\n"
+                )),
+                _ => body.push_str(&format!(
+                    "<div id=\"{a}-{f}-{k}\" class=\"{b} {c}\">\n  <span data-n=\"{n}\">{a} {b}</span>\n  <a href=\"/{c}/{n}\">{c}</a>\n  <input name=\"{a}{k}\" value=\"{n}\">\n</div>\n"
+                )),
+            }
+        }
+        let (dir, file) = match lang {
+            0 => ("src", format!("m{f}.rs")),
+            1 => ("src", format!("C{f}.cs")),
+            2 => ("src", format!("m{f}.js")),
+            3 => ("src", format!("m{f}.py")),
+            _ => ("src", format!("p{f}.html")),
+        };
+        let text = match lang {
+            1 => format!("namespace Gen {{\npublic class C{f} {{\n{body}}}\n}}\n"),
+            4 => format!("<!DOCTYPE html>\n<html>\n<body>\n{body}</body>\n</html>\n"),
+            _ => body,
+        };
+        std::fs::write(root.join(repo).join(dir).join(file), text).unwrap();
+    }
+    names
+}
+
+/// Percentile `p` (0..=100) of `v` (sorted in place), in milliseconds.
+fn pct_ms(v: &mut [Duration], p: usize) -> f64 {
+    v.sort();
+    let i = ((v.len() - 1) * p).div_ceil(100);
+    v[i].as_secs_f64() * 1e3
+}
+
+/// The numbers in `docs/spikes/raft-replication.md`, "Stage F at scale"
+/// (epic story 25). Not a gate: run it once, locally, in release:
+///
+/// ```sh
+/// cargo test --release -p graph-cli --test cluster_e2e measure_replication_at_scale -- --ignored --nocapture
+/// MG_SCALE_TOKENS=10000000 cargo test --release -p graph-cli --test cluster_e2e measure_replication_at_scale -- --ignored --nocapture
+/// ```
+///
+/// Without `MG_SCALE_TOKENS` it measures the vendored corpus; with it, a
+/// generated tree of about that many tokens ([`generate_tree`]).
+/// `MG_SCALE_DIR` puts the temporary files somewhere other than the
+/// system temp directory.
+#[test]
+#[ignore = "measurement for docs/spikes/raft-replication.md; run with --release --ignored"]
+fn measure_replication_at_scale() {
+    use graph_store::Store;
+    let d = match std::env::var_os("MG_SCALE_DIR") {
+        Some(p) => {
+            std::fs::create_dir_all(&p).unwrap();
+            tempfile::tempdir_in(p).unwrap()
+        }
+        None => tempfile::tempdir().unwrap(),
+    };
+    let secs = |t: Instant| t.elapsed().as_secs_f64();
+    let generated = std::env::var("MG_SCALE_TOKENS")
+        .ok()
+        .map(|v| v.parse::<u64>().expect("MG_SCALE_TOKENS: a number"));
+    let (root, repos) = match generated {
+        Some(tokens) => {
+            let root = d.path().join("src");
+            let t = Instant::now();
+            let repos = generate_tree(&root, tokens);
+            println!("generated ~{tokens} tokens in {:.1} s", secs(t));
+            (root, repos)
+        }
+        None => (corpus(), corpus_repos()),
+    };
+    {
+        fn walk(p: &Path) -> (u64, u64) {
+            let mut acc = (0, 0);
+            for e in std::fs::read_dir(p).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if e.file_name() != ".git" {
+                        let (b, f) = walk(&p);
+                        acc = (acc.0 + b, acc.1 + f);
+                    }
+                } else {
+                    acc = (acc.0 + p.metadata().unwrap().len(), acc.1 + 1);
+                }
+            }
+            acc
+        }
+        let (bytes, files) = walk(&root);
+        println!(
+            "source: {bytes} bytes in {files} files, {} repos",
+            repos.len()
+        );
+    }
+
+    // Embedded ingest: best of 3 on the corpus, once at scale.
+    let runs = if generated.is_some() { 1 } else { 3 };
+    let mut embedded = f64::MAX;
+    let mut embedded_db = PathBuf::new();
+    for i in 0..runs {
+        let db = d.path().join(format!("embedded{i}.redb"));
+        let t = Instant::now();
+        index_tree(&["--db", db.to_str().unwrap()], &root, &repos);
+        embedded = embedded.min(secs(t));
+        embedded_db = db;
+    }
+    let local = graph_store::open_store(&embedded_db, graph_cli::shipped_extractors()).unwrap();
+    let infos = local.describe(Some("scale"), None).unwrap();
+    let tokens: usize = infos
+        .iter()
+        .flat_map(|r| r.languages.values())
+        .map(|l| l.tokens)
+        .sum();
+    let files: usize = infos.iter().map(|r| r.files).sum();
+    let langs: std::collections::BTreeSet<&String> =
+        infos.iter().flat_map(|r| r.languages.keys()).collect();
+    println!(
+        "indexed: {tokens} tokens, {files} files, languages {langs:?}; db {} B",
+        std::fs::metadata(&embedded_db).unwrap().len()
+    );
+    println!("embedded ingest: {embedded:.3} s (best of {runs})");
+
+    // One node: ingest, snapshot build, snapshot install on a new learner.
+    let one = d.path().join("one");
+    let mut n = Node::start(
+        1,
+        &one,
+        "127.0.0.1:0",
+        &["--bootstrap", "--log-keep-entries", "0"],
+    );
+    wait_for("node 1 to lead", || (n.leader() == Some(1)).then_some(()));
+    let t = Instant::now();
+    index_tree(&n.server(), &root, &repos);
+    let single = secs(t);
+    println!(
+        "1-node ingest via --server: {single:.3} s ({:.0}% of embedded speed; ADR trigger < 50%)",
+        100.0 * embedded / single
+    );
+    let t = Instant::now();
+    let snap = ok(&["--server", &n.addr, "cluster", "snapshot", "--json"]);
+    println!("snapshot build: {:.3} s ({})", secs(t), snap.trim());
+    let st = n.status().unwrap();
+    println!(
+        "after snapshot+purge: log_bytes={} store_bytes={}",
+        st["log_bytes"], st["store_bytes"]
+    );
+    let target = n.applied();
+    let t = Instant::now();
+    let n2 = Node::start(
+        2,
+        &d.path().join("learner"),
+        "127.0.0.1:0",
+        &["--join", &n.addr, "--standby"],
+    );
+    let joined = secs(t);
+    wait_applied(&n2, target);
+    println!(
+        "snapshot transfer + install on a new learner: joined after {joined:.3} s, applied \
+         {target} after {:.3} s",
+        secs(t)
+    );
+    drop(n2);
+    n.shutdown();
+    std::fs::remove_dir_all(&one).ok();
+    std::fs::remove_dir_all(d.path().join("learner")).ok();
+
+    // Three nodes: ingest through the leader.
+    let dirs: Vec<PathBuf> = (1..=3).map(|i| d.path().join(format!("c{i}"))).collect();
+    let n1 = Node::start(1, &dirs[0], "127.0.0.1:0", &["--bootstrap"]);
+    wait_for("node 1 to lead", || (n1.leader() == Some(1)).then_some(()));
+    let join = ["--join", n1.addr.as_str(), "--auto-promote"];
+    let n2 = Node::start(2, &dirs[1], "127.0.0.1:0", &join);
+    let n3 = Node::start(3, &dirs[2], "127.0.0.1:0", &join);
+    wait_for("three voters", || (voters(&n1).len() == 3).then_some(()));
+    let _ = &n3;
+    let t = Instant::now();
+    index_tree(&n1.server(), &root, &repos);
+    let triple = secs(t);
+    println!(
+        "3-node ingest via the leader: {triple:.3} s ({:.0}% of embedded speed; ADR trigger < 50%)",
+        100.0 * embedded / triple
+    );
+    wait_applied(&n2, committed(&n1));
+
+    // Reads: the same queries embedded (in process), on the leader and on
+    // a follower, local and linearizable.
+    let words = ["value", "leader", "snapshot", "fn", "return", "class"];
+    let queries: Vec<graph_store::Query> = words
+        .iter()
+        .map(|w| {
+            let mut q = graph_store::Query::new(*w);
+            q.org = Some("scale".into());
+            q.limit = Some(100);
+            q
+        })
+        .collect();
+    let queries = if generated.is_some() {
+        queries
+    } else {
+        // The corpus is not in org `scale`.
+        queries
+            .into_iter()
+            .map(|mut q| {
+                q.org = None;
+                q
+            })
+            .collect()
+    };
+    let rounds = 50;
+    let time_reads = |s: &dyn Store| {
+        // One warm-up pass.
+        for q in &queries {
+            s.search(q).unwrap();
+        }
+        let mut v = Vec::new();
+        for _ in 0..rounds {
+            for q in &queries {
+                let t = Instant::now();
+                s.search(q).unwrap();
+                v.push(t.elapsed());
+            }
+        }
+        (pct_ms(&mut v, 50), pct_ms(&mut v, 95))
+    };
+    let remote = |addr: &str, mode: graph_client::ReadMode| {
+        let mut c = graph_client::ClientConfig::new(addr);
+        c.read_mode = mode;
+        graph_client::RemoteStore::connect(c).unwrap()
+    };
+    use graph_client::ReadMode::{Linearizable, Local};
+    let (e50, e95) = time_reads(local.as_ref());
+    println!("read, embedded (in process): p50 {e50:.3} ms, p95 {e95:.3} ms");
+    for (label, addr) in [("leader", &n1.addr), ("follower", &n2.addr)] {
+        for (mode, m) in [("local", Local), ("linearizable", Linearizable)] {
+            let (p50, p95) = time_reads(&remote(addr, m));
+            println!(
+                "read, {label} {mode}: p50 {p50:.3} ms, p95 {p95:.3} ms (RPC overhead p50 {:.3} ms \
+                 over embedded; ADR trigger > 5 ms)",
+                p50 - e50
+            );
+        }
+    }
+    drop(local);
+    drop((n1, n2, n3));
+}

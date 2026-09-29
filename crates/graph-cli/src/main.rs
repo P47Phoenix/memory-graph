@@ -205,6 +205,13 @@ enum Cmd {
     /// Prints `listening on <addr>` once ready (after joining, with --join); stops on Ctrl-C /
     /// SIGTERM. Exit code 6: the data directory belongs to another cluster than --join's peer
     Serve {
+        /// Read these settings from a TOML file: every serve flag is a key of the same name
+        /// (kebab-case or snake_case: `data-dir = "/data"`, `bootstrap = true`, `peers =
+        /// ["a:7000"]`), plus `db` and `cache-bytes`. A flag on the command line (or its
+        /// environment variable) overrides the file; an unknown key is an error. Env:
+        /// MEMORY_GRAPH_CONFIG
+        #[arg(long, env = "MEMORY_GRAPH_CONFIG", value_name = "FILE")]
+        config: Option<PathBuf>,
         /// Address to listen on (port 0 picks a free port; the line printed on start names it)
         #[arg(long, default_value = "127.0.0.1:7000", value_name = "HOST:PORT")]
         listen: String,
@@ -295,6 +302,18 @@ enum Cmd {
         /// wildcard IP replaced by the host name). Stored in node.json
         #[arg(long, value_name = "HOST:PORT")]
         advertise: Option<String>,
+        /// With --data-dir, on a restart: this node now listens at HOST:PORT (a new IP, port or
+        /// DNS name). Once serving, it asks the leader (through any member it knows) to record
+        /// the new address in the membership, then rewrites node.json; the start fails, and
+        /// node.json stays as it was, if no leader accepts it within 2 minutes. The same
+        /// address again is a plain restart. (A different --advertise is refused instead)
+        #[arg(
+            long,
+            value_name = "HOST:PORT",
+            requires = "data_dir",
+            conflicts_with = "advertise"
+        )]
+        update_advertise: Option<String>,
         /// This node's id. --db: default 1. --data-dir: required on the first start, then read
         /// from node.json (a different id is refused)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -758,8 +777,17 @@ fn server_header(addr: &str, st: &graph_proto::pb::StatusResponse) -> String {
 /// The server a command talks to, once resolved (for the error message).
 static REMOTE_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The command line, with serve --config <file>'s settings applied
+/// ([graph_cli::serve_config]).
+fn parse_cli(args: Vec<std::ffi::OsString>) -> Result<Cli> {
+    use clap::{CommandFactory, FromArgMatches};
+    let args = graph_cli::serve_config::apply(&Cli::command(), args)?;
+    let m = Cli::command().get_matches_from(args);
+    Ok(Cli::from_arg_matches(&m).unwrap_or_else(|e| e.exit()))
+}
+
 fn run() -> Result<i32> {
-    let cli = Cli::parse();
+    let cli = parse_cli(std::env::args_os().collect())?;
     if let Some(d) = cli.write_deadline {
         graph_cli::target::set_write_deadline(d);
     }
@@ -767,6 +795,7 @@ fn run() -> Result<i32> {
     let overrides = cli.overrides();
     // `serve` owns a file; everything else resolves --db / --server.
     if let Cmd::Serve {
+        config: _,
         listen,
         data_dir,
         bootstrap,
@@ -782,6 +811,7 @@ fn run() -> Result<i32> {
         accept_snapshot_overwrite,
         join_timeout,
         advertise,
+        update_advertise,
         node_id,
         node_id_from_hostname,
         log_format,
@@ -966,6 +996,7 @@ fn run() -> Result<i32> {
             cfg.min_free_disk = m.resolve(total);
         }
         cfg.advertise = advertise.clone();
+        cfg.update_advertise = update_advertise.clone();
         if !cluster_mode && (tuned || advertise.is_some()) {
             // Not refused (a stage A script may pass them), but said: with
             // --db they tune the one-member log of this file only.
@@ -1894,5 +1925,210 @@ mod chunk_bytes_flag_tests {
             "the --chunk-bytes override must change commit granularity, \
              or the flag has become a silent no-op (issue #28)"
         );
+    }
+}
+
+/// `serve --config <file>` (epic story 25 AC 4, issue #106): a file with
+/// every setting gives exactly what the same flags give.
+#[cfg(test)]
+mod serve_config_tests {
+    use super::*;
+    use clap::CommandFactory;
+    use std::ffi::OsString;
+
+    /// Every serve (and global) argument's raw values, by id, as parsed.
+    fn parsed(args: Vec<OsString>) -> Vec<(String, Vec<OsString>)> {
+        let args = graph_cli::serve_config::apply(&Cli::command(), args).unwrap();
+        let top = Cli::command().try_get_matches_from(args).unwrap();
+        let (name, sm) = top.subcommand().unwrap();
+        assert_eq!(name, "serve");
+        let cmd = Cli::command();
+        let serve = cmd.find_subcommand("serve").unwrap();
+        let ids: Vec<String> = serve
+            .get_arguments()
+            .chain(cmd.get_arguments())
+            .map(|a| a.get_id().to_string())
+            .filter(|id| id != "config" && id != "help")
+            .collect();
+        ids.into_iter()
+            .map(|id| {
+                let v = sm
+                    .try_get_raw(&id)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.map(OsString::from).collect())
+                    .unwrap_or_default();
+                (id, v)
+            })
+            .collect()
+    }
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    fn check(flags: &[&str], toml: &str) {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("serve.toml");
+        std::fs::write(&f, toml).unwrap();
+        let from_flags = parsed(os(flags));
+        let mut a = os(&["memory-graph", "serve", "--config"]);
+        a.push(f.into_os_string());
+        let from_file = parsed(a);
+        assert_eq!(from_file, from_flags);
+        // And the file really set something (not two sets of defaults).
+        let listen = from_file.iter().find(|(id, _)| id == "listen").unwrap();
+        assert_ne!(listen.1, os(&["127.0.0.1:7000"]));
+    }
+
+    #[test]
+    fn a_config_file_equals_the_same_flags() {
+        check(
+            &[
+                "memory-graph",
+                "serve",
+                "--data-dir",
+                "/data",
+                "--join",
+                "peer:7000",
+                "--auto-promote",
+                "--accept-snapshot-overwrite",
+                "--join-timeout",
+                "30s",
+                "--listen",
+                "0.0.0.0:7001",
+                "--advertise",
+                "h:7001",
+                "--node-id",
+                "3",
+                "--log-format",
+                "json",
+                "--log-level",
+                "debug",
+                "--metrics-listen",
+                "0.0.0.0:9100",
+                "--ready-max-lag",
+                "50",
+                "--snapshot-log-entries",
+                "500",
+                "--snapshot-log-bytes",
+                "64M",
+                "--log-keep-entries",
+                "10",
+                "--election-timeout-min",
+                "600",
+                "--election-timeout-max",
+                "1200",
+                "--heartbeat-interval",
+                "100",
+                "--min-free-disk",
+                "5%",
+                "--snapshot-max-age",
+                "10m",
+                "--cache-bytes",
+                "1000000",
+            ],
+            r#"
+data-dir = "/data"
+join = "peer:7000"
+auto_promote = true
+accept-snapshot-overwrite = true
+join-timeout = "30s"
+listen = "0.0.0.0:7001"
+advertise = "h:7001"
+node-id = 3
+log-format = "json"
+log_level = "debug"
+metrics-listen = "0.0.0.0:9100"
+ready-max-lag = 50
+snapshot-log-entries = 500
+snapshot-log-bytes = "64M"
+log-keep-entries = 10
+election-timeout-min = 600
+election-timeout-max = 1200
+heartbeat-interval = 100
+min-free-disk = "5%"
+snapshot-max-age = "10m"
+cache-bytes = 1000000
+"#,
+        );
+        check(
+            &[
+                "memory-graph",
+                "serve",
+                "--data-dir",
+                "/data",
+                "--bootstrap-or-join",
+                "mg-0.mg:7000",
+                "--peers",
+                "mg-1.mg:7000,mg-2.mg:7000",
+                "--replicas",
+                "5",
+                "--bootstrap-probe-timeout",
+                "10s",
+                "--force-bootstrap",
+                "--node-id-from-hostname",
+                "--listen",
+                "0.0.0.0:7000",
+            ],
+            r#"
+data_dir = "/data"
+bootstrap_or_join = "mg-0.mg:7000"
+peers = ["mg-1.mg:7000", "mg-2.mg:7000"]
+replicas = 5
+bootstrap_probe_timeout = "10s"
+force_bootstrap = true
+node_id_from_hostname = true
+listen = "0.0.0.0:7000"
+"#,
+        );
+        check(
+            &[
+                "memory-graph",
+                "serve",
+                "--data-dir",
+                "/data",
+                "--update-advertise",
+                "new:7000",
+                "--listen",
+                "0.0.0.0:7002",
+            ],
+            "data-dir = \"/data\"\nupdate-advertise = \"new:7000\"\nlisten = \"0.0.0.0:7002\"\n",
+        );
+        check(
+            &[
+                "memory-graph",
+                "serve",
+                "--db",
+                "g.redb",
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            "db = \"g.redb\"\nlisten = \"127.0.0.1:0\"\n",
+        );
+    }
+
+    #[test]
+    fn flags_override_the_config_file_and_clap_still_validates_it() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("serve.toml");
+        std::fs::write(
+            &f,
+            "listen = \"0.0.0.0:7001\"\nnode-id = 3\ndata-dir = \"/d\"\n",
+        )
+        .unwrap();
+        let mut a = os(&["memory-graph", "serve", "--node-id", "5", "--config"]);
+        a.push(f.clone().into_os_string());
+        let got = parsed(a);
+        let get = |id: &str| got.iter().find(|(i, _)| i == id).unwrap().1.clone();
+        assert_eq!(get("node_id"), os(&["5"]));
+        assert_eq!(get("listen"), os(&["0.0.0.0:7001"]));
+        // The file's values go through the flags' own rules: `bootstrap`
+        // needs a data directory.
+        std::fs::write(&f, "bootstrap = true\n").unwrap();
+        let mut a = os(&["memory-graph", "serve", "--config"]);
+        a.push(f.into_os_string());
+        let args = graph_cli::serve_config::apply(&Cli::command(), a).unwrap();
+        assert!(Cli::command().try_get_matches_from(args).is_err());
     }
 }

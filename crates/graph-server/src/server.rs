@@ -71,6 +71,12 @@ pub struct ServeConfig {
     /// address with a wildcard IP replaced by the host name. Stored in
     /// `node.json` (a different value on restart is refused).
     pub advertise: Option<String>,
+    /// `--update-advertise`: a restarted member now listens at this address;
+    /// it asks the cluster to record it, then rewrites `node.json`
+    /// ([`crate::advertise`]). Refused on a first start and in `--db` mode.
+    pub update_advertise: Option<String>,
+    /// How long `--update-advertise` keeps asking before the start fails.
+    pub update_advertise_timeout: Duration,
     /// Raft timing and log retention; `None` picks
     /// [`RaftSettings::cluster`] (`--data-dir`) or
     /// [`RaftSettings::standalone`] (`--db`).
@@ -173,6 +179,8 @@ impl ServeConfig {
             listen,
             node_id: None,
             advertise: None,
+            update_advertise: None,
+            update_advertise_timeout: crate::advertise::DEFAULT_UPDATE_ADVERTISE_TIMEOUT,
             raft: None,
             min_free_disk: 0,
             free_space_probe: None,
@@ -215,6 +223,7 @@ impl std::fmt::Debug for ServeConfig {
             .field("listen", &self.listen)
             .field("node_id", &self.node_id)
             .field("advertise", &self.advertise)
+            .field("update_advertise", &self.update_advertise)
             .field("raft", &self.raft)
             .field("min_free_disk", &self.min_free_disk)
             .field("cache_bytes", &self.cache_bytes)
@@ -338,6 +347,27 @@ pub async fn start(
     }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
+    // `--update-advertise` moves a member: refused before anything is
+    // opened or written for a node that is not one.
+    if cfg.update_advertise.is_some() {
+        match &plan {
+            None => {
+                return Err(StoreError::Rejected(
+                    "--update-advertise needs --data-dir (a --db server is a cluster of one; \
+                     its address is --advertise)"
+                        .into(),
+                ))
+            }
+            Some(p) if p.existing.is_none() => {
+                return Err(StoreError::Rejected(
+                    "--update-advertise changes the address of a node that already belongs \
+                     to a cluster; this data directory is new (use --advertise)"
+                        .into(),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
     let node_id = match &plan {
         Some(p) => p.node_id,
         None => cfg.node_id.unwrap_or(1),
@@ -431,6 +461,9 @@ pub async fn start(
         })));
     }
     let mut initialize = plan.is_none();
+    // `--update-advertise` on a restart whose address differs: the new
+    // address, and node.json as it is until the cluster recorded it.
+    let mut moved: Option<(PathBuf, NodeJson)> = None;
     let (identity, advertise) = match (&plan, &paths.node_json) {
         (Some(plan), Some(json_path)) => {
             let (json, advertise) = match &plan.existing {
@@ -438,13 +471,43 @@ pub async fn start(
                     if let Some(a) = &cfg.advertise {
                         if a != &found.advertise {
                             return Err(StoreError::Rejected(format!(
-                                "--advertise {a} differs from {} recorded in `{}` \
-                                 (changing it needs --update-advertise, a later stage)",
+                                "--advertise {a} differs from {} recorded in `{}`; to move \
+                                 this node to a new address, restart it with \
+                                 --update-advertise {a} (instead of --advertise)",
                                 found.advertise,
                                 json_path.display()
                             )));
                         }
                     }
+                    let advertise = match &cfg.update_advertise {
+                        Some(a) if a != &found.advertise => {
+                            if found.cluster_id.is_none() {
+                                return Err(StoreError::Rejected(format!(
+                                    "--update-advertise {a}: this node never joined its \
+                                     cluster (no cluster id in `{}`), so no member knows its \
+                                     address; start it with --join again",
+                                    json_path.display()
+                                )));
+                            }
+                            tracing::warn!(
+                                from = %found.advertise,
+                                to = %a,
+                                "--update-advertise: moving this node to a new address"
+                            );
+                            let mut json = found.clone();
+                            json.advertise = a.clone();
+                            moved = Some((json_path.clone(), json));
+                            a.clone()
+                        }
+                        Some(a) => {
+                            tracing::info!(
+                                addr = %a,
+                                "--update-advertise: already the recorded address; nothing to do"
+                            );
+                            found.advertise.clone()
+                        }
+                        None => found.advertise.clone(),
+                    };
                     // The log and the store must agree before the node
                     // takes part in any election (QA: a lost raft.redb
                     // would let it vote twice in a term).
@@ -458,7 +521,7 @@ pub async fn start(
                         )?;
                     }
                     initialize = found.bootstrapped;
-                    (found.clone(), found.advertise.clone())
+                    (found.clone(), advertise)
                 }
                 None => {
                     let advertise = cfg
@@ -788,6 +851,41 @@ pub async fn start(
             crate::join::spawn_rejoin(raft.clone(), spec.peer.clone(), req, shutdown.clone());
         }
     }
+    // `--update-advertise`: serving at the new address now (the leader asks
+    // it who it is), so ask the cluster to record it: through this node
+    // first (it forwards to the leader it knows, or leads itself), then the
+    // other members at the addresses its membership lists. node.json
+    // follows only once the change is committed; a refusal or the timeout
+    // stops the server again and fails the start, node.json unchanged.
+    if let Some((json_path, json)) = moved {
+        let mut endpoints = vec![addr.to_string()];
+        endpoints.extend(
+            raft.metrics()
+                .membership_config
+                .membership()
+                .nodes()
+                .filter(|(id, _)| **id != node_id)
+                .map(|(_, n)| n.addr.clone()),
+        );
+        let done = crate::advertise::update_advertise(
+            &endpoints,
+            node_id,
+            &json.advertise,
+            cfg.update_advertise_timeout,
+        )
+        .await
+        .and_then(|_| json.write(&json_path));
+        if let Err(e) = done {
+            shutdown.trigger();
+            let _ = task.await;
+            return Err(e);
+        }
+        tracing::info!(
+            advertise = %json.advertise,
+            node_json = %json_path.display(),
+            "--update-advertise: node.json records the new address"
+        );
+    }
     Ok(Running {
         addr,
         metrics_addr,
@@ -880,7 +978,24 @@ async fn wait_for_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    // Windows: Ctrl-C, and Ctrl-Break (what a supervisor sends a console
+    // process it started in its own process group, e.g. Python's
+    // `send_signal(CTRL_BREAK_EVENT)` in `scripts/cluster_soak.py`).
+    #[cfg(windows)]
+    {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut brk) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = brk.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }
