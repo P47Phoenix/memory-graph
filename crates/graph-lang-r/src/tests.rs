@@ -119,6 +119,14 @@ fn r_markdown_scans_only_r_chunks() {
 }
 
 #[test]
+fn r_markdown_fences_honour_their_length() {
+    let src = "Intro\n\n````markdown\n```{r}\nshown <- function() 1\n```\n````\n\n````{r}\nkept <- function() 1\n# ```\nstill <- function() 2\n````\nafter <- function() 3\n";
+    let s = syms(src);
+    let names: Vec<_> = s.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(names, ["kept", "still"]);
+}
+
+#[test]
 fn bom_and_non_ascii_positions() {
     let src = "\u{feff}# é\nf_é <- function() \"ü\"\n";
     let ex = RExtractor.extract(src);

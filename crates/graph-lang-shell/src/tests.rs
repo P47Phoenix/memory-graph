@@ -99,6 +99,17 @@ fn declarations() {
 }
 
 #[test]
+fn export_stops_at_glued_separators() {
+    let s = syms("export B=2; do_thing arg\nif true; then export Y=2; fi\n(readonly Z=1)\nexport W=$(a; b)|c\n");
+    let names: Vec<_> = s.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(names, ["B", "Y", "Z", "W"]);
+    assert_eq!(find(&s, "B").3, "export B=2");
+    assert_eq!(find(&s, "Y").3, "export Y=2");
+    assert_eq!(find(&s, "Z").3, "readonly Z=1");
+    assert_eq!(find(&s, "W").3, "export W=$(a; b)");
+}
+
+#[test]
 fn nested_functions_nest() {
     let ex = ShellExtractor.extract(SRC);
     let span = |n: &str| ex.symbols.iter().find(|s| s.name == n).unwrap().span;

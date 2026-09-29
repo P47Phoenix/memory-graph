@@ -95,6 +95,29 @@ CREATE TABLE [dbo].[Users] ([Id] INT NOT NULL, [Name] NVARCHAR(50))\nCREATE TRIG
 }
 
 #[test]
+fn tsql_routine_without_outer_begin_runs_to_go() {
+    let src = "CREATE PROC p AS\nIF 1=1 BEGIN SELECT 1; END;\nSELECT 2;\nGO\nCREATE PROC q AS\nWHILE 1=0 BEGIN SELECT 1 END\nSELECT 3;\n";
+    let s = syms(src);
+    assert_eq!(
+        find(&s, "p").3,
+        "CREATE PROC p AS\nIF 1=1 BEGIN SELECT 1; END;\nSELECT 2;"
+    );
+    assert_eq!(
+        find(&s, "q").3,
+        "CREATE PROC q AS\nWHILE 1=0 BEGIN SELECT 1 END\nSELECT 3;"
+    );
+}
+
+#[test]
+fn only_modifiers_between_create_and_the_object_keyword() {
+    let src = "CREATE EXTENSION IF NOT EXISTS hstore WITH SCHEMA public;\nCREATE PUBLICATION pub FOR TABLE t;\n\
+CREATE ALGORITHM=MERGE SQL SECURITY INVOKER VIEW v AS SELECT 1;\nCREATE GLOBAL TEMPORARY TABLE tt (x int);\n";
+    let s = syms(src);
+    let names: Vec<_> = s.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(names, ["v", "tt"]);
+}
+
+#[test]
 fn plsql_packages() {
     let src = "CREATE OR REPLACE PACKAGE emp_pkg AS\n  PROCEDURE hire(p_name VARCHAR2);\n  FUNCTION total RETURN NUMBER;\nEND emp_pkg;\n/\n\
 CREATE OR REPLACE PACKAGE BODY emp_pkg IS\n  g_count NUMBER := 0;\n  PROCEDURE hire(p_name VARCHAR2) IS\n    v NUMBER;\n  BEGIN\n    IF p_name IS NULL THEN RETURN; END IF;\n    INSERT INTO emp VALUES (p_name);\n  END hire;\n  FUNCTION total RETURN NUMBER IS\n  BEGIN\n    RETURN g_count;\n  END;\nEND emp_pkg;\n/\n\

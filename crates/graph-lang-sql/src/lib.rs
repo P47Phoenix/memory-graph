@@ -139,6 +139,46 @@ fn boundaries(source: &str, tokens: &[TokenDecl], code: &[usize]) -> Vec<bool> {
     out
 }
 
+/// Words allowed between `CREATE` and the object keyword; anything else
+/// (`CREATE EXTENSION ... WITH SCHEMA`, `CREATE PUBLICATION ... FOR TABLE`)
+/// means the statement makes something that is not a symbol.
+const CREATE_MODIFIERS: &[&str] = &[
+    "or",
+    "replace",
+    "alter",
+    "unique",
+    "clustered",
+    "nonclustered",
+    "columnstore",
+    "fulltext",
+    "spatial",
+    "bitmap",
+    "temp",
+    "temporary",
+    "global",
+    "local",
+    "unlogged",
+    "materialized",
+    "recursive",
+    "editionable",
+    "noneditionable",
+    "editioning",
+    "force",
+    "noforce",
+    "constraint",
+    "definer",
+    "algorithm",
+    "sql",
+    "security",
+    "invoker",
+    "aggregate",
+    "external",
+    "virtual",
+    "secure",
+    "transient",
+    "volatile",
+];
+
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
@@ -266,6 +306,17 @@ impl Scanner<'_> {
             if let Some(h) = hit {
                 break Some(h);
             }
+            if self.text(k) == "=" {
+                // `DEFINER = user@host`, `ALGORITHM = MERGE`: skip the value.
+                k += 2;
+                while k + 1 < n && self.text(k) == "@" {
+                    k += 2;
+                }
+                continue;
+            }
+            if !self.is_any(k, CREATE_MODIFIERS) {
+                break None;
+            }
             k += 1;
         };
         let Some((kw, kind, mut lang, mut shape)) = found else {
@@ -382,10 +433,24 @@ impl Scanner<'_> {
         let mut stack: Vec<Block> = Vec::new();
         let mut block_done = false;
         let mut begin_seen = false;
+        // Whether the body is one outer `BEGIN ... END` block: the first
+        // word after `AS`/`IS` is `BEGIN`, or a `BEGIN` comes with no
+        // `AS`/`IS` before it (MySQL). `None` until known.
+        let mut outer: Option<bool> = None;
+        let mut after_as = false;
         let start = c;
         while c < n {
             if self.boundary[c] {
                 return (c.saturating_sub(1), c);
+            }
+            if stack.is_empty() && outer.is_none() {
+                if after_as {
+                    outer = Some(self.is_begin(c));
+                } else if self.is_any(c, &["as", "is"]) {
+                    after_as = true;
+                } else if self.is_begin(c) {
+                    outer = Some(true);
+                }
             }
             if let Some(e) = self.dollar_open(c) {
                 c = self.skip_dollar(c, e);
@@ -411,7 +476,8 @@ impl Scanner<'_> {
             } else if stack.is_empty() && c > start && self.is(c, "create") {
                 return (c - 1, c);
             } else if stack.is_empty() && self.text(c) == ";" {
-                if block_done || (!begin_seen && self.ends_here(c + 1)) {
+                let whole = outer == Some(true);
+                if (block_done && whole) || ((!begin_seen || !whole) && self.ends_here(c + 1)) {
                     return (c, c + 1);
                 }
             } else if matches!(self.text(c), "(" | "[") {

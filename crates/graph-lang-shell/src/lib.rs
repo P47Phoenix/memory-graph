@@ -19,7 +19,9 @@
 //! (`f() if ...; fi`) is not a symbol; `export -f` / `declare -f` and
 //! `declare` without `-r`/`-x` are ignored; a `case` word used as a plain
 //! argument (`echo case`) confuses the matching of `)` inside a `(...)`
-//! body; plain `NAME=value` assignments and `local` are not symbols.
+//! body; plain `NAME=value` assignments and `local` are not symbols; zsh's
+//! multi-name `function a b c { ... }` is not a symbol (only one name per
+//! definition is recognized).
 use graph_core::scan::span_between;
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -125,6 +127,13 @@ impl Scanner<'_> {
 
     fn same_line(&self, a: usize, b: usize) -> bool {
         b < self.code.len() && self.tok(a).span.end_line == self.tok(b).span.start_line
+    }
+
+    /// A command separator or closer that ends an `export` word list.
+    fn is_separator(&self, c: usize) -> bool {
+        c < self.code.len()
+            && self.tok(c).class != TokenClass::Literal
+            && matches!(self.text(c), ";" | "&" | "|" | ")" | "}")
     }
 
     fn command_position(&self, c: usize) -> bool {
@@ -278,9 +287,7 @@ impl Scanner<'_> {
         };
         let mut first = true;
         while k < n && self.same_line(k - 1, k) {
-            if self.tok(k).class != TokenClass::Literal
-                && matches!(self.text(k), ";" | "&" | "|" | ")" | "}")
-            {
+            if self.is_separator(k) {
                 break;
             }
             let start = k;
@@ -295,7 +302,7 @@ impl Scanner<'_> {
                     }
                 }
                 last = e;
-                if !self.adjacent(e, e + 1) {
+                if !self.adjacent(e, e + 1) || self.is_separator(e + 1) {
                     break;
                 }
                 e += 1;

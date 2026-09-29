@@ -110,29 +110,36 @@ struct Segment {
 /// Splits a document into prose (fences included) and R chunk bodies.
 fn segments(source: &str) -> Vec<Segment> {
     let mut out: Vec<Segment> = Vec::new();
-    let mut in_chunk = false;
+    // The open fence, if any: (backtick count, whether it is an R chunk).
+    let mut fence: Option<(usize, bool)> = None;
     let mut offset = 0;
     for (i, raw) in source.split_inclusive('\n').enumerate() {
         let line = raw.trim_start_matches('\u{feff}').trim_start();
-        let (code, next_in) = if in_chunk {
-            if line.starts_with("```") && line.trim_start_matches('`').trim().is_empty() {
-                (false, false)
-            } else {
-                (true, true)
+        let ticks = line.bytes().take_while(|&b| b == b'`').count();
+        let rest = &line[ticks..];
+        let code = match fence {
+            Some((len, is_r)) => {
+                if ticks >= len && rest.trim().is_empty() {
+                    fence = None;
+                    false
+                } else {
+                    is_r
+                }
             }
-        } else if let Some(rest) = line.strip_prefix("```") {
-            let rest = rest.trim_start_matches('`').trim_start();
-            let r_chunk = rest.strip_prefix('{').is_some_and(|h| {
-                let h = h.trim_start();
-                (h.starts_with('r') || h.starts_with('R'))
-                    && h[1..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| matches!(c, '}' | ',' | ' ' | '\t'))
-            });
-            (false, r_chunk)
-        } else {
-            (false, false)
+            None if ticks >= 3 => {
+                let rest = rest.trim_start();
+                let r_chunk = rest.strip_prefix('{').is_some_and(|h| {
+                    let h = h.trim_start();
+                    (h.starts_with('r') || h.starts_with('R'))
+                        && h[1..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| matches!(c, '}' | ',' | ' ' | '\t'))
+                });
+                fence = Some((ticks, r_chunk));
+                false
+            }
+            None => false,
         };
         let end = offset + raw.len();
         match out.last_mut() {
@@ -144,7 +151,6 @@ fn segments(source: &str) -> Vec<Segment> {
                 code,
             }),
         }
-        in_chunk = next_in;
         offset = end;
     }
     out
