@@ -674,14 +674,24 @@ dependencies = [
  "crossbeam-channel",
  "graph-client",
  "graph-core",
+ "graph-lang-asm",
  "graph-lang-aspx",
+ "graph-lang-c",
+ "graph-lang-cobol",
  "graph-lang-csharp",
+ "graph-lang-elixir",
+ "graph-lang-fsharp",
+ "graph-lang-gdscript",
+ "graph-lang-go",
+ "graph-lang-haskell",
  "graph-lang-html",
  "graph-lang-java",
  "graph-lang-javascript",
  "graph-lang-python",
  "graph-lang-r",
+ "graph-lang-rpg",
  "graph-lang-rust",
+ "graph-lang-scala",
  "graph-lang-shell",
  "graph-lang-sql",
  "graph-lang-typescript",
@@ -734,6 +744,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-asm"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-aspx"
 version = "0.1.0"
 dependencies = [
@@ -743,7 +761,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-c"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-cobol"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-csharp"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-elixir"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-fsharp"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-gdscript"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-go"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-haskell"
 version = "0.1.0"
 dependencies = [
  "graph-core",
@@ -791,12 +865,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-rpg"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-rust"
 version = "0.1.0"
 dependencies = [
  "graph-core",
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "graph-lang-scala"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
 ]
 
 [[package]]

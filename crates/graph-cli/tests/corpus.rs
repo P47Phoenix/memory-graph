@@ -490,6 +490,141 @@ fn every_parsed_token_is_stored() {
             "no Python {kind} {qualified} in {file}"
         );
     }
+    // C, C++, Go and Scala scanners on real code: exact files and kinds,
+    // and nesting (methods under their class, members under the package).
+    let one = |name: &str, lang: &str, kind: &str| {
+        let mut q = graph_store::SymbolQuery::new(name);
+        q.language = Some(lang.into());
+        let hits = store.search_symbols(&q).unwrap();
+        hits.into_iter()
+            .find(|h| h.lang_kind.as_deref() == Some(kind))
+            .unwrap_or_else(|| panic!("no {lang} {kind} {name}"))
+    };
+    assert_eq!(one("cJSON_Parse", "c", "function").file, "cJSON.c");
+    assert_eq!(one("cJSON", "c", "struct").file, "cJSON.h");
+    assert_eq!(one("CJSON_VERSION_MAJOR", "c", "macro").file, "cJSON.h");
+    assert_eq!(one("cJSON_bool", "c", "typedef").file, "cJSON.h");
+    let opts = one("Options", "cpp", "class");
+    assert_eq!(opts.file, "include/cxxopts.hpp");
+    assert!(one("parse_positional", "cpp", "method")
+        .qualified
+        .contains("Options::parse_positional"));
+    one("cxxopts", "cpp", "namespace");
+    let m = one("Fprint", "go", "method");
+    assert_eq!(m.file, "color.go");
+    assert!(m.qualified.starts_with("color::"), "{}", m.qualified);
+    one("Color", "go", "struct");
+    one("FgRed", "go", "const");
+    one("Str", "scala", "class");
+    one("ErrorMode", "scala", "trait");
+    one("Throw", "scala", "case object");
+    assert!(one("overlay", "scala", "def")
+        .qualified
+        .contains("Str::overlay"));
+    for lang in ["c", "cpp", "go", "scala"] {
+        let n: usize = store
+            .describe(None, None)
+            .unwrap()
+            .iter()
+            .filter_map(|i| i.languages.get(lang))
+            .map(|l| l.symbols)
+            .sum();
+        assert!(n > 100, "{lang} extractor found only {n} symbols");
+    }
+    // F#, Haskell, Elixir and GDScript: one declaration each, with its kind
+    // and nesting, on real code.
+    for (lang, name, lang_kind, qualified) in [
+        (
+            "fsharp",
+            "IArgParserTemplate",
+            "interface",
+            "Argu::IArgParserTemplate",
+        ),
+        (
+            "haskell",
+            "rangeParse",
+            "function",
+            "PostgREST.RangeQuery::rangeParse",
+        ),
+        (
+            "elixir",
+            "NimbleOptions.Docs",
+            "defmodule",
+            "NimbleOptions.Docs",
+        ),
+        ("gdscript", "destroy", "func", "Enemy::destroy"),
+    ] {
+        let mut q = graph_store::SymbolQuery::new(name);
+        q.language = Some(lang.into());
+        let hits = store.search_symbols(&q).unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.lang_kind.as_deref() == Some(lang_kind) && h.qualified == qualified),
+            "{lang} {name}: {hits:?}"
+        );
+    }
+    // Elixir functions nest in their module (a Type, for the class grain).
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("elixir".into());
+    q.kind = Some("method".into());
+    let methods = store.search_symbols(&q).unwrap();
+    assert!(
+        methods.len() > 50
+            && methods
+                .iter()
+                .all(|h| h.qualified.starts_with("NimbleOptions")),
+        "{} Elixir methods",
+        methods.len()
+    );
+    // COBOL, RPG and assembly: real programs yield their symbols.
+    let spot = |name: &str, lang: &str, lang_kind: &str, file: &str| {
+        let mut q = graph_store::SymbolQuery::new(name);
+        q.language = Some(lang.into());
+        let hits = store.search_symbols(&q).unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.lang_kind.as_deref() == Some(lang_kind) && h.file == file),
+            "{lang} {lang_kind} {name} not found in {file}: {hits:?}"
+        );
+    };
+    spot("cow", "cobol", "program", "cow.cbl");
+    spot("web-header", "cobol", "paragraph", "cow.cbl");
+    spot("start-readfile", "cobol", "paragraph", "cowtemplate.cbl");
+    spot(
+        "the-values",
+        "cobol",
+        "level-01",
+        "controllers/showname.cbl",
+    );
+    spot(
+        "working-storage",
+        "cobol",
+        "section",
+        "controllers/showsum.cbl",
+    );
+    spot(
+        "convertObjectToValues",
+        "rpg",
+        "procedure",
+        "examples/JSONPARS5B.JSON-Build-from-scratch-different-ways.rpgle",
+    );
+    spot(
+        "stockList",
+        "rpg",
+        "ds",
+        "examples/JSONPARS5B.JSON-Build-from-scratch-different-ways.rpgle",
+    );
+    spot(
+        "myTrace",
+        "rpg",
+        "interface",
+        "examples/JSONPARS0A.JSON-Basic-features.rpgle",
+    );
+    spot("start", "asm", "label", "snake.asm");
+    spot("SUMFN", "asm", "label", "Chapter 06/codesnippets.s");
+    spot("PUSH2", "asm", "macro", "Chapter 06/codesnippets.s");
+    spot("VAR1", "asm", "equ", "Chapter 06/codesnippets.s");
+    spot("hexstr", "asm", "data", "Chapter 04/printdword.s");
     // Cross-repo, cross-language search works on real code.
     let hits = store.search(&Query::new("ITransport")).unwrap();
     let repos: BTreeSet<_> = hits.iter().filter_map(|h| h.repo.clone()).collect();
@@ -607,8 +742,8 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 /// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
-    const EXPECTED_FILES: usize = 632;
-    const EXPECTED_HASH: u64 = 10106295268086031470;
+    const EXPECTED_FILES: usize = 704;
+    const EXPECTED_HASH: u64 = 2636213689751639222;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());
