@@ -37,6 +37,9 @@ struct Handle {
     conn: u64,
     created: Instant,
     snap: SharedSnapshot,
+    /// The node's read freshness when the handle opened (ADR 0004 D8): the
+    /// handle is frozen there, so every read through it reports this.
+    meta: Option<graph_proto::ReadMeta>,
 }
 
 /// The table of open handles.
@@ -120,6 +123,18 @@ impl SnapshotTable {
     /// snapshot is taken outside the table lock (it opens a read
     /// transaction) and the caps are checked again after.
     pub fn open(&self, conn: u64, store: &V2Store) -> Result<u64, Status> {
+        self.open_with_meta(conn, store, None)
+    }
+
+    /// [`open`](Self::open), recording the [`ReadMeta`](graph_proto::ReadMeta)
+    /// the handle's reads report (taken before the snapshot, so the frozen
+    /// view reflects at least its `applied_index`).
+    pub fn open_with_meta(
+        &self,
+        conn: u64,
+        store: &V2Store,
+        meta: Option<graph_proto::ReadMeta>,
+    ) -> Result<u64, Status> {
         self.check_caps(&self.lock(), conn)?;
         let snap = store
             .snapshot_owned()
@@ -138,6 +153,7 @@ impl SnapshotTable {
                 conn,
                 created: Instant::now(),
                 snap: Arc::new(Mutex::new(snap)),
+                meta,
             },
         );
         *t.per_conn.entry(conn).or_insert(0) += 1;
@@ -168,6 +184,11 @@ impl SnapshotTable {
             });
         }
         Ok(Arc::clone(&t.open[&id].snap))
+    }
+
+    /// The meta recorded when handle `id` opened, if any.
+    pub fn meta(&self, id: u64) -> Option<graph_proto::ReadMeta> {
+        self.lock().open.get(&id).and_then(|h| h.meta)
     }
 
     /// Close one handle (a no-op for an unknown id).

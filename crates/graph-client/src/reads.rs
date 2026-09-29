@@ -26,7 +26,7 @@ fn nodes(v: Vec<pb::Node>) -> Result<Vec<Node>> {
 
 pub async fn get(c: &Conn, view: View, id: NodeId) -> Result<Option<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .get(pb::GetRequest {
                     view: view_of(view),
@@ -40,7 +40,7 @@ pub async fn get(c: &Conn, view: View, id: NodeId) -> Result<Option<Node>> {
 
 pub async fn parent(c: &Conn, view: View, id: NodeId) -> Result<Option<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .parent(pb::ParentRequest {
                     view: view_of(view),
@@ -54,7 +54,7 @@ pub async fn parent(c: &Conn, view: View, id: NodeId) -> Result<Option<Node>> {
 
 pub async fn count_nodes(c: &Conn, view: View, kind: NodeKind) -> Result<usize> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .count_nodes(pb::CountNodesRequest {
                     view: view_of(view),
@@ -69,7 +69,7 @@ pub async fn count_nodes(c: &Conn, view: View, kind: NodeKind) -> Result<usize> 
 
 pub async fn roots(c: &Conn, view: View) -> Result<Vec<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .roots(pb::RootsRequest {
                     view: view_of(view),
@@ -82,7 +82,7 @@ pub async fn roots(c: &Conn, view: View) -> Result<Vec<Node>> {
 
 pub async fn children(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .children(pb::ChildrenRequest {
                     view: view_of(view),
@@ -102,7 +102,7 @@ pub async fn children_page(
     limit: usize,
 ) -> Result<Page<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .children_page(pb::ChildrenPageRequest {
                     view: view_of(view),
@@ -124,7 +124,7 @@ pub async fn descendants_page(
     limit: usize,
 ) -> Result<Page<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .descendants_page(pb::DescendantsPageRequest {
                     view: view_of(view),
@@ -140,7 +140,7 @@ pub async fn descendants_page(
 
 pub async fn ancestors(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             store_client(ch)
                 .ancestors(pb::AncestorsRequest {
                     view: view_of(view),
@@ -175,7 +175,7 @@ async fn drain(
 
 pub async fn descendants(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
     let r = c
-        .call(Kind::Read, |ch| async move {
+        .read_call(view, |ch| async move {
             let r = store_client(ch)
                 .descendants(pb::DescendantsRequest {
                     view: view_of(view),
@@ -204,7 +204,7 @@ pub async fn file_tokens(
         path: path.into(),
     };
     let (toks, meta) = c
-        .call(Kind::Read, |ch| {
+        .read_call(view, |ch| {
             let req = req.clone();
             async move {
                 let r = store_client(ch).file_tokens(req).await?;
@@ -230,7 +230,7 @@ pub async fn describe(
         repo: repo.map(str::to_string),
     };
     let r = c
-        .call(Kind::Read, |ch| {
+        .read_call(view, |ch| {
             let req = req.clone();
             async move {
                 let mut cl = store_client(ch);
@@ -252,7 +252,7 @@ async fn search_page(c: &Conn, view: View, q: &Query) -> Result<(Vec<Hit>, bool)
         query: Some(q.clone().into()),
     };
     let r = c
-        .call(Kind::Read, |ch| {
+        .read_call(view, |ch| {
             let req = req.clone();
             async move { store_client(ch).search(req).await }
         })
@@ -272,7 +272,7 @@ async fn search_symbols_page(
         query: Some(q.clone().into()),
     };
     let r = c
-        .call(Kind::Read, |ch| {
+        .read_call(view, |ch| {
             let req = req.clone();
             async move { store_client(ch).search_symbols(req).await }
         })
@@ -283,9 +283,10 @@ async fn search_symbols_page(
 }
 
 /// `OpenSnapshot`; `linearizable`: the server runs the read barrier first.
+/// The handle is pinned to the node that opened it: its reads go there.
 pub async fn open_snapshot(c: &Conn, linearizable: bool) -> Result<u64> {
-    let r = c
-        .call(Kind::Read, |ch| async move {
+    let (r, endpoint) = c
+        .call_at(Kind::Read, None, |ch| async move {
             let mut req = tonic::Request::new(pb::OpenSnapshotRequest {});
             if linearizable {
                 req.metadata_mut().insert(
@@ -296,17 +297,21 @@ pub async fn open_snapshot(c: &Conn, linearizable: bool) -> Result<u64> {
             store_client(ch).open_snapshot(req).await
         })
         .await?;
-    Ok(r.into_inner().snapshot_id)
+    let id = r.into_inner().snapshot_id;
+    c.pin(id, &endpoint)?;
+    Ok(id)
 }
 
 pub async fn close_snapshot(c: &Conn, id: u64) -> Result<()> {
-    c.call(Kind::Read, |ch| async move {
-        store_client(ch)
-            .close_snapshot(pb::CloseSnapshotRequest { snapshot_id: id })
-            .await
-    })
-    .await?;
-    Ok(())
+    let r = c
+        .read_call(View::Snapshot(id), |ch| async move {
+            store_client(ch)
+                .close_snapshot(pb::CloseSnapshotRequest { snapshot_id: id })
+                .await
+        })
+        .await;
+    c.unpin(id);
+    r.map(|_| ())
 }
 
 /// A frozen view to page under: the caller's own snapshot handle, or a

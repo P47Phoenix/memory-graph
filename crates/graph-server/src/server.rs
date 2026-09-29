@@ -105,6 +105,10 @@ pub struct ServeConfig {
     /// Test-only: a snapshot install waits at this gate (holding the
     /// store's install state) until the test opens it.
     pub install_gate: Option<crate::slot::InstallGate>,
+    /// Test-only: `apply` calls this with each entry's index before it
+    /// applies it; the test blocks inside it to keep the node's applied
+    /// index behind its committed one.
+    pub apply_gate: Option<crate::raft::state_machine::ApplyGate>,
 }
 
 /// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
@@ -173,6 +177,7 @@ impl ServeConfig {
             testing: TestingHooks::default(),
             storage_backend: None,
             install_gate: None,
+            apply_gate: None,
         }
     }
 
@@ -506,6 +511,7 @@ pub async fn start(
         failpoints: SmFailpoints {
             fail_before_apply: cfg.testing.fail_before_apply,
         },
+        apply_gate: cfg.apply_gate.clone(),
         append_observer: cfg.append_observer.clone(),
     })
     .await?;

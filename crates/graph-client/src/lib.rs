@@ -40,7 +40,7 @@ mod reads;
 mod remote;
 mod snapshot;
 
-pub use conn::{block_on, HelloInfo, ReadLog};
+pub use conn::{block_on, HelloInfo, ReadLog, QUICK_CONNECT_TIMEOUT};
 pub use graph_proto::ReadMeta;
 pub use remote::RemoteStore;
 pub use snapshot::RemoteSnapshot;

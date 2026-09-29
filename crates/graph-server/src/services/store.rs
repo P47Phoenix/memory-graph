@@ -318,9 +318,12 @@ impl pb::store_server::Store for StoreService {
         if linearizable {
             self.ctx.linearizable_barrier().await?;
         }
+        // Frozen into the handle: its reads report the state it opened at.
+        let mut meta = self.ctx.raft.read_meta();
+        meta.stale_possible &= !linearizable;
         let slot = Arc::clone(&self.ctx.slot);
         let id = tokio::task::spawn_blocking(move || {
-            slot.with_store_read(|s| Ok(slot.snapshots().open(conn, s)))
+            slot.with_store_read(|s| Ok(slot.snapshots().open_with_meta(conn, s, Some(meta))))
                 .map_err(|e| graph_proto::store_error_to_status(&e))?
         })
         .await

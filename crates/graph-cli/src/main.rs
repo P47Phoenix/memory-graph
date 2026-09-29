@@ -39,6 +39,13 @@ struct Cli {
     #[arg(long, global = true, env = "MEMORY_GRAPH_WRITE_DEADLINE", value_name = "DURATION",
           value_parser = graph_cli::target::parse_write_deadline)]
     write_deadline: Option<std::time::Duration>,
+    /// With --server: how long a read keeps retrying (no leader for a linearizable read, a node
+    /// unreachable) before it fails, with exit code 4 when no leader answered, e.g. `500ms`,
+    /// `10s`. It also bounds the first connect. Also read from MEMORY_GRAPH_READ_DEADLINE.
+    /// Default 5s
+    #[arg(long, global = true, env = "MEMORY_GRAPH_READ_DEADLINE", value_name = "DURATION",
+          value_parser = graph_cli::target::parse_write_deadline)]
+    read_deadline: Option<std::time::Duration>,
     /// Deprecated, hidden: there is one storage format now. `--backend v2` is accepted as a no-op for old
     /// scripts; `--backend v1` is an error that says where the retired format went
     #[arg(long, global = true, hide = true, value_enum)]
@@ -646,7 +653,12 @@ fn main() {
             }
             let code = graph_cli::target::exit_code(&e);
             let e = match REMOTE_ADDR.get() {
-                Some(addr) => graph_cli::target::explain_remote_failure(e, addr, code),
+                Some(addr) => graph_cli::target::explain_remote_failure(
+                    e,
+                    addr,
+                    code,
+                    REMOTE_IS_READ.get().copied().unwrap_or(false),
+                ),
                 None => e,
             };
             eprintln!("Error: {e:?}");
@@ -678,11 +690,22 @@ fn server_header(addr: &str, st: &graph_proto::pb::StatusResponse) -> String {
 /// The server a command talks to, once resolved (for the error message).
 static REMOTE_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Whether the command is a read (`describe`, `symbols`, `search`,
+/// `export`): its exit-4 failure is explained as a read's.
+static REMOTE_IS_READ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn run() -> Result<i32> {
     let cli = Cli::parse();
     if let Some(d) = cli.write_deadline {
         graph_cli::target::set_write_deadline(d);
     }
+    if let Some(d) = cli.read_deadline {
+        graph_cli::target::set_read_deadline(d);
+    }
+    let _ = REMOTE_IS_READ.set(matches!(
+        cli.cmd,
+        Cmd::Describe { .. } | Cmd::Symbols { .. } | Cmd::Search { .. } | Cmd::Export { .. }
+    ));
     reject_legacy_backend(cli.backend)?;
     let overrides = cli.overrides();
     // `serve` owns a file; everything else resolves --db / --server.
@@ -852,6 +875,11 @@ fn run() -> Result<i32> {
             cfg.testing.stall_writes_after = Some(v.trim().parse().with_context(|| {
                 format!("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER={v}: not a count")
             })?);
+        }
+        // Test-only (serve_e2e): act as if no leader were known, so a
+        // linearizable read fails with NoLeader. Not a feature.
+        if std::env::var_os("MEMORY_GRAPH_TESTING_WITHHOLD_LEADER").is_some() {
+            cfg.testing.withhold_leader = true;
         }
         let shown = match (cluster_mode, node_id) {
             (true, Some(n)) => format!("data dir {}, node {n}", served.display()),

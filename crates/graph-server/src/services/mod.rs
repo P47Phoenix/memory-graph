@@ -155,8 +155,9 @@ impl Ctx {
     /// snapshot handle. The read itself runs on the blocking pool. Returns
     /// the answer with its [`ReadMeta`], taken before the read (so the
     /// answer reflects at least `applied_index`); a linearizable read is
-    /// never `stale_possible`. For a snapshot view the meta is the node's
-    /// own state, not the handle's (the handle is frozen when it opened).
+    /// never `stale_possible`. For a snapshot view the meta is the handle's,
+    /// recorded when it opened (the handle is frozen there): a handle opened
+    /// linearizably is never `stale_possible`.
     pub async fn read<T, F>(
         &self,
         view: Option<graph_proto::pb::View>,
@@ -187,8 +188,13 @@ impl Ctx {
                 Ok((v, meta))
             }
             View::Snapshot(id) => {
-                let meta = self.raft.read_meta();
                 let snap = slot.snapshots().get(id).map_err(status)?;
+                // The handle's own freshness, frozen when it opened (a
+                // linearizable handle is never stale_possible).
+                let meta = slot
+                    .snapshots()
+                    .meta(id)
+                    .unwrap_or_else(|| self.raft.read_meta());
                 let v = tokio::task::spawn_blocking(move || {
                     let g = snap
                         .lock()

@@ -31,7 +31,8 @@ pub mod exit {
     pub const NOT_SERVING: i32 = 1;
     /// `cluster leader`: no leader is known.
     pub const NO_LEADER: i32 = 3;
-    /// A write (or linearizable read) found no leader within its deadline.
+    /// A write (or linearizable read) found no leader within its deadline
+    /// (`--write-deadline`; `--read-deadline` for a read).
     pub const WRITE_DEADLINE: i32 = 4;
     /// The server speaks another protocol or store format version.
     pub const PROTOCOL: i32 = 5;
@@ -71,19 +72,35 @@ pub fn exit_code(e: &anyhow::Error) -> i32 {
     }
 }
 
-/// Add what a remote exit-4 failure means to its message: the write never
-/// got an answer from a leader within the write deadline, whether the
-/// server was unreachable, the connection was lost mid-call, or no leader
-/// was elected. Other failures are returned unchanged.
-pub fn explain_remote_failure(e: anyhow::Error, addr: &str, code: i32) -> anyhow::Error {
-    if code == exit::WRITE_DEADLINE {
+/// Add what a remote exit-4 failure means to its message. A write
+/// (`read = false`) never got an answer from a leader within the write
+/// deadline, whether the server was unreachable, the connection was lost
+/// mid-call, or no leader was elected. A read (`read = true`, a
+/// linearizable one) found no leader within the read deadline and answered
+/// nothing rather than possibly stale data. Other failures are returned
+/// unchanged.
+pub fn explain_remote_failure(
+    e: anyhow::Error,
+    addr: &str,
+    code: i32,
+    read: bool,
+) -> anyhow::Error {
+    if code != exit::WRITE_DEADLINE {
+        return e;
+    }
+    if read {
+        e.context(format!(
+            "server {addr}: the linearizable read found no leader within the read deadline \
+             (--read-deadline: an election, the node cut off from the majority, or the leader \
+             unreachable); it answers nothing rather than possibly stale data. Retry later, or \
+             use --read local for the node's own, possibly stale, answer"
+        ))
+    } else {
         e.context(format!(
             "server {addr}: the write was not acknowledged within the write deadline \
              (connection lost, server unreachable, or no leader); it may or may not have \
              been applied, and rerunning it is safe"
         ))
-    } else {
-        e
     }
 }
 
@@ -274,6 +291,17 @@ fn connectable(listen: &str) -> String {
     }
 }
 
+/// The `--read-deadline` of this process: the client's retry budget
+/// (`ClientConfig::retry.budget`), which bounds every read and the first
+/// `Hello`, applied to every [`connect`] that sets no budget of its own.
+static READ_DEADLINE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Set the read deadline every later [`connect`] uses (once per process).
+/// Unset, [`ClientConfig`]'s default retry budget (5 s).
+pub fn set_read_deadline(d: Duration) {
+    let _ = READ_DEADLINE.set(d);
+}
+
 /// The `--write-deadline` of this process, applied to every [`connect`].
 static WRITE_DEADLINE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
@@ -321,7 +349,7 @@ pub fn connect_with(addr: &str, read: ReadMode, budget: Option<Duration>) -> Res
     if let Some(d) = WRITE_DEADLINE.get() {
         cfg.write_deadline = *d;
     }
-    if let Some(b) = budget {
+    if let Some(b) = budget.or_else(|| READ_DEADLINE.get().copied()) {
         cfg.retry.budget = b;
     }
     let store = RemoteStore::connect(cfg).map_err(|e| match e {
@@ -573,15 +601,26 @@ mod tests {
     fn a_remote_write_deadline_names_the_server_and_the_lost_connection() {
         let e = anyhow::Error::from(StoreError::NoLeader { retry_after_ms: 5 });
         let code = exit_code(&e);
-        let e = explain_remote_failure(e, "h:7", code);
+        let e = explain_remote_failure(e, "h:7", code, false);
         assert_eq!(exit_code(&e), exit::WRITE_DEADLINE, "the code survives");
         let msg = format!("{e:#}");
         assert!(
             msg.contains("server h:7") && msg.contains("connection lost"),
             "{msg}"
         );
-        let e = explain_remote_failure(anyhow!("plain"), "h:7", 1);
+        let e = explain_remote_failure(anyhow!("plain"), "h:7", 1, false);
         assert_eq!(e.to_string(), "plain");
+        // A read gets a read's explanation, never the write's.
+        let e = anyhow::Error::from(StoreError::NoLeader { retry_after_ms: 5 });
+        let e = explain_remote_failure(e, "h:7", exit::WRITE_DEADLINE, true);
+        assert_eq!(exit_code(&e), exit::WRITE_DEADLINE);
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("linearizable read found no leader")
+                && msg.contains("--read-deadline")
+                && !msg.contains("write"),
+            "{msg}"
+        );
     }
 
     fn write_sidecar(db: &Path, pid: u32, listen: &str) {

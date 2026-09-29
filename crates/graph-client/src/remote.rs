@@ -65,6 +65,12 @@ impl RemoteStore {
         self.conn.config()
     }
 
+    /// The endpoint calls go to now: the one that answered the last
+    /// successful call (the connection moves on only after a failure).
+    pub fn endpoint(&self) -> String {
+        self.conn.active_endpoint()
+    }
+
     /// The highest Raft log index an `Index` RPC of this store reported as
     /// applied (0 before the first). Shared, so a progress display can read
     /// it while the store itself is boxed as `dyn Store`.

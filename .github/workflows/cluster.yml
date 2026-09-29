@@ -6,12 +6,19 @@ on:
   push:
     branches: [main]
   pull_request:
+    # Every crate the `memory-graph` binary is built from (graph-cli,
+    # -server, -client, -proto, -store, -core and the language crates),
+    # the lock file, the script and this workflow.
     paths:
-      - "crates/graph-server/**"
-      - "crates/graph-client/**"
-      - "crates/graph-store/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "scripts/cluster_kill_test.py"
       - ".github/workflows/cluster.yml"
+  schedule:
+    # Nightly, so a change the path filter missed still meets the test.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 jobs:
   kill-leader:
     runs-on: ubuntu-latest
