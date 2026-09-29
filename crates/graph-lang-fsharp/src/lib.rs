@@ -33,7 +33,7 @@
 //! (` ``a b`` `) are not symbols; members inside an object expression
 //! (`{ new IDisposable with ... }`) at a type's top level are reported as
 //! members of that type; light-off (`#light "off"`) syntax is not handled.
-use graph_core::scan::{code_index, indent_block, matching_close, span_between};
+use graph_core::scan::{code_close_table, code_index, indent_block, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -97,6 +97,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut s = Scanner {
         tokens,
         code: &code,
+        closes: code_close_table(tokens, &code),
         out: Vec::new(),
         depth: 0,
     };
@@ -124,6 +125,8 @@ enum Prev {
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
+    /// [`code_close_table`] of `code`: closers found in one linear pass.
+    closes: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
     /// Current nesting of namespace/module/type bodies.
     depth: usize,
@@ -154,8 +157,7 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     fn block_end(&self, c: usize, hi: usize) -> usize {

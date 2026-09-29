@@ -49,6 +49,52 @@ pub fn matching_close(tokens: &[TokenDecl], open: usize) -> Option<usize> {
     None
 }
 
+/// [`matching_close`] for every token at once: `close_table(tokens)[i] ==
+/// matching_close(tokens, i)` for every index `i`, computed in one linear
+/// pass instead of one scan per opener. Use it (or [`code_close_table`])
+/// whenever an extractor looks up closers in a loop: calling
+/// [`matching_close`] per opener is quadratic on long unbalanced runs such
+/// as 100k `(`.
+///
+/// Semantics match [`matching_close`] exactly: comments and literals are
+/// skipped, and a mismatched closer (e.g. the `]` in `(]`) leaves every
+/// delimiter still open at that point unclosed.
+pub fn close_table(tokens: &[TokenDecl]) -> Vec<Option<usize>> {
+    let mut out = vec![None; tokens.len()];
+    let mut stack: Vec<(usize, &'static str)> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if is_trivia(t) {
+            continue;
+        }
+        if let Some(c) = closer_for(&t.text) {
+            stack.push((i, c));
+        } else if matches!(t.text.as_str(), ")" | "]" | "}") {
+            match stack.pop() {
+                Some((open, want)) if want == t.text => out[open] = Some(i),
+                _ => stack.clear(),
+            }
+        }
+    }
+    out
+}
+
+/// [`close_table`] re-indexed by code position, for extractors that walk a
+/// `code` index (sorted indices into `tokens`, e.g. from [`code_index`]):
+/// entry `c` is the code position of the token closing `tokens[code[c]]`,
+/// or `None` if it does not close or its closer is not in `code`. This is
+/// exactly `matching_close(tokens, code[c])` followed by
+/// `code.binary_search(&close).ok()`, in linear time.
+pub fn code_close_table(tokens: &[TokenDecl], code: &[usize]) -> Vec<Option<usize>> {
+    let table = close_table(tokens);
+    let mut pos = vec![None; tokens.len()];
+    for (c, &i) in code.iter().enumerate() {
+        pos[i] = Some(c);
+    }
+    code.iter()
+        .map(|&i| table[i].and_then(|close| pos[close]))
+        .collect()
+}
+
 fn closer_for(text: &str) -> Option<&'static str> {
     match text {
         "(" => Some(")"),
@@ -453,5 +499,55 @@ mod tests {
         assert!(c.skip_balanced().is_none());
         assert_eq!(c.pos(), open);
         assert_eq!(c.tokens().len(), t.len());
+    }
+}
+
+#[cfg(test)]
+mod close_table_tests {
+    use super::*;
+    use crate::tokenizer::tokenize;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `close_table` equals `matching_close` at every index, and
+        /// `code_close_table` equals the per-opener lookup-then-binary-search
+        /// every extractor used, for any subset of tokens as `code`.
+        #[test]
+        fn close_tables_match_matching_close(
+            parts in proptest::collection::vec(
+                prop_oneof![
+                    Just("("), Just(")"), Just("["), Just("]"), Just("{"), Just("}"),
+                    Just("a"), Just("\"(\""), Just("'}'"), Just("/*{*/"), Just("//)\n"),
+                    Just("\n#if (\n"),
+                ],
+                0..48,
+            ),
+            keep in proptest::collection::vec(any::<bool>(), 0..200),
+        ) {
+            let src = parts.join(" ");
+            let tokens = tokenize(&src);
+            let table = close_table(&tokens);
+            prop_assert_eq!(table.len(), tokens.len());
+            for (i, got) in table.iter().enumerate() {
+                prop_assert_eq!(*got, matching_close(&tokens, i), "{} at {}", src, i);
+            }
+            let code: Vec<usize> = (0..tokens.len())
+                .filter(|&i| keep.get(i).copied().unwrap_or(true))
+                .collect();
+            let by_code = code_close_table(&tokens, &code);
+            for (c, &i) in code.iter().enumerate() {
+                let expected = matching_close(&tokens, i)
+                    .and_then(|close| code.binary_search(&close).ok());
+                prop_assert_eq!(by_code[c], expected, "{} at {}", src, c);
+            }
+        }
+    }
+
+    #[test]
+    fn close_table_is_linear_on_unbalanced_runs() {
+        let tokens = tokenize(&"(".repeat(100_000));
+        let start = std::time::Instant::now();
+        assert!(close_table(&tokens).iter().all(Option::is_none));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 }

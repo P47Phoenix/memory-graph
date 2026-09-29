@@ -25,7 +25,7 @@
 //! Known limits: a body expression continued on the next line by a trailing
 //! operator is cut at the line end; `setMethod` names the generic, not the
 //! class; `assign("name", function...)` and S4 `setValidity` are not symbols.
-use graph_core::scan::{matching_close, span_between};
+use graph_core::scan::{code_close_table, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -167,6 +167,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut s = Scanner {
         tokens,
         code: &code,
+        closes: code_close_table(tokens, &code),
         out: Vec::new(),
     };
     for c in 0..code.len() {
@@ -215,6 +216,8 @@ const CLASS_CALLS: &[&str] = &["setClass", "setRefClass", "R6Class"];
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
+    /// [`code_close_table`] of `code`: closers found in one linear pass.
+    closes: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
 }
 
@@ -240,8 +243,7 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     /// Length of a left-assignment operator at `c` (`<-`, `<<-`, `=`).

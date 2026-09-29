@@ -20,7 +20,7 @@
 //! its first declarator. Odd input never sets `has_errors`: unbalanced
 //! braces make the scanner resynchronize one token later. Type bodies nested
 //! more than [`MAX_DEPTH`] deep are not scanned (the outer types are kept).
-use graph_core::scan::{code_index, span_between};
+use graph_core::scan::{code_close_table, code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -61,7 +61,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         code: &code,
         out: Vec::new(),
         depth: 0,
-        closes: close_table(tokens, &code),
+        closes: code_close_table(tokens, &code),
     };
     s.body(0, code.len(), &Level::File);
     s.out
@@ -100,7 +100,7 @@ struct Scanner<'a> {
     out: Vec<SymbolDecl>,
     /// Nesting of `body` calls, capped at [`MAX_DEPTH`].
     depth: usize,
-    /// [`close_table`] of `code`.
+    /// [`code_close_table`] of `code`.
     closes: Vec<Option<usize>>,
 }
 
@@ -389,33 +389,6 @@ impl Scanner<'_> {
         }
         None
     }
-}
-
-/// For each code position (`code` indexes `tokens`), the code position of the
-/// delimiter closing it, exactly as `graph_core::scan::matching_close` would
-/// find it (literals ignored; a mismatched closer leaves every delimiter open
-/// at that point unclosed), computed in one pass instead of one scan per
-/// opener, so deeply nested or unbalanced input stays linear.
-fn close_table(tokens: &[TokenDecl], code: &[usize]) -> Vec<Option<usize>> {
-    let mut out = vec![None; code.len()];
-    let mut stack: Vec<(usize, &str)> = Vec::new();
-    for (c, &i) in code.iter().enumerate() {
-        let t = &tokens[i];
-        if matches!(t.class, TokenClass::Comment | TokenClass::Literal) {
-            continue;
-        }
-        match t.text.as_str() {
-            "(" => stack.push((c, ")")),
-            "[" => stack.push((c, "]")),
-            "{" => stack.push((c, "}")),
-            ")" | "]" | "}" => match stack.pop() {
-                Some((open, want)) if want == t.text => out[open] = Some(c),
-                _ => stack.clear(),
-            },
-            _ => {}
-        }
-    }
-    out
 }
 
 #[cfg(test)]

@@ -215,33 +215,3 @@ fn deep_nesting_is_capped_not_a_stack_overflow() {
         }
     }
 }
-
-proptest! {
-    /// The one-pass close table agrees with `matching_close` everywhere, so
-    /// the scanner's output does not depend on which one it uses.
-    #[test]
-    fn close_table_matches_matching_close(
-        parts in proptest::collection::vec(
-            prop_oneof![
-                Just("("), Just(")"), Just("["), Just("]"), Just("{"), Just("}"), Just("a"),
-                Just("\"(\""), Just("'}'"), Just("/*{*/"), Just("//)\n"), Just("`{`"),
-            ],
-            0..40,
-        )
-    ) {
-        let src = parts.join(" ");
-        let tokens = graph_core::tokenizer::tokenize_with(&src, JS_TOKENIZER);
-        let code: Vec<usize> = tokens
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.class != TokenClass::Comment)
-            .map(|(i, _)| i)
-            .collect();
-        let table = close_table(&tokens, &code);
-        for (c, &i) in code.iter().enumerate() {
-            let expected = graph_core::scan::matching_close(&tokens, i)
-                .and_then(|close| code.binary_search(&close).ok());
-            prop_assert_eq!(table[c], expected, "{} at {}", src, c);
-        }
-    }
-}

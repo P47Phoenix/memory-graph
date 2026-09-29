@@ -20,7 +20,7 @@
 //! computed members (`[Symbol.iterator]() {}`), class-field arrows
 //! (`x = () => {}`), object-literal methods, anonymous
 //! `module.exports = function () {}`.
-use graph_core::scan::{matching_close, span_between};
+use graph_core::scan::{code_close_table, matching_close, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::cell::Cell;
@@ -91,33 +91,6 @@ pub fn type_end(tokens: &[TokenDecl], code: &[usize], c: usize, hi: usize) -> us
     .type_end(c, hi)
 }
 
-/// For each code position (`code` indexes `tokens`), the code position of the
-/// delimiter closing it, exactly as `graph_core::scan::matching_close` would
-/// find it (literals ignored; a mismatched closer leaves every delimiter open
-/// at that point unclosed), computed in one pass instead of one scan per
-/// opener, so deeply nested or unbalanced input stays linear.
-pub fn close_table(tokens: &[TokenDecl], code: &[usize]) -> Vec<Option<usize>> {
-    let mut out = vec![None; code.len()];
-    let mut stack: Vec<(usize, &str)> = Vec::new();
-    for (c, &i) in code.iter().enumerate() {
-        let t = &tokens[i];
-        if matches!(t.class, TokenClass::Comment | TokenClass::Literal) {
-            continue;
-        }
-        match t.text.as_str() {
-            "(" => stack.push((c, ")")),
-            "[" => stack.push((c, "]")),
-            "{" => stack.push((c, "}")),
-            ")" | "]" | "}" => match stack.pop() {
-                Some((open, want)) if want == t.text => out[open] = Some(c),
-                _ => stack.clear(),
-            },
-            _ => {}
-        }
-    }
-    out
-}
-
 fn scan_tokens(tokens: &[TokenDecl], ts: bool) -> Vec<SymbolDecl> {
     let code: Vec<usize> = tokens
         .iter()
@@ -130,7 +103,7 @@ fn scan_tokens(tokens: &[TokenDecl], ts: bool) -> Vec<SymbolDecl> {
         code: &code,
         ts,
         depth: Cell::new(0),
-        closes: Some(close_table(tokens, &code)),
+        closes: Some(code_close_table(tokens, &code)),
     };
     let mut out = Vec::new();
     s.scan(0, code.len(), &mut out);
@@ -166,7 +139,7 @@ struct Scanner<'a> {
     ts: bool,
     /// Nesting of `scan` calls, capped at [`MAX_DEPTH`].
     depth: Cell<usize>,
-    /// [`close_table`], when built (else each lookup scans forward).
+    /// [`code_close_table`], when built (else each lookup scans forward).
     closes: Option<Vec<Option<usize>>>,
 }
 
