@@ -116,6 +116,7 @@ impl Scanner<'_> {
         span: (usize, usize),
     ) {
         out.push(SymbolDecl {
+            owner: None,
             name,
             kind,
             lang_kind: Some(lang.into()),

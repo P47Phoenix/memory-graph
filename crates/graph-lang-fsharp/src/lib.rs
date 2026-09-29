@@ -225,6 +225,7 @@ impl Scanner<'_> {
     fn emit(&mut self, name: String, kind: SymbolKind, lk: &str, first: usize, last: usize) {
         let span = span_between(&self.tok(first).span, &self.tok(last).span);
         self.out.push(SymbolDecl {
+            owner: None,
             name,
             kind,
             lang_kind: Some(lk.to_string()),

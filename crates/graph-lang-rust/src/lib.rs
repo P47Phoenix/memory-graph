@@ -171,6 +171,7 @@ impl Collector<'_> {
         let (sl, sc) = self.pos(r.start);
         let (el, ec) = self.pos(r.end);
         self.out.push(SymbolDecl {
+            owner: None,
             name,
             kind,
             lang_kind: Some(lang_kind.into()),

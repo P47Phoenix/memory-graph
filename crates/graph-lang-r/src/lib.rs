@@ -353,6 +353,7 @@ impl Scanner<'_> {
         }
         let span = span_between(&self.tok(first).span, &self.tok(last).span);
         self.out.push(SymbolDecl {
+            owner: None,
             name,
             kind,
             lang_kind: Some(lang.into()),

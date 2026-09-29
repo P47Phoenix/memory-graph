@@ -277,6 +277,10 @@ pub struct SymbolHit {
     /// Language-specific kind string (`struct`, `impl`, `fn`, ...).
     pub lang_kind: Option<String>,
     pub span: Option<Span>,
+    /// The extractor's owner hint (`SymbolDecl::owner`), e.g. a Go method's
+    /// receiver type. Omitted from JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Per-language contents of a repo. `symbol_kinds` keys are `generic` or

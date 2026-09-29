@@ -112,6 +112,7 @@ fn zero_length_and_equal_span_symbols_are_configuration_independent() {
         end_col: e + 1,
     };
     let sym = |n: &str, k, s, e| SymbolDecl {
+        owner: None,
         name: n.into(),
         kind: k,
         lang_kind: None,
@@ -193,6 +194,7 @@ fn v2_ext(tokens: &[&str], syms: &[(&str, Option<&str>)]) -> graph_core::Extract
         symbols: syms
             .iter()
             .map(|(name, lk)| SymbolDecl {
+                owner: None,
                 name: (*name).into(),
                 kind: SymbolKind::Type,
                 lang_kind: lk.map(Into::into),

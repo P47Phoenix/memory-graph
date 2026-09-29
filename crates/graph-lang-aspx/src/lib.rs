@@ -157,6 +157,7 @@ fn server_blocks(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
             .find(|&j| tokens[j].class == TokenClass::Identifier)
             .map_or_else(|| lang.to_string(), |j| tokens[j].text.clone());
         out.push(SymbolDecl {
+            owner: None,
             name,
             kind: SymbolKind::Other,
             lang_kind: Some(lang.into()),
@@ -254,6 +255,7 @@ fn server_scripts(source: &str, tokens: Vec<TokenDecl>) -> (Vec<TokenDecl>, Vec<
                 kind: SymbolKind::Module,
                 lang_kind: Some("server_script".into()),
                 span: span_between(&first.span, &last.span),
+                owner: None,
             });
             symbols.extend(graph_lang_csharp::member_symbols(&code));
         }

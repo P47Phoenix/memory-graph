@@ -203,6 +203,7 @@ impl Scanner<'_> {
             && self.tok(name - 1).span.end == self.tok(name).span.start;
         let prefix = if private { "#" } else { "" };
         out.push(SymbolDecl {
+            owner: None,
             name: format!("{prefix}{}", self.text(name)),
             kind,
             lang_kind: Some(lang.into()),

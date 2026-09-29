@@ -1913,6 +1913,7 @@ mod chunk_bytes_flag_tests {
             let mut ex = Extraction {
                 has_errors: false,
                 symbols: vec![SymbolDecl {
+                    owner: None,
                     name: "S".into(),
                     kind: SymbolKind::Function,
                     lang_kind: None,

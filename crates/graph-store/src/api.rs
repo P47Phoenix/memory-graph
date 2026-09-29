@@ -494,7 +494,8 @@ pub trait Store: StoreRead + Send + Sync {
 
 /// Schema version stamped in the database file at `path`, without opening a
 /// store. `Ok(None)` when there is no file or it holds no schema yet (empty
-/// or freshly created). `Ok(Some(v))` is the current layout. A file in the
+/// or freshly created). `Ok(Some(v))` is the current layout, or the one
+/// earlier layout an open upgrades in place (`v2::UPGRADABLE_SCHEMA_VERSION`). A file in the
 /// retired per-node format is [`StoreError::LegacyFormat`]; any other
 /// version is [`StoreError::SchemaMismatch`]. Reads only; it fails with
 /// `Locked` while another process holds the file.
@@ -523,6 +524,8 @@ pub fn detect_format(path: &Path) -> Result<Option<u64>> {
     match found {
         None => Ok(None),
         Some(v) if v == crate::v2::V2_SCHEMA_VERSION => Ok(Some(v)),
+        // Opening upgrades it in place (a restamp; issue #137).
+        Some(v) if v == crate::v2::UPGRADABLE_SCHEMA_VERSION => Ok(Some(v)),
         Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => Err(StoreError::LegacyFormat {
             path: path.display().to_string(),
             version: v,
