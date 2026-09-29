@@ -504,6 +504,11 @@ impl Scanner<'_> {
                     None => return c,
                 },
                 ";" | "," | ")" | "]" | "}" | "=" | ">" => return c,
+                // Reserved words that start a declaration, never a type: a
+                // type stops before them, so it cannot end inside the
+                // declaration (`type A = class B {}` must not give a type
+                // span that partially overlaps the class, #145).
+                "class" | "function" | "enum" | "interface" => return c,
                 "|" | "&" | "?" | ":" | "." | "-" | "+" => {
                     c += 1;
                     operand = true;

@@ -40,7 +40,7 @@ impl Extractor for TypeScriptExtractor {
     }
 
     fn version(&self) -> String {
-        format!("typescript-scan-1+tok{TOKENIZER_VERSION}")
+        format!("typescript-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {

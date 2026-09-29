@@ -41,7 +41,7 @@ impl Extractor for ShellExtractor {
     }
 
     fn version(&self) -> String {
-        format!("shell-scan-1+tok{TOKENIZER_VERSION}")
+        format!("shell-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {

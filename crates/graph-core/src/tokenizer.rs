@@ -156,7 +156,11 @@ pub struct TokenizerOptions {
     /// tabs ignored for `<<-`), is one Literal token (leading whitespace
     /// excluded). `<<<` is a here-string, not a heredoc, and `<<` inside
     /// arithmetic `((...))` / `$((...))` is a shift; an unquoted delimiter
-    /// (optionally `\`-escaped) must start with a letter or `_`.
+    /// (optionally `\`-escaped) must start with a letter or `_`. A `"..."`
+    /// string holding a command substitution is one Literal through its
+    /// real closing quote, however the substitution nests quotes
+    /// (`"$(basename "$f")"`); when the substitution never closes, the
+    /// string ends at its next `"` as without this rule.
     pub shell_words: bool,
     /// `-` joins an identifier when directly followed by a letter, digit or
     /// `_` (COBOL `WORKING-STORAGE`, RPG `dcl-proc`). Note `a-b` is then one
@@ -164,6 +168,28 @@ pub struct TokenizerOptions {
     pub hyphen_idents: bool,
     /// Fixed-column source layout (COBOL, fixed-form RPG); `None` is free form.
     pub fixed_columns: Option<FixedLayout>,
+    /// Python string prefixes: `r`, `u`, `b`, `f`, `t` and the two-letter
+    /// combinations (`rb`, `br`, `fr`, `rf`, `tr`, `rt`), any case, directly
+    /// followed by a quote make one Literal with their string (`rb'''x'''`,
+    /// `f"{a}"`). Escapes are lexed as for an unprefixed string (so raw
+    /// `r"a\"b"` stays one literal, as in Python). A `"` inside an f-string
+    /// replacement field ends the literal early (spans stay exact).
+    pub python_string_prefixes: bool,
+    /// R raw strings: `r"(...)"`, `R'[...]'`, `r"{...}"` with optional
+    /// dashes between the quote and the bracket (`r"--(...)--"`), one
+    /// Literal. Without its closing sequence the `r` stays an identifier.
+    pub r_raw_strings: bool,
+    /// MySQL `#` comments, SQL-safe subset: a `#` that is the first token on
+    /// its line and is followed by whitespace or the line end is a Comment
+    /// to the end of the line. `#temp` / `##temp` (T-SQL temporary tables),
+    /// `#` after code (PostgreSQL XOR) and `#comment` without a space stay
+    /// code.
+    pub sql_hash_comments: bool,
+    /// RPG compile-time data: from the first line starting with `**CTDATA`,
+    /// `**FTRANS` or `**ALTSEQ` (any case) or `**` followed by a blank or
+    /// the line end (not the `**FREE` first line), each section (its marker
+    /// line and data lines up to the next marker) is one Literal, trimmed.
+    pub rpg_compile_time_data: bool,
 }
 
 impl TokenizerOptions {
@@ -193,6 +219,10 @@ impl TokenizerOptions {
         shell_words: false,
         hyphen_idents: false,
         fixed_columns: None,
+        python_string_prefixes: false,
+        r_raw_strings: false,
+        sql_hash_comments: false,
+        rpg_compile_time_data: false,
     };
     /// Rust (with the extractor): raw and byte literals.
     pub const RUST: Self = Self {
@@ -252,9 +282,11 @@ impl TokenizerOptions {
         no_block_slash_comments: true,
         hash_comments: true,
         triple_quote_strings: true,
+        python_string_prefixes: true,
         ..Self::DEFAULT
     };
-    /// GDScript: the Python dialect.
+    /// GDScript: the Python dialect (its `r"..."` raw strings are prefixed
+    /// strings too).
     pub const GDSCRIPT: Self = Self::PYTHON;
     /// POSIX shell / bash.
     pub const SHELL: Self = Self {
@@ -264,20 +296,23 @@ impl TokenizerOptions {
         shell_words: true,
         ..Self::DEFAULT
     };
-    /// R: `#` comments, `'...'` strings, backtick names.
+    /// R: `#` comments, `'...'` strings, backtick names, raw strings.
     pub const R: Self = Self {
         single_quote_strings: true,
         no_line_slash_comments: true,
         no_block_slash_comments: true,
         hash_comments: true,
         raw_backtick_strings: true,
+        r_raw_strings: true,
         ..Self::DEFAULT
     };
-    /// SQL (ANSI plus T-SQL `[names]`): `--` and `/* */` comments.
+    /// SQL (ANSI plus T-SQL `[names]`): `--` and `/* */` comments, and MySQL
+    /// `# ` comments at line start (see `sql_hash_comments`).
     pub const SQL: Self = Self {
         no_line_slash_comments: true,
         dash_comments: true,
         sql_strings: true,
+        sql_hash_comments: true,
         ..Self::DEFAULT
     };
     /// Haskell: `--` (Haskell rule) and nested `{- -}` comments, primes.
@@ -314,7 +349,10 @@ impl TokenizerOptions {
     /// limits: `;` always starts a comment (GNU as uses it as a statement
     /// separator on some targets); a trailing AT&T `# comment` after code is
     /// not a comment; ARM32 `@` comments are not recognised (`@` stays an
-    /// operator, since MASM uses `@@:` labels at line start).
+    /// operator, since MASM uses `@@:` labels at line start). Both are kept
+    /// out on purpose (#127): a trailing `#` cannot be told from an ARM
+    /// immediate (`mov r0, # 1`), and `@` is code in MASM (`@@:`, `jmp @F`)
+    /// and GNU as x86 (`.type f, @function`).
     pub const ASM: Self = Self {
         doubled_single_quotes: true,
         hash_comments: true,
@@ -332,12 +370,13 @@ impl TokenizerOptions {
         ..Self::DEFAULT
     };
     /// RPG IV: fixed form unless the file starts with `**FREE`; `//`
-    /// comments, hyphenated names (`dcl-proc`).
+    /// comments, hyphenated names (`dcl-proc`), compile-time data.
     pub const RPG: Self = Self {
         doubled_single_quotes: true,
         no_block_slash_comments: true,
         hyphen_idents: true,
         fixed_columns: Some(FixedLayout::Rpg),
+        rpg_compile_time_data: true,
         ..Self::DEFAULT
     };
 }
@@ -366,12 +405,56 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
         heredocs: Vec::new(),
         parens: Vec::new(),
     };
+    let end = if opts.rpg_compile_time_data {
+        rpg_data_start(src)
+    } else {
+        src.len()
+    };
     match opts.fixed_columns {
-        Some(FixedLayout::Rpg) if is_free_rpg(src) => lx.run(src.len()),
-        Some(layout) => lx.fixed(layout),
-        None => lx.run(src.len()),
+        Some(FixedLayout::Rpg) if is_free_rpg(src) => lx.run(end),
+        Some(layout) => lx.fixed(layout, end),
+        None => lx.run(end),
+    }
+    if end < src.len() {
+        lx.data_sections(end);
     }
     lx.out
+}
+
+/// RPG: a compile-time data marker line: `**CTDATA`, `**FTRANS`,
+/// `**ALTSEQ` (any case), or `**` followed by a blank or the line end. A
+/// `**` exponent operator continuing a free-form expression (`**2;`) is not
+/// one.
+pub fn is_rpg_data_marker(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("**") else {
+        return false;
+    };
+    let rest = rest.trim_end_matches(['\r', '\n']);
+    let upper = rest.to_ascii_uppercase();
+    rest.is_empty()
+        || rest.starts_with([' ', '\t'])
+        || ["CTDATA", "FTRANS", "ALTSEQ"]
+            .iter()
+            .any(|k| upper.starts_with(k))
+}
+
+/// RPG: byte offset where compile-time data starts (the first data marker
+/// line, never the `**FREE` first line), or `src.len()` when there is none.
+pub fn rpg_data_start(src: &str) -> usize {
+    let free = is_free_rpg(src);
+    let mut off = 0;
+    for (n, line) in src.split_inclusive('\n').enumerate() {
+        let l = if n == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        } else {
+            line
+        };
+        if is_rpg_data_marker(l) && !(n == 0 && free) {
+            return off;
+        }
+        off += line.len();
+    }
+    src.len()
 }
 
 /// `**FREE` (any case) as the whole first line, after an optional BOM.
@@ -434,13 +517,19 @@ impl Lexer<'_> {
 
     /// Emit `src[from..to]`, trimmed of whitespace, as one Comment if any is left.
     fn trimmed_comment(&mut self, from: usize, to: usize) {
+        self.trimmed(from, to, TokenClass::Comment);
+    }
+
+    /// Emit `src[from..to]`, trimmed of whitespace, as one `class` token if
+    /// any is left.
+    fn trimmed(&mut self, from: usize, to: usize, class: TokenClass) {
         let s = &self.src[from..to];
         let t = s.trim_start_matches(is_gap);
         let start = to - t.len();
         let end = start + t.trim_end_matches(is_gap).len();
         if end > start {
             self.adv_to(start);
-            self.push(end, TokenClass::Comment);
+            self.push(end, class);
         }
     }
 
@@ -449,14 +538,31 @@ impl Lexer<'_> {
         self.out.last().is_none_or(|t| t.span.end_line < self.line)
     }
 
-    /// Lex a fixed-column source line by line.
-    fn fixed(&mut self, layout: FixedLayout) {
+    /// RPG compile-time data from `from` (a line start) to the end: one
+    /// trimmed Literal per section, a section starting at each marker line.
+    fn data_sections(&mut self, from: usize) {
+        let src = self.src;
+        let mut start = from;
+        let mut off = from;
+        for line in src[from..].split_inclusive('\n') {
+            if off > start && is_rpg_data_marker(line) {
+                self.trimmed(start, off, TokenClass::Literal);
+                start = off;
+            }
+            off += line.len();
+        }
+        self.trimmed(start, src.len(), TokenClass::Literal);
+    }
+
+    /// Lex a fixed-column source line by line, up to `limit` (a line start
+    /// or the end of input).
+    fn fixed(&mut self, layout: FixedLayout, limit: usize) {
         let src = self.src;
         let (seq, lead, code_end) = match layout {
             FixedLayout::Cobol => (6, false, 72),
             FixedLayout::Rpg => (5, true, 80),
         };
-        while self.i < src.len() {
+        while self.i < limit {
             let ls = self.i;
             let le = src[ls..].find('\n').map_or(src.len(), |p| ls + p);
             let ce = if src[ls..le].ends_with('\r') {
@@ -516,7 +622,11 @@ impl Lexer<'_> {
                 continue;
             }
             let rest = &src[i..limit];
-            let hash = c == '#' && opts.hash_comments && self.hash_ok();
+            let hash = c == '#'
+                && ((opts.hash_comments && self.hash_ok())
+                    || (opts.sql_hash_comments
+                        && self.at_line_start()
+                        && rest[1..].chars().next().is_none_or(char::is_whitespace)));
             let mut m = std::mem::take(&mut self.m);
             // Markup rules apply outside server-tag code.
             let markup = opts.markup && !m.code;
@@ -615,6 +725,16 @@ impl Lexer<'_> {
                 .flatten()
             {
                 (n, TokenClass::Literal)
+            } else if let Some(n) = (opts.python_string_prefixes && !markup)
+                .then(|| python_prefixed_len(rest, opts.single_quote_strings))
+                .flatten()
+            {
+                (n, TokenClass::Literal)
+            } else if let Some(n) = (opts.r_raw_strings && !markup)
+                .then(|| r_raw_len(rest))
+                .flatten()
+            {
+                (n, TokenClass::Literal)
             } else if c.is_alphabetic() || c == '_' {
                 (
                     ident_len(rest, markup && m.tag, opts.hyphen_idents, opts.prime_idents),
@@ -644,6 +764,11 @@ impl Lexer<'_> {
                 (doubled_len(&rest[..line_len(rest)]), TokenClass::Literal)
             } else if c == '\'' && opts.single_quote_strings {
                 (single_quoted_len(rest), TokenClass::Literal)
+            } else if let Some(n) = (opts.shell_words && c == '"' && !markup)
+                .then(|| shell_dq_len(rest))
+                .flatten()
+            {
+                (n, TokenClass::Literal)
             } else if c == '"' || c == '`' || (c == '\'' && is_char_literal(rest)) {
                 (quoted_len(rest, c), TokenClass::Literal)
             } else if let Some(n) =
@@ -964,6 +1089,121 @@ fn csharp_literal_len(rest: &str) -> Option<usize> {
     Some(rest.len())
 }
 
+/// A Python prefixed string (`r"..."`, `rb'''...'''`, `f"..."`) at the start
+/// of `rest`. `sq`: `'...'` is a string in this dialect.
+fn python_prefixed_len(rest: &str, sq: bool) -> Option<usize> {
+    let p = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    let prefix = rest[..p].to_ascii_lowercase();
+    const PREFIXES: &[&str] = &["r", "u", "b", "f", "t", "br", "rb", "fr", "rf", "tr", "rt"];
+    if !PREFIXES.contains(&prefix.as_str()) {
+        return None;
+    }
+    let q = &rest[p..];
+    let n = if let Some(n) = triple_quoted_len(q, false) {
+        n
+    } else if q.starts_with('"') {
+        quoted_len(q, '"')
+    } else if q.starts_with('\'') && sq {
+        single_quoted_len(q)
+    } else {
+        return None;
+    };
+    Some(p + n)
+}
+
+/// An R raw string (`r"(...)"`, `R'--[...]--'`) at the start of `rest`, if
+/// it closes.
+fn r_raw_len(rest: &str) -> Option<usize> {
+    let b = rest.as_bytes();
+    if !matches!(b[0], b'r' | b'R') {
+        return None;
+    }
+    let q = *b.get(1)?;
+    if q != b'"' && q != b'\'' {
+        return None;
+    }
+    let dashes = b[2..].iter().take_while(|&&c| c == b'-').count();
+    let close = match *b.get(2 + dashes)? {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        _ => return None,
+    };
+    let mut term = vec![close];
+    term.extend(std::iter::repeat_n(b'-', dashes));
+    term.push(q);
+    let body = 3 + dashes;
+    b[body..]
+        .windows(term.len())
+        .position(|w| w == term.as_slice())
+        .map(|p| body + p + term.len())
+}
+
+/// Deepest nesting of quotes and command substitutions followed by
+/// [`shell_dq_len`]; deeper input falls back to the plain rule.
+const SHELL_NEST_MAX: usize = 64;
+
+/// A shell `"..."` string at the start of `rest` that holds a `$(...)`
+/// command substitution, through its real closing quote (quotes inside the
+/// substitution nest). `None` (use the plain rule) when it holds none, or
+/// when anything in it is unterminated.
+fn shell_dq_len(rest: &str) -> Option<usize> {
+    let (end, subst) = shell_dq_end(rest.as_bytes(), 1, 0)?;
+    subst.then_some(end)
+}
+
+/// End (after the closing `"`) of a double-quoted string whose body starts
+/// at `p`, and whether it held a command substitution.
+fn shell_dq_end(b: &[u8], mut p: usize, depth: usize) -> Option<(usize, bool)> {
+    if depth > SHELL_NEST_MAX {
+        return None;
+    }
+    let mut subst = false;
+    while p < b.len() {
+        match b[p] {
+            b'\\' => p += 2,
+            b'"' => return Some((p + 1, subst)),
+            b'$' if b.get(p + 1) == Some(&b'(') => {
+                p = shell_subst_end(b, p + 2, depth + 1)?;
+                subst = true;
+            }
+            _ => p += 1,
+        }
+    }
+    None
+}
+
+/// End (after the matching `)`) of a command substitution whose body starts
+/// at `p`.
+fn shell_subst_end(b: &[u8], mut p: usize, depth: usize) -> Option<usize> {
+    if depth > SHELL_NEST_MAX {
+        return None;
+    }
+    let mut parens = 1usize;
+    while p < b.len() {
+        match b[p] {
+            b'\\' => p += 2,
+            b'(' => {
+                parens += 1;
+                p += 1;
+            }
+            b')' => {
+                parens -= 1;
+                p += 1;
+                if parens == 0 {
+                    return Some(p);
+                }
+            }
+            b'"' => p = shell_dq_end(b, p + 1, depth + 1)?.0,
+            q @ (b'\'' | b'`') => p += 2 + b[p + 1..].iter().position(|&c| c == q)?,
+            _ => p += 1,
+        }
+    }
+    None
+}
+
 /// Whether a `/` after `prev` (the last token) starts a regex rather than
 /// dividing: true when `prev` cannot end an operand.
 fn regex_allowed(prev: Option<&TokenDecl>) -> bool {
@@ -1232,6 +1472,13 @@ mod tests {
                 o.dash_comments = true;
                 o.haskell_block_comments = true;
             }
+            "python_string_prefixes" => {
+                o.python_string_prefixes = true;
+                o.single_quote_strings = true;
+            }
+            "r_raw_strings" => o.r_raw_strings = true,
+            "sql_hash_comments" => o.sql_hash_comments = true,
+            "rpg_compile_time_data" => o.rpg_compile_time_data = true,
             "fixed_cobol" => o.fixed_columns = Some(FixedLayout::Cobol),
             "fixed_rpg" => o.fixed_columns = Some(FixedLayout::Rpg),
             "PYTHON" => o = TokenizerOptions::PYTHON,
@@ -1273,9 +1520,11 @@ mod tests {
         ("hyphen_idents", 0xcc2fb60810b3912f),
         ("fixed_cobol", 0x2320cbe948c5c2df),
         ("fixed_rpg", 0xa4b95ac258618d66),
-        ("PYTHON", 0x186548073abbdec0),
+        // PYTHON and SQL changed with #127 (`f' '` is a prefixed string,
+        // `# 1` at line start a MySQL comment).
+        ("PYTHON", 0x678bbdc6a72d75d4),
         ("SHELL", 0x722243900ce93348),
-        ("SQL", 0xcf34462a8425d99d),
+        ("SQL", 0xc65d90d669af700e),
         ("HASKELL", 0xc63b1d790c2884d6),
         ("FSHARP", 0x9985481f3cf3cc21),
         ("ASM", 0xef2217eae3f3ece6),
@@ -1323,6 +1572,154 @@ mod tests {
             "dialect output changed: bump TOKENIZER_VERSION and update LANG_GOLDENS to {}",
             changed.join(", ")
         );
+    }
+
+    /// One golden per flag and named dialect touched by #127, over all the
+    /// sources plus `FOLLOWUP_SOURCES` (kept apart so the tables above stay
+    /// as they were).
+    const FOLLOWUP_GOLDENS: &[(&str, u64)] = &[
+        ("python_string_prefixes", 0xc68eafb894bc0bee),
+        ("r_raw_strings", 0x4c3452a992769b92),
+        ("sql_hash_comments", 0x2b14e4c7f36d24f5),
+        ("rpg_compile_time_data", 0xa1756ba5cf388766),
+        ("shell_words", 0xe9344cd0f4766ede),
+        ("PYTHON", 0xd36e08dcaa43df52),
+        ("SHELL", 0x4895503d40809bcf),
+        ("SQL", 0xc9068899c2738aa5),
+        ("R", 0xf73a78f8a954f09),
+        ("RPG", 0xe215f5f654279785),
+    ];
+
+    const FOLLOWUP_SOURCES: &[&str] = &[
+        "x = r\"a\\\"b\" + rb'''c\nd''' + f\"{y}\" + Br'e' + bar\"z\" + u'' + rx'no'",
+        "x <- r\"(a \"q\" b)\" + R'--[c]--' + r\"{d}\" + r\"(open",
+        "# mysql comment\nSELECT #t, ##g FROM #temp # xor\n#nospace\n  # indented\n",
+        "     C                   EVAL      X = 1\n**CTDATA ARR\nabc  def\n'x\n** \nmore\n",
+        "echo \"$(basename \"$f\")\" \"$(a \"$(b 'c)' \\\")\")\" x\" \"$(open \"q\"",
+    ];
+
+    #[test]
+    fn followup_dialects_are_pinned() {
+        let fnv = |opts: TokenizerOptions| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for src in DIALECT_SOURCES
+                .iter()
+                .chain(LANG_SOURCES)
+                .chain(FOLLOWUP_SOURCES)
+            {
+                for b in format!("{:?}", tokenize_with(src, opts)).bytes() {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                }
+            }
+            h
+        };
+        let changed: Vec<String> = FOLLOWUP_GOLDENS
+            .iter()
+            .filter_map(|&(name, golden)| {
+                let got = fnv(dialect(name));
+                (got != golden).then(|| format!("(\"{name}\", {got:#x})"))
+            })
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "dialect output changed: bump the affected extractors' versions and update FOLLOWUP_GOLDENS to {}",
+            changed.join(", ")
+        );
+    }
+
+    fn dtoks_with(opts: TokenizerOptions, s: &str) -> Vec<(String, TokenClass)> {
+        tokenize_with(s, opts)
+            .into_iter()
+            .map(|t| (t.text, t.class))
+            .collect()
+    }
+
+    fn lits(opts: TokenizerOptions, s: &str) -> Vec<String> {
+        dtoks_with(opts, s)
+            .into_iter()
+            .filter(|t| t.1 == TokenClass::Literal)
+            .map(|t| t.0)
+            .collect()
+    }
+
+    #[test]
+    fn python_string_prefixes() {
+        let py = TokenizerOptions::PYTHON;
+        assert_eq!(
+            lits(py, r#"r"a\"b" rb'''x''' F"{y}" Br'z' u"" t'q' bar"s""#),
+            [
+                r#"r"a\"b""#,
+                "rb'''x'''",
+                "F\"{y}\"",
+                "Br'z'",
+                "u\"\"",
+                "t'q'",
+                "\"s\""
+            ]
+        );
+        // Not prefixes: other words, and a word glued to a string.
+        let t = dtoks_with(py, "rx'a' print(b)");
+        assert_eq!(t[0], ("rx".into(), TokenClass::Identifier));
+        assert_eq!(t[1], ("'a'".into(), TokenClass::Literal));
+        assert_eq!(t[2], ("print".into(), TokenClass::Identifier));
+        assert_eq!(dtoks_with(py, "b")[0].1, TokenClass::Identifier);
+    }
+
+    #[test]
+    fn r_raw_strings() {
+        let r = TokenizerOptions::R;
+        assert_eq!(
+            lits(r, r#"r"(a "q" \ b)" R'--[c]-]--' r"{d}""#),
+            [r#"r"(a "q" \ b)""#, "R'--[c]-]--'", "r\"{d}\""]
+        );
+        // Unclosed or not bracketed: `r` is an identifier.
+        assert_eq!(dtoks_with(r, "r\"(open")[0].1, TokenClass::Identifier);
+        assert_eq!(dtoks_with(r, "r\"x\"")[0].1, TokenClass::Identifier);
+    }
+
+    #[test]
+    fn sql_hash_comments() {
+        let sql = TokenizerOptions::SQL;
+        let c: Vec<_> = dtoks_with(sql, "# c\nSELECT #t, a # b\n#x\n  # d\n#")
+            .into_iter()
+            .filter(|t| t.1 == TokenClass::Comment)
+            .map(|t| t.0)
+            .collect();
+        assert_eq!(c, ["# c", "# d", "#"]);
+    }
+
+    #[test]
+    fn rpg_compile_time_data() {
+        let rpg = TokenizerOptions::RPG;
+        let src =
+            "     C                   EVAL      X = 1\n**CTDATA ARR\n  abc 'x\n**ctdata b\nq\n";
+        let t = dtoks_with(rpg, src);
+        let n = t.len();
+        assert_eq!(
+            t[n - 2],
+            ("**CTDATA ARR\n  abc 'x".into(), TokenClass::Literal)
+        );
+        assert_eq!(t[n - 1], ("**ctdata b\nq".into(), TokenClass::Literal));
+        assert!(t.iter().any(|x| x.0 == "EVAL"));
+        // Free form too; `**FREE` and an exponent are not markers.
+        let t = dtoks_with(rpg, "**FREE\nx = y\n **2;\n**\ndata\n");
+        assert_eq!(t.last().unwrap(), &("**\ndata".into(), TokenClass::Literal));
+        assert!(t.iter().any(|x| x.0 == "2"));
+    }
+
+    #[test]
+    fn shell_quotes_nest_in_command_substitutions() {
+        let sh = TokenizerOptions::SHELL;
+        assert_eq!(
+            lits(sh, r#"echo "$(basename "$f")" "$(a "$(b 'c)' \")") x" "a""#),
+            [
+                r#""$(basename "$f")""#,
+                r#""$(a "$(b 'c)' \")") x""#,
+                "\"a\""
+            ]
+        );
+        // An unclosed substitution keeps the plain rule.
+        assert_eq!(lits(sh, "\"$(open \"q\"")[0], "\"$(open \"");
     }
 
     #[test]
@@ -1996,7 +2393,7 @@ mod tests {
 
         #[test]
         fn spans_match_source_lang_heavy(
-            src in "([ \\t\\n]|\\r\\n|#|-|;|\\{|\\}|\\(|\\)|\\*|>|<|\\$|'|\"|`|\\[|\\]|/|@|x|EOF|é|\\\\|\\*\\*FREE\\n|      ){0,60}"
+            src in "([ \\t\\n]|\\r\\n|#|-|;|\\{|\\}|\\(|\\)|\\*|>|<|\\$|'|\"|`|\\[|\\]|/|@|x|EOF|é|\\\\|\\*\\*FREE\\n|      |r|rb|f|\\*\\*CTDATA\\n|\\*\\* \\n|\\$\\(){0,60}"
         ) {
             check_spans(&src)?;
         }
@@ -2010,7 +2407,11 @@ mod tests {
     fn check_spans(src: &str) -> Result<(), TestCaseError> {
         check_spans_with(src, TokenizerOptions::default())?;
         check_spans_with(src, RUST)?;
-        for (name, _) in DIALECT_GOLDENS.iter().chain(LANG_GOLDENS) {
+        for (name, _) in DIALECT_GOLDENS
+            .iter()
+            .chain(LANG_GOLDENS)
+            .chain(FOLLOWUP_GOLDENS)
+        {
             check_spans_with(src, dialect(name))?;
         }
         // Every flag at once, with each layout.
@@ -2053,6 +2454,10 @@ mod tests {
             shell_words: true,
             hyphen_idents: true,
             fixed_columns,
+            python_string_prefixes: true,
+            r_raw_strings: true,
+            sql_hash_comments: true,
+            rpg_compile_time_data: true,
         }
     }
 

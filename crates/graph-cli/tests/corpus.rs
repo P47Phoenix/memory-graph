@@ -411,8 +411,27 @@ fn every_parsed_token_is_stored() {
     q.repo = Some("webforms".into());
     let aspx = store.search_symbols(&q).unwrap();
     let kinds: BTreeSet<_> = aspx.iter().filter_map(|h| h.lang_kind.clone()).collect();
-    for k in ["directive", "control", "binding"] {
+    for k in ["directive", "control", "binding", "server_script"] {
         assert!(kinds.contains(k), "no aspx {k} symbol: {kinds:?}");
+    }
+    // Server-side C# in `<script runat="server">` (#72): the class and the
+    // method nest in the page's server_script module.
+    let in_view = |name: &str, kind: &str| {
+        aspx.iter()
+            .find(|h| {
+                h.name == name
+                    && h.lang_kind.as_deref() == Some(kind)
+                    && h.file == "web/ViewPeople.aspx"
+            })
+            .unwrap_or_else(|| panic!("no {kind} {name} in ViewPeople.aspx"))
+    };
+    let module = in_view("server_script", "server_script").span.unwrap();
+    for (name, kind) in [("ViewPeopleModel", "class"), ("Page_Load", "method")] {
+        let h = in_view(name, kind).span.unwrap();
+        assert!(
+            module.start <= h.start && h.end <= module.end,
+            "{name} {h:?} not inside {module:?}"
+        );
     }
     // Java: classes nest in their package, methods in their class.
     let mut q = graph_store::SymbolQuery::new("ArticleApi");

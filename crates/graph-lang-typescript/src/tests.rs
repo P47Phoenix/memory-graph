@@ -35,6 +35,25 @@ fn assert_nested(ex: &Extraction) {
     }
 }
 
+/// #145: a type alias whose "type" is a declaration (`= class ... {}`)
+/// stopped inside the declaration and partially overlapped its symbol.
+#[test]
+fn type_alias_never_ends_inside_a_declaration() {
+    for src in [
+        "type class = class class { }",
+        "type A = class B { }",
+        "type A = interface B { }",
+        "type A = enum B { }",
+        "type A = function f() { }",
+        "type A = B | class C { }",
+    ] {
+        assert_nested(&TypeScriptExtractor.extract(src));
+    }
+    // Real aliases are unaffected.
+    let s = syms("type A = B | C;");
+    assert_eq!(find(&s, "A").3, "type A = B | C;");
+}
+
 fn inside(s: &[Sym], outer: &str, inner: &str, src: &str) -> bool {
     let (o, i) = (&find(s, outer).3, &find(s, inner).3);
     let (os, is) = (src.find(o.as_str()).unwrap(), src.find(i.as_str()).unwrap());

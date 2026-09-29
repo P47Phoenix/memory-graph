@@ -46,7 +46,7 @@ impl Extractor for GdscriptExtractor {
     }
 
     fn version(&self) -> String {
-        format!("gdscript-scan-1+tok{TOKENIZER_VERSION}")
+        format!("gdscript-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {

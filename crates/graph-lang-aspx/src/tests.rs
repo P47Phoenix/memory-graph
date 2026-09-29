@@ -80,6 +80,62 @@ fn directives_controls_and_blocks() {
     assert!(s.iter().all(|x| x.0 != "hidden"));
 }
 
+/// #72: server-side C# in `<script runat="server">` and `<% %>` blocks.
+#[test]
+fn server_script_csharp_symbols() {
+    let src = "<%@ Page %>\n<script runat=\"server\">  public class M\n    {\n        public int[] P {get;set;}\n    }\n\n    M Model {get;set;}\n\n    void Page_Load(object sender, EventArgs e)\n    {\n        if (a < b && c > \"</x>\") { }\n    }\n</script>\n<h1 id=\"t\">x</h1>\n<% int n = 0; %>\n";
+    let ex = AspxExtractor.extract(src);
+    assert_nested(&ex);
+    // Token spans are exact, in file coordinates (C# tokens in the body).
+    for t in &ex.tokens {
+        let (s, e) = (t.span.start as usize, t.span.end as usize);
+        assert_eq!(&src[s..e], t.text);
+        let line = 1 + src[..s].matches('\n').count() as u32;
+        let col = 1 + src[..s].rsplit('\n').next().unwrap().chars().count() as u32;
+        assert_eq!((t.span.start_line, t.span.start_col), (line, col), "{t:?}");
+        let line = 1 + src[..e].matches('\n').count() as u32;
+        let col = 1 + src[..e].rsplit('\n').next().unwrap().chars().count() as u32;
+        assert_eq!((t.span.end_line, t.span.end_col), (line, col), "{t:?}");
+    }
+    // The C# string is one literal token, not markup.
+    assert!(ex.tokens.iter().any(|t| t.text == "\"</x>\""));
+    let s = syms(src);
+    let get = |n: &str, k: &str| {
+        s.iter()
+            .find(|x| x.0 == n && x.1 == k)
+            .unwrap_or_else(|| panic!("{n}/{k} in {s:#?}"))
+    };
+    let module = get("server_script", "server_script");
+    assert!(module.2.starts_with("public class M") && module.2.ends_with("}"));
+    assert!(get("M", "class").2.ends_with("{get;set;}\n    }"));
+    get("P", "property");
+    get("Model", "property");
+    assert!(get("Page_Load", "method").2.starts_with("void Page_Load("));
+    get("t", "element");
+    let kind = |n: &str| {
+        AspxExtractor
+            .extract(src)
+            .symbols
+            .into_iter()
+            .find(|x| x.name == n)
+            .unwrap()
+            .kind
+    };
+    assert_eq!(kind("server_script"), SymbolKind::Module);
+    // Code blocks are statements, not scanned for declarations.
+    assert!(s.iter().all(|x| x.0 != "n"));
+    assert_eq!(get("int", "code_block").2, "<% int n = 0; %>");
+    // Unclosed server scripts, and bodies with server tags, stay markup.
+    for src in [
+        "<script runat=\"server\"> class A {} ",
+        "<script runat=\"server\"> class A { <%= x %> } </script>",
+        "<script> class A {} </script>",
+    ] {
+        let s = syms(src);
+        assert!(s.iter().all(|x| x.1 != "server_script"), "{src}: {s:?}");
+    }
+}
+
 #[test]
 fn computed_attribute_values_are_not_names() {
     let s = syms("<div id=<%= X %> runat=\"server\"></div><td class=<%# Eval(\"a\") %> id=t></td>");
@@ -129,6 +185,7 @@ proptest! {
                 Just("</div>"), Just("<%"), Just("<%="), Just("<%#"), Just("<%@ Page"), Just("%>"),
                 Just("<%--"), Just("--%>"), Just("'"), Just("\""), Just("<"), Just(">"), Just("x"),
                 Just("<script runat=server>"), Just("</script>"), Just("//"), Just("\n"),
+                Just("class A { void M() { } }"), Just("{"), Just("}"), Just("int P {get;set;}"),
             ],
             0..40,
         )
