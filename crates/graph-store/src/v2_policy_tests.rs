@@ -486,47 +486,71 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
         })
         .collect();
 
-    let d = tempfile::tempdir().unwrap();
-    let mut s = V2Store::open(d.path().join("v.redb")).unwrap();
-    s.register(Box::new(graph_lang_rust::RustExtractor));
-    s.set_chunk_bytes(1); // every file its own chunk: worst case for marker overhead
-    let t = std::time::Instant::now();
-    let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
-    let elapsed = t.elapsed();
-    assert!(results.iter().all(|r| r.is_ok()));
     let total_bytes: usize = bf.iter().map(|f| f.bytes.len()).sum();
+    let chunks = bf.len();
+
+    // Index the batch into a fresh store with the given chunk cap; wall-clock
+    // seconds for the whole `index_batch`.
+    let d = tempfile::tempdir().unwrap();
+    let mut n = 0usize;
+    let mut time_one = |chunk_bytes: usize| -> f64 {
+        n += 1;
+        let mut s = V2Store::open(d.path().join(format!("v{n}.redb"))).unwrap();
+        s.register(Box::new(graph_lang_rust::RustExtractor));
+        s.set_chunk_bytes(chunk_bytes);
+        let t = std::time::Instant::now();
+        let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        assert!(results.iter().all(|r| r.is_ok()));
+        secs
+    };
+
+    // Relative, not absolute (issue #136). Each round indexes the same batch
+    // unchunked (one transaction, the marker written once) and then chunked
+    // one file per chunk (every file its own fsync'd commit plus a marker
+    // re-stamp), back to back. Extraction and byte-proportional work are the
+    // same in both, so the excess of chunked over unchunked, as a fraction of
+    // unchunked, is the per-chunk commit + marker cost normalised by how fast
+    // this machine is right now. The best (smallest) round is kept, since
+    // load only ever adds noise.
+    let mut best = (f64::MAX, 0.0, 0.0);
+    for _ in 0..3 {
+        let u = time_one(usize::MAX);
+        let c = time_one(1);
+        let excess = (c - u).max(0.0) / u;
+        if excess < best.0 {
+            best = (excess, u, c);
+        }
+    }
+    let (excess, unchunked, chunked) = best;
+    let per_chunk_ms = (chunked - unchunked).max(0.0) * 1000.0 / chunks as f64;
     eprintln!(
-        "chunked ingest with open-batch marker, {} files ({} bytes), one chunk each: {:.1} ms total",
-        bf.len(),
-        total_bytes,
-        elapsed.as_secs_f64() * 1000.0
+        "chunked ingest with open-batch marker, {chunks} files ({total_bytes} bytes): unchunked \
+         {:.1} ms, one chunk per file {:.1} ms, excess {:.2}x of unchunked ({per_chunk_ms:.2} ms \
+         per chunk)",
+        unchunked * 1000.0,
+        chunked * 1000.0,
+        excess
     );
-    // The corpus is this repo's own tree, which keeps growing, and cost
-    // tracks bytes (tokens), not files: the extractor crates are few but
-    // large (issue #136; the #125 file-count ceiling failed at 7.9 s vs
-    // 7.2 s on CI). Measured on a debug build (Windows dev box, 145 files,
-    // 3.08 MB): the same batch unchunked takes 1.7-2.2 s (~0.6-0.7 us/byte),
-    // one-chunk-per-file 2.4-3.6 s, so per-chunk commit + marker cost is
-    // roughly 2-10 ms. The ceiling is:
-    //   2.5 us/byte  (~3.5x the local byte rate; CI ran ~3x slower)
-    // + 20 ms/chunk  (2-10x the measured per-chunk cost, covers a slow fsync)
-    // and never below the original 5 s. Today that is ~10.6 s against
-    // ~3 s locally and 7.9 s on the slowest CI run seen. What it still
-    // catches: bookkeeping that grows with the batch (quadratic in chunks:
-    // 145^2 marker rewrites) or a per-chunk cost of tens of ms (e.g. several
-    // extra fsyncs, or rewriting the whole marker table per chunk). A single
-    // extra ~5 ms fsync per chunk is within noise for any wall-clock gate;
-    // the marker-content tests above cover its correctness.
-    let ceiling = (2.5e-6 * total_bytes as f64 + 0.020 * bf.len() as f64).max(5.0);
+    // Gate on the excess ratio. Measured (Windows debug, 145 files, 3.08 MB;
+    // see PR #141): idle 0.40-0.47, with 32 CPU burners on 32 cores 0.26-0.57
+    // (absolute per-chunk ms rises 3-10x under load, so a fixed ms gate
+    // cannot separate load from a regression; the ratio can). An injected
+    // 30 ms per chunk commit, or per-chunk bookkeeping that grows with the
+    // number of chunks, both land well above the gate: +30 ms per commit\n    // gave 2.84-2.95x, a sleep of 0.2 ms x chunk index 1.59-1.64x.
+    const EXCESS_GATE: f64 = 1.0;
     assert!(
-        elapsed.as_secs_f64() < ceiling,
-        "indexing this repo's own corpus ({} files, {} bytes, one file per chunk) took {:.1} ms; \
-         expected under {:.1} s (2.5 us/byte + 20 ms per chunk commit, at least 5 s) even with \
-         the added marker write per chunk",
-        bf.len(),
-        total_bytes,
-        elapsed.as_secs_f64() * 1000.0,
-        ceiling
+        excess < EXCESS_GATE,
+        "one-chunk-per-file ingest was {excess:.2}x slower than unchunked ({per_chunk_ms:.2} ms \
+         per chunk; unchunked {:.1} ms, chunked {:.1} ms, {chunks} chunks); expected under \
+         {EXCESS_GATE}x",
+        unchunked * 1000.0,
+        chunked * 1000.0
+    );
+    // Very generous absolute sanity bound only (~20x the idle debug time).
+    assert!(
+        chunked < 60.0,
+        "chunked ingest took {chunked:.1} s, expected well under 60 s"
     );
 }
 
