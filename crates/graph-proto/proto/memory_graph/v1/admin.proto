@@ -106,6 +106,27 @@ message StatusResponse {
   // Log entries this node applied since it started (the count of
   // `mg_apply_duration_seconds`).
   uint64 entries_applied_total = 31;
+  // Snapshot backups (ADR 0006, `serve --backup-url`); absent when this
+  // node has no backup location.
+  optional BackupStatus backup = 32;
+}
+
+// This node's snapshot backups since it started.
+message BackupStatus {
+  // The location, e.g. `file:///srv/backups` (never a secret).
+  string url = 1;
+  // `--backup-on`: `leader`, `all` or `none`.
+  string on = 2;
+  // Log index of the last snapshot committed to the location (0: none).
+  uint64 last_index = 3;
+  // Unix seconds of that commit (0: none).
+  uint64 last_success_unix = 4;
+  // Uploads that failed after every retry.
+  uint64 failures_total = 5;
+  // Bytes written by successful uploads.
+  uint64 bytes_total = 6;
+  // The last failure; empty once an upload succeeds again.
+  string last_backup_error = 7;
 }
 
 // Replication progress of one peer, as the leader sees it.

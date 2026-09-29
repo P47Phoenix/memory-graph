@@ -36,7 +36,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 18] = [
+pub const METRIC_NAMES: [&str; 22] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -55,6 +55,10 @@ pub const METRIC_NAMES: [&str; 18] = [
     "mg_quorum_probes_total",
     "mg_apply_duration_seconds",
     "mg_build_info",
+    "mg_backup_last_success_timestamp",
+    "mg_backup_last_index",
+    "mg_backup_failures_total",
+    "mg_backup_bytes_total",
 ];
 
 /// The Prometheus text exposition format this module writes.
@@ -448,6 +452,33 @@ pub fn render(ctx: &Ctx) -> String {
         graph_proto::PROTOCOL_VERSION,
         graph_store::SCHEMA_VERSION
     );
+    let b = ctx.backup.as_ref().map(|b| b.stats()).unwrap_or_default();
+    gauge(
+        &mut out,
+        "mg_backup_last_success_timestamp",
+        "Unix seconds of the last snapshot backup committed (0: none).",
+        b.last_success_unix,
+    );
+    gauge(
+        &mut out,
+        "mg_backup_last_index",
+        "Log index of the last snapshot backup committed (0: none).",
+        b.last_index,
+    );
+    head(
+        &mut out,
+        "mg_backup_failures_total",
+        "counter",
+        "Snapshot backups that failed after every retry.",
+    );
+    let _ = writeln!(out, "mg_backup_failures_total {}", b.failures_total);
+    head(
+        &mut out,
+        "mg_backup_bytes_total",
+        "counter",
+        "Bytes written by successful snapshot backups.",
+    );
+    let _ = writeln!(out, "mg_backup_bytes_total {}", b.bytes_total);
     out
 }
 

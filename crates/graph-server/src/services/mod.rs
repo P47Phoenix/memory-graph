@@ -61,6 +61,8 @@ pub struct Ctx {
     pub auto_promoting: std::sync::Mutex<std::collections::BTreeSet<u64>>,
     /// When this node last started an election on `Admin.TriggerElect`.
     pub last_elect: std::sync::Mutex<Option<Instant>>,
+    /// The backup uploader (`--backup-url`), for status and metrics.
+    pub backup: Option<crate::backup::Backup>,
 }
 
 /// How long a follower's `LINEARIZABLE` read waits to apply the leader's
