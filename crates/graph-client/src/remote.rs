@@ -26,6 +26,13 @@ fn timed<T>(msg: T, deadline: Duration) -> tonic::Request<T> {
     r
 }
 
+/// Whether a failed attempt may still have taken effect: a detail-less
+/// transport loss or deadline (a typed answer, such as `NotLeader`, or
+/// `UNAVAILABLE` means the request was not processed).
+fn outcome_unknown(st: &tonic::Status) -> bool {
+    st.details().is_empty() && graph_proto::error::is_transport_loss(st.code(), st.message())
+}
+
 /// What [`RemoteStore::admin_remove`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoveOutcome {
@@ -35,9 +42,10 @@ pub struct RemoveOutcome {
     /// The node was not a member: nothing changed (a mistyped id, or an
     /// earlier attempt already removed it; see `retried`).
     pub not_a_member: bool,
-    /// The call was sent more than once (a lost answer or a leader
-    /// change), so `not_a_member` may mean an earlier attempt of this same
-    /// call removed the node.
+    /// An earlier attempt of this call ended with its outcome unknown (the
+    /// connection was lost or timed out after sending), so `not_a_member`
+    /// may mean that attempt removed the node. A clean `NotLeader`
+    /// redirect or an `UNAVAILABLE` retry does not set it.
     pub retried: bool,
 }
 
@@ -220,20 +228,28 @@ impl RemoteStore {
     /// succeed) but is reported in [`RemoveOutcome::not_a_member`].
     pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<RemoveOutcome> {
         let d = self.config().admin_deadline;
-        let attempts = Arc::new(AtomicU64::new(0));
+        // Set when an attempt ended with its outcome unknown: a detail-less
+        // transport loss or deadline after the request may have been sent.
+        // A typed answer (such as a `NotLeader` redirect) or `UNAVAILABLE`
+        // (never processed) leaves it clear.
+        let uncertain = Arc::new(AtomicBool::new(false));
         let r = self.run(self.conn.call(Kind::Write, |ch| {
-            attempts.fetch_add(1, Ordering::Relaxed);
+            let uncertain = Arc::clone(&uncertain);
             async move {
-                admin_client(ch)
+                let r = admin_client(ch)
                     .remove(timed(pb::RemoveRequest { node_id, force }, d))
-                    .await
+                    .await;
+                if r.as_ref().is_err_and(outcome_unknown) {
+                    uncertain.store(true, Ordering::Relaxed);
+                }
+                r
             }
         }))?;
         let r = r.into_inner();
         Ok(RemoveOutcome {
             log_index: r.log_index,
             not_a_member: r.not_a_member,
-            retried: attempts.load(Ordering::Relaxed) > 1,
+            retried: uncertain.load(Ordering::Relaxed),
         })
     }
 
@@ -655,5 +671,25 @@ impl Store for RemoteStore {
             .stats
             .ok_or_else(|| StoreError::Protocol("VacuumResponse.stats is missing".into()))?;
         VacuumStats::try_from(stats).map_err(StoreError::from)
+    }
+}
+
+#[cfg(test)]
+mod remove_outcome_tests {
+    use super::outcome_unknown;
+    use graph_store::StoreError;
+    use tonic::Status;
+
+    #[test]
+    fn only_a_lost_answer_makes_a_retried_remove_uncertain() {
+        assert!(outcome_unknown(&Status::unknown("transport error")));
+        assert!(outcome_unknown(&Status::deadline_exceeded("timeout")));
+        assert!(!outcome_unknown(&Status::unavailable("tcp connect error")));
+        let redirect: Status = graph_proto::WireError::Store(StoreError::NotLeader {
+            leader_id: Some(1),
+            leader_addr: Some("h:1".into()),
+        })
+        .into();
+        assert!(!outcome_unknown(&redirect));
     }
 }

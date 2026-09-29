@@ -331,20 +331,30 @@ pub enum Plan {
 /// See [`Plan`]. A differing vote never joins: an answer to the old
 /// leader term's request is not an answer to this one.
 pub fn plan(inflight: &AppendKey, new: &AppendKey) -> Plan {
+    let p = plan_unchecked(inflight, new);
+    debug_assert!(
+        inflight.first != new.first || inflight.last.is_some() == new.last.is_some(),
+        "same first entry, but last {:?} vs {:?}",
+        inflight.last,
+        new.last
+    );
+    p
+}
+
+/// [`plan`] without its debug assertion, so the fallback for the
+/// impossible case is testable in a debug build.
+fn plan_unchecked(inflight: &AppendKey, new: &AppendKey) -> Plan {
     if inflight.vote != new.vote || inflight.prev != new.prev || inflight.first != new.first {
         return Plan::Replace;
     }
     // The first entries are equal, so either both requests carry entries or
     // neither does: a mixed pair cannot happen. Were it to (a bug), joining
     // could pass a success of no entries off as a success of some, so it is
-    // replaced instead (and trips a debug assertion).
+    // replaced instead (and `plan` trips a debug assertion).
     let shorter = match (&inflight.last, &new.last) {
         (Some(a), Some(b)) => a.index < b.index,
         (None, None) => false,
-        (a, b) => {
-            debug_assert!(false, "same first entry, but last {a:?} vs {b:?}");
-            return Plan::Replace;
-        }
+        _ => return Plan::Replace,
     };
     Plan::Join {
         upto: if shorter { inflight.last } else { None },
@@ -885,16 +895,24 @@ mod tests {
         assert_eq!(plan(&hb(), &hb()), Plan::Join { upto: None });
     }
 
-    /// Entries against none with the same first entry cannot happen; in a
-    /// release build it is replaced, never joined as a success.
+    /// Entries against none with the same first entry cannot happen; the
+    /// fallback replaces, never joins as a success.
     #[test]
-    #[cfg(not(debug_assertions))]
     fn a_mixed_pair_is_replaced() {
         let with = AppendKey::of(&req(2, 4, 5, 8));
         let mut without = with.clone();
         without.last = None;
-        assert_eq!(plan(&without, &with), Plan::Replace);
-        assert_eq!(plan(&with, &without), Plan::Replace);
+        assert_eq!(plan_unchecked(&without, &with), Plan::Replace);
+        assert_eq!(plan_unchecked(&with, &without), Plan::Replace);
+    }
+
+    /// Same vote and previous log id, another first entry: replace.
+    #[test]
+    fn another_first_entry_is_replaced() {
+        let a = AppendKey::of(&req(2, 4, 5, 8));
+        let mut b = a.clone();
+        b.first = AppendKey::of(&req(2, 4, 6, 8)).first;
+        assert_eq!(plan(&a, &b), Plan::Replace);
     }
 
     #[test]
