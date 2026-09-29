@@ -13,7 +13,7 @@ name = "memory-graph"
 path = "src/main.rs"
 
 [features]
-default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-typescript", "lang-python", "lang-java"]
+default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-typescript", "lang-python", "lang-java", "lang-sql", "lang-shell", "lang-r"]
 lang-rust = ["dep:graph-lang-rust"]
 lang-csharp = ["dep:graph-lang-csharp"]
 lang-javascript = ["dep:graph-lang-javascript"]
@@ -22,6 +22,9 @@ lang-html = ["dep:graph-lang-html"]
 lang-typescript = ["dep:graph-lang-typescript"]
 lang-python = ["dep:graph-lang-python"]
 lang-java = ["dep:graph-lang-java"]
+lang-sql = ["dep:graph-lang-sql"]
+lang-shell = ["dep:graph-lang-shell"]
+lang-r = ["dep:graph-lang-r"]
 
 [dependencies]
 graph-core = { path = "../graph-core" }
@@ -37,6 +40,9 @@ graph-lang-html = { path = "../graph-lang-html", optional = true }
 graph-lang-typescript = { path = "../graph-lang-typescript", optional = true }
 graph-lang-python = { path = "../graph-lang-python", optional = true }
 graph-lang-java = { path = "../graph-lang-java", optional = true }
+graph-lang-sql = { path = "../graph-lang-sql", optional = true }
+graph-lang-shell = { path = "../graph-lang-shell", optional = true }
+graph-lang-r = { path = "../graph-lang-r", optional = true }
 clap.workspace = true
 ignore.workspace = true
 anyhow.workspace = true

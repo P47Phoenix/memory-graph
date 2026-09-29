@@ -1,0 +1,40 @@
+---
+title: "Sales analysis"
+output: html_document
+---
+
+This report's code isn't R when it's prose: `f <- function() 1`.
+
+```{r setup, include=FALSE}
+library(R6)
+summarise_sales <- function(df, by = "region") {
+  aggregate(df$amount, list(df[[by]]), sum)
+}
+```
+
+## Models
+
+```{r models}
+setClass("Sale", representation(amount = "numeric", region = "character"))
+setGeneric("total", function(x, ...) standardGeneric("total"))
+setMethod("total", "Sale", function(x, ...) sum(x@amount))
+
+Ledger <- R6Class("Ledger",
+  public = list(
+    entries = NULL,
+    add = function(sale) {
+      self$entries <- c(self$entries, sale)
+      invisible(self)
+    },
+    balance = function() sum(vapply(self$entries, total, numeric(1)))
+  )
+)
+```
+
+```{python}
+def not_r(): pass
+```
+
+```{r}
+function(x) x * 1.2 -> with_tax
+```

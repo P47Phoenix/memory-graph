@@ -680,7 +680,10 @@ dependencies = [
  "graph-lang-java",
  "graph-lang-javascript",
  "graph-lang-python",
+ "graph-lang-r",
  "graph-lang-rust",
+ "graph-lang-shell",
+ "graph-lang-sql",
  "graph-lang-typescript",
  "graph-proto",
  "graph-server",
@@ -780,12 +783,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-r"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-rust"
 version = "0.1.0"
 dependencies = [
  "graph-core",
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "graph-lang-shell"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-sql"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
 ]
 
 [[package]]

@@ -63,7 +63,8 @@ pub fn detect_language_from_content(path: &str, src: &str) -> String {
         "" => by_path,
         "python" => "python".into(),
         "node" | "nodejs" => "javascript".into(),
-        "bash" | "sh" | "zsh" | "dash" => "shell".into(),
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "mksh" => "shell".into(),
+        "Rscript" => "r".into(),
         other => other.to_string(),
     }
 }
@@ -107,6 +108,8 @@ mod tests {
         let d = detect_language_from_content;
         assert_eq!(d("tool", "#!/usr/bin/env python3\nprint(1)"), "python");
         assert_eq!(d("run", "#!/bin/bash\n"), "shell");
+        assert_eq!(d("run", "#!/bin/ksh\n"), "shell");
+        assert_eq!(d("run", "#!/usr/bin/env Rscript\n"), "r");
         assert_eq!(d("x", "#!/usr/bin/env -S node --flag\n"), "javascript");
         assert_eq!(d("Makefile", ""), "make");
         assert_eq!(d("a.rs", "#!/usr/bin/env python"), "rust"); // extension wins
