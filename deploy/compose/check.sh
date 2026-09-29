@@ -62,7 +62,10 @@ cleanup() {
 trap cleanup EXIT
 
 # `elapsed=12ms` and `"elapsed_ms":12` differ between runs.
-normalize() { sed -E 's/elapsed=[0-9]+/elapsed=N/g; s/"elapsed_ms":[0-9]+/"elapsed_ms":N/g'; }
+# A `--server` run's `--json` also says `"stale_possible"` (ADR 0004 D8),
+# an embedded one does not; a linearizable read must say `false`, so only
+# that exact field is dropped (a `true` still differs).
+normalize() { sed -E 's/elapsed=[0-9]+/elapsed=N/g; s/"elapsed_ms":[0-9]+/"elapsed_ms":N/g; s/,"stale_possible":false//g; s/"stale_possible":false,//g'; }
 
 # The embedded side of the comparison: this binary on a local file, or
 # (EMBEDDED_IN_IMAGE=1, for a host whose platform differs from the

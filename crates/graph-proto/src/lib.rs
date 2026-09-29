@@ -19,6 +19,7 @@
 
 pub mod convert;
 pub mod error;
+pub mod read_meta;
 pub mod version;
 
 /// The generated `memory_graph.v1` package.
@@ -32,6 +33,7 @@ pub mod memory_graph {
 pub use convert::{ConvertError, View};
 pub use error::{status_to_store_error, store_error_to_status, WireError};
 pub use memory_graph::v1 as pb;
+pub use read_meta::{ReadMeta, READ_META_HEADER, READ_MODE_HEADER};
 pub use version::{check_version, CheckVersion, SendVersion, PROTOCOL_VERSION_HEADER};
 
 /// The protocol version exchanged in `Store.Hello`. A server refuses any

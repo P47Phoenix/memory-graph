@@ -23,9 +23,11 @@ struct Cli {
     /// Database file, opened in this process (default ./graph.redb). Not together with --server
     #[arg(long, global = true)]
     db: Option<PathBuf>,
-    /// Use the `memory-graph serve` at this host:port instead of a local file (also read from
-    /// MEMORY_GRAPH_SERVER; the flag wins). Not together with --db
-    #[arg(long, global = true, value_name = "HOST:PORT")]
+    /// Use the `memory-graph serve` at this host:port instead of a local file; several nodes of
+    /// one cluster as a comma-separated list (the first that answers is used, an unreachable or
+    /// leaderless one is skipped). Also read from MEMORY_GRAPH_SERVER; the flag wins. Not
+    /// together with --db. With --json, read commands add `stale_possible`
+    #[arg(long, global = true, value_name = "HOST:PORT[,HOST:PORT...]")]
     server: Option<String>,
     /// With --server: how reads are served, `local` (the node's store as it is) or `linearizable`
     /// (sees every acknowledged write). Also read from MEMORY_GRAPH_READ. Default local
@@ -35,8 +37,15 @@ struct Cli {
     /// fails with exit code 4, e.g. `500ms`, `10s`, `2m`. Also read from MEMORY_GRAPH_WRITE_DEADLINE.
     /// Default 10s
     #[arg(long, global = true, env = "MEMORY_GRAPH_WRITE_DEADLINE", value_name = "DURATION",
-          value_parser = graph_cli::target::parse_write_deadline)]
+          value_parser = graph_cli::target::parse_deadline)]
     write_deadline: Option<std::time::Duration>,
+    /// With --server: how long a read keeps retrying (no leader for a linearizable read, a node
+    /// unreachable) before it fails, with exit code 4 when no leader answered, e.g. `500ms`,
+    /// `10s`. It also bounds the first connect. Also read from MEMORY_GRAPH_READ_DEADLINE.
+    /// Default 5s
+    #[arg(long, global = true, env = "MEMORY_GRAPH_READ_DEADLINE", value_name = "DURATION",
+          value_parser = graph_cli::target::parse_deadline)]
+    read_deadline: Option<std::time::Duration>,
     /// Deprecated, hidden: there is one storage format now. `--backend v2` is accepted as a no-op for old
     /// scripts; `--backend v1` is an error that says where the retired format went
     #[arg(long, global = true, hide = true, value_enum)]
@@ -739,7 +748,12 @@ fn main() {
             }
             let code = graph_cli::target::exit_code(&e);
             let e = match REMOTE_ADDR.get() {
-                Some(addr) => graph_cli::target::explain_remote_failure(e, addr, code),
+                Some(addr) => graph_cli::target::explain_remote_failure(
+                    e,
+                    addr,
+                    code,
+                    REMOTE_IS_READ.get().copied().unwrap_or(false),
+                ),
                 None => e,
             };
             if JSON_LOGS.get().copied().unwrap_or(false) {
@@ -777,8 +791,8 @@ fn server_header(addr: &str, st: &graph_proto::pb::StatusResponse) -> String {
 /// The server a command talks to, once resolved (for the error message).
 static REMOTE_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// The command line, with serve --config <file>'s settings applied
-/// ([graph_cli::serve_config]).
+/// The command line, with `serve --config <file>`'s settings applied
+/// ([`graph_cli::serve_config`]).
 fn parse_cli(args: Vec<std::ffi::OsString>) -> Result<Cli> {
     use clap::{CommandFactory, FromArgMatches};
     let args = graph_cli::serve_config::apply(&Cli::command(), args)?;
@@ -786,11 +800,22 @@ fn parse_cli(args: Vec<std::ffi::OsString>) -> Result<Cli> {
     Ok(Cli::from_arg_matches(&m).unwrap_or_else(|e| e.exit()))
 }
 
+/// Whether the command is a read (`describe`, `symbols`, `search`,
+/// `export`): its exit-4 failure is explained as a read's.
+static REMOTE_IS_READ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn run() -> Result<i32> {
     let cli = parse_cli(std::env::args_os().collect())?;
     if let Some(d) = cli.write_deadline {
         graph_cli::target::set_write_deadline(d);
     }
+    if let Some(d) = cli.read_deadline {
+        graph_cli::target::set_read_deadline(d);
+    }
+    let _ = REMOTE_IS_READ.set(matches!(
+        cli.cmd,
+        Cmd::Describe { .. } | Cmd::Symbols { .. } | Cmd::Search { .. } | Cmd::Export { .. }
+    ));
     reject_legacy_backend(cli.backend)?;
     let overrides = cli.overrides();
     // `serve` owns a file; everything else resolves --db / --server.
@@ -966,20 +991,11 @@ fn run() -> Result<i32> {
             if let Some(v) = heartbeat_interval {
                 r.heartbeat_ms = *v;
             }
-            if r.election_min_ms >= r.election_max_ms {
-                bail!(
-                    "--election-timeout-min ({} ms) must be below --election-timeout-max ({} ms)",
-                    r.election_min_ms,
-                    r.election_max_ms
-                );
-            }
-            if r.heartbeat_ms >= r.election_min_ms {
-                bail!(
-                    "--heartbeat-interval ({} ms) must be below --election-timeout-min ({} ms), \
-                     or followers call elections while the leader is alive",
-                    r.heartbeat_ms,
-                    r.election_min_ms
-                );
+            // In cluster mode also 3 * heartbeat < election min: the read
+            // freshness lease (election min - 2 * heartbeat) must outlast
+            // one heartbeat.
+            if let Err(e) = r.validate(cluster_mode) {
+                bail!("invalid timings (--heartbeat-interval, --election-timeout-min/-max): {e}");
             }
             cfg.raft = Some(r);
         }
@@ -1028,6 +1044,11 @@ fn run() -> Result<i32> {
             cfg.testing.stall_writes_after = Some(v.trim().parse().with_context(|| {
                 format!("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER={v}: not a count")
             })?);
+        }
+        // Test-only (serve_e2e): act as if no leader were known, so a
+        // linearizable read fails with NoLeader. Not a feature.
+        if std::env::var_os("MEMORY_GRAPH_TESTING_WITHHOLD_LEADER").is_some() {
+            cfg.testing.withhold_leader = true;
         }
         let shown = match (cluster_mode, node_id) {
             (true, Some(n)) => format!("data dir {}, node {n}", served.display()),
@@ -1549,7 +1570,9 @@ fn run() -> Result<i32> {
             if json {
                 out!(
                     "{}",
-                    serde_json::to_string(&serde_json::json!({ "repos": infos }))?
+                    serde_json::to_string(&graph_cli::target::with_read_meta(
+                        serde_json::json!({ "repos": infos })
+                    ))?
                 );
             } else {
                 for i in &infos {
@@ -1601,7 +1624,9 @@ fn run() -> Result<i32> {
             q.offset = offset.map(|o| o as usize);
             let hits = store.search_symbols(&q)?;
             if json {
-                let out = serde_json::json!({ "query": pattern, "results": hits });
+                let out = graph_cli::target::with_read_meta(
+                    serde_json::json!({ "query": pattern, "results": hits }),
+                );
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
@@ -1695,7 +1720,9 @@ fn run() -> Result<i32> {
             q.offset = offset.map(|o| o as usize);
             let hits = store.search(&q)?;
             if json {
-                let out = serde_json::json!({ "query": text, "grain": grain, "results": hits });
+                let out = graph_cli::target::with_read_meta(
+                    serde_json::json!({ "query": text, "grain": grain, "results": hits }),
+                );
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {

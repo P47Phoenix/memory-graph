@@ -5,7 +5,7 @@
 //! there. Only the child this test spawned is ever killed.
 use graph_client::{ClientConfig, RemoteStore};
 use graph_core::{Extractor, NodeKind};
-use graph_server::{InitMode, RaftSettings, ServeConfig};
+use graph_server::{InitMode, ServeConfig};
 use graph_store::StoreRead;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -31,7 +31,7 @@ fn child_server_process() {
         InitMode::Bootstrap { restore: None },
         Some(1),
     );
-    cfg.raft = Some(RaftSettings::standalone());
+    cfg.raft = Some(graph_server::testing::TEST_RAFT);
     graph_server::run_blocking_with(cfg, exts(), |r| {
         let addr = r.addr;
         use std::io::Write;

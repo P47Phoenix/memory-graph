@@ -65,6 +65,12 @@ impl RemoteStore {
         self.conn.config()
     }
 
+    /// The endpoint calls go to now: the one that answered the last
+    /// successful call (the connection moves on only after a failure).
+    pub fn endpoint(&self) -> String {
+        self.conn.active_endpoint()
+    }
+
     /// The highest Raft log index an `Index` RPC of this store reported as
     /// applied (0 before the first). Shared, so a progress display can read
     /// it while the store itself is boxed as `dyn Store`.
@@ -77,6 +83,13 @@ impl RemoteStore {
     /// Shared like [`applied_index`](Self::applied_index).
     pub fn forwarded_to_leader(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.forwarded)
+    }
+
+    /// The [`ReadMeta`](graph_proto::ReadMeta)s of this store's reads (and
+    /// its snapshots'): the last, and whether any was `stale_possible`.
+    /// Shared like [`applied_index`](Self::applied_index).
+    pub fn read_log(&self) -> Arc<crate::ReadLog> {
+        self.conn.read_log()
     }
 
     fn run<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -453,7 +466,10 @@ impl StoreRead for RemoteStore {
 
 impl Store for RemoteStore {
     fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>> {
-        let id = self.run(reads::open_snapshot(&self.conn))?;
+        let id = self.run(reads::open_snapshot(
+            &self.conn,
+            self.view() == graph_proto::View::Linearizable,
+        ))?;
         Ok(Box::new(RemoteSnapshot::new(
             Arc::clone(&self.conn),
             Arc::clone(&self.rt),

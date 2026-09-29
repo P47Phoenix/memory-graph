@@ -230,7 +230,7 @@ def main():
                     victim.kill()
                 # Down for a moment while the writer keeps going.
                 time.sleep(2)
-                victim.start([])  # a plain restart
+                victim.start(tuning)  # a plain restart (no --bootstrap / --join)
                 target = wait_for("the leader's committed index", leader_committed, 180)
                 t_up = time.monotonic()
                 wait_for(f"node {victim.id} to catch up to {target}",
