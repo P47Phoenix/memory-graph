@@ -674,8 +674,10 @@ dependencies = [
  "crossbeam-channel",
  "graph-client",
  "graph-core",
+ "graph-lang-asm",
  "graph-lang-aspx",
  "graph-lang-c",
+ "graph-lang-cobol",
  "graph-lang-csharp",
  "graph-lang-elixir",
  "graph-lang-fsharp",
@@ -685,6 +687,7 @@ dependencies = [
  "graph-lang-html",
  "graph-lang-javascript",
  "graph-lang-r",
+ "graph-lang-rpg",
  "graph-lang-rust",
  "graph-lang-scala",
  "graph-lang-shell",
@@ -738,6 +741,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-asm"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-aspx"
 version = "0.1.0"
 dependencies = [
@@ -748,6 +759,14 @@ dependencies = [
 
 [[package]]
 name = "graph-lang-c"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-cobol"
 version = "0.1.0"
 dependencies = [
  "graph-core",
@@ -820,6 +839,14 @@ dependencies = [
 
 [[package]]
 name = "graph-lang-r"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-rpg"
 version = "0.1.0"
 dependencies = [
  "graph-core",

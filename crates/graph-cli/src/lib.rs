@@ -55,6 +55,12 @@ pub fn shipped_extractors() -> Vec<Box<dyn graph_core::Extractor>> {
     v.push(Box::new(graph_lang_go::GoExtractor));
     #[cfg(feature = "lang-scala")]
     v.push(Box::new(graph_lang_scala::ScalaExtractor));
+    #[cfg(feature = "lang-cobol")]
+    v.push(Box::new(graph_lang_cobol::CobolExtractor));
+    #[cfg(feature = "lang-rpg")]
+    v.push(Box::new(graph_lang_rpg::RpgExtractor));
+    #[cfg(feature = "lang-asm")]
+    v.push(Box::new(graph_lang_asm::AsmExtractor));
     v
 }
 

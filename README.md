@@ -428,6 +428,9 @@ Languages are detected per file from the extension, the filename (`Makefile`) or
 | C++ | `cpp`, `cc`, `cxx`, `hpp`, `hh`, `hxx`, `ipp` | token-stream scanner (`lang-c` feature, shared with C; a `.h` stays language `c` but is scanned with the C++ rules when it contains `class`/`namespace`/`template`/`public:`) |
 | Go | `go` | token-stream scanner (receiver methods are siblings of their type, so they do not roll up under `--grain class`) |
 | Scala | `scala`, `sc` | token-stream scanner (brace and indentation syntax; a `def` in an `object` is a function). `.sc` is also SuperCollider's extension; such files are scanned as Scala and get few or odd symbols |
+| COBOL | `cbl`, `cob`, `cpy` | sentence scanner: programs, divisions, sections, paragraphs, level-01/77 items (fixed and free format) |
+| RPG IV / RPGLE | `rpgle`, `sqlrpgle`, `rpgleinc`, `rpg` | token-stream scanner: procedures, subroutines, prototypes, interfaces, data structures, standalone fields, constants, tags (`**FREE`, mixed and fixed form) |
+| Assembly | `asm`, `s` (not `inc`: PHP, Pascal and POV-Ray use it too) | line scanner (NASM, MASM, GNU as; x86 and ARM): labels, procs, macros, sections, segments, structs, constants |
 
 Everything else (Python, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
 

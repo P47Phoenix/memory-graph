@@ -60,6 +60,26 @@
       "name": "godot-game",
       "description": "The GDScript of a Godot 2D platformer demo; exercises the GDScript extractor.",
       "repos": ["godot-platformer"]
+    },
+    {
+      "name": "cobol-web",
+      "description": "A tiny COBOL web framework (CGI); exercises the COBOL extractor on real programs.",
+      "repos": ["cobol-on-wheelchair"]
+    },
+    {
+      "name": "rpg-json",
+      "description": "RPG IV (**FREE) examples for a JSON/XML service program; exercises the RPG extractor.",
+      "repos": ["noxdb"]
+    },
+    {
+      "name": "asm-snake",
+      "description": "A snake game in 16-bit x86 NASM; exercises the assembly extractor (NASM syntax).",
+      "repos": ["snake-asm"]
+    },
+    {
+      "name": "asm-arm64",
+      "description": "AArch64 GNU as examples for Apple Silicon; exercises the assembly extractor (GNU as syntax, macros).",
+      "repos": ["hellosilicon"]
     }
   ],
   "repos": [
@@ -231,6 +251,42 @@
       "split": "the GDScript files of the 2d/platformer demo",
       "include": ["2d/platformer/game.gd", "2d/platformer/player/player.gd", "2d/platformer/player/gun.gd", "2d/platformer/player/bullet.gd", "2d/platformer/enemy/enemy.gd", "LICENSE.md"],
       "languages": ["gdscript"]
+    },
+    {
+      "dir": "cobol-on-wheelchair",
+      "kind": "COBOL web framework",
+      "upstream": "https://github.com/azac/cobol-on-wheelchair",
+      "commit": "9eac2bcb0e1f6edfdfefccc85a66270b444f3c48",
+      "license": "MIT",
+      "include": ["cow.cbl", "cowtemplate.cbl", "config.cbl", "controllers", "LICENSE"],
+      "languages": ["cobol"]
+    },
+    {
+      "dir": "noxdb",
+      "kind": "RPG IV JSON library examples",
+      "upstream": "https://github.com/sitemule/noxDB",
+      "commit": "e1075364f5273d579b7e79112bfa665adbbc6a7f",
+      "license": "MIT",
+      "include": ["examples/JSONPARS0A.JSON-Basic-features.rpgle", "examples/JSONPARS5B.JSON-Build-from-scratch-different-ways.rpgle", "examples/HTTPXM001A.Using-httprequest-with-JSON-XML-TEXT.rpgle", "LICENSE"],
+      "languages": ["rpg"]
+    },
+    {
+      "dir": "snake-asm",
+      "kind": "x86 NASM game",
+      "upstream": "https://github.com/donno2048/snake",
+      "commit": "5c7cf1f2c9542da91d9a1eb681f147e41084ff2f",
+      "license": "MIT",
+      "include": ["snake.asm", "LICENSE"],
+      "languages": ["asm"]
+    },
+    {
+      "dir": "hellosilicon",
+      "kind": "AArch64 assembly examples",
+      "upstream": "https://github.com/below/HelloSilicon",
+      "commit": "45a4f1dde5a48c73182ac8087a6d4c8ed6691c24",
+      "license": "MIT",
+      "include": ["Chapter 04", "Chapter 06", "LICENSE"],
+      "languages": ["asm"]
     }
   ],
   "links": [
