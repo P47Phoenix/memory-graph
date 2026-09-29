@@ -131,6 +131,17 @@ impl Scanner<'_> {
             if c > 0 && matches!(self.text(c - 1), "." | "?.") {
                 continue;
             }
+            // `class type ...`, `function module(...)`: a declared name, not
+            // a keyword (#145: `class type A = {};` made a type alias that
+            // ran past the class).
+            if c > 0
+                && matches!(
+                    self.text(c - 1),
+                    "class" | "interface" | "enum" | "function" | "namespace" | "module" | "type"
+                )
+            {
+                continue;
+            }
             if !self.is_ident(c) || c + 1 >= hi {
                 continue;
             }

@@ -21,7 +21,12 @@
 //! symbols the C# extractor (`graph-lang-csharp`) finds in it as members of
 //! the page class (nested classes, fields, properties, methods, ...). A
 //! server script that is never closed, or whose body holds `<%`/`%>`, stays
-//! markup. `<% ... %>` blocks are not scanned for C# symbols: they hold the
+//! markup. Only C# scripts are scanned: the language is the script's
+//! `language` attribute, else the `<%@ Page/Control/Master Language=... %>`
+//! directive's, and must be `C#`, `cs` or `csharp` (any case). With neither,
+//! Web Forms compiles the script as VB, so it stays markup, as do VB (and
+//! other) scripts. As in ASP.NET, the first `</script>` ends the body even
+//! inside a C# string (`"</script>"`). `<% ... %>` blocks are not scanned for C# symbols: they hold the
 //! statements of the page's render method, where a scanner would read
 //! `if (x) {` or `int n = 0;` as declarations.
 //!
@@ -166,12 +171,52 @@ fn server_blocks(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
 /// as C#: returns the tokens (markup tokens outside the bodies, C# tokens
 /// inside, all in file coordinates) and a `server_script` module plus the C#
 /// symbols for each body.
+fn is_csharp(lang: &str) -> bool {
+    ["c#", "cs", "csharp"]
+        .iter()
+        .any(|l| lang.trim().eq_ignore_ascii_case(l))
+}
+
+/// The `Language` attribute of the first `<%@ Page %>` / `<%@ Control %>`
+/// (or `Master`) directive.
+fn directive_language(source: &str, tokens: &[TokenDecl]) -> Option<String> {
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        if tokens[i].text == "<%@"
+            && ["page", "control", "master"]
+                .iter()
+                .any(|d| tokens[i + 1].text.eq_ignore_ascii_case(d))
+        {
+            let mut j = i + 2;
+            while j + 2 < tokens.len() && tokens[j].text != "%>" {
+                if tokens[j].text.eq_ignore_ascii_case("language") && tokens[j + 1].text == "=" {
+                    let v = &tokens[j + 2];
+                    if v.text == "'" {
+                        // Server-tag code lexes `'C#'` as `'` `C` `#` `'`.
+                        let close = (j + 3..tokens.len()).find(|&k| tokens[k].text == "'")?;
+                        let (a, b) = (v.span.end as usize, tokens[close].span.start as usize);
+                        return source.get(a..b).map(str::to_string);
+                    }
+                    return Some(v.text.trim_matches(|c| c == '"' || c == '\'').to_string());
+                }
+                j += 1;
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
 fn server_scripts(source: &str, tokens: Vec<TokenDecl>) -> (Vec<TokenDecl>, Vec<SymbolDecl>) {
     // (index of the start tag's `>`, index of the end tag's `<`)
     let bodies = std::cell::RefCell::new(Vec::new());
+    let page_lang = directive_language(source, &tokens);
     scan_elements(&tokens, &[("<%", "%>")], |tag| {
+        let lang = tag.attr("language").or(page_lang.as_deref());
         let server = tag.name.eq_ignore_ascii_case("script")
             && !tag.self_closing
+            && lang.is_some_and(is_csharp)
             && tag
                 .attr("runat")
                 .is_some_and(|v| v.eq_ignore_ascii_case("server"));

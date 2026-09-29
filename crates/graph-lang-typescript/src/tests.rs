@@ -46,6 +46,11 @@ fn type_alias_never_ends_inside_a_declaration() {
         "type A = enum B { }",
         "type A = function f() { }",
         "type A = B | class C { }",
+        "class type class = { } ;",
+        "class type A = { } ;",
+        "class interface A { } ;",
+        "class enum A { } ;",
+        "class module A { } ;",
     ] {
         assert_nested(&TypeScriptExtractor.extract(src));
     }

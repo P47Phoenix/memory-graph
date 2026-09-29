@@ -159,8 +159,9 @@ pub struct TokenizerOptions {
     /// (optionally `\`-escaped) must start with a letter or `_`. A `"..."`
     /// string holding a command substitution is one Literal through its
     /// real closing quote, however the substitution nests quotes
-    /// (`"$(basename "$f")"`); when the substitution never closes, the
-    /// string ends at its next `"` as without this rule.
+    /// (`"$(basename "$f")"`); when the string or substitution never
+    /// closes, the string ends at its next `"` as without this rule, and so
+    /// do all later strings in the file (keeping lexing linear).
     pub shell_words: bool,
     /// `-` joins an identifier when directly followed by a letter, digit or
     /// `_` (COBOL `WORKING-STORAGE`, RPG `dcl-proc`). Note `a-b` is then one
@@ -177,17 +178,21 @@ pub struct TokenizerOptions {
     pub python_string_prefixes: bool,
     /// R raw strings: `r"(...)"`, `R'[...]'`, `r"{...}"` with optional
     /// dashes between the quote and the bracket (`r"--(...)--"`), one
-    /// Literal. Without its closing sequence the `r` stays an identifier.
+    /// Literal. Without its closing sequence the `r` stays an identifier,
+    /// and the rest of the file lexes without this rule (so an unterminated
+    /// raw string is scanned for once, keeping lexing linear).
     pub r_raw_strings: bool,
     /// MySQL `#` comments, SQL-safe subset: a `#` that is the first token on
     /// its line and is followed by whitespace or the line end is a Comment
     /// to the end of the line. `#temp` / `##temp` (T-SQL temporary tables),
     /// `#` after code (PostgreSQL XOR) and `#comment` without a space stay
-    /// code.
+    /// code. Known misfire: a PostgreSQL XOR operator that starts a
+    /// continuation line (`SELECT a\n# b`) is read as a comment.
     pub sql_hash_comments: bool,
     /// RPG compile-time data: from the first line starting with `**CTDATA`,
-    /// `**FTRANS` or `**ALTSEQ` (any case) or `**` followed by a blank or
-    /// the line end (not the `**FREE` first line), each section (its marker
+    /// `**FTRANS` or `**ALTSEQ` (any case) or, in fixed form only, `**`
+    /// followed by a blank or the line end (so a free-form `** 2;`
+    /// continuation is code; never the `**FREE` first line), each section (its marker
     /// line and data lines up to the next marker) is one Literal, trimmed.
     pub rpg_compile_time_data: bool,
 }
@@ -404,6 +409,8 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
         m: MarkupState::default(),
         heredocs: Vec::new(),
         parens: Vec::new(),
+        shell_nest_off: false,
+        r_raw_off: false,
     };
     let end = if opts.rpg_compile_time_data {
         rpg_data_start(src)
@@ -422,17 +429,16 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
 }
 
 /// RPG: a compile-time data marker line: `**CTDATA`, `**FTRANS`,
-/// `**ALTSEQ` (any case), or `**` followed by a blank or the line end. A
-/// `**` exponent operator continuing a free-form expression (`**2;`) is not
-/// one.
-pub fn is_rpg_data_marker(line: &str) -> bool {
+/// `**ALTSEQ` (any case), or, in a fixed-form file (`free` false), `**`
+/// followed by a blank or the line end. A `**` exponent operator continuing
+/// a free-form expression (`**2;`, `** 2;`) is not one.
+pub fn is_rpg_data_marker(line: &str, free: bool) -> bool {
     let Some(rest) = line.strip_prefix("**") else {
         return false;
     };
     let rest = rest.trim_end_matches(['\r', '\n']);
     let upper = rest.to_ascii_uppercase();
-    rest.is_empty()
-        || rest.starts_with([' ', '\t'])
+    (!free && (rest.is_empty() || rest.starts_with([' ', '\t'])))
         || ["CTDATA", "FTRANS", "ALTSEQ"]
             .iter()
             .any(|k| upper.starts_with(k))
@@ -449,7 +455,7 @@ pub fn rpg_data_start(src: &str) -> usize {
         } else {
             line
         };
-        if is_rpg_data_marker(l) && !(n == 0 && free) {
+        if is_rpg_data_marker(l, free) && !(n == 0 && free) {
             return off;
         }
         off += line.len();
@@ -481,6 +487,11 @@ struct Lexer<'a> {
     heredocs: Vec<(String, bool)>,
     /// `shell_words`: open parentheses, true when inside arithmetic `((`.
     parens: Vec<bool>,
+    /// A nested `"$(...)"` scan read to the end of input without closing:
+    /// later strings use the plain rule (keeps lexing linear).
+    shell_nest_off: bool,
+    /// Same for an unterminated R raw string.
+    r_raw_off: bool,
 }
 
 impl Lexer<'_> {
@@ -542,10 +553,11 @@ impl Lexer<'_> {
     /// trimmed Literal per section, a section starting at each marker line.
     fn data_sections(&mut self, from: usize) {
         let src = self.src;
+        let free = is_free_rpg(src);
         let mut start = from;
         let mut off = from;
         for line in src[from..].split_inclusive('\n') {
-            if off > start && is_rpg_data_marker(line) {
+            if off > start && is_rpg_data_marker(line, free) {
                 self.trimmed(start, off, TokenClass::Literal);
                 start = off;
             }
@@ -730,8 +742,13 @@ impl Lexer<'_> {
                 .flatten()
             {
                 (n, TokenClass::Literal)
-            } else if let Some(n) = (opts.r_raw_strings && !markup)
-                .then(|| r_raw_len(rest))
+            } else if let Some(n) = (opts.r_raw_strings && !markup && !self.r_raw_off)
+                .then(|| {
+                    r_raw_len(rest).unwrap_or_else(|()| {
+                        self.r_raw_off = true;
+                        None
+                    })
+                })
                 .flatten()
             {
                 (n, TokenClass::Literal)
@@ -764,9 +781,15 @@ impl Lexer<'_> {
                 (doubled_len(&rest[..line_len(rest)]), TokenClass::Literal)
             } else if c == '\'' && opts.single_quote_strings {
                 (single_quoted_len(rest), TokenClass::Literal)
-            } else if let Some(n) = (opts.shell_words && c == '"' && !markup)
-                .then(|| shell_dq_len(rest))
-                .flatten()
+            } else if let Some(n) =
+                (opts.shell_words && c == '"' && !markup && !self.shell_nest_off)
+                    .then(|| {
+                        shell_dq_len(rest).unwrap_or_else(|()| {
+                            self.shell_nest_off = true;
+                            None
+                        })
+                    })
+                    .flatten()
             {
                 (n, TokenClass::Literal)
             } else if c == '"' || c == '`' || (c == '\'' && is_char_literal(rest)) {
@@ -1113,23 +1136,27 @@ fn python_prefixed_len(rest: &str, sq: bool) -> Option<usize> {
     Some(p + n)
 }
 
-/// An R raw string (`r"(...)"`, `R'--[...]--'`) at the start of `rest`, if
-/// it closes.
-fn r_raw_len(rest: &str) -> Option<usize> {
+/// An R raw string (`r"(...)"`, `R'--[...]--'`) at the start of `rest`:
+/// `Ok(None)` when `rest` does not open one, `Err` when it opens one that
+/// never closes (the scan read to the end of input; the caller then stops
+/// trying, which keeps lexing linear).
+fn r_raw_len(rest: &str) -> Result<Option<usize>, ()> {
     let b = rest.as_bytes();
     if !matches!(b[0], b'r' | b'R') {
-        return None;
+        return Ok(None);
     }
-    let q = *b.get(1)?;
+    let Some(&q) = b.get(1) else {
+        return Ok(None);
+    };
     if q != b'"' && q != b'\'' {
-        return None;
+        return Ok(None);
     }
     let dashes = b[2..].iter().take_while(|&&c| c == b'-').count();
-    let close = match *b.get(2 + dashes)? {
-        b'(' => b')',
-        b'[' => b']',
-        b'{' => b'}',
-        _ => return None,
+    let close = match b.get(2 + dashes) {
+        Some(b'(') => b')',
+        Some(b'[') => b']',
+        Some(b'{') => b'}',
+        _ => return Ok(None),
     };
     let mut term = vec![close];
     term.extend(std::iter::repeat_n(b'-', dashes));
@@ -1138,7 +1165,8 @@ fn r_raw_len(rest: &str) -> Option<usize> {
     b[body..]
         .windows(term.len())
         .position(|w| w == term.as_slice())
-        .map(|p| body + p + term.len())
+        .map(|p| Some(body + p + term.len()))
+        .ok_or(())
 }
 
 /// Deepest nesting of quotes and command substitutions followed by
@@ -1149,9 +1177,12 @@ const SHELL_NEST_MAX: usize = 64;
 /// command substitution, through its real closing quote (quotes inside the
 /// substitution nest). `None` (use the plain rule) when it holds none, or
 /// when anything in it is unterminated.
-fn shell_dq_len(rest: &str) -> Option<usize> {
-    let (end, subst) = shell_dq_end(rest.as_bytes(), 1, 0)?;
-    subst.then_some(end)
+/// `Err` when the string or a substitution in it never closes (the scan
+/// read to the end of input; the caller then stops trying, which keeps
+/// lexing linear).
+fn shell_dq_len(rest: &str) -> Result<Option<usize>, ()> {
+    let (end, subst) = shell_dq_end(rest.as_bytes(), 1, 0).ok_or(())?;
+    Ok(subst.then_some(end))
 }
 
 /// End (after the closing `"`) of a double-quoted string whose body starts
@@ -1701,10 +1732,22 @@ mod tests {
         );
         assert_eq!(t[n - 1], ("**ctdata b\nq".into(), TokenClass::Literal));
         assert!(t.iter().any(|x| x.0 == "EVAL"));
-        // Free form too; `**FREE` and an exponent are not markers.
-        let t = dtoks_with(rpg, "**FREE\nx = y\n **2;\n**\ndata\n");
-        assert_eq!(t.last().unwrap(), &("**\ndata".into(), TokenClass::Literal));
-        assert!(t.iter().any(|x| x.0 == "2"));
+        // Free form too; `**FREE`, an exponent and a free-form `** 2;`
+        // continuation are not markers.
+        let t = dtoks_with(rpg, "**FREE\nx = y\n**2;\nz = w\n** 3;\n**CTDATA a\ndata\n");
+        assert_eq!(
+            t.last().unwrap(),
+            &("**CTDATA a\ndata".into(), TokenClass::Literal)
+        );
+        assert!(t.iter().any(|x| x.0 == "2") && t.iter().any(|x| x.0 == "3"));
+        assert!(t.iter().any(|x| x.0 == "FREE"));
+        // The `**FREE` first line (with a BOM too) never starts data.
+        assert_eq!(rpg_data_start("**FREE\nx;\n"), 10);
+        assert_eq!(rpg_data_start("\u{feff}**free\r\nx;\n"), 14);
+        assert_eq!(rpg_data_start("**FREE\n**ctdata x\n"), 7);
+        // Fixed form: `**` alone is a marker (and a first-line one too).
+        assert_eq!(rpg_data_start("** \nx\n"), 0);
+        assert_eq!(rpg_data_start("     C  X\n**\nx\n"), 10);
     }
 
     #[test]
@@ -1720,6 +1763,33 @@ mod tests {
         );
         // An unclosed substitution keeps the plain rule.
         assert_eq!(lits(sh, "\"$(open \"q\"")[0], "\"$(open \"");
+        // No substitution: the plain rule (escaped quotes included).
+        assert_eq!(lits(sh, r#"a "x \" y" b"#), [r#""x \" y""#]);
+        // After one unterminated scan, later strings use the plain rule.
+        assert_eq!(
+            lits(sh, "\"$(a\n\"$(b \"c\")\""),
+            ["\"$(a\n\"", "\"c\"", "\""]
+        );
+    }
+
+    /// Unterminated nested strings must not make lexing quadratic (#150
+    /// review: 40k such lines took seconds). Generous bound for debug CI.
+    #[test]
+    fn unterminated_nesting_stays_linear() {
+        for (opts, line) in [
+            (TokenizerOptions::SHELL, "echo \"$( x \" y\n"),
+            (TokenizerOptions::R, "x <- r\"( y\n"),
+        ] {
+            let src = line.repeat(40_000);
+            let t = std::time::Instant::now();
+            let toks = tokenize_with(&src, opts);
+            assert!(!toks.is_empty());
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(3),
+                "{line:?}: {:?}",
+                t.elapsed()
+            );
+        }
     }
 
     #[test]
