@@ -19,7 +19,7 @@ jobs:
   windows:
     # The suites where the host OS shows through (#100, #120): path separators
     # in the walk and on the wire, language detection, open errors. Not the
-    # whole workspace: the cluster/serve suites spawn several servers and
+    # whole workspace: the cluster suites spawn several servers and
     # are OS-neutral, and would roughly triple this leg's time. The one
     # skipped store test is a wall-clock ceiling (50 ms per fsync'd commit)
     # calibrated on the Linux runner (#154).
