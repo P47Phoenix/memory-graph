@@ -6,7 +6,7 @@
 use crate::conn::{store_client, Conn, Kind};
 use graph_core::{Node, NodeId, NodeKind};
 use graph_proto::convert::enum_i32;
-use graph_proto::{pb, ConvertError, View};
+use graph_proto::{pb, ConvertError, ReadMeta, View};
 use graph_store::{Hit, Page, Query, RepoInfo, StoreError, SymbolHit, SymbolQuery};
 use tokio_stream::StreamExt;
 
@@ -35,7 +35,7 @@ pub async fn get(c: &Conn, view: View, id: NodeId) -> Result<Option<Node>> {
                 .await
         })
         .await?;
-    r.into_inner().node.map(conv).transpose()
+    c.answer(r).node.map(conv).transpose()
 }
 
 pub async fn parent(c: &Conn, view: View, id: NodeId) -> Result<Option<Node>> {
@@ -49,7 +49,7 @@ pub async fn parent(c: &Conn, view: View, id: NodeId) -> Result<Option<Node>> {
                 .await
         })
         .await?;
-    r.into_inner().node.map(conv).transpose()
+    c.answer(r).node.map(conv).transpose()
 }
 
 pub async fn count_nodes(c: &Conn, view: View, kind: NodeKind) -> Result<usize> {
@@ -63,7 +63,7 @@ pub async fn count_nodes(c: &Conn, view: View, kind: NodeKind) -> Result<usize> 
                 .await
         })
         .await?;
-    usize::try_from(r.into_inner().count)
+    usize::try_from(c.answer(r).count)
         .map_err(|_| StoreError::Protocol("count does not fit usize".into()))
 }
 
@@ -77,7 +77,7 @@ pub async fn roots(c: &Conn, view: View) -> Result<Vec<Node>> {
                 .await
         })
         .await?;
-    nodes(r.into_inner().nodes)
+    nodes(c.answer(r).nodes)
 }
 
 pub async fn children(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
@@ -91,7 +91,7 @@ pub async fn children(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
                 .await
         })
         .await?;
-    nodes(r.into_inner().nodes)
+    nodes(c.answer(r).nodes)
 }
 
 pub async fn children_page(
@@ -113,7 +113,7 @@ pub async fn children_page(
                 .await
         })
         .await?;
-    conv(r.into_inner())
+    conv(c.answer(r))
 }
 
 pub async fn descendants_page(
@@ -135,7 +135,7 @@ pub async fn descendants_page(
                 .await
         })
         .await?;
-    conv(r.into_inner())
+    conv(c.answer(r))
 }
 
 pub async fn ancestors(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
@@ -149,7 +149,7 @@ pub async fn ancestors(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
                 .await
         })
         .await?;
-    nodes(r.into_inner().nodes)
+    nodes(c.answer(r).nodes)
 }
 
 /// Consume a `NodeBatch` stream into one list; `Ok(None)` when the first
@@ -176,17 +176,18 @@ async fn drain(
 pub async fn descendants(c: &Conn, view: View, id: NodeId) -> Result<Vec<Node>> {
     let r = c
         .call(Kind::Read, |ch| async move {
-            let s = store_client(ch)
+            let r = store_client(ch)
                 .descendants(pb::DescendantsRequest {
                     view: view_of(view),
                     id,
                 })
-                .await?
-                .into_inner();
-            drain(s).await
+                .await?;
+            let meta = ReadMeta::from_metadata(r.metadata());
+            drain(r.into_inner()).await.map(|v| (v, meta))
         })
         .await?;
-    Ok(r.unwrap_or_default())
+    c.note(r.1);
+    Ok(r.0.unwrap_or_default())
 }
 
 pub async fn file_tokens(
@@ -202,14 +203,18 @@ pub async fn file_tokens(
         repo: repo.into(),
         path: path.into(),
     };
-    c.call(Kind::Read, |ch| {
-        let req = req.clone();
-        async move {
-            let s = store_client(ch).file_tokens(req).await?.into_inner();
-            drain(s).await
-        }
-    })
-    .await
+    let (toks, meta) = c
+        .call(Kind::Read, |ch| {
+            let req = req.clone();
+            async move {
+                let r = store_client(ch).file_tokens(req).await?;
+                let meta = ReadMeta::from_metadata(r.metadata());
+                drain(r.into_inner()).await.map(|v| (v, meta))
+            }
+        })
+        .await?;
+    c.note(meta);
+    Ok(toks)
 }
 
 pub async fn describe(
@@ -237,7 +242,7 @@ pub async fn describe(
             }
         })
         .await?;
-    r.into_inner().repos.into_iter().map(conv).collect()
+    c.answer(r).repos.into_iter().map(conv).collect()
 }
 
 /// One `Search` page: hits and whether the server applied its default.
@@ -251,8 +256,8 @@ async fn search_page(c: &Conn, view: View, q: &Query) -> Result<(Vec<Hit>, bool)
             let req = req.clone();
             async move { store_client(ch).search(req).await }
         })
-        .await?
-        .into_inner();
+        .await
+        .map(|r| c.answer(r))?;
     let hits = r.hits.into_iter().map(conv).collect::<Result<Vec<_>>>()?;
     Ok((hits, r.applied_default_limit))
 }
@@ -271,18 +276,24 @@ async fn search_symbols_page(
             let req = req.clone();
             async move { store_client(ch).search_symbols(req).await }
         })
-        .await?
-        .into_inner();
+        .await
+        .map(|r| c.answer(r))?;
     let hits = r.hits.into_iter().map(conv).collect::<Result<Vec<_>>>()?;
     Ok((hits, r.applied_default_limit))
 }
 
-pub async fn open_snapshot(c: &Conn) -> Result<u64> {
+/// `OpenSnapshot`; `linearizable`: the server runs the read barrier first.
+pub async fn open_snapshot(c: &Conn, linearizable: bool) -> Result<u64> {
     let r = c
         .call(Kind::Read, |ch| async move {
-            store_client(ch)
-                .open_snapshot(pb::OpenSnapshotRequest {})
-                .await
+            let mut req = tonic::Request::new(pb::OpenSnapshotRequest {});
+            if linearizable {
+                req.metadata_mut().insert(
+                    graph_proto::READ_MODE_HEADER,
+                    tonic::metadata::MetadataValue::from_static("linearizable"),
+                );
+            }
+            store_client(ch).open_snapshot(req).await
         })
         .await?;
     Ok(r.into_inner().snapshot_id)
@@ -304,7 +315,7 @@ async fn paging_view(c: &Conn, view: View) -> Result<(View, Option<u64>)> {
     match view {
         View::Snapshot(_) => Ok((view, None)),
         View::Local | View::Linearizable => {
-            let id = open_snapshot(c).await?;
+            let id = open_snapshot(c, view == View::Linearizable).await?;
             Ok((View::Snapshot(id), Some(id)))
         }
     }

@@ -6,11 +6,12 @@ use graph_proto::error::WireError;
 use graph_proto::pb::admin_client::AdminClient;
 use graph_proto::pb::store_client::StoreClient;
 use graph_proto::pb::write_client::WriteClient;
+use graph_proto::ReadMeta;
 use graph_proto::{pb, status_to_store_error, SendVersion, View, PROTOCOL_VERSION};
 use graph_store::StoreError;
 use rand::Rng;
 use std::future::Future;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
@@ -78,6 +79,52 @@ pub struct Conn {
     cfg: ClientConfig,
     active: RwLock<Active>,
     hello: HelloInfo,
+    reads: Arc<ReadLog>,
+}
+
+/// The [`ReadMeta`] of this connection's reads: the last one, and whether
+/// any so far was `stale_possible` (what a CLI command reports).
+#[derive(Debug, Default)]
+pub struct ReadLog {
+    inner: Mutex<ReadLogInner>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ReadLogInner {
+    last: Option<ReadMeta>,
+    any_stale: bool,
+    reads: u64,
+}
+
+impl ReadLog {
+    fn note(&self, m: ReadMeta) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.last = Some(m);
+        g.any_stale |= m.stale_possible;
+        g.reads += 1;
+    }
+
+    /// The meta of the last read that carried one.
+    pub fn last(&self) -> Option<ReadMeta> {
+        self.snapshot().last
+    }
+
+    /// Whether any read so far may have missed acknowledged writes; `None`
+    /// before the first read that carried a meta.
+    pub fn stale_possible(&self) -> Option<bool> {
+        let g = self.snapshot();
+        (g.reads > 0).then_some(g.any_stale)
+    }
+
+    fn snapshot(&self) -> ReadLogInner {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// No message size limit on either direction: a `FileBytes` may carry a
@@ -184,28 +231,36 @@ impl Conn {
             return Err(StoreError::Rejected("no server endpoint given".into()));
         }
         let mut last = None;
-        for ep in cfg.endpoints.clone() {
-            let channel = endpoint_for(&ep, cfg.connect_timeout)?.connect_lazy();
-            match Self::hello_on(&ep, &channel, &cfg).await {
-                Ok(h) => {
-                    let hello = HelloInfo::from((h, ep.clone()));
-                    return Ok(Conn {
-                        cfg,
-                        active: RwLock::new(Active {
-                            endpoint: ep,
-                            channel,
-                        }),
-                        hello,
-                    });
-                }
-                Err(e) => {
-                    tracing::debug!(endpoint = %ep, error = %e, "hello failed");
-                    // A protocol mismatch is definitive for that server;
-                    // an unreachable endpoint means try the next.
-                    if matches!(e, StoreError::Protocol(_)) {
-                        return Err(e);
+        // With several endpoints, one quick pass (no retries) first, so a
+        // dead node early in the list costs one refused connect, not the
+        // whole retry budget; then the retrying pass.
+        let quick = cfg.endpoints.len() > 1;
+        let passes: &[bool] = if quick { &[false, true] } else { &[true] };
+        for &retry in passes {
+            for ep in cfg.endpoints.clone() {
+                let channel = endpoint_for(&ep, cfg.connect_timeout)?.connect_lazy();
+                match Self::hello_on(&ep, &channel, &cfg, retry).await {
+                    Ok(h) => {
+                        let hello = HelloInfo::from((h, ep.clone()));
+                        return Ok(Conn {
+                            cfg,
+                            active: RwLock::new(Active {
+                                endpoint: ep,
+                                channel,
+                            }),
+                            hello,
+                            reads: Arc::default(),
+                        });
                     }
-                    last = Some(e);
+                    Err(e) => {
+                        tracing::debug!(endpoint = %ep, error = %e, "hello failed");
+                        // A protocol mismatch is definitive for that server;
+                        // an unreachable endpoint means try the next.
+                        if matches!(e, StoreError::Protocol(_)) {
+                            return Err(e);
+                        }
+                        last = Some(e);
+                    }
                 }
             }
         }
@@ -216,6 +271,7 @@ impl Conn {
         endpoint: &str,
         channel: &Channel,
         cfg: &ClientConfig,
+        retry: bool,
     ) -> Result<pb::HelloResponse, StoreError> {
         let mut client = store_client(channel.clone());
         let deadline = Instant::now() + cfg.retry.budget;
@@ -238,7 +294,7 @@ impl Conn {
                     }
                     return Ok(h);
                 }
-                Err(st) if st.code() == Code::Unavailable && st.details().is_empty() => {
+                Err(st) if retry && st.code() == Code::Unavailable && st.details().is_empty() => {
                     let delay = jitter(&cfg.retry, attempt);
                     if Instant::now() + delay > deadline {
                         return Err(map_status(endpoint, &st));
@@ -257,6 +313,42 @@ impl Conn {
 
     pub fn config(&self) -> &ClientConfig {
         &self.cfg
+    }
+
+    /// The read metas this connection received (shared).
+    pub fn read_log(&self) -> Arc<ReadLog> {
+        Arc::clone(&self.reads)
+    }
+
+    /// Record a streamed read's meta (taken from its response headers).
+    pub fn note(&self, m: Option<ReadMeta>) {
+        if let Some(m) = m {
+            self.reads.note(m);
+        }
+    }
+
+    /// A read's answer: records its `mg-read-meta` header, if any.
+    pub fn answer<T>(&self, r: tonic::Response<T>) -> T {
+        if let Some(m) = ReadMeta::from_metadata(r.metadata()) {
+            self.reads.note(m);
+        }
+        r.into_inner()
+    }
+
+    /// Move to the configured endpoint after the active one (with more
+    /// than one configured): a dead or leaderless node does not hold the
+    /// client when another may answer.
+    fn rotate(&self) {
+        let eps = &self.cfg.endpoints;
+        if eps.len() < 2 {
+            return;
+        }
+        let (cur, _) = self.channel();
+        let next = eps
+            .iter()
+            .position(|e| *e == cur)
+            .map_or(0, |i| (i + 1) % eps.len());
+        let _ = self.switch_to(&eps[next]);
     }
 
     /// The read view for this connection's configured mode.
@@ -332,11 +424,13 @@ impl Conn {
                 }
                 WireError::NoLeader { retry_after_ms } => {
                     switches = 0;
+                    self.rotate();
                     Duration::from_millis(*retry_after_ms)
                         .clamp(self.cfg.retry.base, self.cfg.retry.cap)
                 }
                 _ if retryable(kind, &st) => {
                     switches = 0;
+                    self.rotate();
                     jitter(&self.cfg.retry, attempt)
                 }
                 _ => return Err(map_status(&endpoint, &st)),

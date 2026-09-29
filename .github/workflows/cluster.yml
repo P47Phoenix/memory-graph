@@ -1,0 +1,24 @@
+name: cluster
+# ADR 0004 test plan D (epic story 23): three real `memory-graph serve
+# --data-dir` processes, the leader SIGKILLed three times mid-writes, every
+# acknowledged batch checked on every node. See docs/testing.md.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/graph-server/**"
+      - "crates/graph-client/**"
+      - "crates/graph-store/**"
+      - "scripts/cluster_kill_test.py"
+      - ".github/workflows/cluster.yml"
+jobs:
+  kill-leader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p graph-cli
+      - run: python3 scripts/cluster_kill_test.py --bin target/release/memory-graph --rounds 3

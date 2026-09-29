@@ -632,6 +632,7 @@ pub async fn start(
                     .testing
                     .delay_append_entries_ms
                     .map(Duration::from_millis),
+                leader_contact: Arc::clone(&raft.leader_contact),
             })
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),

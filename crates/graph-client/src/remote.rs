@@ -79,6 +79,13 @@ impl RemoteStore {
         Arc::clone(&self.forwarded)
     }
 
+    /// The [`ReadMeta`](graph_proto::ReadMeta)s of this store's reads (and
+    /// its snapshots'): the last, and whether any was `stale_possible`.
+    /// Shared like [`applied_index`](Self::applied_index).
+    pub fn read_log(&self) -> Arc<crate::ReadLog> {
+        self.conn.read_log()
+    }
+
     fn run<F: std::future::Future>(&self, f: F) -> F::Output {
         block_on(&self.rt, f)
     }
@@ -444,7 +451,10 @@ impl StoreRead for RemoteStore {
 
 impl Store for RemoteStore {
     fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>> {
-        let id = self.run(reads::open_snapshot(&self.conn))?;
+        let id = self.run(reads::open_snapshot(
+            &self.conn,
+            self.view() == graph_proto::View::Linearizable,
+        ))?;
         Ok(Box::new(RemoteSnapshot::new(
             Arc::clone(&self.conn),
             Arc::clone(&self.rt),

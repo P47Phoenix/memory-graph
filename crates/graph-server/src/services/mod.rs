@@ -5,8 +5,9 @@
 use crate::raft::RaftNode;
 use crate::server::{ShutdownHandle, SysInfoFn};
 use crate::slot::StoreSlot;
-use graph_proto::{store_error_to_status, View};
+use graph_proto::{store_error_to_status, ReadMeta, View};
 use graph_store::{StoreError, StoreRead};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::Status;
@@ -66,8 +67,25 @@ pub struct Ctx {
 /// read index before it answers `NoLeader`.
 pub const READ_INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Counts one read in [`RaftNode::read_index_waits`](crate::raft::RaftNode)
+/// until dropped.
+struct WaitGuard(Arc<AtomicUsize>);
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub fn status(e: StoreError) -> Status {
     store_error_to_status(&e)
+}
+
+/// A read's answer with its [`ReadMeta`] in the `mg-read-meta` header.
+pub fn reply<M>(msg: M, meta: ReadMeta) -> tonic::Response<M> {
+    let mut r = tonic::Response::new(msg);
+    meta.insert_into(r.metadata_mut());
+    r
 }
 
 fn join_err(e: tokio::task::JoinError) -> Status {
@@ -115,6 +133,8 @@ impl Ctx {
         .map_err(crate::forward::forward_error)?
         .into_inner()
         .read_index;
+        self.raft.read_index_waits.fetch_add(1, Ordering::SeqCst);
+        let _waiting = WaitGuard(Arc::clone(&self.raft.read_index_waits));
         self.raft
             .raft
             .wait(Some(READ_INDEX_WAIT))
@@ -132,8 +152,16 @@ impl Ctx {
     /// Run a read against the requested view (ADR 0004 D8): `Local` on the
     /// store as it is, `Linearizable` after the read barrier
     /// ([`linearizable_barrier`](Self::linearizable_barrier)), or a
-    /// snapshot handle. The read itself runs on the blocking pool.
-    pub async fn read<T, F>(&self, view: Option<graph_proto::pb::View>, f: F) -> Result<T, Status>
+    /// snapshot handle. The read itself runs on the blocking pool. Returns
+    /// the answer with its [`ReadMeta`], taken before the read (so the
+    /// answer reflects at least `applied_index`); a linearizable read is
+    /// never `stale_possible`. For a snapshot view the meta is the node's
+    /// own state, not the handle's (the handle is frozen when it opened).
+    pub async fn read<T, F>(
+        &self,
+        view: Option<graph_proto::pb::View>,
+        f: F,
+    ) -> Result<(T, ReadMeta), Status>
     where
         T: Send + 'static,
         F: FnOnce(&dyn StoreRead) -> Result<T, StoreError> + Send + 'static,
@@ -142,19 +170,26 @@ impl Ctx {
         let slot = Arc::clone(&self.slot);
         match view {
             View::Local | View::Linearizable => {
+                let mut meta;
                 if view == View::Linearizable {
                     self.linearizable_barrier().await?;
+                    meta = self.raft.read_meta();
+                    meta.stale_possible = false;
+                } else {
+                    meta = self.raft.read_meta();
                 }
                 // Fails fast (UNAVAILABLE) while a snapshot install swaps
                 // the file (D8): the client moves to its next endpoint.
-                tokio::task::spawn_blocking(move || slot.with_store_read(|s| f(s)))
+                let v = tokio::task::spawn_blocking(move || slot.with_store_read(|s| f(s)))
                     .await
                     .map_err(join_err)?
-                    .map_err(status)
+                    .map_err(status)?;
+                Ok((v, meta))
             }
             View::Snapshot(id) => {
+                let meta = self.raft.read_meta();
                 let snap = slot.snapshots().get(id).map_err(status)?;
-                tokio::task::spawn_blocking(move || {
+                let v = tokio::task::spawn_blocking(move || {
                     let g = snap
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -162,7 +197,8 @@ impl Ctx {
                 })
                 .await
                 .map_err(join_err)?
-                .map_err(status)
+                .map_err(status)?;
+                Ok((v, meta))
             }
         }
     }

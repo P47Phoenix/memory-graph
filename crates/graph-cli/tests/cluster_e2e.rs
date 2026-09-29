@@ -85,7 +85,14 @@ fn ok(args: &[&str]) -> String {
 
 /// Drop what differs between two runs of the same work: elapsed times.
 fn normalize(s: &str) -> String {
+    // A server's JSON reads carry `stale_possible` (ADR 0004 D8), which
+    // depends on each node's view of the leader, not on the data compared.
     let mut s = s.to_string();
+    for v in ["false", "true"] {
+        s = s
+            .replace(&format!(",\"stale_possible\":{v}"), "")
+            .replace(&format!("\"stale_possible\":{v},"), "");
+    }
     for key in ["elapsed=", "\"elapsed_ms\":"] {
         let mut out = String::with_capacity(s.len());
         let mut rest = s.as_str();

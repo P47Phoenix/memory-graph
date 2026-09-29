@@ -23,9 +23,11 @@ struct Cli {
     /// Database file, opened in this process (default ./graph.redb). Not together with --server
     #[arg(long, global = true)]
     db: Option<PathBuf>,
-    /// Use the `memory-graph serve` at this host:port instead of a local file (also read from
-    /// MEMORY_GRAPH_SERVER; the flag wins). Not together with --db
-    #[arg(long, global = true, value_name = "HOST:PORT")]
+    /// Use the `memory-graph serve` at this host:port instead of a local file; several nodes of
+    /// one cluster as a comma-separated list (the first that answers is used, an unreachable or
+    /// leaderless one is skipped). Also read from MEMORY_GRAPH_SERVER; the flag wins. Not
+    /// together with --db. With --json, read commands add `stale_possible`
+    #[arg(long, global = true, value_name = "HOST:PORT[,HOST:PORT...]")]
     server: Option<String>,
     /// With --server: how reads are served, `local` (the node's store as it is) or `linearizable`
     /// (sees every acknowledged write). Also read from MEMORY_GRAPH_READ. Default local
@@ -1354,7 +1356,9 @@ fn run() -> Result<i32> {
             if json {
                 out!(
                     "{}",
-                    serde_json::to_string(&serde_json::json!({ "repos": infos }))?
+                    serde_json::to_string(&graph_cli::target::with_read_meta(
+                        serde_json::json!({ "repos": infos })
+                    ))?
                 );
             } else {
                 for i in &infos {
@@ -1406,7 +1410,9 @@ fn run() -> Result<i32> {
             q.offset = offset.map(|o| o as usize);
             let hits = store.search_symbols(&q)?;
             if json {
-                let out = serde_json::json!({ "query": pattern, "results": hits });
+                let out = graph_cli::target::with_read_meta(
+                    serde_json::json!({ "query": pattern, "results": hits }),
+                );
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
@@ -1500,7 +1506,9 @@ fn run() -> Result<i32> {
             q.offset = offset.map(|o| o as usize);
             let hits = store.search(&q)?;
             if json {
-                let out = serde_json::json!({ "query": text, "grain": grain, "results": hits });
+                let out = graph_cli::target::with_read_meta(
+                    serde_json::json!({ "query": text, "grain": grain, "results": hits }),
+                );
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {

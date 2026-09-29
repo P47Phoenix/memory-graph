@@ -14,6 +14,13 @@
 //!   `search_symbols` without a limit pages to completion under a snapshot
 //!   handle when the server applied its default limit, so the pages come
 //!   from one frozen view.
+//! * Every read answer carries a [`ReadMeta`] (the `mg-read-meta` response
+//!   header: applied index, the leader's committed index as last seen,
+//!   `stale_possible`); [`RemoteStore::read_log`] collects them.
+//! * Several endpoints (`ClientConfig::endpoints`): the first that answers
+//!   `Hello` is used; an unreachable or leaderless node moves the
+//!   connection to the next one (a `NotLeader` naming the leader moves it
+//!   there).
 //! * Indexing ships raw source bytes: `prepare` returns
 //!   `PreparedFile::remote`, `index_prepared` streams one `Write.Index`
 //!   RPC (a header, then one `FileBytes` per file); the server parses.
@@ -33,7 +40,8 @@ mod reads;
 mod remote;
 mod snapshot;
 
-pub use conn::{block_on, HelloInfo};
+pub use conn::{block_on, HelloInfo, ReadLog};
+pub use graph_proto::ReadMeta;
 pub use remote::RemoteStore;
 pub use snapshot::RemoteSnapshot;
 

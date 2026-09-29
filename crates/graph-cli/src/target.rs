@@ -314,7 +314,9 @@ pub fn connect(addr: &str, read: ReadMode) -> Result<RemoteStore> {
 /// [`connect`] with a custom retry budget for the first `Hello` (e.g. a
 /// short one for `health`).
 pub fn connect_with(addr: &str, read: ReadMode, budget: Option<Duration>) -> Result<RemoteStore> {
-    let mut cfg = ClientConfig::new(addr);
+    let endpoints = endpoints(addr)?;
+    let mut cfg = ClientConfig::new(endpoints[0].clone());
+    cfg.endpoints = endpoints;
     cfg.read_mode = read;
     if let Some(d) = WRITE_DEADLINE.get() {
         cfg.write_deadline = *d;
@@ -322,18 +324,78 @@ pub fn connect_with(addr: &str, read: ReadMode, budget: Option<Duration>) -> Res
     if let Some(b) = budget {
         cfg.retry.budget = b;
     }
-    RemoteStore::connect(cfg).map_err(|e| match e {
+    let store = RemoteStore::connect(cfg).map_err(|e| match e {
         StoreError::Protocol(_) | StoreError::SchemaMismatch { .. } => anyhow::Error::new(Exit {
             code: exit::PROTOCOL,
             message: format!("server {addr} is not compatible with this client: {e}"),
         }),
         e => anyhow::Error::new(e).context(format!("cannot connect to server {addr}")),
-    })
+    })?;
+    *READ_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store.read_log());
+    Ok(store)
+}
+
+/// `--server` / `MEMORY_GRAPH_SERVER`: one `host:port`, or several
+/// separated by commas (the client uses the first that answers and moves
+/// on to the next when one is unreachable or has no leader).
+pub fn endpoints(addr: &str) -> Result<Vec<String>> {
+    let eps: Vec<String> = addr
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect();
+    if eps.is_empty() {
+        bail!("--server `{addr}` names no endpoint (give host:port[,host:port...])");
+    }
+    Ok(eps)
+}
+
+/// The read log of the last server connection this process made.
+static READ_LOG: std::sync::Mutex<Option<std::sync::Arc<graph_client::ReadLog>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a read of this process's server connection may have missed
+/// acknowledged writes (ADR 0004 D8): `None` with no server (embedded
+/// output is unchanged) or before any read.
+pub fn stale_possible() -> Option<bool> {
+    READ_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|l| l.stale_possible())
+}
+
+/// Add `"stale_possible"` to a JSON output document when talking to a
+/// server (unchanged embedded).
+pub fn with_read_meta(mut doc: serde_json::Value) -> serde_json::Value {
+    if let (Some(stale), Some(o)) = (stale_possible(), doc.as_object_mut()) {
+        o.insert("stale_possible".into(), serde_json::Value::Bool(stale));
+    }
+    doc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_takes_a_comma_separated_endpoint_list() {
+        assert_eq!(endpoints("h:1").unwrap(), ["h:1"]);
+        assert_eq!(
+            endpoints(" a:1 , b:2,,c:3 ").unwrap(),
+            ["a:1", "b:2", "c:3"]
+        );
+        assert!(endpoints(" , ").is_err());
+    }
+
+    #[test]
+    fn embedded_json_output_gets_no_stale_possible() {
+        let doc = with_read_meta(serde_json::json!({ "repos": [] }));
+        assert!(doc.get("stale_possible").is_none());
+    }
 
     #[test]
     fn write_deadline_parses_units_and_refuses_zero() {

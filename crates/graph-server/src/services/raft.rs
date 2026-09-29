@@ -50,6 +50,8 @@ pub struct RaftService {
     pub disk: DiskGuard,
     /// Test hook ([`crate::TestingHooks::delay_append_entries_ms`]).
     pub delay_append: Option<std::time::Duration>,
+    /// Where an accepted `AppendEntries` is recorded (read staleness, D8).
+    pub leader_contact: Arc<crate::raft::node::LeaderContact>,
 }
 
 fn raft_status<E: std::fmt::Display>(e: RaftError<u64, E>) -> Status {
@@ -98,7 +100,14 @@ impl pb::raft_server::Raft for RaftService {
             }
         }
         let rpc = wire::append_from_pb(req).map_err(bad)?;
+        let leader_commit = rpc.leader_commit.map(|l| l.index);
         let resp = self.raft.append_entries(rpc).await.map_err(raft_status)?;
+        // Any answer but a higher vote means a live leader of this term
+        // reached us (a conflict or partial success only means we lag,
+        // which the recorded commit index shows).
+        if !matches!(resp, openraft::raft::AppendEntriesResponse::HigherVote(_)) {
+            self.leader_contact.seen(leader_commit);
+        }
         Ok(Response::new(wire::append_resp_to_pb(&resp)))
     }
 

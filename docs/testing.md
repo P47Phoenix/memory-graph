@@ -281,6 +281,29 @@ well under 30 s (the slowest, the partition, about 5 s):
   `describe` are unchanged on every node, and `run_differential` against an
   embedded oracle passes.
 
+## Linearizable reads and crash tests (ADR 0004 stage D)
+
+`crates/graph-server/tests/linearizable.rs` runs on the in-process `ClusterTestbed` on every platform (`cargo test -p graph-server --test linearizable`):
+
+- `reads_carry_read_meta`: every read answer has a `ReadMeta` (`mg-read-meta` header); fresh on the leader and on a caught-up follower.
+- `linearizable_read_on_lagging_follower_sees_the_write`: the fault plan drops `AppendEntries` to a follower; a `local` read there misses the acked write and reports `stale_possible`; a `linearizable` read parks on the leader's read index (the test waits on `RaftNode::read_index_waits`, never a sleep), the test heals, and the read includes the write.
+- `stale_leader_linearizable_read_never_returns_old_data`: the old leader is partitioned away with a connected client, the majority elects and acks a write; linearizable reads on the old leader answer `NoLeader`/`NotLeader` or the new data, never the old; after the heal they see the write.
+- `minority_linearizable_read_fails_no_leader`: bounded `NoLeader`, while `local` still answers (stale_possible).
+- `history_checker`: three writer threads (one repo each, clients over all three endpoints) and three linearizable reader threads (one per node) for 10 s with a fixed seed (`MEMORY_GRAPH_HISTORY_SECS`, `MEMORY_GRAPH_HISTORY_SEED` override). Each reader records what was acknowledged before its read started and checks the read sees at least that, that its `applied_index` never goes back, and that it is never `stale_possible`. A failure prints the seed.
+
+Power loss and process kill are covered by `tests/durability.rs` (`PowerCutDisk`: an acked write survives a power cut of every node, a cut mid-write leaves no torn state) and `tests/process_kill.rs` (a killed child process keeps every acked write).
+
+### The `cluster` CI job
+
+`.github/workflows/cluster.yml` (Linux; on push to `main` and on PRs touching `graph-server`, `graph-client` or `graph-store`) runs `scripts/cluster_kill_test.py`: three real `memory-graph serve --data-dir` processes (node 1 `--bootstrap`, 2 and 3 `--join <node 1> --auto-promote`), a writer indexing numbered one-file repos through `--server a,b,c` and recording each batch whose command exited 0, and three rounds of: SIGKILL the current leader (`cluster leader --json`), keep writing on the survivors, restart the killed node with no cluster flags, pause the writer and wait until all three report one applied index. At the end every acknowledged batch must be in `describe --json --read local` on every node. Only processes the script started are killed; every wait has a timeout.
+
+Locally (Windows uses `TerminateProcess`):
+
+```sh
+cargo build --release -p graph-cli
+python3 scripts/cluster_kill_test.py --bin target/release/memory-graph   # --rounds N, --keep
+```
+
 ## Database size
 
 `crates/graph-cli/tests/size_gate.rs` indexes `testdata/corpus` and fails if

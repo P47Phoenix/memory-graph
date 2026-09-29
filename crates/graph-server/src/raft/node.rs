@@ -140,6 +140,36 @@ pub struct RaftNode {
     /// write proposal waits this long after it was counted in
     /// [`in_flight`](Self::in_flight), before it reaches Raft.
     pub hold_proposal: Option<Duration>,
+    /// The last `AppendEntries` this node accepted from a leader (when, and
+    /// the leader's commit index it carried): what a `LOCAL` read's
+    /// [`ReadMeta`](graph_proto::ReadMeta) judges staleness by (ADR 0004 D8).
+    pub leader_contact: Arc<LeaderContact>,
+    /// Linearizable reads on this node waiting to apply the leader's read
+    /// index right now (a test observes a read parked there).
+    pub read_index_waits: Arc<AtomicUsize>,
+}
+
+/// The last leader contact a follower saw ([`RaftNode::leader_contact`]).
+#[derive(Debug, Default)]
+pub struct LeaderContact(std::sync::Mutex<Option<(std::time::Instant, Option<u64>)>>);
+
+impl LeaderContact {
+    /// Record an accepted `AppendEntries` carrying `leader_commit`.
+    pub fn seen(&self, leader_commit: Option<u64>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((std::time::Instant::now(), leader_commit));
+    }
+
+    /// When the leader was last heard from, and its commit index then.
+    pub fn last(&self) -> Option<(std::time::Instant, Option<u64>)> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
@@ -275,6 +305,8 @@ impl RaftNode {
             transferring: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             hold_proposal: None,
+            leader_contact: Arc::default(),
+            read_index_waits: Arc::default(),
         };
         // The metrics are published by the Raft task, so right after
         // `Raft::new`/`initialize` they may not show the membership yet:
@@ -528,6 +560,37 @@ impl RaftNode {
                 })
             }
             Err(RaftError::Fatal(e)) => Err(fatal(e)),
+        }
+    }
+
+    /// How fresh a `LOCAL` read on this node is (ADR 0004 D8). The leader
+    /// is fresh while a quorum acknowledged it within an election timeout
+    /// (a sole voter always is); a follower while it heard from a leader
+    /// within an election timeout and has applied the commit index that
+    /// leader sent. No known leader: stale possible.
+    pub fn read_meta(&self) -> graph_proto::ReadMeta {
+        let m = self.metrics();
+        let applied = m.last_applied.map_or(0, |l| l.index);
+        let window = Duration::from_millis(self.settings.election_max_ms.max(1));
+        let known = !self.withhold_leader && m.current_leader.is_some();
+        if known && m.state == ServerState::Leader && m.current_leader == Some(self.node_id) {
+            let voters = m.membership_config.membership().voter_ids().count();
+            let acked = voters <= 1
+                || m.millis_since_quorum_ack
+                    .is_some_and(|ms| ms <= window.as_millis() as u64);
+            return graph_proto::ReadMeta {
+                applied_index: applied,
+                leader_committed_index: Some(applied),
+                stale_possible: !acked || self.transferring.load(Ordering::SeqCst),
+            };
+        }
+        let last = self.leader_contact.last();
+        let committed = last.and_then(|(_, c)| c);
+        let recent = last.is_some_and(|(at, _)| at.elapsed() <= window);
+        graph_proto::ReadMeta {
+            applied_index: applied,
+            leader_committed_index: committed,
+            stale_possible: !known || !recent || committed.is_some_and(|c| applied < c),
         }
     }
 

@@ -301,6 +301,7 @@ Design: ADR 0004 D6, D8, D9.
 - Given `--join` on a directory whose store is not empty, When it starts, Then it must be refused without `--accept-snapshot-overwrite`.
 
 **23. Linearizable reads and crash tests (5 pts)**
+Status: Delivered on branch stage-d (PR pending). Settled details: [ADR 0004](adr/0004-client-server-and-replication.md) D8 ("Settled in stage D").
 As an AI-agent integrator
 I want a read mode that is guaranteed to see every acknowledged write
 So that an agent can index and then query without a race.
