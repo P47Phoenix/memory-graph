@@ -1007,14 +1007,30 @@ fn a_slow_append_longer_than_the_heartbeat_still_replicates() {
 }
 
 /// #116: a write that takes longer than the quorum-loss window to commit,
-/// because every follower is slow (not gone), still succeeds: the
-/// heartbeats keep the quorum acknowledgement fresh, so the leader never
-/// answers it `NoLeader`.
+/// because every follower is slow (not gone), still succeeds. openraft 0.9
+/// sends a follower no heartbeat while an append to it is under way, so
+/// the leader hears nothing from either follower for longer than the
+/// window; the liveness probe finds them `SERVING`, so the leader never
+/// answers the write `NoLeader`.
+///
+/// The timings keep the append delay between the window and the election
+/// timeout: the followers, hearing nothing meanwhile either, must not call
+/// an election (QA: with the delay above `election_min` this test failed 7
+/// of 22 runs on an election, not on the check under test).
 #[test]
 fn a_slow_but_healthy_write_is_not_cut_off_by_the_quorum_loss_window() {
-    let window = TEST_RAFT.quorum_loss_window();
-    let delay = window.as_millis() as u64 * 2;
+    let raft = RaftSettings {
+        heartbeat_ms: 150,
+        election_min_ms: 2000,
+        election_max_ms: 3000,
+        quorum_loss_ms: Some(300),
+        ..TEST_RAFT
+    };
+    let window = raft.quorum_loss_window();
+    // Past the window by far, well short of the election timeout.
+    let delay = 800;
     let mut tb = ClusterTestbed::with_config(3, exts(), move |id, c| {
+        c.raft = Some(raft);
         if id != 1 {
             c.testing.delay_append_entries_ms = Some(delay);
         }
@@ -1034,11 +1050,11 @@ fn a_slow_but_healthy_write_is_not_cut_off_by_the_quorum_loss_window() {
         took > window,
         "the write outlasted the window (and the write deadline): {took:?}"
     );
-    assert_eq!(
-        tb.node(leader).raft().unwrap().metrics().current_term,
-        term,
-        "no election"
-    );
+    let l = tb.node(leader).raft().unwrap();
+    assert_eq!(l.metrics().current_term, term, "no election");
+    // The silent followers were asked directly and answered SERVING.
+    let (alive, dead) = l.net_stats.probes();
+    assert!(alive > 0, "alive {alive}, dead {dead}");
 }
 
 /// Final review 1: while a slow follower's transfer is under way the

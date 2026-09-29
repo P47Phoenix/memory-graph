@@ -382,7 +382,10 @@ enum Cmd {
         heartbeat_interval: Option<u64>,
         /// A leader that has heard from no quorum for this long answers its pending writes
         /// NoLeader (the client retries, then exits 4), ms (default: the election timeout max).
-        /// Only quorum loss triggers it; a slow but healthy write is never cut off
+        /// Only quorum loss triggers it; a slow but healthy write is never cut off. A client's
+        /// write to a minority leader fails after at most about its write deadline plus 1.5x
+        /// this window (the window, then a liveness probe of up to half of it). NoLeader does
+        /// not mean the write was not applied; retries are idempotent
         #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
         quorum_loss_timeout: Option<u64>,
         /// Refuse writes and snapshot builds (RESOURCE_EXHAUSTED) while the volume has less than
@@ -760,9 +763,13 @@ fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
 /// is then logged as JSON rather than printed as text.
 static JSON_LOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// The stack `run` gets: an unoptimized build of the argument parsing and
-/// dispatch (one large `match` over every command) outgrows Windows' 1 MiB
-/// main-thread stack, so it runs on a thread of its own.
+/// The stack `run` gets, on a thread of its own. Needed for the debug-build
+/// frame size of `run()` (one large `match` over every command, unoptimized):
+/// it outgrew Windows' 1 MiB main-thread stack when `serve` gained
+/// `--quorum-loss-timeout`, and every CLI test failed with a stack overflow.
+/// A release build runs within 1 MiB (checked on Windows, 2026-09-29, with
+/// `run` on a 1 MiB thread: `describe` and `index` work); 8 MiB costs only
+/// address space, so both builds use it.
 const MAIN_STACK_BYTES: usize = 8 << 20;
 
 fn main() {

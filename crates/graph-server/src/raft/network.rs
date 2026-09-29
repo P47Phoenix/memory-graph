@@ -92,6 +92,8 @@ struct NetStatsInner {
     joined_transfers: u64,
     partial_joins: u64,
     inflight_aborted: u64,
+    probes_alive: u64,
+    probes_dead: u64,
 }
 
 #[derive(Default)]
@@ -152,12 +154,10 @@ impl NetStats {
         });
     }
 
-    /// `target` answered a liveness probe (see [`probe`]): reachable now,
-    /// though no Raft RPC to it completed (one may be in a slow transfer).
-    pub fn probed(&self, target: NodeId) {
-        self.with(|s| {
-            s.peers.entry(target).or_default().last_answer = Some(std::time::Instant::now());
-        });
+    /// Liveness probes of the quorum-loss check ([`Prober`]): answered
+    /// `SERVING`, and not (any other answer or none).
+    pub fn probes(&self) -> (u64, u64) {
+        self.with(|s| (s.probes_alive, s.probes_dead))
     }
 
     /// Whether `target` answered an RPC (a heartbeat counts) within
@@ -207,33 +207,129 @@ impl NetStats {
     }
 }
 
-/// Whether the server at `addr` answers a `grpc.health.v1` check within
-/// `timeout`, on a connection of its own: openraft 0.9 sends a peer no
-/// heartbeat while an `AppendEntries` to it is under way, so a slow
-/// transfer to a live peer looks like silence to the leader. The quorum
-/// loss check (issue #116) asks this before calling a peer gone.
-pub async fn probe(addr: &str, timeout: Duration) -> bool {
-    let uri = if addr.contains("://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    };
-    let Ok(ep) = Endpoint::from_shared(uri) else {
-        return false;
-    };
-    let check = async {
-        let ch = ep
+/// Liveness probes for the quorum-loss check of a pending write (issue
+/// #116): openraft 0.9 sends a peer no heartbeat while an `AppendEntries`
+/// to it is under way, so a slow transfer to a live peer looks like
+/// silence to the leader. Before calling a quorum gone the leader asks each
+/// silent voter's `grpc.health.v1` directly, on a connection of its own
+/// (cached per peer, so a partition-long run of probes does not reconnect
+/// each time; dropped after a failure).
+///
+/// One per node, shared by every pending write: probes run one round at a
+/// time ([`Prober::round`]), and a peer probed within the last `fresh` is
+/// not probed again, so many writes waiting at once cost one probe per
+/// peer per tick, not one per write.
+///
+/// Limit: a peer counts as alive when its health service says `SERVING`,
+/// which proves the process and the link, not that its Raft can append
+/// (a full disk, a stuck apply). Such a peer keeps a pending write
+/// waiting, as before this check existed; it is never a wrong answer.
+#[derive(Clone, Default)]
+pub struct Prober {
+    round: Arc<tokio::sync::Mutex<()>>,
+    channels: Arc<Mutex<HashMap<NodeId, (String, Channel)>>>,
+    last_probe: Arc<Mutex<HashMap<NodeId, std::time::Instant>>>,
+}
+
+impl Prober {
+    fn channel(&self, id: NodeId, addr: &str, timeout: Duration) -> Option<Channel> {
+        let mut g = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((a, ch)) = g.get(&id) {
+            if a == addr {
+                return Some(ch.clone());
+            }
+        }
+        let uri = if addr.contains("://") {
+            addr.to_string()
+        } else {
+            format!("http://{addr}")
+        };
+        let ch = Endpoint::from_shared(uri)
+            .ok()?
             .connect_timeout(timeout)
             .tcp_nodelay(true)
-            .connect()
-            .await?;
-        tonic_health::pb::health_client::HealthClient::new(ch)
-            .check(tonic_health::pb::HealthCheckRequest::default())
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    };
-    matches!(tokio::time::timeout(timeout, check).await, Ok(Ok(())))
+            .connect_lazy();
+        g.insert(id, (addr.to_string(), ch.clone()));
+        Some(ch)
+    }
+
+    fn forget(&self, id: NodeId) {
+        self.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    /// Whether `addr` answers `SERVING` within `timeout` (any other status,
+    /// an error or silence: not alive).
+    async fn probe(&self, id: NodeId, addr: &str, timeout: Duration) -> bool {
+        let Some(ch) = self.channel(id, addr, timeout) else {
+            return false;
+        };
+        let mut client = tonic_health::pb::health_client::HealthClient::new(ch);
+        let check = client.check(tonic_health::pb::HealthCheckRequest::default());
+        let alive = matches!(
+            tokio::time::timeout(timeout, check).await,
+            Ok(Ok(r)) if r.get_ref().status
+                == tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+        );
+        if !alive {
+            self.forget(id);
+        }
+        alive
+    }
+
+    /// One probe round over `peers` (id, address): waits for a round
+    /// already under way, then probes, in parallel and each within
+    /// `timeout`, those that did not answer within `window` since and were
+    /// not probed within `fresh`. Records answers and counts in `stats`.
+    pub async fn round(
+        &self,
+        stats: &NetStats,
+        peers: Vec<(NodeId, String)>,
+        window: Duration,
+        fresh: Duration,
+        timeout: Duration,
+    ) {
+        let _one_at_a_time = self.round.lock().await;
+        let due: Vec<(NodeId, String)> = {
+            let mut last = self
+                .last_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = std::time::Instant::now();
+            peers
+                .into_iter()
+                .filter(|(id, _)| !stats.answered_within(*id, window))
+                .filter(|(id, _)| {
+                    let due = last.get(id).is_none_or(|t| now.duration_since(*t) >= fresh);
+                    if due {
+                        last.insert(*id, now);
+                    }
+                    due
+                })
+                .collect()
+        };
+        let mut probes = tokio::task::JoinSet::new();
+        for (id, addr) in due {
+            let me = self.clone();
+            probes.spawn(async move { (id, me.probe(id, &addr, timeout).await) });
+        }
+        while let Some(r) = probes.join_next().await {
+            let Ok((id, alive)) = r else { continue };
+            stats.with(|s| {
+                if alive {
+                    s.probes_alive += 1;
+                    s.peers.entry(id).or_default().last_answer = Some(std::time::Instant::now());
+                } else {
+                    s.probes_dead += 1;
+                }
+            });
+        }
+    }
 }
 
 /// Snapshot stream chunk size.

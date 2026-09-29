@@ -3,7 +3,7 @@
 //! mode's first start), resume from the log after, run the snapshot policy,
 //! and answer the leader and membership questions the services ask.
 use super::log_store::{AppendObserver, RedbLogStore};
-use super::network::{FaultPlan, FaultyNetwork, GrpcNetwork, NetStats};
+use super::network::{FaultPlan, FaultyNetwork, GrpcNetwork, NetStats, Prober};
 use super::snapshot_dir::SnapshotDir;
 use super::state_machine::{SmFailpoints, StoreStateMachine};
 use super::types::{LogRequest, LogResponse, NodeId, TypeConfig};
@@ -52,8 +52,10 @@ pub struct RaftSettings {
     /// A leader that has heard from no quorum for this long while a
     /// proposal waits answers that proposal `NoLeader` (retryable), so a
     /// client's write deadline holds during a partition (issue #116).
-    /// `None`: `election_max_ms` (by then a follower cut off from a leader
-    /// would have started an election). Slow but healthy writes are not
+    /// `NoLeader` does not mean the write was not applied; retries are
+    /// idempotent. `None`: `election_max_ms` (by then a follower cut off
+    /// from a leader would have started an election), at least twice the
+    /// heartbeat. Slow but healthy writes are not
     /// affected: heartbeats keep the quorum acknowledgement fresh however
     /// long an entry takes (`--quorum-loss-timeout`).
     pub quorum_loss_ms: Option<u64>,
@@ -95,7 +97,10 @@ impl RaftSettings {
 impl RaftSettings {
     /// The quorum-loss window (see [`RaftSettings::quorum_loss_ms`]).
     pub fn quorum_loss_window(&self) -> Duration {
-        Duration::from_millis(self.quorum_loss_ms.unwrap_or(self.election_max_ms))
+        Duration::from_millis(self.quorum_loss_ms.unwrap_or_else(|| {
+            self.election_max_ms
+                .max(self.heartbeat_ms.saturating_mul(2))
+        }))
     }
 
     /// Checks the timings. Always: `election_min_ms < election_max_ms` and
@@ -123,9 +128,13 @@ impl RaftSettings {
         }
         // openraft refreshes its "last quorum ack" metric at least every
         // 1.5 heartbeats, so a shorter window could fire on a healthy
-        // leader between two refreshes.
+        // leader between two refreshes. The default always passes; checked
+        // when set explicitly or for a cluster, so existing `--db` timings
+        // keep working.
         let q = self.quorum_loss_window().as_millis() as u64;
-        if q < self.heartbeat_ms.saturating_mul(2) {
+        if (self.quorum_loss_ms.is_some() || multi_member)
+            && q < self.heartbeat_ms.saturating_mul(2)
+        {
             return Err(format!(
                 "quorum-loss timeout ({q} ms) must be at least twice the heartbeat interval \
                  ({} ms), or a healthy leader could answer NoLeader",
@@ -193,6 +202,8 @@ pub struct RaftNode {
     pub net_stats: NetStats,
     /// Test fault injection, also obeyed by the quorum-loss probe.
     pub faults: Option<FaultPlan>,
+    /// The quorum-loss check's liveness probes, shared by every write.
+    pub prober: Prober,
     /// Test hook ([`crate::server::TestingHooks::withhold_leader`]).
     pub withhold_leader: bool,
     /// The timings this node runs with.
@@ -390,6 +401,7 @@ impl RaftNode {
             disk: p.disk,
             net_stats,
             faults: p.faults,
+            prober: Prober::default(),
             withhold_leader: false,
             settings: s,
             transferring: Arc::new(AtomicBool::new(false)),
@@ -537,24 +549,16 @@ impl RaftNode {
         }
     }
 
-    /// Resolves (with `NoLeader`) once this node leads but has heard from
-    /// no quorum for [`RaftSettings::quorum_loss_window`] (issue #116): a
-    /// leader cut off from its majority cannot commit, and openraft would
-    /// keep the proposal pending until the partition heals. The entry may
-    /// still commit later (if this node keeps leading once healed); every
-    /// write is idempotent on a retry (ADR 0004 D2/D7), so the client's
-    /// retry is safe either way. Never resolves on a sole voter, or while
-    /// the quorum answers, however long the write itself takes.
-    /// Probe (see [`super::network::probe`]) every voter that answered
-    /// nothing within `window`, in parallel, each within `timeout`; record
-    /// the answers. Whether any answered. A test partition
-    /// ([`FaultPlan`]) cuts probes as it cuts Raft RPCs.
-    async fn probe_silent_voters(&self, window: Duration, timeout: Duration) -> bool {
+    /// One shared probe round ([`Prober::round`]) over the voters that
+    /// answered nothing within `window`: one probe per peer per `tick`
+    /// however many writes wait, each within half the window. A test partition ([`FaultPlan`]) cuts
+    /// probes as it cuts Raft RPCs.
+    async fn probe_silent_voters(&self, window: Duration, tick: Duration) {
         let m = self.raft.metrics().borrow().clone();
         let mem = m.membership_config.membership();
-        let silent: Vec<(NodeId, String)> = mem
+        let peers: Vec<(NodeId, String)> = mem
             .voter_ids()
-            .filter(|id| *id != self.node_id && !self.net_stats.answered_within(*id, window))
+            .filter(|id| *id != self.node_id)
             .filter(|id| {
                 self.faults
                     .as_ref()
@@ -562,20 +566,24 @@ impl RaftNode {
             })
             .filter_map(|id| mem.get_node(&id).map(|n| (id, n.addr.clone())))
             .collect();
-        let mut probes = tokio::task::JoinSet::new();
-        for (id, addr) in silent {
-            probes.spawn(async move { (id, super::network::probe(&addr, timeout).await) });
-        }
-        let mut any = false;
-        while let Some(r) = probes.join_next().await {
-            if let Ok((id, true)) = r {
-                self.net_stats.probed(id);
-                any = true;
-            }
-        }
-        any
+        // A probe may need a new TCP + HTTP/2 connection: a heartbeat is
+        // too tight for that under load (QA: a false NoLeader in 1 of 10
+        // runs on a loaded 32-core host), so it gets half the window.
+        let timeout = (window / 2).max(tick);
+        self.prober
+            .round(&self.net_stats, peers, window, tick, timeout)
+            .await;
     }
 
+    /// Resolves (with `NoLeader`) once this node leads but has heard from
+    /// no quorum for [`RaftSettings::quorum_loss_window`] (issue #116): a
+    /// leader cut off from its majority cannot commit, and openraft would
+    /// keep the proposal pending until the partition heals. `NoLeader` does
+    /// not mean the write was not applied: the entry may still commit later
+    /// (if this node keeps leading once healed), and retries are idempotent
+    /// (ADR 0004 D2/D7). Never resolves on a sole voter, or while the
+    /// quorum answers (a Raft RPC or a liveness probe), however long the
+    /// write itself takes.
     async fn quorum_lost(&self) -> StoreError {
         let window = self.settings.quorum_loss_window();
         let started = tokio::time::Instant::now();
@@ -591,9 +599,13 @@ impl RaftNode {
             // Before calling the quorum gone, ask the silent voters directly:
             // a slow transfer to a live peer also silences it (openraft
             // sends no heartbeat meanwhile). An answer counts for a window.
-            if lost && self.probe_silent_voters(window, tick).await {
-                continue;
-            }
+            let lost = lost && {
+                self.probe_silent_voters(window, tick).await;
+                let m = rx.borrow();
+                quorum_lost(&m, self.node_id, started.elapsed(), window, |id| {
+                    self.net_stats.answered_within(id, window)
+                })
+            };
             if lost {
                 tracing::warn!(
                     window_ms = window.as_millis() as u64,
@@ -1025,8 +1037,61 @@ mod tests {
         assert!(!quorum_lost(&f, 1, long, w, none));
     }
 
+    fn metrics_with(
+        configs: Vec<BTreeSet<NodeId>>,
+        nodes: &[NodeId],
+    ) -> RaftMetrics<NodeId, BasicNode> {
+        let mut m = leader_metrics(&[1, 2, 3], Some(5000));
+        let nodes: BTreeMap<NodeId, BasicNode> = nodes
+            .iter()
+            .map(|i| (*i, BasicNode::new(format!("h:{i}"))))
+            .collect();
+        m.membership_config = Arc::new(openraft::StoredMembership::new(
+            None,
+            openraft::Membership::new(configs, nodes),
+        ));
+        m
+    }
+
+    /// A joint change needs a majority of both configurations: from
+    /// {1,2,3} to {1,4,5} with only 2 and 3 answering, the new one has only
+    /// the leader.
+    #[test]
+    fn quorum_loss_counts_every_joint_configuration() {
+        let w = Duration::from_millis(2000);
+        let long = Duration::from_millis(5000);
+        let m = metrics_with(
+            vec![BTreeSet::from([1, 2, 3]), BTreeSet::from([1, 4, 5])],
+            &[1, 2, 3, 4, 5],
+        );
+        assert!(quorum_lost(&m, 1, long, w, |id| id == 2 || id == 3));
+        assert!(!quorum_lost(&m, 1, long, w, |id| id == 2 || id == 4));
+    }
+
+    /// Learners are not voters: their answers never make a quorum, and a
+    /// leader with learners but no other voter is a sole voter.
+    #[test]
+    fn quorum_loss_ignores_learners() {
+        let w = Duration::from_millis(2000);
+        let long = Duration::from_millis(5000);
+        let m = metrics_with(vec![BTreeSet::from([1, 2, 3])], &[1, 2, 3, 4, 5]);
+        assert!(quorum_lost(&m, 1, long, w, |id| id == 4 || id == 5));
+        let sole = metrics_with(vec![BTreeSet::from([1])], &[1, 4, 5]);
+        assert!(!quorum_lost(&sole, 1, long, w, |_| false));
+    }
+
     #[test]
     fn quorum_loss_window_defaults_to_election_max_and_is_validated() {
+        // A `--db` tuning with a heartbeat above half the election max
+        // still validates: the default window is at least two heartbeats.
+        let db = RaftSettings {
+            heartbeat_ms: 150,
+            election_min_ms: 200,
+            election_max_ms: 250,
+            ..RaftSettings::standalone()
+        };
+        db.validate(false).unwrap();
+        assert_eq!(db.quorum_loss_window(), Duration::from_millis(300));
         let s = RaftSettings::cluster();
         assert_eq!(
             s.quorum_loss_window(),
