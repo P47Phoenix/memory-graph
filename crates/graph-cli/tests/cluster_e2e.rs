@@ -770,6 +770,13 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
     assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
     assert!(text(&o.stderr).contains("--force"), "{}", text(&o.stderr));
     assert_eq!(voters(&n1), [1, 2, 3]);
+    // #122: a mistyped id is no error (exit 0) but says nothing was removed.
+    let typo = ok(&["--server", &n2.addr, "cluster", "remove", "42"]);
+    assert!(
+        typo.contains("node 42 is not a member; nothing to remove"),
+        "{typo}"
+    );
+    assert_eq!(voters(&n1), [1, 2, 3]);
 
     // Transfer leadership to node 2 (asked through node 3), then remove
     // node 3 with --force.

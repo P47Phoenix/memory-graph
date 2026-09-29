@@ -42,7 +42,7 @@ mod snapshot;
 
 pub use conn::{block_on, HelloInfo, ReadLog, QUICK_CONNECT_TIMEOUT};
 pub use graph_proto::ReadMeta;
-pub use remote::RemoteStore;
+pub use remote::{RemoteStore, RemoveOutcome};
 pub use snapshot::RemoteSnapshot;
 
 pub use graph_proto::{PROTOCOL_VERSION, RAFT_ENTRY_MAX_BYTES};

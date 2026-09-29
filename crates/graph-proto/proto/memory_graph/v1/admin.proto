@@ -179,7 +179,14 @@ message RemoveRequest {
   // failure). Never allows removing the leader or dropping below quorum.
   bool force = 2;
 }
-message RemoveResponse { uint64 log_index = 1; }
+message RemoveResponse {
+  uint64 log_index = 1;
+  // The node was not a member, so nothing changed (Remove stays idempotent;
+  // log_index is then the current membership's). Additive (ADR 0004 D1, no
+  // PROTOCOL_VERSION bump): an older server never sets it, and false keeps
+  // the old meaning.
+  bool not_a_member = 2;
+}
 
 message TransferLeaderRequest { uint64 to_node_id = 1; }
 message TransferLeaderResponse {

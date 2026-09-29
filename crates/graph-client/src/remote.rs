@@ -26,6 +26,29 @@ fn timed<T>(msg: T, deadline: Duration) -> tonic::Request<T> {
     r
 }
 
+/// Whether a failed attempt may still have taken effect: a detail-less
+/// transport loss or deadline (a typed answer, such as `NotLeader`, or
+/// `UNAVAILABLE` means the request was not processed).
+fn outcome_unknown(st: &tonic::Status) -> bool {
+    st.details().is_empty() && graph_proto::error::is_transport_loss(st.code(), st.message())
+}
+
+/// What [`RemoteStore::admin_remove`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    /// The membership entry's log index (with `not_a_member`, the index of
+    /// the membership in effect).
+    pub log_index: u64,
+    /// The node was not a member: nothing changed (a mistyped id, or an
+    /// earlier attempt already removed it; see `retried`).
+    pub not_a_member: bool,
+    /// An earlier attempt of this call ended with its outcome unknown (the
+    /// connection was lost or timed out after sending), so `not_a_member`
+    /// may mean that attempt removed the node. A clean `NotLeader`
+    /// redirect or an `UNAVAILABLE` retry does not set it.
+    pub retried: bool,
+}
+
 pub struct RemoteStore {
     rt: Arc<tokio::runtime::Runtime>,
     conn: Arc<Conn>,
@@ -200,16 +223,34 @@ impl RemoteStore {
 
     /// `Admin.Remove`: remove `node_id` from the membership (any node
     /// forwards it to the leader, which enforces the guards: not the
-    /// leader, not below quorum, 3 voters to 2 only with `force`). Returns
-    /// the membership entry's log index.
-    pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<u64> {
+    /// leader, not below quorum, 3 voters to 2 only with `force`). A node
+    /// that is not a member is no error (a retry of a committed remove must
+    /// succeed) but is reported in [`RemoveOutcome::not_a_member`].
+    pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<RemoveOutcome> {
         let d = self.config().admin_deadline;
-        self.run(self.conn.call(Kind::Write, |ch| async move {
-            admin_client(ch)
-                .remove(timed(pb::RemoveRequest { node_id, force }, d))
-                .await
-        }))
-        .map(|r| r.into_inner().log_index)
+        // Set when an attempt ended with its outcome unknown: a detail-less
+        // transport loss or deadline after the request may have been sent.
+        // A typed answer (such as a `NotLeader` redirect) or `UNAVAILABLE`
+        // (never processed) leaves it clear.
+        let uncertain = Arc::new(AtomicBool::new(false));
+        let r = self.run(self.conn.call(Kind::Write, |ch| {
+            let uncertain = Arc::clone(&uncertain);
+            async move {
+                let r = admin_client(ch)
+                    .remove(timed(pb::RemoveRequest { node_id, force }, d))
+                    .await;
+                if r.as_ref().is_err_and(outcome_unknown) {
+                    uncertain.store(true, Ordering::Relaxed);
+                }
+                r
+            }
+        }))?;
+        let r = r.into_inner();
+        Ok(RemoveOutcome {
+            log_index: r.log_index,
+            not_a_member: r.not_a_member,
+            retried: uncertain.load(Ordering::Relaxed),
+        })
     }
 
     /// `Admin.TransferLeader`: make voter `node_id` the leader (forwarded
@@ -630,5 +671,25 @@ impl Store for RemoteStore {
             .stats
             .ok_or_else(|| StoreError::Protocol("VacuumResponse.stats is missing".into()))?;
         VacuumStats::try_from(stats).map_err(StoreError::from)
+    }
+}
+
+#[cfg(test)]
+mod remove_outcome_tests {
+    use super::outcome_unknown;
+    use graph_store::StoreError;
+    use tonic::Status;
+
+    #[test]
+    fn only_a_lost_answer_makes_a_retried_remove_uncertain() {
+        assert!(outcome_unknown(&Status::unknown("transport error")));
+        assert!(outcome_unknown(&Status::deadline_exceeded("timeout")));
+        assert!(!outcome_unknown(&Status::unavailable("tcp connect error")));
+        let redirect: Status = graph_proto::WireError::Store(StoreError::NotLeader {
+            leader_id: Some(1),
+            leader_addr: Some("h:1".into()),
+        })
+        .into();
+        assert!(!outcome_unknown(&redirect));
     }
 }
