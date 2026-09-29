@@ -40,7 +40,7 @@ impl Extractor for PythonExtractor {
     }
 
     fn version(&self) -> String {
-        format!("python-scan-1+tok{TOKENIZER_VERSION}")
+        format!("python-scan-2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {

@@ -411,9 +411,29 @@ fn every_parsed_token_is_stored() {
     q.repo = Some("webforms".into());
     let aspx = store.search_symbols(&q).unwrap();
     let kinds: BTreeSet<_> = aspx.iter().filter_map(|h| h.lang_kind.clone()).collect();
-    for k in ["directive", "control", "binding"] {
+    for k in ["directive", "control", "binding", "server_script"] {
         assert!(kinds.contains(k), "no aspx {k} symbol: {kinds:?}");
     }
+    // Server-side C# in `<script runat="server">` (#72): default.aspx says
+    // `Language="C#"`, so its method nests in the server_script module.
+    // ViewPeople.aspx names no language (the site sets it in web.config,
+    // which a per-file extractor cannot see; Web Forms' default is VB), so
+    // its script stays markup.
+    let in_file = |file: &str, name: &str, kind: &str| {
+        aspx.iter()
+            .find(|h| h.name == name && h.lang_kind.as_deref() == Some(kind) && h.file == file)
+    };
+    assert!(in_file("web/ViewPeople.aspx", "server_script", "server_script").is_none());
+    let in_view = |name: &str, kind: &str| {
+        in_file("web/default.aspx", name, kind)
+            .unwrap_or_else(|| panic!("no {kind} {name} in default.aspx"))
+    };
+    let module = in_view("server_script", "server_script").span.unwrap();
+    let h = in_view("Page_Init", "method").span.unwrap();
+    assert!(
+        module.start <= h.start && h.end <= module.end,
+        "Page_Init {h:?} not inside {module:?}"
+    );
     // Java: classes nest in their package, methods in their class.
     let mut q = graph_store::SymbolQuery::new("ArticleApi");
     q.language = Some("java".into());
