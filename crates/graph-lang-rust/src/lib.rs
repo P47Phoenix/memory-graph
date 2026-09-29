@@ -5,7 +5,7 @@
 //! `graph_core::tokenizer` (exact spans, comments kept). A file that does not
 //! parse yields tokens only and is flagged `has_errors`.
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions};
-use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind};
+use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind, TokenClass};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
@@ -17,17 +17,40 @@ impl Extractor for RustExtractor {
     }
 
     fn version(&self) -> String {
-        format!("rust-syn-2+tok{}", graph_core::tokenizer::TOKENIZER_VERSION)
+        // `kw1`: keywords are classed `keyword` (#98). Part of the file
+        // fingerprint, so a store indexed before it re-indexes Rust files.
+        format!(
+            "rust-syn-2+kw1+tok{}",
+            graph_core::tokenizer::TOKENIZER_VERSION
+        )
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(
+        let mut tokens = tokenize_with(
             source,
             TokenizerOptions {
                 rust_literals: true,
                 ..Default::default()
             },
         );
+        for i in 0..tokens.len() {
+            // The tokenizer splits a raw identifier `r#use` into `r`, `#`,
+            // `use`: that `use` is an identifier. A lifetime `'static` is
+            // `'`, `static`: no keyword either.
+            let lifetime = i >= 1
+                && tokens[i - 1].text == "'"
+                && tokens[i - 1].span.end == tokens[i].span.start;
+            let raw = lifetime
+                || i >= 2
+                    && tokens[i - 1].text == "#"
+                    && tokens[i - 1].span.end == tokens[i].span.start
+                    && tokens[i - 2].text == "r"
+                    && tokens[i - 2].span.end == tokens[i - 1].span.start;
+            let t = &mut tokens[i];
+            if !raw && t.class == TokenClass::Identifier && is_keyword(&t.text) {
+                t.class = TokenClass::Keyword;
+            }
+        }
         // syn strips a BOM before lexing, so its byte ranges start after it.
         let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
         let file = match syn::parse_file(&source[bom..]) {
@@ -53,6 +76,66 @@ impl Extractor for RustExtractor {
             has_errors: false,
         }
     }
+}
+
+/// Rust's strict and reserved keywords (the Reference, edition 2018 and
+/// later). Weak keywords (`union`, `macro_rules`, `raw`, `safe`) are also
+/// ordinary identifiers, so they stay identifiers.
+fn is_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "gen"
+            | "macro"
+            | "override"
+            | "priv"
+            | "try"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+    )
 }
 
 fn line_starts(src: &str) -> Vec<usize> {

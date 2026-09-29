@@ -199,6 +199,40 @@ fn index_reopen_search() {
     assert!(out.is_empty());
 }
 
+/// #98: the Rust keyword `use` is found by `search --kind keyword`, and a
+/// `use` that is not the keyword (a raw identifier) is not.
+#[test]
+fn rust_use_is_a_keyword() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let rs = d.path().join("a.rs");
+    std::fs::write(&rs, "use std::fmt;\nfn f() { let r#use = 1; }\n").unwrap();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index-file",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        rs.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let hits = |kind: &str| -> Vec<u64> {
+        let (ok, out, err) = run(&["--db", &db, "search", "use", "--kind", kind, "--json"]);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["span"]["start"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(hits("keyword"), [0]);
+    assert_eq!(hits("identifier"), [29]);
+}
+
 #[test]
 fn errors() {
     let d = tempfile::tempdir().unwrap();
