@@ -261,11 +261,39 @@ fn promote_refuses_other_extractor_hash() {
     let e = tb.client(1).admin_promote(2).unwrap_err();
     assert!(e.to_string().contains("extractor"), "{e}");
     assert!(tb.membership(1).1.contains(&2), "still a learner");
-    // Unknown ids and voters are refused too.
+    // Unknown ids are refused too; promoting a voter is an idempotent OK.
     let e = tb.client(1).admin_promote(9).unwrap_err();
     assert!(e.to_string().contains("not a member"), "{e}");
-    let e = tb.client(1).admin_promote(1).unwrap_err();
-    assert!(e.to_string().contains("already a voter"), "{e}");
+    tb.client(1).admin_promote(1).unwrap();
+}
+
+/// Membership changes are idempotent under a client retry: promote twice,
+/// add the same learner twice, remove twice; each call succeeds.
+#[test]
+fn membership_changes_are_idempotent() {
+    let _w = watchdog("membership_changes_are_idempotent", TEST_LIMIT);
+    let mut tb = ClusterTestbed::new(1, exts());
+    let cfg = join_cfg(&tb, 2, false);
+    tb.add_node(2, cfg, exts()).unwrap();
+    wait_until("node 2 is a learner", || tb.membership(1).1.contains(&2));
+    let addr = tb.node(2).endpoint();
+    tb.client(1).admin_add_learner(2, &addr, true).unwrap();
+    assert!(tb.membership(1).1.contains(&2), "still a learner");
+    let e = tb
+        .client(1)
+        .admin_add_learner(2, "127.0.0.1:1", true)
+        .unwrap_err();
+    assert!(e.to_string().contains("already a member"), "{e}");
+    tb.client(1).admin_promote(2).unwrap();
+    tb.client(1).admin_promote(2).unwrap();
+    assert!(tb.membership(1).0.contains(&2), "a voter");
+    // A voter at the same address: add-learner is a no-op, not a demotion.
+    tb.client(1).admin_add_learner(2, &addr, true).unwrap();
+    assert!(tb.membership(1).0.contains(&2), "still a voter");
+    tb.client(1).admin_remove(2, true).unwrap();
+    tb.client(1).admin_remove(2, true).unwrap();
+    assert!(!tb.membership(1).0.contains(&2));
+    assert!(!tb.membership(1).1.contains(&2));
 }
 
 /// Restarting with the same `--bootstrap` / `--join --auto-promote`
@@ -452,8 +480,9 @@ fn remove_guards() {
     );
     let e = via.admin_remove(a, false).unwrap_err();
     assert!(e.to_string().contains("--force"), "{e}");
-    let e = via.admin_remove(42, true).unwrap_err();
-    assert!(e.to_string().contains("not a member"), "{e}");
+    // A non-member: nothing to remove, an idempotent OK (a retried remove).
+    via.admin_remove(42, true).unwrap();
+    assert_eq!(tb.membership(leader).0.len(), 3);
     // A voter down: removing another would leave one reachable voter of
     // two, below a quorum of 2.
     tb.node_mut(b).kill();

@@ -103,7 +103,10 @@ stderr (`--log-format json`), level from `MEMORY_GRAPH_LOG`. The metric names ar
 
 **Up** (3 to 5): `kubectl scale statefulset memory-graph --replicas 5`. Pods 3 and 4 join with
 `--auto-promote` and become voters once caught up. Raise the PodDisruptionBudget to
-`minAvailable: 3` (a majority of five).
+`minAvailable: 3` (a majority of five). Update `--replicas` in the pod arguments together with
+`spec.replicas` (edit the manifest and apply it, rather than only `kubectl scale`): pod 0 asks the
+pods `--replicas` names for an existing cluster when its volume is lost, and a stale count leaves
+the new pods out of that question. The same applies when scaling down.
 
 **Down** (5 to 3), one pod at a time, highest ordinal first:
 
@@ -137,10 +140,24 @@ It refuses to start, with the recovery in the message, when:
   incarnation): check the manifests, or `cluster remove 1` by hand;
 - the old member cannot be removed (no leader: pods 1 and 2 do not have a quorum without pod 0;
   bring them back first), within `--join-timeout`;
-- pods 1 and 2 report two different clusters.
+- pods 1 and 2 report two different clusters;
+- something answers at the address the cluster records for node 1 and says it is in a cluster (a
+  live duplicate, not the lost incarnation): it is never removed;
+- a pod accepts the TCP connection but does not answer Status within
+  `--bootstrap-probe-timeout`: it may be a live, overloaded member, so pod 0 neither bootstraps nor
+  joins. Only pods that cannot be reached at all (no DNS record, connection refused, no TCP
+  connection within 2 s) count as down. `--force-bootstrap` overrides this when every other pod
+  is known to be gone.
+
+If the join fails **after** the old member was removed (the leader changed, `--join-timeout`
+passed), the pod exits and Kubernetes restarts it; the next start finds node 1 no longer listed and
+simply joins, so it recovers on its own. Until pod 0 is promoted again the cluster runs with two
+voters (no failure tolerated): with `--auto-promote` that is until it catches up; **without**
+`--auto-promote` it stays that way until you run `cluster promote 1` (the log warns when a voter is
+removed without it).
 
 One case it cannot tell apart: **every** pod down and pod 0's volume lost. If pods 1 and 2 do not
-answer within `--bootstrap-probe-timeout`, pod 0 bootstraps a new, empty cluster, and pods 1 and 2
+answer within `--bootstrap-probe-timeout` because they cannot be reached at all, pod 0 bootstraps a new, empty cluster, and pods 1 and 2
 then refuse to restart (`WrongCluster`, exit 6: their `--join` peer, pod 0, is in another
 cluster). Recover by deleting pod 0 and its claim again: while pod 0 is away, pods 1 and 2 restart
 (an unreachable peer is only a warning) and elect a leader (two of three voters are a quorum); the

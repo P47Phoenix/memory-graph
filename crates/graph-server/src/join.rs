@@ -324,44 +324,84 @@ const PROBE_ATTEMPT: Duration = Duration::from_secs(2);
 /// Pause between probe rounds.
 const PROBE_ROUND: Duration = Duration::from_millis(200);
 
-async fn probe_status(addr: &str) -> Option<pb::StatusResponse> {
-    tokio::time::timeout(PROBE_ATTEMPT, async {
+/// What one sibling probe found.
+#[derive(Debug)]
+enum Probe {
+    /// It answered `Status`.
+    Answered(Box<pb::StatusResponse>),
+    /// No TCP connection could be made within [`PROBE_ATTEMPT`]: its name
+    /// did not resolve, the connection was refused, or nothing answered
+    /// the handshake (nothing runs there).
+    Unreachable,
+    /// A TCP connection was made but `Status` was not answered within
+    /// [`PROBE_ATTEMPT`]: something runs there and may be a live member.
+    Silent,
+}
+
+async fn probe(addr: &str) -> Probe {
+    // First the plain TCP connection, which separates "nothing there" from
+    // "there but silent" (a process that accepts and never answers).
+    let host_port = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+    let host_port = host_port.trim_end_matches('/');
+    match tokio::time::timeout(PROBE_ATTEMPT, tokio::net::TcpStream::connect(host_port)).await {
+        Ok(Ok(tcp)) => drop(tcp),
+        Ok(Err(_)) | Err(_) => return Probe::Unreachable,
+    }
+    let asked = tokio::time::timeout(PROBE_ATTEMPT, async {
         admin(addr, PROBE_ATTEMPT)
-            .await
-            .ok()?
+            .await?
             .status(pb::StatusRequest {})
             .await
-            .ok()
             .map(tonic::Response::into_inner)
     })
-    .await
-    .ok()
-    .flatten()
+    .await;
+    match asked {
+        Ok(Ok(st)) => Probe::Answered(Box::new(st)),
+        Ok(Err(_)) | Err(_) => Probe::Silent,
+    }
+}
+
+async fn probe_status(addr: &str) -> Option<pb::StatusResponse> {
+    match probe(addr).await {
+        Probe::Answered(st) => Some(*st),
+        Probe::Unreachable | Probe::Silent => None,
+    }
 }
 
 /// Ask `siblings` (`Admin.Status`, in rounds, until `timeout`) whether a
 /// cluster exists. Returns as soon as one reports a cluster id, or once
 /// every sibling answered that it has none (a first deployment: they wait
-/// to join ordinal 0); at the deadline, with some siblings unreachable and
-/// none reporting a cluster, [`Discovery::NoCluster`]. Siblings reporting
-/// two different cluster ids are refused.
+/// to join ordinal 0). At the deadline, with none reporting a cluster: a
+/// sibling that was reached but did not answer (a timeout, not a name that
+/// does not resolve or a refused connection) fails the start, since it may
+/// be a live member; otherwise (every silent sibling unreachable)
+/// [`Discovery::NoCluster`]. Siblings reporting two different cluster ids
+/// are refused.
 pub async fn discover(siblings: &[String], timeout: Duration) -> Result<Discovery, StoreError> {
     let deadline = Instant::now() + timeout;
     let mut empty: std::collections::BTreeSet<String> = Default::default();
+    // Siblings that, in the latest round, were reached but did not answer.
+    let mut silent: std::collections::BTreeSet<String> = Default::default();
     loop {
         let round = futures_join_all(siblings.iter().cloned().map(|s| async move {
-            let st = probe_status(&s).await;
+            let st = probe(&s).await;
             (s, st)
         }))
         .await;
         let mut found: Vec<(String, String)> = Vec::new();
         for (addr, st) in round {
+            silent.remove(&addr);
             match st {
-                Some(st) if !st.cluster_id.is_empty() => found.push((addr, st.cluster_id)),
-                Some(_) => {
+                Probe::Answered(st) if !st.cluster_id.is_empty() => {
+                    found.push((addr, st.cluster_id))
+                }
+                Probe::Answered(_) => {
                     empty.insert(addr);
                 }
-                None => {}
+                Probe::Silent => {
+                    silent.insert(addr);
+                }
+                Probe::Unreachable => {}
             }
         }
         if let Some((via, cluster_id)) = found.first().cloned() {
@@ -400,16 +440,35 @@ pub async fn discover(siblings: &[String], timeout: Duration) -> Result<Discover
             return Ok(Discovery::NoCluster);
         }
         if Instant::now() >= deadline {
-            let silent: Vec<&str> = siblings
+            // A sibling that is there but does not answer may be a live
+            // member of a cluster (overloaded, partitioned): bootstrapping
+            // next to it would create a second, empty cluster that reports
+            // ready. Refuse; `--force-bootstrap` is the escape hatch.
+            let hung: Vec<&str> = silent
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !empty.contains(*s))
+                .collect();
+            if !hung.is_empty() {
+                return Err(StoreError::Rejected(format!(
+                    "--bootstrap-or-join: {hung:?} accepted a TCP connection but did not \
+                     answer Status within {timeout:?}; one of them may be a live member of an \
+                     existing cluster, so this node neither bootstraps nor joins. Retry once \
+                     they answer, or pass --force-bootstrap if every other member is known to \
+                     be gone"
+                )));
+            }
+            let down: Vec<&str> = siblings
                 .iter()
                 .map(String::as_str)
                 .filter(|s| !empty.contains(*s))
                 .collect();
             tracing::warn!(
-                ?silent,
+                ?down,
                 ?timeout,
-                "--bootstrap-or-join: these members did not answer; none that did is in a \
-                 cluster, so this node bootstraps one"
+                "--bootstrap-or-join: these members could not be reached (no such name, or \
+                 connection refused); none that answered is in a cluster, so this node \
+                 bootstraps one"
             );
             return Ok(Discovery::NoCluster);
         }
@@ -446,7 +505,8 @@ where
 ///   node id (it was a voter or a learner), that member is the lost
 ///   incarnation: it is removed first (a voter that lost its log must not
 ///   vote again under its id), provided it is recorded at this node's
-///   advertised address; the node then joins as a learner and, with
+///   advertised address and nothing that is in a cluster answers there (a
+///   live duplicate is refused, never removed); the node then joins as a learner and, with
 ///   `--auto-promote`, becomes a voter once caught up.
 ///
 /// `node_id` and `advertise` are this node's (`--node-id` /
@@ -517,6 +577,28 @@ pub async fn resolve_bootstrap_or_join(
                     m.addr
                 )))
             }
+        }
+        // Same address: is anything alive there? This node does not serve
+        // yet, so an answer carrying a cluster id is a live incarnation (a
+        // duplicate pod, a stale process), never the lost one: removing it
+        // would remove a healthy member.
+        if let Some(st) = probe_status(&m.addr).await {
+            if !st.cluster_id.is_empty() {
+                return Err(StoreError::Rejected(format!(
+                    "--bootstrap-or-join: cluster {cluster_id} lists node {me} at {}, and a live \
+                     node {} of cluster {} answers there; that is not a lost incarnation, so it \
+                     is not removed. Stop the other process (or give this one another node id \
+                     or address), or to recover: {recovery}",
+                    m.addr, st.node_id, st.cluster_id
+                )));
+            }
+        }
+        if m.role == "voter" && !spec.join.auto_promote {
+            tracing::warn!(
+                node_id = me,
+                "--bootstrap-or-join: removing a voter without --auto-promote; the cluster runs \
+                 with one voter fewer until this node is promoted again (`cluster promote {me}`)"
+            );
         }
         tracing::warn!(
             node_id = me,

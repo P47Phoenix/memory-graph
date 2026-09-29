@@ -575,6 +575,15 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Connections served at once; one accepted beyond that is closed at once
 /// (a flood of idle connections holds at most this many tasks, each for at
 /// most [`READ_TIMEOUT`] plus the time to write the answer).
+///
+/// Starvation bound: every connection holds its slot for at most
+/// `2 * READ_TIMEOUT` (10 s, the whole-connection timeout in
+/// [`serve_metrics`]), so a flood of idle or never-reading clients can keep
+/// a legitimate scrape out for at most that long per wave of slots, not
+/// forever; a scraper that retries on its interval (15-60 s typically) gets
+/// through as soon as a slot frees. The flood cannot touch the gRPC port,
+/// which has its own listener. 64 is far above what any number of real
+/// scrapers opens at once (one connection each per interval).
 pub const MAX_CONNECTIONS: usize = 64;
 
 /// Serve `GET /metrics` on `listener` until `shutdown`; every connection is

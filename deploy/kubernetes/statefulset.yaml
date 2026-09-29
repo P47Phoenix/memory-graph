@@ -71,7 +71,7 @@ spec:
             - --bootstrap-or-join
             - memory-graph-0.memory-graph.$(POD_NAMESPACE).svc.cluster.local:7000
             - --replicas
-            - "3"                # keep equal to spec.replicas
+            - "3"                # keep equal to spec.replicas: update both on a scale up or down
             - --auto-promote
             - --metrics-listen
             - 0.0.0.0:9100

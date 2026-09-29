@@ -13,8 +13,12 @@
 //!   (`WrongCluster`) or runs other extractors; `Join` also checks the
 //!   store format and protocol versions, and refuses a node id that is a
 //!   member at another address or already a voter.
-//! * `Promote`: an unknown id, a voter, or a node whose extractor version
-//!   set hash differs (asked again at promotion time) is refused.
+//! * `Promote`: an unknown id, or a node whose extractor version set hash
+//!   differs (asked again at promotion time) is refused.
+//! * Idempotence (a client retry after a lost answer, or two concurrent
+//!   requests): `Promote` of a voter, `AddLearner` of a member at the same
+//!   address, and `Remove` of a non-member succeed without a change,
+//!   answering the log index of the membership in effect.
 //! * `Remove`: the leader itself ("transfer leadership first"), 3 voters
 //!   down to 2 without `force`, and any removal for which the voters that
 //!   are reachable now are fewer than a quorum of the new voter set or of
@@ -202,6 +206,12 @@ fn members_of(ctx: &Ctx) -> Vec<pb::Member> {
         .collect()
 }
 
+/// The log index of the membership in effect (what an idempotent
+/// membership change that had nothing to do answers).
+fn membership_index(m: &openraft::RaftMetrics<NodeId, openraft::BasicNode>) -> u64 {
+    m.membership_config.log_id().map_or(0, |l| l.index)
+}
+
 /// `Promote` on the leader, with its guards.
 async fn promote_guarded(ctx: &Ctx, id: NodeId) -> Result<u64, Status> {
     ensure_leader_idle(ctx)?;
@@ -214,7 +224,10 @@ async fn promote_guarded(ctx: &Ctx, id: NodeId) -> Result<u64, Status> {
         )));
     };
     if mem.voter_ids().any(|v| v == id) {
-        return Err(rejected(format!("node {id} is already a voter")));
+        // Idempotent: a retried promote whose first attempt committed, or
+        // two concurrent promotes of one node, both succeed.
+        tracing::info!(node = id, "promote: node {id} is already a voter");
+        return Ok(membership_index(&m));
     }
     let addr = node.addr.clone();
     // The promotion gate (ADR 0004 D9): asked now, not remembered from the
@@ -259,7 +272,12 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Statu
     let m = ctx.raft.metrics();
     let mem = m.membership_config.membership();
     if mem.get_node(&id).is_none() {
-        return Err(rejected(format!("node {id} is not a member")));
+        // Idempotent: a retried remove whose first attempt committed.
+        tracing::info!(
+            node = id,
+            "remove: node {id} is not a member; nothing to remove"
+        );
+        return Ok(membership_index(&m));
     }
     let voters: BTreeSet<NodeId> = mem.voter_ids().collect();
     if !voters.contains(&id) {
@@ -858,6 +876,16 @@ impl pb::admin_server::Admin for AdminService {
                     r.node_id, n.addr, r.addr
                 )));
             }
+            // Idempotent: already a learner (or a voter) at this address,
+            // e.g. a retried add whose first attempt committed.
+            tracing::info!(
+                node = r.node_id,
+                "add-learner: already a member at this address"
+            );
+            let m = self.ctx.raft.metrics();
+            return Ok(Response::new(pb::AddLearnerResponse {
+                log_index: membership_index(&m),
+            }));
         }
         probe_node(&self.ctx, r.node_id, &r.addr).await?;
         let log_index = self

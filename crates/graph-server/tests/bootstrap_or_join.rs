@@ -168,6 +168,65 @@ fn unreachable_siblings_are_asked_until_the_probe_timeout() {
     assert!(!b.is_empty() && a != b);
 }
 
+/// A sibling that accepts TCP but never answers may be a live member: pod
+/// 0 refuses to start rather than bootstrap a second, empty cluster.
+#[test]
+fn a_silent_sibling_is_refused_not_bootstrapped_over() {
+    let _w = watchdog(
+        "a_silent_sibling_is_refused_not_bootstrapped_over",
+        TEST_LIMIT,
+    );
+    // Bound and listening (the OS completes the handshake), never accepted.
+    let hung = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = hung.local_addr().unwrap().to_string();
+    let mut tb = ClusterTestbed::new(1, exts());
+    let cfg = tb.node_config(
+        2,
+        InitMode::BootstrapOrJoin(spec(vec![addr], Duration::from_secs(3))),
+    );
+    let dir = cfg.data_dir.clone().unwrap();
+    let e = tb.add_node(2, cfg, exts()).unwrap_err().to_string();
+    assert!(e.contains("did not answer Status"), "{e}");
+    assert!(e.contains("--force-bootstrap"), "{e}");
+    assert!(
+        !dir.join("node.json").exists(),
+        "a refused start bootstraps nothing"
+    );
+    drop(hung);
+}
+
+/// A live node at the address the cluster records for pod 0's id is not a
+/// lost incarnation: the start is refused and nothing is removed.
+#[test]
+fn a_live_duplicate_at_the_recorded_address_is_not_removed() {
+    let _w = watchdog(
+        "a_live_duplicate_at_the_recorded_address_is_not_removed",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let (ep1, ep2, ep3) = (
+        tb.node(1).endpoint(),
+        tb.node(2).endpoint(),
+        tb.node(3).endpoint(),
+    );
+    // A second process claiming node 1 at node 1's (live) address.
+    let mut cfg = tb.node_config(
+        4,
+        InitMode::BootstrapOrJoin(spec(vec![ep2, ep3], Duration::from_secs(20))),
+    );
+    cfg.node_id = Some(1);
+    cfg.advertise = Some(ep1);
+    let e = tb.add_node(4, cfg, exts()).unwrap_err().to_string();
+    assert!(e.contains("not a lost incarnation"), "{e}");
+    assert!(e.contains("cluster remove 1"), "recovery steps: {e}");
+    let leader = tb.leader();
+    assert!(
+        tb.membership(leader).0.contains(&1),
+        "node 1 is still a voter"
+    );
+}
+
 #[test]
 fn other_ordinals_join_and_initialized_ordinal_0_restarts() {
     let _w = watchdog(
