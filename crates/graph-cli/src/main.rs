@@ -180,7 +180,9 @@ enum ClusterCmd {
     /// another node id, another cluster (exit code 6) or other extractors are refused. Waits
     /// until it caught up with the leader's log
     AddLearner {
+        /// The new node's id (its --node-id)
         id: u64,
+        /// The host:port the new node serves at (its --advertise address)
         addr: String,
         /// Return once the change is committed, without waiting for the catch-up
         #[arg(long)]
@@ -188,11 +190,15 @@ enum ClusterCmd {
     },
     /// Make learner <ID> a voter (joint consensus). Refused for an unknown node, a voter, or a
     /// node whose extractor version set differs from the cluster's
-    Promote { id: u64 },
+    Promote {
+        /// The learner's node id
+        id: u64,
+    },
     /// Remove node <ID> from the cluster. Refused for the leader (transfer leadership first),
     /// for anything that would leave fewer reachable voters than a quorum, and for 3 voters down
     /// to 2 unless --force
     Remove {
+        /// The node id to remove
         id: u64,
         /// Allow going from 3 voters to 2 (a cluster that then tolerates no failure). Never
         /// overrides the other guards
@@ -201,7 +207,10 @@ enum ClusterCmd {
     },
     /// Make voter <ID> the leader: the leader waits until <ID> caught up, pauses its heartbeats
     /// and writes (clients retry) until its lease runs out, and asks <ID> to call an election
-    TransferLeader { id: u64 },
+    TransferLeader {
+        /// The voter's node id
+        id: u64,
+    },
 }
 
 // Parsed once per process; `Serve`'s many flags make it the large variant.
@@ -387,6 +396,8 @@ enum Cmd {
     /// Kubernetes readiness probe / Compose healthcheck). Exit 1 in every other case. Needs
     /// --server (or MEMORY_GRAPH_SERVER)
     Health {
+        /// Check the memory-graph.ready service (a leader is known and this node is caught up)
+        /// instead of the default one (the store is open)
         #[arg(long)]
         ready: bool,
     },
@@ -398,8 +409,10 @@ enum Cmd {
     },
     /// Index one file under an org and repo (re-indexing replaces it)
     IndexFile {
+        /// Organization name, free-form: the top level of the graph (org -> repo -> file)
         #[arg(long)]
         org: String,
+        /// Repository name, free-form: the second level of the graph, under --org
         #[arg(long)]
         repo: String,
         /// Language override (default: detected from extension)
@@ -408,14 +421,18 @@ enum Cmd {
         /// Re-index even when the file is unchanged since it was last indexed
         #[arg(long)]
         reindex: bool,
+        /// The file to index; stored under the repo by this path as given
         path: PathBuf,
     },
     /// Index a directory as a repo (honors .gitignore; skips binary files)
     Index {
+        /// Organization name, free-form: the top level of the graph (org -> repo -> file)
         #[arg(long)]
         org: String,
+        /// Repository name, free-form: the second level of the graph, under --org
         #[arg(long)]
         repo: String,
+        /// Print the summary as JSON instead of text
         #[arg(long)]
         json: bool,
         /// Skip files larger than this many bytes (lockfiles, minified bundles, dumps). Off by default:
@@ -473,6 +490,7 @@ enum Cmd {
         /// Report disk space but never stop for it
         #[arg(long)]
         no_disk_check: bool,
+        /// The directory to index as one repo; files are stored by their path relative to it
         dir: PathBuf,
     },
     /// Show what `index` sizes itself from on this machine: CPUs, memory (and where the reading came
@@ -497,10 +515,13 @@ enum Cmd {
     },
     /// Show what is indexed: per repo, the languages present and each language's symbol kinds
     Describe {
+        /// Only repos of this org
         #[arg(long)]
         org: Option<String>,
+        /// Only repos with this name
         #[arg(long)]
         repo: Option<String>,
+        /// Print JSON (`{"repos": [...]}`) instead of text
         #[arg(long)]
         json: bool,
     },
@@ -2198,5 +2219,43 @@ listen = "0.0.0.0:7000"
             typed.extend(os(extra));
             assert_eq!(parsed(a), parsed(typed), "{extra:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod help_text_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Every visible argument of every (sub)command, `--help` and `--version`
+    /// aside, says what it is for (#98).
+    #[test]
+    fn no_argument_has_empty_help() {
+        fn walk(cmd: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                if arg.is_hide_set() || id == "help" || id == "version" {
+                    continue;
+                }
+                let empty = arg
+                    .get_help()
+                    .map(|h| h.to_string().trim().is_empty())
+                    .unwrap_or(true);
+                if empty {
+                    missing.push(format!("{path} {id}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                if sub.is_hide_set() || sub.get_name() == "help" {
+                    continue;
+                }
+                walk(sub, &format!("{path} {}", sub.get_name()), missing);
+            }
+        }
+        let mut cmd = Cli::command();
+        cmd.build();
+        let mut missing = vec![];
+        walk(&cmd, "memory-graph", &mut missing);
+        assert!(missing.is_empty(), "arguments without help: {missing:#?}");
     }
 }
