@@ -10,6 +10,18 @@ pub const FLOOR: u64 = 256 * MIB;
 /// Under pressure the budget stops growing but keeps this much, so files
 /// still commit in reasonable groups rather than one at a time.
 pub const PRESSURE_FLOOR: u64 = 64 * MIB;
+/// On a small machine or container the floors scale down so that, at the
+/// current growth estimate, the floor budget takes at most this share of
+/// total memory (and the pressure floor a quarter of that). Without it a
+/// 512 MB container got the 256 MB source floor, ≈6.2 GB at 25x (#94).
+pub const FLOOR_SHARE: f64 = 0.25;
+/// Upper bound on the estimated memory (source budget × growth) of any
+/// fraction budget, as a share of total: the target is a share (≤ 1) of what
+/// is free above the reserve, so at most `1 - OS_RESERVE` of total (0.56 at
+/// the default fraction), and the floors at most `FLOOR_SHARE`. A fixed
+/// `--memory` and the caller's own floor (one batch in `--deterministic`)
+/// are not bound by it.
+pub const MAX_BUDGET_SHARE: f64 = 1.0 - OS_RESERVE;
 /// Share of physical RAM kept free for the operating system and everything
 /// else: the budget only ever targets what is free above it, and dropping
 /// below it is memory pressure.
@@ -651,6 +663,13 @@ impl MemoryPolicy {
         Some(d)
     }
 
+    /// `floor` source bytes, lowered so that at the current growth estimate
+    /// it takes at most `share` of `total` memory (and at least one byte).
+    fn scaled_floor(&self, floor: u64, share: f64, total: u64) -> u64 {
+        let fit = (total as f64 * share / self.expansion) as u64;
+        floor.min(fit).max(1)
+    }
+
     /// The cap for `sample`, given `held` source bytes in flight taking
     /// `growth` bytes of heap (measured, or estimated when 0).
     fn decide(&self, sample: Option<&MemSample>, held: u64, growth: u64) -> Decision {
@@ -715,7 +734,11 @@ impl MemoryPolicy {
             // the pressure floor and stays there until free memory is back
             // above 30% of RAM.
             return Decision {
-                cap: (held / 2).max(self.floor).max(PRESSURE_FLOOR),
+                cap: (held / 2).max(self.floor).max(self.scaled_floor(
+                    PRESSURE_FLOOR,
+                    FLOOR_SHARE / 4.0,
+                    m.total,
+                )),
                 under_pressure: true,
                 reason: format!("pressure: {why}; budget held down until 30% is free"),
             };
@@ -732,7 +755,9 @@ impl MemoryPolicy {
         let spare = m.available.saturating_add(growth).saturating_sub(reserve);
         let target = (spare as f64 * fraction / self.expansion) as u64;
         let ceiling = m.total / 2;
-        let floor = self.floor.max(FLOOR);
+        let floor = self
+            .floor
+            .max(self.scaled_floor(FLOOR, FLOOR_SHARE, m.total));
         let cap = target.clamp(floor, ceiling.max(floor));
         let clamped = if cap > target {
             format!("; raised to the {} floor", mb(floor))
@@ -808,6 +833,67 @@ impl Sizing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mem_mb(total_mb: u64, avail_mb: u64) -> MemSample {
+        MemSample {
+            total: total_mb * MIB,
+            available: avail_mb * MIB,
+            rss: None,
+            psi_some_avg10: None,
+            source: "test",
+        }
+    }
+
+    /// #94: in a 512 MB container the budget's estimated memory stays within
+    /// a stated share of total, however little is free, under pressure too.
+    #[test]
+    fn small_container_budget_fits_in_its_memory() {
+        let total = 512 * MIB;
+        let in_mem = |p: &MemoryPolicy| p.cap as f64 * p.expansion;
+        for avail in [500, 400, 200, 110, 50, 1] {
+            let m = mem_mb(512, avail);
+            for f in [DEFAULT_FRACTION, 0.25, 1.0] {
+                let p = MemoryPolicy::new(MemorySpec::Fraction(f), 1, Ok(&m));
+                assert!(
+                    in_mem(&p) <= MAX_BUDGET_SHARE * total as f64,
+                    "avail {avail} MB, fraction {f}: {} source",
+                    p.cap
+                );
+                assert!(p.cap > 0);
+            }
+            let p = MemoryPolicy::new(MemorySpec::Fraction(DEFAULT_FRACTION), 1, Ok(&m));
+            assert!(in_mem(&p) <= 0.57 * total as f64, "avail {avail} MB");
+        }
+        // Under pressure (nearly nothing free): the scaled pressure floor.
+        let p = MemoryPolicy::new(
+            MemorySpec::Fraction(DEFAULT_FRACTION),
+            1,
+            Ok(&mem_mb(512, 1)),
+        );
+        assert!(p.under_pressure);
+        assert!(in_mem(&p) <= FLOOR_SHARE / 4.0 * total as f64 + 1.0);
+        // Not under pressure but little free: the scaled floor.
+        let p = MemoryPolicy::new(
+            MemorySpec::Fraction(DEFAULT_FRACTION),
+            1,
+            Ok(&mem_mb(512, 110)),
+        );
+        assert!(!p.under_pressure);
+        assert!(in_mem(&p) <= FLOOR_SHARE * total as f64 + 1.0);
+        assert!(p.reason.contains("floor"), "{}", p.reason);
+        // A big machine keeps the old floors.
+        let p = MemoryPolicy::new(MemorySpec::Fraction(DEFAULT_FRACTION), 1, Ok(&mem(64, 13)));
+        assert_eq!(p.cap, FLOOR);
+        let p = MemoryPolicy::new(MemorySpec::Fraction(DEFAULT_FRACTION), 1, Ok(&mem(64, 1)));
+        assert_eq!(p.cap, PRESSURE_FLOOR);
+        // A caller's floor (one deterministic batch) is still honoured.
+        let p = MemoryPolicy::new(
+            MemorySpec::Fraction(DEFAULT_FRACTION),
+            32 * MIB,
+            Ok(&mem_mb(512, 110)),
+        );
+        assert!(p.cap >= 32 * MIB);
+    }
 
     fn mem(total_gb: u64, avail_gb: u64) -> MemSample {
         MemSample {
@@ -1018,7 +1104,9 @@ mod tests {
         );
         let s = Sizing::new(1, Ok(mem(2, 1)), 0, None, 1);
         assert_eq!(s.parse_threads, 1);
-        assert_eq!(s.memory_budget, FLOOR, "fraction floor");
+        // The fraction floor, scaled to FLOOR_SHARE of a 2 GB box (#94).
+        let scaled = ((2u64 << 30) as f64 * FLOOR_SHARE / INITIAL_EXPANSION) as u64;
+        assert_eq!(s.memory_budget, scaled.min(FLOOR), "fraction floor");
         let s = Sizing::new(8, Err("no probe".into()), 0, None, FLOOR);
         assert_eq!(s.memory_budget, FALLBACK_BUDGET);
         assert!(s.policy.reason.contains("unknown"));
@@ -1155,7 +1243,12 @@ mod tests {
         let d = p.update(Some(&mem(16, 1)), 0, 0).unwrap();
         assert_eq!(d.cap, FLOOR);
         let mut q = MemoryPolicy::new(MemorySpec::Fraction(0.25), 1, Ok(&mem(16, 10)));
-        assert_eq!(q.update(Some(&mem(16, 1)), 0, 0).unwrap().cap, 64 << 20);
+        // The pressure floor, scaled to a quarter of FLOOR_SHARE of 16 GB.
+        let scaled = ((16u64 << 30) as f64 * FLOOR_SHARE / 4.0 / INITIAL_EXPANSION) as u64;
+        assert_eq!(
+            q.update(Some(&mem(16, 1)), 0, 0).unwrap().cap,
+            scaled.min(PRESSURE_FLOOR)
+        );
         // Our own growth counts too.
         let mut big = mem(16, 10);
         big.rss = Some(11 << 30);

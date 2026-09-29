@@ -1276,7 +1276,7 @@ mod prune_and_limits {
             "index",
             "--deterministic",
             "--memory",
-            "64K",
+            "32M",
             "--org",
             "o",
             "--repo",
@@ -1313,7 +1313,7 @@ mod prune_and_limits {
                     "index",
                     "--deterministic",
                     "--memory",
-                    "64K",
+                    "32M",
                     "--org",
                     "o",
                     "--repo",
@@ -2273,8 +2273,8 @@ fn adaptive_commit_stores_the_same_content() {
             vec!["--deterministic", "-j", "1"],
             vec!["-j", "8"],
             vec!["-j", "3", "--memory", "64K"],
-            // A budget below one fixed batch must not hang `--deterministic`.
-            vec!["--deterministic", "-j", "2", "--memory", "64K"],
+            // The least budget `--deterministic` accepts (one fixed batch).
+            vec!["--deterministic", "-j", "2", "--memory", "32M"],
         ] {
             let db = d.path().join(format!("g{}", seen.len()));
             let db = db.to_str().unwrap();
@@ -2411,16 +2411,20 @@ fn memory_budget_bounds_bytes_in_flight() {
         std::fs::write(root.join(format!("f{i:03}.rs")), body).unwrap();
     }
     let root = root.to_str().unwrap();
-    for mode in [&["-j", "8"][..], &["--deterministic", "-j", "8"][..]] {
+    // `--deterministic` needs at least one fixed batch of budget (#88).
+    for mode in [
+        &["--memory", "16K", "-j", "8"][..],
+        &["--memory", "32M", "--deterministic", "-j", "8"][..],
+    ] {
         let db = d.path().join(format!("g{}", mode.len()));
-        let mut flags = vec!["--stats", "--memory", "16K"];
+        let mut flags = vec!["--stats"];
         flags.extend_from_slice(mode);
         let (sum, _) = index_json(db.to_str().unwrap(), root, &flags);
         assert_eq!(sum["files"], 200, "{sum}");
         let peak = sum["stats"]["peak_in_flight"].as_u64().unwrap();
         let cap = sum["stats"]["memory_budget"].as_u64().unwrap();
         assert!(peak <= cap, "{mode:?}: peak {peak} > budget {cap}");
-        if mode.len() == 2 {
+        if !mode.contains(&"--deterministic") {
             assert_eq!(cap, 16 * 1024, "adaptive keeps the requested budget");
             assert!(sum["stats"]["transactions"].as_u64().unwrap() > 1);
         }
@@ -2460,15 +2464,20 @@ fn memory_share_follows_free_ram() {
             / growth) as u64;
         // `available` is the end-of-run sample: allow free memory to have
         // moved by a quarter meanwhile (other tests run alongside).
+        // The floor scales with the host (#94): 256M on big hosts, else
+        // FLOOR_SHARE of total at the growth estimate (1x..64x over a run).
+        use graph_cli::sysinfo::{FLOOR, FLOOR_SHARE};
+        let floor_at = |x: f64| FLOOR.min((total as f64 * FLOOR_SHARE / x) as u64);
+        let (floor_lo, floor_hi) = (floor_at(64.0), floor_at(1.0));
         assert!(
-            cap <= bound.max(256 << 20) * 5 / 4,
+            cap <= bound.max(floor_hi) * 5 / 4,
             "cap {cap} bound {bound}: {m}"
         );
         let reason = m["reason"].as_str().unwrap();
         // A loaded machine may already be under pressure; then the reason
         // says so and the cap only shrinks.
         if m["pressure_episodes"] == 0 {
-            assert!(cap >= (256 << 20).min(total / 2), "{m}");
+            assert!(cap >= floor_lo.min(total / 2), "{m}");
             assert!(reason.contains("10%"), "{m}");
         } else {
             assert!(reason.contains("pressure"), "{m}");

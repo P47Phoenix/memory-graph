@@ -80,6 +80,10 @@ pub const CASES: &[(&str, Case)] = &[
     ("vacuum_preserves_reads", vacuum_preserves_reads),
     ("claimed_extension_extractor", claimed_extension_extractor),
     ("prepared_matches_batch", prepared_matches_batch),
+    (
+        "prepared_counted_matches_uncounted",
+        prepared_counted_matches_uncounted,
+    ),
     ("prepare_skips_unchanged", prepare_skips_unchanged),
     ("prepared_rejections_in_order", prepared_rejections_in_order),
     (
@@ -2002,6 +2006,40 @@ fn prepare_all(
         .iter()
         .map(|f| s.prepare("o", repo, f, opts).unwrap())
         .collect()
+}
+
+/// `index_prepared_counted` stores and answers exactly as `index_prepared`
+/// does, and reports at least one commit per call (#89); the count itself
+/// depends on the chunk size, so only its lower bound is portable.
+fn prepared_counted_matches_uncounted(h: &Harness) {
+    let s = (h.open)(vec![]).expect("open store");
+    let f = |p, b: &'static [u8]| BatchFile {
+        path: p,
+        bytes: b,
+        language: None,
+        origin: Some(ORIGIN_DIRECTORY),
+    };
+    let files = [f("a.txt", b"foo bar\n"), f("b.txt", b"baz foo\n")];
+    let d = IndexOptions::default();
+    let prep = |repo| {
+        files
+            .iter()
+            .map(|file| s.prepare("o", repo, file, d).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let plain = s.index_prepared("o", "a", prep("a"), d).unwrap();
+    let (counted, commits) = s.index_prepared_counted("o", "b", prep("b"), d).unwrap();
+    assert!(commits >= 1, "a call commits at least once");
+    let (x, y): (Vec<_>, Vec<_>) = (
+        plain.iter().map(stats_proj).collect(),
+        counted.iter().map(stats_proj).collect(),
+    );
+    assert_eq!(x, y, "per-file outcomes");
+    let toks = |repo| s.file_tokens("o", repo, "b.txt").unwrap().map(|v| v.len());
+    assert_eq!(toks("a"), toks("b"));
+    // An empty call still answers (and commits nothing visible).
+    let (none, _) = s.index_prepared_counted("o", "c", vec![], d).unwrap();
+    assert!(none.is_empty());
 }
 
 /// `prepare` + `index_prepared` stores exactly what `index_batch` stores for
