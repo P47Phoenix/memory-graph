@@ -128,7 +128,8 @@
         "src/requests/hooks.py",
         "src/requests/status_codes.py",
         "src/requests/structures.py",
-        "LICENSE"
+        "LICENSE",
+        "NOTICE"
       ],
       "languages": ["python"]
     },

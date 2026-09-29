@@ -9,14 +9,19 @@
 //! | module-level `ALL_CAPS = ...` / `ALL_CAPS: T = ...` | Constant | `constant` |
 //!
 //! A `class`/`def` span runs from its first decorator (or the keyword)
-//! through the last token of its indented block (`graph_core::scan::
-//! indent_block`); an assignment's span is its logical line. A `def` nested in
+//! through the last token of its indented block; an assignment's span is its
+//! logical line. Blocks are measured on logical lines (the same rule as
+//! `graph_core::scan::indent_block`, but a line continuing a bracket or a `\`
+//! continuation never ends a block, whatever its column). A `def` nested in
 //! a function is a Function. A file with unbalanced brackets or broken
 //! indentation (an unexpected indent, a dedent to no enclosing level, a `:`
 //! header without a block) is flagged `has_errors` and yields tokens only.
+//! Columns count characters, so a tab is one column: indentation mixing tabs
+//! and spaces inconsistently between lines usually sets `has_errors`, much as
+//! Python raises `TabError`.
 //! Not symbols: instance attributes, non-constant module variables, class
 //! attributes other than lambdas, conditional imports.
-use graph_core::scan::{code_index, indent_block, span_between};
+use graph_core::scan::{code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -160,7 +165,7 @@ fn scan(tokens: &[TokenDecl], code: &[usize], lines: &[std::ops::Range<usize>]) 
     let mut open: Vec<(usize, bool)> = Vec::new();
     // First code position of pending decorator lines.
     let mut decorators: Option<usize> = None;
-    for line in lines {
+    for (k, line) in lines.iter().enumerate() {
         let s = line.start;
         while open.last().is_some_and(|&(end, _)| end < code[s]) {
             open.pop();
@@ -176,7 +181,14 @@ fn scan(tokens: &[TokenDecl], code: &[usize], lines: &[std::ops::Range<usize>]) 
         }
         let kw = text(c);
         if matches!(kw, "def" | "class") && c + 1 < line.end && is_ident(c + 1) {
-            let end = indent_block(tokens, code[s], &[TokenClass::Comment]);
+            // The block: every later logical line indented past the header.
+            let indent = tokens[code[s]].span.start_col;
+            let block_last = lines[k + 1..]
+                .iter()
+                .take_while(|l| tokens[code[l.start]].span.start_col > indent)
+                .last()
+                .unwrap_or(line);
+            let end = code[block_last.end - 1];
             let class = kw == "class";
             let (kind, lang) = if class {
                 (SymbolKind::Type, "class")

@@ -199,3 +199,21 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+#[test]
+fn backslash_continuation_into_a_dedent_stays_in_the_block() {
+    let src = "def f():\n    x = 1 + \\\n2\n    return x\ny = 1\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "f").3, "def f():\n    x = 1 + \\\n2\n    return x");
+}
+
+#[test]
+fn inconsistent_tabs_and_spaces_are_errors() {
+    // One tab is one column: like Python's TabError.
+    let ex = PythonExtractor.extract("def f():\n\tx = 1\n        y = 2\n");
+    assert!(ex.has_errors);
+    assert!(ex.symbols.is_empty());
+    // Consistent tabs are fine.
+    let s = syms("class A:\n\tdef m(self):\n\t\treturn 1\n");
+    assert_eq!(find(&s, "m").1, SymbolKind::Method);
+}

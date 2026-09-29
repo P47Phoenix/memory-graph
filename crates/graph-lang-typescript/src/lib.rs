@@ -21,7 +21,7 @@
 //! arrow-typed variables. TSX is scanned like TypeScript; JSX text that
 //! looks like a regex or unbalanced braces can cut a scan short, never
 //! producing invalid spans or `has_errors`.
-use graph_core::scan::{code_index, matching_close, span_between};
+use graph_core::scan::{code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -62,6 +62,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let s = Scanner {
         tokens,
         code: &code,
+        closes: graph_lang_javascript::close_table(tokens, &code),
     };
     s.scan(&mut out);
     out.sort_by(|a, b| {
@@ -79,6 +80,7 @@ const PREFIXES: &[&str] = &["export", "default", "declare", "const"];
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
+    closes: Vec<Option<usize>>,
 }
 
 impl Scanner<'_> {
@@ -95,8 +97,7 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     fn start_of(&self, mut c: usize) -> usize {

@@ -607,8 +607,8 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 /// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
-    const EXPECTED_FILES: usize = 631;
-    const EXPECTED_HASH: u64 = 8211309065603804251;
+    const EXPECTED_FILES: usize = 632;
+    const EXPECTED_HASH: u64 = 10106295268086031470;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());

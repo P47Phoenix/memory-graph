@@ -234,3 +234,57 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// Runs `f` on a thread with the indexer's 2 MB stack, so a recursion that
+/// grows with nesting depth overflows here as it would in production.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn deep_nesting_is_capped_not_a_stack_overflow() {
+    let n = 20_000;
+    for balanced in [true, false] {
+        let mut src = "class A {".repeat(n);
+        if balanced {
+            src.push_str(&"}".repeat(n));
+        }
+        let ex = on_small_stack(move || JavaExtractor.extract(&src));
+        assert!(!ex.symbols.is_empty());
+        assert!(ex.symbols.len() <= MAX_DEPTH + 1);
+        assert_eq!(ex.symbols[0].span.start, 0);
+    }
+}
+
+#[test]
+fn record_constructors_annotation_constants_and_c_style_arrays() {
+    let s = syms(
+        "record P(int x) {\n  P { check(x); }\n  public P(String s) { this(1); }\n}\n\
+         @interface M { int LIMIT = 3; String v(); }\n\
+         class C { int x[]; String[] a[] = {}; }\n",
+    );
+    let ctors: Vec<_> = s
+        .iter()
+        .filter(|x| x.2 == "constructor")
+        .map(|x| x.3.as_str())
+        .collect();
+    assert_eq!(
+        ctors,
+        ["P { check(x); }", "public P(String s) { this(1); }"]
+    );
+    assert_eq!(
+        (find(&s, "LIMIT").1, find(&s, "LIMIT").2.as_str()),
+        (SymbolKind::Constant, "constant")
+    );
+    assert_eq!(find(&s, "x").3, "int x[];");
+    assert_eq!(find(&s, "x").2, "field");
+    assert_eq!(find(&s, "a").3, "String[] a[] = {};");
+    // Initializer blocks are still not symbols.
+    let s = syms("class A { static { } { } }");
+    assert_eq!(s.len(), 1);
+}

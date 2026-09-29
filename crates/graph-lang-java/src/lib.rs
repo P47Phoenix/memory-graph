@@ -8,7 +8,7 @@
 //! | `package a.b;` | Module | `package` |
 //! | `class` `interface` `enum` `record` | Type | the keyword |
 //! | `@interface` | Type | `annotation` |
-//! | methods / constructors (incl. annotation elements) | Method | `method` / `constructor` |
+//! | methods / constructors (incl. annotation elements and compact record constructors) | Method | `method` / `constructor` |
 //! | fields | Variable | `field` |
 //! | `static final` fields, interface fields | Constant | `constant` |
 //!
@@ -18,8 +18,9 @@
 //! (no local or anonymous classes, no lambdas); enum constants are not
 //! symbols. A multi-declarator field (`int a, b;`) yields one symbol, named by
 //! its first declarator. Odd input never sets `has_errors`: unbalanced
-//! braces make the scanner resynchronize one token later.
-use graph_core::scan::{code_index, matching_close, span_between};
+//! braces make the scanner resynchronize one token later. Type bodies nested
+//! more than [`MAX_DEPTH`] deep are not scanned (the outer types are kept).
+use graph_core::scan::{code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -59,6 +60,8 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         tokens,
         code: &code,
         out: Vec::new(),
+        depth: 0,
+        closes: close_table(tokens, &code),
     };
     s.body(0, code.len(), &Level::File);
     s.out
@@ -95,7 +98,16 @@ struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
     out: Vec<SymbolDecl>,
+    /// Nesting of `body` calls, capped at [`MAX_DEPTH`].
+    depth: usize,
+    /// [`close_table`] of `code`.
+    closes: Vec<Option<usize>>,
 }
+
+/// Deepest nesting of type bodies scanned. Deeper declarations are not
+/// reported, their enclosing ones are: this bounds the recursion so
+/// adversarial input cannot overflow the indexer thread's stack.
+pub const MAX_DEPTH: usize = 256;
 
 /// How a declaration ended.
 enum End {
@@ -120,12 +132,20 @@ impl Scanner<'_> {
     }
 
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.closes[c]
     }
 
     /// Declarations in code positions `[lo, hi)`.
     fn body(&mut self, lo: usize, hi: usize, level: &Level) {
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.depth += 1;
+        self.body_level(lo, hi, level);
+        self.depth -= 1;
+    }
+
+    fn body_level(&mut self, lo: usize, hi: usize, level: &Level) {
         let mut c = lo;
         while c < hi {
             if matches!(self.text(c), ";" | "}") {
@@ -327,11 +347,23 @@ impl Scanner<'_> {
         while n > h + 1 && self.text(n - 1) == "]" && self.text(n - 2) == "[" {
             n -= 2;
         }
-        let Some(n) = n.checked_sub(1).filter(|&n| n > h && self.is_ident(n)) else {
+        let Some(n) = n.checked_sub(1).filter(|&n| n >= h && self.is_ident(n)) else {
             return false;
         };
-        if MODIFIERS.contains(&self.text(n)) || matches!(*end, End::Block { .. }) {
-            // Initializer blocks (`static { }`) and stray blocks.
+        if let End::Block { .. } = *end {
+            // A compact canonical record constructor (`Point { ... }`);
+            // otherwise an initializer block (`static { }`) or a stray block.
+            if self.text(n) == owner && (h..n).all(|c| MODIFIERS.contains(&self.text(c))) {
+                self.push(
+                    owner.clone(),
+                    SymbolKind::Method,
+                    "constructor",
+                    (start, last),
+                );
+            }
+            return false;
+        }
+        if n == h || MODIFIERS.contains(&self.text(n)) {
             return false;
         }
         let words = || (h..n).map(|c| self.text(c));
@@ -357,6 +389,33 @@ impl Scanner<'_> {
         }
         None
     }
+}
+
+/// For each code position (`code` indexes `tokens`), the code position of the
+/// delimiter closing it, exactly as `graph_core::scan::matching_close` would
+/// find it (literals ignored; a mismatched closer leaves every delimiter open
+/// at that point unclosed), computed in one pass instead of one scan per
+/// opener, so deeply nested or unbalanced input stays linear.
+fn close_table(tokens: &[TokenDecl], code: &[usize]) -> Vec<Option<usize>> {
+    let mut out = vec![None; code.len()];
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    for (c, &i) in code.iter().enumerate() {
+        let t = &tokens[i];
+        if matches!(t.class, TokenClass::Comment | TokenClass::Literal) {
+            continue;
+        }
+        match t.text.as_str() {
+            "(" => stack.push((c, ")")),
+            "[" => stack.push((c, "]")),
+            "{" => stack.push((c, "}")),
+            ")" | "]" | "}" => match stack.pop() {
+                Some((open, want)) if want == t.text => out[open] = Some(c),
+                _ => stack.clear(),
+            },
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]

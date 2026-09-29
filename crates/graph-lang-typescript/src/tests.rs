@@ -251,3 +251,79 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// Runs `f` on a thread with the indexer's 2 MB stack, so a recursion that
+/// grows with nesting depth overflows here as it would in production.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn deep_nesting_is_capped_not_a_stack_overflow() {
+    let n = 20_000;
+    for (open, close) in [
+        ("class A { m(): void {", "} }"),
+        ("const f = (): void => {", "};"),
+        ("namespace N {", "}"),
+    ] {
+        for balanced in [true, false] {
+            let mut src = open.repeat(n);
+            if balanced {
+                src.push_str(&close.repeat(n));
+            }
+            let ex = on_small_stack(move || TypeScriptExtractor.extract(&src));
+            if balanced {
+                assert!(!ex.symbols.is_empty(), "{open}");
+                assert_eq!(ex.symbols[0].span.start, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn keyword_member_accesses_and_arrow_params_are_not_declarations() {
+    // `.module` / `.namespace` / `.interface` / `.enum` / `.type` followed by
+    // what would otherwise complete a declaration.
+    for src in [
+        "obj.module\nfoo { }\n",
+        "obj.namespace\nfoo { }\n",
+        "obj.interface\nFoo { }\n",
+        "obj.enum\nE { }\n",
+        "obj.type\nT = 1;\n",
+        // `type X =>`: an arrow, not a type alias.
+        "let a = type\nb => b;\n",
+    ] {
+        let s = syms(src);
+        assert!(
+            s.iter().all(|x| !matches!(
+                x.2.as_str(),
+                "module" | "namespace" | "interface" | "enum" | "type"
+            )),
+            "{src}: {s:#?}"
+        );
+    }
+}
+
+#[test]
+fn overload_signatures_without_semicolons() {
+    let src = "class C {\n  m(a: string): void\n  m(a: number): void\n  m(a) { return a; }\n}\n";
+    let s = syms(src);
+    let ms: Vec<_> = s
+        .iter()
+        .filter(|x| x.0 == "m")
+        .map(|x| (x.1, x.3.as_str()))
+        .collect();
+    assert_eq!(
+        ms,
+        [
+            (SymbolKind::Method, "m(a: string): void"),
+            (SymbolKind::Method, "m(a: number): void"),
+            (SymbolKind::Method, "m(a) { return a; }"),
+        ]
+    );
+}
