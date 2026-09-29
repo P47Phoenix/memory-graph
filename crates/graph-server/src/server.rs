@@ -125,6 +125,11 @@ pub struct ServeConfig {
     pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
 }
 
+/// How long a restart whose `node.json` address differs from the one its
+/// membership lists waits for the leader to catch it up (its log may be
+/// merely behind) before refusing to start.
+pub const ADVERTISE_CATCHUP: Duration = Duration::from_secs(5);
+
 /// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
 /// codes 3/4/5 can be driven end to end against a real server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -157,6 +162,15 @@ pub struct TestingHooks {
     /// committed the new address, before `node.json` is rewritten (a crash
     /// in that window).
     pub fail_before_advertise_rewrite: bool,
+    /// `--update-advertise` rewrites `node.json` as soon as the leader
+    /// committed the new address, without waiting for this node's own log
+    /// to hold it (the behaviour before that wait existed), so a test can
+    /// leave a node with a lagging membership view.
+    pub advertise_rewrite_skip_wait: bool,
+    /// How long a restart whose `node.json` address differs from its
+    /// membership's waits for the leader to catch it up before refusing
+    /// (default [`ADVERTISE_CATCHUP`]).
+    pub advertise_catchup_ms: Option<u64>,
     /// Hold every received `AppendEntries` that carries entries for this
     /// long before handing it to Raft (a slow link or disk, longer than
     /// the leader's heartbeat timeout). Heartbeats are not delayed.
@@ -643,24 +657,9 @@ pub async fn start(
     // new address and node.json being rewritten; serving at the old address
     // would then leave the leader replicating to the new one. Refused, with
     // the flag that finishes the move (ADR 0004 Q3, docs/deploy/data-dir.md).
-    if moved.is_none() && plan.as_ref().is_some_and(|p| p.existing.is_some()) {
-        let listed = raft
-            .metrics()
-            .membership_config
-            .membership()
-            .get_node(&node_id)
-            .map(|n| n.addr.clone());
-        if let Some(listed) = listed.filter(|l| *l != advertise) {
-            let _ = tokio::time::timeout(cfg.shutdown_grace, raft.shutdown()).await;
-            slot.close();
-            return Err(StoreError::Rejected(format!(
-                "this node's address in node.json is {advertise}, but the cluster's membership \
-                 records node {node_id} at {listed} (an --update-advertise that stopped after \
-                 the cluster committed it); restart with --update-advertise {listed}, listening \
-                 where {listed} reaches, to finish the move"
-            )));
-        }
-    }
+    // Checked once serving (below): a log that is merely behind gets a
+    // bounded wait to catch up from the leader first.
+    let check_address = moved.is_none() && plan.as_ref().is_some_and(|p| p.existing.is_some());
     raft.withhold_leader = cfg.testing.withhold_leader;
     raft.hold_proposal = cfg.testing.hold_proposal_ms.map(Duration::from_millis);
     let shutdown = ShutdownHandle::new();
@@ -870,6 +869,47 @@ pub async fn start(
             result
         })
     };
+    if check_address && !listed_at(&raft, node_id, &ctx.info.advertise) {
+        // Serving at node.json's address: if the leader lists this node
+        // there, it replicates here and the view catches up; if it lists
+        // another address, it never does and the start is refused.
+        let wait = cfg
+            .testing
+            .advertise_catchup_ms
+            .map_or(ADVERTISE_CATCHUP, Duration::from_millis);
+        let advertise = ctx.info.advertise.clone();
+        let want = advertise.clone();
+        let _ = raft
+            .raft
+            .wait(Some(wait))
+            .metrics(
+                move |m| {
+                    m.membership_config
+                        .membership()
+                        .get_node(&node_id)
+                        .is_none_or(|n| n.addr == want)
+                },
+                "node.json's address in this node's membership",
+            )
+            .await;
+        let listed = raft
+            .metrics()
+            .membership_config
+            .membership()
+            .get_node(&node_id)
+            .map(|n| n.addr.clone());
+        if let Some(listed) = listed.filter(|l| *l != advertise) {
+            shutdown.trigger();
+            let _ = task.await;
+            return Err(StoreError::Rejected(format!(
+                "this node's address in node.json is {advertise}, but the cluster's membership \
+                 records node {node_id} at {listed} (an --update-advertise that stopped after \
+                 the cluster committed it); restart with --update-advertise {listed}, listening \
+                 where {listed} reaches, to finish the move"
+            )));
+        }
+        tracing::info!(%advertise, "membership caught up with node.json's address");
+    }
     // `--join`: serving now (the leader asks this node who it is before
     // adding it), so ask to be added; a refusal or the timeout stops the
     // server again and fails the start.
@@ -924,14 +964,16 @@ pub async fn start(
                 new = json.advertise,
             ))
         };
-        let done = match done {
-            Ok(_) if cfg.testing.fail_before_advertise_rewrite => {
-                // Deterministic: the crash comes once this node's own log
-                // holds the committed address (bounded wait).
-                let want = json.advertise.clone();
-                let _ = raft
-                    .raft
-                    .wait(Some(Duration::from_secs(30)))
+        // The leader's commit does not need this node in its majority, so
+        // this node's own log may not hold the new address yet. node.json
+        // follows only once it does (bounded wait): otherwise a stop in that
+        // window leaves node.json ahead of the local membership, and the
+        // restart check would name the old address.
+        let in_own_log = |raft: &RaftNode| {
+            let want = json.advertise.clone();
+            let r = raft.raft.clone();
+            async move {
+                r.wait(Some(Duration::from_secs(30)))
                     .metrics(
                         move |m| {
                             m.membership_config
@@ -941,14 +983,33 @@ pub async fn start(
                         },
                         "new address in this node's membership",
                     )
-                    .await;
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        StoreError::Storage(format!(
+                            "this node's own log did not receive the new address: {e}"
+                        ))
+                    })
+            }
+        };
+        let done = match done {
+            Ok(_) if cfg.testing.fail_before_advertise_rewrite => {
+                // Deterministic: the crash comes once this node's own log
+                // holds the committed address (bounded wait).
+                let _ = in_own_log(&raft).await;
                 Err(not_rewritten(StoreError::Storage(
                     "testing: failpoint after the new address was committed, before node.json \
                      was rewritten"
                         .into(),
                 )))
             }
-            Ok(_) => json.write(&json_path).map_err(not_rewritten),
+            Ok(_) if cfg.testing.advertise_rewrite_skip_wait => {
+                json.write(&json_path).map_err(not_rewritten)
+            }
+            Ok(_) => match in_own_log(&raft).await {
+                Ok(()) => json.write(&json_path).map_err(not_rewritten),
+                Err(e) => Err(not_rewritten(e)),
+            },
             Err(e) => Err(e),
         };
         if let Err(e) = done {
@@ -1075,6 +1136,16 @@ async fn wait_for_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Whether this node's membership view lists node `id` at `addr` (or not at
+/// all: nothing to compare against).
+fn listed_at(raft: &RaftNode, id: u64, addr: &str) -> bool {
+    raft.metrics()
+        .membership_config
+        .membership()
+        .get_node(&id)
+        .is_none_or(|n| n.addr == addr)
 }
 
 #[cfg(test)]

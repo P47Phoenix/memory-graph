@@ -174,7 +174,8 @@ async fn probe_node(ctx: &Ctx, id: NodeId, addr: &str) -> Result<pb::StatusRespo
 /// `UpdateAdvertise`: the server at the new address must already be a
 /// member of this cluster, so it reports this cluster's id. [`probe_node`]
 /// lets an empty id through (a node that is still joining); a member being
-/// moved has one, so an empty id here is a server that is not it.
+/// moved has one, so an empty id here is a server that is not it: an empty
+/// `theirs` is refused, like a different one.
 fn check_moved_member_cluster(
     ours: &str,
     id: NodeId,

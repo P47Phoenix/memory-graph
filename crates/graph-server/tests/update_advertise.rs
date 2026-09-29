@@ -178,11 +178,19 @@ fn a_crash_between_commit_and_node_json_rewrite_is_refused_then_finished() {
         let cfg = tb.node_mut(3).config_mut();
         cfg.testing.fail_before_advertise_rewrite = false;
         cfg.update_advertise = None;
+        // Refused only after the catch-up wait (the leader replicates to
+        // the new address, so this view never changes).
+        cfg.testing.advertise_catchup_ms = Some(2_000);
     }
+    let t = Instant::now();
     let e = tb.node_mut(3).try_restart().unwrap_err().to_string();
     assert!(
         e.contains(&format!("--update-advertise {new}")) && e.contains(&old),
         "{e}"
+    );
+    assert!(
+        t.elapsed() >= Duration::from_secs(2),
+        "refused before the wait"
     );
     assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, old);
 
@@ -199,6 +207,97 @@ fn a_crash_between_commit_and_node_json_rewrite_is_refused_then_finished() {
     tb.node_mut(3).config_mut().update_advertise = None;
     tb.node_mut(3).restart();
     assert_eq!(tb.node(3).endpoint(), new);
+}
+
+/// Review of #124: node.json is rewritten only once this node's own log holds
+/// the new address, so stopping right after a successful move and
+/// restarting plainly is never refused.
+#[test]
+fn a_restart_right_after_a_move_is_never_refused() {
+    let mut tb = ClusterTestbed::new(3, rust_only());
+    tb.form();
+    let idx = write(&tb, 0);
+    tb.wait_applied(idx, CLUSTER_WAIT);
+    let json_path = tb.data_dir(3).join("node.json");
+    for round in 0..3 {
+        tb.node_mut(3).stop();
+        let new = free_addr();
+        {
+            let cfg = tb.node_mut(3).config_mut();
+            cfg.listen = new.parse().unwrap();
+            cfg.update_advertise = Some(new.clone());
+            cfg.update_advertise_timeout = CLUSTER_WAIT;
+            // A slow link to this node: the leader commits without it.
+            cfg.testing.delay_append_entries_ms = Some(500);
+            // Refusal would be immediate-ish; any refusal fails the test.
+            cfg.testing.advertise_catchup_ms = Some(100);
+        }
+        tb.node_mut(3).restart();
+        assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, new);
+        assert_eq!(
+            addr_in_membership(&tb, 3, 3),
+            Some(new.clone()),
+            "round {round}"
+        );
+        // Stop at once and restart plainly.
+        tb.node_mut(3).stop();
+        tb.node_mut(3).config_mut().update_advertise = None;
+        tb.node_mut(3)
+            .try_restart()
+            .unwrap_or_else(|e| panic!("round {round}: plain restart refused: {e}"));
+        assert_eq!(tb.node(3).endpoint(), new);
+        tb.node_mut(3).config_mut().testing.delay_append_entries_ms = None;
+    }
+    let idx = write(&tb, 1);
+    tb.wait_applied(idx, CLUSTER_WAIT);
+    assert_eq!(files_on(&tb, 3), 2);
+}
+
+/// Review of #124: a node whose membership view merely lags (node.json has
+/// the new address, its own log not yet) is not refused: it serves at
+/// node.json's address, the leader catches it up, and the check passes.
+#[test]
+fn a_lagging_membership_view_is_caught_up_not_refused() {
+    let mut tb = ClusterTestbed::new(3, rust_only());
+    tb.form();
+    let idx = write(&tb, 0);
+    tb.wait_applied(idx, CLUSTER_WAIT);
+    let old = tb.node(3).endpoint();
+    let json_path = tb.data_dir(3).join("node.json");
+    tb.node_mut(3).stop();
+    let new = free_addr();
+    {
+        let cfg = tb.node_mut(3).config_mut();
+        cfg.listen = new.parse().unwrap();
+        cfg.update_advertise = Some(new.clone());
+        cfg.update_advertise_timeout = CLUSTER_WAIT;
+        // The old behaviour (no wait for the own log) plus a slow link:
+        // node.json is rewritten while this node's view still has `old`.
+        cfg.testing.advertise_rewrite_skip_wait = true;
+        cfg.testing.delay_append_entries_ms = Some(5_000);
+    }
+    tb.node_mut(3).restart();
+    assert_eq!(NodeJson::read(&json_path).unwrap().unwrap().advertise, new);
+    assert_eq!(
+        addr_in_membership(&tb, 3, 3),
+        Some(old.clone()),
+        "the view should lag behind node.json here"
+    );
+    tb.node_mut(3).stop();
+    {
+        let cfg = tb.node_mut(3).config_mut();
+        cfg.update_advertise = None;
+        cfg.testing.advertise_rewrite_skip_wait = false;
+        cfg.testing.delay_append_entries_ms = None;
+        cfg.testing.advertise_catchup_ms = Some(CLUSTER_WAIT.as_millis() as u64);
+    }
+    tb.node_mut(3)
+        .try_restart()
+        .unwrap_or_else(|e| panic!("a lagging view was refused: {e}"));
+    assert_eq!(addr_in_membership(&tb, 3, 3), Some(new.clone()));
+    let idx = write(&tb, 1);
+    tb.wait_applied(idx, CLUSTER_WAIT);
+    assert_eq!(files_on(&tb, 3), 2);
 }
 
 /// QA 3 and 4: the leader refuses a new address that is another member's

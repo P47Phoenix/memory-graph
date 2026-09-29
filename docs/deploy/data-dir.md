@@ -101,6 +101,17 @@ Run the command it names (the one you ran before, with the same `--update-advert
 already has that address, so it only confirms it, and then `node.json` is rewritten. To go back to
 the old address instead, run `--update-advertise <old address>`.
 
+`node.json` is rewritten only once the node's own log holds the new address, so a restart right
+after a successful move is never refused. A node whose log is merely behind (its membership still
+lists an older address) is not refused either: before refusing, a restart serves and waits a few
+seconds for the leader to catch it up, then checks again.
+
+**Addresses are compared as exact strings.** The check above, and the leader's own checks, compare
+the address in `node.json` (`--advertise` / `--update-advertise`) with the one in the membership
+character for character. `localhost:7003` and `127.0.0.1:7003` are different addresses, as are
+`[::1]:7003` and `::1:7003`. If you add a node by hand with `cluster add-learner <id> <addr>`,
+spell `<addr>` exactly as that node's `--advertise`, or its next restart is refused.
+
 ## Stopping a node
 
 A graceful stop drains in-flight requests, shuts Raft down and closes the store, then removes
