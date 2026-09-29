@@ -42,6 +42,12 @@ openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "generic-sn
 tonic-health = "=0.14.6"
 rand = "=0.8.8"
 tracing = "=0.1.44"
+# Structured logs (`serve --log-format text|json`, `--log-level`): fmt +
+# EnvFilter + JSON, no ANSI, no `time` crate (the built-in RFC 3339 timer).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter", "json"] }
+# The per-RPC tower layer (spans and metrics) on the tonic server.
+tower-layer = "0.3"
+tower-service = "0.3"
 
 # Optimise dependencies (redb, serde_json, ...) in dev/test builds so the
 # corpus test does not spend ~20s in unoptimised storage code.

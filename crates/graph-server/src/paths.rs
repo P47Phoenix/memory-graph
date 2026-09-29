@@ -111,6 +111,32 @@ pub enum InitMode {
     /// (refused with `WrongCluster` when the peer belongs to another
     /// cluster).
     Join(JoinSpec),
+    /// `--bootstrap-or-join` (a StatefulSet, ADR 0004 D10): ordinal 0
+    /// bootstraps and the others join, except that an ordinal 0 whose data
+    /// directory is not initialized first asks its siblings whether a
+    /// cluster already exists (pod 0 lost its volume) and joins it rather
+    /// than creating a second one. Resolved into [`InitMode::Bootstrap`] or
+    /// [`InitMode::Join`] by [`crate::join::resolve_bootstrap_or_join`]
+    /// before anything is opened.
+    BootstrapOrJoin(BootstrapOrJoin),
+}
+
+/// The `--bootstrap-or-join` settings ([`InitMode::BootstrapOrJoin`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapOrJoin {
+    /// This pod's ordinal (the host name's `-<n>` suffix).
+    pub ordinal: u64,
+    /// How to join: the peer is the named `--bootstrap-or-join` address
+    /// (ordinal 0's; for ordinal 0 itself, the sibling that answered).
+    pub join: JoinSpec,
+    /// `host:port` of the other members to ask for an existing cluster
+    /// (ordinal 0 on an uninitialized data directory only).
+    pub siblings: Vec<String>,
+    /// How long ordinal 0 asks before it bootstraps (it stops early once
+    /// every sibling answered that it has no cluster yet).
+    pub probe_timeout: std::time::Duration,
+    /// `--force-bootstrap`: ordinal 0 bootstraps without asking.
+    pub force_bootstrap: bool,
 }
 
 /// The `--join` flags.
@@ -362,6 +388,74 @@ pub fn hostname() -> String {
     "localhost".into()
 }
 
+/// The ordinal of a StatefulSet pod's host name: the number after the last
+/// `-` (`memory-graph-2` -> 2, `mg-0-1` -> 1). Refused (with the reason):
+/// no `-<digits>` suffix, a leading zero (`mg-007`: Kubernetes never names
+/// a pod so, and `mg-07` / `mg-7` must not both be node 8), or an ordinal
+/// too large for a node id.
+pub fn hostname_ordinal(host: &str) -> Result<u64, String> {
+    // A fully qualified name counts by its first label.
+    let first = host.split('.').next().unwrap_or(host);
+    let not_a_pod = || {
+        format!(
+            "host name `{host}` does not end in `-<ordinal>` (a StatefulSet pod name such as \
+             memory-graph-0)"
+        )
+    };
+    let (_, n) = first.rsplit_once('-').ok_or_else(not_a_pod)?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(not_a_pod());
+    }
+    if n.len() > 1 && n.starts_with('0') {
+        return Err(format!(
+            "host name `{host}`: the ordinal `{n}` has a leading zero (a StatefulSet pod \
+             ordinal never does)"
+        ));
+    }
+    n.parse::<u64>()
+        .ok()
+        .filter(|o| *o < u64::MAX)
+        .ok_or_else(|| {
+            format!(
+                "host name `{host}`: the ordinal `{n}` is too large for a node id (ordinal + 1)"
+            )
+        })
+}
+
+/// The other pods of a StatefulSet of `replicas` pods, from ordinal 0's
+/// address: `memory-graph-0.memory-graph.ns.svc:7000` with 3 replicas is
+/// `memory-graph-1.memory-graph.ns.svc:7000`, `memory-graph-2...` (what
+/// `--bootstrap-or-join` asks when `--peers` is not given).
+pub fn sibling_addrs(peer: &str, replicas: u64) -> Result<Vec<String>, String> {
+    let (host, port) = peer
+        .rsplit_once(':')
+        .ok_or_else(|| format!("`{peer}` is not host:port"))?;
+    let (first, rest) = match host.split_once('.') {
+        Some((f, r)) => (f, format!(".{r}")),
+        None => (host, String::new()),
+    };
+    let set = first
+        .strip_suffix("-0")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "`{peer}` is not ordinal 0 of a StatefulSet (`<name>-0...`); pass the other \
+                 members with --peers"
+            )
+        })?;
+    Ok((1..replicas)
+        .map(|i| format!("{set}-{i}{rest}:{port}"))
+        .collect())
+}
+
+/// `serve --node-id-from-hostname`: the node id of a StatefulSet pod, its
+/// ordinal plus one (node ids start at 1).
+pub fn node_id_from_hostname(host: &str) -> Result<u64, StoreError> {
+    hostname_ordinal(host)
+        .map(|n| n + 1)
+        .map_err(|e| StoreError::Rejected(format!("--node-id-from-hostname: {e}")))
+}
+
 /// The default advertised address for a bound `addr`: itself, with a
 /// wildcard IP (`0.0.0.0`, `[::]`) replaced by the host name.
 pub fn default_advertise(addr: std::net::SocketAddr) -> String {
@@ -468,17 +562,23 @@ pub fn plan(
             }
         }
     }
-    let restore = match init {
-        InitMode::Restart => {
-            return Err(StoreError::Rejected(format!(
-                "`{}` is not initialized: pass --bootstrap to create a new cluster, or \
+    let restore =
+        match init {
+            InitMode::BootstrapOrJoin(_) => return Err(StoreError::Rejected(
+                "internal: --bootstrap-or-join must be resolved (join::resolve_bootstrap_or_join) \
+                 before planning the start"
+                    .into(),
+            )),
+            InitMode::Restart => {
+                return Err(StoreError::Rejected(format!(
+                    "`{}` is not initialized: pass --bootstrap to create a new cluster, or \
                  --join <peer> to join one",
-                dir.display()
-            )))
-        }
-        InitMode::Bootstrap { restore } => restore.clone(),
-        InitMode::Uninitialized | InitMode::Join(_) => None,
-    };
+                    dir.display()
+                )))
+            }
+            InitMode::Bootstrap { restore } => restore.clone(),
+            InitMode::Uninitialized | InitMode::Join(_) => None,
+        };
     let node_id = node_id.ok_or_else(|| {
         StoreError::Rejected(format!(
             "--node-id is required on the first start of `{}`",
@@ -868,6 +968,46 @@ mod tests {
             "protocol_version":1,"store_format_version":1,"extractors_hash":"x","created":0}"#;
         std::fs::write(&path, old).unwrap();
         assert!(!NodeJson::read(&path).unwrap().unwrap().bootstrapped);
+    }
+
+    #[test]
+    fn hostname_ordinals() {
+        assert_eq!(hostname_ordinal("memory-graph-0"), Ok(0));
+        assert_eq!(hostname_ordinal("memory-graph-12"), Ok(12));
+        assert_eq!(hostname_ordinal("mg-3.memory-graph.ns.svc"), Ok(3));
+        assert_eq!(hostname_ordinal("mg-0-1"), Ok(1), "the last `-` counts");
+        assert!(hostname_ordinal("memory-graph").is_err());
+        assert!(hostname_ordinal("node-").is_err());
+        assert!(hostname_ordinal("node-1a").is_err());
+        let e = hostname_ordinal("mg-007").unwrap_err();
+        assert!(e.contains("leading zero"), "{e}");
+        assert!(hostname_ordinal("mg-00").is_err());
+        let e = hostname_ordinal("mg-99999999999999999999999").unwrap_err();
+        assert!(e.contains("too large"), "{e}");
+        let e = hostname_ordinal(&format!("mg-{}", u64::MAX)).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
+        assert_eq!(
+            hostname_ordinal(&format!("mg-{}", u64::MAX - 1)),
+            Ok(u64::MAX - 1)
+        );
+        let e = node_id_from_hostname("mg-007").unwrap_err().to_string();
+        assert!(e.contains("leading zero"), "{e}");
+        assert_eq!(
+            sibling_addrs("mg-0.mg.ns.svc.cluster.local:7000", 3).unwrap(),
+            [
+                "mg-1.mg.ns.svc.cluster.local:7000",
+                "mg-2.mg.ns.svc.cluster.local:7000"
+            ]
+        );
+        assert_eq!(sibling_addrs("my-set-0:7", 2).unwrap(), ["my-set-1:7"]);
+        assert!(sibling_addrs("mg-0:7", 1).unwrap().is_empty());
+        assert!(sibling_addrs("mg-1.mg:7000", 3).is_err());
+        assert!(sibling_addrs("-0:7", 3).is_err());
+        assert!(sibling_addrs("mg-0", 3).is_err());
+        assert_eq!(node_id_from_hostname("memory-graph-0").unwrap(), 1);
+        assert_eq!(node_id_from_hostname("memory-graph-2").unwrap(), 3);
+        let e = node_id_from_hostname("laptop").unwrap_err().to_string();
+        assert!(e.contains("laptop"), "{e}");
     }
 
     #[test]

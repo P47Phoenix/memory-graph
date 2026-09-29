@@ -1,0 +1,51 @@
+name: Compose
+# The three-node Compose cluster end to end (deploy/compose/cluster.yml,
+# ADR 0004 D10, epic story 24): build the image and the CLI, start the
+# cluster (`up --wait`: every node passes `health --ready`), index the corpus
+# through a follower, diff a follower's answers against an embedded run,
+# stop and restart the first node while writes go on, wait until all three
+# applied the same index, `down -v`. The steps live in
+# deploy/compose/check.sh, which runs the same way on a workstation.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compose-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build the CLI (the client side of the check)
+        run: cargo build --release --locked -p graph-cli
+
+      - name: Build the image once (layer cache shared with the Docker workflow)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: memory-graph:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cluster end to end
+        env:
+          MG: target/release/memory-graph
+          # The image was built above; do not build it again per service.
+          COMPOSE_UP_ARGS: --no-build
+          WAIT_SECS: "240"
+        run: bash deploy/compose/check.sh

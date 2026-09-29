@@ -195,6 +195,8 @@ enum ClusterCmd {
     TransferLeader { id: u64 },
 }
 
+// Parsed once per process; `Serve`'s many flags make it the large variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Serve a database over gRPC; other processes, machines and containers then use it with
@@ -229,9 +231,52 @@ enum Cmd {
             conflicts_with = "bootstrap"
         )]
         join: Option<String>,
-        /// With --join: become a voter once caught up (the leader promotes the node when its
-        /// replication lag is zero)
-        #[arg(long, requires = "join", conflicts_with = "standby")]
+        /// For a StatefulSet: ordinal 0 (host name ending in `-0`) bootstraps, the others --join
+        /// <HOST:PORT> (ordinal 0's address). Ordinal 0 on an empty data directory first asks the
+        /// other members (--peers) whether a cluster exists and joins it instead (a lost volume
+        /// never creates a second cluster). Restarts are plain restarts either way
+        #[arg(
+            long,
+            value_name = "HOST:PORT",
+            requires = "data_dir",
+            conflicts_with_all = ["bootstrap", "join", "restore"]
+        )]
+        bootstrap_or_join: Option<String>,
+        /// With --bootstrap-or-join: the other members ordinal 0 asks for an existing cluster,
+        /// comma-separated HOST:PORTs (default: ordinals 1..--replicas of the named peer's
+        /// StatefulSet, e.g. memory-graph-1.<same domain>:<same port>)
+        #[arg(
+            long,
+            requires = "bootstrap_or_join",
+            value_delimiter = ',',
+            value_name = "HOST:PORT,..."
+        )]
+        peers: Vec<String>,
+        /// With --bootstrap-or-join and no --peers: the StatefulSet's replica count
+        #[arg(
+            long,
+            requires = "bootstrap_or_join",
+            default_value_t = 3,
+            value_name = "N"
+        )]
+        replicas: u64,
+        /// With --bootstrap-or-join: how long ordinal 0 asks the other members before it
+        /// bootstraps (it stops early once all of them answered they have no cluster)
+        #[arg(
+            long,
+            requires = "bootstrap_or_join",
+            value_parser = parse_duration,
+            default_value = "30s",
+            value_name = "DURATION"
+        )]
+        bootstrap_probe_timeout: std::time::Duration,
+        /// With --bootstrap-or-join: ordinal 0 bootstraps an empty data directory without asking
+        /// the other members (a deliberate new cluster)
+        #[arg(long, requires = "bootstrap_or_join")]
+        force_bootstrap: bool,
+        /// With --join (or --bootstrap-or-join): become a voter once caught up (the leader
+        /// promotes the node when its replication lag is zero)
+        #[arg(long, conflicts_with = "standby")]
         auto_promote: bool,
         /// With --join: stay a learner (a read replica) until `cluster promote`; the default
         /// without --auto-promote, said explicitly
@@ -254,6 +299,30 @@ enum Cmd {
         /// from node.json (a different id is refused)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         node_id: Option<u64>,
+        /// Take the node id from the host name's trailing `-<ordinal>` plus one (a StatefulSet
+        /// pod `memory-graph-2` is node 3), instead of --node-id
+        #[arg(long, requires = "data_dir", conflicts_with = "node_id")]
+        node_id_from_hostname: bool,
+        /// Log format on stderr: text, or json (one object per line: timestamp, level, target,
+        /// message, span)
+        #[arg(long, value_enum, default_value = "text")]
+        log_format: graph_cli::logging::LogFormat,
+        /// Log filter, tracing EnvFilter syntax: `info`, `debug`, `info,graph_server=debug`
+        /// (default info). Env: MEMORY_GRAPH_LOG
+        #[arg(
+            long,
+            env = "MEMORY_GRAPH_LOG",
+            default_value = "info",
+            value_name = "FILTER"
+        )]
+        log_level: String,
+        /// Serve Prometheus metrics (text format 0.0.4) at http://<HOST:PORT>/metrics
+        #[arg(long, value_name = "HOST:PORT")]
+        metrics_listen: Option<String>,
+        /// The memory-graph.ready health service is SERVING only while a leader is known and
+        /// this node's applied index is within this many entries of the leader's commit index
+        #[arg(long, value_name = "N", default_value_t = graph_server::DEFAULT_READY_MAX_LAG)]
+        ready_max_lag: u64,
         /// Build a snapshot (and purge the log below it) after this many applied entries
         /// (default 10000)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
@@ -285,7 +354,10 @@ enum Cmd {
         snapshot_max_age: std::time::Duration,
     },
     /// Check a server's health (grpc.health.v1): exit 0 when serving, 1 when not (or unreachable).
-    /// With --ready: serving and a leader is known. Needs --server (or MEMORY_GRAPH_SERVER)
+    /// With --ready: the memory-graph.ready service, SERVING while a leader is known and this node
+    /// has applied to within the server's --ready-max-lag of the leader's commit index (a
+    /// Kubernetes readiness probe / Compose healthcheck). Exit 1 in every other case. Needs
+    /// --server (or MEMORY_GRAPH_SERVER)
     Health {
         #[arg(long)]
         ready: bool,
@@ -630,6 +702,10 @@ fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
 }
 
+/// Set once `serve --log-format json` installed its subscriber: a failure
+/// is then logged as JSON rather than printed as text.
+static JSON_LOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn main() {
     match run() {
         Ok(code) => std::process::exit(code),
@@ -647,7 +723,13 @@ fn main() {
                 Some(addr) => graph_cli::target::explain_remote_failure(e, addr, code),
                 None => e,
             };
-            eprintln!("Error: {e:?}");
+            if JSON_LOGS.get().copied().unwrap_or(false) {
+                // `serve --log-format json`: stderr stays one JSON object
+                // per line, the failure included.
+                tracing::error!(error = %format!("{e:#}"), exit_code = code, "memory-graph serve failed");
+            } else {
+                eprintln!("Error: {e:?}");
+            }
             std::process::exit(code);
         }
     }
@@ -690,12 +772,22 @@ fn run() -> Result<i32> {
         bootstrap,
         restore,
         join,
+        bootstrap_or_join,
+        peers,
+        replicas,
+        bootstrap_probe_timeout,
+        force_bootstrap,
         auto_promote,
         standby: _,
         accept_snapshot_overwrite,
         join_timeout,
         advertise,
         node_id,
+        node_id_from_hostname,
+        log_format,
+        log_level,
+        metrics_listen,
+        ready_max_lag,
         snapshot_log_entries,
         snapshot_log_bytes,
         log_keep_entries,
@@ -709,6 +801,47 @@ fn run() -> Result<i32> {
         if let Some(s) = &cli.server {
             bail!("serve takes --db <file> or --data-dir <dir> to serve, not --server {s}");
         }
+        graph_cli::logging::init(*log_format, log_level)?;
+        let _ = JSON_LOGS.set(*log_format == graph_cli::logging::LogFormat::Json);
+        if *auto_promote && join.is_none() && bootstrap_or_join.is_none() {
+            bail!("--auto-promote needs --join <peer> (or --bootstrap-or-join <peer>)");
+        }
+        // A StatefulSet pod's identity from its host name (ADR 0004 D10,
+        // docs/deploy/kubernetes.md): node id = ordinal + 1, ordinal 0
+        // bootstraps, the others join.
+        let host = graph_server::paths::hostname();
+        let node_id = &if *node_id_from_hostname {
+            Some(graph_server::paths::node_id_from_hostname(&host)?)
+        } else {
+            *node_id
+        };
+        let bootstrap_or_join = match bootstrap_or_join {
+            Some(peer) => {
+                let ordinal = graph_server::paths::hostname_ordinal(&host)
+                    .map_err(|e| anyhow::anyhow!("--bootstrap-or-join: {e}"))?;
+                let siblings = if !peers.is_empty() {
+                    peers.clone()
+                } else if ordinal == 0 {
+                    graph_server::paths::sibling_addrs(peer, *replicas)
+                        .map_err(|e| anyhow::anyhow!("--bootstrap-or-join: {e}"))?
+                } else {
+                    Vec::new()
+                };
+                Some(graph_server::paths::BootstrapOrJoin {
+                    ordinal,
+                    join: graph_server::JoinSpec {
+                        peer: peer.clone(),
+                        auto_promote: *auto_promote,
+                        accept_snapshot_overwrite: *accept_snapshot_overwrite,
+                        timeout: *join_timeout,
+                    },
+                    siblings,
+                    probe_timeout: *bootstrap_probe_timeout,
+                    force_bootstrap: *force_bootstrap,
+                })
+            }
+            None => None,
+        };
         if cli.chunk_bytes.is_some() {
             bail!("--chunk-bytes does not apply to serve: the server cuts replicated log entries at {} MiB", graph_client::RAFT_ENTRY_MAX_BYTES >> 20);
         }
@@ -736,7 +869,9 @@ fn run() -> Result<i32> {
                         dir.display()
                     );
                 }
-                let init = if *bootstrap {
+                let init = if let Some(b) = &bootstrap_or_join {
+                    graph_server::InitMode::BootstrapOrJoin(b.clone())
+                } else if *bootstrap {
                     graph_server::InitMode::Bootstrap {
                         restore: restore.clone(),
                     }
@@ -834,14 +969,26 @@ fn run() -> Result<i32> {
         if !cluster_mode && (tuned || advertise.is_some()) {
             // Not refused (a stage A script may pass them), but said: with
             // --db they tune the one-member log of this file only.
-            eprintln!(
-                "memory-graph serve: note: with --db, --advertise and the Raft options \
+            tracing::info!(
+                "note: with --db, --advertise and the Raft options \
                  (--snapshot-log-entries/-bytes, --log-keep-entries, --election-timeout-*, \
                  --heartbeat-interval) apply to this single-node server's own log only; \
                  clusters use --data-dir"
             );
         }
         cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
+        cfg.ready_max_lag = *ready_max_lag;
+        if let Some(m) = metrics_listen {
+            use std::net::ToSocketAddrs;
+            cfg.metrics_listen = Some(
+                m.to_socket_addrs()
+                    .with_context(|| format!("--metrics-listen {m}: not a host:port"))?
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--metrics-listen {m}: resolves to no address")
+                    })?,
+            );
+        }
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
         // Test-only fault injection (serve_e2e): park writes after N
@@ -856,15 +1003,30 @@ fn run() -> Result<i32> {
             (true, None) => format!("data dir {}", served.display()),
             (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
         };
-        graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |a| {
-            // Scripts and tests read this line for the bound port.
-            println!("memory-graph serve: listening on {a} ({shown})");
+        let log_format = *log_format;
+        graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
+            // Scripts and tests read these lines for the bound ports (the
+            // metrics line first: the listening line is the start signal);
+            // JSON objects under --log-format json.
+            use graph_cli::logging::start_line;
+            if let Some(m) = r.metrics_addr {
+                let msg = format!("metrics on http://{m}/metrics");
+                println!(
+                    "{}",
+                    start_line(log_format, "metrics", &msg, &m.to_string())
+                );
+            }
+            let msg = format!("listening on {} ({shown})", r.addr);
+            println!(
+                "{}",
+                start_line(log_format, "listening", &msg, &r.addr.to_string())
+            );
         })
         .map_err(|e| match e {
             StoreError::Locked(why) => graph_cli::target::locked_error(&served, &why),
             e => anyhow::Error::from(e).context(format!("serving `{}`", served.display())),
         })?;
-        eprintln!("memory-graph serve: stopped");
+        tracing::info!("memory-graph serve: stopped");
         return Ok(0);
     }
     let target = cli.target()?;
@@ -951,6 +1113,8 @@ fn run() -> Result<i32> {
                                 "log_bytes": st.log_bytes,
                                 "store_bytes": st.store_bytes,
                                 "writes_forwarded_total": st.writes_forwarded_total,
+                                "rpcs_total": st.rpcs_total,
+                                "entries_applied_total": st.entries_applied_total,
                                 "members": st.members.iter().map(|m| serde_json::json!({
                                     "node_id": m.node_id,
                                     "addr": m.addr,
