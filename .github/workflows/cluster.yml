@@ -14,10 +14,14 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/cluster_kill_test.py"
+      - "scripts/cluster_soak.py"
       - ".github/workflows/cluster.yml"
   schedule:
     # Nightly, so a change the path filter missed still meets the test.
     - cron: "17 3 * * *"
+    # Weekly (Sunday): also the short soak (epic story 25; the 60-minute run
+    # is local, see docs/spikes/raft-replication.md).
+    - cron: "41 4 * * 0"
   workflow_dispatch:
 jobs:
   kill-leader:
@@ -29,3 +33,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p graph-cli
       - run: python3 scripts/cluster_kill_test.py --bin target/release/memory-graph --rounds 3
+  soak:
+    # scripts/cluster_soak.py for 5 minutes: 3 nodes under a continuous
+    # indexing loop, a node restarted every minute (graceful stop and kill
+    # alternating), every acknowledged batch on every node, the Raft log
+    # within the purge policy. Weekly schedule (or by hand) only.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '41 4 * * 0')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p graph-cli
+      - run: python3 scripts/cluster_soak.py --bin target/release/memory-graph --minutes 5 --restart-every 60 --sample-every 15

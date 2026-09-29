@@ -40,7 +40,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the restart check waits for the peer's cluster id.
 const PEER_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn uri(addr: &str) -> String {
+pub(crate) fn uri(addr: &str) -> String {
     if addr.contains("://") {
         addr.to_string()
     } else {
@@ -48,7 +48,7 @@ fn uri(addr: &str) -> String {
     }
 }
 
-async fn admin(
+pub(crate) async fn admin(
     addr: &str,
     connect_timeout: Duration,
 ) -> Result<
@@ -104,14 +104,14 @@ pub async fn check_peer_cluster(peer: &str, mine: &str) -> Result<(), StoreError
 }
 
 /// What a `Join` attempt's failure means for the loop.
-enum Next {
+pub(crate) enum Next {
     /// Try again (after a back-off), at this address.
     Retry(String),
     /// A refusal: give up.
     Fail(StoreError),
 }
 
-fn classify(current: &str, st: &tonic::Status) -> Next {
+pub(crate) fn classify(current: &str, st: &tonic::Status) -> Next {
     if st.details().is_empty()
         && (st.code() == Code::Unavailable
             || graph_proto::error::is_transport_loss(st.code(), st.message()))

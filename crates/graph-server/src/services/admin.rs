@@ -171,6 +171,26 @@ async fn probe_node(ctx: &Ctx, id: NodeId, addr: &str) -> Result<pb::StatusRespo
     Ok(st)
 }
 
+/// `UpdateAdvertise`: the server at the new address must already be a
+/// member of this cluster, so it reports this cluster's id. [`probe_node`]
+/// lets an empty id through (a node that is still joining); a member being
+/// moved has one, so an empty id here is a server that is not it: an empty
+/// `theirs` is refused, like a different one.
+fn check_moved_member_cluster(
+    ours: &str,
+    id: NodeId,
+    addr: &str,
+    theirs: &str,
+) -> Result<(), Status> {
+    if theirs.is_empty() || theirs != ours {
+        return Err(Status::failed_precondition(format!(
+            "the server at {addr} reports cluster id `{theirs}`, not this cluster's `{ours}`: \
+             it is not member {id} of this cluster"
+        )));
+    }
+    Ok(())
+}
+
 fn check_extractors(ctx: &Ctx, id: NodeId, addr: &str, theirs: &str) -> Result<(), Status> {
     if theirs != ctx.info.extractors_hash {
         return Err(Status::failed_precondition(format!(
@@ -662,6 +682,49 @@ async fn join_guarded(ctx: &Arc<Ctx>, r: pb::JoinRequest) -> Result<pb::JoinResp
     })
 }
 
+/// `UpdateAdvertise` on the leader (`serve --update-advertise`): member
+/// `id` now listens at `addr`. Refused for an unknown node or an empty
+/// address; the server at `addr` must be node `id` of this cluster with
+/// this cluster's extractors (a misdirected update would point the leader's
+/// replication at another process). The address in effect already: a no-op.
+async fn update_advertise_guarded(ctx: &Ctx, id: NodeId, addr: &str) -> Result<u64, Status> {
+    if id == 0 || addr.is_empty() {
+        return Err(rejected(
+            "UpdateAdvertise needs a node id (>= 1) and an address".into(),
+        ));
+    }
+    ensure_leader_idle(ctx)?;
+    let m = ctx.raft.metrics();
+    let Some(node) = m.membership_config.membership().get_node(&id) else {
+        return Err(rejected(format!(
+            "node {id} is not a member of this cluster; a new node joins with `serve --join`"
+        )));
+    };
+    if node.addr == addr {
+        tracing::info!(node = id, addr, "update-advertise: already this address");
+        return Ok(membership_index(&m));
+    }
+    // Another member's recorded address, even while that member is down:
+    // two members at one address would send one's traffic to the other.
+    if let Some((other, _)) = m
+        .membership_config
+        .membership()
+        .nodes()
+        .find(|(o, n)| **o != id && n.addr == addr)
+    {
+        return Err(Status::failed_precondition(format!(
+            "{addr} is the recorded address of member {other}; a member's address must be its \
+             own (remove member {other} first if it moved away for good)"
+        )));
+    }
+    let old = node.addr.clone();
+    let st = probe_node(ctx, id, addr).await?;
+    check_moved_member_cluster(&ctx.info.cluster_id(), id, addr, &st.cluster_id)?;
+    let log_index = ctx.raft.set_node_addr(id, addr).await.map_err(status)?;
+    tracing::info!(node = id, from = %old, to = addr, log_index, "updated a member's address");
+    Ok(log_index)
+}
+
 /// Forward an admin request to the leader when this node is not it
 /// (counted like a forwarded write), else fall through to the local body.
 macro_rules! on_leader {
@@ -936,6 +999,16 @@ impl pb::admin_server::Admin for AdminService {
         ))
     }
 
+    async fn update_advertise(
+        &self,
+        req: Request<pb::UpdateAdvertiseRequest>,
+    ) -> Result<Response<pb::UpdateAdvertiseResponse>, Status> {
+        on_leader!(self, req, update_advertise);
+        let r = req.into_inner();
+        let log_index = update_advertise_guarded(&self.ctx, r.node_id, &r.addr).await?;
+        Ok(Response::new(pb::UpdateAdvertiseResponse { log_index }))
+    }
+
     async fn trigger_elect(
         &self,
         _req: Request<pb::TriggerElectRequest>,
@@ -1064,5 +1137,23 @@ impl pb::admin_server::Admin for AdminService {
         Ok(Response::new(pb::MetricsResponse {
             text: crate::observe::render(&self.ctx),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_moved_member_cluster;
+
+    /// Dev review 4: a moved member must report this cluster's id; an
+    /// empty or a different one is refused.
+    #[test]
+    fn update_advertise_probe_requires_a_matching_cluster_id() {
+        assert!(check_moved_member_cluster("abc", 3, "h:1", "abc").is_ok());
+        for theirs in ["", "other"] {
+            let e = check_moved_member_cluster("abc", 3, "h:1", theirs).unwrap_err();
+            assert_eq!(e.code(), tonic::Code::FailedPrecondition);
+            assert!(e.message().contains("not member 3"), "{}", e.message());
+        }
+        assert!(check_moved_member_cluster("", 3, "h:1", "").is_err());
     }
 }

@@ -301,7 +301,7 @@ Design: ADR 0004 D6, D8, D9.
 - Given `--join` on a directory whose store is not empty, When it starts, Then it must be refused without `--accept-snapshot-overwrite`.
 
 **23. Linearizable reads and crash tests (5 pts)**
-Status: Delivered on branch stage-d (PR pending). Settled details: [ADR 0004](adr/0004-client-server-and-replication.md) D8 ("Settled in stage D").
+Status: Delivered in PR #119. Settled details: [ADR 0004](adr/0004-client-server-and-replication.md) D8 ("Settled in stage D").
 As an AI-agent integrator
 I want a read mode that is guaranteed to see every acknowledged write
 So that an agent can index and then query without a race.
@@ -313,7 +313,7 @@ Design: ADR 0004 D7, D8.
 - Given the CI `cluster` job, When it spawns three binaries, kills the leader with SIGKILL mid-batch and restarts it, Then every acknowledged batch must be present on all nodes.
 
 **24. Observability and packaging (5 pts)**
-Status: delivered on branch stage-e (PR pending); see the README's Observability section and [docs/deploy/](deploy/kubernetes.md).
+Status: Delivered in PR #121; see the README's Observability section and [docs/deploy/](deploy/kubernetes.md).
 As a database operator
 I want logs, metrics, health probes and ready-made deployments
 So that I can run the cluster in Docker Compose or Kubernetes and see what it is doing.
@@ -325,6 +325,7 @@ Design: ADR 0004 D10.
 - Given `docs/deploy/kubernetes.md`, When followed, Then it must describe a StatefulSet with a headless service for `--advertise`, node ids from the ordinal, gRPC readiness on `memory-graph.ready`, a PodDisruptionBudget of `minAvailable: 2` and `cluster remove` before scale-down.
 
 **25. Cluster hardening (3 pts)**
+Status: Delivered in PR #124: the benchmark at the corpus and at 10 M tokens and the 60-minute soak in [spikes/raft-replication.md](spikes/raft-replication.md) ("Stage F at scale"), `scripts/cluster_soak.py` (weekly in the `cluster` CI workflow), `serve --update-advertise` (issue #107) and `serve --config <file.toml>` (issue #106). This closes the epic's client/server stories 20-25.
 As a database operator
 I want measured replication performance, a soak run and the remaining operator knobs
 So that the cluster can be trusted at the epic's scale target.

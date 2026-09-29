@@ -62,6 +62,10 @@ def wait_for(what, probe, timeout):
 
 
 class Node:
+    # Popen creationflags (the soak runs each node in its own process
+    # group on Windows, so a Ctrl-Break stops only that node).
+    popen_flags = 0
+
     def __init__(self, bin_path, root, node_id, port):
         self.bin = bin_path
         self.id = node_id
@@ -113,6 +117,7 @@ class Node:
             stdout=subprocess.PIPE,
             stderr=logf,
             stdin=subprocess.DEVNULL,
+            creationflags=self.popen_flags,
             text=True,
             encoding="utf-8",
             errors="replace",

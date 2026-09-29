@@ -544,6 +544,24 @@ impl RaftNode {
         Ok(r.log_id().index)
     }
 
+    /// Replace member `id`'s address with `addr` (`--update-advertise`):
+    /// one membership entry, voters and learners unchanged
+    /// (`ChangeMembers::SetNodes`; every replication stream is rebuilt with
+    /// the new address). The guards are the caller's
+    /// (`Admin.UpdateAdvertise`). Returns the entry's index.
+    pub async fn set_node_addr(&self, id: NodeId, addr: &str) -> Result<u64, StoreError> {
+        let _in_flight = self.proposal()?;
+        let r = committed(self.raft.change_membership(
+            openraft::ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
+                id,
+                BasicNode::new(addr),
+            )])),
+            false,
+        ))
+        .await?;
+        Ok(r.log_id().index)
+    }
+
     /// Build a snapshot now (after the disk guard) and wait until the
     /// current snapshot covers what was applied when asked; returns its
     /// `(index, term)`.

@@ -11,7 +11,7 @@ D6, D7.
 
 | Path | What | Notes |
 |---|---|---|
-| `node.json` | Node id, cluster id, advertised address, binary / protocol / store format versions, extractor version set hash, creation time | Written once on the first start. A different `--node-id` or `--advertise` on a later start is refused. |
+| `node.json` | Node id, cluster id, advertised address, binary / protocol / store format versions, extractor version set hash, creation time | Written on the first start. A different `--node-id` or `--advertise` on a later start is refused; `--update-advertise` rewrites the address once the cluster recorded it. |
 | `graph.redb` | The store: every applied log entry, and the index of the last one applied | What reads answer from. Same format as an embedded `--db` file. |
 | `raft.redb` | The Raft log, the vote and the committed index | Purged below each snapshot (keeping `--log-keep-entries`), then compacted. |
 | `snapshots/snap-<term>-<index>.redb` + `.meta` | The latest snapshot: a copy of the store at a log index, with its SHA-256, size and membership | One pair kept; a follower too far behind is sent it. |
@@ -68,5 +68,56 @@ a one-off pod running the same command, then scale back to 3.
 
 ## Moving a node
 
-A node's advertised address is part of the membership. To move a node to another address, remove
-it (`cluster remove <id>`), wipe its directory and join it again under the new address.
+A node's advertised address is part of the membership. To move a node to another address (a new
+IP, port or DNS name), restart it with `--update-advertise <host:port>`:
+
+```sh
+memory-graph serve --data-dir ./n3 --listen 0.0.0.0:7013 --update-advertise host3:7013
+```
+
+Once it serves at the new address, the node asks the leader (through itself or any member its
+membership lists) to record the address: the leader asks the server there who it is (it must be
+this node, of this cluster, with the same extractors) and commits one membership entry that
+replaces the address (voters and learners unchanged). An address another member has recorded,
+even one that is down, is refused. Only then is `node.json` rewritten. If no
+leader accepts it within 2 minutes, the start fails and `node.json` keeps the old address; run the
+same command again. A plain `--advertise` with another address is still refused. Until the leader
+has the new address it cannot reach the node, so move one node at a time and let it rejoin before
+the next. Removing the node (`cluster remove <id>`), wiping its directory and joining again under
+the new address also works, at the cost of a full copy.
+
+**A crash mid-move.** If the node stops after the cluster committed the new address but before
+`node.json` was rewritten, `node.json` still names the old address while the membership (in the
+node's own log) names the new one. A plain restart then refuses to start, because it would serve at
+the old address while the leader replicates to the new one:
+
+```text
+this node's address in node.json is host3:7003, but the cluster's membership records node 3 at
+host3:7013 (an --update-advertise that stopped after the cluster committed it); restart with
+--update-advertise host3:7013, listening where host3:7013 reaches, to finish the move
+```
+
+Run the command it names (the one you ran before, with the same `--update-advertise`). The leader
+already has that address, so it only confirms it, and then `node.json` is rewritten. To go back to
+the old address instead, run `--update-advertise <old address>`.
+
+`node.json` is rewritten only once the node's own log holds the new address, so a restart right
+after a successful move is never refused. A node whose log is merely behind (its membership still
+lists an older address) is not refused either: before refusing, a restart serves and waits a few
+seconds for the leader to catch it up, then checks again.
+
+**Addresses are compared as exact strings.** The check above, and the leader's own checks, compare
+the address in `node.json` (`--advertise` / `--update-advertise`) with the one in the membership
+character for character. `localhost:7003` and `127.0.0.1:7003` are different addresses, as are
+`[::1]:7003` and `::1:7003`. If you add a node by hand with `cluster add-learner <id> <addr>`,
+spell `<addr>` exactly as that node's `--advertise`, or its next restart is refused.
+
+## Stopping a node
+
+A graceful stop drains in-flight requests, shuts Raft down and closes the store, then removes
+`LOCK`. It is triggered by Ctrl-C or SIGTERM (`docker stop`, Kubernetes) on Unix, and by Ctrl-C or
+Ctrl-Break on Windows. A supervisor on Windows starts the server in its own process group
+(`CREATE_NEW_PROCESS_GROUP`) and sends it Ctrl-Break (Python:
+`proc.send_signal(signal.CTRL_BREAK_EVENT)`), as `scripts/cluster_soak.py` does. `taskkill /F` and
+`TerminateProcess` are kills: the node recovers from its log on the next start, but it does not
+drain.

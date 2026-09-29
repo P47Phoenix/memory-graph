@@ -41,6 +41,7 @@
 //! reads the node's store, `LINEARIZABLE` first runs openraft's read barrier,
 //! and a `snapshot_id` reads a frozen handle.
 
+pub mod advertise;
 pub mod conn;
 pub mod disk;
 pub mod extractors;

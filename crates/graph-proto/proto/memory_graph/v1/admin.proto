@@ -44,6 +44,13 @@ service Admin {
   rpc TriggerSnapshot(TriggerSnapshotRequest) returns (stream TriggerSnapshotResponse);
   // Prometheus text exposition of the server's metrics.
   rpc Metrics(MetricsRequest) returns (MetricsResponse);
+  // `serve --update-advertise` (stage F): member `node_id` now listens at
+  // `addr`. The leader asks the server at `addr` who it is (it must be that
+  // node, of this cluster, with this cluster's extractors) and replaces the
+  // node's address in the membership (one membership log entry; voters and
+  // learners unchanged). Idempotent: the address already in effect changes
+  // nothing. May be sent to any member: a follower forwards it.
+  rpc UpdateAdvertise(UpdateAdvertiseRequest) returns (UpdateAdvertiseResponse);
 }
 
 message StatusRequest {}
@@ -242,4 +249,15 @@ message MetricsRequest {}
 message MetricsResponse {
   // Prometheus text exposition format.
   string text = 1;
+}
+
+message UpdateAdvertiseRequest {
+  uint64 node_id = 1;
+  // The new `host:port` the leader and the other members reach it at.
+  string addr = 2;
+}
+message UpdateAdvertiseResponse {
+  // Log index of the membership change (the membership in effect when the
+  // address was already this one).
+  uint64 log_index = 1;
 }

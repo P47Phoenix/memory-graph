@@ -1,6 +1,6 @@
 # Measurement: Raft replication cost (log size, fsync throughput, ingest, snapshots)
 
-Status: stage B evidence (epic story 21, [ADR 0004](../adr/0004-client-server-and-replication.md) D5-D7 and its revisit trigger "replicated ingest below 50% of embedded"). Date 2026-09-28. Not a decision.
+Status: stage B evidence, plus the stage F run at scale and the soak (section "Stage F at scale", epic story 25) (epic story 21, [ADR 0004](../adr/0004-client-server-and-replication.md) D5-D7 and its revisit trigger "replicated ingest below 50% of embedded"). Date 2026-09-28. Not a decision.
 
 **TL;DR (plain language).**
 - **Replicated ingest runs at 94% of embedded speed, on one node and on three loopback nodes alike. The ADR trigger (below 50%) is not tripped.** [M]
@@ -99,3 +99,84 @@ The build is `V2Store::export_snapshot` from one read transaction, plus the SHA-
 - ADR 0004 revisit trigger ("replicated ingest below 50% of embedded"): **not tripped**. The measurement is 94% on one node and on three loopback nodes. [M]
 - The log does not accumulate on disk after snapshots, now that a purge compacts. The size gate pins it at <= 1.5x the indexed source (measured 0.53x). [M]
 - Not measured here: a real network, a large tree (the corpus is 1.7 MB), and a follower on a slower disk than the leader. The small-entry numbers are the floor that a real network adds to. [E]
+
+## Stage F at scale (epic story 25)
+
+Date 2026-09-28. Same machine as above: AMD Ryzen 9 7950X, 63 GB RAM, NVMe, Windows 11 Pro, rustc 1.98.1, `--release`. Three nodes are separate `serve --data-dir` processes on loopback, sharing one disk. All numbers are [M].
+
+**Method.**
+- **Harness:** the ignored test `measure_replication_at_scale` in `crates/graph-cli/tests/cluster_e2e.rs`, which drives the release binary. `MG_SCALE_TOKENS=10000000` generates a deterministic tree of about that many tokens (`generate_tree`: Rust, C#, JavaScript, HTML with extractors, Python on the fallback tokenizer, in ten repos). Without it, the harness uses the vendored corpus.
+- **Ingest:** one `index` process per repo. Embedded is best of 3 on the corpus, one run at 10 M. The one-node run uses `--bootstrap --log-keep-entries 0`. The three-node run has two `--join --auto-promote` nodes, and the clock starts once there are three voters.
+- **Snapshot:** built with `cluster snapshot` on the one-node server. Install is timed from starting a `--join --standby` learner after the purge until it has applied the leader's index.
+- **Reads:** six token searches (`--org`, limit 100), 50 rounds after a warm-up, in process through `RemoteStore` (local and linearizable) against the leader and a follower of the three-node cluster. The baseline is the same queries on the embedded file in process. "RPC overhead" is remote p50 minus embedded p50.
+- **Runs:** the corpus and 10 M results below come from an idle machine; the 10 M row shows two runs. Earlier 10 M runs overlapped with `cargo` builds on the same machine. They measured 3-node ingest at 43% and 66% of embedded, and one-node ingest at 76% and 79%. See issue #123.
+
+```sh
+cargo test --release -p graph-cli --test cluster_e2e measure_replication_at_scale -- --ignored --nocapture
+MG_SCALE_TOKENS=10000000 cargo test --release -p graph-cli --test cluster_e2e measure_replication_at_scale -- --ignored --nocapture
+```
+
+| | corpus | 10 M tokens (2 idle runs) |
+|---|---:|---:|
+| source | 1,684,464 B, 660 files, 243,987 tokens | 41,728,360 B, 10,811 files, 10,006,836 tokens |
+| store | 17,379,328 B | 539,504,640 B |
+| embedded ingest | 1.324 s | 9.160 / 8.935 s |
+| 1-node ingest (share of embedded) | 1.280 s (103%) | 11.345 / 11.202 s (81% / 80%) |
+| 3-node ingest via the leader (share of embedded; trigger < 50%) | 1.424 s (93%) | 12.328 / 12.575 s (74% / 71%) |
+| snapshot build | 0.135 s | 3.860 / 3.823 s |
+| snapshot transfer + install on a new learner | 0.165 s | 1.246 / 1.222 s |
+| read p50 / p95, embedded (in process) | 0.570 / 0.701 ms | 9.812 / 11.599 ms |
+| read p50 / p95, follower local | 0.773 / 0.917 ms | 10.342 / 12.091 ms |
+| read p50 / p95, follower linearizable | 0.966 / 1.098 ms | 11.000 / 13.176 ms |
+| read p50 / p95, leader local | 0.777 / 0.914 ms | 11.032 / 13.381 ms |
+| read p50 / p95, leader linearizable | 0.893 / 1.027 ms | 11.414 / 13.537 ms |
+| RPC overhead p50 (worst of the four; trigger > 5 ms) | 0.396 ms | 1.603 / 0.954 ms |
+
+**Reading it.**
+- Replicated ingest loses ground with size. On the corpus it matches embedded. At 10 M tokens it runs at 80% on one node and 71-74% on three. Each 8 MiB entry now pays its log fsync on the leader, a follower's fsync and the apply transaction, and the three nodes share one disk.
+- Under concurrent build load, one three-node run dropped to 43%, past the D5 trigger. It did not reproduce on an idle machine. It is issue #123: the margin is thinner at scale, and one shared disk is the worst case.
+- **Linearizable versus local reads on a follower:** linearizable adds about 0.2 ms at the corpus and 0.5-0.7 ms at 10 M. That is one ReadIndex round trip to the leader.
+- **RPC overhead** stays at 0.2-0.4 ms on the corpus and 0.4-1.6 ms at 10 M, where answers are 100 hits with spans. That is well under the 5 ms D1 trigger.
+- **The D7 trigger (install slower than replaying the retained log):** a new learner installs the 540 MB store in 1.2 s, while the same log took 11 s to apply on the leader. The trigger is not tripped.
+
+### Soak (60 minutes) [M]
+
+Script: `scripts/cluster_soak.py` (see [testing.md](../testing.md)). It ran in release on the machine above, from `stage-f` at `ccbdff1` (which includes Stage D, PR #119):
+
+```sh
+python scripts/cluster_soak.py --bin target/release/memory-graph --minutes 62 --csv soak-samples.csv
+```
+
+The three nodes ran with `--snapshot-log-entries 1000 --log-keep-entries 100`, so snapshots and purges happen every few thousand writes rather than every 10000. The writer loop alternated one-file `index-file` batches and 20-file `index <dir>` batches through `--server a,b,c`.
+
+**Restarts.** A node was restarted every 5 minutes, round robin, alternating a graceful stop (Ctrl-Break) and a kill (TerminateProcess). That made 12 restarts: 6 graceful, all of which exited 0, and 6 kills. Each restarted node caught up with the leader's committed index in 0.01-0.70 s.
+
+**Writes.** 39,512 batches were attempted and all 39,512 were acknowledged; none failed. At the end, every node held every acknowledged batch with every file, and all three had converged at applied index 58,974.
+
+**Purge policy.** The purged index advanced from 0 to about 57,900 on every node. `log_bytes` (the size of `raft.redb`) stayed between 0.73 and 3.9 MB for the whole hour, against a 64 MiB bound. It did not grow with the ~59,000 entries written.
+
+| t (min) | node 1 log_bytes / purged | node 2 | node 3 |
+|---:|---:|---:|---:|
+| 0 | 1,589,248 / 0 | 1,589,248 / 0 | 1,589,248 / 0 |
+| 5 | 2,117,632 / 4,900 | 1,617,920 / 4,900 | 1,617,920 / 4,900 |
+| 10 | 1,531,904 / 9,900 | 2,019,328 / 9,900 | 1,617,920 / 9,900 |
+| 15 | 1,531,904 / 14,900 | 1,605,632 / 14,900 | 2,117,632 / 14,900 |
+| 20 | 2,060,288 / 18,900 | 1,605,632 / 18,900 | 1,748,992 / 18,900 |
+| 25 | 1,748,992 / 23,900 | 3,702,784 / 23,900 | 1,748,992 / 23,900 |
+| 30 | 1,789,952 / 27,900 | 1,691,648 / 27,900 | 1,789,952 / 27,901 |
+| 35 | 1,789,952 / 32,901 | 1,691,648 / 32,900 | 1,531,904 / 32,901 |
+| 40 | 1,638,400 / 37,902 | 1,691,648 / 37,901 | 1,531,904 / 37,902 |
+| 45 | 1,638,400 / 42,902 | 1,773,568 / 42,928 | 1,531,904 / 42,902 |
+| 50 | 1,638,400 / 46,902 | 1,773,568 / 46,928 | 1,773,568 / 46,902 |
+| 55 | 1,896,448 / 51,902 | 1,773,568 / 51,928 | 1,835,008 / 51,902 |
+| 60 | 1,896,448 / 55,902 | 1,691,648 / 55,930 | 1,835,008 / 55,902 |
+| 62 (end) | 1,896,448 / 57,902 | 1,691,648 / 57,930 | 1,515,520 / 57,902 |
+
+Peaks over the run: 2.83 MB (node 1), 3.87 MB (node 2), 3.93 MB (node 3). The CI `cluster` workflow runs a 5-minute variant weekly (`--minutes 5 --restart-every 60`).
+
+### Stage F verdict
+
+- **D1 (RPC overhead > 5 ms p50 at 10 M tokens):** not tripped. The worst p50 was 1.6 ms.
+- **D5 (replicated ingest < 50% of embedded):** not tripped on an idle machine, which measured 71-81%. One run under load measured 43%, which is issue #123.
+- **D7 (snapshot install slower than log replay):** not tripped. Install took 1.2 s, against 11 s to apply the log.
+- **Soak:** no acknowledged write was lost in 62 minutes with 12 restarts, and the log stayed bounded (under 4 MB) with the purged index advancing on every node.

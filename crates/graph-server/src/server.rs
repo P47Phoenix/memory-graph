@@ -71,6 +71,12 @@ pub struct ServeConfig {
     /// address with a wildcard IP replaced by the host name. Stored in
     /// `node.json` (a different value on restart is refused).
     pub advertise: Option<String>,
+    /// `--update-advertise`: a restarted member now listens at this address;
+    /// it asks the cluster to record it, then rewrites `node.json`
+    /// ([`crate::advertise`]). Refused on a first start and in `--db` mode.
+    pub update_advertise: Option<String>,
+    /// How long `--update-advertise` keeps asking before the start fails.
+    pub update_advertise_timeout: Duration,
     /// Raft timing and log retention; `None` picks
     /// [`RaftSettings::cluster`] (`--data-dir`) or
     /// [`RaftSettings::standalone`] (`--db`).
@@ -119,6 +125,11 @@ pub struct ServeConfig {
     pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
 }
 
+/// How long a restart whose `node.json` address differs from the one its
+/// membership lists waits for the leader to catch it up (its log may be
+/// merely behind) before refusing to start.
+pub const ADVERTISE_CATCHUP: Duration = Duration::from_secs(5);
+
 /// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
 /// codes 3/4/5 can be driven end to end against a real server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -147,6 +158,19 @@ pub struct TestingHooks {
     /// Failpoint: a first start fails right after writing `node.json`,
     /// before the Raft node is initialized (a crash in that window).
     pub fail_after_node_json: bool,
+    /// Failpoint: `--update-advertise` fails right after the cluster
+    /// committed the new address, before `node.json` is rewritten (a crash
+    /// in that window).
+    pub fail_before_advertise_rewrite: bool,
+    /// `--update-advertise` rewrites `node.json` as soon as the leader
+    /// committed the new address, without waiting for this node's own log
+    /// to hold it (the behaviour before that wait existed), so a test can
+    /// leave a node with a lagging membership view.
+    pub advertise_rewrite_skip_wait: bool,
+    /// How long a restart whose `node.json` address differs from its
+    /// membership's waits for the leader to catch it up before refusing
+    /// (default [`ADVERTISE_CATCHUP`]).
+    pub advertise_catchup_ms: Option<u64>,
     /// Hold every received `AppendEntries` that carries entries for this
     /// long before handing it to Raft (a slow link or disk, longer than
     /// the leader's heartbeat timeout). Heartbeats are not delayed.
@@ -173,6 +197,8 @@ impl ServeConfig {
             listen,
             node_id: None,
             advertise: None,
+            update_advertise: None,
+            update_advertise_timeout: crate::advertise::DEFAULT_UPDATE_ADVERTISE_TIMEOUT,
             raft: None,
             min_free_disk: 0,
             free_space_probe: None,
@@ -215,6 +241,7 @@ impl std::fmt::Debug for ServeConfig {
             .field("listen", &self.listen)
             .field("node_id", &self.node_id)
             .field("advertise", &self.advertise)
+            .field("update_advertise", &self.update_advertise)
             .field("raft", &self.raft)
             .field("min_free_disk", &self.min_free_disk)
             .field("cache_bytes", &self.cache_bytes)
@@ -346,6 +373,27 @@ pub async fn start(
     }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
+    // `--update-advertise` moves a member: refused before anything is
+    // opened or written for a node that is not one.
+    if cfg.update_advertise.is_some() {
+        match &plan {
+            None => {
+                return Err(StoreError::Rejected(
+                    "--update-advertise needs --data-dir (a --db server is a cluster of one; \
+                     its address is --advertise)"
+                        .into(),
+                ))
+            }
+            Some(p) if p.existing.is_none() => {
+                return Err(StoreError::Rejected(
+                    "--update-advertise changes the address of a node that already belongs \
+                     to a cluster; this data directory is new (use --advertise)"
+                        .into(),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
     if let Some(r) = &cfg.raft {
         r.validate(paths.data_dir.is_some())
             .map_err(|e| StoreError::Rejected(format!("Raft settings: {e}")))?;
@@ -443,6 +491,9 @@ pub async fn start(
         })));
     }
     let mut initialize = plan.is_none();
+    // `--update-advertise` on a restart whose address differs: the new
+    // address, and node.json as it is until the cluster recorded it.
+    let mut moved: Option<(PathBuf, NodeJson)> = None;
     let (identity, advertise) = match (&plan, &paths.node_json) {
         (Some(plan), Some(json_path)) => {
             let (json, advertise) = match &plan.existing {
@@ -450,13 +501,43 @@ pub async fn start(
                     if let Some(a) = &cfg.advertise {
                         if a != &found.advertise {
                             return Err(StoreError::Rejected(format!(
-                                "--advertise {a} differs from {} recorded in `{}` \
-                                 (changing it needs --update-advertise, a later stage)",
+                                "--advertise {a} differs from {} recorded in `{}`; to move \
+                                 this node to a new address, restart it with \
+                                 --update-advertise {a} (instead of --advertise)",
                                 found.advertise,
                                 json_path.display()
                             )));
                         }
                     }
+                    let advertise = match &cfg.update_advertise {
+                        Some(a) if a != &found.advertise => {
+                            if found.cluster_id.is_none() {
+                                return Err(StoreError::Rejected(format!(
+                                    "--update-advertise {a}: this node never joined its \
+                                     cluster (no cluster id in `{}`), so no member knows its \
+                                     address; start it with --join again",
+                                    json_path.display()
+                                )));
+                            }
+                            tracing::warn!(
+                                from = %found.advertise,
+                                to = %a,
+                                "--update-advertise: moving this node to a new address"
+                            );
+                            let mut json = found.clone();
+                            json.advertise = a.clone();
+                            moved = Some((json_path.clone(), json));
+                            a.clone()
+                        }
+                        Some(a) => {
+                            tracing::info!(
+                                addr = %a,
+                                "--update-advertise: already the recorded address; nothing to do"
+                            );
+                            found.advertise.clone()
+                        }
+                        None => found.advertise.clone(),
+                    };
                     // The log and the store must agree before the node
                     // takes part in any election (QA: a lost raft.redb
                     // would let it vote twice in a term).
@@ -470,7 +551,7 @@ pub async fn start(
                         )?;
                     }
                     initialize = found.bootstrapped;
-                    (found.clone(), found.advertise.clone())
+                    (found.clone(), advertise)
                 }
                 None => {
                     let advertise = cfg
@@ -570,6 +651,15 @@ pub async fn start(
         testing_apply_gate: cfg.testing_apply_gate.clone(),
     })
     .await?;
+    // A restart that keeps node.json's address (no move asked for): the
+    // membership this node loaded must list it there too. They differ after
+    // a `--update-advertise` that stopped between the cluster committing the
+    // new address and node.json being rewritten; serving at the old address
+    // would then leave the leader replicating to the new one. Refused, with
+    // the flag that finishes the move (ADR 0004 Q3, docs/deploy/data-dir.md).
+    // Checked once serving (below): a log that is merely behind gets a
+    // bounded wait to catch up from the leader first.
+    let check_address = moved.is_none() && plan.as_ref().is_some_and(|p| p.existing.is_some());
     raft.withhold_leader = cfg.testing.withhold_leader;
     raft.hold_proposal = cfg.testing.hold_proposal_ms.map(Duration::from_millis);
     let shutdown = ShutdownHandle::new();
@@ -779,6 +869,47 @@ pub async fn start(
             result
         })
     };
+    if check_address && !listed_at(&raft, node_id, &ctx.info.advertise) {
+        // Serving at node.json's address: if the leader lists this node
+        // there, it replicates here and the view catches up; if it lists
+        // another address, it never does and the start is refused.
+        let wait = cfg
+            .testing
+            .advertise_catchup_ms
+            .map_or(ADVERTISE_CATCHUP, Duration::from_millis);
+        let advertise = ctx.info.advertise.clone();
+        let want = advertise.clone();
+        let _ = raft
+            .raft
+            .wait(Some(wait))
+            .metrics(
+                move |m| {
+                    m.membership_config
+                        .membership()
+                        .get_node(&node_id)
+                        .is_none_or(|n| n.addr == want)
+                },
+                "node.json's address in this node's membership",
+            )
+            .await;
+        let listed = raft
+            .metrics()
+            .membership_config
+            .membership()
+            .get_node(&node_id)
+            .map(|n| n.addr.clone());
+        if let Some(listed) = listed.filter(|l| *l != advertise) {
+            shutdown.trigger();
+            let _ = task.await;
+            return Err(StoreError::Rejected(format!(
+                "this node's address in node.json is {advertise}, but the cluster's membership \
+                 records node {node_id} at {listed} (an --update-advertise that stopped after \
+                 the cluster committed it); restart with --update-advertise {listed}, listening \
+                 where {listed} reaches, to finish the move"
+            )));
+        }
+        tracing::info!(%advertise, "membership caught up with node.json's address");
+    }
     // `--join`: serving now (the leader asks this node who it is before
     // adding it), so ask to be added; a refusal or the timeout stops the
     // server again and fails the start.
@@ -799,6 +930,98 @@ pub async fn start(
         if spec.auto_promote {
             crate::join::spawn_rejoin(raft.clone(), spec.peer.clone(), req, shutdown.clone());
         }
+    }
+    // `--update-advertise`: serving at the new address now (the leader asks
+    // it who it is), so ask the cluster to record it: through this node
+    // first (it forwards to the leader it knows, or leads itself), then the
+    // other members at the addresses its membership lists. node.json
+    // follows only once the change is committed; a refusal or the timeout
+    // stops the server again and fails the start, node.json unchanged.
+    if let Some((json_path, json)) = moved {
+        let mut endpoints = vec![addr.to_string()];
+        endpoints.extend(
+            raft.metrics()
+                .membership_config
+                .membership()
+                .nodes()
+                .filter(|(id, _)| **id != node_id)
+                .map(|(_, n)| n.addr.clone()),
+        );
+        let done = crate::advertise::update_advertise(
+            &endpoints,
+            node_id,
+            &json.advertise,
+            cfg.update_advertise_timeout,
+        )
+        .await;
+        // Committed, but node.json not rewritten: say so, and how to finish.
+        let not_rewritten = |e: StoreError| {
+            StoreError::Storage(format!(
+                "the cluster recorded node {node_id} at {new}, but `{}` was not rewritten: {e}; \
+                 fix that, then restart with --update-advertise {new} to finish the move (a \
+                 plain restart is refused until then)",
+                json_path.display(),
+                new = json.advertise,
+            ))
+        };
+        // The leader's commit does not need this node in its majority, so
+        // this node's own log may not hold the new address yet. node.json
+        // follows only once it does (bounded wait): otherwise a stop in that
+        // window leaves node.json ahead of the local membership, and the
+        // restart check would name the old address.
+        let in_own_log = |raft: &RaftNode| {
+            let want = json.advertise.clone();
+            let r = raft.raft.clone();
+            async move {
+                r.wait(Some(Duration::from_secs(30)))
+                    .metrics(
+                        move |m| {
+                            m.membership_config
+                                .membership()
+                                .get_node(&node_id)
+                                .is_some_and(|n| n.addr == want)
+                        },
+                        "new address in this node's membership",
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        StoreError::Storage(format!(
+                            "this node's own log did not receive the new address: {e}"
+                        ))
+                    })
+            }
+        };
+        let done = match done {
+            Ok(_) if cfg.testing.fail_before_advertise_rewrite => {
+                // Deterministic: the crash comes once this node's own log
+                // holds the committed address (bounded wait).
+                let _ = in_own_log(&raft).await;
+                Err(not_rewritten(StoreError::Storage(
+                    "testing: failpoint after the new address was committed, before node.json \
+                     was rewritten"
+                        .into(),
+                )))
+            }
+            Ok(_) if cfg.testing.advertise_rewrite_skip_wait => {
+                json.write(&json_path).map_err(not_rewritten)
+            }
+            Ok(_) => match in_own_log(&raft).await {
+                Ok(()) => json.write(&json_path).map_err(not_rewritten),
+                Err(e) => Err(not_rewritten(e)),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = done {
+            shutdown.trigger();
+            let _ = task.await;
+            return Err(e);
+        }
+        tracing::info!(
+            advertise = %json.advertise,
+            node_json = %json_path.display(),
+            "--update-advertise: node.json records the new address"
+        );
     }
     Ok(Running {
         addr,
@@ -892,10 +1115,37 @@ async fn wait_for_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    // Windows: Ctrl-C, and Ctrl-Break (what a supervisor sends a console
+    // process it started in its own process group, e.g. Python's
+    // `send_signal(CTRL_BREAK_EVENT)` in `scripts/cluster_soak.py`).
+    #[cfg(windows)]
+    {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut brk) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = brk.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Whether this node's membership view lists node `id` at `addr` (or not at
+/// all: nothing to compare against).
+fn listed_at(raft: &RaftNode, id: u64, addr: &str) -> bool {
+    raft.metrics()
+        .membership_config
+        .membership()
+        .get_node(&id)
+        .is_none_or(|n| n.addr == addr)
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ pub mod logging;
 use diskinfo::{DiskInputs, DiskPolicy, DiskProbe, MinFree};
 pub mod progress;
 pub mod report;
+pub mod serve_config;
 pub mod sysinfo;
 pub mod target;
 use dataflow::Trace;

@@ -40,6 +40,8 @@ console.workspace = true
 crossbeam-channel.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# serve --config <file.toml> (pure Rust).
+toml = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
