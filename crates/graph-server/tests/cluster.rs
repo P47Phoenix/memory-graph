@@ -1006,6 +1006,57 @@ fn a_slow_append_longer_than_the_heartbeat_still_replicates() {
     assert_eq!(l.metrics().current_term, term, "no election");
 }
 
+/// #116: a write that takes longer than the quorum-loss window to commit,
+/// because every follower is slow (not gone), still succeeds. openraft 0.9
+/// sends a follower no heartbeat while an append to it is under way, so
+/// the leader hears nothing from either follower for longer than the
+/// window; the liveness probe finds them `SERVING`, so the leader never
+/// answers the write `NoLeader`.
+///
+/// The timings keep the append delay between the window and the election
+/// timeout: the followers, hearing nothing meanwhile either, must not call
+/// an election (QA: with the delay above `election_min` this test failed 7
+/// of 22 runs on an election, not on the check under test).
+#[test]
+fn a_slow_but_healthy_write_is_not_cut_off_by_the_quorum_loss_window() {
+    let raft = RaftSettings {
+        heartbeat_ms: 150,
+        election_min_ms: 2000,
+        election_max_ms: 3000,
+        quorum_loss_ms: Some(300),
+        ..TEST_RAFT
+    };
+    let window = raft.quorum_loss_window();
+    // Past the window by far, well short of the election timeout.
+    let delay = 800;
+    let mut tb = ClusterTestbed::with_config(3, exts(), move |id, c| {
+        c.raft = Some(raft);
+        if id != 1 {
+            c.testing.delay_append_entries_ms = Some(delay);
+        }
+    });
+    tb.form();
+    let leader = tb.leader();
+    let term = tb.node(leader).raft().unwrap().metrics().current_term;
+    let mut cfg = graph_client::ClientConfig::new(tb.node(leader).endpoint());
+    cfg.write_deadline = Duration::from_secs(1);
+    let c = RemoteStore::connect(cfg).unwrap();
+    let t0 = Instant::now();
+    let f = small_file(0);
+    c.index_bytes("o", "r", &f.0, &f.1, None)
+        .expect("a slow but healthy write succeeds");
+    let took = t0.elapsed();
+    assert!(
+        took > window,
+        "the write outlasted the window (and the write deadline): {took:?}"
+    );
+    let l = tb.node(leader).raft().unwrap();
+    assert_eq!(l.metrics().current_term, term, "no election");
+    // The silent followers were asked directly and answered SERVING.
+    let (alive, dead) = l.net_stats.probes();
+    assert!(alive > 0, "alive {alive}, dead {dead}");
+}
+
 /// Final review 1: while a slow follower's transfer is under way the
 /// leader's log keeps growing, so openraft's retries ask for more entries
 /// than the transfer carries. They join it (a partial success up to what
@@ -1335,20 +1386,22 @@ fn a_minority_partition_cannot_commit_and_heals() {
     let mut cfg = graph_client::ClientConfig::new(tb.node(old).endpoint());
     cfg.write_deadline = Duration::from_secs(2);
     let lonely = RemoteStore::connect(cfg).unwrap();
-    // The cut-off leader accepts the proposal but can never commit it: the
-    // call does not return (the client's deadline bounds its retries, not
-    // a call in flight), so it runs on its own thread and must not have
-    // succeeded 2 s later.
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let writer = std::thread::spawn(move || {
-        let r = lonely.index_bytes("o", "r", "lost.rs", b"fn lost() {}", None);
-        let _ = done_tx.send(r.is_ok());
-    });
-    // Still pending after 2 s means not committed; an answer must not be a
-    // success.
-    if let Ok(ok) = done_rx.recv_timeout(Duration::from_secs(2)) {
-        assert!(!ok, "a minority committed a write");
-    }
+    // #116: the cut-off leader accepts the proposal but can never commit
+    // it; once no quorum has answered it for the quorum-loss window (1.2 s
+    // here) it answers `NoLeader`, the client retries until its 2 s write
+    // deadline and fails with `NoLeader` (exit 4 in the CLI). Bounded:
+    // deadline plus the window plus one back-off, with margin.
+    let t0 = Instant::now();
+    let r = lonely.index_bytes("o", "r", "lost.rs", b"fn lost() {}", None);
+    let took = t0.elapsed();
+    assert!(
+        matches!(r, Err(graph_store::StoreError::NoLeader { .. })),
+        "a minority write must fail NoLeader: {r:?}"
+    );
+    let bound = Duration::from_secs(2)
+        + Duration::from_millis(TEST_RAFT.election_max_ms)
+        + Duration::from_millis(1500);
+    assert!(took < bound, "took {took:?}, bound {bound:?}");
     // The old leader may still believe it leads; wait for the majority's.
     let deadline = Instant::now() + CLUSTER_WAIT;
     let new = loop {
@@ -1367,18 +1420,7 @@ fn a_minority_partition_cannot_commit_and_heals() {
     tb.heal();
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
     // Healed, the old leader learns the new term and truncates its
-    // uncommitted proposal; the client, told `NotLeader`, may retry it
-    // through the new leader. Either way the call ends, and then every
-    // node holds the same history.
-    if matches!(
-        done_rx.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty)
-    ) {
-        done_rx
-            .recv_timeout(CLUSTER_WAIT)
-            .expect("the pending write ended after healing");
-    }
-    writer.join().unwrap();
+    // uncommitted proposal; every node then holds the majority's history.
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
     let want = summary(&tb.client(new));
     for id in tb.ids() {
