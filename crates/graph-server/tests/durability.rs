@@ -7,7 +7,6 @@ use graph_client::{ClientConfig, RemoteStore};
 use graph_core::{Extractor, NodeKind};
 use graph_server::powercut::{CutMode, PowerCutDisk};
 use graph_server::testing::{ClusterTestbed, CLUSTER_WAIT};
-use graph_server::RaftSettings;
 use graph_store::{open_store, BatchFile, IndexOptions, RepoInfo, Store, StoreRead};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -134,7 +133,7 @@ fn a_power_cut_mid_write_leaves_no_torn_state() {
                 let d2 = disk.clone();
                 let mut tb = ClusterTestbed::with_config(1, exts(), move |_, c| {
                     c.storage_backend = Some(d2.factory());
-                    c.raft = Some(RaftSettings::standalone());
+                    c.raft = Some(graph_server::testing::TEST_RAFT);
                 });
                 let dir = tb.data_dir(1);
                 // The same port across the restart.

@@ -858,7 +858,7 @@ fn bootstrap_cfg(dir: &Path, listen: &str, node_id: u64) -> ServeConfig {
         InitMode::Bootstrap { restore: None },
         Some(node_id),
     );
-    cfg.raft = Some(RaftSettings::standalone());
+    cfg.raft = Some(graph_server::testing::TEST_RAFT);
     cfg.shutdown_grace = Duration::from_secs(5);
     cfg
 }
@@ -1068,7 +1068,7 @@ fn adding_a_node_of_another_cluster_is_refused() {
         InitMode::Uninitialized,
         Some(3),
     );
-    other.raft = Some(RaftSettings::standalone());
+    other.raft = Some(graph_server::testing::TEST_RAFT);
     let c = TestServer::try_start_config(
         other,
         vec![Box::new(graph_lang_rust::RustExtractor) as Box<dyn Extractor>],

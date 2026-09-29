@@ -9,7 +9,7 @@ use graph_client::{ClientConfig, ReadMode, RemoteStore};
 use graph_core::{Extractor, NodeKind};
 use graph_proto::pb;
 use graph_server::testing::{ClusterTestbed, TestServer, CLUSTER_WAIT};
-use graph_server::{InitMode, JoinSpec, NodeJson, RaftSettings, ServeConfig};
+use graph_server::{InitMode, JoinSpec, NodeJson, ServeConfig};
 use graph_store::conformance::run_differential;
 use graph_store::{BatchFile, IndexOptions, Store, StoreError, StoreRead, ORIGIN_DIRECTORY};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -328,7 +328,7 @@ fn wrong_cluster_is_refused() {
         InitMode::Bootstrap { restore: None },
         Some(2),
     );
-    cfg.raft = Some(RaftSettings::standalone());
+    cfg.raft = Some(graph_server::testing::TEST_RAFT);
     let b = {
         let s = TestServer::try_start_config(cfg.clone(), exts()).unwrap();
         let id = RemoteStore::connect(ClientConfig::new(s.endpoint()))
