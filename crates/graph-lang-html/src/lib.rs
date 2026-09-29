@@ -21,12 +21,8 @@ pub struct HtmlExtractor;
 
 /// Tokenizer dialect used for HTML.
 pub const HTML_TOKENIZER: TokenizerOptions = TokenizerOptions {
-    rust_literals: false,
-    single_quote_strings: false,
-    csharp_strings: false,
     markup: true,
-    aspx: false,
-    regex_literals: false,
+    ..TokenizerOptions::DEFAULT
 };
 
 impl Extractor for HtmlExtractor {

@@ -28,12 +28,9 @@ pub struct JavaScriptExtractor;
 
 /// Tokenizer dialect used for JavaScript.
 pub const JS_TOKENIZER: TokenizerOptions = TokenizerOptions {
-    rust_literals: false,
     single_quote_strings: true,
-    csharp_strings: false,
-    markup: false,
-    aspx: false,
     regex_literals: true,
+    ..TokenizerOptions::DEFAULT
 };
 
 impl Extractor for JavaScriptExtractor {
