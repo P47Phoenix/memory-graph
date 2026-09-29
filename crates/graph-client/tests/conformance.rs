@@ -357,6 +357,78 @@ fn store_errors_round_trip_through_a_real_rpc() {
     assert!(matches!(err, StoreError::InvalidSpan(_)), "{err:?}");
 }
 
+/// The server normalizes on receipt, not only the Rust client: raw
+/// `IndexFile`, `IngestExtraction` and `Prune` requests carrying `\` paths
+/// (as another client might send) are stored and matched as `/` (#120).
+#[test]
+fn server_normalizes_raw_backslash_paths() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), vec![]);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{}", server.endpoint()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut w = pb::write_client::WriteClient::new(ch);
+        w.index_file(pb::IndexFileRequest {
+            org: "o".into(),
+            repo: "r".into(),
+            file: Some(pb::FileBytes {
+                path: r"dir\.gitignore".into(),
+                bytes: b"foo\n".to_vec(),
+                language: None,
+                origin: Some(ORIGIN_DIRECTORY.into()),
+            }),
+            options: Some(IndexOptions::default().into()),
+        })
+        .await
+        .unwrap();
+        let ex = graph_core::Extraction {
+            has_errors: false,
+            symbols: vec![],
+            tokens: graph_core::tokenizer::tokenize("foo"),
+        };
+        w.ingest_extraction(pb::IngestExtractionRequest {
+            org: "o".into(),
+            repo: "r".into(),
+            path: r"src\x.txt".into(),
+            language: "text".into(),
+            extraction: Some(ex.into()),
+            origin: Some(ORIGIN_DIRECTORY.into()),
+        })
+        .await
+        .unwrap();
+        let removed = w
+            .prune(pb::PruneRequest {
+                org: "o".into(),
+                repo: "r".into(),
+                keep: vec![r"dir\.gitignore".into(), r"src\x.txt".into()],
+                dry_run: true,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .removed;
+        assert!(removed.is_empty(), "{removed:?}");
+    });
+    let remote = connect(&server);
+    for f in ["dir/.gitignore", "src/x.txt"] {
+        assert!(remote.file_tokens("o", "r", f).unwrap().is_some(), "{f}");
+    }
+    let info = format!("{:?}", remote.describe(None, None).unwrap());
+    assert!(!info.contains("gitignore"), "{info}");
+    let mut files: Vec<_> = remote
+        .search(&Query::new("foo"))
+        .unwrap()
+        .into_iter()
+        .filter_map(|h| h.file)
+        .collect();
+    files.sort();
+    assert_eq!(files, ["dir/.gitignore", "src/x.txt"]);
+}
+
 #[test]
 fn unknown_protocol_version_is_refused() {
     let d = tempfile::tempdir().unwrap();

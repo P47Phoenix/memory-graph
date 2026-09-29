@@ -44,6 +44,7 @@ fn opening_a_directory_has_no_read_only_hint() {
         .to_string();
     assert!(msg.contains("cannot open database"), "{msg}");
     assert!(!msg.contains("writable"), "{msg}");
+    assert!(msg.contains("not a database file"), "{msg}");
 }
 
 #[cfg(unix)]

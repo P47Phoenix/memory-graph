@@ -2489,10 +2489,18 @@ fn the_fifty_percent_age_warning_fires_exactly_once_per_snapshot() {
         "failed to build snapshot_warn_probe example:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let exe = workspace_root.join(format!(
-        "target/debug/examples/snapshot_warn_probe{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    // This test binary is `<target>/<profile>/deps/<name>`; the example lands
+    // in `<target>/<profile>/examples`, whatever CARGO_TARGET_DIR says.
+    let exe = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("test binary lives under <target>/<profile>/deps")
+        .join("examples")
+        .join(format!(
+            "snapshot_warn_probe{}",
+            std::env::consts::EXE_SUFFIX
+        ));
     assert!(exe.exists(), "expected probe binary at {exe:?}");
 
     let d = tempfile::tempdir().unwrap();

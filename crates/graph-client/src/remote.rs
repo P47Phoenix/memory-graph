@@ -653,7 +653,7 @@ impl Store for RemoteStore {
         let req = pb::PruneRequest {
             org: org.into(),
             repo: repo.into(),
-            keep: keep.iter().cloned().collect(),
+            keep: keep.iter().map(|k| graph_core::normalize_path(k)).collect(),
             dry_run,
         };
         let kind = if dry_run { Kind::Read } else { Kind::Write };

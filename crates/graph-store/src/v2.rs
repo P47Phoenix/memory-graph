@@ -3104,6 +3104,9 @@ impl V2Store {
         keep: &HashSet<String>,
         dry_run: bool,
     ) -> Result<Vec<String>> {
+        // Stored paths are normalized; so is the keep set, or a `\` keep set
+        // (a Windows caller) would match nothing and prune everything.
+        let keep: HashSet<String> = keep.iter().map(|k| normalize_path(k)).collect();
         let mut removed = Vec::new();
         {
             let mut w = W::new(wt)?;

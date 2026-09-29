@@ -93,6 +93,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("prepared_duplicate_paths", prepared_duplicate_paths),
     ("remote_prepared_is_rejected", remote_prepared_is_rejected),
     ("backslash_paths", backslash_paths),
+    ("prune_backslash_keep", prune_backslash_keep),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1593,6 +1594,9 @@ fn differential_seed(s: &dyn Store) {
         .unwrap();
     s.index_bytes("o1", "r2", "m.txt", b"foo mfoo m\n", None)
         .unwrap();
+    // A Windows-style path (#100, #120): stored as `sub/dir/.gitignore`.
+    s.index_bytes("o1", "r2", r"sub\dir\.gitignore", b"foo x\n", None)
+        .unwrap();
 }
 
 /// A batch re-index of unchanged bytes still refreshes the file's origin, in
@@ -2271,6 +2275,23 @@ fn backslash_paths(h: &Harness) {
     let mut q = SymbolQuery::new("*");
     q.file = Some(r"src\lib.rs".into());
     assert_eq!(s.search_symbols(&q).unwrap().len(), 3);
+}
+
+/// A keep set spelled with `\` (a Windows caller) keeps the same files as
+/// its `/` twin; it must not match nothing and prune everything.
+fn prune_backslash_keep(h: &Harness) {
+    let s = open(h);
+    let d = IndexOptions::default();
+    let files = [bf("src/a.txt", b"foo"), bf("src/b.txt", b"foo")];
+    s.index_batch("o", "r", &files, d).unwrap();
+    let keep: HashSet<String> = [r"src\a.txt".to_string()].into();
+    assert_eq!(s.prune_files("o", "r", &keep, true).unwrap(), ["src/b.txt"]);
+    assert_eq!(
+        s.prune_files("o", "r", &keep, false).unwrap(),
+        ["src/b.txt"]
+    );
+    assert!(s.file_tokens("o", "r", "src/a.txt").unwrap().is_some());
+    assert!(s.file_tokens("o", "r", "src/b.txt").unwrap().is_none());
 }
 
 /// The same path twice in one batch (`./x` normalizes to `x`): the prepared

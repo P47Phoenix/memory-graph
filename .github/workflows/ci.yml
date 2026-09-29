@@ -22,9 +22,13 @@ jobs:
     # whole workspace: the cluster/serve suites spawn several servers and
     # are OS-neutral, and would roughly triple this leg's time. The one
     # skipped store test is a wall-clock ceiling (50 ms per fsync'd commit)
-    # calibrated on the Linux runner.
+    # calibrated on the Linux runner (#154).
     runs-on: windows-latest
     steps:
+      # The runner defaults to core.autocrlf=true. .gitattributes already
+      # pins the corpus and fixtures as -text; this makes every other file
+      # the tests read byte-identical to Linux too.
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -32,6 +36,8 @@ jobs:
       - run: cargo test -p graph-store -- --skip chunked_ingest_with_the_open_batch_marker_completes_promptly
       - run: cargo test -p graph-client --test conformance
       - run: cargo test -p graph-cli --test e2e
+      - run: cargo test -p graph-cli --test corpus
+      - run: cargo test -p graph-cli --test serve_e2e
   proto-regen:
     # The generated gRPC code under crates/graph-proto/src/gen is checked in
     # (ADR 0004 D1). Regenerate it with the pure-Rust compiler (protox, no

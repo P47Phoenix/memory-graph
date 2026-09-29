@@ -82,6 +82,16 @@ pub fn extension(path: &str) -> Option<String> {
 /// (`\` is read as a separator, so `src\a.rs` is `src/a.rs`), no `.`
 /// components, `..` resolved where possible. `a.rs`, `./a.rs` and `x/../a.rs`
 /// are the same file.
+///
+/// Because `\` is a separator on every OS, a Unix file literally named
+/// `a\b` maps to `a/b` (the directory walk skips such names, visibly, rather
+/// than let them collide). Other shapes, which are not repo-relative and are
+/// kept only so they stay distinct: a drive path `C:\x\a.rs` becomes
+/// `C:/x/a.rs` (relative, `C:` is an ordinary component); a UNC path
+/// `\\srv\share\a.rs` becomes `/srv/share/a.rs` (absolute, the doubled
+/// separator collapses); a leading `..` is kept on a relative path
+/// (`../a.rs`) and dropped at the root of an absolute one (`/../a.rs` is
+/// `/a.rs`).
 pub fn normalize_path(path: &str) -> String {
     let path = path.replace('\\', "/");
     let abs = path.starts_with('/');
@@ -114,6 +124,11 @@ mod tests {
         assert_eq!(normalize_path("../a.rs"), "../a.rs");
         assert_eq!(normalize_path(r"src\lib.rs"), "src/lib.rs");
         assert_eq!(normalize_path(r".\a\..\b/c.rs"), "b/c.rs");
+        assert_eq!(normalize_path(r"a\b"), "a/b");
+        assert_eq!(normalize_path(r"C:\x\a.rs"), "C:/x/a.rs");
+        assert_eq!(normalize_path(r"\\srv\share\a.rs"), "/srv/share/a.rs");
+        assert_eq!(normalize_path(r"..\a.rs"), "../a.rs");
+        assert_eq!(normalize_path("/../a.rs"), "/a.rs");
     }
 
     #[test]

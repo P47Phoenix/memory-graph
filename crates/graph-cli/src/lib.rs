@@ -469,6 +469,15 @@ fn walk(
                 continue;
             } else if !ft.is_file() {
                 skip("not a regular file")
+            } else if !cfg!(windows) && rel.to_str().is_some_and(|s| s.contains('\\')) {
+                // `\` is a path separator in stored paths on every OS, so a
+                // Unix file named `a\b` would silently become (and collide
+                // with) `a/b`: skip it, visibly.
+                Item::Skip {
+                    reason: "`\\` in file name (a path separator in stored paths)",
+                    what: rel.to_string_lossy().into_owned(),
+                    unreadable: false,
+                }
             } else if let Some(rel_s) = rel.to_str().map(graph_core::normalize_path) {
                 match entry.metadata() {
                     Err(_) => Item::Skip {

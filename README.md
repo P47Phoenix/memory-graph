@@ -107,6 +107,11 @@ Each file's fingerprint is the SHA-256 of its bytes plus the language, the extra
 | `--force` | With `--prune`: allow removals even when nothing was indexed. `--reindex` does not bypass that check. |
 | `--max-file-size N` | Skip files larger than N bytes (lockfiles, minified bundles, dumps). Off by default: the only built-in limit is the store's 4 GiB span limit, and such a file is skipped with the reason `larger than 4 GiB (span limit)` without being read. A file is parsed in memory whole and its parse takes about 25x its size (the measured growth per source byte), so a 1 GB file needs about 25 GB of RAM; the memory budget admits it alone. Set this flag when a tree may hold such files. |
 
+Stored paths are `/`-separated on every OS: `\` is read as a separator wherever a path comes in (the walk, `index-file`, `ingest`, a `--server` client, the server itself), so a tree indexed on Windows, on Linux, or from Windows through a Linux server gives the same database. Consequences:
+
+- A Unix file literally named `a\b` would be stored as `a/b`, so the directory walk skips it with the reason ``\`` in file name`` rather than let it collide. Non-relative shapes stay distinct but are not portable: `C:\x\a.rs` is stored as `C:/x/a.rs`, a UNC path `\\srv\share\a.rs` as `/srv/share/a.rs`, a leading `..` is kept on a relative path.
+- **Upgrading a database built on Windows before this change**, which holds `\` paths: re-indexing adds the `/` copy and the old `\` entries stay (they still show up in search) until `index --prune` removes them. `--prune` only removes files last written by a directory run, so `\` entries written by `index-file` or `ingest` are never pruned; for those, index into a fresh database. `--file` and other path lookups normalize their argument, so they cannot reach an old `\` key.
+
 Known limitation: `index-file` stores the path as given, so it only shares a File node with a directory `index` when called with the same repo-relative path.
 
 ### Failures stay per file
