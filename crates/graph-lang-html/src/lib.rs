@@ -136,6 +136,7 @@ pub fn scan_elements(
         };
         let slot = classify(&tag).map(|(name, lang)| {
             out.push(SymbolDecl {
+                owner: None,
                 name,
                 kind: SymbolKind::Other,
                 lang_kind: Some(lang),

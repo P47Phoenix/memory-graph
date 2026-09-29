@@ -243,18 +243,22 @@ fn symbol_hit() -> impl Strategy<Value = SymbolHit> {
         symbol_kind(),
         option::of(text()),
         option::of(span()),
+        option::of(text()),
     )
         .prop_map(
-            |(org, repo, file, language, name, qualified, kind, lang_kind, span)| SymbolHit {
-                org,
-                repo,
-                file,
-                language,
-                name,
-                qualified,
-                kind,
-                lang_kind,
-                span,
+            |(org, repo, file, language, name, qualified, kind, lang_kind, span, owner)| {
+                SymbolHit {
+                    org,
+                    repo,
+                    file,
+                    language,
+                    name,
+                    qualified,
+                    kind,
+                    lang_kind,
+                    span,
+                    owner,
+                }
             },
         )
 }
@@ -325,14 +329,20 @@ fn ingest_stats() -> impl Strategy<Value = IngestStats> {
 fn extraction() -> impl Strategy<Value = Extraction> {
     (
         vec(
-            (text(), symbol_kind(), option::of(text()), span()).prop_map(
-                |(name, kind, lang_kind, span)| SymbolDecl {
+            (
+                text(),
+                symbol_kind(),
+                option::of(text()),
+                span(),
+                option::of(text()),
+            )
+                .prop_map(|(name, kind, lang_kind, span, owner)| SymbolDecl {
                     name,
                     kind,
                     lang_kind,
                     span,
-                },
-            ),
+                    owner,
+                }),
             0..4,
         ),
         vec(

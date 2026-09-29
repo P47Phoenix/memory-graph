@@ -23,6 +23,7 @@ pub(crate) fn span_ext(
         symbols: syms
             .iter()
             .map(|&(n, kind, s, e)| SymbolDecl {
+                owner: None,
                 name: n.into(),
                 kind,
                 lang_kind: None,
@@ -799,6 +800,7 @@ mod ranged_children {
             .iter()
             .enumerate()
             .map(|(idx, &(a, b))| SymbolDecl {
+                owner: None,
                 name: format!("S{idx}_{a}_{b}"),
                 kind: SymbolKind::Function,
                 lang_kind: None,

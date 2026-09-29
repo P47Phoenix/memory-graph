@@ -247,6 +247,7 @@ impl Scanner<'_> {
 
     fn push(&mut self, name: String, kind: SymbolKind, lang: &str, first: usize, last: usize) {
         self.out.push(SymbolDecl {
+            owner: None,
             name,
             kind,
             lang_kind: Some(lang.to_string()),

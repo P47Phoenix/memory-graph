@@ -207,6 +207,7 @@ impl Scanner<'_> {
         };
         let span = span_between(&self.tok(c).span, &self.tok(close).span);
         self.out.push(SymbolDecl {
+            owner: None,
             name,
             kind: SymbolKind::Function,
             lang_kind: Some("function".into()),
@@ -317,6 +318,7 @@ impl Scanner<'_> {
                 let from = if first { c } else { start };
                 let span = span_between(&self.tok(from).span, &self.tok(last).span);
                 self.out.push(SymbolDecl {
+                    owner: None,
                     name: t.text.clone(),
                     kind,
                     lang_kind: Some(lang.into()),

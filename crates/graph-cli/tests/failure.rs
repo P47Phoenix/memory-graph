@@ -25,6 +25,7 @@ impl Extractor for Fake {
         };
         Extraction {
             symbols: vec![SymbolDecl {
+                owner: None,
                 name: "s".into(),
                 kind: SymbolKind::Function,
                 lang_kind: None,

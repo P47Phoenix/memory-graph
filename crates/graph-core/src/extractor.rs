@@ -8,6 +8,14 @@ pub struct SymbolDecl {
     pub kind: SymbolKind,
     pub lang_kind: Option<String>,
     pub span: Span,
+    /// The name of the type this symbol belongs to when that type does not
+    /// enclose it by span, e.g. a Go method's receiver type (`func (r *Rect)
+    /// Area()` has owner `Rect`). Language-agnostic: any extractor may set
+    /// it. The `class` search grain uses it only when no type-like symbol
+    /// encloses the symbol by span, and resolves it to a type-like symbol of
+    /// that exact name in the same file; `None` (the usual case) means no
+    /// hint.
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -77,6 +77,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut out = Vec::with_capacity(s.out.len() + 1);
     if let (Some(name), Some(&first), Some(&last)) = (s.class_name, code.first(), code.last()) {
         out.push(SymbolDecl {
+            owner: None,
             name,
             kind: SymbolKind::Type,
             lang_kind: Some("class_name".into()),
@@ -155,6 +156,7 @@ impl Scanner<'_> {
     fn emit(&mut self, name: String, kind: SymbolKind, lk: &str, first: usize, last: usize) {
         let span = span_between(&self.tok(first).span, &self.tok(last).span);
         self.out.push(SymbolDecl {
+            owner: None,
             name,
             kind,
             lang_kind: Some(lk.to_string()),

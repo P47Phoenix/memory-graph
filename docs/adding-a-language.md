@@ -16,7 +16,7 @@ These `graph-core` items are the stable surface for extractors:
 |---|---|
 | `Extractor` | `language()`, `extract(src)`, `version()`, `extensions()` |
 | `Extraction` | `symbols`, `tokens`, `has_errors` |
-| `SymbolDecl` | `name`, `kind: SymbolKind`, `lang_kind: Option<String>`, `span` |
+| `SymbolDecl` | `name`, `kind: SymbolKind`, `lang_kind: Option<String>`, `span`, `owner: Option<String>` |
 | `TokenDecl`, `Span`, `TokenClass`, `SymbolKind` | schema types |
 | `tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION}` | the shared tokenizer |
 | `scan::{Cursor, matching_close, close_table, code_close_table, span_between, code_index, keyword_block, indent_block, line_iter}` | helpers for token-stream scanners |
@@ -55,6 +55,14 @@ These `graph-core` items are the stable surface for extractors:
   `variable`, `constant`, `other`). Put your language's own vocabulary in
   `lang_kind` (`section`, `property`, `control`, ...); `describe` shows both as
   `generic/lang_kind`.
+- `owner` names the type a symbol belongs to when that type does not enclose
+  it by span (Go sets it to a method's receiver type: `func (b *Box) W()` has
+  owner `Box`). Leave it `None` otherwise. `search --grain class` uses it only
+  when no type-like symbol encloses the hit by span, and resolves it to a
+  type-like symbol with exactly that name **in the same file** (the first in
+  source order); an owner declared in another file does not roll up.
+  `symbols --json` reports it as `owner`. Setting it changes `extract`'s
+  output, so bump `version()`.
 
 ### Tokens
 

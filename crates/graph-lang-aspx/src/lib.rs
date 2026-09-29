@@ -95,6 +95,7 @@ fn server_blocks(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
             .find(|&j| tokens[j].class == TokenClass::Identifier)
             .map_or_else(|| lang.to_string(), |j| tokens[j].text.clone());
         out.push(SymbolDecl {
+            owner: None,
             name,
             kind: SymbolKind::Other,
             lang_kind: Some(lang.into()),

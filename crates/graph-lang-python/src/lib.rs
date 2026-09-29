@@ -198,6 +198,7 @@ fn scan(tokens: &[TokenDecl], code: &[usize], lines: &[std::ops::Range<usize>]) 
                 (SymbolKind::Function, "function")
             };
             out.push(SymbolDecl {
+                owner: None,
                 name: text(c + 1).to_string(),
                 kind,
                 lang_kind: Some(lang.into()),
@@ -223,6 +224,7 @@ fn scan(tokens: &[TokenDecl], code: &[usize], lines: &[std::ops::Range<usize>]) 
         let last = code[line.end - 1];
         if eq + 1 < line.end && text(eq + 1) == "lambda" && (text(s + 1) == "=" || eq > s + 2) {
             out.push(SymbolDecl {
+                owner: None,
                 name: name.to_string(),
                 kind: SymbolKind::Function,
                 lang_kind: Some("lambda".into()),
@@ -230,6 +232,7 @@ fn scan(tokens: &[TokenDecl], code: &[usize], lines: &[std::ops::Range<usize>]) 
             });
         } else if open.is_empty() && is_constant_name(name) {
             out.push(SymbolDecl {
+                owner: None,
                 name: name.to_string(),
                 kind: SymbolKind::Constant,
                 lang_kind: Some("constant".into()),

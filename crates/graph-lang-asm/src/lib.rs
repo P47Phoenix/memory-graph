@@ -315,6 +315,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut out = Vec::new();
     let mut push = |name: &str, kind, lk: &str, a: usize, b: usize| {
         out.push(SymbolDecl {
+            owner: None,
             name: name.to_string(),
             kind,
             lang_kind: Some(lk.to_string()),

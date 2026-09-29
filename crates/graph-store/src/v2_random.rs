@@ -49,6 +49,7 @@ fn extraction(toks: &[Tok], syms: &[Sym]) -> Extraction {
             .map(|&(nm, k, a, b)| {
                 let (a, b) = (a % n, b % n);
                 SymbolDecl {
+                    owner: None,
                     name: NAMES[nm].into(),
                     kind: KINDS[k],
                     lang_kind: None,

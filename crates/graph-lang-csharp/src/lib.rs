@@ -384,6 +384,7 @@ impl Scanner<'_> {
         let span = span_between(&self.tok(start).span, &self.tok(span_end).span);
         let push = |s: &mut Self, name: String, kind: SymbolKind, lang: &str| {
             s.out.push(SymbolDecl {
+                owner: None,
                 name,
                 kind,
                 lang_kind: Some(lang.to_string()),
