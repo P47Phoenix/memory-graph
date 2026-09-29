@@ -41,8 +41,13 @@
 | 23 | Linearizable reads and crash tests | High | 5 | P3 | 22 |
 | 24 | Observability and packaging (metrics, health, Compose, Kubernetes) | Medium | 5 | P3 | 22 |
 | 25 | Cluster hardening (benchmarks, soak, `--update-advertise`) | Medium | 3 | P4 | 23, 24 |
+| 26 | Tokenizer dialects and scan helpers for more languages | Foundation | 5 | P2 | 6 |
+| 27 | TypeScript, Python and Java symbol extractors | High | 8 | P2 | 26, 16 |
+| 28 | C, C++, Go and Scala symbol extractors | High | 8 | P2 | 26 |
+| 29 | SQL, shell, R, F#, Haskell, Elixir and GDScript symbol extractors | High | 8 | P3 | 26 |
+| 30 | COBOL, RPG and assembly symbol extractors | Medium | 8 | P3 | 26 |
 
-Total: 25 stories, 126 pts (average about 5.0). Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day.
+Total: 30 stories, 163 pts (average about 5.4). Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -212,6 +217,7 @@ So that keeping the graph current is fast.
 *Status: the skip-unchanged part is implemented.* File nodes carry a fingerprint (SHA-256 of the content + lowercased language + `Extractor::version()` (includes the tokenizer version) + store index format version); an identical fingerprint skips the file and is reported as `unchanged` (`index`, `index-file`, `--json`, `IngestStats`, `index_batch`). `--reindex` re-indexes regardless (`--force` is only the `--prune` empty-run override). The tokenizer version is part of the extractor versions. Known issue (pre-existing, out of scope): `index-file` stores its path as given rather than repo-relative. Pre-fingerprint files re-index once. Deleted-file removal is `--prune` (story 10).
 
 **16. Python extractor via the Extractor trait (5 pts)**
+Status: Delivered in PR #132 (story 27), as a token-stream scanner rather than `ruff_python_parser` (blocked on MSRV, see ADR 0002); a file with unbalanced brackets or broken indentation is flagged `has_errors` and keeps tokens only.
 As an AI-agent integrator
 I want Python files indexed with symbols
 So that mixed-language repos are navigable.
@@ -334,6 +340,32 @@ Design: ADR 0004 revisit triggers.
 - Given a soak run of at least one hour with continuous indexing and a node restarted every five minutes, When it ends, Then no acknowledged write may be missing and the Raft log must stay within the purge policy.
 - Given `serve --update-advertise <addr>` on an existing member, When it restarts, Then the cluster must learn the new address without a re-join.
 - Given the open configuration question (ADR 0004 Q2), When this story closes, Then either a TOML configuration file is delivered or an issue records why not.
+
+**26. Tokenizer dialects and scan helpers for more languages (5 pts)**
+Status: Delivered in PR #126. Follow-ups: #127.
+As an extractor author
+I want the generic tokenizer to know each language's comments, strings and column layout, plus shared scan helpers
+So that a new language's symbol scanner stays small and its token spans stay exact.
+- Given the new dialect flags (`#`, `--`, `{- -}`, `(* *)` and `;` comments, triple-quoted, backtick, SQL and shell strings, primes, hyphenated names, COBOL and RPG fixed columns), When any input is tokenized, Then every token's text, bytes, line and column must match the source, and the existing dialects' output must be byte-identical (goldens unchanged, `TOKENIZER_VERSION` unchanged).
+- Given `code_index`, `keyword_block`, `indent_block` and `line_iter`, When used by an extractor, Then they must be documented in `docs/adding-a-language.md` and unit-tested.
+
+**27. TypeScript, Python and Java symbol extractors (8 pts)**
+Status: Delivered in PR #132 (closes #73 and delivers story 16).
+**28. C, C++, Go and Scala symbol extractors (8 pts)**
+Status: Delivered in PR #130.
+**29. SQL, shell, R, F#, Haskell, Elixir and GDScript symbol extractors (8 pts)**
+Status: Delivered in PRs #128 (SQL, shell, R) and #129 (F#, Haskell, Elixir, GDScript).
+**30. COBOL, RPG and assembly symbol extractors (8 pts)**
+Status: Delivered in PR #131 (RPG IV free, mixed and fixed form; NASM, MASM and GNU as for x86 and ARM). Follow-ups: #133, #134.
+
+Stories 27-30 share one story:
+As an AI-agent integrator
+I want symbols (types, callables, modules, variables and constants) for each of these languages
+So that the `symbol`, `method` and `class` grains and symbol search work across a polyglot codebase.
+- Given each language, When indexed, Then its documented symbol kinds must exist with exact span text, containers must be `type` so the class grain rolls up, and namespaces or packages must be `module`.
+- Given each extractor, When implemented, Then the change must touch only its own crate plus registration (one `lang-*` feature, on by default), with no schema, storage or query changes.
+- Given malformed, BOM-prefixed, CRLF, non-ASCII or 20000-level nested input, When indexed, Then there must be no panic or stack overflow and every span must stay valid.
+- Given a suitable MIT or Apache-2.0 public repo, When the corpus test runs, Then a pinned slice must be indexed with spot-checked symbols; languages without one must have a hand-written fixture.
 
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
