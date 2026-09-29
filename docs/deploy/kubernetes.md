@@ -40,14 +40,23 @@ args:
   - --node-id-from-hostname
   - --bootstrap-or-join
   - memory-graph-0.memory-graph.$(POD_NAMESPACE).svc.cluster.local:7000
+  - --replicas
+  - "3"                # keep equal to spec.replicas
   - --auto-promote
 ```
 
 - **`--node-id-from-hostname`**: the node id is the trailing `-<ordinal>` of the host name plus
   one (`memory-graph-0` is node 1, `memory-graph-2` is node 3). The host name is read from
   `HOSTNAME` (a pod's is its name), then `/etc/hostname`; a name without an ordinal is refused.
-- **`--bootstrap-or-join <peer>`**: ordinal 0 behaves as `--bootstrap`, every other ordinal as
+- **`--bootstrap-or-join <peer>`**: ordinal 0 bootstraps, every other ordinal behaves as
   `--join <peer>`. With `--auto-promote`, a joined pod becomes a voter once it has caught up.
+  Ordinal 0 on an **empty** data directory first asks the other pods (`Admin.Status`;
+  `memory-graph-1` and `-2` from `--replicas`, or an explicit `--peers a:7000,b:7000`) whether a
+  cluster already exists, for up to `--bootstrap-probe-timeout` (default 30s). It bootstraps only
+  when none reports a cluster: at once when every one of them answered that it has none (a first
+  deployment: they are waiting to join pod 0), else at the timeout. If one reports a cluster, pod 0
+  joins it instead (see [Pod 0 loses its volume](#pod-0-loses-its-volume)); if two report
+  different clusters, it refuses to start. `--force-bootstrap` skips the question.
 - **`--advertise`** uses the headless Service name, which Kubernetes expands from the env vars
   (`$(VAR)` in `args`). It is recorded in `node.json` and the membership, so it must stay the same
   across restarts (it does: the pod name and namespace are stable).
@@ -71,10 +80,13 @@ anyway except through `/memory-graph health`).
 
 - **Liveness** asks the default service (`""`): `SERVING` once the store is open. A pod without a
   leader (a partition, a lost quorum) stays alive: restarting it would not help.
-- **Readiness** asks `memory-graph.ready`: `SERVING` only while a leader is known **and** the pod
-  has applied to within `--ready-max-lag` entries (default 1000) of the leader's commit index. A
-  learner still catching up, or a pod cut off from the leader, is taken out of
-  `memory-graph-client`. The same check from a shell: `memory-graph health --ready --server
+- **Readiness** asks `memory-graph.ready`: `SERVING` only while a leader is known, a leader's
+  `AppendEntries` (heartbeats included, sent to voters and learners alike) reached the pod within
+  three maximum election timeouts (6 s by default), **and** the pod has applied to within
+  `--ready-max-lag` entries (default 1000) of the leader's commit index. A learner still catching
+  up, or a pod cut off from the leader (a learner never campaigns, so it keeps naming its last
+  leader: the silence is what shows it is cut off), is taken out of `memory-graph-client`; an
+  idle, caught-up learner stays ready. The same check from a shell: `memory-graph health --ready --server
   <pod>:7000` (exit 0 ready, 1 otherwise).
 - During shutdown both services go `NOT_SERVING` first, then in-flight requests finish
   (`terminationGracePeriodSeconds: 45` covers the server's 30 s drain).
@@ -109,14 +121,41 @@ it first with `cluster transfer-leader`), any removal that leaves fewer reachabl
 quorum, and 3 voters down to 2 without `--force`. Delete the pod's claim afterwards: a later
 scale-up with the old claim would restart a removed node instead of joining it again.
 
-## Caveats
+## Pod 0 loses its volume
 
-- **Pod 0 losing its volume** would bootstrap a *new* cluster (it sees an empty directory and
-  `--bootstrap-or-join` says bootstrap), which the other pods refuse (`WrongCluster`). To replace
-  pod 0's volume: `cluster remove 1` from another pod (after a `transfer-leader` if it led), delete
-  the claim, and start pod 0 once with its args changed to `--join
-  memory-graph-1.memory-graph.<ns>.svc.cluster.local:7000 --auto-promote` (a StatefulSet patch),
-  then restore the args.
+A pod 0 whose claim was lost or replaced starts on an empty `/data`. It does **not** create a
+second cluster: it asks pods 1 and 2, finds the cluster, and rejoins it. Because a voter that lost
+its log and vote must not vote again under its id, it first removes its own old member (node 1)
+through the pod that answered (`cluster remove 1 --force`, which the leader still refuses if that
+would leave fewer reachable voters than a quorum), then joins as a learner, catches up by log or
+snapshot, and with `--auto-promote` is a voter again. The log says so (`a cluster already exists
+(this pod lost its data directory); joining it`). Nothing to do by hand in the common case.
+
+It refuses to start, with the recovery in the message, when:
+
+- the cluster lists node 1 at another address than this pod's `--advertise` (not its lost
+  incarnation): check the manifests, or `cluster remove 1` by hand;
+- the old member cannot be removed (no leader: pods 1 and 2 do not have a quorum without pod 0;
+  bring them back first), within `--join-timeout`;
+- pods 1 and 2 report two different clusters.
+
+One case it cannot tell apart: **every** pod down and pod 0's volume lost. If pods 1 and 2 do not
+answer within `--bootstrap-probe-timeout`, pod 0 bootstraps a new, empty cluster, and pods 1 and 2
+then refuse to restart (`WrongCluster`, exit 6: their `--join` peer, pod 0, is in another
+cluster). Recover by deleting pod 0 and its claim again: while pod 0 is away, pods 1 and 2 restart
+(an unreachable peer is only a warning) and elect a leader (two of three voters are a quorum); the
+new pod 0 then finds their cluster and rejoins it as above. A longer `--bootstrap-probe-timeout`
+makes this case rarer.
+
+## Hardening
+
+The container runs as the image's non-root user with `allowPrivilegeEscalation: false`,
+`readOnlyRootFilesystem: true` (it writes only to `/data`), all capabilities dropped and the
+`RuntimeDefault` seccomp profile. The manifest's image tag is a placeholder
+(`REPLACE-WITH-RELEASE-TAG`): pin a release tag or a digest, never `:main`, so every pod runs the
+same build whenever it restarts.
+
+## Caveats
 - **No TLS or authentication** yet (a later stage of ADR 0004): keep the Services cluster-internal
   and restrict them with a NetworkPolicy.
 - Backup and restore: [data-dir.md](data-dir.md). Compose: [compose.md](compose.md).

@@ -48,5 +48,31 @@ pub const STREAM_BATCH_NODES: usize = 4096;
 /// own), ADR 0004 D5.
 pub const RAFT_ENTRY_MAX_BYTES: usize = 8 << 20;
 
+/// Every gRPC method path this package defines (`/memory_graph.v1.Store/Search`,
+/// ...), read from the generated code, so a new RPC is listed without an
+/// edit here. A server labels metrics by these (and the standard health
+/// methods) only: a client-supplied path is not a label value.
+pub fn rpc_paths() -> &'static std::collections::BTreeSet<&'static str> {
+    static PATHS: std::sync::OnceLock<std::collections::BTreeSet<&'static str>> =
+        std::sync::OnceLock::new();
+    PATHS.get_or_init(|| {
+        const GEN: &str = include_str!("gen/memory_graph.v1.rs");
+        GEN.split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| {
+                s.strip_prefix("/memory_graph.v1.")
+                    .and_then(|r| r.split_once('/'))
+                    .is_some_and(|(svc, m)| {
+                        !svc.is_empty()
+                            && !m.is_empty()
+                            && svc.bytes().all(|b| b.is_ascii_alphanumeric())
+                            && m.bytes().all(|b| b.is_ascii_alphanumeric())
+                    })
+            })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests;

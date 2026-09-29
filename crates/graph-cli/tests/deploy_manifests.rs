@@ -138,6 +138,22 @@ fn kubernetes_manifests() {
                         Some(65532),
                         "the image's user owns the volume"
                     );
+                    // --replicas tells ordinal 0 whom to ask after a lost
+                    // volume: it must match the StatefulSet.
+                    assert_eq!(
+                        value_after(&args, "--replicas").and_then(|r| r.parse::<i64>().ok()),
+                        spec["replicas"].as_i64()
+                    );
+                    let sc = &c["securityContext"];
+                    assert_eq!(sc["allowPrivilegeEscalation"].as_bool(), Some(false));
+                    assert_eq!(sc["readOnlyRootFilesystem"].as_bool(), Some(true));
+                    assert_eq!(strings(&sc["capabilities"]["drop"]), ["ALL"]);
+                    assert_eq!(s(&sc["seccompProfile"]["type"]), "RuntimeDefault");
+                    let image = s(&c["image"]);
+                    assert!(
+                        !image.ends_with(":main") && !image.ends_with(":latest"),
+                        "a pinned (placeholder) tag, not a moving one: {image}"
+                    );
                 }
                 "PodDisruptionBudget" => {
                     assert_eq!(doc["spec"]["minAvailable"].as_i64(), Some(2));
@@ -182,7 +198,10 @@ fn compose_file() {
         let id = n.to_string();
         assert_eq!(value_after(&args, "--node-id"), Some(id.as_str()));
         let ports = strings(&svc["ports"]);
-        assert!(ports.contains(&format!("700{n}:7000")), "{ports:?}");
+        assert!(
+            ports.contains(&format!("${{MG_GRPC_PORT_{n}:-700{n}}}:7000")),
+            "{ports:?}"
+        );
         let volumes = strings(&svc["volumes"]);
         assert_eq!(volumes, [format!("node{n}-data:/data")]);
         if n == 1 {

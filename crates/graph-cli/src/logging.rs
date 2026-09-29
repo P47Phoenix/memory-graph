@@ -50,9 +50,67 @@ pub fn init(format: LogFormat, spec: &str) -> Result<()> {
     r.map_err(|e| anyhow::anyhow!("installing the log subscriber: {e}"))
 }
 
+/// `serve`'s start lines on stdout (`metrics on ...`, then `listening on
+/// ...`, which scripts wait for). Text: `memory-graph serve: <message>`.
+/// JSON: an object like a log line (`timestamp`, `level`, `target`,
+/// `message`) plus `event` (`metrics` / `listening`) and `addr`, so a
+/// container runtime merging stdout into the JSON log stream sees only JSON.
+/// The message is the text line either way, so a parser looking for
+/// `listening on <addr> ` reads both.
+pub fn start_line(format: LogFormat, event: &str, message: &str, addr: &str) -> String {
+    let text = format!("memory-graph serve: {message}");
+    match format {
+        LogFormat::Text => text,
+        LogFormat::Json => {
+            use tracing_subscriber::fmt::time::FormatTime;
+            let mut ts = String::new();
+            let _ = tracing_subscriber::fmt::time::SystemTime
+                .format_time(&mut tracing_subscriber::fmt::format::Writer::new(&mut ts));
+            serde_json::json!({
+                "timestamp": ts,
+                "level": "INFO",
+                "target": "memory_graph::serve",
+                "message": text,
+                "event": event,
+                "addr": addr,
+            })
+            .to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_lines_are_text_or_one_json_object() {
+        let t = start_line(
+            LogFormat::Text,
+            "listening",
+            "listening on 1.2.3.4:5 (db x)",
+            "1.2.3.4:5",
+        );
+        assert_eq!(t, "memory-graph serve: listening on 1.2.3.4:5 (db x)");
+        let j = start_line(
+            LogFormat::Json,
+            "listening",
+            "listening on 1.2.3.4:5 (db C:\\x \"y\")",
+            "1.2.3.4:5",
+        );
+        assert!(!j.contains('\n'));
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["event"], "listening");
+        assert_eq!(v["addr"], "1.2.3.4:5");
+        assert_eq!(v["level"], "INFO");
+        assert!(!v["timestamp"].as_str().unwrap().is_empty());
+        // The text parsers' `listening on <addr> ` still finds the address.
+        let addr = j
+            .split("listening on ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next());
+        assert_eq!(addr, Some("1.2.3.4:5"));
+    }
 
     #[test]
     fn filters_parse_or_name_the_flag() {

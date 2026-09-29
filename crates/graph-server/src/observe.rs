@@ -123,6 +123,10 @@ pub struct Observability {
     /// with on a follower or learner.
     leader_commit: AtomicU64,
     leader_commit_changed: tokio::sync::Notify,
+    /// When a leader last reached this node (`AppendEntries`, heartbeats
+    /// included, or `InstallSnapshot`): a follower or learner that has not
+    /// heard from one for a while is partitioned and not ready.
+    last_heard: Mutex<Option<Instant>>,
 }
 
 impl Observability {
@@ -169,6 +173,22 @@ impl Observability {
         self.leader_commit.load(Ordering::SeqCst)
     }
 
+    /// A leader's `AppendEntries` or `InstallSnapshot` arrived just now.
+    pub fn note_heard_from_leader(&self) {
+        *self
+            .last_heard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// Time since a leader last reached this node (`None`: never).
+    pub fn since_heard_from_leader(&self) -> Option<Duration> {
+        self.last_heard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|t| t.elapsed())
+    }
+
     /// Resolves the next time [`note_leader_commit`](Self::note_leader_commit)
     /// raises the value.
     pub async fn leader_commit_changed(&self) {
@@ -176,18 +196,42 @@ impl Observability {
     }
 }
 
-/// Whether `memory-graph.ready` is `SERVING` (D10): a leader is known and
-/// this node's applied index is within `max_lag` entries of the leader's
-/// committed index (the leader itself: always, once it leads). A learner
-/// still catching up is therefore not ready.
-pub fn is_ready(
-    leader_known: bool,
-    is_leader: bool,
-    applied: u64,
-    leader_commit: u64,
-    max_lag: u64,
-) -> bool {
-    leader_known && (is_leader || leader_commit.saturating_sub(applied) <= max_lag)
+/// How long a follower or learner stays ready without hearing from a
+/// leader: three maximum election timeouts. The leader sends
+/// `AppendEntries` (heartbeats when idle) to every voter and learner each
+/// heartbeat interval, far more often than that, so only a node the leader
+/// cannot reach (a partition) goes this long.
+pub fn leader_silence_limit(election_max_ms: u64) -> Duration {
+    Duration::from_millis(election_max_ms.saturating_mul(3))
+}
+
+/// The inputs of [`is_ready`].
+#[derive(Debug, Clone, Copy)]
+pub struct Readiness {
+    pub leader_known: bool,
+    pub is_leader: bool,
+    pub applied: u64,
+    /// The leader's committed index, as its `AppendEntries` said.
+    pub leader_commit: u64,
+    /// Time since a leader last reached this node (`None`: never).
+    pub since_heard: Option<Duration>,
+}
+
+/// Whether `memory-graph.ready` is `SERVING` (D10). The leader: always,
+/// once it leads. A follower or learner: a leader is known, one reached
+/// it within `silence_limit` ([`leader_silence_limit`]; a partitioned node
+/// keeps its last known leader and would otherwise stay ready), and its
+/// applied index is within `max_lag` entries of the leader's committed
+/// index (a learner still catching up is not ready).
+pub fn is_ready(r: Readiness, max_lag: u64, silence_limit: Duration) -> bool {
+    if !r.leader_known {
+        return false;
+    }
+    if r.is_leader {
+        return true;
+    }
+    r.since_heard.is_some_and(|d| d <= silence_limit)
+        && r.leader_commit.saturating_sub(r.applied) <= max_lag
 }
 
 /// Escape a label value (exposition format 0.0.4).
@@ -374,16 +418,31 @@ pub fn render(ctx: &Ctx) -> String {
 // ---------------------------------------------------------------------------
 // The per-RPC layer.
 
+/// The `rpc` label of every path that is not a known method.
+pub const UNKNOWN_RPC: &str = "unknown";
+
+/// The standard health methods (tonic-health), besides
+/// [`graph_proto::rpc_paths`].
+const HEALTH_PATHS: [&str; 2] = [
+    "/grpc.health.v1.Health/Check",
+    "/grpc.health.v1.Health/Watch",
+];
+
 /// `/memory_graph.v1.Store/Search` -> `Store/Search`,
-/// `/grpc.health.v1.Health/Check` -> `Health/Check`.
+/// `/grpc.health.v1.Health/Check` -> `Health/Check`; any other path (a
+/// client can send anything) is [`UNKNOWN_RPC`], so label cardinality stays
+/// bounded by the methods this server defines.
 pub fn rpc_name(path: &str) -> String {
+    if !(graph_proto::rpc_paths().contains(path) || HEALTH_PATHS.contains(&path)) {
+        return UNKNOWN_RPC.to_string();
+    }
     let path = path.trim_start_matches('/');
     match path.split_once('/') {
         Some((svc, method)) => {
             let svc = svc.rsplit('.').next().unwrap_or(svc);
             format!("{svc}/{method}")
         }
-        None => path.to_string(),
+        None => UNKNOWN_RPC.to_string(),
     }
 }
 
@@ -512,23 +571,38 @@ where
 /// Longest request head accepted (a scraper sends a few hundred bytes).
 const MAX_REQUEST: usize = 16 * 1024;
 /// A connection that has not sent a full request head by then is dropped.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connections served at once; one accepted beyond that is closed at once
+/// (a flood of idle connections holds at most this many tasks, each for at
+/// most [`READ_TIMEOUT`] plus the time to write the answer).
+pub const MAX_CONNECTIONS: usize = 64;
 
 /// Serve `GET /metrics` on `listener` until `shutdown`; every connection is
 /// answered once and closed (`Connection: close`).
 pub async fn serve_metrics(listener: TcpListener, ctx: Arc<Ctx>, shutdown: ShutdownHandle) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let accepted = tokio::select! {
             a = listener.accept() => a,
             _ = shutdown.wait() => return,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    tracing::debug!(%peer, "metrics: too many connections open; closing this one");
+                    drop(stream);
+                    continue;
+                };
                 let ctx = Arc::clone(&ctx);
                 tokio::spawn(async move {
-                    if let Err(e) = answer(stream, &ctx).await {
-                        tracing::debug!(error = %e, "metrics connection");
+                    // Writing the answer is bounded too (a peer that
+                    // never reads).
+                    match tokio::time::timeout(READ_TIMEOUT * 2, answer(stream, &ctx)).await {
+                        Ok(Err(e)) => tracing::debug!(error = %e, "metrics connection"),
+                        Err(_) => tracing::debug!("metrics connection timed out"),
+                        Ok(Ok(())) => {}
                     }
+                    drop(permit);
                 });
             }
             Err(e) => {
@@ -620,7 +694,79 @@ mod tests {
     fn rpc_names_drop_the_package() {
         assert_eq!(rpc_name("/memory_graph.v1.Store/Search"), "Store/Search");
         assert_eq!(rpc_name("/grpc.health.v1.Health/Check"), "Health/Check");
-        assert_eq!(rpc_name("/odd"), "odd");
+        assert_eq!(
+            rpc_name("/memory_graph.v1.Raft/AppendEntries"),
+            "Raft/AppendEntries"
+        );
+        assert_eq!(rpc_name("/memory_graph.v1.Admin/Metrics"), "Admin/Metrics");
+        assert_eq!(rpc_name("/grpc.health.v1.Health/Watch"), "Health/Watch");
+        for odd in [
+            "/odd",
+            "",
+            "/",
+            "/memory_graph.v1.Store/NoSuchMethod",
+            "/memory_graph.v1.Nope/Search",
+            "/x.y.Store/Search",
+            "/memory_graph.v1.Store/Search/extra",
+        ] {
+            assert_eq!(rpc_name(odd), UNKNOWN_RPC, "{odd}");
+        }
+        // Random client-chosen paths never make new label values.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..500 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let p = format!("/memory_graph.v1.Store/{seed:x}");
+            assert_eq!(rpc_name(&p), UNKNOWN_RPC, "{p}");
+        }
+        assert!(graph_proto::rpc_paths().len() > 30);
+        assert!(graph_proto::rpc_paths().contains("/memory_graph.v1.Write/Index"));
+    }
+
+    /// A service answering an empty `200` to everything.
+    #[derive(Clone)]
+    struct Echo;
+
+    impl tower_service::Service<http::Request<()>> for Echo {
+        type Response = http::Response<()>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<http::Response<()>, std::convert::Infallible>>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _: http::Request<()>) -> Self::Future {
+            std::future::ready(Ok(http::Response::new(())))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rpc_layer_labels_unknown_paths_unknown() {
+        use tower_layer::Layer as _;
+        use tower_service::Service as _;
+        let obs = Observability::new();
+        let mut svc = RpcLayer::new(Arc::clone(&obs)).layer(Echo);
+        let paths = [
+            "/memory_graph.v1.Store/Search".to_string(),
+            "/memory_graph.v1.Store/f00dfeed".to_string(),
+            "/evil/\"}\n".to_string(),
+            format!("/{}", "a".repeat(4000)),
+        ];
+        for p in &paths {
+            let uri: http::Uri = p.parse().unwrap_or_else(|_| "/bad".parse().unwrap());
+            let req = http::Request::builder().uri(uri).body(()).unwrap();
+            svc.call(req).await.unwrap();
+        }
+        let keys: Vec<(String, String)> = obs.rpc.lock().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            [
+                ("Store/Search".to_string(), "ok".to_string()),
+                (UNKNOWN_RPC.to_string(), "ok".to_string())
+            ],
+            "only known methods are label values"
+        );
+        assert_eq!(obs.rpc_total(), paths.len() as u64);
     }
 
     #[test]
@@ -655,18 +801,50 @@ mod tests {
     }
 
     #[test]
-    fn readiness_needs_a_leader_and_a_small_lag() {
-        assert!(!is_ready(false, false, 10, 10, 1000));
-        assert!(is_ready(true, true, 0, 5000, 0), "the leader is ready");
-        assert!(is_ready(true, false, 10, 1010, 1000));
+    fn readiness_needs_a_leader_a_recent_word_from_it_and_a_small_lag() {
+        let limit = Duration::from_secs(6);
+        let r = |leader_known, is_leader, applied, leader_commit, heard: Option<u64>| Readiness {
+            leader_known,
+            is_leader,
+            applied,
+            leader_commit,
+            since_heard: heard.map(Duration::from_secs),
+        };
+        assert!(!is_ready(r(false, false, 10, 10, Some(0)), 1000, limit));
         assert!(
-            !is_ready(true, false, 10, 1011, 1000),
+            is_ready(r(true, true, 0, 5000, None), 0, limit),
+            "the leader is ready"
+        );
+        assert!(is_ready(r(true, false, 10, 1010, Some(1)), 1000, limit));
+        assert!(
+            !is_ready(r(true, false, 10, 1011, Some(1)), 1000, limit),
             "a catching-up learner"
         );
         assert!(
-            is_ready(true, false, 20, 10, 0),
+            is_ready(r(true, false, 20, 10, Some(0)), 0, limit),
             "applied ahead of what it heard"
         );
+        assert!(
+            is_ready(r(true, false, 10, 10, Some(6)), 1000, limit),
+            "at the limit"
+        );
+        assert!(
+            !is_ready(r(true, false, 10, 10, Some(7)), 1000, limit),
+            "a partitioned follower or learner"
+        );
+        assert!(
+            !is_ready(r(true, false, 10, 10, None), 1000, limit),
+            "never heard from a leader"
+        );
+        assert_eq!(leader_silence_limit(2000), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn heard_from_leader_is_recorded() {
+        let o = Observability::default();
+        assert_eq!(o.since_heard_from_leader(), None);
+        o.note_heard_from_leader();
+        assert!(o.since_heard_from_leader().unwrap() < Duration::from_secs(60));
     }
 
     #[test]

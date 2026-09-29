@@ -93,8 +93,10 @@ impl pb::raft_server::Raft for RaftService {
     ) -> Result<Response<pb::AppendEntriesResponse>, Status> {
         self.check_headers(&req, true)?;
         let req = req.into_inner();
-        // Heartbeats included: what the leader has committed, so a node
-        // far behind (a learner catching up) knows it is not ready.
+        // Heartbeats included: a leader reaches this node (readiness of a
+        // partitioned node), and what it has committed, so a node far
+        // behind (a learner catching up) knows it is not ready.
+        self.obs.note_heard_from_leader();
         if let Some(c) = &req.leader_commit {
             self.obs.note_leader_commit(c.index);
         }
@@ -124,6 +126,7 @@ impl pb::raft_server::Raft for RaftService {
         req: Request<Streaming<pb::InstallSnapshotRequest>>,
     ) -> Result<Response<pb::InstallSnapshotResponse>, Status> {
         self.check_headers(&req, true)?;
+        self.obs.note_heard_from_leader();
         let mut stream = req.into_inner();
         let header = match stream.next().await {
             Some(Ok(pb::InstallSnapshotRequest {

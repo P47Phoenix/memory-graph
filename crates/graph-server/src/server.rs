@@ -112,9 +112,11 @@ pub struct ServeConfig {
     /// node's applied index is within this many entries of the leader's
     /// committed index (default [`crate::DEFAULT_READY_MAX_LAG`]).
     pub ready_max_lag: u64,
-    /// Test-only: hold apply back (see
-    /// [`crate::raft::state_machine::ApplyGate`]).
-    pub apply_gate: Option<crate::raft::state_machine::ApplyGate>,
+    /// Testing only, not a supported API (hidden from the docs, like the
+    /// failpoints): hold apply back (see
+    /// [`crate::raft::state_machine::TestingApplyGate`]).
+    #[doc(hidden)]
+    pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
 }
 
 /// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
@@ -185,7 +187,7 @@ impl ServeConfig {
             install_gate: None,
             metrics_listen: None,
             ready_max_lag: crate::DEFAULT_READY_MAX_LAG,
-            apply_gate: None,
+            testing_apply_gate: None,
         }
     }
 
@@ -319,9 +321,21 @@ fn resolve(cfg: &ServeConfig) -> Result<(NodePaths, Option<paths::StartPlan>), S
 
 /// Start a server on the current tokio runtime.
 pub async fn start(
-    cfg: ServeConfig,
+    mut cfg: ServeConfig,
     extractors: Vec<Arc<dyn Extractor>>,
 ) -> Result<Running, StoreError> {
+    // `--bootstrap-or-join` becomes a bootstrap or a join first (ordinal
+    // 0 on an empty directory asks its siblings; a lost volume must not
+    // create a second cluster).
+    if let (InitMode::BootstrapOrJoin(spec), Some(dir)) = (&cfg.init, &cfg.data_dir) {
+        cfg.init = crate::join::resolve_bootstrap_or_join(
+            spec,
+            dir,
+            cfg.node_id,
+            cfg.advertise.as_deref(),
+        )
+        .await?;
+    }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
     let node_id = match &plan {
@@ -541,7 +555,7 @@ pub async fn start(
         },
         append_observer: cfg.append_observer.clone(),
         obs: Arc::clone(&obs),
-        apply_gate: cfg.apply_gate.clone(),
+        testing_apply_gate: cfg.testing_apply_gate.clone(),
     })
     .await?;
     raft.withhold_leader = cfg.testing.withhold_leader;
@@ -602,13 +616,17 @@ pub async fn start(
         let mut rx = raft.raft.metrics();
         let raft_for_health = raft.clone();
         let max_lag = cfg.ready_max_lag;
+        let silence = crate::observe::leader_silence_limit(settings.election_max_ms);
+        // Re-checked at least this often: the time since a leader last
+        // reached this node grows without any event.
+        let recheck = (silence / 4).min(Duration::from_secs(1));
         tokio::spawn(async move {
             let mut last = None;
             loop {
                 if shutdown.is_triggered() {
                     return;
                 }
-                let ready = raft_ready(&raft_for_health, &rx.borrow_and_update(), max_lag);
+                let ready = raft_ready(&raft_for_health, &rx.borrow_and_update(), max_lag, silence);
                 if last != Some(ready) {
                     tracing::info!(ready, max_lag, "readiness changed");
                     last = Some(ready);
@@ -634,9 +652,10 @@ pub async fn start(
                 tokio::select! {
                     r = rx.changed() => if r.is_err() { return },
                     _ = raft_for_health.obs.leader_commit_changed() => {}
-                    // A backstop for a change noted between the check and
-                    // the wait (`Notify::notify_waiters` keeps no permit).
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    // The leader's silence, and a backstop for a change
+                    // noted between the check and the wait
+                    // (`Notify::notify_waiters` keeps no permit).
+                    _ = tokio::time::sleep(recheck) => {}
                 }
             }
         });
@@ -782,19 +801,26 @@ pub async fn start(
 }
 
 /// Whether `memory-graph.ready` is `SERVING`: a leader is known (and the
-/// test hook does not hide it) and this node applied the leader's committed
-/// index to within `max_lag` entries ([`crate::observe::is_ready`]).
+/// test hook does not hide it), a leader reached this node within `silence`
+/// (unless it is the leader), and it applied the leader's committed index
+/// to within `max_lag` entries ([`crate::observe::is_ready`]).
 fn raft_ready(
     raft: &RaftNode,
     m: &openraft::RaftMetrics<crate::raft::NodeId, openraft::impls::BasicNode>,
     max_lag: u64,
+    silence: Duration,
 ) -> bool {
     crate::observe::is_ready(
-        !raft.withhold_leader && m.current_leader.is_some(),
-        m.current_leader == Some(raft.node_id) && m.state == openraft::ServerState::Leader,
-        m.last_applied.as_ref().map_or(0, |l| l.index),
-        raft.obs.leader_commit(),
+        crate::observe::Readiness {
+            leader_known: !raft.withhold_leader && m.current_leader.is_some(),
+            is_leader: m.current_leader == Some(raft.node_id)
+                && m.state == openraft::ServerState::Leader,
+            applied: m.last_applied.as_ref().map_or(0, |l| l.index),
+            leader_commit: raft.obs.leader_commit(),
+            since_heard: raft.obs.since_heard_from_leader(),
+        },
         max_lag,
+        silence,
     )
 }
 

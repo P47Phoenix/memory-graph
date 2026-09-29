@@ -30,11 +30,13 @@ To run the published image instead of building one:
 | Node id / advertised address | 1 / `node1:7000` | 2 / `node2:7000` | 3 / `node3:7000` |
 | gRPC port on the host | 7001 | 7002 | 7003 |
 | `/metrics` on the host | 9101 | 9102 | 9103 |
+| Override the host ports | `MG_GRPC_PORT_1`, `MG_METRICS_PORT_1` | `..._2` | `..._3` |
 | Volume (`/data`) | `node1-data` | `node2-data` | `node3-data` |
 
 - **Health.** Every node's healthcheck is `memory-graph health --ready --server 127.0.0.1:7000`,
   the `memory-graph.ready` gRPC health service: `SERVING` only while a leader is known and the node
-  has applied to within `--ready-max-lag` (default 1000) entries of the leader's commit index.
+  heard from it within three election timeouts, and has applied to within `--ready-max-lag`
+  (default 1000) entries of the leader's commit index.
   node2 and node3 start once node1 is healthy (`depends_on: condition: service_healthy`), and
   `up --wait` returns once all three are. The image's own `HEALTHCHECK` (`health` without
   `--ready`: the process serves) stays for single-container use.
@@ -53,11 +55,15 @@ To run the published image instead of building one:
 
 `deploy/compose/check.sh` (run from the repository root, with a built CLI:
 `cargo build --release -p graph-cli`) does what the `compose` CI job does: `up -d --wait`;
-waits for three voters (`cluster members --server :7001`); indexes `testdata/corpus` through
+waits for three voters (`cluster members` through node1); indexes `testdata/corpus` through
 node2; compares node3's answers (`--read linearizable`) with an embedded run of the same
 indexing; scrapes every node's `/metrics`; stops node1, writes through node2 and reads the write
 through node3; starts node1 and waits until all three report the same applied index
-(`cluster status --json`); `down -v`. On failure it prints the container logs. `KEEP=1` leaves
+(`cluster status --json`); `down -v`. It runs as its own Compose project
+(`CHECK_PROJECT`, default `memory-graph-check-<pid>`) on its own host ports (`CHECK_PORT_BASE`,
+default 17000: gRPC 17001-17003, metrics 19101-19103), so its `down -v` never touches a cluster
+started from this file the documented way (project `memory-graph`). On failure it prints the
+container logs. `KEEP=1` leaves
 the cluster running; `MG=<path>` picks the CLI; `EMBEDDED_IN_IMAGE=1` runs the embedded side in
 the image (a host whose platform differs from the containers').
 

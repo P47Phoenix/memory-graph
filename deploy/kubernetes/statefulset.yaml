@@ -4,7 +4,11 @@
 #   --node-id-from-hostname      memory-graph-N is node N+1
 #   --bootstrap-or-join <peer>   memory-graph-0 bootstraps, the others join
 #                                it and become voters once caught up
-#                                (--auto-promote)
+#                                (--auto-promote). A memory-graph-0 whose
+#                                volume is empty first asks memory-graph-1
+#                                and -2 (--replicas) for an existing cluster
+#                                and rejoins it: a lost PVC never creates a
+#                                second cluster (docs/deploy/kubernetes.md).
 # On a restart every pod finds its data directory initialized, so both are
 # plain restarts. podManagementPolicy: Parallel, because after a full stop
 # no single pod can be ready alone (a leader needs a quorum), so ordered
@@ -39,7 +43,10 @@ spec:
         fsGroup: 65532
       containers:
         - name: memory-graph
-          image: ghcr.io/p47phoenix/memory-graph:main
+          # Pin a release (:X.Y.Z) or a digest (@sha256:...); :main moves with
+          # every merge, and pods restarted at different times would run
+          # different builds. REPLACE the placeholder tag before applying.
+          image: ghcr.io/p47phoenix/memory-graph:REPLACE-WITH-RELEASE-TAG
           imagePullPolicy: IfNotPresent
           env:
             - name: POD_NAME
@@ -63,6 +70,8 @@ spec:
             - --node-id-from-hostname
             - --bootstrap-or-join
             - memory-graph-0.memory-graph.$(POD_NAMESPACE).svc.cluster.local:7000
+            - --replicas
+            - "3"                # keep equal to spec.replicas
             - --auto-promote
             - --metrics-listen
             - 0.0.0.0:9100
@@ -100,6 +109,13 @@ spec:
               memory: 512Mi
             limits:
               memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: data
               mountPath: /data

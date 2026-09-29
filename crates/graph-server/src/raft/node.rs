@@ -112,8 +112,9 @@ pub struct NodeStart {
     pub append_observer: Option<AppendObserver>,
     /// Metrics and readiness inputs this node records (stage E).
     pub obs: Arc<crate::observe::Observability>,
-    /// Test-only: see [`crate::raft::state_machine::ApplyGate`].
-    pub apply_gate: Option<crate::raft::state_machine::ApplyGate>,
+    /// Testing only: see [`crate::raft::state_machine::TestingApplyGate`].
+    #[doc(hidden)]
+    pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
 }
 
 #[derive(Clone)]
@@ -246,7 +247,7 @@ impl RaftNode {
         let sm = StoreStateMachine::new(Arc::clone(&p.slot), Arc::clone(&p.snapshots))
             .with_failpoints(p.failpoints)
             .with_obs(Arc::clone(&p.obs))
-            .with_apply_gate(p.apply_gate.clone());
+            .with_testing_apply_gate(p.testing_apply_gate.clone());
         let net_stats = NetStats::default();
         let net = GrpcNetwork::new(
             Arc::clone(&p.identity),

@@ -18,7 +18,9 @@
 # to within --ready-max-lag entries of it), so `up --wait` returns once all
 # three are caught up, and node2/node3 start only once node1 is ready.
 # Metrics: each node serves Prometheus text at :9100/metrics inside the
-# network (published on 9101-9103).
+# network (published on 9101-9103). Host ports: MG_GRPC_PORT_<n> and
+# MG_METRICS_PORT_<n> override 700<n> / 910<n>; check.sh uses its own project
+# name and ports, so it never touches a cluster started from this file.
 name: memory-graph
 
 x-node: &node
@@ -61,8 +63,8 @@ services:
       - --min-free-disk
       - 512M
     ports:
-      - "7001:7000"
-      - "9101:9100"
+      - "${MG_GRPC_PORT_1:-7001}:7000"
+      - "${MG_METRICS_PORT_1:-9101}:9100"
     volumes:
       - node1-data:/data
 
@@ -89,8 +91,8 @@ services:
       - --min-free-disk
       - 512M
     ports:
-      - "7002:7000"
-      - "9102:9100"
+      - "${MG_GRPC_PORT_2:-7002}:7000"
+      - "${MG_METRICS_PORT_2:-9102}:9100"
     volumes:
       - node2-data:/data
     depends_on:
@@ -120,8 +122,8 @@ services:
       - --min-free-disk
       - 512M
     ports:
-      - "7003:7000"
-      - "9103:9100"
+      - "${MG_GRPC_PORT_3:-7003}:7000"
+      - "${MG_METRICS_PORT_3:-9103}:9100"
     volumes:
       - node3-data:/data
     depends_on:

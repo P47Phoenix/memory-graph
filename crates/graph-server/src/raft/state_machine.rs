@@ -64,14 +64,15 @@ pub struct StoreStateMachine {
     snapshots: Arc<SnapshotDir>,
     failpoints: SmFailpoints,
     obs: Arc<crate::observe::Observability>,
-    apply_gate: Option<ApplyGate>,
+    testing_apply_gate: Option<TestingApplyGate>,
 }
 
-/// Test-only: called (on the blocking pool) with the index of every entry
+/// Testing only, not a supported API (#[doc(hidden)]): called (on the blocking pool) with the index of every entry
 /// of a batch before the batch is applied; a test blocks in it to hold
 /// apply back while the node keeps receiving and committing entries (a
 /// slow apply, deterministically).
-pub type ApplyGate = Arc<dyn Fn(u64) + Send + Sync>;
+#[doc(hidden)]
+pub type TestingApplyGate = Arc<dyn Fn(u64) + Send + Sync>;
 
 pub use super::snapshot_dir::replace_file;
 
@@ -104,13 +105,14 @@ impl StoreStateMachine {
             snapshots,
             failpoints: SmFailpoints::default(),
             obs: Arc::default(),
-            apply_gate: None,
+            testing_apply_gate: None,
         }
     }
 
-    /// Test-only: see [`ApplyGate`].
-    pub fn with_apply_gate(mut self, gate: Option<ApplyGate>) -> Self {
-        self.apply_gate = gate;
+    /// Testing only: see [`TestingApplyGate`].
+    #[doc(hidden)]
+    pub fn with_testing_apply_gate(mut self, gate: Option<TestingApplyGate>) -> Self {
+        self.testing_apply_gate = gate;
         self
     }
 
@@ -337,7 +339,7 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
         let slot = Arc::clone(&self.slot);
         let fp = self.failpoints;
         let obs = Arc::clone(&self.obs);
-        let gate = self.apply_gate.clone();
+        let gate = self.testing_apply_gate.clone();
         // Parsing and committing block; keep them off the runtime workers.
         tokio::task::spawn_blocking(move || {
             if let Some(g) = gate {

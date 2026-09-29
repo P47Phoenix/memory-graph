@@ -111,7 +111,8 @@ impl Serve {
                 let metrics = stdout.iter().find_map(|l| {
                     l.split("metrics on http://")
                         .nth(1)
-                        .map(|r| r.trim_end_matches("/metrics").to_string())
+                        .and_then(|r| r.split("/metrics").next())
+                        .map(str::to_string)
                 });
                 break (addr, metrics);
             }
@@ -483,9 +484,35 @@ fn json_logs_metrics_and_health_exit_codes() {
     check_histograms(&types, &samples);
     assert_eq!(http_get(&metrics, "/nope").0, 404);
 
-    // cluster status --json carries the totals.
+    // cluster status --json carries the totals, and (idle: nothing is
+    // written between the two reads) the same Raft numbers as /metrics.
     let st: serde_json::Value =
         serde_json::from_str(&ok(&["--server", &s.addr, "cluster", "status", "--json"])).unwrap();
+    let (_, now) = parse_prometheus(&http_get(&metrics, "/metrics").1);
+    for (metric, key) in [
+        ("mg_raft_term", "current_term"),
+        ("mg_raft_leader_id", "leader_id"),
+        ("mg_raft_last_log_index", "last_log_index"),
+        ("mg_raft_committed_index", "committed_index"),
+        ("mg_raft_applied_index", "applied_index"),
+        ("mg_raft_snapshot_index", "snapshot_index"),
+        ("mg_raft_purged_index", "purged_index"),
+    ] {
+        assert_eq!(
+            one(&now, metric),
+            st[key].as_u64().unwrap_or(0) as f64,
+            "{metric} vs status {key}: {st}"
+        );
+    }
+    let role = now
+        .iter()
+        .find(|s| s.name == "mg_raft_role" && s.value == 1.0)
+        .map(|s| s.labels["role"].clone());
+    assert_eq!(role.as_deref(), st["role"].as_str(), "{st}");
+    assert!(
+        !now.iter().any(|s| s.name == "mg_raft_replication_lag"),
+        "a one-node cluster has no peers"
+    );
     assert!(st["rpcs_total"].as_u64().unwrap() >= 1, "{st}");
     assert!(st["entries_applied_total"].as_u64().unwrap() >= 1, "{st}");
     assert_eq!(st["writes_forwarded_total"].as_u64(), Some(0));
@@ -500,14 +527,21 @@ fn json_logs_metrics_and_health_exit_codes() {
         Some(1)
     );
 
-    // stdout: only the start lines, no logs.
-    assert!(
-        stdout
-            .iter()
-            .all(|l| l.starts_with("memory-graph serve: metrics on ")
-                || l.starts_with("memory-graph serve: listening on ")),
-        "{stdout:?}"
-    );
+    // stdout: only the start lines, no logs, and JSON objects too (a
+    // container runtime merges stdout into the log stream).
+    assert_eq!(stdout.len(), 2, "{stdout:?}");
+    for (l, event) in stdout.iter().zip(["metrics", "listening"]) {
+        let v: serde_json::Value =
+            serde_json::from_str(l).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {l}"));
+        assert_eq!(v["event"], event, "{l}");
+        for k in ["timestamp", "level", "target", "message", "addr"] {
+            assert!(v.get(k).is_some(), "{k} missing: {l}");
+        }
+    }
+    let v: serde_json::Value = serde_json::from_str(&stdout[1]).unwrap();
+    assert_eq!(v["addr"], addr.as_str());
+    let v: serde_json::Value = serde_json::from_str(&stdout[0]).unwrap();
+    assert_eq!(v["addr"], metrics.as_str());
     // stderr: JSON lines only, each with the four keys.
     assert!(!stderr.is_empty(), "logs were written");
     let mut rpc_span = false;
@@ -565,6 +599,12 @@ fn text_logs_and_a_bad_filter() {
         &[],
     );
     assert!(s.metrics.is_none());
+    assert_eq!(s.stdout.len(), 1);
+    assert!(
+        s.stdout[0].starts_with("memory-graph serve: listening on "),
+        "text start line: {:?}",
+        s.stdout
+    );
     let stderr = s.stop();
     assert!(
         stderr
@@ -597,7 +637,9 @@ fn statefulset_identity_from_the_hostname() {
     assert!(!o.status.success());
     assert!(text(&o.stderr).contains("laptop"), "{}", text(&o.stderr));
 
-    // Ordinal 0: bootstraps as node 1 (the peer is never contacted).
+    // Ordinal 0 on an empty directory asks the other members (--peers)
+    // whether a cluster exists; none answers within the probe timeout, so
+    // it bootstraps as node 1.
     let p0 = Serve::start(
         &[
             "--data-dir",
@@ -607,6 +649,10 @@ fn statefulset_identity_from_the_hostname() {
             "--node-id-from-hostname",
             "--bootstrap-or-join",
             "127.0.0.1:1",
+            "--peers",
+            "127.0.0.1:1",
+            "--bootstrap-probe-timeout",
+            "1s",
             "--auto-promote",
         ],
         &[("HOSTNAME", "memory-graph-0")],

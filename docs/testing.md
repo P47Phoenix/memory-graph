@@ -131,7 +131,10 @@ Four layers, from the wire up:
 Two more layers on top of the four above. Every wait polls a condition with
 a hard timeout and a message naming what it waited for. Faults are injected
 through deterministic hooks (failpoints in `TestingHooks`, the network
-`FaultPlan`, a fake free-space probe), never by sleeping and hoping.
+`FaultPlan`, a fake free-space probe, the apply gate
+`ServeConfig::testing_apply_gate`), never by sleeping and hoping. The
+`testing_*` hooks are for tests only: `#[doc(hidden)]`, not a supported API,
+and they may change without notice.
 
 5. **Cluster testbed** (`cargo test -p graph-server --test cluster`):
    `graph_server::testing::ClusterTestbed` runs n in-process nodes on

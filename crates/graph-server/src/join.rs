@@ -302,3 +302,291 @@ pub fn is_learner(raft: &RaftNode) -> bool {
     let mem = m.membership_config.membership();
     mem.get_node(&raft.node_id).is_some() && !mem.voter_ids().any(|v| v == raft.node_id)
 }
+
+// ---------------------------------------------------------------------------
+// `--bootstrap-or-join` (ADR 0004 D10).
+
+/// What ordinal 0 found among its siblings ([`discover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Discovery {
+    /// No sibling reported a cluster id: bootstrap.
+    NoCluster,
+    /// `via` answered `cluster_id`; its membership is `members`.
+    Cluster {
+        cluster_id: String,
+        via: String,
+        members: Vec<pb::Member>,
+    },
+}
+
+/// How long one sibling probe (connect + `Status`) may take.
+const PROBE_ATTEMPT: Duration = Duration::from_secs(2);
+/// Pause between probe rounds.
+const PROBE_ROUND: Duration = Duration::from_millis(200);
+
+async fn probe_status(addr: &str) -> Option<pb::StatusResponse> {
+    tokio::time::timeout(PROBE_ATTEMPT, async {
+        admin(addr, PROBE_ATTEMPT)
+            .await
+            .ok()?
+            .status(pb::StatusRequest {})
+            .await
+            .ok()
+            .map(tonic::Response::into_inner)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Ask `siblings` (`Admin.Status`, in rounds, until `timeout`) whether a
+/// cluster exists. Returns as soon as one reports a cluster id, or once
+/// every sibling answered that it has none (a first deployment: they wait
+/// to join ordinal 0); at the deadline, with some siblings unreachable and
+/// none reporting a cluster, [`Discovery::NoCluster`]. Siblings reporting
+/// two different cluster ids are refused.
+pub async fn discover(siblings: &[String], timeout: Duration) -> Result<Discovery, StoreError> {
+    let deadline = Instant::now() + timeout;
+    let mut empty: std::collections::BTreeSet<String> = Default::default();
+    loop {
+        let round = futures_join_all(siblings.iter().cloned().map(|s| async move {
+            let st = probe_status(&s).await;
+            (s, st)
+        }))
+        .await;
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (addr, st) in round {
+            match st {
+                Some(st) if !st.cluster_id.is_empty() => found.push((addr, st.cluster_id)),
+                Some(_) => {
+                    empty.insert(addr);
+                }
+                None => {}
+            }
+        }
+        if let Some((via, cluster_id)) = found.first().cloned() {
+            if let Some((other, id2)) = found.iter().find(|(_, c)| *c != cluster_id) {
+                return Err(StoreError::Rejected(format!(
+                    "--bootstrap-or-join: the other members disagree: {via} is in cluster \
+                     {cluster_id} but {other} is in cluster {id2}; refusing to bootstrap or \
+                     join until that is resolved"
+                )));
+            }
+            let members = tokio::time::timeout(PROBE_ATTEMPT, async {
+                admin(&via, PROBE_ATTEMPT)
+                    .await?
+                    .members(pb::MembersRequest {})
+                    .await
+                    .map(tonic::Response::into_inner)
+            })
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("Members"))
+            .and_then(|r| r)
+            .map_err(|e| {
+                StoreError::Rejected(format!(
+                    "--bootstrap-or-join: {via} is in cluster {cluster_id} but did not list its \
+                     members: {}",
+                    e.message()
+                ))
+            })?
+            .members;
+            return Ok(Discovery::Cluster {
+                cluster_id,
+                via,
+                members,
+            });
+        }
+        if siblings.iter().all(|s| empty.contains(s)) {
+            return Ok(Discovery::NoCluster);
+        }
+        if Instant::now() >= deadline {
+            let silent: Vec<&str> = siblings
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !empty.contains(*s))
+                .collect();
+            tracing::warn!(
+                ?silent,
+                ?timeout,
+                "--bootstrap-or-join: these members did not answer; none that did is in a \
+                 cluster, so this node bootstraps one"
+            );
+            return Ok(Discovery::NoCluster);
+        }
+        tokio::time::sleep(PROBE_ROUND.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+}
+
+async fn futures_join_all<F: std::future::Future + Send + 'static>(
+    futs: impl Iterator<Item = F>,
+) -> Vec<F::Output>
+where
+    F::Output: Send + 'static,
+{
+    let handles: Vec<_> = futs.map(tokio::spawn).collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        if let Ok(v) = h.await {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Resolve [`InitMode::BootstrapOrJoin`](crate::InitMode::BootstrapOrJoin)
+/// into the mode this start uses:
+///
+/// * an ordinal other than 0: [`InitMode::Join`](crate::InitMode::Join)
+///   through the named peer (a restart when initialized);
+/// * ordinal 0 on an initialized data directory: a restart;
+/// * ordinal 0 on an uninitialized one: [`discover`] among the siblings.
+///   No cluster: bootstrap. A cluster (pod 0 lost its volume): join it
+///   through the sibling that answered. If the cluster still lists this
+///   node id (it was a voter or a learner), that member is the lost
+///   incarnation: it is removed first (a voter that lost its log must not
+///   vote again under its id), provided it is recorded at this node's
+///   advertised address; the node then joins as a learner and, with
+///   `--auto-promote`, becomes a voter once caught up.
+///
+/// `node_id` and `advertise` are this node's (`--node-id` /
+/// `--node-id-from-hostname`, `--advertise`).
+pub async fn resolve_bootstrap_or_join(
+    spec: &crate::paths::BootstrapOrJoin,
+    data_dir: &std::path::Path,
+    node_id: Option<NodeId>,
+    advertise: Option<&str>,
+) -> Result<crate::InitMode, StoreError> {
+    use crate::InitMode;
+    if spec.ordinal != 0 {
+        return Ok(InitMode::Join(spec.join.clone()));
+    }
+    let paths = crate::NodePaths::for_data_dir(data_dir);
+    let initialized = match &paths.node_json {
+        Some(p) => crate::NodeJson::read(p)?.is_some(),
+        None => false,
+    };
+    let bootstrap = InitMode::Bootstrap { restore: None };
+    if initialized || spec.force_bootstrap || spec.siblings.is_empty() {
+        if spec.force_bootstrap && !initialized {
+            tracing::warn!("--force-bootstrap: not asking the other members for a cluster");
+        }
+        return Ok(bootstrap);
+    }
+    tracing::info!(siblings = ?spec.siblings, "--bootstrap-or-join: ordinal 0 on an empty data directory; asking the other members whether a cluster exists");
+    let (cluster_id, via, members) = match discover(&spec.siblings, spec.probe_timeout).await? {
+        Discovery::NoCluster => return Ok(bootstrap),
+        Discovery::Cluster {
+            cluster_id,
+            via,
+            members,
+        } => (cluster_id, via, members),
+    };
+    let me = node_id.ok_or_else(|| {
+        StoreError::Rejected(
+            "--bootstrap-or-join needs a node id (--node-id or --node-id-from-hostname)".into(),
+        )
+    })?;
+    tracing::warn!(
+        %cluster_id,
+        %via,
+        node_id = me,
+        "--bootstrap-or-join: a cluster already exists (this pod lost its data directory); \
+         joining it instead of bootstrapping a new one"
+    );
+    if let Some(m) = members.iter().find(|m| m.node_id == me) {
+        let recovery = format!(
+            "remove the old member (`memory-graph --server {via} cluster remove {me} --force`) \
+             and start this node again, or pass --force-bootstrap to create a new cluster (its \
+             data would be separate from cluster {cluster_id})"
+        );
+        match advertise {
+            Some(a) if a == m.addr => {}
+            Some(a) => {
+                return Err(StoreError::Rejected(format!(
+                    "--bootstrap-or-join: cluster {cluster_id} lists node {me} at {}, not at this \
+                     node's address {a}; refusing to replace it. To recover: {recovery}",
+                    m.addr
+                )))
+            }
+            None => {
+                return Err(StoreError::Rejected(format!(
+                    "--bootstrap-or-join: cluster {cluster_id} lists node {me} at {}; without \
+                     --advertise this node cannot tell whether that is its lost incarnation. \
+                     Pass --advertise, or to recover: {recovery}",
+                    m.addr
+                )))
+            }
+        }
+        tracing::warn!(
+            node_id = me,
+            role = %m.role,
+            "--bootstrap-or-join: removing this node's lost incarnation from the cluster before \
+             joining again"
+        );
+        remove_lost_self(&via, me, spec.join.timeout)
+            .await
+            .map_err(|e| {
+                StoreError::Rejected(format!(
+                    "--bootstrap-or-join: node {me} lost its data directory and is still a \
+                     member of cluster {cluster_id}; removing the old member failed: {e}. To \
+                     recover: {recovery}"
+                ))
+            })?;
+    }
+    let mut join = spec.join.clone();
+    join.peer = via;
+    Ok(InitMode::Join(join))
+}
+
+/// `Admin.Remove` of `id` through `peer` (forwarded to the leader), with
+/// `force` (3 voters to 2: the node is back as a voter once it caught up),
+/// retrying while no leader answers until `timeout`.
+async fn remove_lost_self(peer: &str, id: NodeId, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut target = peer.to_string();
+    let mut delay = Duration::from_millis(100);
+    loop {
+        let attempt = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
+            admin(&target, Duration::from_secs(5))
+                .await?
+                .remove(pb::RemoveRequest {
+                    node_id: id,
+                    force: true,
+                })
+                .await
+        })
+        .await;
+        let last = match attempt {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(st)) => {
+                // Removed meanwhile (a retry after a lost answer): done.
+                if st.message().contains(&format!("node {id} is not a member")) {
+                    return Ok(());
+                }
+                match classify(&target, &st) {
+                    Next::Fail(e) => {
+                        // The quorum check answers a rejection while the
+                        // other members still settle; retry it too.
+                        if !st.message().contains("would drop below quorum") {
+                            return Err(e.to_string());
+                        }
+                        st.message().to_string()
+                    }
+                    Next::Retry(next) => {
+                        target = next;
+                        st.message().to_string()
+                    }
+                }
+            }
+            Err(_) => format!("no answer within {ATTEMPT_TIMEOUT:?}"),
+        };
+        if Instant::now() + delay > deadline {
+            return Err(format!(
+                "no leader removed it within {timeout:?}; last error: {last}"
+            ));
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
+    }
+}

@@ -231,8 +231,10 @@ enum Cmd {
             conflicts_with = "bootstrap"
         )]
         join: Option<String>,
-        /// For a StatefulSet: --bootstrap when this host's name ends in `-0` (the pod ordinal),
-        /// else --join <HOST:PORT>. Restarts are plain restarts either way
+        /// For a StatefulSet: ordinal 0 (host name ending in `-0`) bootstraps, the others --join
+        /// <HOST:PORT> (ordinal 0's address). Ordinal 0 on an empty data directory first asks the
+        /// other members (--peers) whether a cluster exists and joins it instead (a lost volume
+        /// never creates a second cluster). Restarts are plain restarts either way
         #[arg(
             long,
             value_name = "HOST:PORT",
@@ -240,6 +242,38 @@ enum Cmd {
             conflicts_with_all = ["bootstrap", "join", "restore"]
         )]
         bootstrap_or_join: Option<String>,
+        /// With --bootstrap-or-join: the other members ordinal 0 asks for an existing cluster,
+        /// comma-separated HOST:PORTs (default: ordinals 1..--replicas of the named peer's
+        /// StatefulSet, e.g. memory-graph-1.<same domain>:<same port>)
+        #[arg(
+            long,
+            requires = "bootstrap_or_join",
+            value_delimiter = ',',
+            value_name = "HOST:PORT,..."
+        )]
+        peers: Vec<String>,
+        /// With --bootstrap-or-join and no --peers: the StatefulSet's replica count
+        #[arg(
+            long,
+            requires = "bootstrap_or_join",
+            default_value_t = 3,
+            value_name = "N"
+        )]
+        replicas: u64,
+        /// With --bootstrap-or-join: how long ordinal 0 asks the other members before it
+        /// bootstraps (it stops early once all of them answered they have no cluster)
+        #[arg(
+            long,
+            requires = "bootstrap_or_join",
+            value_parser = parse_duration,
+            default_value = "30s",
+            value_name = "DURATION"
+        )]
+        bootstrap_probe_timeout: std::time::Duration,
+        /// With --bootstrap-or-join: ordinal 0 bootstraps an empty data directory without asking
+        /// the other members (a deliberate new cluster)
+        #[arg(long, requires = "bootstrap_or_join")]
+        force_bootstrap: bool,
         /// With --join (or --bootstrap-or-join): become a voter once caught up (the leader
         /// promotes the node when its replication lag is zero)
         #[arg(long, conflicts_with = "standby")]
@@ -668,6 +702,10 @@ fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
 }
 
+/// Set once `serve --log-format json` installed its subscriber: a failure
+/// is then logged as JSON rather than printed as text.
+static JSON_LOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn main() {
     match run() {
         Ok(code) => std::process::exit(code),
@@ -685,7 +723,13 @@ fn main() {
                 Some(addr) => graph_cli::target::explain_remote_failure(e, addr, code),
                 None => e,
             };
-            eprintln!("Error: {e:?}");
+            if JSON_LOGS.get().copied().unwrap_or(false) {
+                // `serve --log-format json`: stderr stays one JSON object
+                // per line, the failure included.
+                tracing::error!(error = %format!("{e:#}"), exit_code = code, "memory-graph serve failed");
+            } else {
+                eprintln!("Error: {e:?}");
+            }
             std::process::exit(code);
         }
     }
@@ -729,6 +773,10 @@ fn run() -> Result<i32> {
         restore,
         join,
         bootstrap_or_join,
+        peers,
+        replicas,
+        bootstrap_probe_timeout,
+        force_bootstrap,
         auto_promote,
         standby: _,
         accept_snapshot_overwrite,
@@ -754,6 +802,7 @@ fn run() -> Result<i32> {
             bail!("serve takes --db <file> or --data-dir <dir> to serve, not --server {s}");
         }
         graph_cli::logging::init(*log_format, log_level)?;
+        let _ = JSON_LOGS.set(*log_format == graph_cli::logging::LogFormat::Json);
         if *auto_promote && join.is_none() && bootstrap_or_join.is_none() {
             bail!("--auto-promote needs --join <peer> (or --bootstrap-or-join <peer>)");
         }
@@ -766,21 +815,32 @@ fn run() -> Result<i32> {
         } else {
             *node_id
         };
-        let (bootstrap, join) = match bootstrap_or_join {
+        let bootstrap_or_join = match bootstrap_or_join {
             Some(peer) => {
-                let ordinal = graph_server::paths::hostname_ordinal(&host).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--bootstrap-or-join: host name `{host}` does not end in `-<ordinal>` \
-                         (a StatefulSet pod name such as memory-graph-0)"
-                    )
-                })?;
-                if ordinal == 0 {
-                    (&true, &None)
+                let ordinal = graph_server::paths::hostname_ordinal(&host)
+                    .map_err(|e| anyhow::anyhow!("--bootstrap-or-join: {e}"))?;
+                let siblings = if !peers.is_empty() {
+                    peers.clone()
+                } else if ordinal == 0 {
+                    graph_server::paths::sibling_addrs(peer, *replicas)
+                        .map_err(|e| anyhow::anyhow!("--bootstrap-or-join: {e}"))?
                 } else {
-                    (&false, &Some(peer.clone()))
-                }
+                    Vec::new()
+                };
+                Some(graph_server::paths::BootstrapOrJoin {
+                    ordinal,
+                    join: graph_server::JoinSpec {
+                        peer: peer.clone(),
+                        auto_promote: *auto_promote,
+                        accept_snapshot_overwrite: *accept_snapshot_overwrite,
+                        timeout: *join_timeout,
+                    },
+                    siblings,
+                    probe_timeout: *bootstrap_probe_timeout,
+                    force_bootstrap: *force_bootstrap,
+                })
             }
-            None => (bootstrap, join),
+            None => None,
         };
         if cli.chunk_bytes.is_some() {
             bail!("--chunk-bytes does not apply to serve: the server cuts replicated log entries at {} MiB", graph_client::RAFT_ENTRY_MAX_BYTES >> 20);
@@ -809,7 +869,9 @@ fn run() -> Result<i32> {
                         dir.display()
                     );
                 }
-                let init = if *bootstrap {
+                let init = if let Some(b) = &bootstrap_or_join {
+                    graph_server::InitMode::BootstrapOrJoin(b.clone())
+                } else if *bootstrap {
                     graph_server::InitMode::Bootstrap {
                         restore: restore.clone(),
                     }
@@ -941,13 +1003,24 @@ fn run() -> Result<i32> {
             (true, None) => format!("data dir {}", served.display()),
             (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
         };
+        let log_format = *log_format;
         graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
             // Scripts and tests read these lines for the bound ports (the
-            // metrics line first: the listening line is the start signal).
+            // metrics line first: the listening line is the start signal);
+            // JSON objects under --log-format json.
+            use graph_cli::logging::start_line;
             if let Some(m) = r.metrics_addr {
-                println!("memory-graph serve: metrics on http://{m}/metrics");
+                let msg = format!("metrics on http://{m}/metrics");
+                println!(
+                    "{}",
+                    start_line(log_format, "metrics", &msg, &m.to_string())
+                );
             }
-            println!("memory-graph serve: listening on {} ({shown})", r.addr);
+            let msg = format!("listening on {} ({shown})", r.addr);
+            println!(
+                "{}",
+                start_line(log_format, "listening", &msg, &r.addr.to_string())
+            );
         })
         .map_err(|e| match e {
             StoreError::Locked(why) => graph_cli::target::locked_error(&served, &why),
