@@ -234,6 +234,55 @@ fn standalone_macro_lines_do_not_name_declarations() {
 }
 
 #[test]
+fn deep_nesting_does_not_overflow_the_stack() {
+    let e = CppExtractor.extract(&"namespace a { ".repeat(20000));
+    assert!(!e.symbols.is_empty() && e.symbols.len() <= MAX_DEPTH);
+    let e = CExtractor.extract(&"struct S { ".repeat(20000));
+    assert!(e.symbols.len() <= MAX_DEPTH);
+    let src = format!("int {}fp{};", "(*".repeat(20000), ")".repeat(20000));
+    let e = CExtractor.extract(&src);
+    assert!(!e.has_errors);
+}
+
+#[test]
+fn only_the_first_preprocessor_branch_is_scanned() {
+    let src = "void f(int a) {\n#ifdef X\n  if (a) {\n#else\n  if (!a) {\n#endif\n    g();\n  }\n}\n#if Y\n#define M 1\n#elif Z\n#define M 2\n#else\nint only_else;\n#endif\nint after = 1;\n";
+    let s = c(src);
+    assert!(find(&s, "f", "function").3.ends_with("}\n}"), "{s:#?}");
+    find(&s, "after", "variable");
+    assert_eq!(s.iter().filter(|x| x.0 == "M").count(), 2);
+    assert!(s.iter().all(|x| x.0 != "only_else"));
+}
+
+#[test]
+fn cpp_in_a_c_header_is_scanned_as_cpp() {
+    let src = "class Foo {\npublic:\n  void bar() {}\n  ~Foo();\n};\n";
+    let s = c(src);
+    assert_eq!(find(&s, "Foo", "class").1, SymbolKind::Type);
+    assert_eq!(find(&s, "bar", "method").1, SymbolKind::Method);
+    assert_eq!(find(&s, "~Foo", "destructor").1, SymbolKind::Method);
+    assert!(s.iter().all(|x| x.2 != "variable"));
+    assert_eq!(CExtractor.language(), "c");
+    // Plain C headers stay C (`class` is an identifier there).
+    assert_eq!(c("int class;\n")[0].2, "variable");
+}
+
+#[test]
+fn pointer_declarators_and_forward_declarations() {
+    let s = c("void (*signal(int sig, void (*h)(int)))(int) { return 0; }\nint (*fp)(int);\nstruct S;\nstruct T t;\n");
+    assert_eq!(find(&s, "signal", "function").1, SymbolKind::Function);
+    assert_eq!(find(&s, "fp", "variable").1, SymbolKind::Variable);
+    find(&s, "t", "variable");
+    assert!(s.iter().all(|x| x.0 != "void" && x.0 != "S" && x.0 != "h"));
+    let s = cpp("enum class E : int;\nstruct S;\nclass C;\ntemplate <class T> struct U;\n");
+    assert!(s.is_empty(), "{s:#?}");
+    let s = cpp("namespace A { struct B { void f(); }; }\nvoid A::B::f() {}\n");
+    let f: Vec<_> = s.iter().filter(|x| x.0 == "f").collect();
+    assert_eq!(f.len(), 2);
+    assert_eq!(f[1].2, "method");
+}
+
+#[test]
 fn h_files_stay_c() {
     assert_eq!(CExtractor.extensions(), ["c", "h"]);
     assert!(!CppExtractor.extensions().contains(&"h"));

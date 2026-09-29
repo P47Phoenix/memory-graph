@@ -14,7 +14,10 @@
 //!
 //! The package symbol spans from `package` to the end of the file, so every
 //! other symbol nests in it. A method is not nested under its receiver
-//! type (like a Rust `impl` method, it is a sibling of the type). A
+//! type (like a Rust `impl` method, it is a sibling of the type) and is
+//! named without the receiver (`Area`, not `Rect.Area`), so methods do not
+//! roll up under their type with `--grain class`: `--grain method` finds
+//! them, and the `func (r Rect)` receiver is in the span text. A
 //! declaration runs from its keyword (or, inside a `( ... )` group, from its
 //! first name) through its closing `}` or the last token before Go's
 //! automatic semicolon. Function bodies, struct fields and interface

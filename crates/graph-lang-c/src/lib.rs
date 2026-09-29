@@ -23,15 +23,23 @@
 //! symbols; nested types in a C struct are. Odd input never sets
 //! `has_errors`.
 //!
-//! Known limits: preprocessor lines other than `#define` are dropped, so
-//! `#if`/`#else` branches that both open a brace unbalance the braces (an
-//! unmatched `{` runs to the end of its enclosing range). A macro invocation
-//! without a trailing `;` merges with the next declaration. Variables
+//! Known limits: preprocessor lines other than `#define` are dropped and
+//! only the first branch of each `#if`/`#ifdef`/`#ifndef` group is scanned
+//! (`#define`s are found in every branch), so code only in an `#else` is
+//! not seen. A macro invocation without a trailing `;` merges with the next
+//! declaration, unless it is an all-caps macro alone on its line. Variables
 //! declared after a type body (`struct S { .. } s;`) and all but the first
-//! declarator of `int a, b;` are not symbols. An out-of-class definition
-//! qualified by a namespace (`ns::f() {}`) is reported as a method of `ns`.
-//! `extern` declarations and K&R-style parameter declarations are skipped.
-use graph_core::scan::{matching_close, span_between};
+//! declarator of `int a, b;` are not symbols. Names never carry a
+//! qualifier: an out-of-line `A::B::f` is named `f` with owner `B`, and a
+//! definition qualified by a namespace (`ns::f() {}`) is reported as a
+//! method of `ns`. A destructor is named `~Box`. `extern` declarations and
+//! K&R-style parameter declarations are skipped. Bodies nested deeper than
+//! 64 levels are not scanned.
+//!
+//! A `.h` file is C unless it uses C++-only syntax (`class X {`,
+//! `namespace X {`, `template <`, `public:`); then it is scanned with the
+//! C++ rules but keeps the language `c`.
+use graph_core::scan::span_between;
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -54,7 +62,7 @@ impl Extractor for CExtractor {
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        extract(source, TokenizerOptions::C, false)
+        extract(source, TokenizerOptions::C, false, true)
     }
 }
 
@@ -72,18 +80,28 @@ impl Extractor for CppExtractor {
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        extract(source, TokenizerOptions::CPP, true)
+        extract(source, TokenizerOptions::CPP, true, false)
     }
 }
 
-fn extract(source: &str, dialect: TokenizerOptions, cpp: bool) -> Extraction {
+/// Nesting depth past which bodies are not scanned (deeper symbols are
+/// dropped), so that pathological input cannot overflow the stack.
+const MAX_DEPTH: usize = 64;
+
+fn extract(source: &str, dialect: TokenizerOptions, cpp: bool, sniff: bool) -> Extraction {
     let tokens = tokenize_with(source, dialect);
     let (code, macros) = preprocess(&tokens);
+    // A C header (`.h`) that uses C++-only constructs is scanned as C++; its
+    // language stays `c`.
+    let cpp = cpp || (sniff && looks_like_cpp(&tokens, &code));
+    let pairs = match_pairs(&tokens, &code);
     let mut s = Scanner {
         tokens: &tokens,
         code: &code,
+        pairs: &pairs,
         out: macros,
         cpp,
+        depth: 0,
     };
     s.body(0, code.len(), &Level::File);
     let mut symbols = s.out;
@@ -95,11 +113,57 @@ fn extract(source: &str, dialect: TokenizerOptions, cpp: bool) -> Extraction {
     }
 }
 
-/// Code token indices (no comments, no preprocessor lines) and the
-/// `#define` macros found on the way.
+/// Matching `(`/`[`/`{` closers over the code stream only (so tokens in
+/// dropped preprocessor branches do not count), ignoring literals. A closer
+/// that does not match the innermost opener is ignored.
+fn match_pairs(tokens: &[TokenDecl], code: &[usize]) -> Vec<Option<usize>> {
+    let mut pairs = vec![None; code.len()];
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    for (c, &i) in code.iter().enumerate() {
+        let t = &tokens[i];
+        if t.class == TokenClass::Literal {
+            continue;
+        }
+        let text = t.text.as_str();
+        match text {
+            "(" => stack.push((c, ")")),
+            "[" => stack.push((c, "]")),
+            "{" => stack.push((c, "}")),
+            ")" | "]" | "}" if stack.last().is_some_and(|&(_, want)| want == text) => {
+                if let Some((open, _)) = stack.pop() {
+                    pairs[open] = Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// Whether code tokens use C++-only syntax: `class Name {`/`:`,
+/// `namespace Name {`, `template <`, an access specifier `public:`, or `::`.
+fn looks_like_cpp(tokens: &[TokenDecl], code: &[usize]) -> bool {
+    let text = |k: usize| code.get(k).map_or("", |&i| tokens[i].text.as_str());
+    let ident = |k: usize| {
+        code.get(k)
+            .is_some_and(|&i| tokens[i].class == TokenClass::Identifier)
+    };
+    (0..code.len()).any(|k| match text(k) {
+        "class" | "namespace" => ident(k + 1) && matches!(text(k + 2), "{" | ":"),
+        "template" => text(k + 1) == "<",
+        "public" | "private" | "protected" => text(k + 1) == ":" && text(k + 2) != ":",
+        _ => false,
+    })
+}
+
+/// Code token indices (no comments, no preprocessor lines, only the first
+/// branch of each `#if`/`#ifdef`/`#ifndef` group) and the `#define` macros
+/// found on the way (from every branch).
 fn preprocess(tokens: &[TokenDecl]) -> (Vec<usize>, Vec<SymbolDecl>) {
     let mut code = Vec::with_capacity(tokens.len());
     let mut macros = Vec::new();
+    // One entry per open `#if` group: whether a later branch is being skipped.
+    let mut groups: Vec<bool> = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
         let t = &tokens[i];
@@ -109,7 +173,9 @@ fn preprocess(tokens: &[TokenDecl]) -> (Vec<usize>, Vec<SymbolDecl>) {
         }
         let first_on_line = i == 0 || tokens[i - 1].span.end_line < t.span.start_line;
         if t.text != "#" || !first_on_line {
-            code.push(i);
+            if !groups.contains(&true) {
+                code.push(i);
+            }
             i += 1;
             continue;
         }
@@ -129,6 +195,18 @@ fn preprocess(tokens: &[TokenDecl]) -> (Vec<usize>, Vec<SymbolDecl>) {
         let words: Vec<usize> = (i + 1..=j)
             .filter(|&k| tokens[k].class != TokenClass::Comment)
             .collect();
+        match words.first().map(|&d| tokens[d].text.as_str()) {
+            Some("if" | "ifdef" | "ifndef") => groups.push(false),
+            Some("elif" | "else" | "elifdef" | "elifndef") => {
+                if let Some(g) = groups.last_mut() {
+                    *g = true;
+                }
+            }
+            Some("endif") => {
+                groups.pop();
+            }
+            _ => {}
+        }
         if let [d, n, ..] = words[..] {
             if tokens[d].text == "define" && tokens[n].class == TokenClass::Identifier {
                 let last = *words.last().unwrap_or(&n);
@@ -188,6 +266,10 @@ struct Scanner<'a> {
     code: &'a [usize],
     out: Vec<SymbolDecl>,
     cpp: bool,
+    /// For each code position, the code position of its matching closer.
+    pairs: &'a [Option<usize>],
+    /// Current body nesting depth (see [`MAX_DEPTH`]).
+    depth: usize,
 }
 
 /// How a declaration header ended.
@@ -233,8 +315,7 @@ impl Scanner<'_> {
 
     /// Code position of the token matching the delimiter at `c`.
     fn close_of(&self, c: usize) -> Option<usize> {
-        let close = matching_close(self.tokens, self.code[c])?;
-        self.code.binary_search(&close).ok()
+        self.pairs[c]
     }
 
     /// `::` made of the tokens at `c` and `c + 1`.
@@ -280,6 +361,15 @@ impl Scanner<'_> {
 
     /// Declarations in code positions `[lo, hi)`.
     fn body(&mut self, lo: usize, hi: usize, level: &Level) {
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.depth += 1;
+        self.body_inner(lo, hi, level);
+        self.depth -= 1;
+    }
+
+    fn body_inner(&mut self, lo: usize, hi: usize, level: &Level) {
         let mut c = lo;
         while c < hi {
             match self.text(c) {
@@ -666,7 +756,11 @@ impl Scanner<'_> {
 
     /// Top-level `(` of the parameter list in `[h, hi)`, the first `=`
     /// before it, and the `operator` keyword if any.
-    fn find_params(&self, h: usize, hi: usize) -> (Option<usize>, Option<usize>, Option<usize>) {
+    fn find_params(
+        &self,
+        h: usize,
+        mut hi: usize,
+    ) -> (Option<usize>, Option<usize>, Option<usize>) {
         let mut c = h;
         while c < hi {
             match self.text(c) {
@@ -681,6 +775,20 @@ impl Scanner<'_> {
                         c += 1;
                     }
                     return ((c < hi).then_some(c), None, Some(op));
+                }
+                // `void (*signal(int))(int)`: the parameters are inside
+                // the pointer declarator group; `int (*fp)(int)` has none.
+                "(" if self.is_param_paren(c, h)
+                    && c + 1 < hi
+                    && matches!(self.text(c + 1), "*" | "&" | "^") =>
+                {
+                    match self.close_of(c) {
+                        Some(x) if x < hi => {
+                            hi = x;
+                            c += 1;
+                        }
+                        _ => return (None, None, None),
+                    }
                 }
                 "(" if self.is_param_paren(c, h) => {
                     // `MACRO(type) name(...)`: a macro call before the
@@ -755,11 +863,12 @@ impl Scanner<'_> {
             };
             let dtor = n > h && self.text(n - 1) == "~";
             let q = self.qualifier_before(if dtor { n - 1 } else { n }, h);
-            (
-                self.text(n).to_string(),
-                q,
-                if dtor { "destructor" } else { "" },
-            )
+            let name = if dtor {
+                format!("~{}", self.text(n))
+            } else {
+                self.text(n).to_string()
+            };
+            (name, q, if dtor { "destructor" } else { "" })
         };
         let owner = match level {
             Level::Class(o) => Some(o.clone()),
@@ -829,7 +938,7 @@ impl Scanner<'_> {
     /// The name of the first declarator in `[lo, hi)`: the last identifier
     /// before a top-level `,`, `[`, `:` or `hi`, looking inside a
     /// `(*name)` group. Must be at `min` or later.
-    fn declarator_name(&self, lo: usize, hi: usize, min: usize) -> Option<usize> {
+    fn declarator_name(&self, lo: usize, mut hi: usize, mut min: usize) -> Option<usize> {
         let mut c = lo;
         let mut name = None;
         while c < hi {
@@ -837,7 +946,8 @@ impl Scanner<'_> {
                 "(" => {
                     let close = self.close_of(c).filter(|&x| x < hi)?;
                     if c + 1 < close && matches!(self.text(c + 1), "*" | "&" | "^") {
-                        return self.declarator_name(c + 1, close, c + 1);
+                        (c, hi, min, name) = (c + 1, close, c + 1, None);
+                        continue;
                     }
                     if self.is_ident(c.checked_sub(1)?) {
                         break; // parameters after the name

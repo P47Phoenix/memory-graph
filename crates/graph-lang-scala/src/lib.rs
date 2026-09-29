@@ -10,9 +10,14 @@
 //! | `object` / `case object` / `package object` | Module | `object` / `case object` / `package object` |
 //! | `class` / `case class` / `trait` / `enum` | Type | `class` / `case class` / `trait` / `enum` |
 //! | `type` alias or abstract type | Type | `type` |
-//! | `def` inside a class/trait/enum | Method | `def` |
+//! | `given name: T with { ... }` | Type | `given` |
+//! | `def` inside a class/trait/enum/given | Method | `def` |
 //! | `def` elsewhere (top level, in an object) | Function | `def` |
 //! | `val` / `var` | Variable | `val` / `var` |
+//! | `case X` in an `enum` body | Constant | `case` |
+//!
+//! Objects are modules, not types, so a `def` in an `object` is a
+//! Function (it does not roll up under the `class` grain).
 //!
 //! A declaration's span starts at its first modifier or annotation and
 //! runs through the last token before a `;`, the enclosing closer, or the
@@ -20,10 +25,13 @@
 //! brackets. Bodies of `def`/`val`/`var` are not scanned. Odd input never
 //! sets `has_errors`.
 //!
-//! Known limits: pattern definitions (`val (a, b) = ...`) and `given`
-//! instances are not symbols; a `val x, y = 1` yields `x` only; an
-//! `extension` method is a top-level function; a declaration whose
-//! continuation lines are indented less than its first token ends early.
+//! Known limits: pattern definitions (`val (a, b) = ...`), anonymous
+//! `given`s and `given` aliases' bodies are not symbols; a `val x, y = 1`
+//! yields `x` only; in `case A, B` the first case spans from `case`, the
+//! others are just their name; an `extension` method is a top-level
+//! function; a declaration whose continuation lines are indented less than
+//! its first token ends early. Bodies nested deeper than 64 levels are not
+//! scanned.
 use graph_core::scan::{code_index, matching_close, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -50,8 +58,9 @@ impl Extractor for ScalaExtractor {
             tokens: &tokens,
             code: &code,
             out: Vec::new(),
+            depth: 0,
         };
-        s.body(0, code.len(), false);
+        s.body(0, code.len(), Ctx::Other);
         let symbols = s.out;
         Extraction {
             symbols,
@@ -80,13 +89,29 @@ const MODIFIERS: &[&str] = &[
 ];
 
 const DECL_KEYWORDS: &[&str] = &[
-    "package", "object", "class", "trait", "enum", "def", "val", "var", "type",
+    "package", "object", "class", "trait", "enum", "def", "val", "var", "type", "given",
 ];
+
+/// Nesting depth past which bodies are not scanned (deeper symbols are
+/// dropped), so that pathological input cannot overflow the stack.
+const MAX_DEPTH: usize = 64;
+
+/// What encloses a body.
+#[derive(Clone, Copy, PartialEq)]
+enum Ctx {
+    /// File, package or object: `def` is a Function.
+    Other,
+    /// Class, trait or given: `def` is a Method.
+    Type,
+    /// Enum: like `Type`, and `case X` is a constant.
+    Enum,
+}
 
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
     out: Vec<SymbolDecl>,
+    depth: usize,
 }
 
 impl Scanner<'_> {
@@ -117,15 +142,33 @@ impl Scanner<'_> {
 
     /// Declarations in code positions `[lo, hi)`; `in_type` for the body
     /// of a class, trait or enum.
-    fn body(&mut self, lo: usize, hi: usize, in_type: bool) {
+    fn body(&mut self, lo: usize, hi: usize, ctx: Ctx) {
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.depth += 1;
+        self.body_inner(lo, hi, ctx);
+        self.depth -= 1;
+    }
+
+    fn body_inner(&mut self, lo: usize, hi: usize, ctx: Ctx) {
         let mut c = lo;
         while c < hi {
             if c > lo && self.text(c - 1) == "." {
                 c += 1;
                 continue;
             }
+            if ctx == Ctx::Enum
+                && self.text(c) == "case"
+                && c + 1 < hi
+                && self.is_ident(c + 1)
+                && !matches!(self.text(c + 1), "class" | "object")
+            {
+                c = self.enum_case(c, hi) + 1;
+                continue;
+            }
             if let Some(kw) = self.keyword_after_modifiers(c, hi) {
-                c = self.declaration(c, kw, hi, in_type) + 1;
+                c = self.declaration(c, kw, hi, ctx) + 1;
                 continue;
             }
             c = match self.text(c) {
@@ -211,7 +254,32 @@ impl Scanner<'_> {
 
     /// Record the declaration starting at `start` with keyword `kw`; returns
     /// its last code position.
-    fn declaration(&mut self, start: usize, kw: usize, hi: usize, in_type: bool) -> usize {
+    /// `case A, B` or `case X(..) extends E` in an enum body; returns its
+    /// last code position.
+    fn enum_case(&mut self, start: usize, hi: usize) -> usize {
+        let end = self.decl_end(start, start, hi);
+        let n = start + 1;
+        let single = n + 1 > end || self.text(n + 1) != ",";
+        let name = self.text(n).to_string();
+        self.push(
+            name,
+            SymbolKind::Constant,
+            "case",
+            start,
+            if single { end } else { n },
+        );
+        if !single {
+            let mut k = n + 1;
+            while k < end && self.text(k) == "," && self.is_ident(k + 1) {
+                let name = self.text(k + 1).to_string();
+                self.push(name, SymbolKind::Constant, "case", k + 1, k + 1);
+                k += 2;
+            }
+        }
+        end
+    }
+
+    fn declaration(&mut self, start: usize, kw: usize, hi: usize, ctx: Ctx) -> usize {
         let case = (start..kw).any(|c| self.text(c) == "case");
         let mut kw = kw;
         let mut lang = self.text(kw).to_string();
@@ -231,6 +299,9 @@ impl Scanner<'_> {
         }
         let name = match self.text(kw) {
             "def" => self.def_name(n, end),
+            // `given name: T with ...`; anonymous givens are not symbols.
+            "given" => (self.is_ident(n) && n < end && matches!(self.text(n + 1), ":" | "[" | "("))
+                .then(|| self.text(n).to_string()),
             _ if self.is_ident(n) => Some(self.text(n).to_string()),
             _ => None,
         };
@@ -238,17 +309,18 @@ impl Scanner<'_> {
             return end;
         };
         let (kind, body) = match self.text(kw) {
-            "object" => (SymbolKind::Module, Some(false)),
-            "class" | "trait" | "enum" => (SymbolKind::Type, Some(true)),
+            "object" => (SymbolKind::Module, Some(Ctx::Other)),
+            "class" | "trait" | "given" => (SymbolKind::Type, Some(Ctx::Type)),
+            "enum" => (SymbolKind::Type, Some(Ctx::Enum)),
             "type" => (SymbolKind::Type, None),
-            "def" if in_type => (SymbolKind::Method, None),
+            "def" if ctx != Ctx::Other => (SymbolKind::Method, None),
             "def" => (SymbolKind::Function, None),
             _ => (SymbolKind::Variable, None),
         };
         self.push(name, kind, &lang, start, end);
-        if let Some(in_type) = body {
+        if let Some(inner) = body {
             if let Some((lo, hi)) = self.template_body(n + 1, end) {
-                self.body(lo, hi, in_type);
+                self.body(lo, hi, inner);
             }
         }
         end
@@ -269,11 +341,11 @@ impl Scanner<'_> {
             let close = self.close_of(k).filter(|&x| x < hi);
             let last = close.unwrap_or(hi - 1);
             self.push(name, SymbolKind::Module, "package", start, last);
-            self.body(k + 1, close.unwrap_or(hi), false);
+            self.body(k + 1, close.unwrap_or(hi), Ctx::Other);
             return last;
         }
         self.push(name, SymbolKind::Module, "package", start, hi - 1);
-        self.body(k, hi, false);
+        self.body(k, hi, Ctx::Other);
         hi - 1
     }
 
@@ -327,7 +399,7 @@ impl Scanner<'_> {
                 }
                 "(" | "[" => k = self.close_of(k).filter(|&x| x <= end)? + 1,
                 "=" => return None,
-                ":" if k == end || self.new_line(k + 1) => return Some((k + 1, end + 1)),
+                ":" | "with" if k == end || self.new_line(k + 1) => return Some((k + 1, end + 1)),
                 _ => k += 1,
             }
         }

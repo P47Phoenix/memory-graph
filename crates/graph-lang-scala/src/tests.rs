@@ -123,7 +123,10 @@ fn declarations() {
     let sides: Vec<_> = s.iter().filter(|x| x.0 == "sides").collect();
     assert_eq!(sides.len(), 2);
     // Locals, parameters, enum cases and imports are not symbols.
-    for n in ["local", "r", "Red", "Try", "x", "args"] {
+    assert_eq!(k("Red"), (SymbolKind::Constant, "case"));
+    assert_eq!(find(&s, "Red").3, "case Red");
+    assert_eq!(find(&s, "Green").3, "Green");
+    for n in ["local", "r", "Try", "x", "args"] {
         assert!(s.iter().all(|x| x.0 != n), "{n}");
     }
 }
@@ -148,6 +151,32 @@ fn backquoted_and_setter_names() {
     for n in ["`type`", "x_=", "::"] {
         assert_eq!(find(&s, n).1, SymbolKind::Method, "{n}");
     }
+}
+
+#[test]
+fn givens_and_enum_cases() {
+    let src = "trait Ord[T]\ngiven intOrd: Ord[Int] with {\n  def compare(a: Int, b: Int) = a - b\n}\ngiven Ord[Long] with\n  def compare(a: Long, b: Long) = 0\ngiven strOrd: Ord[String] with\n  def compare(a: String, b: String) = 0\nenum Planet(mass: Double):\n  case Earth extends Planet(5.9)\n  case Mars extends Planet(0.6)\n  def heavy = mass > 1\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "intOrd").1, SymbolKind::Type);
+    assert_eq!(find(&s, "intOrd").2, "given");
+    assert!(find(&s, "intOrd").3.ends_with("a - b\n}"));
+    assert_eq!(find(&s, "strOrd").2, "given");
+    let cmp: Vec<_> = s.iter().filter(|x| x.0 == "compare").collect();
+    assert_eq!(cmp.len(), 3);
+    assert!(cmp.iter().all(|c| c.1 == SymbolKind::Method), "{cmp:#?}");
+    assert_eq!(find(&s, "Earth").1, SymbolKind::Constant);
+    assert_eq!(find(&s, "Earth").3, "case Earth extends Planet(5.9)");
+    assert_eq!(find(&s, "Mars").2, "case");
+    assert_eq!(find(&s, "heavy").1, SymbolKind::Method);
+}
+
+#[test]
+fn deep_nesting_does_not_overflow_the_stack() {
+    let ex = ScalaExtractor.extract(&"object O { ".repeat(20000));
+    assert!(!ex.symbols.is_empty() && ex.symbols.len() <= MAX_DEPTH);
+    // Siblings, not nesting: all found.
+    let ex = ScalaExtractor.extract(&"class C:\n".repeat(20000));
+    assert_eq!(ex.symbols.len(), 20000);
 }
 
 #[test]
