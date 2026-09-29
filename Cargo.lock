@@ -677,8 +677,11 @@ dependencies = [
  "graph-lang-aspx",
  "graph-lang-csharp",
  "graph-lang-html",
+ "graph-lang-java",
  "graph-lang-javascript",
+ "graph-lang-python",
  "graph-lang-rust",
+ "graph-lang-typescript",
  "graph-proto",
  "graph-server",
  "graph-store",
@@ -753,7 +756,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-java"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-javascript"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-python"
 version = "0.1.0"
 dependencies = [
  "graph-core",
@@ -767,6 +786,15 @@ dependencies = [
  "graph-core",
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "graph-lang-typescript"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "graph-lang-javascript",
+ "proptest",
 ]
 
 [[package]]
