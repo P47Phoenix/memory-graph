@@ -93,6 +93,12 @@ message StatusResponse {
   // Writes (and membership changes) this node forwarded to the leader
   // since it started (ADR 0004 D8; stage E exports it as a metric).
   uint64 writes_forwarded_total = 29;
+  // gRPC calls this node served since it started, every method and outcome
+  // (the sum of `mg_rpc_total`).
+  uint64 rpcs_total = 30;
+  // Log entries this node applied since it started (the count of
+  // `mg_apply_duration_seconds`).
+  uint64 entries_applied_total = 31;
 }
 
 // Replication progress of one peer, as the leader sees it.

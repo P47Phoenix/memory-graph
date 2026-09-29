@@ -1,0 +1,72 @@
+# The data directory: layout, backup and restore
+
+**TL;DR.** A cluster node (`serve --data-dir <dir>`) keeps everything in one directory: its
+identity (`node.json`), the store (`graph.redb`), the Raft log (`raft.redb`), the latest
+snapshot (`snapshots/`) and a `LOCK` file. Back up a cluster with
+`cluster snapshot --out backup.redb` against any node; restore by bootstrapping a new cluster
+from it with `serve --data-dir <empty dir> --bootstrap --restore backup.redb`. Design: ADR 0004
+D6, D7.
+
+## Layout
+
+| Path | What | Notes |
+|---|---|---|
+| `node.json` | Node id, cluster id, advertised address, binary / protocol / store format versions, extractor version set hash, creation time | Written once on the first start. A different `--node-id` or `--advertise` on a later start is refused. |
+| `graph.redb` | The store: every applied log entry, and the index of the last one applied | What reads answer from. Same format as an embedded `--db` file. |
+| `raft.redb` | The Raft log, the vote and the committed index | Purged below each snapshot (keeping `--log-keep-entries`), then compacted. |
+| `snapshots/snap-<term>-<index>.redb` + `.meta` | The latest snapshot: a copy of the store at a log index, with its SHA-256, size and membership | One pair kept; a follower too far behind is sent it. |
+| `LOCK` | `{"pid", "listen", "started"}` of the running server | Removed on a graceful stop; a stale one (dead pid) is ignored. |
+| `replaced-<time>/` | What `--join --accept-snapshot-overwrite` moved aside | Only after that flag; delete when no longer needed. |
+
+The whole directory belongs to one node. Do not copy it to start another node (two nodes with one
+id break Raft's safety); start the other node empty and let it `--join`.
+
+In a container the directory is `/data` (a named volume in Compose, a PersistentVolumeClaim in
+Kubernetes), owned by the image's user 65532.
+
+## Disk
+
+Plan for the store, plus one snapshot copy (the same size), plus the log (up to
+`--snapshot-log-bytes`, default 1G, before a snapshot purges it), plus a transient second copy while
+a snapshot is received. The disk guard (`--min-free-disk`, default 5% of the volume between 2G and
+32G) refuses writes with `RESOURCE_EXHAUSTED` before the volume fills; `mg_store_bytes` and
+`mg_log_bytes` on `/metrics` show the two files.
+
+## Backup
+
+```sh
+memory-graph --server <any node> cluster snapshot --out backup.redb     # builds a snapshot now and downloads it
+```
+
+The download is checked against the snapshot's SHA-256 and size. The file is a complete store at
+one log index: it opens embedded (`memory-graph --db backup.redb describe`) and answers every
+query as the cluster did at that index. Taking it from a follower is fine; it is at most a little
+behind the leader.
+
+A file-level copy of `graph.redb` from a stopped node also works, but a running node's files are
+not a consistent backup.
+
+## Restore
+
+A restore creates a **new** cluster (a new cluster id and a fresh log) whose store is the backup:
+
+```sh
+memory-graph serve --data-dir ./n1 --bootstrap --node-id 1 --restore backup.redb --listen 0.0.0.0:7000
+memory-graph serve --data-dir ./n2 --node-id 2 --join n1:7000 --auto-promote --listen 0.0.0.0:7000
+memory-graph serve --data-dir ./n3 --node-id 3 --join n1:7000 --auto-promote --listen 0.0.0.0:7000
+```
+
+`--restore` works only with `--bootstrap` and only into an empty directory; the file is checked to
+be a store of the current format. Nodes of the old cluster refuse the new one (`WrongCluster`),
+so wipe their directories before they join it.
+
+In Compose: `down -v`, then start node1 once by hand with `--restore` on its volume (for example
+`docker compose run --rm -v "$PWD/backup.redb:/backup.redb:ro" node1 serve --data-dir /data
+--bootstrap --node-id 1 --restore /backup.redb ...`, stop it once it prints `listening on`), then
+`up -d --wait`. In Kubernetes: scale to 0, delete the claims, restore into pod 0's new claim with
+a one-off pod running the same command, then scale back to 3.
+
+## Moving a node
+
+A node's advertised address is part of the membership. To move a node to another address, remove
+it (`cluster remove <id>`), wipe its directory and join it again under the new address.

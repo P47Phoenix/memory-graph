@@ -362,6 +362,31 @@ pub fn hostname() -> String {
     "localhost".into()
 }
 
+/// The ordinal of a StatefulSet pod's host name: the number after the last
+/// `-` (`memory-graph-2` -> 2). `None` when there is no `-<digits>` suffix.
+pub fn hostname_ordinal(host: &str) -> Option<u64> {
+    // A fully qualified name counts by its first label.
+    let first = host.split('.').next().unwrap_or(host);
+    let (_, n) = first.rsplit_once('-')?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
+}
+
+/// `serve --node-id-from-hostname`: the node id of a StatefulSet pod, its
+/// ordinal plus one (node ids start at 1).
+pub fn node_id_from_hostname(host: &str) -> Result<u64, StoreError> {
+    hostname_ordinal(host)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| {
+            StoreError::Rejected(format!(
+                "--node-id-from-hostname: host name `{host}` does not end in `-<ordinal>` \
+                 (a StatefulSet pod name such as memory-graph-0)"
+            ))
+        })
+}
+
 /// The default advertised address for a bound `addr`: itself, with a
 /// wildcard IP (`0.0.0.0`, `[::]`) replaced by the host name.
 pub fn default_advertise(addr: std::net::SocketAddr) -> String {
@@ -868,6 +893,20 @@ mod tests {
             "protocol_version":1,"store_format_version":1,"extractors_hash":"x","created":0}"#;
         std::fs::write(&path, old).unwrap();
         assert!(!NodeJson::read(&path).unwrap().unwrap().bootstrapped);
+    }
+
+    #[test]
+    fn hostname_ordinals() {
+        assert_eq!(hostname_ordinal("memory-graph-0"), Some(0));
+        assert_eq!(hostname_ordinal("memory-graph-12"), Some(12));
+        assert_eq!(hostname_ordinal("mg-3.memory-graph.ns.svc"), Some(3));
+        assert_eq!(hostname_ordinal("memory-graph"), None);
+        assert_eq!(hostname_ordinal("node-"), None);
+        assert_eq!(hostname_ordinal("node-1a"), None);
+        assert_eq!(node_id_from_hostname("memory-graph-0").unwrap(), 1);
+        assert_eq!(node_id_from_hostname("memory-graph-2").unwrap(), 3);
+        let e = node_id_from_hostname("laptop").unwrap_err().to_string();
+        assert!(e.contains("laptop"), "{e}");
     }
 
     #[test]

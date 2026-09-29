@@ -105,6 +105,16 @@ pub struct ServeConfig {
     /// Test-only: a snapshot install waits at this gate (holding the
     /// store's install state) until the test opens it.
     pub install_gate: Option<crate::slot::InstallGate>,
+    /// `--metrics-listen`: serve Prometheus text at `/metrics` here (port
+    /// 0 picks a free one, see [`Running::metrics_addr`]); `None`: off.
+    pub metrics_listen: Option<SocketAddr>,
+    /// `--ready-max-lag`: `memory-graph.ready` is `SERVING` only while this
+    /// node's applied index is within this many entries of the leader's
+    /// committed index (default [`crate::DEFAULT_READY_MAX_LAG`]).
+    pub ready_max_lag: u64,
+    /// Test-only: hold apply back (see
+    /// [`crate::raft::state_machine::ApplyGate`]).
+    pub apply_gate: Option<crate::raft::state_machine::ApplyGate>,
 }
 
 /// Test-only behaviour a [`ServeConfig`] can ask for, so the CLI's exit
@@ -173,6 +183,9 @@ impl ServeConfig {
             testing: TestingHooks::default(),
             storage_backend: None,
             install_gate: None,
+            metrics_listen: None,
+            ready_max_lag: crate::DEFAULT_READY_MAX_LAG,
+            apply_gate: None,
         }
     }
 
@@ -207,6 +220,8 @@ impl std::fmt::Debug for ServeConfig {
             .field("shutdown_grace", &self.shutdown_grace)
             .field("sysinfo", &self.sysinfo.is_some())
             .field("testing", &self.testing)
+            .field("metrics_listen", &self.metrics_listen)
+            .field("ready_max_lag", &self.ready_max_lag)
             .finish()
     }
 }
@@ -250,6 +265,8 @@ impl ShutdownHandle {
 pub struct Running {
     /// The address actually bound (a port-0 config gets the real port).
     pub addr: SocketAddr,
+    /// Where `/metrics` is served (`--metrics-listen`), as bound.
+    pub metrics_addr: Option<SocketAddr>,
     shutdown: ShutdownHandle,
     task: tokio::task::JoinHandle<Result<(), StoreError>>,
     pub slot: Arc<StoreSlot>,
@@ -328,6 +345,21 @@ pub async fn start(
     let addr = listener
         .local_addr()
         .map_err(|e| io_err("local address", e))?;
+    let metrics_listener = match cfg.metrics_listen {
+        Some(m) => Some(
+            TcpListener::bind(m)
+                .await
+                .map_err(|e| io_err(&format!("cannot listen on {m} (--metrics-listen)"), e))?,
+        ),
+        None => None,
+    };
+    let metrics_addr = match &metrics_listener {
+        Some(l) => Some(
+            l.local_addr()
+                .map_err(|e| io_err("metrics local address", e))?,
+        ),
+        None => None,
+    };
     if let Some(dir) = &paths.data_dir {
         std::fs::create_dir_all(dir)
             .map_err(|e| io_err(&format!("creating `{}`", dir.display()), e))?;
@@ -337,14 +369,13 @@ pub async fn start(
     }
     if plan.as_ref().is_some_and(|p| p.overwrite) {
         let to = paths::move_aside(&paths)?;
-        eprintln!(
-            "memory-graph serve: WARNING: --accept-snapshot-overwrite: the store and Raft log \
-             found in `{}` (no node.json) were moved aside to `{}`; this node joins empty and \
-             catches up from the leader",
-            paths.data_dir.as_deref().unwrap_or(Path::new("")).display(),
-            to.display()
+        tracing::warn!(
+            data_dir = %paths.data_dir.as_deref().unwrap_or(Path::new("")).display(),
+            to = %to.display(),
+            "WARNING: --accept-snapshot-overwrite: the store and Raft log found in the data \
+             directory (no node.json) were moved aside; this node joins empty and catches up \
+             from the leader"
         );
-        tracing::warn!(to = %to.display(), "moved an unowned store aside before joining");
     }
     let store_existed = cfg.storage_backend.is_some() || paths.store.exists();
     let log_probe = match &cfg.storage_backend {
@@ -442,12 +473,13 @@ pub async fn start(
                     }
                     initialize = plan.bootstrap;
                     if let Some(id) = &cluster_id {
-                        eprintln!(
-                            "memory-graph serve: WARNING: --bootstrap created a NEW cluster {id} \
-                             in `{}` (node {node_id}); nodes of any other cluster will refuse it",
-                            paths.data_dir.as_deref().unwrap_or(Path::new("")).display()
+                        tracing::warn!(
+                            cluster_id = %id,
+                            node_id,
+                            data_dir = %paths.data_dir.as_deref().unwrap_or(Path::new("")).display(),
+                            "WARNING: --bootstrap created a NEW cluster; nodes of any other \
+                             cluster will refuse it"
                         );
-                        tracing::warn!(cluster_id = %id, node_id, "bootstrapped a new cluster");
                     }
                     (json, advertise)
                 }
@@ -485,6 +517,7 @@ pub async fn start(
     } else {
         RaftSettings::standalone()
     });
+    let obs = crate::observe::Observability::new();
     let mut raft = RaftNode::start(NodeStart {
         node_id,
         advertise: advertise.clone(),
@@ -507,6 +540,8 @@ pub async fn start(
             fail_before_apply: cfg.testing.fail_before_apply,
         },
         append_observer: cfg.append_observer.clone(),
+        obs: Arc::clone(&obs),
+        apply_gate: cfg.apply_gate.clone(),
     })
     .await?;
     raft.withhold_leader = cfg.testing.withhold_leader;
@@ -566,12 +601,18 @@ pub async fn start(
         let shutdown = shutdown.clone();
         let mut rx = raft.raft.metrics();
         let raft_for_health = raft.clone();
+        let max_lag = cfg.ready_max_lag;
         tokio::spawn(async move {
+            let mut last = None;
             loop {
                 if shutdown.is_triggered() {
                     return;
                 }
-                let ready = raft_ready(&raft_for_health, &rx.borrow());
+                let ready = raft_ready(&raft_for_health, &rx.borrow_and_update(), max_lag);
+                if last != Some(ready) {
+                    tracing::info!(ready, max_lag, "readiness changed");
+                    last = Some(ready);
+                }
                 reporter
                     .set_service_status(
                         READY_SERVICE,
@@ -587,16 +628,32 @@ pub async fn start(
                     mark_not_serving(&reporter).await;
                     return;
                 }
-                if rx.changed().await.is_err() {
-                    return;
+                // Applied index and leadership come with the Raft
+                // metrics; the leader's committed index with its
+                // heartbeats (noted by the Raft service).
+                tokio::select! {
+                    r = rx.changed() => if r.is_err() { return },
+                    _ = raft_for_health.obs.leader_commit_changed() => {}
+                    // A backstop for a change noted between the check and
+                    // the wait (`Notify::notify_waiters` keeps no permit).
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
             }
         });
     }
     tokio::spawn(SnapshotTable::reaper(Arc::downgrade(&slot)));
 
+    if let Some(l) = metrics_listener {
+        tokio::spawn(crate::observe::serve_metrics(
+            l,
+            Arc::clone(&ctx),
+            shutdown.clone(),
+        ));
+    }
+
     let no_limit = usize::MAX;
     let router = tonic::transport::Server::builder()
+        .layer(crate::observe::RpcLayer::new(Arc::clone(&obs)))
         .add_service(health)
         .add_service(InterceptedService::new(
             StoreServer::new(StoreService {
@@ -632,6 +689,7 @@ pub async fn start(
                     .testing
                     .delay_append_entries_ms
                     .map(Duration::from_millis),
+                obs: Arc::clone(&obs),
             })
             .max_decoding_message_size(no_limit)
             .max_encoding_message_size(no_limit),
@@ -646,7 +704,13 @@ pub async fn start(
         async move { s.wait().await }
     };
     let mut serve = tokio::spawn(router.serve_with_incoming_shutdown(incoming, signal));
-    tracing::info!(%addr, store = %paths.store.display(), node_id, "serving");
+    tracing::info!(
+        %addr,
+        metrics = ?metrics_addr,
+        store = %paths.store.display(),
+        node_id,
+        "serving"
+    );
 
     let task = {
         let shutdown = shutdown.clone();
@@ -707,6 +771,7 @@ pub async fn start(
     }
     Ok(Running {
         addr,
+        metrics_addr,
         shutdown,
         task,
         slot,
@@ -717,12 +782,20 @@ pub async fn start(
 }
 
 /// Whether `memory-graph.ready` is `SERVING`: a leader is known (and the
-/// test hook does not hide it).
+/// test hook does not hide it) and this node applied the leader's committed
+/// index to within `max_lag` entries ([`crate::observe::is_ready`]).
 fn raft_ready(
     raft: &RaftNode,
     m: &openraft::RaftMetrics<crate::raft::NodeId, openraft::impls::BasicNode>,
+    max_lag: u64,
 ) -> bool {
-    !raft.withhold_leader && m.current_leader.is_some()
+    crate::observe::is_ready(
+        !raft.withhold_leader && m.current_leader.is_some(),
+        m.current_leader == Some(raft.node_id) && m.state == openraft::ServerState::Leader,
+        m.last_applied.as_ref().map_or(0, |l| l.index),
+        raft.obs.leader_commit(),
+        max_lag,
+    )
 }
 
 /// Shutdown step 1: report `""` and [`READY_SERVICE`] as `NOT_SERVING`.
@@ -745,13 +818,14 @@ pub fn run_blocking(
     run_blocking_with(cfg, extractors, |_| {})
 }
 
-/// [`run_blocking`], calling `on_ready` with the bound address once the
+/// [`run_blocking`], calling `on_ready` with the started server (its bound
+/// address, and `/metrics` address if any) once the
 /// store is open, the LOCK sidecar written and the listener accepting (the
 /// CLI prints it, so `--listen 127.0.0.1:0` is usable by scripts and tests).
 pub fn run_blocking_with(
     cfg: ServeConfig,
     extractors: Vec<Box<dyn Extractor>>,
-    on_ready: impl FnOnce(SocketAddr) + Send + 'static,
+    on_ready: impl FnOnce(&Running) + Send + 'static,
 ) -> Result<(), StoreError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -759,7 +833,7 @@ pub fn run_blocking_with(
         .map_err(|e| io_err("tokio runtime", e))?;
     rt.block_on(async move {
         let running = start(cfg, share(extractors)).await?;
-        on_ready(running.addr);
+        on_ready(&running);
         let handle = running.shutdown_handle();
         tokio::spawn(async move {
             wait_for_signal().await;

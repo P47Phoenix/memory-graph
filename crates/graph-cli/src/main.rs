@@ -195,6 +195,8 @@ enum ClusterCmd {
     TransferLeader { id: u64 },
 }
 
+// Parsed once per process; `Serve`'s many flags make it the large variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Serve a database over gRPC; other processes, machines and containers then use it with
@@ -229,9 +231,18 @@ enum Cmd {
             conflicts_with = "bootstrap"
         )]
         join: Option<String>,
-        /// With --join: become a voter once caught up (the leader promotes the node when its
-        /// replication lag is zero)
-        #[arg(long, requires = "join", conflicts_with = "standby")]
+        /// For a StatefulSet: --bootstrap when this host's name ends in `-0` (the pod ordinal),
+        /// else --join <HOST:PORT>. Restarts are plain restarts either way
+        #[arg(
+            long,
+            value_name = "HOST:PORT",
+            requires = "data_dir",
+            conflicts_with_all = ["bootstrap", "join", "restore"]
+        )]
+        bootstrap_or_join: Option<String>,
+        /// With --join (or --bootstrap-or-join): become a voter once caught up (the leader
+        /// promotes the node when its replication lag is zero)
+        #[arg(long, conflicts_with = "standby")]
         auto_promote: bool,
         /// With --join: stay a learner (a read replica) until `cluster promote`; the default
         /// without --auto-promote, said explicitly
@@ -254,6 +265,30 @@ enum Cmd {
         /// from node.json (a different id is refused)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         node_id: Option<u64>,
+        /// Take the node id from the host name's trailing `-<ordinal>` plus one (a StatefulSet
+        /// pod `memory-graph-2` is node 3), instead of --node-id
+        #[arg(long, requires = "data_dir", conflicts_with = "node_id")]
+        node_id_from_hostname: bool,
+        /// Log format on stderr: text, or json (one object per line: timestamp, level, target,
+        /// message, span)
+        #[arg(long, value_enum, default_value = "text")]
+        log_format: graph_cli::logging::LogFormat,
+        /// Log filter, tracing EnvFilter syntax: `info`, `debug`, `info,graph_server=debug`
+        /// (default info). Env: MEMORY_GRAPH_LOG
+        #[arg(
+            long,
+            env = "MEMORY_GRAPH_LOG",
+            default_value = "info",
+            value_name = "FILTER"
+        )]
+        log_level: String,
+        /// Serve Prometheus metrics (text format 0.0.4) at http://<HOST:PORT>/metrics
+        #[arg(long, value_name = "HOST:PORT")]
+        metrics_listen: Option<String>,
+        /// The memory-graph.ready health service is SERVING only while a leader is known and
+        /// this node's applied index is within this many entries of the leader's commit index
+        #[arg(long, value_name = "N", default_value_t = graph_server::DEFAULT_READY_MAX_LAG)]
+        ready_max_lag: u64,
         /// Build a snapshot (and purge the log below it) after this many applied entries
         /// (default 10000)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
@@ -285,7 +320,10 @@ enum Cmd {
         snapshot_max_age: std::time::Duration,
     },
     /// Check a server's health (grpc.health.v1): exit 0 when serving, 1 when not (or unreachable).
-    /// With --ready: serving and a leader is known. Needs --server (or MEMORY_GRAPH_SERVER)
+    /// With --ready: the memory-graph.ready service, SERVING while a leader is known and this node
+    /// has applied to within the server's --ready-max-lag of the leader's commit index (a
+    /// Kubernetes readiness probe / Compose healthcheck). Exit 1 in every other case. Needs
+    /// --server (or MEMORY_GRAPH_SERVER)
     Health {
         #[arg(long)]
         ready: bool,
@@ -690,12 +728,18 @@ fn run() -> Result<i32> {
         bootstrap,
         restore,
         join,
+        bootstrap_or_join,
         auto_promote,
         standby: _,
         accept_snapshot_overwrite,
         join_timeout,
         advertise,
         node_id,
+        node_id_from_hostname,
+        log_format,
+        log_level,
+        metrics_listen,
+        ready_max_lag,
         snapshot_log_entries,
         snapshot_log_bytes,
         log_keep_entries,
@@ -709,6 +753,35 @@ fn run() -> Result<i32> {
         if let Some(s) = &cli.server {
             bail!("serve takes --db <file> or --data-dir <dir> to serve, not --server {s}");
         }
+        graph_cli::logging::init(*log_format, log_level)?;
+        if *auto_promote && join.is_none() && bootstrap_or_join.is_none() {
+            bail!("--auto-promote needs --join <peer> (or --bootstrap-or-join <peer>)");
+        }
+        // A StatefulSet pod's identity from its host name (ADR 0004 D10,
+        // docs/deploy/kubernetes.md): node id = ordinal + 1, ordinal 0
+        // bootstraps, the others join.
+        let host = graph_server::paths::hostname();
+        let node_id = &if *node_id_from_hostname {
+            Some(graph_server::paths::node_id_from_hostname(&host)?)
+        } else {
+            *node_id
+        };
+        let (bootstrap, join) = match bootstrap_or_join {
+            Some(peer) => {
+                let ordinal = graph_server::paths::hostname_ordinal(&host).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--bootstrap-or-join: host name `{host}` does not end in `-<ordinal>` \
+                         (a StatefulSet pod name such as memory-graph-0)"
+                    )
+                })?;
+                if ordinal == 0 {
+                    (&true, &None)
+                } else {
+                    (&false, &Some(peer.clone()))
+                }
+            }
+            None => (bootstrap, join),
+        };
         if cli.chunk_bytes.is_some() {
             bail!("--chunk-bytes does not apply to serve: the server cuts replicated log entries at {} MiB", graph_client::RAFT_ENTRY_MAX_BYTES >> 20);
         }
@@ -834,14 +907,26 @@ fn run() -> Result<i32> {
         if !cluster_mode && (tuned || advertise.is_some()) {
             // Not refused (a stage A script may pass them), but said: with
             // --db they tune the one-member log of this file only.
-            eprintln!(
-                "memory-graph serve: note: with --db, --advertise and the Raft options \
+            tracing::info!(
+                "note: with --db, --advertise and the Raft options \
                  (--snapshot-log-entries/-bytes, --log-keep-entries, --election-timeout-*, \
                  --heartbeat-interval) apply to this single-node server's own log only; \
                  clusters use --data-dir"
             );
         }
         cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
+        cfg.ready_max_lag = *ready_max_lag;
+        if let Some(m) = metrics_listen {
+            use std::net::ToSocketAddrs;
+            cfg.metrics_listen = Some(
+                m.to_socket_addrs()
+                    .with_context(|| format!("--metrics-listen {m}: not a host:port"))?
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--metrics-listen {m}: resolves to no address")
+                    })?,
+            );
+        }
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
         // Test-only fault injection (serve_e2e): park writes after N
@@ -856,15 +941,19 @@ fn run() -> Result<i32> {
             (true, None) => format!("data dir {}", served.display()),
             (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
         };
-        graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |a| {
-            // Scripts and tests read this line for the bound port.
-            println!("memory-graph serve: listening on {a} ({shown})");
+        graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
+            // Scripts and tests read these lines for the bound ports (the
+            // metrics line first: the listening line is the start signal).
+            if let Some(m) = r.metrics_addr {
+                println!("memory-graph serve: metrics on http://{m}/metrics");
+            }
+            println!("memory-graph serve: listening on {} ({shown})", r.addr);
         })
         .map_err(|e| match e {
             StoreError::Locked(why) => graph_cli::target::locked_error(&served, &why),
             e => anyhow::Error::from(e).context(format!("serving `{}`", served.display())),
         })?;
-        eprintln!("memory-graph serve: stopped");
+        tracing::info!("memory-graph serve: stopped");
         return Ok(0);
     }
     let target = cli.target()?;
@@ -951,6 +1040,8 @@ fn run() -> Result<i32> {
                                 "log_bytes": st.log_bytes,
                                 "store_bytes": st.store_bytes,
                                 "writes_forwarded_total": st.writes_forwarded_total,
+                                "rpcs_total": st.rpcs_total,
+                                "entries_applied_total": st.entries_applied_total,
                                 "members": st.members.iter().map(|m| serde_json::json!({
                                     "node_id": m.node_id,
                                     "addr": m.addr,

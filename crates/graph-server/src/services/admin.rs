@@ -81,7 +81,7 @@ pub const TRANSFER_WAIT: Duration = Duration::from_secs(20);
 /// while it is a learner, so a leader change does not lose the intent.
 pub const AUTO_PROMOTE_WAIT: Duration = Duration::from_secs(3600);
 
-fn role(s: ServerState) -> &'static str {
+pub(crate) fn role(s: ServerState) -> &'static str {
     match s {
         ServerState::Leader => "leader",
         ServerState::Follower => "follower",
@@ -756,6 +756,8 @@ impl pb::admin_server::Admin for AdminService {
             data_dir: self.ctx.info.data_dir.clone(),
             advertise: self.ctx.info.advertise.clone(),
             writes_forwarded_total: self.ctx.fwd.forwarded_total(),
+            rpcs_total: self.ctx.raft.obs.rpc_total(),
+            entries_applied_total: self.ctx.raft.obs.apply_total(),
         }))
     }
 
@@ -1031,8 +1033,8 @@ impl pb::admin_server::Admin for AdminService {
         &self,
         _req: Request<pb::MetricsRequest>,
     ) -> Result<Response<pb::MetricsResponse>, Status> {
-        Err(Status::unimplemented(
-            "Admin.Metrics arrives with observability (stage E)",
-        ))
+        Ok(Response::new(pb::MetricsResponse {
+            text: crate::observe::render(&self.ctx),
+        }))
     }
 }

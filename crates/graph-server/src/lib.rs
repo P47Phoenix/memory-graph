@@ -24,6 +24,8 @@
 //! * [`services`]: the four tonic services (`raft` is the peers' side).
 //! * [`forward`]: a follower forwards writes, membership changes and the
 //!   linearizable read barrier to the leader (stage C, ADR 0004 D8/D9).
+//! * [`observe`]: metrics (Prometheus text, `Admin.Metrics`), the per-RPC
+//!   tracing/metrics layer and the `/metrics` HTTP responder (stage E).
 //! * [`disk`]: the disk guard (`--min-free-disk`).
 //! * [`lock`]: the LOCK sidecar naming the holder.
 //! * [`powercut`]: a test-only in-memory redb storage backend that can
@@ -45,6 +47,7 @@ pub mod extractors;
 pub mod forward;
 pub mod join;
 pub mod lock;
+pub mod observe;
 pub mod paths;
 pub mod powercut;
 pub mod raft;
@@ -83,5 +86,11 @@ pub const SNAPSHOT_HANDLES_GLOBAL: usize = 1024;
 /// How often the idle reaper drops expired snapshot handles.
 pub const SNAPSHOT_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// The health service name that is `SERVING` once a leader is known (D10).
+/// The health service name that is `SERVING` while a leader is known and
+/// this node's applied index is within `--ready-max-lag` entries of the
+/// leader's committed index (D10).
 pub const READY_SERVICE: &str = "memory-graph.ready";
+
+/// Default `--ready-max-lag`: entries a node may be behind the leader's
+/// committed index and still report ready.
+pub const DEFAULT_READY_MAX_LAG: u64 = 1000;

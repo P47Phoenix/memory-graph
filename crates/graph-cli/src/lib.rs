@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 
 pub mod dataflow;
 pub mod diskinfo;
+pub mod logging;
 use diskinfo::{DiskInputs, DiskPolicy, DiskProbe, MinFree};
 pub mod progress;
 pub mod report;

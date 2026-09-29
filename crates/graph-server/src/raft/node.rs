@@ -110,6 +110,10 @@ pub struct NodeStart {
     pub faults: Option<FaultPlan>,
     pub failpoints: SmFailpoints,
     pub append_observer: Option<AppendObserver>,
+    /// Metrics and readiness inputs this node records (stage E).
+    pub obs: Arc<crate::observe::Observability>,
+    /// Test-only: see [`crate::raft::state_machine::ApplyGate`].
+    pub apply_gate: Option<crate::raft::state_machine::ApplyGate>,
 }
 
 #[derive(Clone)]
@@ -140,6 +144,9 @@ pub struct RaftNode {
     /// write proposal waits this long after it was counted in
     /// [`in_flight`](Self::in_flight), before it reaches Raft.
     pub hold_proposal: Option<Duration>,
+    /// Metrics and readiness inputs (apply timings, RPC timings, the
+    /// leader's committed index as heard over `AppendEntries`).
+    pub obs: Arc<crate::observe::Observability>,
 }
 
 /// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
@@ -237,7 +244,9 @@ impl RaftNode {
                 .map_err(fatal)??;
         }
         let sm = StoreStateMachine::new(Arc::clone(&p.slot), Arc::clone(&p.snapshots))
-            .with_failpoints(p.failpoints);
+            .with_failpoints(p.failpoints)
+            .with_obs(Arc::clone(&p.obs))
+            .with_apply_gate(p.apply_gate.clone());
         let net_stats = NetStats::default();
         let net = GrpcNetwork::new(
             Arc::clone(&p.identity),
@@ -275,6 +284,7 @@ impl RaftNode {
             transferring: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             hold_proposal: None,
+            obs: p.obs,
         };
         // The metrics are published by the Raft task, so right after
         // `Raft::new`/`initialize` they may not show the membership yet:

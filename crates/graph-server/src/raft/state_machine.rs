@@ -63,7 +63,15 @@ pub struct StoreStateMachine {
     slot: Arc<StoreSlot>,
     snapshots: Arc<SnapshotDir>,
     failpoints: SmFailpoints,
+    obs: Arc<crate::observe::Observability>,
+    apply_gate: Option<ApplyGate>,
 }
+
+/// Test-only: called (on the blocking pool) with the index of every entry
+/// of a batch before the batch is applied; a test blocks in it to hold
+/// apply back while the node keeps receiving and committing entries (a
+/// slow apply, deterministically).
+pub type ApplyGate = Arc<dyn Fn(u64) + Send + Sync>;
 
 pub use super::snapshot_dir::replace_file;
 
@@ -95,7 +103,21 @@ impl StoreStateMachine {
             slot,
             snapshots,
             failpoints: SmFailpoints::default(),
+            obs: Arc::default(),
+            apply_gate: None,
         }
+    }
+
+    /// Test-only: see [`ApplyGate`].
+    pub fn with_apply_gate(mut self, gate: Option<ApplyGate>) -> Self {
+        self.apply_gate = gate;
+        self
+    }
+
+    /// Record apply timings (and spans) into `obs`.
+    pub fn with_obs(mut self, obs: Arc<crate::observe::Observability>) -> Self {
+        self.obs = obs;
+        self
     }
 
     pub fn with_failpoints(mut self, failpoints: SmFailpoints) -> Self {
@@ -119,6 +141,7 @@ impl StoreStateMachine {
         slot: &StoreSlot,
         entries: Vec<Entry>,
         failpoints: SmFailpoints,
+        obs: &crate::observe::Observability,
     ) -> Result<Vec<LogResponse>, StorageError> {
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
@@ -130,7 +153,26 @@ impl StoreStateMachine {
                 ));
                 return Err(StorageIOError::apply(e.log_id, AnyError::new(&err)).into());
             }
-            let r = slot.with_store(|s| Self::apply_one(s, &e)).map_err(|err| {
+            // One `apply` span per entry: index, command kind and file
+            // count (recorded where the payload is decoded), duration.
+            let span = tracing::debug_span!(
+                "apply",
+                index = e.log_id.index,
+                kind = tracing::field::Empty,
+                files = tracing::field::Empty,
+                duration_ms = tracing::field::Empty,
+            );
+            let _enter = span.enter();
+            let started = std::time::Instant::now();
+            let r = slot.with_store(|s| Self::apply_one(s, &e));
+            let secs = started.elapsed().as_secs_f64();
+            span.record("duration_ms", secs * 1000.0);
+            obs.observe_apply(secs);
+            match &r {
+                Ok(_) => tracing::debug!("applied"),
+                Err(err) => tracing::error!(error = %err, "apply failed"),
+            }
+            let r = r.map_err(|err| {
                 StorageError::from(StorageIOError::apply(e.log_id, AnyError::new(&err)))
             })?;
             out.push(r);
@@ -149,6 +191,12 @@ impl StoreStateMachine {
             tracing::debug!(index = marker.index, "entry already applied; skipped");
             return Ok(LogResponse::Skipped);
         }
+        let span = tracing::Span::current();
+        match &e.payload {
+            EntryPayload::Blank => span.record("kind", "blank"),
+            EntryPayload::Membership(_) => span.record("kind", "membership"),
+            EntryPayload::Normal(_) => &span,
+        };
         let r = match &e.payload {
             EntryPayload::Blank => store.mark_only(marker, None).map(|()| LogResponse::Marked),
             EntryPayload::Membership(m) => {
@@ -202,6 +250,16 @@ impl StoreStateMachine {
         let Some(cmd) = cmd.cmd else {
             return Err(StoreError::Protocol("empty LogCommand".into()));
         };
+        let span = tracing::Span::current();
+        let (kind, files) = match &cmd {
+            Cmd::IndexChunk(c) => ("index_chunk", c.files.len()),
+            Cmd::IngestExtraction(_) => ("ingest_extraction", 1),
+            Cmd::Prune(_) => ("prune", 0),
+            Cmd::Vacuum(_) => ("vacuum", 0),
+            Cmd::Noop(_) => ("noop", 0),
+        };
+        span.record("kind", kind);
+        span.record("files", files);
         match cmd {
             Cmd::IndexChunk(c) => {
                 let opts = IndexOptions { reindex: c.reindex };
@@ -278,10 +336,19 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
         let entries: Vec<Entry> = entries.into_iter().collect();
         let slot = Arc::clone(&self.slot);
         let fp = self.failpoints;
+        let obs = Arc::clone(&self.obs);
+        let gate = self.apply_gate.clone();
         // Parsing and committing block; keep them off the runtime workers.
-        tokio::task::spawn_blocking(move || Self::apply_all(&slot, entries, fp))
-            .await
-            .map_err(|e| sm_err(std::io::Error::other(format!("apply task: {e}"))))?
+        tokio::task::spawn_blocking(move || {
+            if let Some(g) = gate {
+                for e in &entries {
+                    g(e.log_id.index);
+                }
+            }
+            Self::apply_all(&slot, entries, fp, &obs)
+        })
+        .await
+        .map_err(|e| sm_err(std::io::Error::other(format!("apply task: {e}"))))?
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -413,13 +480,21 @@ mod tests {
     fn a_refused_entry_moves_the_marker_to_its_log_id() {
         let d = tempfile::tempdir().unwrap();
         let (slot, _) = sm_at(d.path());
-        let out = StoreStateMachine::apply_all(&slot, vec![blank(1), refused(2)], NO_FP).unwrap();
+        let out = StoreStateMachine::apply_all(
+            &slot,
+            vec![blank(1), refused(2)],
+            NO_FP,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(out[0], LogResponse::Marked);
         assert!(matches!(out[1], LogResponse::Failed(_)), "{:?}", out[1]);
         let marker = slot.with_store(|s| s.raft_marker()).unwrap().unwrap();
         assert_eq!(log_id_of(marker), log_id(2));
         // A replay of the refused entry is a skip, not a second refusal.
-        let again = StoreStateMachine::apply_all(&slot, vec![refused(2)], NO_FP).unwrap();
+        let again =
+            StoreStateMachine::apply_all(&slot, vec![refused(2)], NO_FP, &Default::default())
+                .unwrap();
         assert_eq!(again, vec![LogResponse::Skipped]);
     }
 
@@ -430,7 +505,13 @@ mod tests {
         let fp = SmFailpoints {
             fail_before_apply: Some(2),
         };
-        assert!(StoreStateMachine::apply_all(&slot, vec![blank(1), blank(2)], fp).is_err());
+        assert!(StoreStateMachine::apply_all(
+            &slot,
+            vec![blank(1), blank(2)],
+            fp,
+            &Default::default()
+        )
+        .is_err());
         let marker = slot.with_store(|s| s.raft_marker()).unwrap().unwrap();
         assert_eq!(log_id_of(marker), log_id(1), "entry 1 applied, 2 not");
     }
@@ -486,7 +567,7 @@ mod tests {
     /// A slot whose current snapshot (built) is at index 1.
     fn with_snapshot_at_1(d: &Path) -> (Arc<StoreSlot>, Arc<SnapshotDir>) {
         let (slot, _) = sm_at(d);
-        StoreStateMachine::apply_all(&slot, vec![blank(1)], NO_FP).unwrap();
+        StoreStateMachine::apply_all(&slot, vec![blank(1)], NO_FP, &Default::default()).unwrap();
         let snaps = Arc::new(SnapshotDir::open(&d.join("snapshots"), "h").unwrap());
         let snap = snaps.build(&slot).unwrap();
         assert_eq!(snap.meta.last_log_id, Some(log_id(1)));
@@ -517,7 +598,7 @@ mod tests {
         );
         let (sha, size) = super::super::snapshot_dir::sha256_file(&path).unwrap();
         assert_eq!((side.sha256, side.size), (sha, size));
-        StoreStateMachine::apply_all(&slot, vec![blank(2)], NO_FP).unwrap();
+        StoreStateMachine::apply_all(&slot, vec![blank(2)], NO_FP, &Default::default()).unwrap();
         snaps.build(&slot).unwrap();
         assert_eq!(
             files_in(snaps.dir()),
@@ -596,7 +677,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (slot, snaps) = with_snapshot_at_1(d.path());
         // The swapped-in store: marker 5, entries 2..=5 never in the log.
-        StoreStateMachine::apply_all(&slot, vec![blank(5)], NO_FP).unwrap();
+        StoreStateMachine::apply_all(&slot, vec![blank(5)], NO_FP, &Default::default()).unwrap();
         let log = RedbLogStore::open(&d.path().join("raft.redb")).unwrap();
         assert!(crate::raft::node::repair_stale_snapshot(&slot, &snaps, &log).unwrap());
         assert_eq!(snaps.current().unwrap().0.index, 5);
@@ -604,7 +685,7 @@ mod tests {
         assert!(!crate::raft::node::repair_stale_snapshot(&slot, &snaps, &log).unwrap());
         // A store ahead of its snapshot whose log reaches the marker (the
         // normal case after a restart) is left alone.
-        StoreStateMachine::apply_all(&slot, vec![blank(6)], NO_FP).unwrap();
+        StoreStateMachine::apply_all(&slot, vec![blank(6)], NO_FP, &Default::default()).unwrap();
         log.insert_for_test(&blank(6));
         assert!(!crate::raft::node::repair_stale_snapshot(&slot, &snaps, &log).unwrap());
         assert_eq!(snaps.current().unwrap().0.index, 5);

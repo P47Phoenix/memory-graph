@@ -35,6 +35,12 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 | [RPC overhead](spikes/rpc-overhead.md) | Measurement for epic story 20 (not a decision): the gRPC server adds 0.06 ms per empty call and 0.13-0.16 ms per query at p50 over the embedded store on the corpus (5 ms trigger not tripped); found and fixed a needless paging round trip for small unlimited searches. | harness `crates/graph-client/examples/rpc_bench.rs` |
 | [Raft replication](spikes/raft-replication.md) | Measurement for epic story 21 (not a decision). Replicated ingest runs at 94% of embedded on one and on three loopback nodes (the 50% trigger is not tripped). A log entry is its payload plus 25 B. fsync-bound throughput is 664 / 392 small entries/s (1 / 3 nodes). The corpus snapshot builds in 0.15 s and installs in 0.17 s. Measuring found that `raft.redb` never shrank after a purge, fixed by compacting the log after a purge. | ignored test `measure_replication` in `crates/graph-cli/tests/cluster_e2e.rs` |
 
+## Deployment
+- [deploy/compose.md](deploy/compose.md): a three-node cluster with Docker Compose (`deploy/compose/cluster.yml`), and the CI check that runs it end to end.
+- [deploy/kubernetes.md](deploy/kubernetes.md): a StatefulSet with a headless Service, node ids from the pod ordinal, gRPC readiness, a PodDisruptionBudget and the scale-down procedure (manifests in `deploy/kubernetes/`).
+- [deploy/data-dir.md](deploy/data-dir.md): what a node's data directory holds, backup with `cluster snapshot --out` and restore with `serve --bootstrap --restore`.
+- Logs, metrics and health probes: the README's [Observability](../README.md#observability) section.
+
 ## Learnings
 - [learnings.md](learnings.md): a short list of lasting facts, measured numbers, rules and review mistakes to avoid, each linking to the details.
 

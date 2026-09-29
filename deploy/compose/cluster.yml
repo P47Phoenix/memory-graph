@@ -1,0 +1,134 @@
+# A three-node memory-graph cluster (ADR 0004 D10, epic story 24).
+#
+#   docker compose -f deploy/compose/cluster.yml up -d --wait
+#   memory-graph --server 127.0.0.1:7001 cluster members
+#
+# node1 bootstraps a new cluster; node2 and node3 join it through node1 and
+# are promoted to voters once caught up (--auto-promote). Each node keeps its
+# data directory on its own named volume, so `docker compose stop/start` (or
+# a host reboot) is a plain restart: --bootstrap and --join on an initialized
+# data directory are no-ops. `down -v` deletes the data.
+#
+# The image is built from this repository (context ../..) and tagged
+# ${MG_IMAGE:-memory-graph:local}. To run the published image instead:
+#   MG_IMAGE=ghcr.io/p47phoenix/memory-graph:main docker compose -f deploy/compose/cluster.yml up -d --wait --no-build
+#
+# Health: every node's healthcheck is `health --ready` (grpc.health.v1
+# service `memory-graph.ready`: a leader is known and this node has applied
+# to within --ready-max-lag entries of it), so `up --wait` returns once all
+# three are caught up, and node2/node3 start only once node1 is ready.
+# Metrics: each node serves Prometheus text at :9100/metrics inside the
+# network (published on 9101-9103).
+name: memory-graph
+
+x-node: &node
+  image: ${MG_IMAGE:-memory-graph:local}
+  build:
+    context: ../..
+  restart: unless-stopped
+  stop_grace_period: 40s
+  environment:
+    MEMORY_GRAPH_LOG: ${MEMORY_GRAPH_LOG:-info}
+  healthcheck:
+    test: ["CMD", "/memory-graph", "health", "--ready", "--server", "127.0.0.1:7000"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 120s
+    start_interval: 1s
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    command:
+      - serve
+      - --data-dir
+      - /data
+      - --listen
+      - 0.0.0.0:7000
+      - --advertise
+      - node1:7000
+      - --node-id
+      - "1"
+      - --bootstrap
+      - --metrics-listen
+      - 0.0.0.0:9100
+      - --log-format
+      - json
+      # Small volumes (a laptop, a CI runner): the default reserve is 5% of
+      # the volume, at least 2 GiB.
+      - --min-free-disk
+      - 512M
+    ports:
+      - "7001:7000"
+      - "9101:9100"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    <<: *node
+    hostname: node2
+    command:
+      - serve
+      - --data-dir
+      - /data
+      - --listen
+      - 0.0.0.0:7000
+      - --advertise
+      - node2:7000
+      - --node-id
+      - "2"
+      - --join
+      - node1:7000
+      - --auto-promote
+      - --metrics-listen
+      - 0.0.0.0:9100
+      - --log-format
+      - json
+      - --min-free-disk
+      - 512M
+    ports:
+      - "7002:7000"
+      - "9102:9100"
+    volumes:
+      - node2-data:/data
+    depends_on:
+      node1:
+        condition: service_healthy
+
+  node3:
+    <<: *node
+    hostname: node3
+    command:
+      - serve
+      - --data-dir
+      - /data
+      - --listen
+      - 0.0.0.0:7000
+      - --advertise
+      - node3:7000
+      - --node-id
+      - "3"
+      - --join
+      - node1:7000
+      - --auto-promote
+      - --metrics-listen
+      - 0.0.0.0:9100
+      - --log-format
+      - json
+      - --min-free-disk
+      - 512M
+    ports:
+      - "7003:7000"
+      - "9103:9100"
+    volumes:
+      - node3-data:/data
+    depends_on:
+      node1:
+        condition: service_healthy
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

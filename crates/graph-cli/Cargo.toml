@@ -38,6 +38,8 @@ serde_json.workspace = true
 indicatif.workspace = true
 console.workspace = true
 crossbeam-channel.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -62,3 +64,5 @@ serde_json.workspace = true
 anyhow.workspace = true
 graph-store = { path = "../graph-store" }
 redb.workspace = true
+# deploy_manifests: parse the Kubernetes and Compose YAML (pure Rust).
+yaml-rust2 = "0.10"
