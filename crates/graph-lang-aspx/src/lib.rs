@@ -255,6 +255,7 @@ fn server_scripts(source: &str, tokens: Vec<TokenDecl>) -> (Vec<TokenDecl>, Vec<
                 kind: SymbolKind::Module,
                 lang_kind: Some("server_script".into()),
                 span: span_between(&first.span, &last.span),
+                owner: None,
             });
             symbols.extend(graph_lang_csharp::member_symbols(&code));
         }

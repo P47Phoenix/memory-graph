@@ -181,6 +181,7 @@ fn well_nested_detects_partial_overlap() {
         kind: SymbolKind::Other,
         lang_kind: None,
         span: sp(a, b),
+        owner: None,
     };
     let tok = |a, b| TokenDecl {
         text: "t".into(),
