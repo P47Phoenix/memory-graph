@@ -19,14 +19,20 @@
 //!
 //! A label's span runs from the label through the last code token before the
 //! next non-local label, section, block start or block end, so the
-//! instructions of a function nest inside it. A section runs to the next
+//! instructions of a function nest inside it; a data label ends with its
+//! own data directives. MASM repeat blocks (`REPT`, `WHILE`, `FOR`, ...)
+//! are only recognised in files that use a bare `ENDM`, and an unclosed
+//! one ends at the next `PROC`, segment or section. A section runs to the next
 //! section or segment. `.type x, @function` / `%function` and
 //! `global`/`.globl`/`public x` make a label a Function even when no
 //! instruction follows it (`.type x, @object` makes it a Variable); a label
 //! followed by neither code nor data nor such a promotion is not a symbol.
 //!
+//! Extensions: `asm` and `s`. `inc` is deliberately not claimed (PHP,
+//! Pascal and POV-Ray include files use it); such files stay tokens-only.
+//!
 //! Not symbols: local labels (`.L1`, NASM `.loop`, MASM `@@`, numeric `1:`,
-//! macro-local `%%x`), labels inside a MASM `PROC` (proc-scoped there),
+//! macro-local `%%x`, Mach-O compiler locals `Ltmp0`/`LBB0_1`), labels inside a MASM `PROC` (proc-scoped there),
 //! and anything inside a macro body (a template, not code).
 //!
 //! Known limits (the `ASM` dialect's): `;` always starts a comment (GNU as
@@ -50,7 +56,7 @@ impl Extractor for AsmExtractor {
     }
 
     fn extensions(&self) -> &[&str] {
-        &["asm", "s", "inc"]
+        &["asm", "s"]
     }
 
     fn version(&self) -> String {
@@ -270,10 +276,26 @@ fn items(tokens: &[TokenDecl], idx: &[usize]) -> Vec<Item> {
 }
 
 /// Local labels are not symbols.
+/// Local labels are not symbols: `.L1`/`.loop`, `%%x`, `@@`, numeric
+/// `1:`, and the Apple/Mach-O compiler locals (`Ltmp0`, `LBB0_1`, ...).
+/// NASM `$name` is an escaped identifier, not a local.
 fn is_local(name: &str) -> bool {
-    name.starts_with(['.', '%', '$'])
+    const MACHO: &[&str] = &[
+        "Ltmp",
+        "LBB",
+        "LCPI",
+        "Lfunc_",
+        "Lloh",
+        "Lset",
+        "Lexception",
+        "LJTI",
+        "Lcst",
+        "L_",
+    ];
+    name.starts_with(['.', '%'])
         || name.starts_with("@@")
         || name.starts_with(|c: char| c.is_ascii_digit())
+        || MACHO.iter().any(|p| name.starts_with(p))
 }
 
 /// Symbols in assembly tokens (as produced with [`ASM_TOKENIZER`]).
@@ -362,6 +384,16 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
                     Some((None, true)) if kind.is_none() => kind = Some(SymbolKind::Function),
                     _ => {}
                 }
+                // A data label ends with its own data directives, so a
+                // following `len equ $ - msg` does not nest inside it.
+                let end = match (&e.ev, kind) {
+                    (Ev::Label(_), Some(SymbolKind::Variable)) => evs[i + 1..j]
+                        .iter()
+                        .take_while(|x| x.ev == Ev::Data)
+                        .last()
+                        .map_or(e.last, |x| x.last),
+                    _ => end,
+                };
                 match kind {
                     Some(SymbolKind::Function) => {
                         push(n, SymbolKind::Function, "label", e.first, end)
@@ -409,7 +441,14 @@ fn block_kind(b: Block) -> (SymbolKind, &'static str) {
 /// nested macro starts and ends; labels inside a MASM `PROC` are dropped.
 fn events(tokens: &[TokenDecl]) -> Vec<E> {
     let mut out: Vec<E> = Vec::new();
-    let mut macro_depth = 0usize;
+    // Open macro bodies; true for an anonymous MASM repeat block.
+    let mut macros: Vec<bool> = Vec::new();
+    // MASM style: a bare `ENDM` (not GNU `.endm`) appears somewhere.
+    let masm = tokens.iter().enumerate().any(|(i, t)| {
+        t.class == TokenClass::Identifier
+            && t.text.eq_ignore_ascii_case("endm")
+            && !(i > 0 && tokens[i - 1].text == "." && tokens[i - 1].span.end == t.span.start)
+    });
     let mut proc_depth = 0usize;
     let mut records: Vec<Block> = Vec::new();
     for (_, range) in graph_core::scan::line_iter(tokens) {
@@ -422,14 +461,29 @@ fn events(tokens: &[TokenDecl]) -> Vec<E> {
         let it = items(tokens, &idx);
         let mut line = Vec::new();
         let in_struct = matches!(records.last(), Some(Block::Struct | Block::Struc));
-        parse_line(&it, line_last, in_struct, &mut line);
+        parse_line(&it, line_last, in_struct, masm, &mut line);
         for e in line {
-            match &e.ev {
-                Ev::Open(Block::Macro, _) => macro_depth += 1,
-                Ev::Close(Block::Macro) if macro_depth > 0 => {
-                    macro_depth -= 1;
+            // An unclosed repeat block ends at the next PROC, segment or
+            // section, so later symbols are not lost inside it.
+            if matches!(
+                e.ev,
+                Ev::Open(Block::Proc | Block::Segment, _) | Ev::Section(_)
+            ) {
+                while macros.last() == Some(&true) {
+                    macros.pop();
+                    out.push(E {
+                        ev: Ev::Close(Block::Macro),
+                        first: e.first,
+                        last: e.first,
+                    });
                 }
-                _ if macro_depth > 0 => continue,
+            }
+            match &e.ev {
+                Ev::Open(Block::Macro, n) => macros.push(n.is_none()),
+                Ev::Close(Block::Macro) if !macros.is_empty() => {
+                    macros.pop();
+                }
+                _ if !macros.is_empty() => continue,
                 Ev::Open(Block::Proc, _) => proc_depth += 1,
                 Ev::Open(b @ (Block::Segment | Block::Struct | Block::Struc), _) => {
                     records.push(*b)
@@ -454,7 +508,7 @@ fn events(tokens: &[TokenDecl]) -> Vec<E> {
     out
 }
 
-fn parse_line(it: &[Item], line_last: usize, in_struct: bool, out: &mut Vec<E>) {
+fn parse_line(it: &[Item], line_last: usize, in_struct: bool, masm: bool, out: &mut Vec<E>) {
     let lower = |k: usize| {
         it.get(k)
             .filter(|x| x.word)
@@ -554,9 +608,8 @@ fn parse_line(it: &[Item], line_last: usize, in_struct: bool, out: &mut Vec<E>) 
             out.push(whole(Ev::Close(Block::Macro)));
             return;
         }
-        s if MASM_REPEAT.contains(&s) => {
-            // Only a MASM repeat block when not an instruction-like use;
-            // these words are not x86/ARM mnemonics.
+        s if masm && MASM_REPEAT.contains(&s) => {
+            // A MASM repeat block (only in files using MASM's `ENDM`).
             out.push(whole(Ev::Open(Block::Macro, None)));
             return;
         }

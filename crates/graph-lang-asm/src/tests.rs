@@ -300,3 +300,51 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn inc_is_not_claimed() {
+    assert_eq!(AsmExtractor.extensions(), ["asm", "s"]);
+}
+
+#[test]
+fn repeat_words_only_open_blocks_in_masm_files() {
+    // GNU/NASM file (no bare ENDM): `while`/`for` are not blocks.
+    let s = syms("for:\n  nop\nwhile x\nfoo:\n  ret\n");
+    assert_eq!(find(&s, "foo").1, SymbolKind::Function);
+    // MASM file: an unclosed REPT ends at the next PROC.
+    let src = "M MACRO\nENDM\nREPT 3\n  nop\nLater PROC\n  ret\nLater ENDP\n.data\nv DWORD 0\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "Later").2, "proc");
+    assert_eq!(find(&s, "v").1, SymbolKind::Variable);
+    // A closed REPT hides its body.
+    let s = syms("M MACRO\nENDM\nWHILE x\nhidden:\n  nop\nENDM\nshown:\n  nop\n");
+    assert!(!names(&s).contains(&"hidden"));
+    assert!(names(&s).contains(&"shown"));
+}
+
+#[test]
+fn data_label_ends_at_its_data() {
+    let src = "section .data\nmsg: db 'hi', 10\n     db 0\nlen equ $ - msg\nSIZE: equ 4\n%define K 1\n.set J, 2\n";
+    let ex = AsmExtractor.extract(src);
+    let s = syms(src);
+    assert_eq!(find(&s, "msg").3, "msg: db 'hi', 10\n     db 0");
+    // The constants are siblings of `msg`, not nested inside it.
+    let msg = ex.symbols.iter().find(|x| x.name == "msg").unwrap();
+    for c in ["len", "SIZE", "K", "J"] {
+        let c = ex.symbols.iter().find(|x| x.name == c).unwrap();
+        assert!(c.span.start >= msg.span.end, "{c:?}");
+    }
+}
+
+#[test]
+fn local_label_rules() {
+    let src = "_main:\n  nop\nLtmp0:\n  nop\nLBB0_1:\n  nop\nLloh2:\n  nop\n@@:\n  nop\n%%skip:\n  nop\n.Lx:\n  nop\n$escaped:\n  nop\nLoop:\n  nop\n";
+    let s = syms(src);
+    let n = names(&s);
+    for local in ["Ltmp0", "LBB0_1", "Lloh2", "@@", "%%skip", ".Lx"] {
+        assert!(!n.contains(&local), "{local}: {n:?}");
+    }
+    assert!(n.contains(&"$escaped"), "{n:?}");
+    assert!(n.contains(&"Loop"), "{n:?}");
+    assert!(n.contains(&"_main"), "{n:?}");
+}

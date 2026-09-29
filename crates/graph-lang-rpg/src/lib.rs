@@ -29,7 +29,9 @@
 //! Not scanned: compile-time data after a `**CTDATA` / `**` line, compiler
 //! directives (`/copy`, `/free`, `/if` ...), `dcl-f` files, `dcl-subf` /
 //! `dcl-parm` members and H/F/I/O specs. RPG III (RPG/400) specs are read
-//! with the RPG IV columns.
+//! with the RPG IV columns. Columns count characters, so a tab in a fixed
+//! spec counts as one column (as the tokenizer does); tab-indented fixed
+//! specs lose their column positions.
 use graph_core::scan::{line_iter, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -70,8 +72,24 @@ fn is_free(src: &str) -> bool {
     first.trim_end().eq_ignore_ascii_case("**free")
 }
 
-/// Byte offset where compile-time data starts: the first line (after a
-/// `**FREE` first line) beginning with `**`.
+/// A compile-time data marker line: `**CTDATA`, `**FTRANS`, `**ALTSEQ`, or
+/// `**` followed by a blank or the end of the line. A `**` exponent operator
+/// continuing a free-form expression (`**2;`) is not one.
+fn is_data_marker(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("**") else {
+        return false;
+    };
+    let rest = rest.trim_end_matches(['\r', '\n']);
+    let upper = rest.to_ascii_uppercase();
+    rest.is_empty()
+        || rest.starts_with([' ', '\t'])
+        || ["CTDATA", "FTRANS", "ALTSEQ"]
+            .iter()
+            .any(|k| upper.starts_with(k))
+}
+
+/// Byte offset where compile-time data starts: the first data marker line
+/// (not the `**FREE` first line).
 fn data_start(src: &str, free: bool) -> usize {
     let mut off = 0;
     for (n, line) in src.split_inclusive('\n').enumerate() {
@@ -80,7 +98,7 @@ fn data_start(src: &str, free: bool) -> usize {
         } else {
             line
         };
-        if l.starts_with("**") && !(n == 0 && free) {
+        if is_data_marker(l) && !(n == 0 && free) {
             return off;
         }
         off += line.len();

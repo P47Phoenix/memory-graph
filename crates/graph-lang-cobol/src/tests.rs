@@ -266,3 +266,99 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn directive_lines_are_comments() {
+    for d in [">>SOURCE FORMAT FREE", "$SET SOURCEFORMAT\"FREE\""] {
+        let src = format!("{d}\nIDENTIFICATION DIVISION.\nPROGRAM-ID. p.\n");
+        let ex = CobolExtractor.extract(&src);
+        assert_eq!(ex.tokens[0].class, TokenClass::Comment);
+        assert_eq!(ex.tokens[0].text, d);
+        let s = syms(&src);
+        assert_eq!(find(&s, "p").3, "IDENTIFICATION DIVISION.\nPROGRAM-ID. p.");
+    }
+    // Fixed format: a directive in Area A is a comment too.
+    let s = syms(
+        "       >>SOURCE FORMAT FIXED\n       IDENTIFICATION DIVISION.\n       PROGRAM-ID. q.\n",
+    );
+    assert!(find(&s, "q").3.starts_with("IDENTIFICATION"));
+}
+
+#[test]
+fn change_tags_in_sequence_area_stay_fixed() {
+    let src = "ABCDEF IDENTIFICATION DIVISION.\nABCDEF PROGRAM-ID. TAGGED.\nABCDEFD    DISPLAY 'X'.\nABCDEF-    'CONT'.\nABCDEF* note\nABCDEF/page\nABCDEF PROCEDURE DIVISION.\nABCDEF PARA-1.\nABCDEF     STOP RUN.\n";
+    assert!(!is_free_format(src));
+    let s = syms(src);
+    assert_eq!(find(&s, "TAGGED").1, SymbolKind::Module);
+    assert_eq!(find(&s, "PARA-1").1, SymbolKind::Function);
+}
+
+#[test]
+fn programs_without_end_program_are_siblings() {
+    let src = "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. C.\n       PROCEDURE DIVISION.\n       P1.\n           GOBACK.\n       IDENTIFICATION DIVISION.\n       PROGRAM-ID. D.\n       PROCEDURE DIVISION.\n       P2.\n           GOBACK.\n";
+    let s = syms(src);
+    assert!(!contains(&s, "C", "D"));
+    assert!(find(&s, "C").3.ends_with("GOBACK."));
+    assert!(!find(&s, "C").3.contains("PROGRAM-ID. D"));
+    assert!(contains(&s, "D", "P2"));
+}
+
+#[test]
+fn inner_program_closes_before_outer_end() {
+    // INNER has no END PROGRAM but OUTER does: INNER ends before it.
+    let src = "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. OUTER.\n       IDENTIFICATION DIVISION.\n       PROGRAM-ID. INNER.\n       PROCEDURE DIVISION.\n       P2.\n           GOBACK.\n       END PROGRAM OUTER.\n";
+    let s = syms(src);
+    assert!(contains(&s, "OUTER", "INNER"));
+    assert!(find(&s, "INNER").3.ends_with("GOBACK."));
+    assert!(find(&s, "OUTER").3.ends_with("END PROGRAM OUTER."));
+}
+
+#[test]
+fn copybooks_have_symbols() {
+    let s =
+        syms("       01  CUST-REC.\n           05  CUST-ID  PIC 9(5).\n       77  FLAG PIC X.\n");
+    assert_eq!(find(&s, "CUST-REC").2, "level-01");
+    assert_eq!(find(&s, "FLAG").2, "level-77");
+    let s = syms("       COMMON-PARA.\n           DISPLAY 'X'.\n");
+    assert_eq!(find(&s, "COMMON-PARA").1, SymbolKind::Function);
+}
+
+#[test]
+fn empty_names_are_not_symbols() {
+    let s =
+        syms("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. ''.\n       END PROGRAM ''.\n");
+    assert!(s.iter().all(|x| !x.0.is_empty()), "{s:#?}");
+}
+
+#[test]
+fn area_a_limit() {
+    // Columns 8-11 are Area A; column 12 is Area B (a statement).
+    let src = "       PROCEDURE DIVISION.\n       IN-8.\n          IN-11.\n           IN-12.\n";
+    let s = syms(src);
+    assert!(names(&s).contains(&"IN-8"));
+    assert!(names(&s).contains(&"IN-11"));
+    assert!(!names(&s).contains(&"IN-12"));
+}
+
+#[test]
+fn lone_verbs_are_not_paragraphs_in_free_format() {
+    let src = ">>SOURCE FREE\nPROCEDURE DIVISION.\nmain.\n  DISPLAY 1\nEXIT.\nGOBACK.\nCONTINUE.\nELSE.\nSTOP.\nRUN.\nEND-IF.\nnext-one.\n";
+    let s = syms(src);
+    let fns: Vec<_> = s
+        .iter()
+        .filter(|x| x.1 == SymbolKind::Function)
+        .map(|x| x.0.as_str())
+        .collect();
+    assert_eq!(fns, ["main", "next-one"]);
+}
+
+#[test]
+fn fd_ends_a_data_item_and_unnamed_01_is_skipped() {
+    let src = "       DATA DIVISION.\n       FILE SECTION.\n       01  A-REC PIC X.\n       FD  OUT-FILE.\n       01  PIC X(4).\n       01  FILLER PIC X.\n       SD  SORT-FILE.\n       01  B-REC PIC X.\n       RD  REP.\n       01  VALUE 1.\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "A-REC").3, "01  A-REC PIC X.");
+    assert_eq!(find(&s, "B-REC").3, "01  B-REC PIC X.");
+    for n in ["PIC", "FILLER", "OUT-FILE", "VALUE"] {
+        assert!(!names(&s).contains(&n), "{n}: {s:#?}");
+    }
+}

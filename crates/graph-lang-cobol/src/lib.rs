@@ -7,7 +7,9 @@
 //! that has code in the sequence area which fixed format cannot have (two
 //! words in columns 1-6, or a word running from column 6 into column 7, as
 //! in GnuCOBOL `-free` sources without a directive), is tokenized free-form
-//! instead, with `*>` floating comments.
+//! instead, with `*>` floating comments. Directive lines (`>>...`,
+//! `$SET ...`) are Comment tokens in both formats. A file with no
+//! `DIVISION` header (a copybook) is scanned for data items and paragraphs.
 //!
 //! | COBOL | `SymbolKind` | `lang_kind` |
 //! |---|---|---|
@@ -22,7 +24,9 @@
 //! or to the end of the file. A division, section, paragraph or data item
 //! runs to the last code token before the next header of the same or a
 //! higher rank (program > division > section > paragraph / data item; `FD`,
-//! `SD` and `RD` entries also end a data item). Nested programs nest.
+//! `SD` and `RD` entries also end a data item). Nested programs nest; a
+//! program that never gets an `END PROGRAM` ends at the next
+//! `IDENTIFICATION DIVISION` (siblings). Empty names are not symbols.
 //!
 //! Paragraph names are recognised at the start of a sentence (after a `.`)
 //! when followed by `.`: in fixed format only in Area A (columns 8-11); in
@@ -108,7 +112,8 @@ fn code_in_sequence_area(line: &str) -> bool {
         .find(|c| **c != ' ')
         .is_some();
     let word = |c: char| c.is_alphanumeric() || c == '-';
-    let crosses = (cs[5].is_alphabetic() || cs[5] == '-')
+    let crosses = !matches!(cs[6], 'D' | 'd' | '-' | '*' | '/')
+        && (cs[5].is_alphabetic() || cs[5] == '-')
         && word(cs[6])
         && seq.iter().any(|c| c.is_alphabetic());
     two_words || crosses
@@ -116,24 +121,40 @@ fn code_in_sequence_area(line: &str) -> bool {
 
 /// Tokens for COBOL source, fixed or free format.
 pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
-    if !free {
-        return tokenize_with(src, COBOL_TOKENIZER);
-    }
-    let raw = tokenize_with(src, COBOL_FREE_TOKENIZER);
+    let raw = if free {
+        tokenize_with(src, COBOL_FREE_TOKENIZER)
+    } else {
+        tokenize_with(src, COBOL_TOKENIZER)
+    };
     let mut out: Vec<TokenDecl> = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
         let t = &raw[i];
-        let floating = matches!(t.class, TokenClass::Operator | TokenClass::Punctuation)
-            && (t.text.starts_with("*>")
-                || (t.text == "*"
-                    && raw
-                        .get(i + 1)
-                        .is_some_and(|n| n.text.starts_with('>') && n.span.start == t.span.end)));
-        if floating {
+        let adjacent = |text: &str| {
+            raw.get(i + 1).is_some_and(|n| {
+                n.span.start == t.span.end && n.text.to_ascii_uppercase().starts_with(text)
+            })
+        };
+        let code = matches!(t.class, TokenClass::Operator | TokenClass::Punctuation);
+        // `*>` floating comment (free format; fixed format lexes it already).
+        let floating =
+            free && code && (t.text.starts_with("*>") || (t.text == "*" && adjacent(">")));
+        // A compiler directive line (`>>SOURCE ...`, `$SET ...`) is a comment.
+        let line_start = out
+            .last()
+            .is_none_or(|p| p.span.end_line < t.span.start_line);
+        let directive = line_start
+            && code
+            && (t.text.starts_with(">>")
+                || (t.text == ">" && adjacent(">"))
+                || (t.text == "$" && adjacent("SET")));
+        if floating || directive {
             let line = t.span.start_line;
             let mut j = i;
-            while raw.get(j + 1).is_some_and(|n| n.span.start_line == line) {
+            while raw
+                .get(j + 1)
+                .is_some_and(|n| n.span.start_line == line && n.class != TokenClass::Comment)
+            {
                 j += 1;
             }
             let span = span_between(&t.span, &raw[j].span);
@@ -209,6 +230,13 @@ pub fn symbols(tokens: &[TokenDecl], free: bool) -> Vec<SymbolDecl> {
             .map_or(code.len() - 1, |x| x.first.saturating_sub(1))
             .max(evs[i].last)
     };
+    let end_names: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match &e.ev {
+            Ev::ProgEnd(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut progs: Vec<(Option<&str>, usize)> = Vec::new();
     let close = |out: &mut Vec<SymbolDecl>, p: (Option<&str>, usize), end: usize| {
         if let Some(n) = p.0 {
@@ -217,7 +245,20 @@ pub fn symbols(tokens: &[TokenDecl], free: bool) -> Vec<SymbolDecl> {
     };
     for (i, e) in evs.iter().enumerate() {
         match &e.ev {
-            Ev::ProgStart(n) => progs.push((n.as_deref(), e.first)),
+            Ev::ProgStart(n) => {
+                // An open program that never gets an END PROGRAM ends here:
+                // only programs closed by END PROGRAM can contain others.
+                while let Some(&p) = progs.last() {
+                    let ended =
+                        p.0.is_some_and(|p| end_names.iter().any(|n| n.eq_ignore_ascii_case(p)));
+                    if ended {
+                        break;
+                    }
+                    progs.pop();
+                    close(&mut out, p, e.first.saturating_sub(1).max(p.1));
+                }
+                progs.push((n.as_deref(), e.first));
+            }
             Ev::ProgEnd(n) => {
                 let hit = progs
                     .iter()
@@ -275,8 +316,11 @@ fn events(code: &[&TokenDecl], free: bool) -> Vec<E> {
             .find(|&j| period(j))
             .unwrap_or(code.len() - 1)
     };
-    let mut in_procedure = false;
-    let mut in_data = false;
+    // A copybook (no DIVISION header anywhere) may hold data items or
+    // paragraphs.
+    let copybook = !(1..code.len()).any(|c| is(c, "DIVISION") && is_word(c - 1));
+    let mut in_procedure = copybook;
+    let mut in_data = copybook;
     // An `IDENTIFICATION DIVISION` awaiting its PROGRAM-ID.
     let mut pending_id: Option<usize> = None;
     let mut c = 0;
@@ -313,8 +357,10 @@ fn events(code: &[&TokenDecl], free: bool) -> Vec<E> {
             let name = code
                 .get(n)
                 .filter(|t| !period(n) && t.class != TokenClass::Punctuation);
-            if let Some(t) = name {
-                let name = t.text.trim_matches(['\'', '"']).to_string();
+            let name = name
+                .map(|t| t.text.trim_matches(['\'', '"']).to_string())
+                .filter(|n| !n.is_empty());
+            if let Some(name) = name {
                 match pending_id.take() {
                     Some(p) => out[p].ev = Ev::ProgStart(Some(name)),
                     None => {

@@ -268,3 +268,53 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn compile_time_data_markers() {
+    for marker in ["**CTDATA arr", "**ftrans", "**ALTSEQ", "**", "** names"] {
+        let src = format!("**FREE\ndcl-s before int(10);\n{marker}\ndcl-s after int(10);\n");
+        let s = syms(&src);
+        assert!(names(&s).contains(&"before"), "{marker}");
+        assert!(!names(&s).contains(&"after"), "{marker}: {s:#?}");
+    }
+    // Fixed form too.
+    let s = syms("     D before          S             10I 0\n**CTDATA x\n     D after           S             10I 0\n");
+    assert!(names(&s).contains(&"before") && !names(&s).contains(&"after"));
+    // A `**` exponent continuing a free-form expression is not a marker.
+    let src = "**FREE\ndcl-proc p;\n  x = y\n**2;\n  dcl-s later int(10);\nend-proc;\n";
+    let s = syms(src);
+    assert!(names(&s).contains(&"later"), "{s:#?}");
+    assert!(find(&s, "p").3.ends_with("end-proc;"));
+}
+
+#[test]
+fn likeds_and_likerec_are_one_statement() {
+    let src = "**FREE\ndcl-ds a likeds(t);\ndcl-ds b LIKEREC(r);\ndcl-s c int(10);\ndcl-ds d;\n  f int(10);\nend-ds;\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "a").3, "dcl-ds a likeds(t);");
+    assert_eq!(find(&s, "b").3, "dcl-ds b LIKEREC(r);");
+    assert_eq!(find(&s, "c").1, SymbolKind::Variable);
+    assert_eq!(find(&s, "d").3, "dcl-ds d;\n  f int(10);\nend-ds;");
+}
+
+#[test]
+fn long_names_over_several_lines() {
+    let src = "     D partOne...\n     D   partTwo...\n     D                 DS                  QUALIFIED\n     D  sub                          5A\n";
+    let s = syms(src);
+    let ds = find(&s, "partOnepartTwo");
+    assert_eq!(ds.1, SymbolKind::Type);
+    assert!(ds.3.starts_with("D partOne..."), "{}", ds.3);
+    assert!(ds.3.ends_with("5A"));
+}
+
+#[test]
+fn subroutine_stops_at_procedure_boundary() {
+    // `begsr` without `endsr` before the procedure ends: header only.
+    let src = "**FREE\ndcl-proc p;\n  begsr s;\n    x = 1;\nend-proc;\ndcl-proc q;\n  endsr;\nend-proc;\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "s").3, "begsr s;");
+    assert!(contains(&s, "p", "s"));
+    let src = "**FREE\nbegsr s;\ndcl-proc q;\nend-proc;\nendsr;\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "s").3, "begsr s;");
+}
