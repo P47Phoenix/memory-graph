@@ -1,0 +1,42 @@
+# Services for the memory-graph StatefulSet (docs/deploy/kubernetes.md).
+#
+# `memory-graph` is headless: it gives every pod a stable DNS name,
+# memory-graph-N.memory-graph.<namespace>.svc.cluster.local, which the pods
+# advertise to each other (Raft) and to clients. publishNotReadyAddresses:
+# a pod that is still joining or catching up is not ready, yet its peers
+# must reach it to replicate to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-graph
+  labels:
+    app.kubernetes.io/name: memory-graph
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: memory-graph
+  ports:
+    - name: grpc
+      port: 7000
+      targetPort: grpc
+    - name: metrics
+      port: 9100
+      targetPort: metrics
+---
+# `memory-graph-client`: one virtual IP over the ready pods only (a caught-up
+# member; reads may be local or linearizable, writes are forwarded to the
+# leader by whichever pod receives them).
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-graph-client
+  labels:
+    app.kubernetes.io/name: memory-graph
+spec:
+  selector:
+    app.kubernetes.io/name: memory-graph
+  ports:
+    - name: grpc
+      port: 7000
+      targetPort: grpc

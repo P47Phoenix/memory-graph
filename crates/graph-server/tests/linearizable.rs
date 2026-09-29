@@ -353,7 +353,7 @@ fn follower_behind_the_leader_commit_is_stale() {
         let (gate, parked) = (Arc::clone(&gate), Arc::clone(&parked));
         ClusterTestbed::with_config(3, exts(), move |id, cfg| {
             let (gate, parked) = (Arc::clone(&gate), Arc::clone(&parked));
-            cfg.apply_gate = Some(Arc::new(move |_index| {
+            cfg.testing_apply_gate = Some(Arc::new(move |_index| {
                 let (held, cv) = &*gate;
                 let mut h = held.lock().unwrap();
                 if *h == id {
@@ -390,10 +390,10 @@ fn follower_behind_the_leader_commit_is_stale() {
     wait_until("f's apply to park in the gate", || {
         parked.load(Ordering::SeqCst) > 0
     });
-    let contact = Arc::clone(&tb.node(f).raft().unwrap().leader_contact);
+    let contact = Arc::clone(&tb.node(f).raft().unwrap().obs);
     wait_until("f to hear the leader's commit index", || {
         contact
-            .last()
+            .last_leader_contact()
             .is_some_and(|(_, c)| c.is_some_and(|c| c >= idx))
     });
     let local = reader(
@@ -403,7 +403,7 @@ fn follower_behind_the_leader_commit_is_stale() {
     );
     let n = files(&local).unwrap();
     let m = local.read_log().last().unwrap();
-    let (at, _) = contact.last().unwrap();
+    let (at, _) = contact.last_leader_contact().unwrap();
     release(&gate);
     assert_eq!(n, 1, "f has not applied the write");
     assert!(

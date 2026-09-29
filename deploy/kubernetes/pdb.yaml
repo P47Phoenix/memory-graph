@@ -1,0 +1,13 @@
+# Voluntary disruptions (node drains, upgrades) take at most one member of
+# three away: two keep a quorum, so writes continue (docs/deploy/kubernetes.md).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: memory-graph
+  labels:
+    app.kubernetes.io/name: memory-graph
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: memory-graph

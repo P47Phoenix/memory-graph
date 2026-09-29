@@ -313,6 +313,7 @@ Design: ADR 0004 D7, D8.
 - Given the CI `cluster` job, When it spawns three binaries, kills the leader with SIGKILL mid-batch and restarts it, Then every acknowledged batch must be present on all nodes.
 
 **24. Observability and packaging (5 pts)**
+Status: delivered on branch stage-e (PR pending); see the README's Observability section and [docs/deploy/](deploy/kubernetes.md).
 As a database operator
 I want logs, metrics, health probes and ready-made deployments
 So that I can run the cluster in Docker Compose or Kubernetes and see what it is doing.

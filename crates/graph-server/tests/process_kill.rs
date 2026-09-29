@@ -32,7 +32,8 @@ fn child_server_process() {
         Some(1),
     );
     cfg.raft = Some(graph_server::testing::TEST_RAFT);
-    graph_server::run_blocking_with(cfg, exts(), |addr| {
+    graph_server::run_blocking_with(cfg, exts(), |r| {
+        let addr = r.addr;
         use std::io::Write;
         println!("{READY}{addr}");
         let _ = std::io::stdout().flush();

@@ -148,8 +148,12 @@ pub struct NodeStart {
     /// Test hooks.
     pub faults: Option<FaultPlan>,
     pub failpoints: SmFailpoints,
-    pub apply_gate: Option<super::state_machine::ApplyGate>,
     pub append_observer: Option<AppendObserver>,
+    /// Metrics and readiness inputs this node records (stage E).
+    pub obs: Arc<crate::observe::Observability>,
+    /// Testing only: see [`crate::raft::state_machine::TestingApplyGate`].
+    #[doc(hidden)]
+    pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
 }
 
 #[derive(Clone)]
@@ -180,36 +184,14 @@ pub struct RaftNode {
     /// write proposal waits this long after it was counted in
     /// [`in_flight`](Self::in_flight), before it reaches Raft.
     pub hold_proposal: Option<Duration>,
-    /// The last `AppendEntries` this node accepted from a leader (when, and
-    /// the leader's commit index it carried): what a `LOCAL` read's
-    /// [`ReadMeta`](graph_proto::ReadMeta) judges staleness by (ADR 0004 D8).
-    pub leader_contact: Arc<LeaderContact>,
+    /// Metrics and readiness inputs (apply timings, RPC timings, the last
+    /// leader contact and the leader's committed index as heard over
+    /// `AppendEntries`): what readiness (D10) and a `LOCAL` read's
+    /// [`ReadMeta`](graph_proto::ReadMeta) (D8) both judge by.
+    pub obs: Arc<crate::observe::Observability>,
     /// Linearizable reads on this node waiting to apply the leader's read
     /// index right now (a test observes a read parked there).
     pub read_index_waits: Arc<AtomicUsize>,
-}
-
-/// The last leader contact a follower saw ([`RaftNode::leader_contact`]).
-#[derive(Debug, Default)]
-pub struct LeaderContact(std::sync::Mutex<Option<(std::time::Instant, Option<u64>)>>);
-
-impl LeaderContact {
-    /// Record an accepted `AppendEntries` carrying `leader_commit`.
-    pub fn seen(&self, leader_commit: Option<u64>) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((std::time::Instant::now(), leader_commit));
-    }
-
-    /// When the leader was last heard from, and its commit index then.
-    pub fn last(&self) -> Option<(std::time::Instant, Option<u64>)> {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 /// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
@@ -308,7 +290,8 @@ impl RaftNode {
         }
         let sm = StoreStateMachine::new(Arc::clone(&p.slot), Arc::clone(&p.snapshots))
             .with_failpoints(p.failpoints)
-            .with_apply_gate(p.apply_gate.clone());
+            .with_obs(Arc::clone(&p.obs))
+            .with_testing_apply_gate(p.testing_apply_gate.clone());
         let net_stats = NetStats::default();
         let net = GrpcNetwork::new(
             Arc::clone(&p.identity),
@@ -346,8 +329,8 @@ impl RaftNode {
             transferring: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             hold_proposal: None,
-            leader_contact: Arc::default(),
             read_index_waits: Arc::default(),
+            obs: p.obs,
         };
         // The metrics are published by the Raft task, so right after
         // `Raft::new`/`initialize` they may not show the membership yet:
@@ -624,7 +607,7 @@ impl RaftNode {
                 stale_possible: !acked || self.transferring.load(Ordering::SeqCst),
             };
         }
-        let last = self.leader_contact.last();
+        let last = self.obs.last_leader_contact();
         let committed = last.and_then(|(_, c)| c);
         let recent = last.is_some_and(|(at, _)| at.elapsed() < lease);
         graph_proto::ReadMeta {

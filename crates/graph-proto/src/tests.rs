@@ -1037,3 +1037,31 @@ fn protocol_version_is_one() {
     assert_eq!(crate::STREAM_BATCH_NODES, 4096);
     assert_eq!(crate::RAFT_ENTRY_MAX_BYTES, 8 << 20);
 }
+
+/// `rpc_paths` (which scans the generated source) lists exactly the
+/// methods the `.proto` files declare, parsed independently here.
+#[test]
+fn rpc_paths_match_the_proto_files() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("proto/memory_graph/v1");
+    let mut want = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        let mut service = None;
+        for line in text.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("service ") {
+                service = rest.split_whitespace().next().map(str::to_string);
+            } else if let Some(rest) = line.strip_prefix("rpc ") {
+                let method: String = rest
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect();
+                let svc = service.as_deref().expect("an rpc outside a service");
+                want.insert(format!("/memory_graph.v1.{svc}/{method}"));
+            }
+        }
+    }
+    let got: std::collections::BTreeSet<String> =
+        crate::rpc_paths().iter().map(|s| s.to_string()).collect();
+    assert_eq!(got, want);
+    assert_eq!(got.len(), 41, "15 Admin + 3 Raft + 18 Store + 5 Write");
+}

@@ -131,7 +131,10 @@ Four layers, from the wire up:
 Two more layers on top of the four above. Every wait polls a condition with
 a hard timeout and a message naming what it waited for. Faults are injected
 through deterministic hooks (failpoints in `TestingHooks`, the network
-`FaultPlan`, a fake free-space probe), never by sleeping and hoping.
+`FaultPlan`, a fake free-space probe, the apply gate
+`ServeConfig::testing_apply_gate`), never by sleeping and hoping. The
+`testing_*` hooks are for tests only: `#[doc(hidden)]`, not a supported API,
+and they may change without notice.
 
 **Test-only environment variables.** `memory-graph serve` reads two
 variables that exist only for `serve_e2e` and are not features; a server
@@ -301,7 +304,7 @@ well under 30 s (the slowest, the partition, about 5 s):
 - `minority_linearizable_read_fails_no_leader`: bounded `NoLeader`, while `local` still answers (stale_possible).
 - `old_leader_is_stale_once_a_new_leader_commits`: the leader is partitioned; once the majority elected a new leader and acked a write, one `local` read on the old leader (no retry loop) must say `stale_possible` (the freshness lease ends before any election can).
 - `follower_is_stale_soon_after_the_leader_dies`: after the leader is killed a follower's `local` reads turn `stale_possible` within `election_timeout_max`.
-- `follower_behind_the_leader_commit_is_stale`: the `apply_gate` hook parks a follower's apply while heartbeats still arrive; its `local` read reports `leader_committed_index > applied_index` and `stale_possible`.
+- `follower_behind_the_leader_commit_is_stale`: the `testing_apply_gate` hook parks a follower's apply while heartbeats still arrive; its `local` read reports `leader_committed_index > applied_index` and `stale_possible`.
 - `linearizable_snapshot_on_lagging_follower_has_the_write`: a linearizable snapshot handle opened on a lagging follower waits for the read index and holds the acked write; its reads stay `stale_possible: false` after the node turns stale (the meta is the handle's, frozen at the open), while a `local` handle opened then says `true`.
 - `snapshot_reads_stay_on_the_node_that_opened_the_handle`: the client rotated to another endpoint (a `NoLeader`); reads through the handle still go to its node.
 - `client_moves_on_when_its_node_dies` and `a_dead_first_endpoint_is_skipped_fast` (a dead first endpoint costs one 250 ms quick connect, not the 30 s retry budget).

@@ -50,8 +50,9 @@ pub struct RaftService {
     pub disk: DiskGuard,
     /// Test hook ([`crate::TestingHooks::delay_append_entries_ms`]).
     pub delay_append: Option<std::time::Duration>,
-    /// Where an accepted `AppendEntries` is recorded (read staleness, D8).
-    pub leader_contact: Arc<crate::raft::node::LeaderContact>,
+    /// Where leader contact and the leader's committed index are recorded:
+    /// read staleness (D8) and readiness (D10) both judge by it.
+    pub obs: Arc<crate::observe::Observability>,
 }
 
 fn raft_status<E: std::fmt::Display>(e: RaftError<u64, E>) -> Status {
@@ -104,9 +105,12 @@ impl pb::raft_server::Raft for RaftService {
         let resp = self.raft.append_entries(rpc).await.map_err(raft_status)?;
         // Any answer but a higher vote means a live leader of this term
         // reached us (a conflict or partial success only means we lag,
-        // which the recorded commit index shows).
+        // which the recorded commit index shows). Heartbeats included: the
+        // contact keeps a follower fresh (D8) and ready (D10), and the
+        // commit index tells a node far behind (a learner catching up)
+        // that it is neither.
         if !matches!(resp, openraft::raft::AppendEntriesResponse::HigherVote(_)) {
-            self.leader_contact.seen(leader_commit);
+            self.obs.note_leader_contact(leader_commit);
         }
         Ok(Response::new(wire::append_resp_to_pb(&resp)))
     }
@@ -126,6 +130,7 @@ impl pb::raft_server::Raft for RaftService {
         req: Request<Streaming<pb::InstallSnapshotRequest>>,
     ) -> Result<Response<pb::InstallSnapshotResponse>, Status> {
         self.check_headers(&req, true)?;
+        self.obs.note_heard_from_leader();
         let mut stream = req.into_inner();
         let header = match stream.next().await {
             Some(Ok(pb::InstallSnapshotRequest {

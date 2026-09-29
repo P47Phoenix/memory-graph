@@ -108,6 +108,15 @@ impl RemoteStore {
         .map(|r| r.into_inner())
     }
 
+    /// `Admin.Metrics`: the node's metrics in Prometheus text format (what
+    /// `serve --metrics-listen` serves at `/metrics`).
+    pub fn admin_metrics(&self) -> Result<String> {
+        self.run(self.conn.call(Kind::Read, |ch| async move {
+            admin_client(ch).metrics(pb::MetricsRequest {}).await
+        }))
+        .map(|r| r.into_inner().text)
+    }
+
     /// `Admin.SysInfo`: the server machine's `sysinfo --json` document.
     pub fn admin_sysinfo(&self) -> Result<String> {
         self.run(self.conn.call(Kind::Read, |ch| async move {

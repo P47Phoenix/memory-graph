@@ -3247,6 +3247,14 @@ pub struct StatusResponse {
     /// since it started (ADR 0004 D8; stage E exports it as a metric).
     #[prost(uint64, tag = "29")]
     pub writes_forwarded_total: u64,
+    /// gRPC calls this node served since it started, every method and outcome
+    /// (the sum of `mg_rpc_total`).
+    #[prost(uint64, tag = "30")]
+    pub rpcs_total: u64,
+    /// Log entries this node applied since it started (the count of
+    /// `mg_apply_duration_seconds`).
+    #[prost(uint64, tag = "31")]
+    pub entries_applied_total: u64,
 }
 /// Replication progress of one peer, as the leader sees it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
