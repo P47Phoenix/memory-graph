@@ -286,7 +286,28 @@ impl Prober {
     /// already under way, then probes, in parallel and each within
     /// `timeout`, those that did not answer within `window` since and were
     /// not probed within `fresh`. Records answers and counts in `stats`.
+    ///
+    /// The round runs as a task of its own, which the caller only awaits: a
+    /// write that stops waiting (its request dropped) never cuts a round
+    /// short, and a peer is marked probed only once its probe completed, so
+    /// no later write takes an unfinished probe for a fresh one.
     pub async fn round(
+        &self,
+        stats: &NetStats,
+        peers: Vec<(NodeId, String)>,
+        window: Duration,
+        fresh: Duration,
+        timeout: Duration,
+    ) {
+        let me = self.clone();
+        let stats = stats.clone();
+        let task = tokio::spawn(async move {
+            me.round_inner(&stats, peers, window, fresh, timeout).await;
+        });
+        let _ = task.await;
+    }
+
+    async fn round_inner(
         &self,
         stats: &NetStats,
         peers: Vec<(NodeId, String)>,
@@ -296,7 +317,7 @@ impl Prober {
     ) {
         let _one_at_a_time = self.round.lock().await;
         let due: Vec<(NodeId, String)> = {
-            let mut last = self
+            let last = self
                 .last_probe
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -304,13 +325,7 @@ impl Prober {
             peers
                 .into_iter()
                 .filter(|(id, _)| !stats.answered_within(*id, window))
-                .filter(|(id, _)| {
-                    let due = last.get(id).is_none_or(|t| now.duration_since(*t) >= fresh);
-                    if due {
-                        last.insert(*id, now);
-                    }
-                    due
-                })
+                .filter(|(id, _)| last.get(id).is_none_or(|t| now.duration_since(*t) >= fresh))
                 .collect()
         };
         let mut probes = tokio::task::JoinSet::new();
@@ -320,10 +335,15 @@ impl Prober {
         }
         while let Some(r) = probes.join_next().await {
             let Ok((id, alive)) = r else { continue };
+            let now = std::time::Instant::now();
+            self.last_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id, now);
             stats.with(|s| {
                 if alive {
                     s.probes_alive += 1;
-                    s.peers.entry(id).or_default().last_answer = Some(std::time::Instant::now());
+                    s.peers.entry(id).or_default().last_answer = Some(now);
                 } else {
                     s.probes_dead += 1;
                 }
@@ -1084,6 +1104,34 @@ mod tests {
             }
         });
         (addr, h)
+    }
+
+    /// A write that stops waiting mid-round does not cut the round short:
+    /// the probe still completes and is counted, and until it has the peer
+    /// is not marked probed (a later round would probe it).
+    #[tokio::test]
+    async fn a_dropped_waiter_does_not_leave_an_unfinished_probe_marked_fresh() {
+        let (addr, _peer) = silent_peer().await;
+        let prober = Prober::default();
+        let stats = NetStats::default();
+        let window = Duration::from_secs(10);
+        let fresh = Duration::from_secs(10);
+        let timeout = Duration::from_millis(300);
+        let round = prober.round(&stats, vec![(2, addr.clone())], window, fresh, timeout);
+        assert!(tokio::time::timeout(Duration::from_millis(20), round)
+            .await
+            .is_err());
+        // Mid-probe: not marked yet.
+        assert!(!prober.last_probe.lock().unwrap().contains_key(&2));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stats.probes() == (0, 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached round finished its probe");
+        assert_eq!(stats.probes(), (0, 1), "a silent peer is not alive");
+        assert!(prober.last_probe.lock().unwrap().contains_key(&2));
     }
 
     fn connection(addr: &str, stats: &NetStats) -> GrpcConnection {
