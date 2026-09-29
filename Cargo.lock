@@ -680,8 +680,11 @@ dependencies = [
  "graph-lang-go",
  "graph-lang-html",
  "graph-lang-javascript",
+ "graph-lang-r",
  "graph-lang-rust",
  "graph-lang-scala",
+ "graph-lang-shell",
+ "graph-lang-sql",
  "graph-proto",
  "graph-server",
  "graph-store",
@@ -780,6 +783,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-r"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-rust"
 version = "0.1.0"
 dependencies = [
@@ -790,6 +801,22 @@ dependencies = [
 
 [[package]]
 name = "graph-lang-scala"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-shell"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-sql"
 version = "0.1.0"
 dependencies = [
  "graph-core",
