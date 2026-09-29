@@ -1226,6 +1226,10 @@ fn nul_handling(h: &Harness) {
         ..sym("f", SymbolKind::Function, span_of("foo", "foo"))
     });
     rejected(s.ingest_file("o", "r", "a.txt", "text", &ex));
+    let mut ex = plain("foo");
+    ex.symbols
+        .push(sym("f", SymbolKind::Function, span_of("foo", "foo")).with_owner("T\0"));
+    rejected(s.ingest_file("o", "r", "a.txt", "text", &ex));
     rejected(s.ingest_file("", "r", "a.txt", "text", &plain("foo")));
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
     assert_eq!(s.count_nodes(NodeKind::Org).unwrap(), 0);
@@ -2338,8 +2342,8 @@ fn owner_extraction() -> Extraction {
     }
 }
 
-/// Issue #137: under the class grain, a symbol that no type-like symbol
-/// encloses by span rolls up under the type its owner hint names in the
+/// Issue #137: under the class grain, a hit that no type-like symbol
+/// encloses by span (whatever the kind filter) rolls up under the type its owner hint names in the
 /// same file (full span, qualified name, kind filter applied to the type);
 /// an unresolvable hint is `no_matching_symbol`; span nesting wins over a
 /// hint; the other grains ignore hints; `search_symbols` reports them; and a
@@ -2418,6 +2422,64 @@ fn owner_hint_class_grain(h: &Harness) {
             (None, 4, None, true),
             (Some("T".into()), 1, t, false),
             (Some("U".into()), 1, u, false),
+        ]
+    );
+    // Nested symbols that both carry owners: the innermost one that
+    // resolves wins; an unresolvable inner owner falls through to the outer.
+    // A hit inside a type that the kind filter rejects does not fall back to
+    // an owner hint: the hint is only for hits with no enclosing type.
+    const NEST: &str = "type A struct {}\ntype B struct {}\nf() { g() { foo } h() { foo } }\ntype C interface { i() { foo } }\n";
+    let n = |name: &str, kind, lk: Option<&str>, needle: &str, owner: Option<&str>| {
+        let d = SymbolDecl::new(name, kind, lk.map(Into::into), span_of(NEST, needle));
+        match owner {
+            Some(o) => d.with_owner(o),
+            None => d,
+        }
+    };
+    let (ty, fun) = (SymbolKind::Type, SymbolKind::Function);
+    let nest = Extraction {
+        has_errors: false,
+        symbols: vec![
+            n("A", ty, Some("struct"), "type A struct {}", None),
+            n("B", ty, Some("struct"), "type B struct {}", None),
+            n("f", fun, None, "f() { g() { foo } h() { foo } }", Some("A")),
+            n("g", fun, None, "g() { foo }", Some("B")),
+            n("h", fun, None, "h() { foo }", Some("Nope")),
+            n(
+                "C",
+                ty,
+                Some("interface"),
+                "type C interface { i() { foo } }",
+                None,
+            ),
+            n("i", fun, None, "i() { foo }", Some("A")),
+        ],
+        tokens: tokenize(NEST),
+    };
+    s.ingest_file("o", "r2", "nest.toy", "toy", &nest).unwrap();
+    let mut nq = q.clone();
+    nq.grain = Grain::Class;
+    nq.repo = Some("r2".into());
+    let (a, b, c) = (
+        Some(span_of(NEST, "type A struct {}")),
+        Some(span_of(NEST, "type B struct {}")),
+        Some(span_of(NEST, "type C interface { i() { foo } }")),
+    );
+    assert_eq!(
+        rows(&*s, &nq),
+        [
+            (Some("A".into()), 1, a, false),
+            (Some("B".into()), 1, b, false),
+            (Some("C".into()), 1, c, false),
+        ]
+    );
+    nq.symbol_kind = Some("struct".into());
+    assert_eq!(
+        rows(&*s, &nq),
+        [
+            (None, 1, None, true),
+            (Some("A".into()), 1, a, false),
+            (Some("B".into()), 1, b, false),
         ]
     );
 }

@@ -55,10 +55,14 @@ These `graph-core` items are the stable surface for extractors:
   `variable`, `constant`, `other`). Put your language's own vocabulary in
   `lang_kind` (`section`, `property`, `control`, ...); `describe` shows both as
   `generic/lang_kind`.
+- Build symbols with `SymbolDecl::new(name, kind, lang_kind, span)` (and
+  `.with_owner(..)` when needed) rather than a struct literal, so a field
+  added to `SymbolDecl` later does not break your extractor.
 - `owner` names the type a symbol belongs to when that type does not enclose
   it by span (Go sets it to a method's receiver type: `func (b *Box) W()` has
   owner `Box`). Leave it `None` otherwise. `search --grain class` uses it only
-  when no type-like symbol encloses the hit by span, and resolves it to a
+  when no type-like symbol encloses the hit by span (whatever
+  `--symbol-kind` says), and resolves it to a
   type-like symbol with exactly that name **in the same file** (the first in
   source order); an owner declared in another file does not roll up.
   `symbols --json` reports it as `owner`. Setting it changes `extract`'s

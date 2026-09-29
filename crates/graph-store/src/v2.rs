@@ -1712,10 +1712,14 @@ impl R {
                                 && q.symbol_kind.as_deref().is_none_or(|k| kind_matches(s, k))
                         });
                         // Class grain, nothing type-like encloses the token by
-                        // span: follow the innermost resolvable owner hint
-                        // (issue #137) to a type-like symbol in this file.
+                        // span (whatever the kind filter): follow the innermost
+                        // resolvable owner hint (issue #137) to a type-like
+                        // symbol in this file.
                         let mut owned: Vec<Node> = Vec::new();
-                        if pick.is_none() && q.grain == Grain::Class {
+                        if pick.is_none()
+                            && q.grain == Grain::Class
+                            && !chain.iter().any(|s| grain_accepts(Grain::Class, s))
+                        {
                             for &i in &chain_idx {
                                 let Some(o) = syms[i].owner else { continue };
                                 let j = match owners.get(&o) {
