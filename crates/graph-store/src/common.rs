@@ -38,8 +38,17 @@ pub(crate) const SYMBOLS: MultimapTableDefinition<&str, u64> =
 /// `c org repo class` (tokens per class). Zero counts are absent.
 pub(crate) const CATALOG: TableDefinition<&str, u64> = TableDefinition::new("catalog");
 
-/// Map an open failure; the read-only hint is given only for permission errors.
+/// Map an open failure; the read-only hint is given only for permission errors,
+/// and never for a directory: Windows reports opening a directory as a file
+/// as `PermissionDenied` (os error 5), where Linux says `EISDIR` (#100), so a
+/// directory gets its own hint instead of a misleading "must be writable".
 pub(crate) fn open_failed(path: &Path, e: &DatabaseError) -> StoreError {
+    if path.is_dir() {
+        return StoreError::OpenFailed {
+            path: path.display().to_string(),
+            reason: format!("{e} (the path is a directory, not a database file)"),
+        };
+    }
     let denied = matches!(
         e,
         DatabaseError::Storage(redb::StorageError::Io(io))

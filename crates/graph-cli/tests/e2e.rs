@@ -12,6 +12,25 @@ fn run(args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// A Unix file named `a\b.txt` would be stored as `a/b.txt` (`\` is a
+/// separator in stored paths on every OS), so the walk skips it, visibly.
+#[cfg(unix)]
+#[test]
+fn backslash_in_unix_file_name_is_skipped() {
+    let d = tempfile::tempdir().unwrap();
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a\\b.txt"), "foo").unwrap();
+    std::fs::write(src.join("c.txt"), "foo").unwrap();
+    let db = d.path().join("g.redb").display().to_string();
+    let s = src.display().to_string();
+    let (ok, out, err) = run(&["--db", &db, "index", "--org", "o", "--repo", "r", &s]);
+    assert!(ok, "{err}");
+    let all = format!("{out}{err}");
+    assert!(all.contains("in file name"), "{all}");
+    assert!(all.contains("skipped=1"), "{all}");
+}
+
 /// Issue #69: a small ASP.NET Web Forms site indexes with symbols for every
 /// shipped language.
 #[test]
@@ -348,6 +367,15 @@ fn json_purity_language_case_paths_and_bom() {
     // Missing database.
     let (ok, _, err) = run(&["--db", "/no/such.redb", "search", "foo"]);
     assert!(!ok && err.contains("does not exist"));
+    // A directory as the database says so, on every OS (#100).
+    let dir = d.path().display().to_string();
+    for cmd in [&["describe"][..], &["symbols", "foo"]] {
+        let mut args = vec!["--db", dir.as_str()];
+        args.extend_from_slice(cmd);
+        let (ok, _, err) = run(&args);
+        assert!(!ok && err.contains("not a database file"), "{cmd:?}: {err}");
+        assert!(!err.contains("writable"), "{err}");
+    }
 }
 
 #[test]

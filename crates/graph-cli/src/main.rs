@@ -666,6 +666,12 @@ fn open_for_indexing(target: &Target, overrides: Overrides) -> Result<Box<dyn St
 /// Open the store for a query: a local file must already exist.
 fn open_existing(target: &Target, overrides: Overrides) -> Result<Box<dyn Store>> {
     if let Target::Embedded(db) = target {
+        if db.is_dir() {
+            bail!(
+                "database `{}` is a directory, not a database file",
+                db.display()
+            );
+        }
         if !db.is_file() {
             bail!("database `{}` does not exist", db.display());
         }

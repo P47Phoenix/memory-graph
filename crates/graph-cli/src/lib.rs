@@ -455,9 +455,11 @@ fn walk(
             }
             let ft = entry.file_type();
             let rel = entry.path().strip_prefix(o.dir).unwrap_or(entry.path());
+            // Stored paths are `/`-separated on every OS (#100), so a tree
+            // indexed on Windows answers like one indexed on Linux.
             let skip = |reason| Item::Skip {
                 reason,
-                what: rel.to_string_lossy().into_owned(),
+                what: graph_core::normalize_path(&rel.to_string_lossy()),
                 unreadable: false,
             };
             let Some(ft) = ft else { continue };
@@ -467,7 +469,16 @@ fn walk(
                 continue;
             } else if !ft.is_file() {
                 skip("not a regular file")
-            } else if let Some(rel_s) = rel.to_str().map(str::to_owned) {
+            } else if !cfg!(windows) && rel.to_str().is_some_and(|s| s.contains('\\')) {
+                // `\` is a path separator in stored paths on every OS, so a
+                // Unix file named `a\b` would silently become (and collide
+                // with) `a/b`: skip it, visibly.
+                Item::Skip {
+                    reason: "`\\` in file name (a path separator in stored paths)",
+                    what: rel.to_string_lossy().into_owned(),
+                    unreadable: false,
+                }
+            } else if let Some(rel_s) = rel.to_str().map(graph_core::normalize_path) {
                 match entry.metadata() {
                     Err(_) => Item::Skip {
                         reason: "unreadable",

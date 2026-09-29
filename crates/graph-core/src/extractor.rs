@@ -179,10 +179,7 @@ impl Registry {
     /// first, then [`crate::detect_language_from_content`] (built-in extension
     /// table, well-known file names, `#!` line).
     pub fn detect_language(&self, path: &str, src: &str) -> String {
-        let ext = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase);
+        let ext = crate::language::extension(path);
         if let Some(lang) = ext.and_then(|e| self.extensions.get(&e)) {
             return lang.clone();
         }
