@@ -42,13 +42,15 @@ Read this section first. It uses no special vocabulary. Words with a link are ex
 | D5 one Raft group | Sharding (ADR 0003 Q4, stories 14-17) is built; each shard then needs its own Raft group or a routing layer. |
 | D7 whole-file snapshot | Snapshot install time on a follower exceeds the time to replay the retained log; then keep more log or add incremental snapshots. |
 
+**Measured against the triggers (stage F, [spikes/raft-replication.md](../spikes/raft-replication.md) "Stage F at scale", 2026-09-28, [M]):** D1: RPC overhead p50 at 10 M tokens 0.4-1.6 ms (trigger 5 ms), not tripped. D5: replicated ingest at 10 M tokens 80% of embedded on one node and 71-74% on three on an idle machine (the corpus: 93-103%), not tripped; one run under concurrent build load measured 43% (issue #123). D7: the 540 MB store installs on a new learner in 1.2 s against 11 s to apply its log, not tripped. A 62-minute soak with 12 restarts lost no acknowledged write and kept `raft.redb` under 4 MB.
+
 ## Questions still open (in plain words)
 
 | # | Question | Options | Our default |
 |---|---|---|---|
 | Q1 | Authentication and authorization | none; static token; mTLS once TLS lands | None in this ADR; a follow-up issue. |
-| Q2 | A configuration file for `serve` | flags and env only; TOML | Flags and env; TOML is a follow-up issue. |
-| Q3 | Changing a node's advertised address after the fact | restart with `--update-advertise`; re-join | A `--update-advertise` flag in stage F. |
+| Q2 | A configuration file for `serve` | flags and env only; TOML | Flags and env; TOML is a follow-up issue. **Settled in stage F:** `serve --config <file.toml>` (every flag a key; flags and env override the file; issue #106). |
+| Q3 | Changing a node's advertised address after the fact | restart with `--update-advertise`; re-join | A `--update-advertise` flag in stage F. **Settled in stage F:** `serve --update-advertise <host:port>` (`Admin.UpdateAdvertise`, `ChangeMembers::SetNodes`; issue #107). |
 | Q4 | Where snapshots go for backup | local file; object storage | Local file (`cluster snapshot --out`); object storage is a follow-up issue. |
 | Q5 | Lease-based reads instead of the read barrier | ReadIndex barrier; leader lease | ReadIndex (one round trip to a majority per linearizable read); leases only if measured to matter. |
 
@@ -236,7 +238,7 @@ Verified facts the design rests on (2026-09-28, from the code):
 | C | 22 | Membership and forwarding: `--join/--auto-promote/--standby`, `cluster add-learner/promote/remove/members/leader/transfer-leader`, guards, idempotent bootstrap/join, `WrongCluster`, server-side forwarding, `NoLeader` retry, extractor-hash gate. **Status: delivered in PR #118; the settled details are under D9.** | 8 |
 | D | 23 | Consistency and durability: `--read linearizable`, crash tests, a `cluster` CI job that kills the leader mid-batch. **Status: delivered in PR #119; the settled details are under D8.** | 5 |
 | E | 24 | Observability and packaging: tracing, `/metrics`, ready service, `health` command, Compose file and CI smoke, Kubernetes doc. **Status: delivered in PR #121: `--log-format`/`--log-level`, RPC and apply spans, `--metrics-listen` and `Admin.Metrics`, readiness with `--ready-max-lag`, `deploy/compose/` with the `compose` CI job, `deploy/kubernetes/` with `serve --node-id-from-hostname --bootstrap-or-join`, [docs/deploy/](../deploy/kubernetes.md).** | 5 |
-| F | 25 | Hardening: replication benchmarks, soak, `--update-advertise`, config file or issue. | 3 |
+| F | 25 | Hardening: replication benchmarks, soak, `--update-advertise`, config file or issue. **Status: delivered on branch stage-f (PR pending): benchmarks at the corpus and 10 M tokens and a 60-minute soak in [spikes/raft-replication.md](../spikes/raft-replication.md) ("Stage F at scale"), `scripts/cluster_soak.py` (weekly in the `cluster` workflow), `serve --update-advertise`, `serve --config`.** | 3 |
 
 Acceptance criteria per story are in the [epic](../epic-code-memory-graph.md#full-story-definitions).
 
@@ -254,3 +256,21 @@ Layers, as in `docs/testing.md`: **unit** = openraft's shipped `openraft::testin
 ## Follow-ups (filed as issues, 2026-09-28)
 
 TLS once a pure-Rust provider passes the gate (#104); authentication (#105); a TOML configuration file for `serve` (#106); `--update-advertise` (#107); per-(org, repo) sharding across the cluster, one Raft group per shard (#108); the MCP host inside `serve` (#109); snapshots to object storage (#110); lease-based linearizable reads (#111).
+
+## Delivered (stages A-F, 2026-09-28)
+
+What shipped against the decisions:
+
+- **D1:** the `.proto` contract `memory_graph.v1`, with checked-in code and a CI regen diff (`xtask`, `protox`, no `protoc`), and `protocol_version` in `Hello`. The measured RPC overhead is 0.2-1.6 ms p50 up to 10 M tokens. There is no TLS yet (#104).
+- **D2:** `RemoteStore: Store`, which passes `run_all`, `run_differential` and `run_crash_rerun_differential`. `index --server` sends raw bytes and the server parses them (stage A, PR #113).
+- **D3:** `--db` or `--server` (with `MEMORY_GRAPH_SERVER`), several endpoints (`a,b,c`), `--read local|linearizable`, `--write-deadline` and `--read-deadline`, and exit codes 3-6 (stages A, C, D).
+- **D4:** `serve` owns the file. The `LOCK` sidecar names the holder, and an embedded open retries, then names `serve` (stage A).
+- **D5:** openraft 0.9.25 (pinned) on one port, with 8 MiB `IndexChunk` entries and exactly-once apply through the `RAFT_SM` marker. The 50% trigger is not tripped (stages B and F).
+- **D6:** a data directory with `node.json`, `--bootstrap`, `--join`, `--restore`, `WrongCluster` and idempotent restarts (stages B and C). `--bootstrap-or-join` and `--node-id-from-hostname` cover StatefulSets (stage E). `--update-advertise` moves a member to a new address without a re-join, closing Q3 (stage F).
+- **D7:** acknowledgement after a majority fsync plus the leader's apply. Whole-file snapshots, purge with log compaction, and power-cut and kill tests (stages B and D). A 60-minute soak holds the log under 4 MB (stage F).
+- **D8:** `LOCAL` reads everywhere, with `stale_possible` in JSON output. `LINEARIZABLE` reads go through ReadIndex, forwarded from followers (with a history checker). Writes are forwarded from any node (stages C and D).
+- **D9:** learner warm-up, `--auto-promote` and `--standby`, the membership commands with their guards, the extractor-hash gate, and `transfer-leader` (stage C).
+- **D10:** `tracing` text and JSON logs, `/metrics` and `Admin.Metrics`, the health and `memory-graph.ready` services, `cluster status --json`, and the Compose and Kubernetes deployments (stage E).
+- **Q2:** `serve --config <file.toml>` (stage F, #106).
+- **Q3:** `--update-advertise` (stage F, #107).
+- **Still open:** Q1 authentication (#105), Q4 object storage (#110), Q5 lease reads (#111), TLS (#104), sharding (#108), and the MCP host (#109).
