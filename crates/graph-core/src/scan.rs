@@ -123,23 +123,30 @@ pub fn keyword_block(
 
 /// Index of the last token of the indented block headed by `tokens[header]`
 /// (layout languages: Python, GDScript, Haskell, F#). The header's indent is
-/// the start column of the first token on its line; the block runs through
-/// every later token until the first line whose first non-`skip` token
-/// starts at or left of that column. Tokens in `skip` (usually comments) never
-/// end a block, but trailing ones are not included. A one-line block (`def
-/// f(): pass`) ends on its header line. Columns count characters, so a tab
-/// is one column: mixed tab/space indentation is compared as written.
+/// the start column of the first token that starts on the header's line
+/// (so a multi-line token ending there does not count); the block runs
+/// through every later token until the first line whose first non-`skip`
+/// token starts at or left of that column. Line starts inside an open
+/// `(`, `[` or `{` (counted after the header, ignoring literals and
+/// comments) never end the block, so a header split over lines
+/// (`def f(\n  a,\n):`) and multi-line calls in the body stay inside. Tokens
+/// in `skip` (usually comments) never end a block, but trailing ones are not
+/// included. A one-line block (`def f(): pass`) ends on its header line.
+/// Columns count characters, so a tab is one column: mixed tab/space
+/// indentation is compared as written.
 pub fn indent_block(tokens: &[TokenDecl], header: usize, skip: &[TokenClass]) -> usize {
     let Some(h) = tokens.get(header) else {
         return header;
     };
-    let line_first = tokens[..header]
-        .iter()
-        .rposition(|t| t.span.end_line < h.span.start_line)
-        .map_or(0, |p| p + 1);
+    let line = h.span.start_line;
+    let mut line_first = header;
+    while line_first > 0 && tokens[line_first - 1].span.start_line == line {
+        line_first -= 1;
+    }
     let indent = tokens[line_first].span.start_col;
     let mut last = header;
     let mut prev_end_line = h.span.end_line;
+    let mut depth = 0usize;
     // Whether a non-skip token was already seen on the current line (the
     // header's line counts as seen).
     let mut line_open = true;
@@ -151,8 +158,15 @@ pub fn indent_block(tokens: &[TokenDecl], header: usize, skip: &[TokenClass]) ->
         if skip.contains(&t.class) {
             continue;
         }
-        if !line_open && t.span.start_col <= indent {
+        if !line_open && depth == 0 && t.span.start_col <= indent {
             break;
+        }
+        if !is_trivia(t) {
+            match t.text.as_str() {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
         }
         line_open = true;
         last = j;
@@ -397,6 +411,22 @@ mod tests {
         assert_eq!(t[indent_block(&t, 3, &skip)].text, "c");
         // Out of range.
         assert_eq!(indent_block(&t, 99, &skip), 99);
+        // Brackets: a split header and a multi-line call stay in the block.
+        let t = py("x = 0\ndef f(\n a,\n):\n body(1,\n2)\n tail\nnext");
+        let def = t.iter().position(|t| t.text == "def").unwrap();
+        assert_eq!(t[indent_block(&t, def, &skip)].text, "tail");
+        // A header after other tokens on its line (line_first > 0), where
+        // the previous line ends in a multi-line token.
+        let t = py("s = '''a\nb''' ; if c:\n  d\ne");
+        let hdr = t.iter().position(|t| t.text == "if").unwrap();
+        // Indent is `;`'s column 6 (the first token starting on that line,
+        // not the literal's column 5), so `d` at column 3 is outside.
+        assert_eq!(t[indent_block(&t, hdr, &skip)].text, ":");
+        let t = py("s = '''a\nb''' ; if c:\n       d\ne");
+        assert_eq!(t[indent_block(&t, hdr, &skip)].text, "d");
+        let t = py("a\n  if c:\n    d\n  e");
+        let hdr = t.iter().position(|t| t.text == "if").unwrap();
+        assert_eq!(t[indent_block(&t, hdr, &skip)].text, "d");
     }
 
     #[test]

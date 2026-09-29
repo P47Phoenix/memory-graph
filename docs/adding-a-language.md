@@ -65,7 +65,12 @@ spans; the store validates this.
 
 Every switch is off by default; write a dialect as
 `TokenizerOptions { flag: true, ..TokenizerOptions::DEFAULT }` (`DEFAULT`
-equals `default()` but works in `const` items). The switches:
+equals `default()` but works in `const` items). Always end a dialect with
+`..TokenizerOptions::DEFAULT` rather than listing every field: new switches
+are added over time (the struct is deliberately not `#[non_exhaustive]`,
+which would forbid that struct-update syntax outside `graph-core`), and a
+dialect written that way keeps compiling with the new switch off. The
+switches:
 
 | Flag | Effect |
 |---|---|
@@ -77,14 +82,17 @@ equals `default()` but works in `const` items). The switches:
 | `no_line_slash_comments` / `no_block_slash_comments` | `//` / `/* */` are not comments (Python `//`, shell `/tmp/*`) |
 | `hash_comments` | `#` to end of line; with `shell_words` only at a word start |
 | `hash_comments_line_start_only` | ...and only as the first token on a line (ARM `#1` immediates stay code) |
-| `dash_comments` | `--` to end of line (SQL, Haskell) |
+| `dash_comments` | `--` to end of line (SQL); with `haskell_block_comments`, only when no symbol character touches the dash run (`-->`, `--|`, `|--` are operators) |
 | `haskell_block_comments` | nested `{- ... -}` |
+| `prime_idents` | `'` continues an identifier (`foldl'`, `x'`), Haskell and F# |
 | `ml_block_comments` | nested `(* ... *)`; `(*)` stays an operator |
 | `semicolon_comments` | `;` to end of line (NASM, MASM) |
-| `triple_quote_strings` | `"""..."""` / `'''...'''` one Literal, spanning lines |
+| `triple_quote_strings` | `"""..."""` / `'''...'''` one Literal, spanning lines, backslash escapes |
+| `triple_quote_raw` | ...with no backslash escapes (Scala, F#) |
+| `doubled_single_quotes` | `'it''s'` one Literal, no backslash escapes, one line (COBOL, RPG, NASM/MASM) |
 | `raw_backtick_strings` | `` `...` `` one Literal, no escapes, spanning lines (Go) |
 | `sql_strings` | `'it''s'` Literal; `"name"` and `[name]` Identifier tokens |
-| `shell_words` | `$x`, `$1`, `${...}` one Identifier; raw `'...'`; heredoc `<<EOF` / `<<-EOF` / `<<'EOF'` marker one Operator and body one Literal |
+| `shell_words` | `$x`, `$1`, `${...}` one Identifier; raw `'...'`; ANSI-C `$'...'` one Literal; heredoc `<<EOF` / `<<-EOF` / `<<'EOF'` / `<<\EOF` marker one Operator and body one Literal (not inside arithmetic `((...))`) |
 | `hyphen_idents` | `-` joins a name before a letter/digit/`_` (`WORKING-STORAGE`, `dcl-proc`) |
 | `fixed_columns: Option<FixedLayout>` | `Cobol` (cols 1-6 sequence and 73+ are Comments, `*`/`/` in col 7 is a comment line, `*>` inline comments) or `Rpg` (cols 1-5 sequence, col 6 form type its own token, `*` in col 7 comment line, 81+ Comment; a first line `**FREE` turns column handling off) |
 
@@ -95,6 +103,12 @@ Ready-made dialects are associated consts: `DEFAULT`, `RUST`, `CSHARP`,
 combinations). Any change to tokens for an existing input needs a
 `TOKENIZER_VERSION` bump; new flags are pinned by `DIALECT_GOLDENS` /
 `LANG_GOLDENS` and the exact-span proptests in `tokenizer.rs`.
+
+`ASM` limits: `;` always starts a comment (GNU as uses it as a statement
+separator on some targets); `#` is a comment only as the first token on a
+line, so an AT&T trailing `# comment` after code is missed; ARM32 `@`
+comments are not recognised (MASM uses `@@:` labels at line start, so a
+line-start `@` rule would be wrong there).
 
 ### Scanner helpers (`graph_core::scan`)
 
@@ -115,7 +129,9 @@ generators such as tree-sitter: the pure-Rust gate forbids them).
   comments and literals, `None` on a mismatch or no close.
 - `indent_block(tokens, header, skip)` — for layout languages, the last
   token of the block headed by `tokens[header]`: everything on later lines
-  indented deeper than the header's line (tokens in `skip` never end it).
+  indented deeper than the header's line (tokens in `skip` never end it, nor
+  do line starts inside open brackets, so split headers and multi-line calls
+  stay in the block).
 - `line_iter(tokens)` — `(line, index range)` for each run of tokens
   starting on the same line.
 

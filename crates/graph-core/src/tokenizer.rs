@@ -110,7 +110,10 @@ pub struct TokenizerOptions {
     /// Restricts `hash_comments` to a `#` that is the first token on its
     /// line, so ARM immediates (`mov r0, #1`) are not comments.
     pub hash_comments_line_start_only: bool,
-    /// `--` starts a Comment to the end of the line (SQL, Haskell).
+    /// `--` starts a Comment to the end of the line (SQL, Haskell). With
+    /// `haskell_block_comments` the Haskell rule applies: a run of two or
+    /// more dashes is a comment only when neither preceded nor followed by
+    /// another symbol character, so `-->`, `--|` and `|--` are operators.
     pub dash_comments: bool,
     /// `{- ... -}` is a Comment, nesting (Haskell; pragmas `{-# ... #-}`
     /// included). Unterminated runs to end of input.
@@ -121,8 +124,19 @@ pub struct TokenizerOptions {
     /// `;` starts a Comment to the end of the line (NASM, MASM, Lisp).
     pub semicolon_comments: bool,
     /// `"""..."""` and `'''...'''` are one Literal each, spanning lines,
-    /// with backslash escapes (Python, Scala, Elixir, Java text blocks, F#).
+    /// with backslash escapes (Python, Elixir, Java text blocks, GDScript).
     pub triple_quote_strings: bool,
+    /// Makes `triple_quote_strings` raw: no backslash escapes, the first
+    /// closing triple quote ends the literal (Scala, F#).
+    pub triple_quote_raw: bool,
+    /// `'...'` is a Literal where `''` is an escaped quote, with no
+    /// backslash escapes, on one line (an unterminated one stops at the line
+    /// end): COBOL, RPG, NASM/MASM.
+    pub doubled_single_quotes: bool,
+    /// An identifier may contain `'` after its first character (Haskell and
+    /// F# primes: `foldl'`, `x'`), so a `'` right after an identifier is
+    /// never a char literal.
+    pub prime_idents: bool,
     /// `` `...` `` is one Literal with no escapes, spanning lines (Go raw
     /// strings, R quoted names). Unterminated runs to end of input.
     pub raw_backtick_strings: bool,
@@ -135,12 +149,14 @@ pub struct TokenizerOptions {
     /// `${...}` (braces nest, one line) are single Identifier tokens (`$(`
     /// stays `$` then `(`, so command substitutions balance as parentheses);
     /// `'...'` is a Literal with no escapes that may span lines (an
-    /// unterminated one stops at its line end); a heredoc marker `<<WORD`,
+    /// unterminated one stops at its line end); ANSI-C `$'...'` is one
+    /// Literal with backslash escapes; a heredoc marker `<<WORD`,
     /// `<<-WORD`, `<<'WORD'` or `<<"WORD"` is one Operator token, and its
     /// body, from the next line through the terminating `WORD` line (leading
     /// tabs ignored for `<<-`), is one Literal token (leading whitespace
-    /// excluded). `<<<` is a here-string, not a heredoc; an unquoted
-    /// delimiter must start with a letter or `_`.
+    /// excluded). `<<<` is a here-string, not a heredoc, and `<<` inside
+    /// arithmetic `((...))` / `$((...))` is a shift; an unquoted delimiter
+    /// (optionally `\`-escaped) must start with a letter or `_`.
     pub shell_words: bool,
     /// `-` joins an identifier when directly followed by a letter, digit or
     /// `_` (COBOL `WORKING-STORAGE`, RPG `dcl-proc`). Note `a-b` is then one
@@ -169,6 +185,9 @@ impl TokenizerOptions {
         ml_block_comments: false,
         semicolon_comments: false,
         triple_quote_strings: false,
+        triple_quote_raw: false,
+        doubled_single_quotes: false,
+        prime_idents: false,
         raw_backtick_strings: false,
         sql_strings: false,
         shell_words: false,
@@ -219,9 +238,10 @@ impl TokenizerOptions {
         raw_backtick_strings: true,
         ..Self::DEFAULT
     };
-    /// Scala: `"""..."""` strings.
+    /// Scala: raw `"""..."""` strings.
     pub const SCALA: Self = Self {
         triple_quote_strings: true,
+        triple_quote_raw: true,
         ..Self::DEFAULT
     };
     /// Python: `#` comments, `'...'` and triple-quoted strings, `//` is an
@@ -260,19 +280,23 @@ impl TokenizerOptions {
         sql_strings: true,
         ..Self::DEFAULT
     };
-    /// Haskell: `--` and nested `{- -}` comments.
+    /// Haskell: `--` (Haskell rule) and nested `{- -}` comments, primes.
     pub const HASKELL: Self = Self {
+        prime_idents: true,
         no_line_slash_comments: true,
         no_block_slash_comments: true,
         dash_comments: true,
         haskell_block_comments: true,
         ..Self::DEFAULT
     };
-    /// F#: `//` and nested `(* *)` comments, triple-quoted strings.
+    /// F#: `//` and nested `(* *)` comments, raw triple-quoted strings,
+    /// primes.
     pub const FSHARP: Self = Self {
         no_block_slash_comments: true,
         ml_block_comments: true,
         triple_quote_strings: true,
+        triple_quote_raw: true,
+        prime_idents: true,
         ..Self::DEFAULT
     };
     /// Elixir: `#` comments, `'...'` charlists, `"""` heredocs.
@@ -286,10 +310,13 @@ impl TokenizerOptions {
     };
     /// Assembly (NASM, MASM, GNU as; x86 and ARM): `;` comments, `#`
     /// comments only at line start (ARM `#1` immediates stay code), `//`
-    /// and `/* */` comments, `'...'` strings. GNU as uses `;` as a statement
-    /// separator on some targets; here it always starts a comment.
+    /// and `/* */` comments, `'...'` strings with `''` escapes. Known
+    /// limits: `;` always starts a comment (GNU as uses it as a statement
+    /// separator on some targets); a trailing AT&T `# comment` after code is
+    /// not a comment; ARM32 `@` comments are not recognised (`@` stays an
+    /// operator, since MASM uses `@@:` labels at line start).
     pub const ASM: Self = Self {
-        single_quote_strings: true,
+        doubled_single_quotes: true,
         hash_comments: true,
         hash_comments_line_start_only: true,
         semicolon_comments: true,
@@ -297,7 +324,7 @@ impl TokenizerOptions {
     };
     /// COBOL reference format (fixed columns, hyphenated names).
     pub const COBOL: Self = Self {
-        single_quote_strings: true,
+        doubled_single_quotes: true,
         no_line_slash_comments: true,
         no_block_slash_comments: true,
         hyphen_idents: true,
@@ -307,7 +334,7 @@ impl TokenizerOptions {
     /// RPG IV: fixed form unless the file starts with `**FREE`; `//`
     /// comments, hyphenated names (`dcl-proc`).
     pub const RPG: Self = Self {
-        single_quote_strings: true,
+        doubled_single_quotes: true,
         no_block_slash_comments: true,
         hyphen_idents: true,
         fixed_columns: Some(FixedLayout::Rpg),
@@ -337,6 +364,7 @@ pub fn tokenize_with(src: &str, opts: TokenizerOptions) -> Vec<TokenDecl> {
         col: 1,
         m: MarkupState::default(),
         heredocs: Vec::new(),
+        parens: Vec::new(),
     };
     match opts.fixed_columns {
         Some(FixedLayout::Rpg) if is_free_rpg(src) => lx.run(src.len()),
@@ -368,6 +396,8 @@ struct Lexer<'a> {
     m: MarkupState,
     /// Heredoc bodies awaiting the next newline: (delimiter, strip tabs).
     heredocs: Vec<(String, bool)>,
+    /// `shell_words`: open parentheses, true when inside arithmetic `((`.
+    parens: Vec<bool>,
 }
 
 impl Lexer<'_> {
@@ -509,7 +539,7 @@ impl Lexer<'_> {
                 )
             } else if hash
                 || (opts.fixed_columns == Some(FixedLayout::Cobol) && rest.starts_with("*>"))
-                || (opts.dash_comments && rest.starts_with("--"))
+                || (opts.dash_comments && self.dash_comment_at(rest))
                 || (opts.semicolon_comments && c == ';')
             {
                 // A comment to the end of the line.
@@ -538,13 +568,17 @@ impl Lexer<'_> {
                 .flatten()
             {
                 (n, TokenClass::Identifier)
-            } else if let Some((n, delim, strip)) =
-                (opts.shell_words && c == '<' && !src[..i].ends_with('<'))
-                    .then(|| heredoc_marker(rest))
-                    .flatten()
+            } else if let Some((n, delim, strip)) = (opts.shell_words
+                && c == '<'
+                && !src[..i].ends_with('<')
+                && !self.parens.last().copied().unwrap_or(false))
+            .then(|| heredoc_marker(rest))
+            .flatten()
             {
                 self.heredocs.push((delim, strip));
                 (n, TokenClass::Operator)
+            } else if opts.shell_words && rest.starts_with("$'") {
+                (1 + quoted_len(&rest[1..], '\''), TokenClass::Literal)
             } else if opts.shell_words && c == '\'' && !markup {
                 let n = rest[1..]
                     .find('\'')
@@ -552,7 +586,7 @@ impl Lexer<'_> {
                 (n, TokenClass::Literal)
             } else if let Some(n) = opts
                 .triple_quote_strings
-                .then(|| triple_quoted_len(rest))
+                .then(|| triple_quoted_len(rest, opts.triple_quote_raw))
                 .flatten()
             {
                 (n, TokenClass::Literal)
@@ -583,7 +617,7 @@ impl Lexer<'_> {
                 (n, TokenClass::Literal)
             } else if c.is_alphabetic() || c == '_' {
                 (
-                    ident_len(rest, markup && m.tag, opts.hyphen_idents),
+                    ident_len(rest, markup && m.tag, opts.hyphen_idents, opts.prime_idents),
                     TokenClass::Identifier,
                 )
             } else if c.is_ascii_digit() {
@@ -606,6 +640,8 @@ impl Lexer<'_> {
                 } else {
                     (1, TokenClass::Punctuation)
                 }
+            } else if c == '\'' && opts.doubled_single_quotes {
+                (doubled_len(&rest[..line_len(rest)]), TokenClass::Literal)
             } else if c == '\'' && opts.single_quote_strings {
                 (single_quoted_len(rest), TokenClass::Literal)
             } else if c == '"' || c == '`' || (c == '\'' && is_char_literal(rest)) {
@@ -632,8 +668,35 @@ impl Lexer<'_> {
                 }
             }
             self.m = m;
+            if opts.shell_words && len == 1 {
+                match c {
+                    '(' => {
+                        let arith = rest.starts_with("((") || self.parens.last() == Some(&true);
+                        self.parens.push(arith);
+                    }
+                    ')' => {
+                        self.parens.pop();
+                    }
+                    _ => {}
+                }
+            }
             self.push(i + len, class);
         }
+    }
+
+    /// Whether `rest` (at `i`) starts a `--` comment under `dash_comments`.
+    fn dash_comment_at(&self, rest: &str) -> bool {
+        if !rest.starts_with("--") {
+            return false;
+        }
+        if !self.opts.haskell_block_comments {
+            return true;
+        }
+        const SYMBOLS: &str = "!#$%&*+./<=>?@\\^|-~:";
+        let dashes = rest.len() - rest.trim_start_matches('-').len();
+        let after = rest[dashes..].chars().next();
+        let before = self.src[..self.i].chars().next_back();
+        !after.is_some_and(|c| SYMBOLS.contains(c)) && !before.is_some_and(|c| SYMBOLS.contains(c))
     }
 
     /// Whether a `#` at `i` starts a comment under `hash_comments`.
@@ -724,7 +787,7 @@ fn nested_len(rest: &str, open: &str, close: &str) -> usize {
 }
 
 /// `"""..."""` or `'''...'''` with backslash escapes, if `rest` starts with one.
-fn triple_quoted_len(rest: &str) -> Option<usize> {
+fn triple_quoted_len(rest: &str, raw: bool) -> Option<usize> {
     let q = ["\"\"\"", "'''"]
         .into_iter()
         .find(|q| rest.starts_with(q))?;
@@ -732,7 +795,7 @@ fn triple_quoted_len(rest: &str) -> Option<usize> {
     for (p, ch) in rest.char_indices().skip(3) {
         if esc {
             esc = false;
-        } else if ch == '\\' {
+        } else if ch == '\\' && !raw {
             esc = true;
         } else if rest[p..].starts_with(q) {
             return Some(p + 3);
@@ -837,8 +900,8 @@ fn heredoc_marker(rest: &str) -> Option<(usize, String, bool)> {
 /// Length of an identifier at the start of `rest`. In markup, `-` and `:`
 /// continue it when followed by a letter, digit or `_` (`data-id`, `asp:Button`);
 /// with `hyphen`, `-` does.
-fn ident_len(rest: &str, markup: bool, hyphen: bool) -> usize {
-    let word = |ch: char| ch.is_alphanumeric() || ch == '_';
+fn ident_len(rest: &str, markup: bool, hyphen: bool, prime: bool) -> usize {
+    let word = |ch: char| ch.is_alphanumeric() || ch == '_' || (prime && ch == '\'');
     let mut it = rest.char_indices().peekable();
     while let Some((p, ch)) = it.next() {
         if word(ch) {
@@ -1159,6 +1222,16 @@ mod tests {
             "sql_strings" => o.sql_strings = true,
             "shell_words" => o.shell_words = true,
             "hyphen_idents" => o.hyphen_idents = true,
+            "triple_quote_raw" => {
+                o.triple_quote_strings = true;
+                o.triple_quote_raw = true;
+            }
+            "doubled_single_quotes" => o.doubled_single_quotes = true,
+            "prime_idents" => o.prime_idents = true,
+            "haskell_dashes" => {
+                o.dash_comments = true;
+                o.haskell_block_comments = true;
+            }
             "fixed_cobol" => o.fixed_columns = Some(FixedLayout::Cobol),
             "fixed_rpg" => o.fixed_columns = Some(FixedLayout::Rpg),
             "PYTHON" => o = TokenizerOptions::PYTHON,
@@ -1182,33 +1255,37 @@ mod tests {
     /// One golden per new flag and named dialect over `DIALECT_SOURCES`
     /// plus `LANG_SOURCES` (kept apart so `DIALECT_GOLDENS` stays as it was).
     const LANG_GOLDENS: &[(&str, u64)] = &[
-        ("no_slash_comments", 0xcc7b4546d409e443),
-        ("hash_comments", 0xd1afd932cc9dd541),
-        ("hash_comments_line_start_only", 0x7610ecf473e4a5d3),
-        ("dash_comments", 0x664ea1c737191e22),
-        ("haskell_block_comments", 0x653393054d57b814),
-        ("ml_block_comments", 0x345ca59b1d03ef73),
-        ("semicolon_comments", 0x11f1024ac5cb779e),
-        ("triple_quote_strings", 0x83f4cc51f107bf30),
-        ("raw_backtick_strings", 0x5ab58201c627f620),
-        ("sql_strings", 0x5c595002e153cd58),
-        ("shell_words", 0x7db5b8dd307e6e3e),
-        ("hyphen_idents", 0xd76c23bf671374a),
-        ("fixed_cobol", 0xc1b796ed1fd62a67),
-        ("fixed_rpg", 0xab3f9e94906d514a),
-        ("PYTHON", 0x2912be6846ae1c2a),
-        ("SHELL", 0x3a0e79c8327a9996),
-        ("SQL", 0x6b4ea432b54f9df0),
-        ("HASKELL", 0x7052e364980a7a67),
-        ("FSHARP", 0xef19ab0825bfe124),
-        ("ASM", 0x57c78586f5e35d8e),
-        ("COBOL", 0x676cb6da098e5a90),
-        ("RPG", 0x6b4ceaf443dbb400),
-        ("GO", 0x5ab58201c627f620),
-        ("SCALA", 0x83f4cc51f107bf30),
-        ("JAVA", 0x83f4cc51f107bf30),
-        ("ELIXIR", 0x2912be6846ae1c2a),
-        ("R", 0xc30aef89e08e88b2),
+        ("no_slash_comments", 0xc081f4ffcb4f1e9e),
+        ("hash_comments", 0xb7edae0e1c879f50),
+        ("hash_comments_line_start_only", 0x5e178ed4279298ce),
+        ("dash_comments", 0xaacfa7dafaab54dc),
+        ("haskell_block_comments", 0x6a13323b4f9395f5),
+        ("ml_block_comments", 0xe9431c94af1b6cae),
+        ("semicolon_comments", 0xdfc41c99186c0853),
+        ("triple_quote_strings", 0x701a5e21713678e3),
+        ("raw_backtick_strings", 0xe892b7f535bc8f01),
+        ("sql_strings", 0x5344ea80475f30c5),
+        ("shell_words", 0x7a04de4ac97c4f40),
+        ("triple_quote_raw", 0x7de27b9f0b907695),
+        ("doubled_single_quotes", 0x9cf41e9ae363977b),
+        ("prime_idents", 0x9869e64012232154),
+        ("haskell_dashes", 0xcf2d98975a2e4bca),
+        ("hyphen_idents", 0xcc2fb60810b3912f),
+        ("fixed_cobol", 0x2320cbe948c5c2df),
+        ("fixed_rpg", 0xa4b95ac258618d66),
+        ("PYTHON", 0x186548073abbdec0),
+        ("SHELL", 0x722243900ce93348),
+        ("SQL", 0xcf34462a8425d99d),
+        ("HASKELL", 0xc63b1d790c2884d6),
+        ("FSHARP", 0x9985481f3cf3cc21),
+        ("ASM", 0xef2217eae3f3ece6),
+        ("COBOL", 0x9312a3956c379811),
+        ("RPG", 0x9115ed893962f08b),
+        ("GO", 0xe892b7f535bc8f01),
+        ("SCALA", 0x7de27b9f0b907695),
+        ("JAVA", 0x701a5e21713678e3),
+        ("ELIXIR", 0x186548073abbdec0),
+        ("R", 0xed04254ba06a584a),
     ];
 
     const LANG_SOURCES: &[&str] = &[
@@ -1220,6 +1297,7 @@ mod tests {
         "000100 IDENTIFICATION DIVISION.                                         SEQ00001\n000200* comment line\n000300 01 WS-COUNT PIC 9. *> inline\n      - 'cont'\n      /page\r\nshort\n",
         "     H DFTACTGRP(*NO)\n     D name            S             10A\n     C* comment\n      dcl-proc foo; // c\n     C                   EVAL      X = 1                                     cmt\n",
         "**free\ndcl-s x int(10); // ok\n     C* not a comment here\n",
+        "f' 'a' x' = y' -- c\na --> b |-- c --| d --- e\n\"\"\"r\\\"\"\" 'it''s' $'a\\'b' $((1<<2)) cat <<\\EOF\nx\nEOF\n",
     ];
 
     #[test]
@@ -1368,6 +1446,122 @@ mod tests {
         // Here-strings and arithmetic shifts are not heredocs.
         assert_eq!(dtexts("SHELL", "a <<< s")[1..4], ["<", "<", "<"]);
         assert_eq!(dtexts("SHELL", "$((1<<2))")[4..7], ["<", "<", "2"]);
+    }
+
+    #[test]
+    fn shell_arithmetic_and_ansi_c() {
+        use TokenClass::*;
+        // `<<` inside arithmetic is a shift, with or without spaces.
+        let t = dtexts("SHELL", "echo $((a << b)) ((x<<=1))\ny");
+        assert!(!t.iter().any(|s| s.starts_with("<<")), "{t:?}");
+        assert_eq!(t.last().unwrap(), "y");
+        // After the arithmetic closes, heredocs work again.
+        let t = dtexts("SHELL", "$(( (1) )) cat <<E\nb\nE");
+        assert_eq!(t[t.len() - 2..], ["<<E", "b\nE"]);
+        // `$(` command substitution is not arithmetic.
+        let t = dtexts("SHELL", "x=$(cat <<E\nb\nE\n)");
+        assert!(t.contains(&"b\nE".to_string()), "{t:?}");
+        // ANSI-C quoting with backslash escapes.
+        let t = dtoks("SHELL", r"echo $'it\'s' x");
+        assert_eq!(t[1], (r"$'it\'s'".to_string(), Literal));
+        assert_eq!(t[2].0, "x");
+        // Escaped heredoc delimiter.
+        let t = dtoks("SHELL", "cat <<\\EOF\n$x\nEOF\nz");
+        assert_eq!(t[1], ("<<\\EOF".to_string(), Operator));
+        assert_eq!(t[2], ("$x\nEOF".to_string(), Literal));
+        assert_eq!(t[3].0, "z");
+    }
+
+    #[test]
+    fn raw_triple_quotes() {
+        use TokenClass::*;
+        let src = "\"\"\"a\\\"\"\" b";
+        // Raw (Scala, F#): the backslash does not escape.
+        for d in ["SCALA", "FSHARP"] {
+            let t = dtoks(d, src);
+            assert_eq!(t[0], ("\"\"\"a\\\"\"\"".to_string(), Literal), "{d}");
+            assert_eq!(t[1].0, "b", "{d}");
+        }
+        // Escaping (Python, Java, Elixir, GDScript).
+        for d in ["PYTHON", "JAVA", "ELIXIR"] {
+            assert_eq!(dtoks(d, src).len(), 1, "{d}");
+        }
+        assert_eq!(TokenizerOptions::GDSCRIPT, TokenizerOptions::PYTHON);
+    }
+
+    #[test]
+    fn doubled_single_quotes_dialect() {
+        use TokenClass::*;
+        for d in ["ASM", "doubled_single_quotes"] {
+            let t = dtoks(d, r"'it''s' 'a\' 'open");
+            assert_eq!(t[0], ("'it''s'".to_string(), Literal), "{d}");
+            assert_eq!(t[1], (r"'a\'".to_string(), Literal), "{d}");
+            assert_eq!(t[2], ("'open".to_string(), Literal), "{d}");
+        }
+        // One line only.
+        assert_eq!(dtexts("ASM", "'a\nb'"), ["'a", "b", "'"]);
+        let rpg = dtoks("RPG", "**FREE\nx = 'it''s';");
+        assert!(rpg.contains(&("'it''s'".to_string(), Literal)));
+        let cob = dtoks("COBOL", "       DISPLAY 'it''s'.");
+        assert!(cob.contains(&("'it''s'".to_string(), Literal)));
+    }
+
+    #[test]
+    fn haskell_dash_rule() {
+        use TokenClass::*;
+        let t = dtoks("HASKELL", "a --> b |-- c --| d --- e\nf -- g");
+        let texts: Vec<&str> = t.iter().map(|t| t.0.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "a", "-", "-", ">", "b", "|", "-", "-", "c", "-", "-", "|", "d", "--- e", "f",
+                "-- g"
+            ]
+        );
+        assert_eq!(t[13].1, Comment);
+        // SQL is unchanged: any `--` is a comment.
+        assert_eq!(dtoks("SQL", "a -->b")[1], ("-->b".to_string(), Comment));
+    }
+
+    #[test]
+    fn prime_identifiers() {
+        use TokenClass::*;
+        for d in ["HASKELL", "FSHARP"] {
+            let t = dtoks(d, "f' 'a' x' = y'");
+            assert_eq!(
+                t,
+                [
+                    ("f'".to_string(), Identifier),
+                    ("'a'".to_string(), Literal),
+                    ("x'".to_string(), Identifier),
+                    ("=".to_string(), Operator),
+                    ("y'".to_string(), Identifier),
+                ],
+                "{d}"
+            );
+            assert_eq!(dtexts(d, "foldl' f 'a'"), ["foldl'", "f", "'a'"], "{d}");
+        }
+        // Default: the prime is separate.
+        assert_eq!(texts("x' "), ["x", "'"]);
+    }
+
+    #[test]
+    fn sql_bracket_rejects_nested() {
+        use TokenClass::*;
+        let t = dtoks("SQL", "[a[b] [ok]");
+        assert_eq!(t[0], ("[".to_string(), Punctuation));
+        assert!(t.contains(&("[ok]".to_string(), Identifier)));
+    }
+
+    #[test]
+    fn cobol_columns_after_bom() {
+        use TokenClass::*;
+        let t = dtoks("COBOL", "\u{feff}000100* comment\n000200 MOVE A TO B.");
+        assert_eq!(t[0], ("000100".to_string(), Comment));
+        assert_eq!(t[0].1, Comment);
+        assert_eq!(t[1], ("* comment".to_string(), Comment));
+        assert_eq!(t[3], ("MOVE".to_string(), Identifier));
+        assert_eq!(t[3].0, "MOVE");
     }
 
     #[test]
@@ -1822,6 +2016,14 @@ mod tests {
         // Every flag at once, with each layout.
         for fixed in [None, Some(FixedLayout::Cobol), Some(FixedLayout::Rpg)] {
             check_spans_with(src, all_flags(fixed))?;
+            check_spans_with(
+                src,
+                TokenizerOptions {
+                    triple_quote_raw: true,
+                    doubled_single_quotes: true,
+                    ..all_flags(fixed)
+                },
+            )?;
         }
         Ok(())
     }
@@ -1843,6 +2045,9 @@ mod tests {
             ml_block_comments: true,
             semicolon_comments: true,
             triple_quote_strings: true,
+            triple_quote_raw: false,
+            doubled_single_quotes: false,
+            prime_idents: true,
             raw_backtick_strings: true,
             sql_strings: true,
             shell_words: true,
