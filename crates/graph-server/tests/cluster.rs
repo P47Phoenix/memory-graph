@@ -1040,7 +1040,29 @@ fn a_growing_log_joins_the_slow_transfer_instead_of_overlapping_it() {
         c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
         written += 1;
     }
-    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    // #117: after the PartialSuccess openraft must send the remainder to
+    // the real follower (a debug build also runs openraft's
+    // debug_assert_partial_success on the answer). The leader's own view of
+    // node 3's matched index reaches its last entry, and node 3 has it all.
+    let last = tb.leader_last_log_index();
+    tb.wait_applied(last, CLUSTER_WAIT);
+    let deadline = std::time::Instant::now() + CLUSTER_WAIT;
+    loop {
+        let matched = l
+            .metrics()
+            .replication
+            .as_ref()
+            .and_then(|r| r.get(&3).cloned().flatten())
+            .map(|id| id.index);
+        if matched >= Some(last) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "leader never saw node 3 match {last}: {matched:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert_eq!(tb.client(3).count_nodes(NodeKind::File).unwrap(), written);
     assert_eq!(l.metrics().current_term, term, "no election");
     assert!(l.net_stats.joined_transfers() >= l.net_stats.partial_joins());
