@@ -414,6 +414,51 @@ fn every_parsed_token_is_stored() {
     for k in ["directive", "control", "binding"] {
         assert!(kinds.contains(k), "no aspx {k} symbol: {kinds:?}");
     }
+    // F#, Haskell, Elixir and GDScript: one declaration each, with its kind
+    // and nesting, on real code.
+    for (lang, name, lang_kind, qualified) in [
+        (
+            "fsharp",
+            "IArgParserTemplate",
+            "interface",
+            "Argu::IArgParserTemplate",
+        ),
+        (
+            "haskell",
+            "rangeParse",
+            "function",
+            "PostgREST.RangeQuery::rangeParse",
+        ),
+        (
+            "elixir",
+            "NimbleOptions.Docs",
+            "defmodule",
+            "NimbleOptions.Docs",
+        ),
+        ("gdscript", "destroy", "func", "Enemy::destroy"),
+    ] {
+        let mut q = graph_store::SymbolQuery::new(name);
+        q.language = Some(lang.into());
+        let hits = store.search_symbols(&q).unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.lang_kind.as_deref() == Some(lang_kind) && h.qualified == qualified),
+            "{lang} {name}: {hits:?}"
+        );
+    }
+    // Elixir functions nest in their module (a Type, for the class grain).
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("elixir".into());
+    q.kind = Some("method".into());
+    let methods = store.search_symbols(&q).unwrap();
+    assert!(
+        methods.len() > 50
+            && methods
+                .iter()
+                .all(|h| h.qualified.starts_with("NimbleOptions")),
+        "{} Elixir methods",
+        methods.len()
+    );
     // Cross-repo, cross-language search works on real code.
     let hits = store.search(&Query::new("ITransport")).unwrap();
     let repos: BTreeSet<_> = hits.iter().filter_map(|h| h.repo.clone()).collect();
@@ -531,8 +576,8 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 /// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
-    const EXPECTED_FILES: usize = 623;
-    const EXPECTED_HASH: u64 = 9382767952147431474;
+    const EXPECTED_FILES: usize = 648;
+    const EXPECTED_HASH: u64 = 2962854437681706518;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());

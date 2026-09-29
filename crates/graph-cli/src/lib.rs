@@ -39,6 +39,14 @@ pub fn shipped_extractors() -> Vec<Box<dyn graph_core::Extractor>> {
     v.push(Box::new(graph_lang_shell::ShellExtractor));
     #[cfg(feature = "lang-r")]
     v.push(Box::new(graph_lang_r::RExtractor));
+    #[cfg(feature = "lang-fsharp")]
+    v.push(Box::new(graph_lang_fsharp::FSharpExtractor));
+    #[cfg(feature = "lang-haskell")]
+    v.push(Box::new(graph_lang_haskell::HaskellExtractor));
+    #[cfg(feature = "lang-elixir")]
+    v.push(Box::new(graph_lang_elixir::ElixirExtractor));
+    #[cfg(feature = "lang-gdscript")]
+    v.push(Box::new(graph_lang_gdscript::GdscriptExtractor));
     v
 }
 
