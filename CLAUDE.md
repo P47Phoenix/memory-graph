@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A pure-Rust, embedded graph database for source code: org → repo → file → symbol → token, stored in a single [redb](https://github.com/cberner/redb) file. It is language-agnostic by design — the schema, storage and query layers know nothing about any specific language. Every language gets exact-span tokens from a generic fallback tokenizer; languages with an extractor (Rust via `syn`; C#, JavaScript, ASP.NET markup and HTML via token-stream scanners) additionally get symbols (functions, types, methods, ...). See `README.md` for the CLI walkthrough and `docs/epic-code-memory-graph.md` / `docs/adr/` for the design rationale.
+A pure-Rust, embedded graph database for source code: org → repo → file → symbol → token, stored in a single [redb](https://github.com/cberner/redb) file. It is language-agnostic by design — the schema, storage and query layers know nothing about any specific language. Every language gets exact-span tokens from a generic fallback tokenizer; languages with an extractor (Rust via `syn`; C#, JavaScript, ASP.NET markup, HTML, C, C++, Go and Scala via token-stream scanners) additionally get symbols (functions, types, methods, ...). See `README.md` for the CLI walkthrough and `docs/epic-code-memory-graph.md` / `docs/adr/` for the design rationale.
 
 ## Commands
 
