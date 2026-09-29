@@ -2,7 +2,7 @@
 
 An embedded graph database for source code. It indexes one or more repositories into a single file and answers questions such as "where is the token `Node` used?" or "which methods start with `parse`?" with exact byte, line and column spans.
 
-- **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor (Rust, C#, JavaScript, HTML, ASP.NET markup, SQL, shell, R, F#, Haskell, Elixir, GDScript) additionally get symbols: functions, types, methods and so on.
+- **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor (Rust, C#, JavaScript, HTML, ASP.NET markup, SQL, shell, R, F#, Haskell, Elixir, GDScript, C, C++, Go, Scala) additionally get symbols: functions, types, methods and so on.
 - **One file, optionally served.** The database is a single [redb](https://github.com/cberner/redb) file, about 8-10x the size of the indexed source. Opened in-process by default; `memory-graph serve` shares it with other processes, machines and containers over gRPC ([Server mode](#server-mode)).
 - **Pure Rust.** No C dependencies (enforced in CI), so it builds anywhere Rust does and ships as a 7 MB static container image.
 - **Incremental.** Unchanged files are skipped on re-index; deleted files can be pruned.
@@ -424,8 +424,12 @@ Languages are detected per file from the extension, the filename (`Makefile`) or
 | Haskell | `hs`, `lhs` | layout scanner: module, data/newtype/type/class/instance, functions (signature and equations grouped); literate bird-track and `\begin{code}` |
 | Elixir | `ex`, `exs` | `do`/`end` scanner: `defmodule` (a type), `def`/`defp`/`defmacro`..., `defstruct`, `defprotocol`/`defimpl` |
 | GDScript | `gd` | layout scanner: `class_name` (the file class), inner classes, `func`, `signal`, `enum`, `const`, `var` |
+| C | `c`, `h` | token-stream scanner (`lang-c` feature) |
+| C++ | `cpp`, `cc`, `cxx`, `hpp`, `hh`, `hxx`, `ipp` | token-stream scanner (`lang-c` feature, shared with C; a `.h` stays language `c` but is scanned with the C++ rules when it contains `class`/`namespace`/`template`/`public:`) |
+| Go | `go` | token-stream scanner (receiver methods are siblings of their type, so they do not roll up under `--grain class`) |
+| Scala | `scala`, `sc` | token-stream scanner (brace and indentation syntax; a `def` in an `object` is a function). `.sc` is also SuperCollider's extension; such files are scanned as Scala and get few or odd symbols |
 
-Everything else (Python, Go, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
+Everything else (Python, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
 
 Tokenizer dialects: the generic tokenizer treats `r"a\"b"` as an identifier `r` and a string with Python-style escapes. The Rust extractor uses the `rust_literals` dialect, where raw strings (`r"..."`, `r#"..."#`, `br#"..."#`) and byte literals (`b"..."`, `b'x'`) are single literal tokens and an unterminated raw string runs to end of input.
 

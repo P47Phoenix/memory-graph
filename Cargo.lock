@@ -675,15 +675,18 @@ dependencies = [
  "graph-client",
  "graph-core",
  "graph-lang-aspx",
+ "graph-lang-c",
  "graph-lang-csharp",
  "graph-lang-elixir",
  "graph-lang-fsharp",
  "graph-lang-gdscript",
+ "graph-lang-go",
  "graph-lang-haskell",
  "graph-lang-html",
  "graph-lang-javascript",
  "graph-lang-r",
  "graph-lang-rust",
+ "graph-lang-scala",
  "graph-lang-shell",
  "graph-lang-sql",
  "graph-proto",
@@ -744,6 +747,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-c"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-csharp"
 version = "0.1.0"
 dependencies = [
@@ -769,6 +780,14 @@ dependencies = [
 
 [[package]]
 name = "graph-lang-gdscript"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-go"
 version = "0.1.0"
 dependencies = [
  "graph-core",
@@ -814,6 +833,14 @@ dependencies = [
  "graph-core",
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "graph-lang-scala"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
 ]
 
 [[package]]

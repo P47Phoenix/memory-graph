@@ -22,6 +22,26 @@
       "repos": ["webforms"]
     },
     {
+      "name": "c-library",
+      "description": "A stand-alone C library (a JSON parser); exercises the C extractor on real code.",
+      "repos": ["cjson"]
+    },
+    {
+      "name": "cpp-library",
+      "description": "A header-only C++ library (command-line option parsing); exercises the C++ extractor on real code.",
+      "repos": ["cxxopts"]
+    },
+    {
+      "name": "go-library",
+      "description": "A small Go package (terminal colors); exercises the Go extractor on real code.",
+      "repos": ["go-color"]
+    },
+    {
+      "name": "scala-library",
+      "description": "A small Scala library (ANSI colored strings); exercises the Scala extractor on real code.",
+      "repos": ["fansi"]
+    },
+    {
       "name": "fsharp-library",
       "description": "An F# command-line argument parser; exercises the F# extractor.",
       "repos": ["argu"]
@@ -138,6 +158,42 @@
       "license": "MIT",
       "include": ["web", "LICENSE.txt", "README.md"],
       "languages": ["aspx", "csharp"]
+    },
+    {
+      "dir": "cjson",
+      "kind": "C library",
+      "upstream": "https://github.com/DaveGamble/cJSON",
+      "commit": "6d9f2443ab071f86e5d9b43025a40929ec41c46c",
+      "license": "MIT",
+      "include": ["cJSON.c", "cJSON.h", "cJSON_Utils.c", "cJSON_Utils.h", "LICENSE"],
+      "languages": ["c"]
+    },
+    {
+      "dir": "cxxopts",
+      "kind": "header-only C++ library",
+      "upstream": "https://github.com/jarro2783/cxxopts",
+      "commit": "02a9fd7e15080e8338c0dbb88e5782640d6b9325",
+      "license": "MIT",
+      "include": ["include/cxxopts.hpp", "LICENSE"],
+      "languages": ["cpp"]
+    },
+    {
+      "dir": "go-color",
+      "kind": "Go package",
+      "upstream": "https://github.com/fatih/color",
+      "commit": "820c6ebc21b06a3a5328297d556a87f91556e577",
+      "license": "MIT",
+      "include": ["color.go", "color_windows.go", "doc.go", "LICENSE.md"],
+      "languages": ["go"]
+    },
+    {
+      "dir": "fansi",
+      "kind": "Scala library",
+      "upstream": "https://github.com/com-lihaoyi/fansi",
+      "commit": "c8d4e5b56c46f2b360a441ca6d35620819a1ee52",
+      "license": "MIT",
+      "include": ["fansi/src/fansi/Fansi.scala", "LICENSE"],
+      "languages": ["scala"]
     },
     {
       "dir": "argu",

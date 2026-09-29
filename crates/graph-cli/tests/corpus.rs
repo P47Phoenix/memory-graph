@@ -414,6 +414,47 @@ fn every_parsed_token_is_stored() {
     for k in ["directive", "control", "binding"] {
         assert!(kinds.contains(k), "no aspx {k} symbol: {kinds:?}");
     }
+    // C, C++, Go and Scala scanners on real code: exact files and kinds,
+    // and nesting (methods under their class, members under the package).
+    let one = |name: &str, lang: &str, kind: &str| {
+        let mut q = graph_store::SymbolQuery::new(name);
+        q.language = Some(lang.into());
+        let hits = store.search_symbols(&q).unwrap();
+        hits.into_iter()
+            .find(|h| h.lang_kind.as_deref() == Some(kind))
+            .unwrap_or_else(|| panic!("no {lang} {kind} {name}"))
+    };
+    assert_eq!(one("cJSON_Parse", "c", "function").file, "cJSON.c");
+    assert_eq!(one("cJSON", "c", "struct").file, "cJSON.h");
+    assert_eq!(one("CJSON_VERSION_MAJOR", "c", "macro").file, "cJSON.h");
+    assert_eq!(one("cJSON_bool", "c", "typedef").file, "cJSON.h");
+    let opts = one("Options", "cpp", "class");
+    assert_eq!(opts.file, "include/cxxopts.hpp");
+    assert!(one("parse_positional", "cpp", "method")
+        .qualified
+        .contains("Options::parse_positional"));
+    one("cxxopts", "cpp", "namespace");
+    let m = one("Fprint", "go", "method");
+    assert_eq!(m.file, "color.go");
+    assert!(m.qualified.starts_with("color::"), "{}", m.qualified);
+    one("Color", "go", "struct");
+    one("FgRed", "go", "const");
+    one("Str", "scala", "class");
+    one("ErrorMode", "scala", "trait");
+    one("Throw", "scala", "case object");
+    assert!(one("overlay", "scala", "def")
+        .qualified
+        .contains("Str::overlay"));
+    for lang in ["c", "cpp", "go", "scala"] {
+        let n: usize = store
+            .describe(None, None)
+            .unwrap()
+            .iter()
+            .filter_map(|i| i.languages.get(lang))
+            .map(|l| l.symbols)
+            .sum();
+        assert!(n > 100, "{lang} extractor found only {n} symbols");
+    }
     // F#, Haskell, Elixir and GDScript: one declaration each, with its kind
     // and nesting, on real code.
     for (lang, name, lang_kind, qualified) in [
@@ -576,8 +617,8 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 /// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
-    const EXPECTED_FILES: usize = 648;
-    const EXPECTED_HASH: u64 = 2962854437681706518;
+    const EXPECTED_FILES: usize = 665;
+    const EXPECTED_HASH: u64 = 10234658473921474331;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());
