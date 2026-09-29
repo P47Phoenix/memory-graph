@@ -100,6 +100,9 @@ struct PeerStats {
     last_error: Option<String>,
     /// No RPC of any kind (a heartbeat, say) succeeded since that failure.
     failing: bool,
+    /// When the peer last answered an RPC of any kind (heartbeats
+    /// included): whether it is reachable, whatever a slow transfer does.
+    last_answer: Option<std::time::Instant>,
     last_warned: Option<std::time::Instant>,
     suppressed: u64,
 }
@@ -140,13 +143,32 @@ impl NetStats {
     /// snapshot (a heartbeat does not clear a replication error).
     fn succeeded(&self, target: NodeId, delivered: bool) {
         self.with(|s| {
-            if let Some(p) = s.peers.get_mut(&target) {
-                p.failing = false;
-                if delivered {
-                    p.last_error = None;
-                }
+            let p = s.peers.entry(target).or_default();
+            p.failing = false;
+            p.last_answer = Some(std::time::Instant::now());
+            if delivered {
+                p.last_error = None;
             }
         });
+    }
+
+    /// `target` answered a liveness probe (see [`probe`]): reachable now,
+    /// though no Raft RPC to it completed (one may be in a slow transfer).
+    pub fn probed(&self, target: NodeId) {
+        self.with(|s| {
+            s.peers.entry(target).or_default().last_answer = Some(std::time::Instant::now());
+        });
+    }
+
+    /// Whether `target` answered an RPC (a heartbeat counts) within
+    /// `window`: the quorum-loss check of a pending write (issue #116).
+    pub fn answered_within(&self, target: NodeId, window: Duration) -> bool {
+        self.with(|s| {
+            s.peers
+                .get(&target)
+                .and_then(|p| p.last_answer)
+                .is_some_and(|t| t.elapsed() < window)
+        })
     }
 
     /// The last replication error to `target` worth reporting: while RPCs
@@ -183,6 +205,35 @@ impl NetStats {
     pub fn inflight_aborted(&self) -> u64 {
         self.with(|s| s.inflight_aborted)
     }
+}
+
+/// Whether the server at `addr` answers a `grpc.health.v1` check within
+/// `timeout`, on a connection of its own: openraft 0.9 sends a peer no
+/// heartbeat while an `AppendEntries` to it is under way, so a slow
+/// transfer to a live peer looks like silence to the leader. The quorum
+/// loss check (issue #116) asks this before calling a peer gone.
+pub async fn probe(addr: &str, timeout: Duration) -> bool {
+    let uri = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let Ok(ep) = Endpoint::from_shared(uri) else {
+        return false;
+    };
+    let check = async {
+        let ch = ep
+            .connect_timeout(timeout)
+            .tcp_nodelay(true)
+            .connect()
+            .await?;
+        tonic_health::pb::health_client::HealthClient::new(ch)
+            .check(tonic_health::pb::HealthCheckRequest::default())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    matches!(tokio::time::timeout(timeout, check).await, Ok(Ok(())))
 }
 
 /// Snapshot stream chunk size.

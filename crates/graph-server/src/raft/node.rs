@@ -49,6 +49,14 @@ pub struct RaftSettings {
     /// At most this many entries per `AppendEntries` (the byte cap in the
     /// network also applies).
     pub max_payload_entries: u64,
+    /// A leader that has heard from no quorum for this long while a
+    /// proposal waits answers that proposal `NoLeader` (retryable), so a
+    /// client's write deadline holds during a partition (issue #116).
+    /// `None`: `election_max_ms` (by then a follower cut off from a leader
+    /// would have started an election). Slow but healthy writes are not
+    /// affected: heartbeats keep the quorum acknowledgement fresh however
+    /// long an entry takes (`--quorum-loss-timeout`).
+    pub quorum_loss_ms: Option<u64>,
 }
 
 impl RaftSettings {
@@ -68,6 +76,7 @@ impl RaftSettings {
             // handful of entries). A purge is one range delete.
             purge_batch_size: 1,
             max_payload_entries: 64,
+            quorum_loss_ms: None,
         }
     }
 
@@ -84,6 +93,11 @@ impl RaftSettings {
 }
 
 impl RaftSettings {
+    /// The quorum-loss window (see [`RaftSettings::quorum_loss_ms`]).
+    pub fn quorum_loss_window(&self) -> Duration {
+        Duration::from_millis(self.quorum_loss_ms.unwrap_or(self.election_max_ms))
+    }
+
     /// Checks the timings. Always: `election_min_ms < election_max_ms` and
     /// `heartbeat_ms < election_min_ms` (or followers call elections while
     /// the leader is alive). For a cluster (`multi_member`, the
@@ -105,6 +119,17 @@ impl RaftSettings {
                 "heartbeat interval ({} ms) must be below election timeout min ({} ms), \
                  or followers call elections while the leader is alive",
                 self.heartbeat_ms, self.election_min_ms
+            ));
+        }
+        // openraft refreshes its "last quorum ack" metric at least every
+        // 1.5 heartbeats, so a shorter window could fire on a healthy
+        // leader between two refreshes.
+        let q = self.quorum_loss_window().as_millis() as u64;
+        if q < self.heartbeat_ms.saturating_mul(2) {
+            return Err(format!(
+                "quorum-loss timeout ({q} ms) must be at least twice the heartbeat interval \
+                 ({} ms), or a healthy leader could answer NoLeader",
+                self.heartbeat_ms
             ));
         }
         if multi_member && self.heartbeat_ms.saturating_mul(3) >= self.election_min_ms {
@@ -166,6 +191,8 @@ pub struct RaftNode {
     pub disk: DiskGuard,
     /// Per-peer network outcomes (the last error, shown in `Status`).
     pub net_stats: NetStats,
+    /// Test fault injection, also obeyed by the quorum-loss probe.
+    pub faults: Option<FaultPlan>,
     /// Test hook ([`crate::server::TestingHooks::withhold_leader`]).
     pub withhold_leader: bool,
     /// The timings this node runs with.
@@ -208,6 +235,44 @@ impl Drop for InFlight {
 pub struct LeaderInfo {
     pub id: Option<NodeId>,
     pub addr: Option<String>,
+}
+
+/// Whether `node` (a leader with a write pending for `waited`) has lost
+/// its quorum. Both must hold:
+/// * some voter configuration (two during a joint change) lacks a
+///   majority of voters that `answered` any RPC within the window (this
+///   node counts): a heartbeat answer counts, so a slow transfer to a live
+///   follower never makes it look gone;
+/// * openraft's own quorum acknowledgement is `window` old (never one yet:
+///   counted from the write's start).
+///
+/// Not while it follows (openraft answers the write itself), nor as the
+/// sole voter (it is its own quorum).
+pub fn quorum_lost(
+    m: &RaftMetrics<NodeId, BasicNode>,
+    node: NodeId,
+    waited: Duration,
+    window: Duration,
+    answered: impl Fn(NodeId) -> bool,
+) -> bool {
+    if m.state != ServerState::Leader || m.current_leader != Some(node) {
+        return false;
+    }
+    let mem = m.membership_config.membership();
+    if mem.voter_ids().count() <= 1 {
+        return false;
+    }
+    let reachable = mem.get_joint_config().iter().all(|set| {
+        let up = set.iter().filter(|v| **v == node || answered(**v)).count();
+        up > set.len() / 2
+    });
+    if reachable {
+        return false;
+    }
+    match m.millis_since_quorum_ack {
+        Some(ms) => Duration::from_millis(ms) >= window,
+        None => waited >= window,
+    }
 }
 
 fn fatal(e: impl std::fmt::Display) -> StoreError {
@@ -324,6 +389,7 @@ impl RaftNode {
             snapshots: p.snapshots,
             disk: p.disk,
             net_stats,
+            faults: p.faults,
             withhold_leader: false,
             settings: s,
             transferring: Arc::new(AtomicBool::new(false)),
@@ -457,12 +523,90 @@ impl RaftNode {
         if self.metrics().state == ServerState::Leader {
             self.disk.check("write")?;
         }
-        match self.raft.client_write(req).await {
-            Ok(resp) => {
-                let index = resp.log_id().index;
-                Ok((resp.response().clone(), index))
+        let write = self.raft.client_write(req);
+        tokio::pin!(write);
+        tokio::select! {
+            r = &mut write => match r {
+                Ok(resp) => {
+                    let index = resp.log_id().index;
+                    Ok((resp.response().clone(), index))
+                }
+                Err(e) => Err(write_err(e)),
+            },
+            e = self.quorum_lost() => Err(e),
+        }
+    }
+
+    /// Resolves (with `NoLeader`) once this node leads but has heard from
+    /// no quorum for [`RaftSettings::quorum_loss_window`] (issue #116): a
+    /// leader cut off from its majority cannot commit, and openraft would
+    /// keep the proposal pending until the partition heals. The entry may
+    /// still commit later (if this node keeps leading once healed); every
+    /// write is idempotent on a retry (ADR 0004 D2/D7), so the client's
+    /// retry is safe either way. Never resolves on a sole voter, or while
+    /// the quorum answers, however long the write itself takes.
+    /// Probe (see [`super::network::probe`]) every voter that answered
+    /// nothing within `window`, in parallel, each within `timeout`; record
+    /// the answers. Whether any answered. A test partition
+    /// ([`FaultPlan`]) cuts probes as it cuts Raft RPCs.
+    async fn probe_silent_voters(&self, window: Duration, timeout: Duration) -> bool {
+        let m = self.raft.metrics().borrow().clone();
+        let mem = m.membership_config.membership();
+        let silent: Vec<(NodeId, String)> = mem
+            .voter_ids()
+            .filter(|id| *id != self.node_id && !self.net_stats.answered_within(*id, window))
+            .filter(|id| {
+                self.faults
+                    .as_ref()
+                    .is_none_or(|f| f.connected(self.node_id, *id))
+            })
+            .filter_map(|id| mem.get_node(&id).map(|n| (id, n.addr.clone())))
+            .collect();
+        let mut probes = tokio::task::JoinSet::new();
+        for (id, addr) in silent {
+            probes.spawn(async move { (id, super::network::probe(&addr, timeout).await) });
+        }
+        let mut any = false;
+        while let Some(r) = probes.join_next().await {
+            if let Ok((id, true)) = r {
+                self.net_stats.probed(id);
+                any = true;
             }
-            Err(e) => Err(write_err(e)),
+        }
+        any
+    }
+
+    async fn quorum_lost(&self) -> StoreError {
+        let window = self.settings.quorum_loss_window();
+        let started = tokio::time::Instant::now();
+        let mut rx = self.raft.metrics();
+        let tick = Duration::from_millis(self.settings.heartbeat_ms.max(1));
+        loop {
+            let lost = {
+                let m = rx.borrow_and_update();
+                quorum_lost(&m, self.node_id, started.elapsed(), window, |id| {
+                    self.net_stats.answered_within(id, window)
+                })
+            };
+            // Before calling the quorum gone, ask the silent voters directly:
+            // a slow transfer to a live peer also silences it (openraft
+            // sends no heartbeat meanwhile). An answer counts for a window.
+            if lost && self.probe_silent_voters(window, tick).await {
+                continue;
+            }
+            if lost {
+                tracing::warn!(
+                    window_ms = window.as_millis() as u64,
+                    "no quorum acknowledged this leader within the window; \
+                     answering the pending write NoLeader"
+                );
+                return StoreError::NoLeader {
+                    retry_after_ms: NO_LEADER_RETRY_MS,
+                };
+            }
+            // Metrics change at least every 1.5 heartbeats (openraft's
+            // tick); the sleep also bounds the wait when they do not.
+            let _ = tokio::time::timeout(tick, rx.changed()).await;
         }
     }
 
@@ -829,6 +973,76 @@ pub fn follower_stale(known: bool, recent: bool, applied: u64, leader_commit: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leader_metrics(voters: &[NodeId], ack_ms: Option<u64>) -> RaftMetrics<NodeId, BasicNode> {
+        let mut m = RaftMetrics::new_initial(1);
+        m.state = ServerState::Leader;
+        m.current_leader = Some(1);
+        m.millis_since_quorum_ack = ack_ms;
+        let nodes: BTreeMap<NodeId, BasicNode> = voters
+            .iter()
+            .map(|i| (*i, BasicNode::new(format!("h:{i}"))))
+            .collect();
+        let set: BTreeSet<NodeId> = voters.iter().copied().collect();
+        m.membership_config = Arc::new(openraft::StoredMembership::new(
+            None,
+            openraft::Membership::new(vec![set], nodes),
+        ));
+        m
+    }
+
+    /// Issue #116: only a leader of several voters whose quorum has been
+    /// silent for the window counts as having lost it.
+    #[test]
+    fn quorum_loss_needs_a_silent_quorum_for_the_window() {
+        let w = Duration::from_millis(2000);
+        let short = Duration::from_millis(10);
+        let long = Duration::from_millis(5000);
+        let none = |_| false;
+        let all = |_| true;
+        let only2 = |id| id == 2;
+        let q = |ack, waited, answered: &dyn Fn(NodeId) -> bool| {
+            quorum_lost(&leader_metrics(&[1, 2, 3], ack), 1, waited, w, answered)
+        };
+        // Acked recently: healthy, however long the write has waited.
+        assert!(!q(Some(250), long, &none));
+        // openraft's ack is stale but the peers answer heartbeats (a slow
+        // transfer to live followers): healthy.
+        assert!(!q(Some(5000), long, &all));
+        // One peer of two answering is a majority with this node.
+        assert!(!q(Some(5000), long, &only2));
+        // Silent for the window, nobody answering: lost.
+        assert!(q(Some(2000), short, &none));
+        // Never acked: counted from the write's start.
+        assert!(!q(None, short, &none));
+        assert!(q(None, long, &none));
+        // A sole voter is its own quorum.
+        assert!(!quorum_lost(&leader_metrics(&[1], None), 1, long, w, none));
+        // A follower: openraft answers the write itself.
+        let mut f = leader_metrics(&[1, 2, 3], None);
+        f.state = ServerState::Follower;
+        f.current_leader = Some(2);
+        assert!(!quorum_lost(&f, 1, long, w, none));
+    }
+
+    #[test]
+    fn quorum_loss_window_defaults_to_election_max_and_is_validated() {
+        let s = RaftSettings::cluster();
+        assert_eq!(
+            s.quorum_loss_window(),
+            Duration::from_millis(s.election_max_ms)
+        );
+        let tight = RaftSettings {
+            quorum_loss_ms: Some(s.heartbeat_ms),
+            ..s
+        };
+        assert!(tight.validate(true).unwrap_err().contains("quorum-loss"));
+        let ok = RaftSettings {
+            quorum_loss_ms: Some(s.heartbeat_ms * 2),
+            ..s
+        };
+        ok.validate(true).unwrap();
+    }
 
     /// The lease ends before any other node can have been elected: below
     /// `election_timeout_min` by two heartbeats, for every shipped timing.

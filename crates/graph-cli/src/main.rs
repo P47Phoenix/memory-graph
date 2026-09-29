@@ -380,6 +380,11 @@ enum Cmd {
         /// Leader heartbeat interval, ms (--data-dir default 250)
         #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
         heartbeat_interval: Option<u64>,
+        /// A leader that has heard from no quorum for this long answers its pending writes
+        /// NoLeader (the client retries, then exits 4), ms (default: the election timeout max).
+        /// Only quorum loss triggers it; a slow but healthy write is never cut off
+        #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
+        quorum_loss_timeout: Option<u64>,
         /// Refuse writes and snapshot builds (RESOURCE_EXHAUSTED) while the volume has less than
         /// this free plus one snapshot copy: a size (K/M/G) or a percentage of the volume such as
         /// 5%. --data-dir default: 5% of the volume, clamped to 2-32 GiB. --db default: off
@@ -755,8 +760,20 @@ fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
 /// is then logged as JSON rather than printed as text.
 static JSON_LOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// The stack `run` gets: an unoptimized build of the argument parsing and
+/// dispatch (one large `match` over every command) outgrows Windows' 1 MiB
+/// main-thread stack, so it runs on a thread of its own.
+const MAIN_STACK_BYTES: usize = 8 << 20;
+
 fn main() {
-    match run() {
+    let result = std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(run)
+        .expect("spawning the main thread")
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p));
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             // `symbols | head` closes the pipe early: that is not an error.
@@ -870,6 +887,7 @@ fn run() -> Result<i32> {
         election_timeout_min,
         election_timeout_max,
         heartbeat_interval,
+        quorum_loss_timeout,
         min_free_disk,
         snapshot_max_age,
     } = &cli.cmd
@@ -987,7 +1005,8 @@ fn run() -> Result<i32> {
             || log_keep_entries.is_some()
             || election_timeout_min.is_some()
             || election_timeout_max.is_some()
-            || heartbeat_interval.is_some();
+            || heartbeat_interval.is_some()
+            || quorum_loss_timeout.is_some();
         if tuned {
             let mut r = if cluster_mode {
                 graph_server::RaftSettings::cluster()
@@ -1012,11 +1031,17 @@ fn run() -> Result<i32> {
             if let Some(v) = heartbeat_interval {
                 r.heartbeat_ms = *v;
             }
+            if let Some(v) = quorum_loss_timeout {
+                r.quorum_loss_ms = Some(*v);
+            }
             // In cluster mode also 3 * heartbeat < election min: the read
             // freshness lease (election min - 2 * heartbeat) must outlast
             // one heartbeat.
             if let Err(e) = r.validate(cluster_mode) {
-                bail!("invalid timings (--heartbeat-interval, --election-timeout-min/-max): {e}");
+                bail!(
+                    "invalid timings (--heartbeat-interval, --election-timeout-min/-max, \
+                     --quorum-loss-timeout): {e}"
+                );
             }
             cfg.raft = Some(r);
         }
@@ -1040,8 +1065,8 @@ fn run() -> Result<i32> {
             tracing::info!(
                 "note: with --db, --advertise and the Raft options \
                  (--snapshot-log-entries/-bytes, --log-keep-entries, --election-timeout-*, \
-                 --heartbeat-interval) apply to this single-node server's own log only; \
-                 clusters use --data-dir"
+                 --heartbeat-interval, --quorum-loss-timeout) apply to this single-node \
+                 server's own log only; clusters use --data-dir"
             );
         }
         cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
@@ -2083,6 +2108,8 @@ mod serve_config_tests {
                 "1200",
                 "--heartbeat-interval",
                 "100",
+                "--quorum-loss-timeout",
+                "1500",
                 "--min-free-disk",
                 "5%",
                 "--snapshot-max-age",
@@ -2109,6 +2136,7 @@ log-keep-entries = 10
 election-timeout-min = 600
 election-timeout-max = 1200
 heartbeat-interval = 100
+quorum-loss-timeout = 1500
 min-free-disk = "5%"
 snapshot-max-age = "10m"
 cache-bytes = 1000000
