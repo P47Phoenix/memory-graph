@@ -22,6 +22,46 @@
       "repos": ["webforms"]
     },
     {
+      "name": "c-library",
+      "description": "A stand-alone C library (a JSON parser); exercises the C extractor on real code.",
+      "repos": ["cjson"]
+    },
+    {
+      "name": "cpp-library",
+      "description": "A header-only C++ library (command-line option parsing); exercises the C++ extractor on real code.",
+      "repos": ["cxxopts"]
+    },
+    {
+      "name": "go-library",
+      "description": "A small Go package (terminal colors); exercises the Go extractor on real code.",
+      "repos": ["go-color"]
+    },
+    {
+      "name": "scala-library",
+      "description": "A small Scala library (ANSI colored strings); exercises the Scala extractor on real code.",
+      "repos": ["fansi"]
+    },
+    {
+      "name": "fsharp-library",
+      "description": "An F# command-line argument parser; exercises the F# extractor.",
+      "repos": ["argu"]
+    },
+    {
+      "name": "haskell-server",
+      "description": "Haskell modules of the PostgREST server; exercises the Haskell extractor.",
+      "repos": ["postgrest"]
+    },
+    {
+      "name": "elixir-library",
+      "description": "An Elixir options-validation library; exercises the Elixir extractor.",
+      "repos": ["nimble-options"]
+    },
+    {
+      "name": "godot-game",
+      "description": "The GDScript of a Godot 2D platformer demo; exercises the GDScript extractor.",
+      "repos": ["godot-platformer"]
+    },
+    {
       "name": "cobol-web",
       "description": "A tiny COBOL web framework (CGI); exercises the COBOL extractor on real programs.",
       "repos": ["cobol-on-wheelchair"]
@@ -138,6 +178,79 @@
       "license": "MIT",
       "include": ["web", "LICENSE.txt", "README.md"],
       "languages": ["aspx", "csharp"]
+    },
+    {
+      "dir": "cjson",
+      "kind": "C library",
+      "upstream": "https://github.com/DaveGamble/cJSON",
+      "commit": "6d9f2443ab071f86e5d9b43025a40929ec41c46c",
+      "license": "MIT",
+      "include": ["cJSON.c", "cJSON.h", "cJSON_Utils.c", "cJSON_Utils.h", "LICENSE"],
+      "languages": ["c"]
+    },
+    {
+      "dir": "cxxopts",
+      "kind": "header-only C++ library",
+      "upstream": "https://github.com/jarro2783/cxxopts",
+      "commit": "02a9fd7e15080e8338c0dbb88e5782640d6b9325",
+      "license": "MIT",
+      "include": ["include/cxxopts.hpp", "LICENSE"],
+      "languages": ["cpp"]
+    },
+    {
+      "dir": "go-color",
+      "kind": "Go package",
+      "upstream": "https://github.com/fatih/color",
+      "commit": "820c6ebc21b06a3a5328297d556a87f91556e577",
+      "license": "MIT",
+      "include": ["color.go", "color_windows.go", "doc.go", "LICENSE.md"],
+      "languages": ["go"]
+    },
+    {
+      "dir": "fansi",
+      "kind": "Scala library",
+      "upstream": "https://github.com/com-lihaoyi/fansi",
+      "commit": "c8d4e5b56c46f2b360a441ca6d35620819a1ee52",
+      "license": "MIT",
+      "include": ["fansi/src/fansi/Fansi.scala", "LICENSE"],
+      "languages": ["scala"]
+    },
+    {
+      "dir": "argu",
+      "kind": "F# command-line argument parser library",
+      "upstream": "https://github.com/fsprojects/Argu",
+      "commit": "8dcad5bab1f49dd1eaac77ef9895daa0c9ca5744",
+      "license": "MIT",
+      "include": ["src/Argu/Types.fs", "src/Argu/Attributes.fs", "src/Argu/UnionArgInfo.fs", "LICENSE.md"],
+      "languages": ["fsharp"]
+    },
+    {
+      "dir": "postgrest",
+      "kind": "Haskell modules of a REST API server",
+      "upstream": "https://github.com/PostgREST/postgrest",
+      "commit": "667f4dca3ee6b9c781a1184fc80a35ba27d5ebac",
+      "license": "MIT",
+      "include": ["src/library/PostgREST/RangeQuery.hs", "src/library/PostgREST/MediaType.hs", "src/library/PostgREST/Cors.hs", "src/library/PostgREST/Auth.hs", "src/library/PostgREST/Version.hs", "LICENSE"],
+      "languages": ["haskell"]
+    },
+    {
+      "dir": "nimble-options",
+      "kind": "Elixir options-validation library",
+      "upstream": "https://github.com/dashbitco/nimble_options",
+      "commit": "825c05837f236c612c6ac2855735ec6cf7f2be69",
+      "license": "Apache-2.0",
+      "include": ["lib", "mix.exs", "LICENSE.md"],
+      "languages": ["elixir"]
+    },
+    {
+      "dir": "godot-platformer",
+      "kind": "Godot 2D platformer demo (GDScript)",
+      "upstream": "https://github.com/godotengine/godot-demo-projects",
+      "commit": "3e08537616661a5883831628decab4c526260289",
+      "license": "MIT",
+      "split": "the GDScript files of the 2d/platformer demo",
+      "include": ["2d/platformer/game.gd", "2d/platformer/player/player.gd", "2d/platformer/player/gun.gd", "2d/platformer/player/bullet.gd", "2d/platformer/enemy/enemy.gd", "LICENSE.md"],
+      "languages": ["gdscript"]
     },
     {
       "dir": "cobol-on-wheelchair",
