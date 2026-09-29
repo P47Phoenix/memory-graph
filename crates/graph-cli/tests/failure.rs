@@ -180,6 +180,101 @@ fn extractor_panic_fails_one_file_for_any_jobs() {
     }
 }
 
+fn run_mem(
+    db: &Path,
+    dir: &Path,
+    memory: &str,
+    jobs: usize,
+) -> (anyhow::Result<()>, serde_json::Value) {
+    let mut out = Vec::new();
+    let r = index_dir(
+        DirOpts {
+            db,
+            org: "o",
+            repo: "r",
+            dir,
+            json: true,
+            max_file_size: Some(1 << 20),
+            prune: false,
+            force: false,
+            reindex: false,
+            jobs,
+            progress: Some(false),
+            memory: Some(graph_cli::sysinfo::parse_memory_spec(memory).unwrap()),
+            deterministic: false,
+            stats: true,
+            trace: None,
+            disk_probe: None,
+            min_free_disk: graph_cli::diskinfo::MinFree::Default,
+            disk_check: true,
+            chunk_bytes: graph_cli::DEFAULT_CHUNK_BYTES,
+            remote: None,
+        },
+        open,
+        &mut out,
+    );
+    (r, serde_json::from_slice(&out).unwrap())
+}
+
+/// Span failures are recorded at flush and panics on arrival, so the
+/// failure list is sorted: the same under any budget or thread count.
+#[test]
+fn failed_files_order_does_not_depend_on_batching() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("src");
+    std::fs::create_dir(&dir).unwrap();
+    for i in 0..40 {
+        let body = match i % 4 {
+            0 => "bad span",
+            1 => "panic now",
+            _ => "fine",
+        };
+        std::fs::write(dir.join(format!("f{i:02}.zig")), body).unwrap();
+    }
+    let mut seen = Vec::new();
+    for (k, (mem, jobs)) in [("1K", 1), ("64M", 8)].into_iter().enumerate() {
+        let (r, v) = run_mem(&d.path().join(format!("g{k}.redb")), &dir, mem, jobs);
+        assert!(r.is_err());
+        assert_eq!(v["failed"], 20, "{v}");
+        assert_eq!(v["files"], 20, "{v}");
+        seen.push(v["failed_files"].clone());
+    }
+    assert_eq!(seen[0], seen[1]);
+    let paths: Vec<_> = seen[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+}
+
+/// A panicked file gives its budget back: many panicking files, each larger
+/// than a tiny fixed budget, still finish (a leak would stall admission).
+#[test]
+fn panicked_files_release_their_budget() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("src");
+    std::fs::create_dir(&dir).unwrap();
+    let big = format!("panic{}", "x".repeat(8 << 10));
+    for i in 0..30 {
+        std::fs::write(dir.join(format!("p{i:02}.zig")), &big).unwrap();
+    }
+    std::fs::write(dir.join("z.zig"), "fine").unwrap();
+    let db = d.path().join("g.redb");
+    let t = std::thread::spawn(move || run_mem(&db, &dir, "4K", 2).1);
+    let t0 = std::time::Instant::now();
+    while !t.is_finished() {
+        assert!(t0.elapsed().as_secs() < 60, "index stalled: budget leaked");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let v = t.join().unwrap();
+    assert_eq!(v["failed"], 30, "{v}");
+    assert_eq!(v["files"], 1, "{v}");
+}
+
 /// Make reading `path` fail for this process: no permissions on unix, an
 /// exclusive (no sharing) handle on Windows. `None` when the platform lets
 /// the read through anyway (running as root).

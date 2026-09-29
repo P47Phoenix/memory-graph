@@ -53,3 +53,6 @@ tower-service = "0.3"
 # corpus test does not spend ~20s in unoptimised storage code.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Never set `panic = "abort"` in any profile: `index` catches an extractor
+# panic and reports it as one failed file (#82, graph-cli `work`).

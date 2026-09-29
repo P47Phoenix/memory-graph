@@ -63,8 +63,30 @@ fn deterministic_refuses_memory_below_one_batch() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(
         !o.status.success()
-            && err.contains("--deterministic needs --memory of at least 33554432")
+            && err.contains("--deterministic needs --memory of at least 32M")
+            && err.contains("got 16K;")
             && err.contains("one fixed batch"),
+        "{err}"
+    );
+    // From the environment, the message says so.
+    let o = Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+        .env("MEMORY_GRAPH_MEMORY", "1M")
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "index",
+            "--deterministic",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !o.status.success() && err.contains("got 1M (from MEMORY_GRAPH_MEMORY)"),
         "{err}"
     );
     assert!(!db.exists(), "nothing created");

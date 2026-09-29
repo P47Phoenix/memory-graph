@@ -162,6 +162,21 @@ fn is_db_file(
     }
 }
 
+/// `bytes` as `--memory` would spell it: `32M`, `16K`, `1.5G`, `100B`.
+fn human_size(bytes: u64) -> String {
+    for (unit, size) in [("G", 1u64 << 30), ("M", 1 << 20), ("K", 1 << 10)] {
+        if bytes >= size {
+            let v = bytes as f64 / size as f64;
+            return if v.fract() == 0.0 {
+                format!("{v:.0}{unit}")
+            } else {
+                format!("{v:.1}{unit}")
+            };
+        }
+    }
+    format!("{bytes}B")
+}
+
 const BATCH_FILES: usize = 256;
 const BATCH_BYTES: usize = 32 * 1024 * 1024;
 
@@ -375,6 +390,9 @@ fn read_and_prepare(
 
 /// `read_and_prepare` with any panic turned into a per-file failure, so one
 /// bad file (an extractor that panics) neither wedges nor aborts the run.
+/// This relies on unwinding: building with `panic = "abort"` would undo #82.
+/// The default panic hook still prints its one `thread ... panicked` line
+/// to stderr for such a file; that is kept, as the backtrace pointer.
 fn work(store: &dyn Store, o: &DirOpts, item: &Item, board: &Board, k: usize) -> Result<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         read_and_prepare(store, o, item, board, k)
@@ -1016,10 +1034,18 @@ pub fn index_dir_with(
     // would be silently raised to one batch (#88): say so instead.
     if let (true, Some(sysinfo::MemorySpec::Fixed(bytes))) = (o.deterministic, o.memory) {
         if bytes < BATCH_BYTES as u64 {
+            let from_env = std::env::var("MEMORY_GRAPH_MEMORY")
+                .ok()
+                .and_then(|v| sysinfo::parse_memory_spec(&v).ok())
+                == o.memory;
             bail!(
-                "--deterministic needs --memory of at least {} (one fixed batch of 32 MiB is held in memory until it commits), got {}; raise --memory or drop --deterministic",
-                BATCH_BYTES,
-                bytes
+                "--deterministic needs --memory of at least 32M (one fixed batch is held in memory until it commits), got {}{}; raise it or drop --deterministic",
+                human_size(bytes),
+                if from_env {
+                    " (from MEMORY_GRAPH_MEMORY)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -1081,8 +1107,12 @@ pub fn index_dir_with(
         by_lang,
         seen,
         skipped: batch_skipped,
-        failed,
+        mut failed,
     } = tally;
+    // Span failures are recorded at their batch's flush, panics as they
+    // arrive; sort so the report does not depend on batching (paths are
+    // unique within a run).
+    failed.sort();
     for (r, v) in batch_skipped {
         skipped.entry(r).or_default().extend(v);
     }
