@@ -417,6 +417,9 @@ Languages are detected per file from the extension, the filename (`Makefile`) or
 | JavaScript | `js`, `mjs`, `cjs`, `jsx` | token-stream scanner |
 | HTML | `html`, `htm`, `xhtml` | element scanner |
 | ASP.NET markup | `aspx`, `ascx`, `master` | HTML scanner plus directives, server controls, code blocks and bindings |
+| COBOL | `cbl`, `cob`, `cpy` | sentence scanner: programs, divisions, sections, paragraphs, level-01/77 items (fixed and free format) |
+| RPG IV / RPGLE | `rpgle`, `sqlrpgle`, `rpgleinc`, `rpg` | token-stream scanner: procedures, subroutines, prototypes, interfaces, data structures, standalone fields, constants, tags (`**FREE`, mixed and fixed form) |
+| Assembly | `asm`, `s`, `inc` | line scanner (NASM, MASM, GNU as; x86 and ARM): labels, procs, macros, sections, segments, structs, constants |
 
 Everything else (Python, Go, SQL, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
 
