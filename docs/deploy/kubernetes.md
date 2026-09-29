@@ -173,6 +173,6 @@ The container runs as the image's non-root user with `allowPrivilegeEscalation: 
 same build whenever it restarts.
 
 ## Caveats
-- **No TLS or authentication** yet (a later stage of ADR 0004): keep the Services cluster-internal
+- **No TLS or authentication** yet (issues #104, #105): keep the Services cluster-internal
   and restrict them with a NetworkPolicy.
 - Backup and restore: [data-dir.md](data-dir.md). Compose: [compose.md](compose.md).

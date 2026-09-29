@@ -212,7 +212,9 @@ started with any `TestingHooks` set logs a warning at start:
    process the test spawned is ever killed). The ignored
    `measure_replication` in the same file produces
    [spikes/raft-replication.md](spikes/raft-replication.md) (run it with
-   `--release --ignored --nocapture`).
+   `--release --ignored --nocapture`); the ignored
+   `measure_replication_at_scale` produces its "Stage F at scale" section
+   (the corpus, or a generated tree of `MG_SCALE_TOKENS` tokens).
 
 The Raft log's size gate is in `crates/graph-cli/tests/size_gate.rs`. After
 three corpus passes, `cluster snapshot` and the purge, `raft.redb` must be at
@@ -321,6 +323,15 @@ Locally (Windows uses `TerminateProcess`):
 ```sh
 cargo build --release -p graph-cli
 python3 scripts/cluster_kill_test.py --bin target/release/memory-graph   # --rounds N, --keep
+```
+
+### The soak (`scripts/cluster_soak.py`)
+
+The same three nodes, with the kill test's process machinery (it imports `cluster_kill_test.py`), under a continuous indexing loop for `--minutes` (default 60), one node restarted every `--restart-every` seconds (default 300) round robin, alternating a graceful stop (SIGTERM; Ctrl-Break on Windows, each node in its own process group) and a kill. Each restart waits until the node caught up with the leader's committed index. Every `--sample-every` seconds each node's `cluster status` is recorded (`log_bytes`, `purged_index`, `snapshot_index`, `applied_index`). At the end: every acknowledged batch on every node, every graceful stop exited 0, and on every node the purged index advanced and `log_bytes` stayed under `--max-log-bytes` (default 64 MiB; the nodes run with `--snapshot-log-entries 1000 --log-keep-entries 100` so purges happen in a short run). It prints the samples (`--csv FILE` writes them). The `cluster` workflow runs a 5-minute variant (a restart every minute) on its weekly schedule only; the 60-minute run is local, recorded in [spikes/raft-replication.md](spikes/raft-replication.md).
+
+```sh
+python3 scripts/cluster_soak.py --bin target/release/memory-graph              # 60 minutes
+python3 scripts/cluster_soak.py --bin target/release/memory-graph --minutes 5 --restart-every 60
 ```
 
 ## Database size

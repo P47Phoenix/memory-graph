@@ -11,7 +11,7 @@ D6, D7.
 
 | Path | What | Notes |
 |---|---|---|
-| `node.json` | Node id, cluster id, advertised address, binary / protocol / store format versions, extractor version set hash, creation time | Written once on the first start. A different `--node-id` or `--advertise` on a later start is refused. |
+| `node.json` | Node id, cluster id, advertised address, binary / protocol / store format versions, extractor version set hash, creation time | Written on the first start. A different `--node-id` or `--advertise` on a later start is refused; `--update-advertise` rewrites the address once the cluster recorded it. |
 | `graph.redb` | The store: every applied log entry, and the index of the last one applied | What reads answer from. Same format as an embedded `--db` file. |
 | `raft.redb` | The Raft log, the vote and the committed index | Purged below each snapshot (keeping `--log-keep-entries`), then compacted. |
 | `snapshots/snap-<term>-<index>.redb` + `.meta` | The latest snapshot: a copy of the store at a log index, with its SHA-256, size and membership | One pair kept; a follower too far behind is sent it. |
@@ -68,5 +68,19 @@ a one-off pod running the same command, then scale back to 3.
 
 ## Moving a node
 
-A node's advertised address is part of the membership. To move a node to another address, remove
-it (`cluster remove <id>`), wipe its directory and join it again under the new address.
+A node's advertised address is part of the membership. To move a node to another address (a new
+IP, port or DNS name), restart it with `--update-advertise <host:port>`:
+
+```sh
+memory-graph serve --data-dir ./n3 --listen 0.0.0.0:7013 --update-advertise host3:7013
+```
+
+Once it serves at the new address, the node asks the leader (through itself or any member its
+membership lists) to record the address: the leader asks the server there who it is (it must be
+this node, of this cluster, with the same extractors) and commits one membership entry that
+replaces the address (voters and learners unchanged). Only then is `node.json` rewritten. If no
+leader accepts it within 2 minutes, the start fails and `node.json` keeps the old address; run the
+same command again. A plain `--advertise` with another address is still refused. Until the leader
+has the new address it cannot reach the node, so move one node at a time and let it rejoin before
+the next. Removing the node (`cluster remove <id>`), wiping its directory and joining again under
+the new address also works, at the cost of a full copy.
