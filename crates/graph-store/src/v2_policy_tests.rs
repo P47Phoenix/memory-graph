@@ -455,8 +455,9 @@ fn open_batch_marker_is_cleared_after_a_completed_batch() {
 /// asserts a generous wall-clock ceiling on indexing this repo's own
 /// `crates/` tree chunked finely enough that nearly every file is its own
 /// chunk (worst case for marker-write overhead), so a real regression in the
-/// marker bookkeeping would blow well past it. The ceiling scales with the
-/// number of files, because the tree grows (issue #125).
+/// marker bookkeeping would blow well past it. The ceiling scales with total
+/// source bytes plus a per-chunk allowance, because the tree grows and cost
+/// tracks bytes, not files (issues #125, #136).
 #[test]
 fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_own_corpus() {
     let files = this_repos_rust_corpus();
@@ -485,33 +486,71 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
         })
         .collect();
 
+    let total_bytes: usize = bf.iter().map(|f| f.bytes.len()).sum();
+    let chunks = bf.len();
+
+    // Index the batch into a fresh store with the given chunk cap; wall-clock
+    // seconds for the whole `index_batch`.
     let d = tempfile::tempdir().unwrap();
-    let mut s = V2Store::open(d.path().join("v.redb")).unwrap();
-    s.register(Box::new(graph_lang_rust::RustExtractor));
-    s.set_chunk_bytes(1); // every file its own chunk: worst case for marker overhead
-    let t = std::time::Instant::now();
-    let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
-    let elapsed = t.elapsed();
-    assert!(results.iter().all(|r| r.is_ok()));
+    let mut n = 0usize;
+    let mut time_one = |chunk_bytes: usize| -> f64 {
+        n += 1;
+        let mut s = V2Store::open(d.path().join(format!("v{n}.redb"))).unwrap();
+        s.register(Box::new(graph_lang_rust::RustExtractor));
+        s.set_chunk_bytes(chunk_bytes);
+        let t = std::time::Instant::now();
+        let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        assert!(results.iter().all(|r| r.is_ok()));
+        secs
+    };
+
+    // Relative, not absolute (issue #136). Each round indexes the same batch
+    // unchunked (one transaction, the marker written once) and then chunked
+    // one file per chunk (every file its own fsync'd commit plus a marker
+    // re-stamp), back to back. Extraction and byte-proportional work are the
+    // same in both, so the excess of chunked over unchunked, as a fraction of
+    // unchunked, is the per-chunk commit + marker cost normalised by how fast
+    // this machine is right now. The best (smallest) round is kept, since
+    // load only ever adds noise.
+    let mut best = (f64::MAX, 0.0, 0.0);
+    for _ in 0..3 {
+        let u = time_one(usize::MAX);
+        let c = time_one(1);
+        let excess = (c - u).max(0.0) / u;
+        if excess < best.0 {
+            best = (excess, u, c);
+        }
+    }
+    let (excess, unchunked, chunked) = best;
+    let per_chunk_ms = (chunked - unchunked).max(0.0) * 1000.0 / chunks as f64;
     eprintln!(
-        "chunked ingest with open-batch marker, {} files, one chunk each: {:.1} ms total",
-        bf.len(),
-        elapsed.as_secs_f64() * 1000.0
+        "chunked ingest with open-batch marker, {chunks} files ({total_bytes} bytes): unchunked \
+         {:.1} ms, one chunk per file {:.1} ms, excess {:.2}x of unchunked ({per_chunk_ms:.2} ms \
+         per chunk)",
+        unchunked * 1000.0,
+        chunked * 1000.0,
+        excess
     );
-    // The corpus is this repo's own tree, which keeps growing (27 files when
-    // this gate was written; several times that after ADR 0004), and every
-    // file is its own fsync'd commit here. So the ceiling scales with the
-    // file count: 50 ms per chunk commit, never below the original 5 s. A
-    // real regression in the per-chunk marker bookkeeping still blows past
-    // it; the corpus growing does not (issue #125).
-    let ceiling = (0.05 * bf.len() as f64).max(5.0);
+    // Gate on the excess ratio. Measured (Windows debug, 145 files, 3.08 MB;
+    // see PR #141): idle 0.40-0.47, with 32 CPU burners on 32 cores 0.26-0.57
+    // (absolute per-chunk ms rises 3-10x under load, so a fixed ms gate
+    // cannot separate load from a regression; the ratio can). An injected
+    // 30 ms per chunk commit, or per-chunk bookkeeping that grows with the
+    // number of chunks, both land well above the gate: +30 ms per commit\n    // gave 2.84-2.95x, a sleep of 0.2 ms x chunk index 1.59-1.64x.
+    const EXCESS_GATE: f64 = 1.0;
     assert!(
-        elapsed.as_secs_f64() < ceiling,
-        "indexing this repo's own corpus ({} files, one per chunk) took {:.1} ms; expected under \
-         {:.1} s (50 ms per chunk commit, at least 5 s) even with the added marker write per chunk",
-        bf.len(),
-        elapsed.as_secs_f64() * 1000.0,
-        ceiling
+        excess < EXCESS_GATE,
+        "one-chunk-per-file ingest was {excess:.2}x slower than unchunked ({per_chunk_ms:.2} ms \
+         per chunk; unchunked {:.1} ms, chunked {:.1} ms, {chunks} chunks); expected under \
+         {EXCESS_GATE}x",
+        unchunked * 1000.0,
+        chunked * 1000.0
+    );
+    // Very generous absolute sanity bound only (~20x the idle debug time).
+    assert!(
+        chunked < 60.0,
+        "chunked ingest took {chunked:.1} s, expected well under 60 s"
     );
 }
 
@@ -1671,9 +1710,8 @@ fn rebuild_refs_crash_before_commit_leaves_pre_rebuild_state_untouched() {
 
 /// Wall-clock cost of `rebuild_refs` (ADR 0003 story 3, slice 3m gate):
 /// under 50 ms on this repo's own `crates/` tree, and the cost ratio between
-/// a 2x-corpus run (the same files ingested twice, under a second org) and
-/// the 1x run stays under 2.5x -- not e.g. 4x+, which would indicate
-/// quadratic behavior.
+/// a 4x-corpus run (the same files ingested under four orgs) and the 1x run
+/// stays under 8x -- linear is ~4x, quadratic ~16x (issue #86).
 #[test]
 fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
     use graph_core::Extractor;
@@ -1696,43 +1734,44 @@ fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
         let _ = s1.ingest_file("o", "r", &rel, "rust", &ex);
     }
 
-    let s2 = V2Store::open(d.path().join("2x.redb")).unwrap();
-    for org in ["o1", "o2"] {
+    // A 4x corpus (the same files under four orgs), not 2x: linear cost gives
+    // ~4x and quadratic ~16x, so the 8x gate (their geometric midpoint) has a
+    // 2x margin on both sides. With a 2x corpus linear (~2.0x measured) and
+    // quadratic (4x) were only 2x apart and a 2.5x gate flaked at 2.54x on a
+    // loaded runner (issue #86).
+    let s4 = V2Store::open(d.path().join("4x.redb")).unwrap();
+    for org in ["o1", "o2", "o3", "o4"] {
         for path in &files {
             let Ok(src) = std::fs::read_to_string(path) else {
                 continue;
             };
             let rel = path.to_string_lossy().replace('\\', "/");
             let ex = extractor.extract(&src);
-            let _ = s2.ingest_file(org, "r", &rel, "rust", &ex);
+            let _ = s4.ingest_file(org, "r", &rel, "rust", &ex);
         }
     }
 
-    // Averages several reps (with one untimed warm-up call first, so the
-    // first-call allocator/page-cache cost does not skew a single sample) to
-    // damp scheduler noise on a shared CI box.
-    fn avg_ms(s: &V2Store, reps: usize) -> f64 {
-        s.rebuild_refs().unwrap();
+    // Fastest single call: contention from tests running in parallel only
+    // ever adds time, so the minimum over many individual calls is the least
+    // noisy estimate, and a single quiet call suffices (an average over a
+    // batch of calls, as before, absorbs any burst of load that lands in it).
+    fn one_ms(s: &V2Store) -> f64 {
         let t = std::time::Instant::now();
-        for _ in 0..reps {
-            s.rebuild_refs().unwrap();
-        }
-        t.elapsed().as_secs_f64() * 1000.0 / reps as f64
+        s.rebuild_refs().unwrap();
+        t.elapsed().as_secs_f64() * 1000.0
     }
-
-    // Best of several interleaved rounds per size: contention from tests
-    // running in parallel only ever adds time, so the minimum is the least
-    // noisy estimate (issue #78: single rounds gave 2.7-3.4x on a loaded CI
-    // runner vs ~1.3-1.5x unloaded).
-    let reps = 10;
-    let (mut ms1, mut ms2) = (f64::MAX, f64::MAX);
-    for _ in 0..5 {
-        ms1 = ms1.min(avg_ms(&s1, reps));
-        ms2 = ms2.min(avg_ms(&s2, reps));
+    // Untimed warm-up so first-call allocator/page-cache cost is not sampled.
+    s1.rebuild_refs().unwrap();
+    s4.rebuild_refs().unwrap();
+    // Interleaved rounds (issue #78), so a busy spell hits both sizes.
+    let (mut ms1, mut ms4) = (f64::MAX, f64::MAX);
+    for _ in 0..15 {
+        ms1 = ms1.min(one_ms(&s1));
+        ms4 = ms4.min(one_ms(&s4));
     }
-    let ratio = ms2 / ms1.max(0.001);
+    let ratio = ms4 / ms1.max(0.001);
     eprintln!(
-        "rebuild_refs cost: 1x corpus ({} files) {ms1:.3} ms/call, 2x corpus {ms2:.3} ms/call, \
+        "rebuild_refs cost: 1x corpus ({} files) {ms1:.3} ms/call, 4x corpus {ms4:.3} ms/call, \
          ratio {ratio:.2}x",
         files.len()
     );
@@ -1741,13 +1780,13 @@ fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
         "rebuild_refs on the 1x corpus took {ms1:.3} ms, expected < 50 ms"
     );
     assert!(
-        ratio < 2.5,
-        "rebuild_refs cost ratio (2x/1x) was {ratio:.2}x, expected < 2.5x (a quadratic-behavior \
-         gate, not a tight bound)"
+        ratio < 8.0,
+        "rebuild_refs cost ratio (4x/1x) was {ratio:.2}x, expected < 8x (linear is ~4x, \
+         quadratic ~16x; a quadratic-behavior gate, not a tight bound)"
     );
 
     s1.check_consistency(false);
-    s2.check_consistency(false);
+    s4.check_consistency(false);
 }
 
 /// A single term occurring far more than `codec::POSTING_BLOCK` times in one

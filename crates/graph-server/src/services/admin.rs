@@ -18,7 +18,8 @@
 //! * Idempotence (a client retry after a lost answer, or two concurrent
 //!   requests): `Promote` of a voter, `AddLearner` of a member at the same
 //!   address, and `Remove` of a non-member succeed without a change,
-//!   answering the log index of the membership in effect.
+//!   answering the log index of the membership in effect (`Remove` also sets
+//!   `not_a_member`, so an operator sees a mistyped id).
 //! * `Remove`: the leader itself ("transfer leadership first"), 3 voters
 //!   down to 2 without `force`, and any removal for which the voters that
 //!   are reachable now are fewer than a quorum of the new voter set or of
@@ -280,8 +281,9 @@ fn reachable_voters(ctx: &Ctx, voters: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
         .collect()
 }
 
-/// `Remove` on the leader, with its guards.
-async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Status> {
+/// `Remove` on the leader, with its guards. Returns the log index and
+/// whether `id` was not a member (nothing changed; see issue #122).
+async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<(u64, bool), Status> {
     ensure_leader_idle(ctx)?;
     if id == ctx.info.node_id {
         return Err(rejected(format!(
@@ -297,12 +299,12 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Statu
             node = id,
             "remove: node {id} is not a member; nothing to remove"
         );
-        return Ok(membership_index(&m));
+        return Ok((membership_index(&m), true));
     }
     let voters: BTreeSet<NodeId> = mem.voter_ids().collect();
     if !voters.contains(&id) {
         // A learner: no quorum is affected.
-        return ctx.raft.remove(id, false).await.map_err(status);
+        return Ok((ctx.raft.remove(id, false).await.map_err(status)?, false));
     }
     let after: BTreeSet<NodeId> = voters.iter().copied().filter(|v| *v != id).collect();
     if after.is_empty() {
@@ -333,7 +335,7 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<u64, Statu
              failure (a quorum of 2 is 2); pass --force to do it anyway, or add a voter first"
         )));
     }
-    ctx.raft.remove(id, true).await.map_err(status)
+    Ok((ctx.raft.remove(id, true).await.map_err(status)?, false))
 }
 
 /// Holds the transfer slot (new writes and membership changes answer
@@ -975,9 +977,14 @@ impl pb::admin_server::Admin for AdminService {
     ) -> Result<Response<pb::RemoveResponse>, Status> {
         on_leader!(self, req, remove);
         let r = req.into_inner();
-        let log_index = remove_guarded(&self.ctx, r.node_id, r.force).await?;
-        tracing::info!(node = r.node_id, log_index, "removed a member");
-        Ok(Response::new(pb::RemoveResponse { log_index }))
+        let (log_index, not_a_member) = remove_guarded(&self.ctx, r.node_id, r.force).await?;
+        if !not_a_member {
+            tracing::info!(node = r.node_id, log_index, "removed a member");
+        }
+        Ok(Response::new(pb::RemoveResponse {
+            log_index,
+            not_a_member,
+        }))
     }
 
     async fn transfer_leader(

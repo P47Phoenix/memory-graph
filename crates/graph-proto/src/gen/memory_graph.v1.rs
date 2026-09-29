@@ -3375,6 +3375,12 @@ pub struct RemoveRequest {
 pub struct RemoveResponse {
     #[prost(uint64, tag = "1")]
     pub log_index: u64,
+    /// The node was not a member, so nothing changed (Remove stays idempotent;
+    /// log_index is then the current membership's). Additive (ADR 0004 D1, no
+    /// PROTOCOL_VERSION bump): an older server never sets it, and false keeps
+    /// the old meaning.
+    #[prost(bool, tag = "2")]
+    pub not_a_member: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransferLeaderRequest {

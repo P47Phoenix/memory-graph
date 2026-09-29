@@ -290,8 +290,11 @@ fn membership_changes_are_idempotent() {
     // A voter at the same address: add-learner is a no-op, not a demotion.
     tb.client(1).admin_add_learner(2, &addr, true).unwrap();
     assert!(tb.membership(1).0.contains(&2), "still a voter");
-    tb.client(1).admin_remove(2, true).unwrap();
-    tb.client(1).admin_remove(2, true).unwrap();
+    let first = tb.client(1).admin_remove(2, true).unwrap();
+    assert!(!first.not_a_member, "{first:?}");
+    // #122: the repeat is still OK, but says there was nothing to remove.
+    let again = tb.client(1).admin_remove(2, true).unwrap();
+    assert!(again.not_a_member, "{again:?}");
     assert!(!tb.membership(1).0.contains(&2));
     assert!(!tb.membership(1).1.contains(&2));
 }
@@ -481,7 +484,9 @@ fn remove_guards() {
     let e = via.admin_remove(a, false).unwrap_err();
     assert!(e.to_string().contains("--force"), "{e}");
     // A non-member: nothing to remove, an idempotent OK (a retried remove).
-    via.admin_remove(42, true).unwrap();
+    // #122: reported, so an operator notices a mistyped id.
+    let r = via.admin_remove(42, true).unwrap();
+    assert!(r.not_a_member && !r.retried, "{r:?}");
     assert_eq!(tb.membership(leader).0.len(), 3);
     // A voter down: removing another would leave one reachable voter of
     // two, below a quorum of 2.
@@ -497,7 +502,8 @@ fn remove_guards() {
     wait_peer(&tb, b, "node b healthy again", |p| {
         p.last_error.is_empty() && p.lag == 0 && p.matched_index.is_some()
     });
-    tb.client(leader).admin_remove(a, true).unwrap();
+    let r = tb.client(leader).admin_remove(a, true).unwrap();
+    assert!(!r.not_a_member, "{r:?}");
     tb.wait_voters(&[leader, b], CLUSTER_WAIT);
     let (p, bytes) = small_file(1);
     tb.client(leader)
