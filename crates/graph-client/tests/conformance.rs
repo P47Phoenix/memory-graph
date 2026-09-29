@@ -66,6 +66,67 @@ fn remote_matches_embedded_differential() {
     conformance::run_differential(&*embedded, &remote);
 }
 
+/// #120: a Windows client sends `\` paths to a server; the server's answers
+/// equal an embedded index of the same tree with `/` paths (no
+/// `dir\.gitignore` read as language `gitignore` on a Linux host).
+#[test]
+fn backslash_batch_through_server_equals_embedded() {
+    let d = tempfile::tempdir().unwrap();
+    let embedded = open_store(&d.path().join("e.redb"), rust()).unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), rust());
+    let remote = connect(&server);
+    let files = [
+        ("dir/.gitignore", &b"target\nfoo\n"[..]),
+        ("src/lib.rs", &b"fn foo() { bar(); }\n"[..]),
+        ("src/deep/x.txt", &b"foo bar\n"[..]),
+    ];
+    let batch = |sep: &str| -> Vec<(String, &[u8])> {
+        files
+            .iter()
+            .map(|(p, b)| (p.replace('/', sep), *b))
+            .collect()
+    };
+    let run = |s: &dyn Store, sep: &str| {
+        let owned = batch(sep);
+        let fs: Vec<_> = owned
+            .iter()
+            .map(|(p, b)| BatchFile {
+                path: p,
+                bytes: b,
+                language: None,
+                origin: Some(ORIGIN_DIRECTORY),
+            })
+            .collect();
+        for r in s
+            .index_batch("o", "r", &fs, IndexOptions::default())
+            .unwrap()
+        {
+            r.unwrap();
+        }
+    };
+    run(&*embedded, "/");
+    run(&remote, "\\");
+    let describe = |s: &dyn Store| format!("{:?}", s.describe(None, None).unwrap());
+    assert_eq!(describe(&*embedded), describe(&remote));
+    assert!(
+        !describe(&remote).contains("gitignore"),
+        "{}",
+        describe(&remote)
+    );
+    let hits = |s: &dyn Store| {
+        let mut v: Vec<_> = s
+            .search(&Query::new("foo"))
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.file, h.language, h.symbol))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(hits(&*embedded), hits(&remote));
+    assert_eq!(hits(&remote).len(), 3);
+}
+
 #[test]
 fn remote_matches_embedded_differential_linearizable_reads() {
     let d = tempfile::tempdir().unwrap();

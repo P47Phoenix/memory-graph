@@ -551,7 +551,9 @@ impl Store for RemoteStore {
             org: org.into(),
             repo: repo.into(),
             file: Some(pb::FileBytes {
-                path: path.into(),
+                // `/`-separated on the wire whatever the client OS (#120); the
+                // server's store normalizes again on apply.
+                path: graph_core::normalize_path(path),
                 bytes: bytes.to_vec(),
                 language: language.map(str::to_string),
                 origin: origin.map(str::to_string),
@@ -581,7 +583,7 @@ impl Store for RemoteStore {
         let req = pb::IngestExtractionRequest {
             org: org.into(),
             repo: repo.into(),
-            path: path.into(),
+            path: graph_core::normalize_path(path),
             language: language.into(),
             extraction: Some(ex.clone().into()),
             origin: origin.map(str::to_string),

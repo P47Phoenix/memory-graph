@@ -92,6 +92,7 @@ pub const CASES: &[(&str, Case)] = &[
     ),
     ("prepared_duplicate_paths", prepared_duplicate_paths),
     ("remote_prepared_is_rejected", remote_prepared_is_rejected),
+    ("backslash_paths", backslash_paths),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -2209,6 +2210,67 @@ fn prepared_changed_file_replaces(h: &Harness) {
     let st = out[0].as_ref().unwrap();
     assert!(st.replaced && !st.unchanged, "{st:?}");
     assert_eq!(s.search(&Query::new("bar")).unwrap().len(), 1);
+}
+
+/// Stored paths are `/`-separated whatever the caller sent (#100, #120): a
+/// `\` path from a Windows walk or client is the same file as its `/` twin
+/// on every write path (batch, prepared, bytes, pre-extracted ingest), and
+/// the language is read from the last component on either separator, so
+/// `dir\.gitignore` is `unknown`, not `gitignore`.
+fn backslash_paths(h: &Harness) {
+    let s = open(h);
+    let d = IndexOptions::default();
+    let auto = |path| BatchFile {
+        path,
+        bytes: b"foo",
+        language: None,
+        origin: Some(ORIGIN_DIRECTORY),
+    };
+    s.index_batch(
+        "o",
+        "r",
+        &[auto(r"dir\.gitignore"), bf(r"src\a.txt", b"foo")],
+        d,
+    )
+    .unwrap();
+    let p = prepare_all(&*s, "r", &[bf(r"src\b.txt", b"foo")], d);
+    s.index_prepared("o", "r", p, d).unwrap();
+    s.index_bytes("o", "r", r".\src\c.txt", b"foo", Some("text"))
+        .unwrap();
+    s.ingest_file("o", "r", r"src\lib.rs", "rust", &rust_extraction(RUST))
+        .unwrap();
+    for f in [
+        "dir/.gitignore",
+        "src/a.txt",
+        "src/b.txt",
+        "src/c.txt",
+        "src/lib.rs",
+    ] {
+        assert!(s.file_tokens("o", "r", f).unwrap().is_some(), "{f}");
+        let back = f.replace('/', "\\");
+        assert!(s.file_tokens("o", "r", &back).unwrap().is_some(), "{back}");
+    }
+    let info = &s.describe(Some("o"), Some("r")).unwrap()[0];
+    assert_eq!(info.files, 5, "{info:?}");
+    let langs: Vec<_> = info.languages.keys().cloned().collect();
+    assert_eq!(langs, ["rust", "text", "unknown"], "{info:?}");
+    // The `/` twin of an indexed `\` path is the same, unchanged file.
+    let st = s
+        .index_batch("o", "r", &[bf("src/a.txt", b"foo")], d)
+        .unwrap();
+    assert!(st[0].as_ref().unwrap().unchanged, "{st:?}");
+    let mut files: Vec<_> = s
+        .search(&Query::new("foo"))
+        .unwrap()
+        .into_iter()
+        .filter_map(|h| h.file)
+        .collect();
+    files.sort();
+    files.dedup();
+    assert!(files.iter().all(|f| !f.contains('\\')), "{files:?}");
+    let mut q = SymbolQuery::new("*");
+    q.file = Some(r"src\lib.rs".into());
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 3);
 }
 
 /// The same path twice in one batch (`./x` normalizes to `x`): the prepared

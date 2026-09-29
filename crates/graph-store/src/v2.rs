@@ -3208,6 +3208,11 @@ impl V2Store {
         }
         let language = language.to_ascii_lowercase();
         let language = language.as_str();
+        // Every write path lands here, including a pre-extracted ingest
+        // (NDJSON, `IngestExtraction` from a remote client): the stored path
+        // is `/`-separated and normalized whatever the caller sent (#100, #120).
+        let path = normalize_path(path);
+        let path = path.as_str();
         let mut w = W::new(wt)?;
         let mut tally = Tally::default();
         let mut next = w.meta.get("next_id")?.map_or(1, |v| v.value());

@@ -3,11 +3,7 @@
 /// Lowercased language name from a file extension; unknown extensions use the
 /// extension itself, and no extension gives `unknown`.
 pub fn detect_language(path: &str) -> String {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = extension(path).unwrap_or_default();
     match ext.as_str() {
         "rs" => "rust",
         "py" => "python",
@@ -32,10 +28,7 @@ pub fn detect_language(path: &str) -> String {
 /// content (a `#!` interpreter line). Never needs to be told the language.
 pub fn detect_language_from_content(path: &str, src: &str) -> String {
     let by_path = detect_language(path);
-    let name = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = file_name(path);
     match name.to_ascii_lowercase().as_str() {
         "makefile" | "gnumakefile" => return "make".into(),
         "dockerfile" => return "dockerfile".into(),
@@ -69,10 +62,28 @@ pub fn detect_language_from_content(path: &str, src: &str) -> String {
     }
 }
 
-/// Normalize a path for use as file identity: no `.`
+/// The last component of `path`, splitting on both `/` and `\` whatever the
+/// host OS, so a path sent by a Windows client (`dir\.gitignore`) is read the
+/// same way on a Linux server (#120).
+pub fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Lowercased extension of [`file_name`]`(path)`, with the same rules as
+/// [`std::path::Path::extension`] (`.gitignore` has none).
+pub fn extension(path: &str) -> Option<String> {
+    std::path::Path::new(file_name(path))
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+/// Normalize a path for use as file identity: `/`-separated on every OS
+/// (`\` is read as a separator, so `src\a.rs` is `src/a.rs`), no `.`
 /// components, `..` resolved where possible. `a.rs`, `./a.rs` and `x/../a.rs`
 /// are the same file.
 pub fn normalize_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
     let abs = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
     for c in path.split('/') {
@@ -101,6 +112,19 @@ mod tests {
         assert_eq!(normalize_path("x/../a.rs"), "a.rs");
         assert_eq!(normalize_path("/tmp//a/./b.rs"), "/tmp/a/b.rs");
         assert_eq!(normalize_path("../a.rs"), "../a.rs");
+        assert_eq!(normalize_path(r"src\lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path(r".\a\..\b/c.rs"), "b/c.rs");
+    }
+
+    #[test]
+    fn both_separators_detect_the_same_language() {
+        // #120: a Windows client's path read on any host.
+        assert_eq!(detect_language(r"dir\.gitignore"), "unknown");
+        assert_eq!(detect_language("dir/.gitignore"), "unknown");
+        assert_eq!(detect_language(r"a.b\c"), "unknown");
+        assert_eq!(detect_language(r"x\lib.RS"), "rust");
+        assert_eq!(detect_language_from_content(r"d\Makefile", ""), "make");
+        assert_eq!(file_name(r"a\b/c"), "c");
     }
 
     #[test]
