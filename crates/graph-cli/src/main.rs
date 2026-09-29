@@ -612,6 +612,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Serve the Model Context Protocol over stdio, read-only (ADR 0005): an AI assistant starts
+    /// this command and calls its tools (describe, list_repos, search, find_symbols, file_outline,
+    /// file_tokens, list_files). Reads --db, or --server / MEMORY_GRAPH_SERVER with --read. Stdout
+    /// carries only protocol messages; logs go to stderr. Client configuration: docs/mcp.md
+    Mcp,
 }
 
 /// Store settings taken from CLI flags. Both default to redb/`V2Store`
@@ -865,7 +870,11 @@ fn run() -> Result<i32> {
     }
     let _ = REMOTE_IS_READ.set(matches!(
         cli.cmd,
-        Cmd::Describe { .. } | Cmd::Symbols { .. } | Cmd::Search { .. } | Cmd::Export { .. }
+        Cmd::Describe { .. }
+            | Cmd::Symbols { .. }
+            | Cmd::Search { .. }
+            | Cmd::Export { .. }
+            | Cmd::Mcp
     ));
     reject_legacy_backend(cli.backend)?;
     let overrides = cli.overrides();
@@ -1158,6 +1167,39 @@ fn run() -> Result<i32> {
     };
     match cli.cmd {
         Cmd::Serve { .. } => unreachable!("handled above"),
+        Cmd::Mcp => {
+            // Stdout is the protocol channel: everything else goes to stderr.
+            let backend = match &remote_addr {
+                Some((addr, read)) => {
+                    let store = remote(addr, *read, overrides)?;
+                    let log = store.read_log();
+                    eprintln!("memory-graph mcp: serving server {addr} (read {read:?}) over stdio");
+                    graph_mcp::StoreBackend::remote(
+                        Box::new(store),
+                        Box::new(move || log.stale_reads()),
+                    )
+                }
+                None => {
+                    let store = open_existing(&target, overrides)?;
+                    if let Target::Embedded(db) = &target {
+                        eprintln!(
+                            "memory-graph mcp: serving {} over stdio (read-only)",
+                            db.display()
+                        );
+                    }
+                    graph_mcp::StoreBackend::embedded(store)
+                }
+            };
+            let mut server =
+                graph_mcp::McpServer::new(backend, "memory-graph", env!("CARGO_PKG_VERSION"));
+            graph_mcp::serve_stdio(
+                &mut server,
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )
+            .context("mcp stdio")?;
+            eprintln!("memory-graph mcp: stdin closed, exiting");
+        }
         Cmd::Health { ready } => {
             let (addr, read) = need_server("health")?;
             let service = if ready {

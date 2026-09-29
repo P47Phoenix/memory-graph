@@ -1,0 +1,112 @@
+# MCP: the memory graph for AI assistants
+
+`memory-graph mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so an assistant (Claude Code, Claude Desktop, or any MCP client) can search the graph, find symbols, describe repos and outline files. The design is [ADR 0005](adr/0005-mcp.md).
+
+- **Read-only.** There are no tools that write.
+- **stdio only** in this release. The client starts `memory-graph mcp` itself; no port is opened. The HTTP endpoint inside `serve` (`--mcp-listen`) is story 32 and not built yet.
+- **No MCP SDK.** The protocol code is hand-written (`crates/graph-mcp`), so the pure-Rust gate stays clean.
+
+> **Warning: no authentication.** MCP in memory-graph has no authentication (#105). Over stdio this is fine: only the client that started the process can talk to it. The future HTTP endpoint will be off by default and loopback only. *The MCP endpoint has no authentication. Anyone who can reach it can read every indexed source token. Keep it on loopback or behind an authenticating proxy until #105.*
+
+## Quick start
+
+Index something first, then check the command works from a terminal:
+
+```sh
+memory-graph --db /abs/path/graph.redb index --org me --repo myproj ./myproj
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"sh","version":"0"}}}' \
+  | memory-graph --db /abs/path/graph.redb mcp
+```
+
+It prints one line of JSON (the `initialize` result) on stdout, a startup line on stderr, and exits when stdin closes.
+
+## Choosing the target
+
+`mcp` uses the same target flags as every other command:
+
+| You have | Run | Notes |
+|---|---|---|
+| a database file | `memory-graph --db /abs/path/graph.redb mcp` | Opens the file in this process and holds its lock while running: an `index` of the same file waits, then fails with `Locked`. Use a server if you index while the assistant is connected. |
+| a `memory-graph serve` | `memory-graph --server 127.0.0.1:7000 mcp` | Several nodes as `h1:7000,h2:7000`. `--read linearizable` for reads that see every acknowledged write (default `local`). `MEMORY_GRAPH_SERVER` / `MEMORY_GRAPH_READ` also work. |
+
+Always give an **absolute** `--db` path: the client decides the working directory of the process it starts.
+
+## Client configuration
+
+### Claude Code
+
+From a shell:
+
+```sh
+claude mcp add memory-graph -- memory-graph --db /abs/path/graph.redb mcp
+# or against a server:
+claude mcp add memory-graph -- memory-graph --server 127.0.0.1:7000 mcp
+```
+
+Or check it into a project as `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory-graph": {
+      "command": "memory-graph",
+      "args": ["--db", "/abs/path/graph.redb", "mcp"]
+    }
+  }
+}
+```
+
+`claude mcp list` shows whether it connected; `/mcp` inside Claude Code lists its tools.
+
+### Claude Desktop
+
+Edit `claude_desktop_config.json` (Settings > Developer > Edit Config; on macOS `~/Library/Application Support/Claude/`, on Windows `%APPDATA%\Claude\`) and restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "memory-graph": {
+      "command": "/abs/path/to/memory-graph",
+      "args": ["--db", "/abs/path/graph.redb", "mcp"]
+    }
+  }
+}
+```
+
+On Windows use `memory-graph.exe` and escaped backslashes (`"C:\\tools\\memory-graph.exe"`, `"C:\\data\\graph.redb"`). For a server, the args are `["--server", "127.0.0.1:7000", "mcp"]`, optionally with `"--read", "linearizable"` before `mcp`.
+
+### Other clients
+
+Any MCP client with a stdio transport works: the command is `memory-graph`, the arguments are the target flags followed by `mcp`.
+
+## Protocol
+
+- MCP revisions **2025-11-25** and **2025-06-18** (the latest stable one at build time and the one before it). Another `protocolVersion` in `initialize` is refused with JSON-RPC error `-32602` "Unsupported protocol version" and `data: {supported, requested}`.
+- One JSON-RPC 2.0 message per line on stdin, one reply per line on stdout. Batches are refused (`-32600`), as MCP dropped them in 2025-06-18. Ids are strings or integers.
+- Methods: `initialize`, `ping`, `tools/list`, `tools/call`; notifications `notifications/initialized` and `notifications/cancelled` (accepted; requests are answered one at a time, so a cancelled request has already finished). Before `initialize` only `initialize` and `ping` are answered (`-32002` otherwise).
+- **stdout carries only protocol messages.** Logs and errors go to stderr.
+
+## Tools
+
+All seven are read-only (`readOnlyHint: true`), address things by org, repo and path names (never node ids), declare an `inputSchema` and an `outputSchema`, and answer with `structuredContent` plus the same JSON as a text block.
+
+| Tool | Arguments | Answer |
+|---|---|---|
+| `describe` | `org?`, `repo?` | `{repos, stale_possible}`: per repo its files, languages, symbol kinds and token classes (the same as `describe --json`) |
+| `list_repos` | `org?`, paging | items `{org, repo}` |
+| `search` | `text`, `grain?` (`token`, `symbol` (default), `method`, `class`, `file`, `repo`, `org`), `language?`, `org?`, `repo?`, `token_class?`, `symbol_kind?`, paging | items as in `search --json`: `{grain, org, repo, file, language, symbol, symbol_kind, lang_kind, token_class, span, count, no_symbols, no_matching_symbol}` |
+| `find_symbols` | `pattern` (`name`, `prefix*`, `*`), `kind?`, `language?`, `org?`, `repo?`, `file?`, paging | items as in `symbols --json` |
+| `file_outline` | `org`, `repo`, `path`, paging | the file's symbols in source order |
+| `file_tokens` | `org`, `repo`, `path`, `start_line?`, `end_line?`, paging | items `{text, token_class, span}` of the tokens starting on those lines |
+| `list_files` | `org`, `repo`, `prefix?`, paging | items `{path, language, has_errors}` |
+
+A span is `{start, end, start_line, start_col, end_line, end_col}`: byte offsets `[start, end)` and 1-based lines and columns, as in the CLI's `--json`.
+
+**Paging.** List tools take `limit` (default 50, at most 500) and `offset` (default 0) and answer `{items, next_offset, stale_possible}`. `next_offset` is the `offset` of the next page, or `null` at the end. Each page is read from the database as it is at that moment (there is no snapshot across pages in v1). A page whose items would exceed 4 MiB is cut short, with `next_offset` pointing at the first item left out.
+
+**`stale_possible`** is `true` when a read of that call went to a server node that may have missed acknowledged writes (ADR 0004 D8). It is always `false` with `--db`.
+
+**Errors.**
+- Arguments that do not fit the `inputSchema` (a wrong type, an unknown argument, `limit` above 500, an unknown `grain` or `token_class`) are a JSON-RPC `-32602` error; the message lists the valid values.
+- Arguments that name something not indexed (an org, repo, language, symbol kind or file) are a result with `isError: true` and a text block `{"code": "invalid_argument", "message": ..., "retryable": false}`; the message lists what is present.
+- A store error is a result with `isError: true` and `{code, message, retryable}`, the code being the error kind (`no_leader`, `locked`, `corrupt`, `rejected`, ...). `no_leader` is retryable and carries `retry_after_ms`.

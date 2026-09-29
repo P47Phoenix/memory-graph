@@ -1,0 +1,21 @@
+[package]
+name = "graph-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "memory-graph MCP core (ADR 0005 D1): JSON-RPC 2.0 framing, the MCP lifecycle and the read-only tools over graph_store::StoreRead. Hand-rolled, no MCP SDK."
+
+# ADR 0005 D1: graph-store types and serde_json only; no redb, tonic or
+# language crate at run time.
+[dependencies]
+graph-core = { path = "../graph-core" }
+graph-store = { path = "../graph-store" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+graph-server = { path = "../graph-server" }
+graph-client = { path = "../graph-client" }
+graph-lang-rust = { path = "../graph-lang-rust" }
+tempfile.workspace = true
+proptest.workspace = true

@@ -43,6 +43,7 @@ graph-store = { path = "../graph-store" }
 graph-server = { path = "../graph-server" }
 graph-client = { path = "../graph-client" }
 graph-proto = { path = "../graph-proto" }
+graph-mcp = { path = "../graph-mcp" }
 graph-lang-rust = { path = "../graph-lang-rust", optional = true }
 graph-lang-csharp = { path = "../graph-lang-csharp", optional = true }
 graph-lang-javascript = { path = "../graph-lang-javascript", optional = true }

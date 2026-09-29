@@ -695,6 +695,7 @@ dependencies = [
  "graph-lang-shell",
  "graph-lang-sql",
  "graph-lang-typescript",
+ "graph-mcp",
  "graph-proto",
  "graph-server",
  "graph-store",
@@ -913,6 +914,21 @@ dependencies = [
  "graph-core",
  "graph-lang-javascript",
  "proptest",
+]
+
+[[package]]
+name = "graph-mcp"
+version = "0.1.0"
+dependencies = [
+ "graph-client",
+ "graph-core",
+ "graph-lang-rust",
+ "graph-server",
+ "graph-store",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
