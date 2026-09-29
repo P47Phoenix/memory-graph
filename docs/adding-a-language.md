@@ -120,7 +120,7 @@ generators such as tree-sitter: the pure-Rust gate forbids them).
 - `matching_close(tokens, i)` — index of the delimiter closing `tokens[i]`,
   ignoring delimiters inside literals and comments; `None` if unbalanced.
   It scans forward from `i`, so calling it for every opener is quadratic on
-  long unbalanced runs (100k `(` took ~22 s): scanners that look up closers
+  long unbalanced runs such as 100k `(`: scanners that look up closers
   in a loop should build a table once instead.
 - `close_table(tokens)` — `matching_close` for every token in one linear
   pass (`close_table(tokens)[i] == matching_close(tokens, i)`, proptested).

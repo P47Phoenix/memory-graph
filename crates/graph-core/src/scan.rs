@@ -518,14 +518,20 @@ mod close_table_tests {
                 prop_oneof![
                     Just("("), Just(")"), Just("["), Just("]"), Just("{"), Just("}"),
                     Just("a"), Just("\"(\""), Just("'}'"), Just("/*{*/"), Just("//)\n"),
-                    Just("\n#if (\n"),
+                    Just("\n#if (\n"), Just("'('"), Just("-- )\n"), Just("# {\n"),
+                    Just("$$ ( $$"), Just("r#\"[\"#"),
                 ],
                 0..48,
             ),
+            dialect in 0usize..6,
             keep in proptest::collection::vec(any::<bool>(), 0..200),
         ) {
             let src = parts.join(" ");
-            let tokens = tokenize(&src);
+            use crate::tokenizer::{tokenize_with, TokenizerOptions as O};
+            // Dialects change what is a comment or literal, so the trivia
+            // skip is exercised on more than the default tokenizer.
+            let opts = [O::DEFAULT, O::SQL, O::SHELL, O::CSHARP, O::RUST, O::PYTHON][dialect];
+            let tokens = tokenize_with(&src, opts);
             let table = close_table(&tokens);
             prop_assert_eq!(table.len(), tokens.len());
             for (i, got) in table.iter().enumerate() {

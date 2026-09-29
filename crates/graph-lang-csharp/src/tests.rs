@@ -281,3 +281,24 @@ fn nesting_below_the_cap_is_unchanged() {
     let ex = on_small_stack(move || CSharpExtractor.extract(&src));
     assert_eq!(ex.symbols.len(), n);
 }
+
+/// Nesting at the cap is reported in full; one level deeper drops only the
+/// innermost namespace.
+#[test]
+fn nesting_at_and_past_the_cap() {
+    for (n, expected) in [(MAX_DEPTH, MAX_DEPTH), (MAX_DEPTH + 1, MAX_DEPTH)] {
+        let src = format!("{}{}", "namespace a {".repeat(n), "}".repeat(n));
+        let ex = on_small_stack(move || CSharpExtractor.extract(&src));
+        assert_eq!(ex.symbols.len(), expected, "n = {n}");
+    }
+}
+
+/// Depth is restored after each body: many siblings are all scanned.
+#[test]
+fn siblings_do_not_accumulate_depth() {
+    let n = MAX_DEPTH + 44;
+    let src = format!("namespace N {{ {} }}", "class A { void M(){} } ".repeat(n));
+    let ex = CSharpExtractor.extract(&src);
+    let methods = ex.symbols.iter().filter(|s| s.name.ends_with("M")).count();
+    assert_eq!(methods, n);
+}
