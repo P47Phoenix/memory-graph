@@ -13,7 +13,7 @@ name = "memory-graph"
 path = "src/main.rs"
 
 [features]
-default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-sql", "lang-shell", "lang-r", "lang-c", "lang-go", "lang-scala"]
+default = ["lang-rust", "lang-csharp", "lang-javascript", "lang-aspx", "lang-html", "lang-sql", "lang-shell", "lang-r", "lang-fsharp", "lang-haskell", "lang-elixir", "lang-gdscript", "lang-c", "lang-go", "lang-scala"]
 lang-rust = ["dep:graph-lang-rust"]
 lang-csharp = ["dep:graph-lang-csharp"]
 lang-javascript = ["dep:graph-lang-javascript"]
@@ -22,6 +22,10 @@ lang-html = ["dep:graph-lang-html"]
 lang-sql = ["dep:graph-lang-sql"]
 lang-shell = ["dep:graph-lang-shell"]
 lang-r = ["dep:graph-lang-r"]
+lang-fsharp = ["dep:graph-lang-fsharp"]
+lang-haskell = ["dep:graph-lang-haskell"]
+lang-elixir = ["dep:graph-lang-elixir"]
+lang-gdscript = ["dep:graph-lang-gdscript"]
 # One feature for both the C and the C++ extractor (one crate, one scanner).
 lang-c = ["dep:graph-lang-c"]
 lang-go = ["dep:graph-lang-go"]
@@ -41,6 +45,10 @@ graph-lang-html = { path = "../graph-lang-html", optional = true }
 graph-lang-sql = { path = "../graph-lang-sql", optional = true }
 graph-lang-shell = { path = "../graph-lang-shell", optional = true }
 graph-lang-r = { path = "../graph-lang-r", optional = true }
+graph-lang-fsharp = { path = "../graph-lang-fsharp", optional = true }
+graph-lang-haskell = { path = "../graph-lang-haskell", optional = true }
+graph-lang-elixir = { path = "../graph-lang-elixir", optional = true }
+graph-lang-gdscript = { path = "../graph-lang-gdscript", optional = true }
 graph-lang-c = { path = "../graph-lang-c", optional = true }
 graph-lang-go = { path = "../graph-lang-go", optional = true }
 graph-lang-scala = { path = "../graph-lang-scala", optional = true }

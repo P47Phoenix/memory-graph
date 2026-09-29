@@ -677,7 +677,11 @@ dependencies = [
  "graph-lang-aspx",
  "graph-lang-c",
  "graph-lang-csharp",
+ "graph-lang-elixir",
+ "graph-lang-fsharp",
+ "graph-lang-gdscript",
  "graph-lang-go",
+ "graph-lang-haskell",
  "graph-lang-html",
  "graph-lang-javascript",
  "graph-lang-r",
@@ -759,7 +763,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-lang-elixir"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-fsharp"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-gdscript"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
 name = "graph-lang-go"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "proptest",
+]
+
+[[package]]
+name = "graph-lang-haskell"
 version = "0.1.0"
 dependencies = [
  "graph-core",
