@@ -455,8 +455,9 @@ fn open_batch_marker_is_cleared_after_a_completed_batch() {
 /// asserts a generous wall-clock ceiling on indexing this repo's own
 /// `crates/` tree chunked finely enough that nearly every file is its own
 /// chunk (worst case for marker-write overhead), so a real regression in the
-/// marker bookkeeping would blow well past it. The ceiling scales with the
-/// number of files, because the tree grows (issue #125).
+/// marker bookkeeping would blow well past it. The ceiling scales with total
+/// source bytes plus a per-chunk allowance, because the tree grows and cost
+/// tracks bytes, not files (issues #125, #136).
 #[test]
 fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_own_corpus() {
     let files = this_repos_rust_corpus();
@@ -493,23 +494,37 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
     let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
     let elapsed = t.elapsed();
     assert!(results.iter().all(|r| r.is_ok()));
+    let total_bytes: usize = bf.iter().map(|f| f.bytes.len()).sum();
     eprintln!(
-        "chunked ingest with open-batch marker, {} files, one chunk each: {:.1} ms total",
+        "chunked ingest with open-batch marker, {} files ({} bytes), one chunk each: {:.1} ms total",
         bf.len(),
+        total_bytes,
         elapsed.as_secs_f64() * 1000.0
     );
-    // The corpus is this repo's own tree, which keeps growing (27 files when
-    // this gate was written; several times that after ADR 0004), and every
-    // file is its own fsync'd commit here. So the ceiling scales with the
-    // file count: 50 ms per chunk commit, never below the original 5 s. A
-    // real regression in the per-chunk marker bookkeeping still blows past
-    // it; the corpus growing does not (issue #125).
-    let ceiling = (0.05 * bf.len() as f64).max(5.0);
+    // The corpus is this repo's own tree, which keeps growing, and cost
+    // tracks bytes (tokens), not files: the extractor crates are few but
+    // large (issue #136; the #125 file-count ceiling failed at 7.9 s vs
+    // 7.2 s on CI). Measured on a debug build (Windows dev box, 145 files,
+    // 3.08 MB): the same batch unchunked takes 1.7-2.2 s (~0.6-0.7 us/byte),
+    // one-chunk-per-file 2.4-3.6 s, so per-chunk commit + marker cost is
+    // roughly 2-10 ms. The ceiling is:
+    //   2.5 us/byte  (~3.5x the local byte rate; CI ran ~3x slower)
+    // + 20 ms/chunk  (2-10x the measured per-chunk cost, covers a slow fsync)
+    // and never below the original 5 s. Today that is ~10.6 s against
+    // ~3 s locally and 7.9 s on the slowest CI run seen. What it still
+    // catches: bookkeeping that grows with the batch (quadratic in chunks:
+    // 145^2 marker rewrites) or a per-chunk cost of tens of ms (e.g. several
+    // extra fsyncs, or rewriting the whole marker table per chunk). A single
+    // extra ~5 ms fsync per chunk is within noise for any wall-clock gate;
+    // the marker-content tests above cover its correctness.
+    let ceiling = (2.5e-6 * total_bytes as f64 + 0.020 * bf.len() as f64).max(5.0);
     assert!(
         elapsed.as_secs_f64() < ceiling,
-        "indexing this repo's own corpus ({} files, one per chunk) took {:.1} ms; expected under \
-         {:.1} s (50 ms per chunk commit, at least 5 s) even with the added marker write per chunk",
+        "indexing this repo's own corpus ({} files, {} bytes, one file per chunk) took {:.1} ms; \
+         expected under {:.1} s (2.5 us/byte + 20 ms per chunk commit, at least 5 s) even with \
+         the added marker write per chunk",
         bf.len(),
+        total_bytes,
         elapsed.as_secs_f64() * 1000.0,
         ceiling
     );
@@ -1670,9 +1685,8 @@ fn rebuild_refs_crash_before_commit_leaves_pre_rebuild_state_untouched() {
 
 /// Wall-clock cost of `rebuild_refs` (ADR 0003 story 3, slice 3m gate):
 /// under 50 ms on this repo's own `crates/` tree, and the cost ratio between
-/// a 2x-corpus run (the same files ingested twice, under a second org) and
-/// the 1x run stays under 2.5x -- not e.g. 4x+, which would indicate
-/// quadratic behavior.
+/// a 4x-corpus run (the same files ingested under four orgs) and the 1x run
+/// stays under 8x -- linear is ~4x, quadratic ~16x (issue #86).
 #[test]
 fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
     use graph_core::Extractor;
@@ -1695,43 +1709,44 @@ fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
         let _ = s1.ingest_file("o", "r", &rel, "rust", &ex);
     }
 
-    let s2 = V2Store::open(d.path().join("2x.redb")).unwrap();
-    for org in ["o1", "o2"] {
+    // A 4x corpus (the same files under four orgs), not 2x: linear cost gives
+    // ~4x and quadratic ~16x, so the 8x gate (their geometric midpoint) has a
+    // 2x margin on both sides. With a 2x corpus linear (~2.0x measured) and
+    // quadratic (4x) were only 2x apart and a 2.5x gate flaked at 2.54x on a
+    // loaded runner (issue #86).
+    let s4 = V2Store::open(d.path().join("4x.redb")).unwrap();
+    for org in ["o1", "o2", "o3", "o4"] {
         for path in &files {
             let Ok(src) = std::fs::read_to_string(path) else {
                 continue;
             };
             let rel = path.to_string_lossy().replace('\\', "/");
             let ex = extractor.extract(&src);
-            let _ = s2.ingest_file(org, "r", &rel, "rust", &ex);
+            let _ = s4.ingest_file(org, "r", &rel, "rust", &ex);
         }
     }
 
-    // Averages several reps (with one untimed warm-up call first, so the
-    // first-call allocator/page-cache cost does not skew a single sample) to
-    // damp scheduler noise on a shared CI box.
-    fn avg_ms(s: &V2Store, reps: usize) -> f64 {
-        s.rebuild_refs().unwrap();
+    // Fastest single call: contention from tests running in parallel only
+    // ever adds time, so the minimum over many individual calls is the least
+    // noisy estimate, and a single quiet call suffices (an average over a
+    // batch of calls, as before, absorbs any burst of load that lands in it).
+    fn one_ms(s: &V2Store) -> f64 {
         let t = std::time::Instant::now();
-        for _ in 0..reps {
-            s.rebuild_refs().unwrap();
-        }
-        t.elapsed().as_secs_f64() * 1000.0 / reps as f64
+        s.rebuild_refs().unwrap();
+        t.elapsed().as_secs_f64() * 1000.0
     }
-
-    // Best of several interleaved rounds per size: contention from tests
-    // running in parallel only ever adds time, so the minimum is the least
-    // noisy estimate (issue #78: single rounds gave 2.7-3.4x on a loaded CI
-    // runner vs ~1.3-1.5x unloaded).
-    let reps = 10;
-    let (mut ms1, mut ms2) = (f64::MAX, f64::MAX);
-    for _ in 0..5 {
-        ms1 = ms1.min(avg_ms(&s1, reps));
-        ms2 = ms2.min(avg_ms(&s2, reps));
+    // Untimed warm-up so first-call allocator/page-cache cost is not sampled.
+    s1.rebuild_refs().unwrap();
+    s4.rebuild_refs().unwrap();
+    // Interleaved rounds (issue #78), so a busy spell hits both sizes.
+    let (mut ms1, mut ms4) = (f64::MAX, f64::MAX);
+    for _ in 0..15 {
+        ms1 = ms1.min(one_ms(&s1));
+        ms4 = ms4.min(one_ms(&s4));
     }
-    let ratio = ms2 / ms1.max(0.001);
+    let ratio = ms4 / ms1.max(0.001);
     eprintln!(
-        "rebuild_refs cost: 1x corpus ({} files) {ms1:.3} ms/call, 2x corpus {ms2:.3} ms/call, \
+        "rebuild_refs cost: 1x corpus ({} files) {ms1:.3} ms/call, 4x corpus {ms4:.3} ms/call, \
          ratio {ratio:.2}x",
         files.len()
     );
@@ -1740,13 +1755,13 @@ fn rebuild_refs_cost_is_bounded_and_near_linear_on_this_repos_own_corpus() {
         "rebuild_refs on the 1x corpus took {ms1:.3} ms, expected < 50 ms"
     );
     assert!(
-        ratio < 2.5,
-        "rebuild_refs cost ratio (2x/1x) was {ratio:.2}x, expected < 2.5x (a quadratic-behavior \
-         gate, not a tight bound)"
+        ratio < 8.0,
+        "rebuild_refs cost ratio (4x/1x) was {ratio:.2}x, expected < 8x (linear is ~4x, \
+         quadratic ~16x; a quadratic-behavior gate, not a tight bound)"
     );
 
     s1.check_consistency(false);
-    s2.check_consistency(false);
+    s4.check_consistency(false);
 }
 
 /// A single term occurring far more than `codec::POSTING_BLOCK` times in one
