@@ -28,12 +28,10 @@ pub struct AspxExtractor;
 
 /// Tokenizer dialect used for ASP.NET markup.
 pub const ASPX_TOKENIZER: TokenizerOptions = TokenizerOptions {
-    rust_literals: false,
-    single_quote_strings: false,
     csharp_strings: true,
     markup: true,
     aspx: true,
-    regex_literals: false,
+    ..TokenizerOptions::DEFAULT
 };
 
 impl Extractor for AspxExtractor {

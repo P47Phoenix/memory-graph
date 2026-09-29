@@ -19,7 +19,7 @@ These `graph-core` items are the stable surface for extractors:
 | `SymbolDecl` | `name`, `kind: SymbolKind`, `lang_kind: Option<String>`, `span` |
 | `TokenDecl`, `Span`, `TokenClass`, `SymbolKind` | schema types |
 | `tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION}` | the shared tokenizer |
-| `scan::{Cursor, matching_close, span_between}` | helpers for token-stream scanners |
+| `scan::{Cursor, matching_close, span_between, code_index, keyword_block, indent_block, line_iter}` | helpers for token-stream scanners |
 
 ### `Extractor`
 
@@ -63,6 +63,53 @@ Use `tokenizer::tokenize_with` so tokens match everything else in the graph.
 language-agnostic fallback. Tokens must cover the source in order with exact
 spans; the store validates this.
 
+Every switch is off by default; write a dialect as
+`TokenizerOptions { flag: true, ..TokenizerOptions::DEFAULT }` (`DEFAULT`
+equals `default()` but works in `const` items). Always end a dialect with
+`..TokenizerOptions::DEFAULT` rather than listing every field: new switches
+are added over time (the struct is deliberately not `#[non_exhaustive]`,
+which would forbid that struct-update syntax outside `graph-core`), and a
+dialect written that way keeps compiling with the new switch off. The
+switches:
+
+| Flag | Effect |
+|---|---|
+| `rust_literals` | Rust raw/byte strings (`r#"..."#`, `b'x'`) are one Literal |
+| `single_quote_strings` | `'...'` is a Literal (backslash escapes, one line) |
+| `csharp_strings` | C# `@"..."`, `$"..."`, `$@"..."` |
+| `markup` / `aspx` | HTML/XML tags and comments; ASP.NET server tags |
+| `regex_literals` | JavaScript `/.../flags` where a regex can start |
+| `no_line_slash_comments` / `no_block_slash_comments` | `//` / `/* */` are not comments (Python `//`, shell `/tmp/*`) |
+| `hash_comments` | `#` to end of line; with `shell_words` only at a word start |
+| `hash_comments_line_start_only` | ...and only as the first token on a line (ARM `#1` immediates stay code) |
+| `dash_comments` | `--` to end of line (SQL); with `haskell_block_comments`, only when no symbol character touches the dash run (`-->`, `--|`, `|--` are operators) |
+| `haskell_block_comments` | nested `{- ... -}` |
+| `prime_idents` | `'` continues an identifier (`foldl'`, `x'`), Haskell and F# |
+| `ml_block_comments` | nested `(* ... *)`; `(*)` stays an operator |
+| `semicolon_comments` | `;` to end of line (NASM, MASM) |
+| `triple_quote_strings` | `"""..."""` / `'''...'''` one Literal, spanning lines, backslash escapes |
+| `triple_quote_raw` | ...with no backslash escapes (Scala, F#) |
+| `doubled_single_quotes` | `'it''s'` one Literal, no backslash escapes, one line (COBOL, RPG, NASM/MASM) |
+| `raw_backtick_strings` | `` `...` `` one Literal, no escapes, spanning lines (Go) |
+| `sql_strings` | `'it''s'` Literal; `"name"` and `[name]` Identifier tokens |
+| `shell_words` | `$x`, `$1`, `${...}` one Identifier; raw `'...'`; ANSI-C `$'...'` one Literal; heredoc `<<EOF` / `<<-EOF` / `<<'EOF'` / `<<\EOF` marker one Operator and body one Literal (not inside arithmetic `((...))`) |
+| `hyphen_idents` | `-` joins a name before a letter/digit/`_` (`WORKING-STORAGE`, `dcl-proc`) |
+| `fixed_columns: Option<FixedLayout>` | `Cobol` (cols 1-6 sequence and 73+ are Comments, `*`/`/` in col 7 is a comment line, `*>` inline comments) or `Rpg` (cols 1-5 sequence, col 6 form type its own token, `*` in col 7 comment line, 81+ Comment; a first line `**FREE` turns column handling off) |
+
+Ready-made dialects are associated consts: `DEFAULT`, `RUST`, `CSHARP`,
+`JAVASCRIPT`, `TYPESCRIPT`, `HTML`, `ASPX`, `C`, `CPP`, `JAVA`, `GO`,
+`SCALA`, `PYTHON`, `GDSCRIPT`, `SHELL`, `R`, `SQL`, `HASKELL`, `FSHARP`,
+`ELIXIR`, `ASM`, `COBOL`, `RPG` (see their doc comments for the exact
+combinations). Any change to tokens for an existing input needs a
+`TOKENIZER_VERSION` bump; new flags are pinned by `DIALECT_GOLDENS` /
+`LANG_GOLDENS` and the exact-span proptests in `tokenizer.rs`.
+
+`ASM` limits: `;` always starts a comment (GNU as uses it as a statement
+separator on some targets); `#` is a comment only as the first token on a
+line, so an AT&T trailing `# comment` after code is missed; ARM32 `@`
+comments are not recognised (MASM uses `@@:` labels at line start, so a
+line-start `@` rule would be wrong there).
+
 ### Scanner helpers (`graph_core::scan`)
 
 Extractors here are **token-stream scanners, not parsers** (no C-based parser
@@ -73,6 +120,20 @@ generators such as tree-sitter: the pure-Rust gate forbids them).
 - `matching_close(tokens, i)` — index of the delimiter closing `tokens[i]`,
   ignoring delimiters inside literals and comments; `None` if unbalanced.
 - `span_between(a, b)` — the span from the start of `a` to the end of `b`.
+- `code_index(tokens, skip)` — indices of tokens whose class is not in
+  `skip` (e.g. `&[TokenClass::Comment]`).
+- `keyword_block(tokens, open, pairs, ignore_case)` — index of the keyword
+  closing the block opened at `open`, for `(opener, closer)` pairs such as
+  `do`/`end`, `if`/`fi`, `case`/`esac`, `do`/`done`, `BEGIN`/`END`,
+  `PROC`/`ENDP`, `MACRO`/`ENDM`, `dcl-proc`/`end-proc`; nests, skips
+  comments and literals, `None` on a mismatch or no close.
+- `indent_block(tokens, header, skip)` — for layout languages, the last
+  token of the block headed by `tokens[header]`: everything on later lines
+  indented deeper than the header's line (tokens in `skip` never end it, nor
+  do line starts inside open brackets, so split headers and multi-line calls
+  stay in the block).
+- `line_iter(tokens)` — `(line, index range)` for each run of tokens
+  starting on the same line.
 
 ## Registering
 

@@ -33,12 +33,8 @@ pub struct CSharpExtractor;
 
 /// Tokenizer dialect used for C#.
 pub const CSHARP_TOKENIZER: TokenizerOptions = TokenizerOptions {
-    rust_literals: false,
-    single_quote_strings: false,
     csharp_strings: true,
-    markup: false,
-    aspx: false,
-    regex_literals: false,
+    ..TokenizerOptions::DEFAULT
 };
 
 impl Extractor for CSharpExtractor {
