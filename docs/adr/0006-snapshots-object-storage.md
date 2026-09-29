@@ -1,6 +1,6 @@
 # ADR 0006: Snapshots to object storage
 
-**Status:** Proposed (2026-09-29). Not yet accepted; the owner's decisions of 2026-09-29 are recorded below. Builds on [ADR 0004](0004-client-server-and-replication.md) D7 (snapshots). Tracks issue #110. Epic amendment: stories 35-39 in the [epic](../epic-code-memory-graph.md).
+**Status:** Accepted (2026-09-29, by the owner). The owner's decisions of 2026-09-29 are recorded below. Builds on [ADR 0004](0004-client-server-and-replication.md) D7 (snapshots). Tracks issue #110. Epic amendment: stories 35-39 in the [epic](../epic-code-memory-graph.md).
 
 ## In plain words
 
@@ -89,7 +89,7 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 
 - Upload: stream with sha256 in `x-amz-content-sha256` (or per part), then HEAD to check the size.
 - Restore: download to the existing `<store>.restore.tmp` sibling (the name `paths::restore_into` already uses), check size and sha256 against `.meta`, and check `store_format_version` and `extractors_hash` against the binary. Refuse on any mismatch before `restore_into`.
-- The `extractors_hash` check is strict by default. An explicit `--restore-allow-extractor-mismatch` overrides it, for restoring onto a binary with upgraded extractors: the store stays valid and the affected files re-extract on the next index, because their fingerprints include the extractor version. *Pending owner confirmation.* The format version check has no override.
+- The `extractors_hash` check is strict by default. An explicit `--restore-allow-extractor-mismatch` overrides it, for restoring onto a binary with upgraded extractors: the store stays valid and the affected files re-extract on the next index, because their fingerprints include the extractor version. Confirmed by the owner on 2026-09-29. The format version check has no override.
 - A local `--restore <file>` also verifies a sibling `.meta` when present, and warns when absent.
 
 ### E9. Retention
