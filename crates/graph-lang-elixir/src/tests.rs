@@ -135,6 +135,27 @@ fn top_level_def_is_a_function() {
 }
 
 #[test]
+fn deep_nesting_does_not_overflow() {
+    let n = 6000;
+    let mut src = String::new();
+    for i in 0..n {
+        src.push_str(&format!("defmodule M{i} do\n"));
+    }
+    src.push_str(&"end\n".repeat(n));
+    let ex = ElixirExtractor.extract(&src);
+    assert!(ex.symbols.len() > 60);
+    assert_nested(&ex);
+    let src = format!(
+        "def f do\n{}{}end\n",
+        "if x do\n".repeat(n),
+        "end\n".repeat(n)
+    );
+    let s = syms(&src);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].3.ends_with("end\nend"));
+}
+
+#[test]
 fn bom_and_non_ascii_positions() {
     let src = "\u{feff}defmodule Ü do\n  def é(x), do: \"ö\"\nend";
     let ex = ElixirExtractor.extract(src);

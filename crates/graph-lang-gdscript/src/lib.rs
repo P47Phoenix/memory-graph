@@ -18,10 +18,15 @@
 //! (annotations such as `@export` and `static` included) through the last
 //! token of its indented block. Function bodies are not scanned.
 //!
+//! Statement annotations (`@tool`, `@icon`, `@export_group`,
+//! `@export_category`, `@export_subgroup`, ...) are not part of the
+//! declaration that follows them. Inner classes nested more than 64 deep
+//! are not scanned.
+//!
 //! Known limits: a file with `extends` but no `class_name` gets no file
-//! Type (it has no name of its own); anonymous `enum { ... }` is not a
-//! symbol; a statement after `;` on a block header line belongs to that
-//! block.
+//! Type (it has no name of its own), so its functions and variables have
+//! no class container; anonymous `enum { ... }` is not a symbol; a
+//! statement after `;` on a block header line belongs to that block.
 use graph_core::scan::{code_index, indent_block, matching_close, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -65,6 +70,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         code: &code,
         out: Vec::new(),
         class_name: None,
+        depth: 0,
     };
     s.body(0, code.len(), true);
     let mut out = Vec::with_capacity(s.out.len() + 1);
@@ -85,7 +91,26 @@ struct Scanner<'a> {
     code: &'a [usize],
     out: Vec<SymbolDecl>,
     class_name: Option<String>,
+    /// Current inner-class nesting.
+    depth: usize,
 }
+
+/// Deepest inner-class nesting that is scanned.
+const MAX_DEPTH: usize = 64;
+
+/// Annotations that are statements of their own, not part of the next
+/// declaration.
+const STANDALONE: &[&str] = &[
+    "tool",
+    "icon",
+    "static_unload",
+    "abstract",
+    "export_category",
+    "export_group",
+    "export_subgroup",
+    "warning_ignore_start",
+    "warning_ignore_restore",
+];
 
 impl Scanner<'_> {
     fn tok(&self, c: usize) -> &TokenDecl {
@@ -142,13 +167,28 @@ impl Scanner<'_> {
                 c += 1;
                 continue;
             }
-            let start = c;
+            let mut start = c;
             // Annotations: `@name` or `@name(...)`, possibly on earlier lines.
+            // Statement annotations (`@export_group(...)`, `@tool`, ...) stand
+            // alone and are not part of the next declaration.
             while c + 1 < hi
                 && self.text(c) == "@"
                 && self.tok(c + 1).class == TokenClass::Identifier
             {
+                let standalone = STANDALONE.contains(&self.text(c + 1));
                 c += 2;
+                if standalone {
+                    if c < hi && self.text(c) == "(" {
+                        match matching_close(self.tokens, self.code[c])
+                            .and_then(|cl| self.code.binary_search(&cl).ok())
+                        {
+                            Some(cl) if cl < hi => c = cl + 1,
+                            _ => break,
+                        }
+                    }
+                    start = c;
+                    continue;
+                }
                 if c < hi && self.text(c) == "(" {
                     match matching_close(self.tokens, self.code[c])
                         .and_then(|cl| self.code.binary_search(&cl).ok())
@@ -179,8 +219,14 @@ impl Scanner<'_> {
                 ("class", Some(n)) => {
                     self.emit(n, SymbolKind::Type, "class", start, last);
                     // The body starts after the header's `:`.
+                    // Nesting deeper than MAX_DEPTH is not scanned (no stack
+                    // overflow on pathological input).
                     if let Some(colon) = (kw + 2..=last).find(|&k| self.text(k) == ":") {
-                        self.body(colon + 1, last + 1, false);
+                        if self.depth < MAX_DEPTH {
+                            self.depth += 1;
+                            self.body(colon + 1, last + 1, false);
+                            self.depth -= 1;
+                        }
                     }
                 }
                 ("class_name", Some(n)) if top && self.class_name.is_none() => {

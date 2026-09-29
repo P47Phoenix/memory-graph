@@ -26,6 +26,11 @@
 //! `\begin{code}` and `\end{code}` are code; prose is tokenized with the
 //! generic tokenizer, line by line, and never yields symbols.
 //!
+//! Both literate styles are accepted in one file (GHC rejects mixing
+//! them), so in a `\begin{code}` file a prose line starting with `> ` is
+//! read as code. Top-level Template Haskell splices (`makeLenses ''Foo`,
+//! `$(...)`) are not functions.
+//!
 //! Known limits: explicit-brace layout (`where { ... }`) is not followed;
 //! pattern bindings (`(a, b) = ...`) and Template Haskell splices are not
 //! symbols; a `.hs` file with a bird-track-looking line is read as literate.
@@ -86,6 +91,64 @@ fn is_bird(line: &str) -> bool {
     l.starts_with('>') && l[1..].chars().next().is_none_or(|c| c.is_whitespace())
 }
 
+/// Whether `src` is literate Haskell: it has a bird-track line or a
+/// `\begin{code}` line outside `{- -}` comments (a Haddock example
+/// `> f 1` inside `{- | ... -}` does not count), and no column-0 line
+/// outside the code parts looks like plain Haskell (`module`, `import`,
+/// `{-#` or a `name ::` signature).
+fn is_literate(src: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_code = false;
+    let mut literate = false;
+    for (_, line) in lines(src) {
+        let l = line.strip_prefix('\u{feff}').unwrap_or(line);
+        if in_code {
+            in_code = !l.starts_with("\\end{code}");
+            continue;
+        }
+        if depth == 0 {
+            if is_begin(line) {
+                literate = true;
+                in_code = true;
+                continue;
+            }
+            if is_bird(line) {
+                literate = true;
+                continue;
+            }
+            if looks_like_code(l) {
+                return false;
+            }
+        }
+        let opens = l.matches("{-").count();
+        let closes = l.matches("-}").count();
+        depth = (depth + opens).saturating_sub(closes);
+    }
+    literate
+}
+
+/// A column-0 line that only plain (non-literate) Haskell would have.
+fn looks_like_code(l: &str) -> bool {
+    let word = |w: &str| {
+        l.strip_prefix(w)
+            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    };
+    if word("module") || word("import") || l.starts_with("{-#") {
+        return true;
+    }
+    // `name ::` (a type signature).
+    let mut chars = l.char_indices();
+    match chars.next() {
+        Some((_, c)) if c.is_lowercase() || c == '_' => {}
+        _ => return false,
+    }
+    let end = l
+        .char_indices()
+        .find(|&(_, c)| !(c.is_alphanumeric() || c == '_' || c == '\''))
+        .map_or(l.len(), |(i, _)| i);
+    l[end..].trim_start().starts_with("::")
+}
+
 fn is_begin(line: &str) -> bool {
     let l = line.strip_prefix('\u{feff}').unwrap_or(line);
     l.starts_with("\\begin{code}")
@@ -95,7 +158,7 @@ fn is_begin(line: &str) -> bool {
 /// byte and each bird-track `>` is a space (the BOM and newlines are kept),
 /// so code tokens keep their exact positions. `None` if not literate.
 fn literate_mask(src: &str) -> Option<Vec<u8>> {
-    if !lines(src).any(|(_, l)| is_bird(l) || is_begin(l)) {
+    if !is_literate(src) {
         return None;
     }
     let mut out = src.as_bytes().to_vec();
@@ -341,6 +404,34 @@ impl Scanner<'_> {
         Some(t.text.clone())
     }
 
+    /// A top-level Template Haskell splice (`makeLenses ''Foo`,
+    /// `deriveJSON defaultOptions ''Foo`, `$(...)`) rather than a
+    /// definition: no `=` or `::` at all, or a name quote (`''T`, `'f`) or
+    /// `$(` before the first one.
+    fn is_splice(&self, c: usize, end: usize) -> bool {
+        let lone = |k: usize| {
+            (k == c || !(self.is_op(k - 1) && self.adjacent(k - 1, k)))
+                && (k == end || !(self.is_op(k + 1) && self.adjacent(k, k + 1)))
+        };
+        let def = (c..=end).find(|&k| {
+            (self.text(k) == "=" && lone(k))
+                || (self.text(k) == ":"
+                    && k < end
+                    && self.text(k + 1) == ":"
+                    && self.adjacent(k, k + 1))
+        });
+        let Some(def) = def else {
+            return true;
+        };
+        (c..def).any(|j| {
+            let t = self.text(j);
+            let next_adjacent = j + 1 < def && self.adjacent(j, j + 1);
+            t.starts_with("''")
+                || (t == "'" && next_adjacent)
+                || (t == "$" && next_adjacent && self.text(j + 1) == "(")
+        })
+    }
+
     fn flush(&mut self, group: &mut Option<Group>, ctx: Ctx) {
         if let Some(g) = group.take() {
             let (kind, lk) = match ctx {
@@ -372,7 +463,10 @@ impl Scanner<'_> {
             ) {
                 self.flush(&mut group, ctx);
                 self.type_decl(c, end, &kw, ctx);
-            } else if let Some(name) = self.fn_name(c, end) {
+            } else if let Some(name) = self
+                .fn_name(c, end)
+                .filter(|_| ctx != Ctx::Top || !self.is_splice(c, end))
+            {
                 match &mut group {
                     Some(g) if g.name == name => g.last = end,
                     _ => {

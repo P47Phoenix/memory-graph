@@ -169,6 +169,56 @@ fn literate_latex() {
 }
 
 #[test]
+fn haddock_example_is_not_literate() {
+    let src =
+        "module M where\n\n{- | Adds one.\n\n> foo 1 == 2\n-}\nfoo :: Int -> Int\nfoo x = x + 1\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "M").1, SymbolKind::Module);
+    assert_eq!(find(&s, "foo").3, "foo :: Int -> Int\nfoo x = x + 1");
+    // A column-0 signature outside bird tracks also means plain Haskell.
+    let s = syms("foo :: Int\nfoo = 1\n> not a bird track\n");
+    assert_eq!(find(&s, "foo").3, "foo :: Int\nfoo = 1");
+}
+
+#[test]
+fn template_haskell_splices_are_not_functions() {
+    let src = "module T where\nmakeLenses ''Foo\nderiveJSON defaultOptions ''Foo\n$(return [])\nmkThing 'bar\nf :: Int\nf = g ''Foo\n";
+    let s = syms(src);
+    let names: Vec<&str> = s.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(names, ["T", "f"]);
+    assert_eq!(find(&s, "f").3, "f :: Int\nf = g ''Foo");
+}
+
+#[test]
+fn bom_prefixed_literate_bird_tracks() {
+    let src = "\u{feff}> f :: Int\n> f = 1\nProse é.\n";
+    let s = syms(src);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0].3, "f :: Int\n> f = 1");
+    let ex = HaskellExtractor.extract(src);
+    let f = &ex.symbols[0];
+    assert_eq!((f.span.start_line, f.span.start_col), (1, 3));
+}
+
+#[test]
+fn deep_nesting_does_not_overflow() {
+    let mut src = String::from("main = do\n");
+    for i in 1..6000 {
+        src.push_str(&" ".repeat(i));
+        src.push_str("do\n");
+    }
+    let s = syms(&src);
+    assert_eq!(s.len(), 1);
+    let mut src = String::from("class C a where\n");
+    for i in 1..6000 {
+        src.push_str(&" ".repeat(i));
+        src.push_str("class C a where\n");
+    }
+    let ex = HaskellExtractor.extract(&src);
+    assert_nested(&ex);
+}
+
+#[test]
 fn no_module_header() {
     let s = syms("f = 1\ng = 2\n");
     assert_eq!(s.len(), 2);

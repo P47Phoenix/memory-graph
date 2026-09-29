@@ -17,6 +17,11 @@
 //! rolls a function up to its module only when the module is a Type.
 //! `defimpl Proto, for: T` is named `Proto for T`; `defstruct` and
 //! `defexception` are named `%Module{}` after the enclosing module.
+//! A nested `defmodule Inner` inside `defmodule Outer` is named `Inner`,
+//! as written (not `Outer.Inner`, the alias Elixir actually defines); the
+//! nesting shows in the symbol's qualified name (`Outer::Inner`), and a
+//! `defstruct` inside it is `%Inner{}`. Modules nested more than 64 deep
+//! are not scanned.
 //!
 //! A declaration spans from its keyword through its `end`, or, without a
 //! `do` block (`def f(x), do: x`, bodiless heads), through the last token
@@ -98,6 +103,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut s = Scanner {
         toks: &toks,
         out: Vec::new(),
+        depth: 0,
     };
     s.body(0, toks.len(), None);
     s.out
@@ -107,7 +113,12 @@ struct Scanner<'a> {
     /// Code tokens with non-block `do`/`end`/`fn` removed.
     toks: &'a [TokenDecl],
     out: Vec<SymbolDecl>,
+    /// Current module nesting.
+    depth: usize,
 }
+
+/// Deepest module nesting that is scanned.
+const MAX_DEPTH: usize = 64;
 
 impl Scanner<'_> {
     fn text(&self, p: usize) -> &str {
@@ -218,7 +229,12 @@ impl Scanner<'_> {
                     }
                     if let Some((open, close)) = self.do_block(p, hi) {
                         self.emit(name.clone(), SymbolKind::Type, &kw, p, close);
-                        self.body(open + 1, close, Some(&name));
+                        // Nesting deeper than MAX_DEPTH is not scanned.
+                        if self.depth < MAX_DEPTH {
+                            self.depth += 1;
+                            self.body(open + 1, close, Some(&name));
+                            self.depth -= 1;
+                        }
                         p = close + 1;
                     } else {
                         let end = self.stmt_end(p, hi);

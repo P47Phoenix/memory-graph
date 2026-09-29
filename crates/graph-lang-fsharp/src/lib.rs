@@ -24,6 +24,11 @@
 //! anything else (an abbreviation) `type`. Member names drop the
 //! self-identifier (`this.Area` is `Area`). Function bodies are not scanned.
 //!
+//! Operators are named in parentheses (`let (+.) a b` is `(+.)`), and so
+//! are active patterns (`let (|Even|Odd|) n` is `(|Even|Odd|)`). Members
+//! after a `with` (`type R = { .. }` then `with member ...`) belong to the
+//! type. Bodies nested more than 64 deep are not scanned.
+//!
 //! Known limits: `let` patterns (`let a, b = ...`) and backtick names
 //! (` ``a b`` `) are not symbols; members inside an object expression
 //! (`{ new IDisposable with ... }`) at a type's top level are reported as
@@ -93,6 +98,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         tokens,
         code: &code,
         out: Vec::new(),
+        depth: 0,
     };
     s.decls(0, code.len(), Ctx::Top);
     s.out
@@ -119,7 +125,12 @@ struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
     out: Vec<SymbolDecl>,
+    /// Current nesting of namespace/module/type bodies.
+    depth: usize,
 }
+
+/// Deepest body nesting that is scanned.
+const MAX_DEPTH: usize = 64;
 
 impl Scanner<'_> {
     fn tok(&self, c: usize) -> &TokenDecl {
@@ -221,6 +232,17 @@ impl Scanner<'_> {
 
     /// Declarations in code positions `[lo, hi)`.
     fn decls(&mut self, lo: usize, hi: usize, ctx: Ctx) {
+        // Nesting deeper than MAX_DEPTH is not scanned (no stack overflow
+        // on pathological input).
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.depth += 1;
+        self.decls_at(lo, hi, ctx);
+        self.depth -= 1;
+    }
+
+    fn decls_at(&mut self, lo: usize, hi: usize, ctx: Ctx) {
         let Some(level) = (lo..hi).find(|&c| self.line_start(c)) else {
             return;
         };
@@ -231,6 +253,11 @@ impl Scanner<'_> {
             if !self.line_start(c) {
                 c += 1;
                 continue;
+            }
+            // `with` opening a type's members (`type R = { .. }` then
+            // `with member ...` on the next line).
+            if ctx == Ctx::Type && self.text(c) == "with" && c + 1 < hi {
+                c += 1;
             }
             let start = c;
             // Attributes `[< ... >]`, possibly on lines of their own.
@@ -444,7 +471,9 @@ impl Scanner<'_> {
                     TokenClass::Operator | TokenClass::Punctuation
                 ) && !matches!(self.text(k), "(" | ")" | "[" | "]" | "{" | "}" | ",")
             };
-            if !(n + 1..cl).all(is_op) {
+            // An active pattern `(|Even|Odd|)` or `(|Int|_|)` keeps its bars.
+            let active = self.text(n + 1) == "|";
+            if !active && !(n + 1..cl).all(is_op) {
                 return Some(end);
             }
             let op: String = (n + 1..cl).map(|k| self.text(k)).collect();

@@ -148,6 +148,37 @@ fn semicolons_split_statements() {
 }
 
 #[test]
+fn inner_class_ending_in_a_bare_var() {
+    let s = syms("class A:\n\tvar x\nvar y = 1; var z = 2\n");
+    assert_eq!(find(&s, "A").3, "class A:\n\tvar x");
+    assert_eq!(find(&s, "x").3, "var x");
+    assert_eq!(find(&s, "y").3, "var y = 1");
+    assert_eq!(find(&s, "z").3, "var z = 2");
+    let s = syms("class A:\n\tvar a = 1; var b = 2\n");
+    assert_eq!(find(&s, "a").3, "var a = 1");
+    assert_eq!(find(&s, "b").3, "var b = 2");
+    assert_eq!(find(&s, "A").3, "class A:\n\tvar a = 1; var b = 2");
+}
+
+#[test]
+fn statement_annotations_stand_alone() {
+    let s = syms("@tool\n@export_group(\"Stats\")\n@export var hp = 1\n");
+    assert_eq!(find(&s, "hp").3, "@export var hp = 1");
+}
+
+#[test]
+fn deep_nesting_does_not_overflow() {
+    let mut src = String::new();
+    for i in 0..6000 {
+        src.push_str(&"\t".repeat(i));
+        src.push_str(&format!("class C{i}:\n"));
+    }
+    let ex = GdscriptExtractor.extract(&src);
+    assert!(ex.symbols.len() > 60);
+    assert_nested(&ex);
+}
+
+#[test]
 fn bom_and_non_ascii_positions() {
     let src = "\u{feff}class_name Ü\nvar é = \"ö\"\n";
     let ex = GdscriptExtractor.extract(src);

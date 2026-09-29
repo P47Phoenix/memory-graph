@@ -184,6 +184,32 @@ fn top_level_module_without_equals() {
 }
 
 #[test]
+fn struct_active_patterns_and_with_members() {
+    let s = syms(
+        "type P =\n    struct\n        val X: int\n    end\ntype R = { A: int }\n    with member this.B = 1\nlet (|Even|Odd|) n = if n % 2 = 0 then Even else Odd\n",
+    );
+    assert_eq!(find(&s, "P").2, "struct");
+    let b = find(&s, "B");
+    assert_eq!((b.1, b.2.as_str()), (SymbolKind::Method, "member"));
+    assert_eq!(b.3, "member this.B = 1");
+    assert_eq!(find(&s, "R").2, "record");
+    let ap = find(&s, "(|Even|Odd|)");
+    assert_eq!(ap.1, SymbolKind::Function);
+}
+
+#[test]
+fn deep_nesting_does_not_overflow() {
+    let mut src = String::new();
+    for i in 0..6000 {
+        src.push_str(&" ".repeat(i));
+        src.push_str("module M =\n");
+    }
+    let ex = FSharpExtractor.extract(&src);
+    assert!(ex.symbols.len() > 60);
+    assert_nested(&ex);
+}
+
+#[test]
 fn bom_and_non_ascii_positions() {
     let src = "\u{feff}module Ü\nlet é = \"ö\"\n";
     let ex = FSharpExtractor.extract(src);
