@@ -2,7 +2,7 @@
 
 An embedded graph database for source code. It indexes one or more repositories into a single file and answers questions such as "where is the token `Node` used?" or "which methods start with `parse`?" with exact byte, line and column spans.
 
-- **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor (Rust, C#, JavaScript, HTML, ASP.NET markup) additionally get symbols: functions, types, methods and so on.
+- **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor (Rust, C#, JavaScript, HTML, ASP.NET markup, F#, Haskell, Elixir, GDScript) additionally get symbols: functions, types, methods and so on.
 - **One file, optionally served.** The database is a single [redb](https://github.com/cberner/redb) file, about 8-10x the size of the indexed source. Opened in-process by default; `memory-graph serve` shares it with other processes, machines and containers over gRPC ([Server mode](#server-mode)).
 - **Pure Rust.** No C dependencies (enforced in CI), so it builds anywhere Rust does and ships as a 7 MB static container image.
 - **Incremental.** Unchanged files are skipped on re-index; deleted files can be pruned.
@@ -417,6 +417,10 @@ Languages are detected per file from the extension, the filename (`Makefile`) or
 | JavaScript | `js`, `mjs`, `cjs`, `jsx` | token-stream scanner |
 | HTML | `html`, `htm`, `xhtml` | element scanner |
 | ASP.NET markup | `aspx`, `ascx`, `master` | HTML scanner plus directives, server controls, code blocks and bindings |
+| F# | `fs`, `fsi`, `fsx` | layout scanner: namespaces, modules, types, `let`, members |
+| Haskell | `hs`, `lhs` | layout scanner: module, data/newtype/type/class/instance, functions (signature and equations grouped); literate bird-track and `\begin{code}` |
+| Elixir | `ex`, `exs` | `do`/`end` scanner: `defmodule` (a type), `def`/`defp`/`defmacro`..., `defstruct`, `defprotocol`/`defimpl` |
+| GDScript | `gd` | layout scanner: `class_name` (the file class), inner classes, `func`, `signal`, `enum`, `const`, `var` |
 
 Everything else (Python, Go, SQL, YAML, ...) is tokenized with exact spans and no symbols; the same happens to a Rust file if the Rust extractor is not registered (a library build without it). Language names are lowercased, a UTF-8 BOM is ignored, and paths are normalized (`./a.rs` = `a.rs`).
 
