@@ -315,8 +315,9 @@ fn strict_refusal(path: &str, encoding: &'static Encoding) -> StoreError {
         StoreError::NotUtf8(format!("`{path}`"))
     } else {
         StoreError::Rejected(format!(
-            "`{path}` has byte sequences that are invalid in {} (strict encoding)",
-            encoding.name()
+            "`{path}` has byte sequences that are invalid in {} {}",
+            encoding.name(),
+            crate::STRICT_ENCODING_MARK
         ))
     }
 }

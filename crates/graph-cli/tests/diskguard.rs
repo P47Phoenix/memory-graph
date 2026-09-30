@@ -55,6 +55,8 @@ fn run_with(
             disk_check,
             chunk_bytes: if deterministic { 64 << 20 } else { 64 << 10 },
             remote: None,
+            encoding: None,
+            strict_encoding: false,
         },
         open,
         &mut out,
