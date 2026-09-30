@@ -39,6 +39,7 @@ Logs go to stderr. Stdout carries only the `listening on` start line, and `metri
 | `mg_build_info{version,protocol,store_format}` | gauge | Always 1 |
 | `mg_backup_last_success_timestamp`, `mg_backup_last_index` | gauge | Unix time and log index of the last snapshot backup committed (`--backup-url`; 0: none) |
 | `mg_backup_failures_total`, `mg_backup_bytes_total` | counter | Backups that failed after every retry; bytes written by successful ones |
+| `mg_mcp_tool_calls_total{tool,outcome}` | counter | MCP tool calls served by `serve --mcp-listen` ([docs/mcp.md](../mcp.md)) |
 
 `cluster status --json` reports the same Raft and store numbers, `writes_forwarded_total`, `rpcs_total` and `entries_applied_total`.
 

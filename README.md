@@ -3,7 +3,7 @@
 An embedded graph database for source code. It indexes one or more repositories into a single file and answers questions such as "where is the token `Node` used?" or "which methods start with `parse`?" with exact byte, line and column spans.
 
 - **Language-agnostic.** Every file of every language is tokenized with exact spans. Languages with an extractor ([22 of them](#languages)) additionally get symbols: functions, types, methods and so on.
-- **One file, optionally served.** The database is a single [redb](https://github.com/cberner/redb) file, about 8-10x the size of the indexed source. Opened in-process by default; `memory-graph serve` shares it with other processes, machines and containers over gRPC, and can run as a replicated Raft cluster.
+- **One file, optionally served.** The database is a single [redb](https://github.com/cberner/redb) file, about 10x the size of the indexed source. Opened in-process by default; `memory-graph serve` shares it with other processes, machines and containers over gRPC, and can run as a replicated Raft cluster.
 - **Pure Rust.** No C dependencies (enforced in CI), so it builds anywhere Rust does and ships as a 7 MB static container image.
 - **Incremental.** Unchanged files are skipped on re-index; deleted files can be pruned.
 
@@ -32,7 +32,7 @@ Index a directory as a repo, then query it. Every command takes `--db <file>` (d
 ```sh
 memory-graph --db ./g index --org acme --repo api ./api        # whole directory; honors .gitignore, skips binaries
 memory-graph --db ./g describe                                  # what got indexed: languages and symbol kinds per repo
-memory-graph --db ./g search foo --language rust                # every token `foo` in Rust files
+memory-graph --db ./g search Node --language rust               # every token `Node` in Rust files (prints nothing if absent)
 memory-graph --db ./g symbols 'Node*' --kind struct --json      # struct definitions whose name starts with `Node`
 ```
 
@@ -40,7 +40,7 @@ What that looks like on this repository's own `crates/graph-core/src`:
 
 ```text
 $ memory-graph --db ./g index --org demo --repo graph-core crates/graph-core/src
-indexed demo/graph-core: files=6 unchanged=0 symbols=277 tokens=11737 skipped=0 failed=0 pruned=0 elapsed=132ms
+indexed demo/graph-core: files=6 unchanged=0 symbols=589 tokens=27510 skipped=0 failed=0 pruned=0 elapsed=134ms
   rust: 6
 
 $ memory-graph --db ./g search Node --language rust --limit 2
@@ -49,10 +49,10 @@ demo/graph-core/schema.rs:202:17	rust	tests::node_round_trip::n	hits=1
 
 $ memory-graph --db ./g describe
 demo/graph-core: 6 files
-  rust: 6 files, 277 symbols, 11737 tokens
-    constant/const: 11
-    function/fn: 64
-    method/fn: 34
+  rust: 6 files, 589 symbols, 27510 tokens
+    constant/const: 18
+    function/fn: 129
+    method/fn: 50
     ...
 ```
 
@@ -90,15 +90,15 @@ Extensions and what each extractor finds: [docs/guide/languages.md](docs/guide/l
 
 ## Server mode
 
-Share a database between processes, machines or containers with `memory-graph serve`: see the [server guide](docs/guide/server.md).
+One served database for many processes, machines and containers, exit codes, retries: [docs/guide/server.md](docs/guide/server.md).
 
 ## Cluster
 
-Replicate a database across nodes with Raft (`serve --data-dir`): see the [cluster guide](docs/guide/cluster.md).
+3-node Raft clusters, membership, backups: [docs/guide/cluster.md](docs/guide/cluster.md).
 
 ## Observability
 
-Logs, Prometheus metrics and health probes: see the [observability guide](docs/guide/observability.md).
+Logs, Prometheus metrics, health and readiness probes: [docs/guide/observability.md](docs/guide/observability.md).
 
 ## Where to go next
 

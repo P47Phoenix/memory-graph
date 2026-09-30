@@ -107,7 +107,9 @@ def check_file(path, root):
         else:
             dest = path
         if anchor and dest.lower().endswith(".md") and os.path.isfile(dest):
-            if unquote(anchor) not in anchors(dest):
+            # GitHub matches fragments case-insensitively; emphasis markers (* and
+            # the leading/trailing punctuation) are already dropped by slug().
+            if unquote(anchor).lower() not in {a.lower() for a in anchors(dest)}:
                 errors.append(f"{os.path.relpath(path, root)}:{no}: missing anchor #{anchor} in {os.path.relpath(dest, root)}")
     return errors
 

@@ -3,7 +3,7 @@
 What the database file holds, how big it gets, and how to give space back.
 
 - **Format.** One redb file holding an interned dictionary, one compact stream per file with sparse checkpoints, and count postings ([ADR 0003](../adr/0003-data-model.md)).
-- **Size.** About 10x the source and 70 bytes per token on the small test corpus (40 bytes per token at 10 M tokens, where page and dictionary overhead amortise). `scripts/measure-size.py` prints the full table and `crates/graph-cli/tests/size_gate.rs` enforces the ratio in CI (15x, 90 bytes per token).
+- **Size.** About 10x the source (measured 10.2x) and 70 bytes per token on the small test corpus (40 bytes per token at 10 M tokens, where page and dictionary overhead amortise). `scripts/measure-size.py` prints the full table and `crates/graph-cli/tests/size_gate.rs` enforces the ratio in CI (13x, 90 B/token; a reindex plus compact must stay within 1.2x of a fresh index).
 - **Growth and reclaiming space.** Unchanged files add nothing on a rerun. `--reindex` can double the file until `vacuum --compact`, since redb reuses freed pages but never shrinks the file (and grows a file under 4 GiB by doubling it); an embedded `--reindex` run that replaced files prints a hint when the file ends at 2.5x its live data or more (a fresh or compacted file measures about 1.65x). `vacuum` frees dictionary terms after churn; `--compact` rebuilds the file.
 - **Catalog.** `describe` and filter validation read a small counter catalog kept in step with every write, so they cost O(repos), not O(tokens). It is part of the format, written from the first index.
 - **Versioned on disk.** Any change to the stored bytes bumps the schema version; a file from another version is refused without being written to.

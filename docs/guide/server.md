@@ -42,7 +42,7 @@ A served file opened directly waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_W
 | 0 | Success |
 | 1 | Failure (and `health`: not serving; a read whose server is unreachable or whose connection was lost) |
 | 3 | `cluster leader` found no leader |
-| 4 | A write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write |
+| 4 | A write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write; or a `--read linearizable` read that found no leader within `--read-deadline` |
 | 5 | The server speaks another protocol or store format version |
 | 6 | A data directory (or a node named in a membership change) belongs to another cluster (`WrongCluster`) |
 
