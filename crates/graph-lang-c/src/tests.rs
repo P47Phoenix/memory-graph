@@ -373,3 +373,50 @@ proptest! {
         }
     }
 }
+
+thread_local! {
+    /// See `memo_on`.
+    pub(crate) static MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Symbols of `src` from `ex` with the scan memos off.
+fn without_memo(ex: &dyn Extractor, src: &str) -> Vec<SymbolDecl> {
+    MEMO.with(|m| m.set(false));
+    let out = ex.extract(src).symbols;
+    MEMO.with(|m| m.set(true));
+    out
+}
+
+proptest! {
+    /// The memos never change what is found: a random prefix (which fills
+    /// them with failed and successful scans, often unterminated) followed
+    /// by real code gives the same symbols with the memos on and off.
+    #[test]
+    fn memos_do_not_change_symbols(
+        parts in proptest::collection::vec(prop_oneof![Just("struct"), Just("class"), Just("namespace"), Just("template"), Just("operator"), Just("A"), Just("{"), Just("}"), Just("("), Just(")"), Just("["), Just("]"), Just(";"), Just("="), Just("<"), Just(">"), Just(":"), Just("::"), Just(","), Just("\"s"), Just("/*"), Just("<div>"), Just("int"), Just("f")], 0..60),
+        code_first in any::<bool>(),
+    ) {
+        let soup = parts.join(" ");
+        let code = "struct S { int a; } s = { 1 };\ntemplate <class T> class V : public B<T> { V() : x{1} {} int f(int a) const; operator int(); };\nnamespace n { int g(void) { return 0; } }\nint (*fp)(int) = 0;\n";
+        let src = if code_first { format!("{code}{soup}") } else { format!("{soup}\n{code}") };
+        for ex in [&CExtractor as &dyn Extractor, &CppExtractor] {
+            prop_assert_eq!(ex.extract(&src).symbols, without_memo(ex, &src), "{}", src);
+        }
+    }
+}
+/// A failed header scan passes `b` with `params` and `init_list` set; the
+/// resync from `:` reaches `b` with neither, where `b { }` is a body. The
+/// failure memo must key on the flags, not just the position.
+#[test]
+fn header_failure_memo_keys_on_flags() {
+    for src in [
+        "A ( ) : b { } }",
+        "A ( ) : struct S { } }",
+        "A ( ) :\nstruct S { int x; } }",
+        "operator = { } }",
+    ] {
+        for ex in [&CExtractor as &dyn Extractor, &CppExtractor] {
+            assert_eq!(ex.extract(src).symbols, without_memo(ex, src), "{src}");
+        }
+    }
+}

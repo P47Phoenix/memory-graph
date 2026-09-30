@@ -498,7 +498,7 @@ enum Cmd {
         memory: Option<graph_cli::sysinfo::MemorySpec>,
         /// Commit fixed batches (256 files / 32 MiB; a file that does not fit is a batch of its own) instead
         /// of everything ready, so the database file is byte-for-byte reproducible on any machine (slower
-        /// when the writer is the bottleneck)
+        /// when the writer is the bottleneck). A fixed --memory must be at least one batch (32M)
         #[arg(long)]
         deterministic: bool,
         /// Print how busy each stage (walk, parse, commit) was, and the bottleneck, on stderr at the end

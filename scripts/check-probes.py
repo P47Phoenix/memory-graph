@@ -10,6 +10,8 @@ import argparse, json, sys
 ap = argparse.ArgumentParser()
 ap.add_argument("--max-total", type=int, help="memory.total must be at most this (a cgroup limit)")
 ap.add_argument("--source-contains", help="memory.source must contain this text")
+ap.add_argument("--max-budget-share", type=float,
+                help="budget.in_memory must be at most this share of memory.total (#94)")
 a = ap.parse_args()
 
 v = json.load(sys.stdin)
@@ -31,6 +33,11 @@ if a.max_total is not None and (m.get("total") or 0) > a.max_total:
     bad.append(f"memory.total {m.get('total')} exceeds the limit {a.max_total}")
 if a.source_contains and a.source_contains not in (m.get("source") or ""):
     bad.append(f"memory.source {m.get('source')!r} does not mention {a.source_contains!r}")
+if a.max_budget_share is not None:
+    in_mem = v["budget"].get("in_memory") or 0
+    total = m.get("total") or 0
+    if in_mem > a.max_budget_share * total:
+        bad.append(f"budget.in_memory {in_mem} exceeds {a.max_budget_share} of memory.total {total}")
 if not (v["disk"].get("total") or 0) > 0:
     bad.append("disk.total is not positive")
 if v["budget"]["bytes"] <= 0:

@@ -302,3 +302,33 @@ fn siblings_do_not_accumulate_depth() {
     let methods = ex.symbols.iter().filter(|s| s.name.ends_with("M")).count();
     assert_eq!(methods, n);
 }
+
+thread_local! {
+    /// See `memo_on`.
+    pub(crate) static MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Symbols of `src` from `ex` with the scan memos off.
+fn without_memo(ex: &dyn Extractor, src: &str) -> Vec<SymbolDecl> {
+    MEMO.with(|m| m.set(false));
+    let out = ex.extract(src).symbols;
+    MEMO.with(|m| m.set(true));
+    out
+}
+
+proptest! {
+    /// The memos never change what is found: a random prefix (which fills
+    /// them with failed and successful scans, often unterminated) followed
+    /// by real code gives the same symbols with the memos on and off.
+    #[test]
+    fn memos_do_not_change_symbols(
+        parts in proptest::collection::vec(prop_oneof![Just("class"), Just("namespace"), Just("operator"), Just("A"), Just("{"), Just("}"), Just("("), Just(")"), Just("["), Just("]"), Just(";"), Just("="), Just("=>"), Just("<"), Just(">"), Just(","), Just("\"s"), Just("/*"), Just("<div>"), Just("int"), Just("get")], 0..60),
+        code_first in any::<bool>(),
+    ) {
+        let soup = parts.join(" ");
+        let code = "namespace N { class C { int P { get; set; } = 1; int[] a = { 1 }; public static C operator +(C a, C b) => a; void M() { } int F => 2; } }\n";
+        let src = if code_first { format!("{code}{soup}") } else { format!("{soup}\n{code}") };
+        let ex: &dyn Extractor = &CSharpExtractor;
+            prop_assert_eq!(ex.extract(&src).symbols, without_memo(ex, &src), "{}", src);
+    }
+}

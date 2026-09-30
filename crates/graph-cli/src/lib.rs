@@ -162,6 +162,21 @@ fn is_db_file(
     }
 }
 
+/// `bytes` as `--memory` would spell it: `32M`, `16K`, `1.5G`, `100B`.
+fn human_size(bytes: u64) -> String {
+    for (unit, size) in [("G", 1u64 << 30), ("M", 1 << 20), ("K", 1 << 10)] {
+        if bytes >= size {
+            let v = bytes as f64 / size as f64;
+            return if v.fract() == 0.0 {
+                format!("{v:.0}{unit}")
+            } else {
+                format!("{v:.1}{unit}")
+            };
+        }
+    }
+    format!("{bytes}B")
+}
+
 const BATCH_FILES: usize = 256;
 const BATCH_BYTES: usize = 32 * 1024 * 1024;
 
@@ -201,27 +216,28 @@ struct Tally {
 }
 
 /// Store the pending files in one transaction and fold the outcomes into `t`.
-/// Returns the source bytes of the files the store already had (unchanged).
+/// Returns the source bytes of the files the store already had (unchanged)
+/// and how many store transactions committed (#89).
 fn flush_batch(
     store: &dyn Store,
     o: &DirOpts,
     pending: &mut Vec<(String, PreparedFile)>,
     t: &mut Tally,
     board_remote: Option<&progress::RemoteBoard>,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     if pending.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let lens: Vec<u64> = pending.iter().map(|(_, p)| p.bytes_len() as u64).collect();
     let (rels, prepared): (Vec<String>, Vec<PreparedFile>) = pending.drain(..).unzip();
     let n = prepared.len();
     let t0 = std::time::Instant::now();
     let outcomes =
-        store.index_prepared(o.org, o.repo, prepared, IndexOptions { reindex: o.reindex });
+        store.index_prepared_counted(o.org, o.repo, prepared, IndexOptions { reindex: o.reindex });
     if let Some(r) = board_remote {
         r.record(lens.iter().sum(), t0.elapsed());
     }
-    let outcomes = outcomes.map_err(|e| {
+    let (outcomes, commits) = outcomes.map_err(|e| {
             if diskinfo::is_disk_full(&e.to_string()) {
                 anyhow::anyhow!(
                     "disk full while indexing a batch of {n} files ({} files were already stored): {e}; free space and rerun to resume (stored files are skipped)",
@@ -272,7 +288,7 @@ fn flush_batch(
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(unchanged_bytes)
+    Ok((unchanged_bytes, commits))
 }
 
 /// One walk entry, kept in walk order.
@@ -297,6 +313,9 @@ enum Outcome {
         what: String,
         unreadable: bool,
     },
+    /// Preparing it panicked (an extractor bug): a per-file failure, like a
+    /// span rejection, so the rest of the run is stored (#82).
+    Failed(String, String),
 }
 
 /// Read one file (enforcing the size cap while reading, so a file that grows
@@ -369,18 +388,26 @@ fn read_and_prepare(
     Ok(Outcome::Prepared(rel.clone(), Box::new(p)))
 }
 
-/// `read_and_prepare` with any panic turned into an error, so one bad file
-/// cannot wedge the pipeline.
+/// `read_and_prepare` with any panic turned into a per-file failure, so one
+/// bad file (an extractor that panics) neither wedges nor aborts the run.
+/// This relies on unwinding: building with `panic = "abort"` would undo #82.
+/// The default panic hook still prints its one `thread ... panicked` line
+/// to stderr for such a file; that is kept, as the backtrace pointer.
 fn work(store: &dyn Store, o: &DirOpts, item: &Item, board: &Board, k: usize) -> Result<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         read_and_prepare(store, o, item, board, k)
     }))
-    .unwrap_or_else(|_| {
+    .unwrap_or_else(|e| {
         let what = match item {
-            Item::File(rel, _, _) => rel.as_str(),
-            Item::Skip { what, .. } => what.as_str(),
+            Item::File(rel, _, _) => rel.clone(),
+            Item::Skip { what, .. } => what.clone(),
         };
-        Err(anyhow::anyhow!("indexing `{what}` panicked"))
+        let msg = e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        Ok(Outcome::Failed(what, format!("extractor panicked: {msg}")))
     })
 }
 
@@ -761,14 +788,14 @@ fn commit_all(
             // footprint those files hold die with the scope.
             if !pending.is_empty() {
                 let n = pending.len();
-                let unchanged =
+                let (unchanged, commits) =
                     board
                         .commit
                         .busy(0, "committing", &format!("last {n} files"), || {
                             flush_batch(store, o, &mut pending, &mut c.tally, board.remote.as_ref())
                         })?;
                 board.unchanged_bytes.fetch_add(unchanged, Relaxed);
-                board.txns.fetch_add(1, Relaxed);
+                board.txns.fetch_add(commits, Relaxed);
             }
             board.budget.release(held);
             board.footprint.fetch_sub(held_fp, Relaxed);
@@ -812,6 +839,13 @@ fn commit_all(
                     c.walk_errors |= unreadable;
                     c.skipped.entry(reason.into()).or_default().push(what);
                     board.skipped.fetch_add(1, Relaxed);
+                    board.handled.fetch_add(1, Relaxed);
+                }
+                Outcome::Failed(what, why) => {
+                    board.budget.release(size);
+                    board.handled_bytes.fetch_add(size, Relaxed);
+                    c.tally.failed.push((what, why));
+                    board.failed.fetch_add(1, Relaxed);
                     board.handled.fetch_add(1, Relaxed);
                 }
                 Outcome::Prepared(rel, p) => {
@@ -862,11 +896,11 @@ fn commit_all(
                 pending_bytes as f64 / 1048576.0
             );
             let t0 = std::time::Instant::now();
-            let unchanged = board.commit.busy(0, "committing", &label, || {
+            let (unchanged, commits) = board.commit.busy(0, "committing", &label, || {
                 flush_batch(store, o, &mut pending, &mut c.tally, board.remote.as_ref())
             })?;
             board.unchanged_bytes.fetch_add(unchanged, Relaxed);
-            board.txns.store(txn, Relaxed);
+            board.txns.fetch_add(commits, Relaxed);
             board
                 .last_txn
                 .store(t0.elapsed().as_millis() as u64, Relaxed);
@@ -996,6 +1030,25 @@ pub fn index_dir_with(
             o.chunk_bytes
         );
     }
+    // A fixed batch is held until it commits, so a smaller fixed budget
+    // would be silently raised to one batch (#88): say so instead.
+    if let (true, Some(sysinfo::MemorySpec::Fixed(bytes))) = (o.deterministic, o.memory) {
+        if bytes < BATCH_BYTES as u64 {
+            let from_env = std::env::var("MEMORY_GRAPH_MEMORY")
+                .ok()
+                .and_then(|v| sysinfo::parse_memory_spec(&v).ok())
+                == o.memory;
+            bail!(
+                "--deterministic needs --memory of at least 32M (one fixed batch is held in memory until it commits), got {}{}; raise it or drop --deterministic",
+                human_size(bytes),
+                if from_env {
+                    " (from MEMORY_GRAPH_MEMORY)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
     // Pre-flight: refuse when the volume is already below the reserve.
     let probe: DiskProbe = o
         .disk_probe
@@ -1054,8 +1107,12 @@ pub fn index_dir_with(
         by_lang,
         seen,
         skipped: batch_skipped,
-        failed,
+        mut failed,
     } = tally;
+    // Span failures are recorded at their batch's flush, panics as they
+    // arrive; sort so the report does not depend on batching (paths are
+    // unique within a run).
+    failed.sort();
     for (r, v) in batch_skipped {
         skipped.entry(r).or_default().extend(v);
     }
