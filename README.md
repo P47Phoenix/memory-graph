@@ -80,6 +80,10 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 
 Global options: `--db <file>` (default `./graph.redb`), `--server <host:port>[,<host:port>...]` and `--read local|linearizable` ([server guide](docs/guide/server.md)), `--chunk-bytes` (commit a transaction every this many source bytes, default 64 MiB) and `--cache-bytes` (redb's cache, default 1 GiB). Run `memory-graph <command> --help` for the full list.
 
+## Source encodings
+
+Files in UTF-16, Windows code pages, Shift_JIS, GBK, Big5 and other encodings are detected and decoded to UTF-8, so one search matches across them; override detection with `--encoding` or a `.memory-graph.toml`: [docs/guide/indexing.md](docs/guide/indexing.md#source-encodings).
+
 ## Languages
 
 Languages are detected per file from the extension, the filename or a `#!` line, so a polyglot repo needs no flags. Every file gets exact-span tokens; these also get symbols:
@@ -104,14 +108,14 @@ Logs, Prometheus metrics, health and readiness probes: [docs/guide/observability
 
 | Guide | What it covers |
 |---|---|
-| [Indexing](docs/guide/indexing.md) | Incremental rules, `--prune`/`--force`, paths, per-file failures, sizing (threads, memory, disk), progress and traces |
+| [Indexing](docs/guide/indexing.md) | Incremental rules, `--prune`/`--force`, paths, per-file failures, source encodings, sizing (threads, memory, disk), progress and traces |
 | [Querying](docs/guide/querying.md) | Grains, `--kind`, symbol patterns, paging, `--json`, MCP |
 | [Server mode](docs/guide/server.md) | `serve --db`, choosing the target, LOCK, exit codes, retries and write deadlines |
 | [Cluster](docs/guide/cluster.md) | Bootstrap, tuning, TOML config, backups (S3 walkthrough), join/promote/remove, read modes |
 | [Observability](docs/guide/observability.md) | Logs, metrics, health and readiness |
 | [Docker](docs/guide/docker.md) | The container image: first run, Windows, mounts, Compose, serving, troubleshooting, tags |
 | [Languages](docs/guide/languages.md) | Extensions, extractors, tokenizer dialects |
-| [Storage](docs/guide/storage.md) | Format, size, reclaiming space, the retired v1 format |
+| [Storage](docs/guide/storage.md) | Format, size, reclaiming space, schema upgrades, the retired v1 format |
 | [Development](docs/guide/development.md) | Building, tests, CI gates, test corpus, using it as a library |
 | [Deployment](docs/deploy/data-dir.md) | Data directory, backup and restore; also [Compose](docs/deploy/compose.md) and [Kubernetes](docs/deploy/kubernetes.md) |
 | [Documentation index](docs/README.md) | Glossary, epic, ADRs, spikes, learnings |
