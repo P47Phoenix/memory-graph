@@ -113,6 +113,15 @@ fn assert_nothing_left(dir: &Path) {
     );
 }
 
+/// `r` without the entry at `index`.
+fn pb_without(
+    mut r: graph_proto::pb::ListBackupsResponse,
+    index: u64,
+) -> graph_proto::pb::ListBackupsResponse {
+    r.backups.retain(|b| b.index != index);
+    r
+}
+
 fn files(s: &TestServer) -> usize {
     RemoteStore::connect(ClientConfig::new(s.endpoint()))
         .unwrap()
@@ -363,7 +372,21 @@ fn backups_lists_exactly_the_committed_pairs() {
     f.put_object(BUCKET, &format!("{dir_key}/nested/snap-9-5.meta"), b"{}");
     f.put_object(BUCKET, &format!("{PREFIX}/other/snap-1-1.meta"), b"{}");
     f.put_object(BUCKET, &format!("{dir_key}/snap-7-1.meta"), b"not json");
+    // A `.meta` whose data object is gone: listed, marked.
+    let first_meta = meta_at(&f, &cluster, indexes[0]);
+    f.put_object(
+        BUCKET,
+        &format!("{dir_key}/snap-8-99.meta"),
+        &f.object(BUCKET, &first_meta).unwrap(),
+    );
     let r = c.admin_list_backups().unwrap();
+    let orphan_meta = r
+        .backups
+        .iter()
+        .find(|b| b.index == 99)
+        .expect("the data-less .meta is listed");
+    assert!(orphan_meta.error.contains("is missing"), "{orphan_meta:?}");
+    let r = pb_without(r, 99);
     assert_eq!(r.cluster_id, cluster);
     assert!(
         r.location.starts_with(&format!("s3://{BUCKET}/{PREFIX}")),

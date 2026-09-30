@@ -47,8 +47,35 @@ pub struct Uploaded {
     pub side: SnapshotSidecar,
 }
 
+/// Why an on-demand upload ([`Backup::upload_now`]) did not commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadError {
+    /// A newer snapshot replaced the file before the upload opened it:
+    /// upload the current snapshot instead.
+    Replaced(String),
+    /// This node has no cluster id to key the backup by yet.
+    NoClusterId,
+    /// The uploader stopped (the server is shutting down).
+    Stopped,
+    /// The upload failed (after its retries).
+    Failed(String),
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replaced(m) | Self::Failed(m) => f.write_str(m),
+            Self::NoClusterId => f.write_str("this node has no cluster id yet"),
+            Self::Stopped => f.write_str("the server is shutting down"),
+        }
+    }
+}
+
+/// The answer [`Backup::upload_now`] hands back.
+pub type UploadResult = Result<Uploaded, UploadError>;
+
 /// Who waits for a job's outcome (`cluster snapshot --upload`).
-type Waiter = std::sync::mpsc::Sender<Result<Uploaded, String>>;
+type Waiter = tokio::sync::oneshot::Sender<UploadResult>;
 
 struct Job {
     side: SnapshotSidecar,
@@ -62,7 +89,7 @@ enum JobEnd {
     Done(Box<Uploaded>),
     /// Failed (after the retries), or skipped for a reason that is not a
     /// commit.
-    Failed(String),
+    Failed(UploadError),
     /// A newer snapshot (or a stop) replaced it: its waiters move on.
     Superseded,
 }
@@ -155,16 +182,21 @@ impl Backup {
         if !upload {
             return;
         }
-        self.enqueue(side, path, None);
+        let _ = self.enqueue(side, path, None);
     }
 
     /// Queue `side` (replacing a queued job, whose waiters then wait for
-    /// this one); `false` once stopped.
-    fn enqueue(&self, side: &SnapshotSidecar, path: &Path, waiter: Option<Waiter>) -> bool {
+    /// this one); once stopped, the waiter comes back.
+    fn enqueue(
+        &self,
+        side: &SnapshotSidecar,
+        path: &Path,
+        waiter: Option<Waiter>,
+    ) -> Result<(), Option<Waiter>> {
         let i = &self.inner;
         let mut q = lock(&i.queue);
         if q.stop {
-            return false;
+            return Err(waiter);
         }
         let mut waiters: Vec<Waiter> = waiter.into_iter().collect();
         if let Some(old) = q.pending.take() {
@@ -174,7 +206,7 @@ impl Backup {
                 let mut old = old;
                 old.waiters.append(&mut waiters);
                 q.pending = Some(old);
-                return true;
+                return Ok(());
             }
             if old.side.index != side.index {
                 tracing::info!(
@@ -191,45 +223,33 @@ impl Backup {
             waiters,
         });
         i.cv.notify_all();
-        true
+        Ok(())
     }
 
     /// `cluster backups`: this cluster's committed backups in the sink,
     /// highest index first. Blocking: call it off the async runtime.
-    pub fn list(&self) -> Result<Vec<super::restore::Listed>, String> {
-        let prefix = match self.inner.prefix() {
-            Ok(p) => p,
-            Err(_) => return Err("this node has no cluster id yet".into()),
-        };
-        super::restore::list_committed(self.inner.sink.as_ref(), &prefix).map_err(|e| e.to_string())
+    pub fn list(&self) -> Result<Vec<super::restore::Listed>, UploadError> {
+        let prefix = self.inner.prefix().map_err(|_| UploadError::NoClusterId)?;
+        super::restore::list_committed(self.inner.sink.as_ref(), &prefix)
+            .map_err(|e| UploadError::Failed(e.to_string()))
     }
 
-    /// `cluster snapshot --upload`: upload `side` (the snapshot at `path`)
-    /// now, whatever `--backup-on` says, and wait for its commit, up to
-    /// `timeout`. A newer snapshot that supersedes it while it is queued is
-    /// what gets committed (and reported); a pair already committed counts
-    /// as done. Blocking: call it off the async runtime.
+    /// `cluster snapshot --upload`: queue `side` (the snapshot at `path`)
+    /// now, whatever `--backup-on` says, and return a receiver of its
+    /// outcome. Never blocks. A newer snapshot that supersedes it while it
+    /// is queued is what gets committed (and reported); a pair already
+    /// committed counts as done. Dropping the receiver (a caller that gave
+    /// up) does not cancel the upload: it goes on in the background.
     pub fn upload_now(
         &self,
         side: &SnapshotSidecar,
         path: &Path,
-        timeout: Duration,
-    ) -> Result<Uploaded, String> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        if !self.enqueue(side, path, Some(tx)) {
-            return Err("the server is shutting down".into());
+    ) -> tokio::sync::oneshot::Receiver<UploadResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Err(Some(tx)) = self.enqueue(side, path, Some(tx)) {
+            let _ = tx.send(Err(UploadError::Stopped));
         }
-        match rx.recv_timeout(timeout) {
-            Ok(r) => r,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-                "the upload of snapshot {} did not finish within {timeout:?} (it goes on in \
-                 the background; see `cluster status`)",
-                side.index
-            )),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err("the server stopped before the upload finished".into())
-            }
-        }
+        rx
     }
 
     /// Wait until nothing is queued or uploading (tests), up to `timeout`;
@@ -278,7 +298,7 @@ enum Outcome {
     Fatal(String),
     /// Not a failure: a newer snapshot replaced the file before it was
     /// opened, or there is no cluster id to key it by yet.
-    Skipped(String),
+    Skipped(UploadError),
     /// Not a failure: the pair is already committed (by another node
     /// sharing the URL, or before a restart).
     Committed(Box<Uploaded>),
@@ -378,10 +398,7 @@ impl Inner {
                 }
                 Err(Outcome::Skipped(why)) => {
                     tracing::info!(index = job.side.index, "backup: skipped: {why}");
-                    return JobEnd::Failed(format!(
-                        "snapshot {} was not uploaded: {why}",
-                        job.side.index
-                    ));
+                    return JobEnd::Failed(why);
                 }
                 Err(o) => {
                     let (e, fatal) = match o {
@@ -412,7 +429,7 @@ impl Inner {
                         let mut s = lock(&self.stats);
                         s.failures_total += 1;
                         s.last_error = msg.clone();
-                        return JobEnd::Failed(msg);
+                        return JobEnd::Failed(UploadError::Failed(msg));
                     }
                     let delay = self.cfg.retry_backoff * 2u32.pow(attempt);
                     tracing::warn!(
@@ -436,7 +453,7 @@ impl Inner {
     fn prefix(&self) -> Result<String, Outcome> {
         match self.identity.get() {
             Some(id) if !id.is_empty() => Ok(format!("{id}/")),
-            _ => Err(Outcome::Skipped("this node has no cluster id yet".into())),
+            _ => Err(Outcome::Skipped(UploadError::NoClusterId)),
         }
     }
 
@@ -468,10 +485,10 @@ impl Inner {
         let file = match std::fs::File::open(&job.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Outcome::Skipped(format!(
+                return Err(Outcome::Skipped(UploadError::Replaced(format!(
                     "`{}` was replaced by a newer snapshot before the upload began",
                     job.path.display()
-                )))
+                ))))
             }
             Err(e) => return Err(Outcome::Failed(format!("opening the snapshot: {e}"))),
         };
@@ -839,21 +856,62 @@ mod tests {
         b.snapshot_built(&side, &path);
         assert!(b.wait_idle(WAIT));
         assert!(sink.list("").unwrap().is_empty());
-        let up = b.upload_now(&side, &path, WAIT).unwrap();
+        let up = b.upload_now(&side, &path).blocking_recv().unwrap().unwrap();
         assert_eq!(up.key, "c/snap-1-4.redb");
         assert_eq!(up.url, format!("{}/c/snap-1-4.redb", sink.describe()));
         assert_eq!(up.side.sha256, side.sha256);
         assert!(sink.get("c/snap-1-4.meta", &mut std::io::sink()).is_ok());
-        let again = b.upload_now(&side, &path, WAIT).unwrap();
+        let again = b.upload_now(&side, &path).blocking_recv().unwrap().unwrap();
         assert_eq!(again.key, up.key);
         assert_eq!(b.stats().uploads_total, 1);
         // A snapshot whose bytes do not match its sidecar: the error.
-        let (mut bad, path) = snapshot(d.path(), 5, b"five");
+        let (mut bad, bad_path) = snapshot(d.path(), 5, b"five");
         bad.sha256 = "00".repeat(32);
-        let e = b.upload_now(&bad, &path, WAIT).unwrap_err();
-        assert!(e.contains("sha256"), "{e}");
+        let e = b
+            .upload_now(&bad, &bad_path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert!(e.to_string().contains("sha256"), "{e}");
+        // The file replaced (removed) before the upload opened it.
+        let (gone, gone_path) = snapshot(d.path(), 6, b"six");
+        std::fs::remove_file(&gone_path).unwrap();
+        let e = b
+            .upload_now(&gone, &gone_path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(e, UploadError::Replaced(_)), "{e:?}");
+        // A caller that gave up does not cancel the upload.
+        let (late, late_path) = snapshot(d.path(), 7, b"seven");
+        drop(b.upload_now(&late, &late_path));
+        assert!(b.wait_idle(WAIT));
+        assert!(sink.get("c/snap-1-7.meta", &mut std::io::sink()).is_ok());
         b.stop();
-        assert!(b.upload_now(&side, &path, WAIT).is_err());
+        let e = b
+            .upload_now(&side, &path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e, UploadError::Stopped);
+    }
+
+    /// Without a cluster id the upload says so (typed, for the RPC's code).
+    #[test]
+    fn upload_now_without_a_cluster_id() {
+        let d = tempfile::tempdir().unwrap();
+        let sink = Arc::new(FileSink::new(d.path().join("b")));
+        let mut cfg = BackupConfig::new("file:///unused");
+        cfg.sink = Some(sink);
+        let b = Backup::start(cfg, Arc::new(ClusterIdentity::fixed(""))).unwrap();
+        let (side, path) = snapshot(d.path(), 4, b"four");
+        let e = b
+            .upload_now(&side, &path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e, UploadError::NoClusterId);
+        assert_eq!(b.list().unwrap_err(), UploadError::NoClusterId);
     }
 
     /// A pair already committed (another node on the same URL) is neither

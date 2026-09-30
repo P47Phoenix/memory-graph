@@ -752,9 +752,17 @@ macro_rules! on_leader {
     };
 }
 
-/// How long `UploadSnapshot` waits for the upload's commit once the
-/// snapshot is built.
+/// How long `UploadSnapshot` waits for the build and the upload's commit
+/// when the request carries no deadline.
 const UPLOAD_WAIT: Duration = Duration::from_secs(3600);
+
+/// The time `UploadSnapshot` may take: the caller's deadline (default
+/// [`UPLOAD_WAIT`]) less a margin (a tenth, at most 5 s), so the "continues
+/// in the background" answer reaches the caller before it times out.
+fn upload_budget(deadline: Option<Duration>) -> Duration {
+    let d = deadline.unwrap_or(UPLOAD_WAIT);
+    d.saturating_sub((d / 10).min(Duration::from_secs(5)))
+}
 
 /// This node's uploader, or `FAILED_PRECONDITION` without `--backup-url`.
 fn backup_of(ctx: &Ctx) -> Result<crate::backup::Backup, Status> {
@@ -1176,22 +1184,58 @@ impl pb::admin_server::Admin for AdminService {
     ) -> Result<Response<pb::UploadSnapshotResponse>, Status> {
         // The leader uploads (its backup settings count, not this node's).
         on_leader!(self, req, upload_snapshot);
+        // Answer before the caller's deadline (less a margin for the
+        // answer to travel back): an upload still running then goes on in
+        // the background, and so does one whose caller gave up (dropping
+        // the request drops only the receiver, never the upload).
+        let started = std::time::Instant::now();
+        let budget = upload_budget(crate::forward::incoming_timeout(req.metadata()));
+        let left = || budget.saturating_sub(started.elapsed());
         let backup = backup_of(&self.ctx)?;
         self.ctx
             .raft
-            .snapshot_now(SNAPSHOT_WAIT)
+            .snapshot_now(left().min(SNAPSHOT_WAIT))
             .await
             .map_err(status)?;
-        let (side, path) = self
-            .ctx
-            .raft
-            .snapshots
-            .current()
-            .ok_or_else(|| Status::internal("the snapshot was built but is not on disk"))?;
-        let up = tokio::task::spawn_blocking(move || backup.upload_now(&side, &path, UPLOAD_WAIT))
-            .await
-            .map_err(|e| Status::internal(format!("upload task: {e}")))?
-            .map_err(|e| status(StoreError::Storage(format!("--upload: {e}"))))?;
+        // A newer build can replace the snapshot before the uploader opens
+        // it: then the newer one (the current snapshot) is uploaded and
+        // reported instead.
+        let mut attempts = 0;
+        let up = loop {
+            attempts += 1;
+            let (side, path) = self
+                .ctx
+                .raft
+                .snapshots
+                .current()
+                .ok_or_else(|| Status::internal("the snapshot was built but is not on disk"))?;
+            let index = side.index;
+            let rx = backup.upload_now(&side, &path);
+            let r = match tokio::time::timeout(left(), rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => Err(crate::backup::UploadError::Stopped),
+                Err(_) => {
+                    return Err(Status::deadline_exceeded(format!(
+                        "the upload of snapshot {index} did not finish within the request's \
+                         deadline; it continues in the background (see `cluster status` and \
+                         `cluster backups`)"
+                    )))
+                }
+            };
+            match r {
+                Ok(up) => break up,
+                Err(crate::backup::UploadError::Replaced(why)) if attempts < 3 => {
+                    tracing::info!("cluster snapshot --upload: {why}; uploading the current one");
+                }
+                Err(e @ crate::backup::UploadError::NoClusterId) => {
+                    return Err(Status::failed_precondition(format!("--upload: {e}")))
+                }
+                Err(e @ crate::backup::UploadError::Stopped) => {
+                    return Err(Status::unavailable(format!("--upload: {e}")))
+                }
+                Err(e) => return Err(status(StoreError::Storage(format!("--upload: {e}")))),
+            }
+        };
         tracing::info!(url = %up.url, index = up.side.index, "cluster snapshot --upload: committed");
         Ok(Response::new(pb::UploadSnapshotResponse {
             backup: Some(pb::BackupEntry {
@@ -1218,7 +1262,12 @@ impl pb::admin_server::Admin for AdminService {
         let listed = crate::backup::off_runtime("listing the backups", move || b.list())
             .await
             .map_err(Status::internal)?
-            .map_err(|e| status(StoreError::Storage(format!("listing the backups: {e}"))))?;
+            .map_err(|e| match e {
+                crate::backup::UploadError::NoClusterId => {
+                    Status::failed_precondition(format!("listing the backups: {e}"))
+                }
+                e => status(StoreError::Storage(format!("listing the backups: {e}"))),
+            })?;
         let sink = backup.sink();
         let backups = listed
             .into_iter()
@@ -1261,6 +1310,18 @@ impl pb::admin_server::Admin for AdminService {
 #[cfg(test)]
 mod tests {
     use super::check_moved_member_cluster;
+
+    /// The upload answers before the caller's deadline.
+    #[test]
+    fn the_upload_budget_leaves_a_margin() {
+        use super::{upload_budget, UPLOAD_WAIT};
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert_eq!(upload_budget(Some(s(3660))), s(3655));
+        assert_eq!(upload_budget(Some(s(20))), s(18));
+        assert_eq!(upload_budget(None), UPLOAD_WAIT - s(5));
+        assert_eq!(upload_budget(Some(Duration::ZERO)), Duration::ZERO);
+    }
 
     /// Dev review 4: a moved member must report this cluster's id; an
     /// empty or a different one is refused.

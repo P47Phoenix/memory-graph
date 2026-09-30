@@ -18,12 +18,12 @@ use std::time::Duration;
 
 type Result<T> = std::result::Result<T, StoreError>;
 
-/// A request carrying `msg` with `deadline` as its `grpc-timeout` (the
-/// channel enforces it, and the server stops working on it).
-/// The deadline of `Admin.UploadSnapshot` (the server waits up to an hour
-/// for the commit).
+/// The deadline of `Admin.UploadSnapshot`. The server answers a little
+/// before it; an upload still running then continues in the background.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(3660);
 
+/// A request carrying `msg` with `deadline` as its `grpc-timeout` (the
+/// channel enforces it, and the server stops working on it).
 fn timed<T>(msg: T, deadline: Duration) -> tonic::Request<T> {
     let mut r = tonic::Request::new(msg);
     r.set_timeout(deadline);
@@ -289,10 +289,13 @@ impl RemoteStore {
     /// `Admin.UploadSnapshot` (`cluster snapshot --upload`, ADR 0006): the
     /// leader (any node forwards it) builds a snapshot now, uploads it to
     /// its backup location and answers once it committed. Waits up to an
-    /// hour (an upload of a large store takes a while).
+    /// hour (an upload of a large store takes a while); the server answers
+    /// `DEADLINE_EXCEEDED` just before that, and the upload continues in
+    /// the background (also when this call is given up). Sent once to the
+    /// connected node, never retried or moved to another endpoint.
     pub fn admin_upload_snapshot(&self) -> Result<pb::UploadSnapshotResponse> {
         let d = self.config().admin_deadline.max(UPLOAD_DEADLINE);
-        self.run(self.conn.call(Kind::Read, |ch| async move {
+        self.run(self.conn.call_once(|ch| async move {
             admin_client(ch)
                 .upload_snapshot(timed(pb::UploadSnapshotRequest {}, d))
                 .await

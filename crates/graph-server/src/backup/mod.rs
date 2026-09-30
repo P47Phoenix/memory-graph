@@ -40,7 +40,7 @@ pub mod uploader;
 
 pub use file::FileSink;
 pub use s3::{S3Options, S3Sink};
-pub use uploader::{Backup, BackupStats, Uploaded};
+pub use uploader::{Backup, BackupStats, UploadError, UploadResult, Uploaded};
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -220,10 +220,20 @@ pub async fn off_runtime<T: Send + 'static>(
     std::thread::Builder::new()
         .name("backup-call".into())
         .spawn(move || {
-            let _ = tx.send(f());
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| {
+                p.downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a panic without a message".into())
+            });
+            let _ = tx.send(r);
         })
         .map_err(|e| format!("{what}: starting a thread: {e}"))?;
-    rx.await.map_err(|_| format!("{what}: the thread panicked"))
+    match rx.await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(msg)) => Err(format!("{what}: panicked: {msg}")),
+        Err(_) => Err(format!("{what}: the thread ended without an answer")),
+    }
 }
 
 /// A parsed backup URL.
@@ -303,6 +313,18 @@ mod tests {
         assert!(parse_url("s3://B").is_err());
         assert!(parse_url("http://x").is_err());
         assert!(is_url("file:///x") && !is_url("/x/snap-1-2.redb"));
+    }
+
+    #[test]
+    fn off_runtime_reports_a_panic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(off_runtime("x", || 7)).unwrap(), 7);
+        let e = rt
+            .block_on(off_runtime("listing", || -> u8 { panic!("boom {}", 1) }))
+            .unwrap_err();
+        assert!(e.contains("listing: panicked: boom 1"), "{e}");
     }
 
     #[test]

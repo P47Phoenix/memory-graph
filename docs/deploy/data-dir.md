@@ -108,10 +108,18 @@ the stored size is checked with a HEAD after each upload.
   restore (size, sha256, store format, extractors with `--restore-allow-extractor-mismatch`,
   free disk), downloaded to `<store>.restore.tmp` and removed on any refusal; `latest` falls
   back past orphans and damaged pairs to the highest committed backup that verifies.
+- `--restore s3://` and `--backup-url s3://` share one set of S3 flags (`--backup-endpoint`,
+  `--backup-region`, `--backup-virtual-host`, `--backup-credentials-file`, `--backup-profile`);
+  with a `file://` backup URL they serve the restore alone.
 - `memory-graph --server <any node> cluster snapshot --upload` has the leader build a snapshot
-  now and upload it (whatever `--backup-on` says), and prints its URL and sha256;
-  `cluster backups [--json]` lists the committed backups of the cluster in the node's backup
-  location, newest first, with the URLs `--restore` takes.
+  now and upload it (whatever `--backup-on` says), and prints its URL and sha256 (if a newer
+  snapshot replaced it first, that one is uploaded and reported). The call waits up to an hour
+  and is never resent; if the server answers `DEADLINE_EXCEEDED`, or the client gives up, the
+  upload continues in the background (check `cluster status` and `cluster backups`).
+- `cluster backups [--json]` lists the committed backups of the cluster in the backup location
+  of the node you connect to (its own `--backup-url`), newest first, with the URLs `--restore`
+  takes. A `.meta` that cannot be read, or whose data object is missing, is listed with an
+  error.
 - A multipart upload cut short by a crash or an outage is invisible (no `.meta`) but still
   stored and billed until aborted. Retention aborts those under the cluster's prefix once they
   are older than 24 h. As belt and braces, also give the bucket a lifecycle rule that aborts

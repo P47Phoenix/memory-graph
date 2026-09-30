@@ -423,6 +423,7 @@ Design: [ADR 0005](adr/0005-mcp.md) test plan (Accepted).
 - Given `docs/mcp.md` and `serve --help`, When read, Then both must carry the boxed no-authentication warning.
 
 **35. Snapshot backups: `file://` sink and verified restore (5 pts)**
+Status: Delivered in PR #159.
 As a database operator
 I want the leader to copy each snapshot to a backup directory and restore from it with verification
 So that a cluster can be rebuilt after losing every node.
@@ -437,6 +438,7 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E1-E3, E7-E10 (Accepted
 - Given the flags, When configured through TOML, Then they must behave the same; metrics and `cluster status` must report the last backup and the last error.
 
 **36. S3 client over plain HTTP (8 pts)**
+Status: Delivered in PR #167.
 As a database operator
 I want backups written to S3-compatible object storage
 So that they live off the cluster's own disks.
@@ -448,6 +450,7 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E3-E6 (Accepted).
 - Given the change, When CI runs, Then the gate must be clean and every new crate must be MIT or Apache licensed.
 
 **37. Restore from `s3://` and `latest`, `cluster snapshot --upload`, `cluster backups` (3 pts)**
+Status: Delivered in PR #170.
 As a database operator
 I want to restore from object storage by URL and see what backups exist
 So that recovery is one command.
