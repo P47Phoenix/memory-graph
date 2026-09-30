@@ -2,8 +2,8 @@
 //! story 36), a small hand-written S3 client: SigV4 ([`super::sigv4`]),
 //! PUT (with `x-amz-content-sha256`), GET, HEAD, ListObjectsV2, DELETE, and
 //! multipart above [`MULTIPART_THRESHOLD`] (aborted on any error). No AWS
-//! SDK: it runs on the `hyper` / `hyper-util` already in the tree, one
-//! HTTP/1.1 connection per request, on a one-worker tokio runtime the sink
+//! SDK: it runs on the `hyper` / `hyper-util` already in the tree, a
+//! kept-alive HTTP/1.1 connection, on a one-worker tokio runtime the sink
 //! owns (the [`BackupSink`] trait is synchronous; the uploader
 //! calls it from its own thread).
 //!
@@ -16,9 +16,11 @@
 //! (`x-amz-content-sha256`, per part for a multipart upload), so the server
 //! refuses a body that changed on the way; after an upload a HEAD checks
 //! the stored size. A multipart upload that fails is aborted, so no parts
-//! linger; a crash mid-upload leaves only an unfinished upload (a bucket
-//! lifecycle rule for incomplete uploads cleans those) and never an object
-//! under the key.
+//! linger; a crash mid-upload leaves only an unfinished upload, never an
+//! object under the key, and retention aborts unfinished uploads older than
+//! the orphan age ([`BackupSink::sweep_incomplete`]; a bucket lifecycle rule
+//! is the belt and braces). One HTTP/1.1 connection is kept alive and
+//! reused while it is ready, and replaced when it breaks.
 use super::creds::{self, Credentials};
 use super::sigv4;
 use super::{BackupSink, ObjectInfo};
@@ -37,9 +39,16 @@ pub const MULTIPART_THRESHOLD: usize = 64 << 20;
 pub const PART_SIZE: usize = 16 << 20;
 /// The default region (`--backup-region`).
 pub const DEFAULT_REGION: &str = "us-east-1";
-/// The idle timeout of each step of a request (connect, response head, each
-/// body chunk).
+/// The idle timeout of each step of a request: connecting, waiting for a
+/// reusable connection, each chunk of a response body, and the response
+/// head, whose wait also grows with the request body at [`MIN_RATE`] (a
+/// 16 MiB part may take `60 s + 16 s`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// The slowest upload rate a request body is given time for (bytes/s).
+pub const MIN_RATE: u64 = 1 << 20;
+/// The largest response body read into memory (listings, errors); a GET
+/// streams instead.
+pub const MAX_RESPONSE: u64 = 8 << 20;
 
 /// The guidance of an HTTPS refusal.
 const HTTPS_GUIDANCE: &str = "stage 1 of ADR 0006 speaks plain http:// only (no pure-Rust TLS \
@@ -203,7 +212,7 @@ pub struct S3Options {
     pub multipart_threshold: usize,
     /// [`PART_SIZE`] (tests lower it).
     pub part_size: usize,
-    /// [`DEFAULT_TIMEOUT`].
+    /// [`DEFAULT_TIMEOUT`] (see there for what it bounds).
     pub timeout: Duration,
     /// Tests: connect here whatever the host (a virtual-hosted name that
     /// does not resolve), like curl's `--connect-to`.
@@ -250,6 +259,8 @@ pub struct S3Sink {
     endpoint: Endpoint,
     opts: S3Options,
     creds: Credentials,
+    /// The kept-alive connection (HTTP/1.1), reused while it is ready.
+    conn: tokio::sync::Mutex<Option<hyper::client::conn::http1::SendRequest<Full<Bytes>>>>,
     rt: Option<tokio::runtime::Runtime>,
 }
 
@@ -339,6 +350,20 @@ fn s3_error_text(body: &[u8]) -> Option<String> {
     })
 }
 
+/// The `io::ErrorKind` of an S3 error status: 404 `NotFound`, 403
+/// `PermissionDenied`, another 4xx that retrying cannot fix
+/// `InvalidInput` (the uploader does not retry those two), and anything
+/// else (5xx, 408, 409, 429) `Other`.
+pub fn status_kind(status: u16) -> std::io::ErrorKind {
+    match status {
+        404 => std::io::ErrorKind::NotFound,
+        403 => std::io::ErrorKind::PermissionDenied,
+        408 | 409 | 429 => std::io::ErrorKind::Other,
+        400..=499 => std::io::ErrorKind::InvalidInput,
+        _ => std::io::ErrorKind::Other,
+    }
+}
+
 /// The escaped text of an XML element's content.
 fn xml_escape(s: &str) -> String {
     quick_xml::escape::escape(s).into_owned()
@@ -408,6 +433,7 @@ impl S3Sink {
             endpoint,
             opts,
             creds,
+            conn: tokio::sync::Mutex::new(None),
             rt: Some(rt),
         })
     }
@@ -479,7 +505,9 @@ impl S3Sink {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_err(|_| {
+                io_other("S3: the system clock is before 1970, so no request can be signed".into())
+            })?;
         let amz_date = sigv4::amz_date(now);
         let payload = sigv4::sha256_hex(&body);
         let mut headers: Vec<(String, String)> = vec![
@@ -515,61 +543,108 @@ impl S3Sink {
         } else {
             format!("{path}?{q}")
         };
-        let mut req = hyper::Request::builder().method(method).uri(&uri);
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let req = req
-            .header("authorization", auth)
-            .header("content-length", body.len())
-            .body(Full::new(body))
-            .map_err(|e| io_other(format!("S3 {method} {uri}: building the request: {e}")))?;
-        let stream = {
-            let connect = async {
-                match self.opts.connect_to {
-                    Some(a) => tokio::net::TcpStream::connect(a).await,
-                    None => {
-                        let host = self
-                            .endpoint
-                            .host
-                            .trim_start_matches('[')
-                            .trim_end_matches(']');
-                        let h = if self.opts.virtual_host {
-                            format!("{}.{host}", self.url.bucket)
-                        } else {
-                            host.to_string()
-                        };
-                        tokio::net::TcpStream::connect((h.as_str(), self.endpoint.port)).await
-                    }
-                }
-            };
-            tokio::time::timeout(t, connect)
-                .await
-                .map_err(|_| timed_out(&format!("connecting to {}", self.endpoint), t))?
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("S3: connecting to {}: {e}", self.endpoint),
-                    )
-                })?
+        let build = |body: Bytes| {
+            let mut req = hyper::Request::builder().method(method).uri(&uri);
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            req.header("authorization", auth.as_str())
+                .header("content-length", body.len())
+                .body(Full::new(body))
+                .map_err(|e| io_other(format!("S3 {method} {uri}: building the request: {e}")))
         };
-        let _ = stream.set_nodelay(true);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        // The response head may take as long as sending the body does.
+        let head_wait = t + Duration::from_secs(body.len() as u64 / MIN_RATE);
+        let mut slot = self.conn.lock().await;
+        // A kept-alive connection first (it may have been closed by the
+        // server while idle: then once more on a fresh one).
+        for fresh in [false, true] {
+            let mut sender = match (fresh, slot.take()) {
+                (false, Some(mut s)) => match tokio::time::timeout(t, s.ready()).await {
+                    Ok(Ok(())) => s,
+                    _ => continue,
+                },
+                (false, None) => continue,
+                (true, _) => self.connect(method, &uri).await?,
+            };
+            let sent = tokio::time::timeout(head_wait, sender.send_request(build(body.clone())?))
+                .await
+                .map_err(|_| timed_out(&format!("{method} {uri}"), head_wait))?;
+            match sent {
+                Ok(resp) => {
+                    *slot = Some(sender);
+                    return Ok(resp);
+                }
+                // A reused connection that the server had closed.
+                Err(e)
+                    if !fresh
+                        && (e.is_closed() || e.is_canceled() || e.is_incomplete_message()) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(io_other(format!("S3 {method} {uri}: {e}"))),
+            }
+        }
+        unreachable!("the fresh connection returns")
+    }
+
+    /// A new HTTP/1.1 connection to the endpoint.
+    async fn connect(
+        &self,
+        method: &str,
+        uri: &str,
+    ) -> std::io::Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>> {
+        let t = self.opts.timeout;
+        let connect = async {
+            match self.opts.connect_to {
+                Some(a) => tokio::net::TcpStream::connect(a).await,
+                None => {
+                    let host = self
+                        .endpoint
+                        .host
+                        .trim_start_matches('[')
+                        .trim_end_matches(']');
+                    let h = if self.opts.virtual_host {
+                        format!("{}.{host}", self.url.bucket)
+                    } else {
+                        host.to_string()
+                    };
+                    tokio::net::TcpStream::connect((h.as_str(), self.endpoint.port)).await
+                }
+            }
+        };
+        let stream = tokio::time::timeout(t, connect)
             .await
-            .map_err(|e| io_other(format!("S3 {method} {uri}: {e}")))?;
+            .map_err(|_| timed_out(&format!("connecting to {}", self.endpoint), t))?
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("S3: connecting to {}: {e}", self.endpoint),
+                )
+            })?;
+        let _ = stream.set_nodelay(true);
+        let (sender, conn) = tokio::time::timeout(
+            t,
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)),
+        )
+        .await
+        .map_err(|_| timed_out(&format!("{method} {uri}"), t))?
+        .map_err(|e| io_other(format!("S3 {method} {uri}: {e}")))?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let resp = tokio::time::timeout(t, sender.send_request(req))
-            .await
-            .map_err(|_| timed_out(&format!("{method} {uri}"), t))?
-            .map_err(|e| io_other(format!("S3 {method} {uri}: {e}")))?;
-        Ok(resp)
+        Ok(sender)
     }
 
     /// Stream a response body into `sink` (with the idle timeout); the
     /// bytes.
-    async fn drain(&self, resp: Resp, what: &str, dst: &mut dyn Write) -> std::io::Result<u64> {
+    async fn drain(
+        &self,
+        resp: Resp,
+        what: &str,
+        dst: &mut dyn Write,
+        max: Option<u64>,
+    ) -> std::io::Result<u64> {
         let t = self.opts.timeout;
         let mut body = resp.into_body();
         let mut n = 0u64;
@@ -580,8 +655,14 @@ impl S3Sink {
             let Some(frame) = frame else { break };
             let frame = frame.map_err(|e| io_other(format!("S3 {what}: {e}")))?;
             if let Ok(data) = frame.into_data() {
-                dst.write_all(&data)?;
                 n += data.len() as u64;
+                if max.is_some_and(|m| n > m) {
+                    return Err(io_other(format!(
+                        "S3 {what}: the response is over {} bytes",
+                        max.unwrap_or(0)
+                    )));
+                }
+                dst.write_all(&data)?;
             }
         }
         Ok(n)
@@ -589,7 +670,7 @@ impl S3Sink {
 
     async fn body_of(&self, resp: Resp, what: &str) -> std::io::Result<Vec<u8>> {
         let mut v = Vec::new();
-        self.drain(resp, what, &mut v).await?;
+        self.drain(resp, what, &mut v, Some(MAX_RESPONSE)).await?;
         Ok(v)
     }
 
@@ -608,13 +689,8 @@ impl S3Sink {
                 .unwrap_or("unexpected status")
                 .to_string()
         });
-        let kind = match status.as_u16() {
-            404 => std::io::ErrorKind::NotFound,
-            403 => std::io::ErrorKind::PermissionDenied,
-            _ => std::io::ErrorKind::Other,
-        };
         Err(std::io::Error::new(
-            kind,
+            status_kind(status.as_u16()),
             format!("S3 {what}: HTTP {} {detail}", status.as_u16()),
         ))
     }
@@ -634,13 +710,8 @@ impl S3Sink {
             .send("HEAD", Some(okey), &[], Bytes::new(), &[])
             .await?;
         if !r.status().is_success() {
-            let kind = match r.status().as_u16() {
-                404 => std::io::ErrorKind::NotFound,
-                403 => std::io::ErrorKind::PermissionDenied,
-                _ => std::io::ErrorKind::Other,
-            };
             return Err(std::io::Error::new(
-                kind,
+                status_kind(r.status().as_u16()),
                 format!("S3 {what}: HTTP {}", r.status().as_u16()),
             ));
         }
@@ -654,11 +725,87 @@ impl S3Sink {
     async fn verify_size(&self, okey: &str, want: u64) -> std::io::Result<()> {
         let got = self.head(okey).await?;
         if got != want {
+            // Best effort: the object under the key is not what was sent.
+            // (A later `.meta` could never commit it anyway: the uploader
+            // only writes the `.meta` after this put succeeds.)
+            if let Err(e) = self.delete_object(okey).await {
+                tracing::warn!(key = %okey, error = %e, "backup: removing a mis-sized object failed");
+            }
             return Err(io_other(format!(
                 "S3 PUT `{okey}`: stored {got} bytes, sent {want}"
             )));
         }
         Ok(())
+    }
+
+    async fn delete_object(&self, okey: &str) -> std::io::Result<()> {
+        let what = format!("DELETE `{okey}`");
+        let r = self
+            .send("DELETE", Some(okey), &[], Bytes::new(), &[])
+            .await?;
+        match self.check(r, &what).await {
+            Ok(r) => self.body_of(r, &what).await.map(|_| ()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// (key, upload id, initiated) of every multipart upload in progress
+    /// under the object prefix `full` (ListMultipartUploads, paged).
+    async fn list_uploads(&self, full: &str) -> std::io::Result<Vec<(String, String, SystemTime)>> {
+        let mut out = Vec::new();
+        let mut markers: Option<(String, String)> = None;
+        loop {
+            let mut q = vec![
+                ("uploads".to_string(), String::new()),
+                ("prefix".to_string(), full.to_string()),
+            ];
+            if let Some((k, u)) = &markers {
+                q.push(("key-marker".into(), k.clone()));
+                q.push(("upload-id-marker".into(), u.clone()));
+            }
+            let what = format!("ListMultipartUploads `{full}`");
+            let r = self.send("GET", None, &q, Bytes::new(), &[]).await?;
+            let r = self.check(r, &what).await?;
+            let body = self.body_of(r, &what).await?;
+            let t = xml_texts(&body).map_err(|e| io_other(format!("S3 {what}: {e}")))?;
+            let (mut truncated, mut nk, mut nu) = (false, None, None);
+            let mut cur: Option<(String, String, SystemTime)> = None;
+            for (path, text) in t {
+                match path.as_str() {
+                    "ListMultipartUploadsResult/Upload/Key" => {
+                        out.extend(cur.take());
+                        cur = Some((text, String::new(), SystemTime::now()));
+                    }
+                    "ListMultipartUploadsResult/Upload/UploadId" => {
+                        if let Some(c) = cur.as_mut() {
+                            c.1 = text;
+                        }
+                    }
+                    "ListMultipartUploadsResult/Upload/Initiated" => {
+                        if let (Some(c), Some(s)) = (cur.as_mut(), sigv4::parse_iso8601(&text)) {
+                            c.2 = SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+                        }
+                    }
+                    "ListMultipartUploadsResult/IsTruncated" => truncated = text == "true",
+                    "ListMultipartUploadsResult/NextKeyMarker" => nk = Some(text),
+                    "ListMultipartUploadsResult/NextUploadIdMarker" => nu = Some(text),
+                    _ => {}
+                }
+            }
+            out.extend(cur.take());
+            if !truncated {
+                break;
+            }
+            let next = (nk.unwrap_or_default(), nu.unwrap_or_default());
+            if next.0.is_empty() || markers.as_ref() == Some(&next) {
+                return Err(io_other(format!(
+                    "S3 {what}: truncated without new markers"
+                )));
+            }
+            markers = Some(next);
+        }
+        Ok(out)
     }
 
     fn upload_query(id: &str) -> Vec<(String, String)> {
@@ -815,7 +962,7 @@ impl BackupSink for S3Sink {
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            let n = self.drain(r, &what, dst).await?;
+            let n = self.drain(r, &what, dst, None).await?;
             if want.is_some_and(|w| w != n) {
                 return Err(io_other(format!(
                     "S3 {what}: got {n} bytes of {}",
@@ -904,17 +1051,28 @@ impl BackupSink for S3Sink {
 
     fn delete(&self, key: &str) -> std::io::Result<()> {
         let okey = self.object_key(key)?;
-        let what = format!("DELETE `{okey}`");
-        self.run(async {
-            let r = self
-                .send("DELETE", Some(&okey), &[], Bytes::new(), &[])
-                .await?;
-            match self.check(r, &what).await {
-                Ok(r) => self.body_of(r, &what).await.map(|_| ()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
+        self.run(self.delete_object(&okey))
+    }
+
+    /// Abort the multipart uploads under `prefix` begun before
+    /// `older_than` (a crash or an outage mid-upload leaves them behind;
+    /// they are billed and invisible to a listing).
+    fn sweep_incomplete(&self, prefix: &str, older_than: SystemTime) -> std::io::Result<usize> {
+        let full = if self.url.prefix.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{}/{prefix}", self.url.prefix)
+        };
+        let uploads = self.run(self.list_uploads(&full))?;
+        let mut n = 0;
+        for (key, id, initiated) in uploads {
+            if initiated < older_than && !id.is_empty() {
+                tracing::info!(key = %key, "backup: aborting a stale multipart upload");
+                self.run(self.abort(&key, &id))?;
+                n += 1;
             }
-        })
+        }
+        Ok(n)
     }
 
     fn describe(&self) -> String {

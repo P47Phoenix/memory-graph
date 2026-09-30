@@ -186,9 +186,24 @@ impl<R: Read> Read for Hashing<R> {
 enum Outcome {
     /// Retry (and count if the retries run out).
     Failed(String),
+    /// Count at once: retrying cannot help (403, a 4xx the sink calls
+    /// `InvalidInput`).
+    Fatal(String),
     /// Not a failure: a newer snapshot replaced the file before it was
     /// opened, or there is no cluster id to key it by yet.
     Skipped(String),
+}
+
+/// A sink error as an outcome: `PermissionDenied` and `InvalidInput` are
+/// not retried (credentials, a policy or a bad request do not heal in
+/// seconds; the next snapshot tries again).
+fn failed(msg: String, e: &std::io::Error) -> Outcome {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput => {
+            Outcome::Fatal(msg)
+        }
+        _ => Outcome::Failed(msg),
+    }
 }
 
 impl Inner {
@@ -248,7 +263,12 @@ impl Inner {
                     tracing::info!(index = job.side.index, "backup: skipped: {why}");
                     return;
                 }
-                Err(Outcome::Failed(e)) => {
+                Err(o) => {
+                    let (e, fatal) = match o {
+                        Outcome::Fatal(e) => (e, true),
+                        Outcome::Failed(e) => (e, false),
+                        Outcome::Skipped(_) => unreachable!("handled above"),
+                    };
                     if self.superseded_or_stopped() {
                         // Not counted: a newer snapshot (or the shutdown)
                         // replaces this job, so no backup is missing yet.
@@ -259,7 +279,7 @@ impl Inner {
                         );
                         return;
                     }
-                    if attempt >= UPLOAD_RETRIES {
+                    if fatal || attempt >= UPLOAD_RETRIES {
                         let msg = format!(
                             "backing up snapshot {} (term {}) to {}: {e}",
                             job.side.index,
@@ -303,7 +323,7 @@ impl Inner {
         match self.sink.get(meta_key, &mut std::io::sink()) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(Outcome::Failed(format!("reading `{meta_key}`: {e}"))),
+            Err(e) => Err(failed(format!("reading `{meta_key}`: {e}"), &e)),
         }
     }
 
@@ -338,7 +358,7 @@ impl Inner {
         let put = self
             .sink
             .put(&data_key, &mut src)
-            .map_err(|e| Outcome::Failed(format!("writing `{data_key}`: {e}")))?;
+            .map_err(|e| failed(format!("writing `{data_key}`: {e}"), &e))?;
         let sha = hex(&src.hash.finalize());
         if src.n != job.side.size || put != job.side.size || sha != job.side.sha256 {
             // Never commit bytes the sidecar does not describe; and never
@@ -355,7 +375,7 @@ impl Inner {
         let meta = serde_json::to_vec_pretty(&job.side).expect("sidecar serializes");
         self.sink
             .put(&meta_key, &mut meta.as_slice())
-            .map_err(|e| Outcome::Failed(format!("writing `{meta_key}`: {e}")))?;
+            .map_err(|e| failed(format!("writing `{meta_key}`: {e}"), &e))?;
         Ok(put + meta.len() as u64)
     }
 
@@ -379,6 +399,10 @@ impl Inner {
             tracing::info!(key = %key, "backup: retention removes");
             self.sink.delete(&key)?;
         }
+        let cutoff = SystemTime::now()
+            .checked_sub(self.cfg.orphan_age)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        self.sink.sweep_incomplete(&prefix, cutoff)?;
         Ok(())
     }
 }

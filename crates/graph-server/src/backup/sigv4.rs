@@ -1,10 +1,7 @@
-//! AWS Signature Version 4 (ADR 0006 E4), on `sha2` (RustCrypto, pure
-//! Rust). HMAC-SHA256 is the dozen lines of RFC 2104 below rather than the
-//! `hmac` crate the ADR names: `hmac` pulls in `subtle`, which is
-//! BSD-3-Clause, and story 36 requires every new crate to be MIT or Apache.
-//! Constant-time comparison (`subtle`'s purpose) is not needed here: the
-//! client only computes signatures, it never verifies one. Only what the S3 sink needs: header-based signing of one
-//! request whose payload hash the caller gives (`x-amz-content-sha256`).
+//! AWS Signature Version 4 (ADR 0006 E4), with `hmac` + `sha2` (RustCrypto,
+//! pure Rust). `hmac` brings in `subtle` (BSD-3-Clause), accepted by the
+//! owner on 2026-09-29. Only what the S3 sink needs: header-based signing
+//! of one request whose payload hash the caller gives (`x-amz-content-sha256`).
 //!
 //! The canonical request follows the AWS rules for S3: the path is
 //! URI-encoded once (every byte but the unreserved set and `/`), the query
@@ -44,24 +41,12 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
 }
 
-/// HMAC-SHA256 (RFC 2104; SHA-256's block is 64 bytes).
+/// HMAC-SHA256.
 pub fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        k[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let pad = |b: u8| k.iter().map(|x| x ^ b).collect::<Vec<u8>>();
-    let inner = Sha256::new()
-        .chain_update(pad(0x36))
-        .chain_update(data)
-        .finalize();
-    Sha256::new()
-        .chain_update(pad(0x5c))
-        .chain_update(inner)
-        .finalize()
-        .to_vec()
+    use hmac::Mac;
+    let mut m = hmac::Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key length");
+    m.update(data);
+    m.finalize().into_bytes().to_vec()
 }
 
 /// `kSigning` for (secret, `YYYYMMDD`, region, service).
@@ -316,6 +301,47 @@ mod tests {
         for (key, data, want) in cases {
             assert_eq!(hex(&hmac(key, data)), want);
         }
+    }
+
+    /// A ListObjectsV2 whose continuation token and prefix hold reserved
+    /// characters (`+ / = space`): the query must be encoded. The expected
+    /// signature was computed independently with Python's `hmac`/`hashlib`
+    /// and `urllib.parse.quote(s, safe="-_.~")`.
+    #[test]
+    fn a_query_with_reserved_characters_is_encoded() {
+        let q = h(&[
+            ("list-type", "2"),
+            ("prefix", "mg/c 1/"),
+            ("continuation-token", "a+b/c="),
+        ]);
+        assert_eq!(
+            canonical_query(&q),
+            "continuation-token=a%2Bb%2Fc%3D&list-type=2&prefix=mg%2Fc%201%2F"
+        );
+        let headers = h(&[
+            ("host", "127.0.0.1:9000"),
+            ("x-amz-content-sha256", EMPTY_SHA256),
+            ("x-amz-date", "20260929T120000Z"),
+        ]);
+        let r = Request {
+            method: "GET",
+            path: "/backups",
+            query: &q,
+            headers: &headers,
+            payload_sha256: EMPTY_SHA256,
+        };
+        let scope = Scope {
+            amz_date: "20260929T120000Z",
+            region: "us-east-1",
+            service: "s3",
+        };
+        assert!(authorization(
+            &r,
+            &scope,
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        )
+        .ends_with("Signature=b2ca873fb6fc4b24dd1e8c2704a8155d1bd081a8fac6dd6940d488f4223bf582"));
     }
 
     /// The signing-key example of the AWS docs.

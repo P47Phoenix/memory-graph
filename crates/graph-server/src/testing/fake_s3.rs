@@ -54,6 +54,7 @@ struct Obj {
 
 struct Upload {
     key: String,
+    initiated: SystemTime,
     parts: BTreeMap<u32, (Bytes, String)>,
 }
 
@@ -67,6 +68,8 @@ struct State {
     log: Mutex<Vec<String>>,
     page_size: AtomicUsize,
     next_id: AtomicU64,
+    /// TCP connections accepted.
+    connections: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -134,6 +137,7 @@ impl FakeS3 {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
+                st.connections.fetch_add(1, Ordering::SeqCst);
                 let st = Arc::clone(&st);
                 tokio::spawn(async move {
                     let svc = hyper::service::service_fn(move |req| {
@@ -216,6 +220,11 @@ impl FakeS3 {
         lock(&self.state.log).clone()
     }
 
+    /// TCP connections accepted so far.
+    pub fn connections(&self) -> u64 {
+        self.state.connections.load(Ordering::SeqCst)
+    }
+
     /// Multipart uploads started and neither completed nor aborted.
     pub fn pending_uploads(&self) -> usize {
         lock(&self.state.uploads).len()
@@ -264,6 +273,31 @@ impl FakeS3 {
         if let Some(o) = lock(&self.state.objects).get_mut(&format!("{bucket}/{key}")) {
             o.data = Bytes::from(data);
         }
+    }
+
+    /// Start a multipart upload directly (as a crashed client would have),
+    /// begun at `initiated`; its upload id.
+    pub fn begin_upload(&self, bucket: &str, key: &str, initiated: SystemTime) -> String {
+        let id = format!("up-{}", self.state.next_id.fetch_add(1, Ordering::SeqCst));
+        lock(&self.state.uploads).insert(
+            id.clone(),
+            Upload {
+                key: format!("{bucket}/{key}"),
+                initiated,
+                parts: BTreeMap::new(),
+            },
+        );
+        id
+    }
+
+    /// The keys (`bucket/key`) of the uploads in progress.
+    pub fn upload_keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = lock(&self.state.uploads)
+            .values()
+            .map(|u| u.key.clone())
+            .collect();
+        v.sort();
+        v
     }
 
     /// Back-date an object (the orphan sweep's age).
@@ -474,6 +508,9 @@ async fn handle(st: &State, req: hyper::Request<Incoming>) -> Result<Resp, std::
             &q("prefix").unwrap_or_default(),
             q("continuation-token"),
         ),
+        ("GET", true) if q("uploads").is_some() => {
+            list_uploads(st, &bucket, &q("prefix").unwrap_or_default())
+        }
         ("PUT", false) => {
             if let (Some(id), Some(n)) = (q("uploadId"), q("partNumber")) {
                 let n: u32 = n.parse().unwrap_or(0);
@@ -531,6 +568,7 @@ async fn handle(st: &State, req: hyper::Request<Incoming>) -> Result<Resp, std::
                 id.clone(),
                 Upload {
                     key: full,
+                    initiated: SystemTime::now(),
                     parts: BTreeMap::new(),
                 },
             );
@@ -658,5 +696,33 @@ fn list(st: &State, bucket: &str, prefix: &str, after: Option<String>) -> Resp {
         ));
     }
     xml.push_str("</ListBucketResult>");
+    resp(200, xml)
+}
+
+/// ListMultipartUploads (one page: the fake never truncates it).
+fn list_uploads(st: &State, bucket: &str, prefix: &str) -> Resp {
+    let b = format!("{bucket}/");
+    let ups = lock(&st.uploads);
+    let mut xml =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListMultipartUploadsResult>");
+    for (id, u) in ups.iter() {
+        let Some(k) = u.key.strip_prefix(&b) else {
+            continue;
+        };
+        if !k.starts_with(prefix) {
+            continue;
+        }
+        let secs = u
+            .initiated
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        xml.push_str(&format!(
+            "<Upload><Key>{}</Key><UploadId>{id}</UploadId><Initiated>{}</Initiated></Upload>",
+            quick_xml::escape::escape(k),
+            sigv4::iso8601(secs)
+        ));
+    }
+    xml.push_str("<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>");
     resp(200, xml)
 }

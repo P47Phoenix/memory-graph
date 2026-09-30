@@ -71,6 +71,13 @@ pub trait BackupSink: Send + Sync {
     fn delete(&self, key: &str) -> std::io::Result<()>;
     /// Where it writes, for logs (never a secret).
     fn describe(&self) -> String;
+    /// Clean up unfinished uploads under `prefix` begun before
+    /// `older_than` (S3: abort stale multipart uploads); how many. A sink
+    /// whose interrupted puts leave only listable objects (`file://`)
+    /// needs nothing here: the orphan sweep removes those.
+    fn sweep_incomplete(&self, _prefix: &str, _older_than: SystemTime) -> std::io::Result<usize> {
+        Ok(0)
+    }
 }
 
 /// `--backup-on`: which nodes upload the snapshots they build.

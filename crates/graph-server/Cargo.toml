@@ -28,15 +28,16 @@ rand.workspace = true
 # `testing::ClusterTestbed` keeps its nodes in a temp dir.
 tempfile.workspace = true
 # The S3 backup sink (ADR 0006 E4): a hand-written client over the hyper
-# and http already in the tree (via tonic/axum), SigV4 on sha2 (HMAC by
-# hand: the hmac crate pulls in BSD-3 `subtle`). New crate: quick-xml only
-# (MIT, pure Rust).
+# and http already in the tree (via tonic/axum), SigV4 with hmac + sha2.
+# New crates: hmac, quick-xml (MIT/Apache) and, through hmac, `subtle`
+# (BSD-3-Clause, accepted by the owner 2026-09-29). All pure Rust.
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 percent-encoding = "2"
 quick-xml = "0.37"
+hmac = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }

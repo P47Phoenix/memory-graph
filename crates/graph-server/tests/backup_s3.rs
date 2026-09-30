@@ -433,7 +433,8 @@ fn upload_then_restore_equals_the_source() {
         };
         assert!(pos(&data) < pos(&data.replace(".redb", ".meta")));
         assert_eq!(
-            reqs.iter().any(|r| r.contains("uploads=")),
+            reqs.iter()
+                .any(|r| r.starts_with("POST ") && r.contains("uploads=")),
             multipart,
             "multipart {multipart}"
         );
@@ -729,4 +730,69 @@ fn only_the_leader_uploads_across_a_transfer() {
     assert_eq!(uploads(&tb, target), 1);
     let cluster = tb.client(target).admin_status().unwrap().cluster_id;
     assert_eq!(metas(&f, &cluster).len(), 2);
+}
+
+/// One kept-alive connection serves a whole multipart upload (no
+/// handshake per part, no ephemeral-port churn).
+#[test]
+fn a_connection_is_reused() {
+    let f = FakeS3::start();
+    let s = f.sink_with(&format!("s3://{BUCKET}"), small_parts(&f));
+    let body = bytes(20_000, 9);
+    s.put("k", &mut body.as_slice()).unwrap();
+    assert_eq!(get(&s, "k").unwrap(), body);
+    assert!(f.requests().len() >= 8, "{:?}", f.requests());
+    assert_eq!(f.connections(), 1);
+    // A dropped connection is replaced transparently.
+    f.set_faults(Faults {
+        drop_after_bytes: Some(10),
+        ..Default::default()
+    });
+    assert!(s.put("x", &mut &b"0123456789abcdef"[..]).is_err());
+    f.clear_faults();
+    s.put("x", &mut &b"ok"[..]).unwrap();
+    assert_eq!(f.object(BUCKET, "x").unwrap(), b"ok");
+}
+
+/// Retention aborts multipart uploads under this cluster's prefix begun
+/// before the orphan age; a young one and another cluster's stay.
+#[test]
+fn stale_multipart_uploads_are_aborted() {
+    let _w = watchdog("s3 stale multipart", TEST_LIMIT);
+    let f = FakeS3::start();
+    let tb = ClusterTestbed::with_backup(1, exts(), s3_cfg(&f, 7, f.options()));
+    write_and_snapshot(&tb, 1, 0);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let cluster = tb.client(1).admin_status().unwrap().cluster_id;
+    let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+    let stale = format!("{PREFIX}/{cluster}/snap-1-7.redb");
+    let young = format!("{PREFIX}/{cluster}/snap-1-8.redb");
+    let other = format!("{PREFIX}/other-cluster/snap-1-7.redb");
+    f.begin_upload(BUCKET, &stale, old);
+    f.begin_upload(BUCKET, &young, SystemTime::now());
+    f.begin_upload(BUCKET, &other, old);
+    write_and_snapshot(&tb, 1, 1);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    assert_eq!(f.upload_keys(), {
+        let mut want = vec![format!("{BUCKET}/{other}"), format!("{BUCKET}/{young}")];
+        want.sort();
+        want
+    });
+}
+
+/// A 403 is not retried: one request per snapshot, counted at once.
+#[test]
+fn a_403_is_not_retried() {
+    let _w = watchdog("s3 403 not retried", TEST_LIMIT);
+    let f = FakeS3::start();
+    f.set_faults(Faults {
+        forbidden: true,
+        ..Default::default()
+    });
+    let tb = ClusterTestbed::with_backup(1, exts(), s3_cfg(&f, 7, f.options()));
+    write_and_snapshot(&tb, 1, 0);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let st = tb.client(1).admin_status().unwrap().backup.unwrap();
+    assert_eq!(st.failures_total, 1, "{st:?}");
+    assert_eq!(f.requests().len(), 1, "{:?}", f.requests());
 }
