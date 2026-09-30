@@ -1,6 +1,7 @@
 //! Epic story 38 (ADR 0006 testing): backups against a **real** S3 server
 //! with the real binary. Skipped unless `MG_S3_ENDPOINT` is set; CI's
-//! `s3-e2e` job runs it against MinIO over plain HTTP.
+//! `s3-e2e` job runs it against SeaweedFS over plain HTTP (the ADR named
+//! MinIO, whose images can no longer be pulled from Docker Hub).
 //!
 //! * `MG_S3_ENDPOINT`: `http://host:port` of the server.
 //! * `MG_S3_BUCKET`: an existing bucket (default `mg-e2e`).

@@ -185,7 +185,7 @@ to `file://` and sync that directory (the simpler of the two).
   a different name for the same region (`s3.dualstack.eu-west-1.amazonaws.com:443`). Use the
   bucket's regional endpoint and path-style addressing (the default). The hop between
   memory-graph and the sidecar is plain HTTP, so keep it on a private network. (This recipe is
-  not exercised in CI, which runs MinIO over plain HTTP.)
+  not exercised in CI, which runs SeaweedFS over plain HTTP.)
 - Or keep `--backup-url file:///srv/mg-backups` and copy it off the box on a timer:
   `aws s3 sync /srv/mg-backups s3://mg-backups/prod --exact-timestamps` (add `--delete` to let
   retention's deletions follow). A backup is committed by its `.meta`, so a sync that catches an
@@ -250,7 +250,7 @@ by `s3:PutObject`. A restore-only machine needs just `s3:ListBucket` and `s3:Get
 `s3:x-amz-server-side-encryption` conditions if the bucket requires SSE. The credentials go in
 the environment or a credentials file readable only by the service user.
 
-**Testing.** CI's `s3-e2e` job runs `crates/graph-cli/tests/s3_e2e.rs` against MinIO on Linux:
+**Testing.** CI's `s3-e2e` job runs `crates/graph-cli/tests/s3_e2e.rs` against SeaweedFS on Linux (MinIO, the ADR's choice, is no longer pullable from Docker Hub):
 bootstrap, index the vendored corpus, `cluster snapshot --upload` three times with
 `--backup-keep 2`, `cluster backups`, restore `latest` into a new directory and compare the
 answers, a wrong secret refused, a real multipart upload, and no multipart upload left in

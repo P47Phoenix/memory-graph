@@ -60,40 +60,46 @@ jobs:
       - run: cargo build --release -p graph-cli
       - run: bash scripts/disk-full-tmpfs.sh target/release/memory-graph
   s3-e2e:
-    # Backups against a real S3 server (epic story 38, ADR 0006 testing):
-    # MinIO over plain HTTP, with its root credentials enforced. Started with
-    # `docker run` rather than a service container, because MinIO needs the
-    # `server /data` command, which `services:` cannot pass.
+    # Backups against a real S3 server (epic story 38, ADR 0006 testing), over
+    # plain HTTP with credentials enforced. The ADR named MinIO, but its
+    # images are no longer pullable from Docker Hub (`pull access denied for
+    # minio/minio` on the runner), so this runs SeaweedFS's S3 gateway, which
+    # enables SigV4 auth from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+    # Started with `docker run` because `services:` cannot pass its command.
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: mg-e2e-key
       AWS_SECRET_ACCESS_KEY: mg-e2e-secret-0123456789
-      MG_S3_ENDPOINT: http://127.0.0.1:9000
+      MG_S3_ENDPOINT: http://127.0.0.1:8333
       MG_S3_BUCKET: mg-e2e
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Start MinIO
+      - name: Start SeaweedFS (S3 on 8333, auth on)
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
-            minio/minio server /data
-          for i in $(seq 60); do curl -fsS "$MG_S3_ENDPOINT/minio/health/ready" && break; sleep 1; done
-          curl -fsS "$MG_S3_ENDPOINT/minio/health/ready"
-      - name: Create the bucket
-        run: |
-          docker run --rm --network host --entrypoint sh minio/mc -c \
-            "mc alias set e2e $MG_S3_ENDPOINT $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY && mc mb e2e/$MG_S3_BUCKET"
+          docker run -d --name s3 -p 8333:8333 \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+            chrislusf/seaweedfs server -s3 -dir=/data
+          for i in $(seq 90); do
+            docker exec s3 sh -c "echo 's3.bucket.create -name $MG_S3_BUCKET' | weed shell -master=localhost:9333" 2>&1 \
+              | grep -q "created bucket" && break
+            sleep 1
+          done
+          docker exec s3 sh -c "echo 's3.bucket.list' | weed shell -master=localhost:9333" | grep "$MG_S3_BUCKET"
       - name: Anonymous requests are refused
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' "$MG_S3_ENDPOINT/$MG_S3_BUCKET?list-type=2")
+          for i in $(seq 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$MG_S3_ENDPOINT/$MG_S3_BUCKET?list-type=2")
+            [ "$code" != 000 ] && break
+            sleep 1
+          done
           echo "anonymous ListObjectsV2: $code"
           test "$code" = 403
       - run: cargo test -p graph-cli --test s3_e2e -- --nocapture
-      - name: MinIO log on failure
+      - name: S3 server log on failure
         if: failure()
-        run: docker logs minio | tail -n 200
+        run: docker logs s3 2>&1 | tail -n 200
   probes:
     # The machine probes on each platform with one: memory must be known
     # (and say where it came from), disk must be known. macOS only runs here.

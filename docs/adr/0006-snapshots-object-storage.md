@@ -158,7 +158,7 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 | 35 | S1: the `file://` sink and verified restore | 5 | Delivered in PR #159 |
 | 36 | S2: the S3 client over plain HTTP | 8 | Delivered in PR #167 |
 | 37 | S3: `--restore s3://` + `latest`, `cluster snapshot --upload`, `cluster backups` | 3 | |
-| 38 | S4: MinIO e2e CI job + docs | 3 | Delivered in PR #171 |
+| 38 | S4: MinIO e2e CI job + docs | 3 | Delivered in PR #171 (against SeaweedFS: MinIO images are no longer pullable from Docker Hub) |
 | 39 | S5: native HTTPS spike behind `backup-tls` | 5 | Deferred, shared with #104 |
 
 Acceptance criteria are in the [epic](../epic-code-memory-graph.md).
