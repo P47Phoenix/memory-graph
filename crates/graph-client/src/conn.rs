@@ -101,6 +101,7 @@ struct ReadLogInner {
     last: Option<ReadMeta>,
     any_stale: bool,
     reads: u64,
+    stale_reads: u64,
 }
 
 impl ReadLog {
@@ -112,6 +113,7 @@ impl ReadLog {
         g.last = Some(m);
         g.any_stale |= m.stale_possible;
         g.reads += 1;
+        g.stale_reads += u64::from(m.stale_possible);
     }
 
     /// The meta of the last read that carried one.
@@ -124,6 +126,13 @@ impl ReadLog {
     pub fn stale_possible(&self) -> Option<bool> {
         let g = self.snapshot();
         (g.reads > 0).then_some(g.any_stale)
+    }
+
+    /// How many reads so far carried `stale_possible`: a long-lived caller
+    /// (`memory-graph mcp`) compares it before and after one call to know
+    /// whether that call's reads may have missed acknowledged writes.
+    pub fn stale_reads(&self) -> u64 {
+        self.snapshot().stale_reads
     }
 
     fn snapshot(&self) -> ReadLogInner {

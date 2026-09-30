@@ -141,6 +141,7 @@ If a file fails span validation (an extractor or tokenizer bug), only that file 
 - `--language`, `--kind` and `--symbol-kind` values are validated against what `describe` reports, so a typo is an error, not an empty result. Language names are case-insensitive.
 - `symbols` patterns: `name` (exact), `prefix*`, `*` (all), `name\*` (a literal `*`). `**` is rejected as ambiguous.
 - Page with `--limit N --offset M`. `--json` prints `{"query", "results": [...]}` (and `"grain"` for `search`).
+- AI assistants: `memory-graph --db /abs/path/graph.redb mcp` (or `--server host:port mcp`) serves the same queries as read-only MCP tools over stdio. Client configuration for Claude Code and Claude Desktop: [docs/mcp.md](docs/mcp.md).
 
 ## Server mode
 
