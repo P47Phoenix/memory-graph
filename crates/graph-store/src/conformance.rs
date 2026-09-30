@@ -1699,6 +1699,24 @@ fn differential_seed(s: &dyn Store) {
         s.index_bytes_opts("o2", "enc", &path, &fx.bytes, None, None, opts)
             .unwrap();
     }
+    // And a lossy one (a `utf-8` hint on windows-1252 bytes), so the
+    // catalog's lossy count and the hits' `lossy` are compared too.
+    let lossy = IndexOptions {
+        encoding: Some(encoding_rs::UTF_8),
+        ..Default::default()
+    };
+    let st = s
+        .index_bytes_opts(
+            "o2",
+            "enc",
+            "lossy.txt",
+            &legacy("CustomerId caf\u{e9}\n", encoding_rs::WINDOWS_1252),
+            None,
+            None,
+            lossy,
+        )
+        .unwrap();
+    assert!(st.lossy);
 }
 
 /// A batch re-index of unchanged bytes still refreshes the file's origin, in

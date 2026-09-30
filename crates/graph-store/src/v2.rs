@@ -65,13 +65,20 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// rewrite. Both are omitted for UTF-8, so every version-9/10 File node is
 /// a valid version-11 one (absence means UTF-8) and the catalog needs no new
 /// entries for all-UTF-8 content: a 9 or 10 file is restamped straight to 11
-/// (and to [`CATALOG_VERSION`] 2). A version-11 file whose catalog predates
-/// the encoding counts (epic story 43) has them recounted on open.
-pub const V2_SCHEMA_VERSION: u64 = 11;
+/// (now 12, below).
+///
+/// Bumped to 12 for epic story 43: the catalog gains per-repo `e`
+/// (encoding) and `l` (lossy) entries, which a version-11 reader refuses as
+/// a bad catalog key and a version-11 writer would leave stale. A 9 or 10
+/// file is restamped to 12 with [`CATALOG_VERSION`] 2 (all UTF-8, nothing to
+/// count); an 11 file is restamped with its encoding counts recounted from
+/// the File nodes, in the same commit. Older binaries then refuse a 12 file
+/// with `SchemaMismatch`.
+pub const V2_SCHEMA_VERSION: u64 = 12;
 
 /// The earlier layout versions [`V2Store`] upgrades in place on open (a
 /// restamp, see [`V2_SCHEMA_VERSION`]); every other version is refused.
-pub const UPGRADABLE_SCHEMA_VERSIONS: &[u64] = &[9, 10];
+pub const UPGRADABLE_SCHEMA_VERSIONS: &[u64] = &[9, 10, 11];
 
 /// Version of the `refs`/`content_files` derived tables (ADR 0003 story 9).
 /// Unlike `V2_SCHEMA_VERSION` (a hard gate on the on-disk *layout*), this is
@@ -2020,61 +2027,59 @@ fn copy_multimap<K: redb::Key + 'static, V: redb::Key + 'static>(
     Ok(())
 }
 
+/// Bring the catalog up to [`CATALOG_VERSION`] 2 (ADR 0007 C6, epic story
+/// 43) inside `wt`: drop any `e`/`l` entries already there (so nothing is
+/// counted twice), recount them from the File nodes and stamp the version.
+/// It reads every `nodes` row (entity rows only: orgs, repos, files; never a
+/// stream), so it is O(entity rows) in time and holds all of them in memory
+/// at once (a `HashMap` of decoded nodes) while it runs. Only a schema-11
+/// file needs it (its catalog predates the counts).
+fn rebuild_encoding_catalog_in(wt: &redb::WriteTransaction) -> Result<()> {
+    let nodes = wt.open_table(NODES)?;
+    let mut cat = wt.open_table(CATALOG)?;
+    let mut all: HashMap<NodeId, Node> = HashMap::new();
+    for r in nodes.iter()? {
+        let n = dec(r?.1.value())?;
+        all.insert(n.id, n);
+    }
+    let mut stale: Vec<String> = Vec::new();
+    for r in cat.iter()? {
+        let k = r?.0.value().to_string();
+        if k.starts_with("e\0") || k.starts_with("l\0") {
+            stale.push(k);
+        }
+    }
+    for k in stale {
+        cat.remove(k.as_str())?;
+    }
+    let mut tally = Tally::default();
+    for f in all.values().filter(|n| n.kind == NodeKind::File) {
+        let repo = f.parent.and_then(|p| all.get(&p));
+        let org = repo.and_then(|r| r.parent).and_then(|p| all.get(&p));
+        let (Some(repo), Some(org)) = (repo, org) else {
+            continue;
+        };
+        let s = Scope {
+            org: &org.name,
+            repo: &repo.name,
+            lang: "",
+            encoding: f.encoding.as_deref(),
+            lossy: f.lossy,
+        };
+        tally.encoding(&s, 1);
+    }
+    tally.apply(&mut cat)?;
+    wt.open_table(META)?
+        .insert("catalog_version", CATALOG_VERSION)?;
+    Ok(())
+}
+
 /// Recompute `refs`/`content_files` from scratch by scanning every live
 /// file's stream row (the source of truth: a stream row exists iff its file
 /// is live, see `W::remove_content`) and rewriting both tables to match,
 /// stamping `derived_version_refs_content_files` to [`REFS_DERIVED_VERSION`]
 /// in the same write transaction. Shared by [`V2Store::rebuild_refs`] (manual
 /// call) and the self-heal check in `open`/`open_with_cache_bytes`.
-/// Bring the catalog up to [`CATALOG_VERSION`] 2 (ADR 0007 C6, epic story
-/// 43): recount the per-repo encoding (`e`) and lossy (`l`) entries from the
-/// File nodes (O(entity rows), never a stream) and stamp the version, in one
-/// write transaction. Only a schema-11 file written before the catalog kept
-/// those entries needs it; everything else is already correct.
-fn rebuild_encoding_catalog_in(db: &Database) -> Result<()> {
-    let wt = db.begin_write()?;
-    {
-        let nodes = wt.open_table(NODES)?;
-        let mut cat = wt.open_table(CATALOG)?;
-        let mut all: HashMap<NodeId, Node> = HashMap::new();
-        for r in nodes.iter()? {
-            let n = dec(r?.1.value())?;
-            all.insert(n.id, n);
-        }
-        let mut stale: Vec<String> = Vec::new();
-        for r in cat.iter()? {
-            let k = r?.0.value().to_string();
-            if k.starts_with("e\0") || k.starts_with("l\0") {
-                stale.push(k);
-            }
-        }
-        for k in stale {
-            cat.remove(k.as_str())?;
-        }
-        let mut tally = Tally::default();
-        for f in all.values().filter(|n| n.kind == NodeKind::File) {
-            let repo = f.parent.and_then(|p| all.get(&p));
-            let org = repo.and_then(|r| r.parent).and_then(|p| all.get(&p));
-            let (Some(repo), Some(org)) = (repo, org) else {
-                continue;
-            };
-            let s = Scope {
-                org: &org.name,
-                repo: &repo.name,
-                lang: "",
-                encoding: f.encoding.as_deref(),
-                lossy: f.lossy,
-            };
-            tally.encoding(&s, 1);
-        }
-        tally.apply(&mut cat)?;
-        wt.open_table(META)?
-            .insert("catalog_version", CATALOG_VERSION)?;
-    }
-    wt.commit()?;
-    Ok(())
-}
-
 fn rebuild_refs_in(db: &Database) -> Result<()> {
     let wt = db.begin_write()?;
     {
@@ -2414,16 +2419,20 @@ impl V2Store {
             Some(V2_SCHEMA_VERSION) => {}
             Some(v) if UPGRADABLE_SCHEMA_VERSIONS.contains(&v) => {
                 // Issue #137, ADR 0007 C6: the old layouts are subsets of
-                // the new one, so the upgrade is the restamp alone (one
-                // small commit).
+                // the new one, so the upgrade is one small commit: the
+                // restamp, plus (from 11, epic story 43) the catalog's
+                // encoding counts recounted from the File nodes.
                 let wt = db.begin_write()?;
-                {
-                    let mut m = wt.open_table(META)?;
-                    m.insert("schema_version", V2_SCHEMA_VERSION)?;
+                if v == 11 {
+                    rebuild_encoding_catalog_in(&wt)?;
+                } else {
                     // Every 9/10 file is all UTF-8: its catalog is already
                     // correct at version 2 (absence means zero).
-                    m.insert("catalog_version", CATALOG_VERSION)?;
+                    wt.open_table(META)?
+                        .insert("catalog_version", CATALOG_VERSION)?;
                 }
+                wt.open_table(META)?
+                    .insert("schema_version", V2_SCHEMA_VERSION)?;
                 wt.commit()?;
             }
             Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => {
@@ -2465,15 +2474,10 @@ impl V2Store {
             }
         }
 
-        // Soft self-heal (ADR 0003 story 9): an existing file whose
-        // derived_version lags or is missing (any v2 file written before
-        // this mechanism existed) gets refs/content_files rebuilt
-        // automatically, silently -- this is not an error, and never
-        // refuses the open. A file already at the current version does not
-        // write at all, so a plain reopen stays byte-identical.
-        // ADR 0007 C6 / epic story 43: a schema-11 file written before the
-        // catalog counted encodings gets them counted once, from the File
-        // nodes. A current file does not write at all.
+        // ADR 0007 C6 / epic story 43: a catalog whose version is missing or
+        // lower than [CATALOG_VERSION] gets its encoding counts recounted
+        // (a newer one is left alone: the schema gate above already refuses
+        // a newer layout). A current file does not write at all.
         let catalog_version = {
             let rt = db.begin_read()?;
             match rt.open_table(META) {
@@ -2482,10 +2486,18 @@ impl V2Store {
                 Err(e) => return Err(e.into()),
             }
         };
-        if catalog_version != Some(CATALOG_VERSION) {
-            rebuild_encoding_catalog_in(&db)?;
+        if catalog_version.is_none_or(|v| v < CATALOG_VERSION) {
+            let wt = db.begin_write()?;
+            rebuild_encoding_catalog_in(&wt)?;
+            wt.commit()?;
         }
 
+        // Soft self-heal (ADR 0003 story 9): an existing file whose
+        // derived_version lags or is missing (any v2 file written before
+        // this mechanism existed) gets refs/content_files rebuilt
+        // automatically, silently -- this is not an error, and never
+        // refuses the open. A file already at the current version does not
+        // write at all, so a plain reopen stays byte-identical.
         let derived_refs_version = {
             let rt = db.begin_read()?;
             match rt.open_table(META) {

@@ -56,10 +56,7 @@ fn remote_harness() -> Harness {
 /// old-server warning stays off (the threshold is the schema that added it).
 #[test]
 fn current_server_honours_encoding_hints() {
-    assert_eq!(
-        graph_client::ENCODING_STORE_FORMAT,
-        graph_store::SCHEMA_VERSION
-    );
+    assert_eq!(graph_client::ENCODING_STORE_FORMAT, 11);
     let d = tempfile::tempdir().unwrap();
     let ts = TestServer::start(&d.path().join("g.redb"), rust());
     assert!(!connect(&ts).ignores_encoding_hints());

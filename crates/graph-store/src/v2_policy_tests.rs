@@ -2026,8 +2026,8 @@ fn schema_version_mismatch_still_hard_refuses() {
 /// files re-parses none of them: their fingerprints are unchanged.
 #[test]
 fn schema_versions_9_and_10_are_upgraded_in_place() {
-    assert_eq!(crate::v2::UPGRADABLE_SCHEMA_VERSIONS, &[9, 10]);
-    assert_eq!(crate::v2::V2_SCHEMA_VERSION, 11);
+    assert_eq!(crate::v2::UPGRADABLE_SCHEMA_VERSIONS, &[9, 10, 11]);
+    assert_eq!(crate::v2::V2_SCHEMA_VERSION, 12);
     for &old in crate::v2::UPGRADABLE_SCHEMA_VERSIONS {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("v.redb");
@@ -2078,12 +2078,13 @@ fn schema_versions_9_and_10_are_upgraded_in_place() {
     }
 }
 
-/// Epic story 43: a schema-11 file written before the catalog counted
-/// encodings (catalog_version 1 or absent, no `e`/`l` entries) gets them
-/// counted from its File nodes on open, once; a current file reopens
+/// Epic story 43: a schema-11 file (catalog_version 1 or absent) is
+/// upgraded to 12 on open with its encoding counts recounted from the File
+/// nodes. Stale `e`/`l` keys already in it (e.g. a half-written catalog) are
+/// dropped first, so nothing is counted twice. A current file then reopens
 /// without writing.
 #[test]
-fn catalog_version_1_gets_encoding_counts_on_open() {
+fn schema_11_gets_encoding_counts_on_open() {
     for stamp in [Some(1u64), None] {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("v.redb");
@@ -2103,21 +2104,24 @@ fn catalog_version_1_gets_encoding_counts_on_open() {
         let want = s.describe(None, None).unwrap();
         assert_eq!(want[1].encodings.get("UTF-16LE"), Some(&1), "{want:?}");
         assert_eq!(want[0].lossy, 1, "{want:?}");
-        // Back to what a pre-story-43 binary wrote.
+        // Back to schema 11 with an old catalog stamp, keeping the e/l keys
+        // but with wrong values (and one stray repo), to check they are
+        // replaced rather than added to.
         let wt = s.db.begin_write().unwrap();
         {
             let mut cat = wt.open_table(crate::CATALOG).unwrap();
-            let stale: Vec<String> = cat
+            let keys: Vec<String> = cat
                 .iter()
                 .unwrap()
                 .map(|r| r.unwrap().0.value().to_string())
                 .filter(|k| k.starts_with("e\0") || k.starts_with("l\0"))
                 .collect();
-            assert_eq!(stale.len(), 2);
-            for k in stale {
-                cat.remove(k.as_str()).unwrap();
+            assert_eq!(keys.len(), 2);
+            for k in keys {
+                cat.insert(k.as_str(), 7).unwrap();
             }
             let mut meta = wt.open_table(crate::META).unwrap();
+            meta.insert("schema_version", 11).unwrap();
             match stamp {
                 Some(v) => meta.insert("catalog_version", v).map(|_| ()).unwrap(),
                 None => meta.remove("catalog_version").map(|_| ()).unwrap(),
@@ -2125,10 +2129,19 @@ fn catalog_version_1_gets_encoding_counts_on_open() {
         }
         wt.commit().unwrap();
         drop(s);
+        assert_eq!(crate::detect_format(&p).unwrap(), Some(11));
         let s = V2Store::open(&p).unwrap();
         assert_eq!(s.describe(None, None).unwrap(), want, "{stamp:?}");
         assert_eq!(s.describe_by_scan(None, None).unwrap(), want, "{stamp:?}");
+        let rt = s.db.begin_read().unwrap();
+        let meta = rt.open_table(crate::META).unwrap();
+        assert_eq!(meta.get("catalog_version").unwrap().unwrap().value(), 2);
+        drop((meta, rt));
         drop(s);
+        assert_eq!(
+            crate::detect_format(&p).unwrap(),
+            Some(crate::v2::V2_SCHEMA_VERSION)
+        );
         // Now current: a reopen writes nothing.
         let before = std::fs::read(&p).unwrap();
         drop(V2Store::open(&p).unwrap());
@@ -2136,6 +2149,41 @@ fn catalog_version_1_gets_encoding_counts_on_open() {
     }
 }
 
+/// A 9 or 10 file (all UTF-8) is restamped to 12 with catalog_version 2 in
+/// the restamp's commit (no recount), and a reopen afterwards writes nothing.
+#[test]
+fn schema_9_and_10_restamp_sets_catalog_version_2_in_one_commit() {
+    for old in [9u64, 10] {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("v.redb");
+        let s = V2Store::open(&p).unwrap();
+        s.index_bytes("o", "r", "a.txt", b"alpha\n", None).unwrap();
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut meta = wt.open_table(crate::META).unwrap();
+            meta.insert("schema_version", old).unwrap();
+            meta.insert("catalog_version", 1).unwrap();
+        }
+        wt.commit().unwrap();
+        drop(s);
+        let s = V2Store::open(&p).unwrap();
+        // The restamp and the catalog stamp land together (the upgrade
+        // branch commits both at once), so no later heal runs: a second
+        // open writes nothing.
+        let rt = s.db.begin_read().unwrap();
+        let meta = rt.open_table(crate::META).unwrap();
+        assert_eq!(meta.get("catalog_version").unwrap().unwrap().value(), 2);
+        assert_eq!(
+            meta.get("schema_version").unwrap().unwrap().value(),
+            crate::v2::V2_SCHEMA_VERSION
+        );
+        drop((meta, rt));
+        drop(s);
+        let before = std::fs::read(&p).unwrap();
+        drop(V2Store::open(&p).unwrap());
+        assert!(std::fs::read(&p).unwrap() == before, "v{old}");
+    }
+}
 // --- ADR 0003 story 5: packed single sorted dictionary (D1) ---
 
 /// Interning more than a few [`crate::codec::DICT_BLOCK`]-sized worths of

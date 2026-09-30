@@ -38,6 +38,8 @@ pub(crate) use common::{
     Scope, Tally, CATALOG, CHILDREN, META, NAMES, NODES, SYMBOLS,
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
+/// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
+pub use v2::UPGRADABLE_SCHEMA_VERSIONS;
 pub use v2::V2_SCHEMA_VERSION as SCHEMA_VERSION;
 pub use v2::{CompactStats, MarkedCommitHook, RaftMarker, V2Snapshot, V2Store, VacuumStats};
 
@@ -53,6 +55,22 @@ pub const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<u64> = 1..=2;
 pub const CATALOG_VERSION: u64 = 2;
 /// `Node::origin` of files written by a directory run; only these are pruned.
 pub const ORIGIN_DIRECTORY: &str = "directory";
+
+/// The end of the [`StoreError::Rejected`] message of a file refused under
+/// `strict_encoding` for a non-UTF-8 lossy decode (ADR 0007 C3).
+pub const STRICT_ENCODING_MARK: &str = "(strict encoding)";
+
+/// Whether `e` is a per-file refusal by `strict_encoding` (ADR 0007 C3, C8):
+/// `NotUtf8` for a file decoded as UTF-8, or the `Rejected` naming the
+/// encoding. Holds for an error that came back over the wire too, since the
+/// message travels with it.
+pub fn is_strict_encoding_refusal(e: &StoreError) -> bool {
+    match e {
+        StoreError::NotUtf8(_) => true,
+        StoreError::Rejected(m) => m.ends_with(STRICT_ENCODING_MARK),
+        _ => false,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

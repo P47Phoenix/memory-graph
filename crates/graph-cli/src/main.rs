@@ -518,7 +518,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ClusterCmd,
     },
-    /// Index one file under an org and repo (re-indexing replaces it)
+    /// Index one file under an org and repo (re-indexing replaces it). Does not read
+    /// .memory-graph.toml: use --encoding
     IndexFile {
         /// Organization name, free-form: the top level of the graph (org -> repo -> file)
         #[arg(long)]
@@ -532,6 +533,18 @@ enum Cmd {
         /// Re-index even when the file is unchanged since it was last indexed
         #[arg(long)]
         reindex: bool,
+        /// Source encoding: `auto` (the default: BOM, UTF-16 sniff, UTF-8, then detection), `ansi` (the
+        /// Windows system code page; windows-1252 elsewhere), or any WHATWG label (utf-8, utf-16le,
+        /// utf-16be, windows-1252, latin1, shift_jis, gbk, gb18030, euc-kr, big5, iso-2022-jp, ...;
+        /// not `replacement`). A BOM still wins. Resolved here, on the client, and sent with each file,
+        /// so `--server` decodes the same way. Also read from MEMORY_GRAPH_ENCODING
+        #[arg(long, env = "MEMORY_GRAPH_ENCODING", value_name = "LABEL", value_parser = graph_cli::encoding_config::parse_encoding_arg)]
+        encoding: Option<graph_cli::encoding_config::EncodingArg>,
+        /// Refuse (and report) a file whose decode is lossy (invalid in its encoding) instead of storing
+        /// it with U+FFFD replacements; `--encoding utf-8 --strict-encoding` refuses any file that is not
+        /// valid UTF-8. A refused file keeps any content indexed before
+        #[arg(long)]
+        strict_encoding: bool,
         /// The file to index; stored under the repo by this path as given
         path: PathBuf,
     },
@@ -601,6 +614,22 @@ enum Cmd {
         /// Report disk space but never stop for it
         #[arg(long)]
         no_disk_check: bool,
+        /// Source encoding for every file, over the `[encoding]` globs of a `.memory-graph.toml` at the
+        /// root of the directory (glob = "label" relative to the root, case-sensitive on every OS, no leading
+        /// `./` or `/`; the first match wins, and an `auto` glob stops the search too; precedence:
+        /// BOM > --encoding > glob > auto): `auto` (the default: BOM, UTF-16 sniff, UTF-8, then detection), `ansi` (the
+        /// Windows system code page; windows-1252 elsewhere), or any WHATWG label (utf-8, utf-16le,
+        /// utf-16be, windows-1252, latin1, shift_jis, gbk, gb18030, euc-kr, big5, iso-2022-jp, ...;
+        /// not `replacement`). A BOM still wins. Resolved here, on the client, and sent with each file,
+        /// so `--server` decodes the same way. Also read from MEMORY_GRAPH_ENCODING
+        #[arg(long, env = "MEMORY_GRAPH_ENCODING", value_name = "LABEL", value_parser = graph_cli::encoding_config::parse_encoding_arg)]
+        encoding: Option<graph_cli::encoding_config::EncodingArg>,
+        /// Refuse (and report) a file whose decode is lossy (invalid in its encoding) instead of storing
+        /// it with U+FFFD replacements; `--encoding utf-8 --strict-encoding` refuses any file that is not
+        /// valid UTF-8. A refused file is skipped (`invalid in its encoding (--strict-encoding)`) and keeps any
+        /// content indexed before, as other skips do
+        #[arg(long)]
+        strict_encoding: bool,
         /// The directory to index as one repo; files are stored by their path relative to it
         dir: PathBuf,
     },
@@ -1783,6 +1812,8 @@ fn run() -> Result<i32> {
             repo,
             language,
             reindex,
+            encoding,
+            strict_encoding,
             path,
         } => {
             if let Ok(m) = std::fs::metadata(&path) {
@@ -1814,7 +1845,8 @@ fn run() -> Result<i32> {
                 None,
                 IndexOptions {
                     reindex,
-                    ..Default::default()
+                    encoding: encoding.and_then(|e| e.0),
+                    strict_encoding,
                 },
             )?;
             let lang = st.language.clone();
@@ -1846,8 +1878,15 @@ fn run() -> Result<i32> {
             no_progress,
             min_free_disk,
             no_disk_check,
+            encoding,
+            strict_encoding,
             dir,
         } => {
+            // Validate .memory-graph.toml before connecting, so a config error
+            // is not masked by a connection error (index_dir reads it again).
+            if dir.is_dir() {
+                graph_cli::encoding_config::EncodingConfig::load(&dir)?;
+            }
             // With a server: connect first (its leader and applied index
             // feed the progress board), then hand the connection over.
             let (db, remote_store, remote_board) = match &target {
@@ -1895,6 +1934,8 @@ fn run() -> Result<i32> {
                     disk_check: !no_disk_check,
                     chunk_bytes: cli.chunk_bytes.unwrap_or(graph_cli::DEFAULT_CHUNK_BYTES),
                     remote: remote_board,
+                    encoding: encoding.and_then(|e| e.0),
+                    strict_encoding,
                 },
                 |_| match remote_store.take() {
                     Some(s) => Ok(Box::new(s) as Box<dyn Store>),

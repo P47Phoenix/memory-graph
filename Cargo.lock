@@ -715,6 +715,7 @@ dependencies = [
  "console",
  "crossbeam-channel",
  "encoding_rs",
+ "globset",
  "graph-client",
  "graph-core",
  "graph-lang-asm",
