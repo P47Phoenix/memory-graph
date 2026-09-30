@@ -380,7 +380,9 @@ fn a_call_past_the_deadline_times_out() {
     let (srv, addr) = server(&d, m);
     let mut c = McpHttpClient::new(addr);
     let r = c.request("tools/call", json!({"name": "describe", "arguments": {}}));
-    assert_eq!(r["error"]["code"], REQUEST_TIMEOUT, "{r}");
+    // The wire contract: -32001 (REQUEST_TIMEOUT).
+    assert_eq!(r["error"]["code"], -32001, "{r}");
+    assert_eq!(REQUEST_TIMEOUT, -32001);
     let metrics = RemoteStore::connect(ClientConfig::new(srv.endpoint()))
         .unwrap()
         .admin_metrics()
@@ -462,4 +464,25 @@ fn idle_sessions_expire() {
     assert_eq!(c.post(&list).status, 200);
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(c.post(&list).status, 404);
+}
+
+/// SESSION_IDLE counts from the last use, not from initialize: a session
+/// used more often than the idle timeout lives on; left alone it ends,
+/// and a new initialize works.
+#[test]
+fn session_idle_counts_from_the_last_use() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.session_idle = Duration::from_millis(1500);
+    let (_srv, addr) = server(&d, m);
+    let c = McpHttpClient::new(addr);
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(c.post(&list).status, 200, "used within the idle time");
+    }
+    std::thread::sleep(Duration::from_millis(2000));
+    assert_eq!(c.post(&list).status, 404, "idle past session_idle");
+    let fresh = McpHttpClient::new(addr);
+    assert_eq!(fresh.post(&list).status, 200);
 }

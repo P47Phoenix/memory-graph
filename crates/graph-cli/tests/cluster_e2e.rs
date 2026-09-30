@@ -1422,15 +1422,21 @@ fn mcp_on_a_follower_survives_a_leader_kill() {
     assert_eq!(fresh["items"], expected);
 
     // Kill the leader outright. Node 3's reads keep answering the same
-    // data; once its leader's lease runs out and before a new leader
-    // reaches it, they say `stale_possible: true`.
+    // data. Between the old leader's lease running out and a new leader
+    // reaching node 3 they say `stale_possible: true`; that window can be
+    // missed if the election is quick, so either outcome ends this phase:
+    // a stale read, or a new leader already vouching (fresh again). The
+    // lone-node phase below proves `stale_possible` deterministically.
     n1.kill();
-    let stale = wait_for("a stale_possible read after the leader kill", || {
-        let sc = mcp_tool(&mut c, "search", args.clone());
-        assert_eq!(sc["items"], expected, "a read after the leader kill");
-        (sc["stale_possible"] == true).then_some(sc)
-    });
-    assert_eq!(stale["items"], expected);
+    wait_for(
+        "a stale read, or a new leader, after the leader kill",
+        || {
+            let sc = mcp_tool(&mut c, "search", args.clone());
+            assert_eq!(sc["items"], expected, "a read after the leader kill");
+            let new_leader = n3.leader().is_some_and(|l| l != 1);
+            (sc["stale_possible"] == true || new_leader).then_some(())
+        },
+    );
 
     // Kill the other survivor too: node 3 alone has no leader and no
     // quorum, yet LOCAL reads still answer, every one stale_possible.
