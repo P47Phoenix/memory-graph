@@ -143,7 +143,8 @@ to `file://` and sync that directory (the simpler of the two).
   header, so it must be the real S3 name, e.g. `s3.eu-west-1.amazonaws.com`, and no proxy may
   rewrite it (a rewrite fails with `SignatureDoesNotMatch`). So an endpoint of
   `http://127.0.0.1:9080` does **not** work against AWS. Instead, keep the real name on port 80
-  and make that name resolve to the sidecar for memory-graph only:
+  and make that name resolve to the sidecar for memory-graph only (#173 tracks a
+  `--backup-connect-to` flag that would remove the name trick):
 - **stunnel sidecar in Docker Compose** (the sidecar resolves the name normally; memory-graph's
   container maps it to the sidecar with `extra_hosts`):
 
@@ -225,9 +226,15 @@ and to list and abort multipart uploads. Nothing else (no bucket creation, no AC
     {
       "Sid": "ListThePrefix",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::mg-backups",
-      "Condition": { "StringLike": { "s3:prefix": ["prod/*"] } }
+      "Condition": { "StringLike": { "s3:prefix": ["prod/", "prod/*"] } }
+    },
+    {
+      "Sid": "ListMultipartUploads",
+      "Effect": "Allow",
+      "Action": "s3:ListBucketMultipartUploads",
+      "Resource": "arn:aws:s3:::mg-backups"
     },
     {
       "Sid": "ObjectsUnderThePrefix",
@@ -245,7 +252,9 @@ and to list and abort multipart uploads. Nothing else (no bucket creation, no AC
 }
 ```
 
-HEAD requests are covered by `s3:GetObject`, and the multipart create/upload-part/complete calls
+`s3:ListBucketMultipartUploads` does not support the `s3:prefix` condition, so it has its own
+statement on the bucket (a condition there would deny it, and retention's multipart sweep with
+it). HEAD requests are covered by `s3:GetObject`, and the multipart create/upload-part/complete calls
 by `s3:PutObject`. A restore-only machine needs just `s3:ListBucket` and `s3:GetObject`. Add
 `s3:x-amz-server-side-encryption` conditions if the bucket requires SSE. The credentials go in
 the environment or a credentials file readable only by the service user.

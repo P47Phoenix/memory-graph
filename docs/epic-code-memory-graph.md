@@ -53,7 +53,7 @@
 | 35 | Snapshot backups: `file://` sink and verified restore | High | 5 | P2 | 22 |
 | 36 | S3 client over plain HTTP (SigV4, multipart) | High | 8 | P2 | 35 |
 | 37 | Restore from `s3://` and `latest`, `cluster snapshot --upload`, `cluster backups` | Medium | 3 | P2 | 36 |
-| 38 | MinIO e2e CI job and backup docs | Medium | 3 | P3 | 37 |
+| 38 | S3 e2e CI job and backup docs | Medium | 3 | P3 | 37 |
 | 39 | Spike: native HTTPS for backups behind `backup-tls` (**Deferred**, shared with #104) | Low | 5 | P4 | 36, #104 |
 
 Total: 39 stories, 203 pts (average about 5.2); 195 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29.
@@ -463,13 +463,13 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E1, E8, E10 (Accepted).
 - Given `…/latest`, When resolved, Then it must pick the highest committed index and ignore orphans without a `.meta`.
 - Given `cluster snapshot --upload` and `cluster backups [--json]`, When run, Then a snapshot must be uploaded on demand and the backups listed.
 
-**38. MinIO e2e CI job and backup docs (3 pts)**
+**38. S3 e2e CI job and backup docs (3 pts)**
 Status: Delivered in PR #171 (CI job `s3-e2e` against SeaweedFS rather than MinIO, whose images can no longer be pulled from Docker Hub; `crates/graph-cli/tests/s3_e2e.rs`; docs in `docs/deploy/data-dir.md` and the README). With it stories 35-38 are delivered; 39 stays deferred with #104.
 As a database operator
 I want backups tested against a real S3-compatible server and documented
 So that I can set them up with confidence.
 Design: [ADR 0006](adr/0006-snapshots-object-storage.md) testing (Accepted).
-- Given a MinIO service container over plain HTTP on Linux, When the CI job runs upload, retention and restore, Then it must be green.
+- Given an S3-compatible server (SeaweedFS in CI; MinIO's image is no longer pullable) over plain HTTP on Linux, When the CI job runs upload, retention and restore, Then it must be green.
 - Given the docs, When read, Then they must cover the sidecar TLS recipe, bucket lifecycle rules and a minimal IAM policy, and the README walkthrough must work.
 
 **39. Spike: native HTTPS for backups behind `backup-tls` (5 pts)**

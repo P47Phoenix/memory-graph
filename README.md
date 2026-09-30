@@ -206,9 +206,9 @@ memory-graph serve --data-dir ./n1 --listen 127.0.0.1:7001   # later: a restart 
 
 ```sh
 export AWS_ACCESS_KEY_ID=mg-demo AWS_SECRET_ACCESS_KEY=mg-demo-secret-123
-docker run -d --name s3 -p 8333:8333 -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY chrislusf/seaweedfs server -s3 -dir=/data
-sleep 10   # until it is up
-docker exec s3 sh -c "echo 's3.bucket.create -name mg-backups' | weed shell -master=localhost:9333"
+docker run -d --name s3 -p 8333:8333 -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY chrislusf/seaweedfs:4.48 server -s3 -dir=/data
+until docker exec s3 sh -c "echo 's3.bucket.create -name mg-backups' | weed shell -master=localhost:9333" 2>&1 \
+  | grep -q "created bucket"; do sleep 1; done   # retries until SeaweedFS is up
 
 memory-graph serve --data-dir ./n1 --bootstrap --node-id 1 --listen 127.0.0.1:7001 \
   --backup-url s3://mg-backups/prod --backup-endpoint http://127.0.0.1:8333 &

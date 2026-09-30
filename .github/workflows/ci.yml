@@ -67,6 +67,7 @@ jobs:
     # enables SigV4 auth from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
     # Started with `docker run` because `services:` cannot pass its command.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       AWS_ACCESS_KEY_ID: mg-e2e-key
       AWS_SECRET_ACCESS_KEY: mg-e2e-secret-0123456789
@@ -80,13 +81,17 @@ jobs:
         run: |
           docker run -d --name s3 -p 8333:8333 \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
-            chrislusf/seaweedfs server -s3 -dir=/data
+            chrislusf/seaweedfs:4.48 server -s3 -dir=/data
+          created=
           for i in $(seq 90); do
-            docker exec s3 sh -c "echo 's3.bucket.create -name $MG_S3_BUCKET' | weed shell -master=localhost:9333" 2>&1 \
-              | grep -q "created bucket" && break
+            if docker exec s3 sh -c "echo 's3.bucket.create -name $MG_S3_BUCKET' | weed shell -master=localhost:9333" 2>&1 \
+              | grep -q "created bucket"; then created=1; break; fi
             sleep 1
           done
-          docker exec s3 sh -c "echo 's3.bucket.list' | weed shell -master=localhost:9333" | grep "$MG_S3_BUCKET"
+          if [ -z "$created" ]; then
+            echo "::error::SeaweedFS did not create bucket $MG_S3_BUCKET within 90 s"
+            exit 1
+          fi
       - name: Anonymous requests are refused
         run: |
           for i in $(seq 60); do
