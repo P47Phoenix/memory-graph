@@ -288,3 +288,66 @@ fn record_constructors_annotation_constants_and_c_style_arrays() {
     let s = syms("class A { static { } { } }");
     assert_eq!(s.len(), 1);
 }
+
+thread_local! {
+    /// See `memo_on`.
+    pub(crate) static MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Symbols of `src` from `ex` with the scan memos off.
+fn without_memo(ex: &dyn Extractor, src: &str) -> Vec<SymbolDecl> {
+    MEMO.with(|m| m.set(false));
+    let out = ex.extract(src).symbols;
+    MEMO.with(|m| m.set(true));
+    out
+}
+
+proptest! {
+    /// The memos never change what is found: a random prefix (which fills
+    /// them with failed and successful scans, often unterminated) followed
+    /// by real code gives the same symbols with the memos on and off.
+    #[test]
+    fn memos_do_not_change_symbols(
+        parts in proptest::collection::vec(prop_oneof![Just("class"), Just("interface"), Just("A"), Just("{"), Just("}"), Just("("), Just(")"), Just("["), Just("]"), Just(";"), Just("="), Just("<"), Just(">"), Just(","), Just("\"s"), Just("/*"), Just("<div>"), Just("int"), Just("@A"), Just("new")], 0..60),
+        code_first in any::<bool>(),
+    ) {
+        let soup = parts.join(" ");
+        let code = "package p;\nclass C { int[] a = { 1 }; Runnable r = new Runnable() { public void run() {} }; void m() {} int x = f(1); }\n";
+        let src = if code_first { format!("{code}{soup}") } else { format!("{soup}\n{code}") };
+        let ex: &dyn Extractor = &JavaExtractor;
+            prop_assert_eq!(ex.extract(&src).symbols, without_memo(ex, &src), "{}", src);
+    }
+}
+/// `semi_after` answers from its memo exactly as a fresh scan would, for
+/// starts inside a range it already walked (the extractor itself only
+/// re-reads failed walks, so this checks the memo directly).
+#[test]
+fn semi_after_memo_matches_fresh_scans() {
+    let tokens = JavaExtractor
+        .extract("a = f(1) + { 2 } ; b = c } d = e ;")
+        .tokens;
+    let code = code_index(&tokens, &[TokenClass::Comment]);
+    let s = Scanner {
+        tokens: &tokens,
+        code: &code,
+        out: Vec::new(),
+        depth: 0,
+        closes: code_close_table(&tokens, &code),
+        header_fails: RefCell::default(),
+        semis: RefCell::default(),
+    };
+    let hi = code.len();
+    let fresh: Vec<_> = (0..hi)
+        .map(|c| {
+            s.semis.borrow_mut().clear();
+            s.semi_after(c, hi)
+        })
+        .collect();
+    s.semis.borrow_mut().clear();
+    for order in [(0..hi).collect::<Vec<_>>(), (0..hi).rev().collect()] {
+        for c in order {
+            assert_eq!(s.semi_after(c, hi), fresh[c], "from {c}");
+        }
+    }
+    assert!(fresh.iter().any(Option::is_some) && fresh.iter().any(Option::is_none));
+}

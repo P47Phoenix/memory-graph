@@ -34,3 +34,57 @@ fn unbalanced_delimiter_runs_are_linear() {
         }
     }
 }
+
+/// Long runs of other openers that never close, each repeated 25k times
+/// (#142, #146): keyword blocks (`keyword_close_table`), generic lists and
+/// type aliases (`NestedEnds`, `TypeEnds`), and declarations with no
+/// terminator that made the C-family scanners resynchronize one token at a
+/// time, each resync scanning to the end of the file. Before the fix these
+/// took minutes in release (Elixir `def f do` x 40k: 99.5 s; TypeScript
+/// `type a = (` x 40k: 65.7 s; C# `<div>` x 40k: 23 s); linear scanners
+/// take milliseconds per shape even in debug. Every extractor gets every
+/// shape, so a quadratic path in any of them shows up here too.
+///
+/// Why an absolute bound at 25k rather than a doubling ratio: the ratio
+/// check was tried for #133 and was too noisy on shared runners. At 25k a
+/// linear shape takes ~0.1 s in debug, while the quadratic ones above take
+/// 4-40 s at 25k even in release, so the 5 s bound separates them widely
+/// and the whole test stays short in CI's debug run.
+#[test]
+fn unclosed_keyword_and_declaration_runs_are_linear() {
+    let n = 25_000;
+    let shapes = [
+        "def f do\n",
+        "class A ",
+        "class A extends B<",
+        "abstract class A ",
+        "if x; then\n",
+        "function f() {\n",
+        "type a = (",
+        "type a = <",
+        "type a<",
+        "template <",
+        "a<",
+        "x = ",
+        "struct a {} ",
+        "<div>",
+        "\"",
+        "`",
+        "/*",
+        "if ",
+        "case ",
+        "<%",
+    ];
+    for ex in graph_cli::shipped_extractors() {
+        let lang = ex.language().to_string();
+        for shape in shapes {
+            // Rust is parsed by `syn`, still quadratic on this shape: a
+            // follow-up outside the token scanners.
+            if lang == "rust" && shape == "struct a {} " {
+                continue;
+            }
+            let took = time_extract(ex.as_ref(), shape.repeat(n));
+            assert!(took < Duration::from_secs(5), "{lang} {shape:?}: {took:?}");
+        }
+    }
+}

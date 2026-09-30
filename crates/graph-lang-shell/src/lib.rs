@@ -22,7 +22,7 @@
 //! body; plain `NAME=value` assignments and `local` are not symbols; zsh's
 //! multi-name `function a b c { ... }` is not a symbol (only one name per
 //! definition is recognized).
-use graph_core::scan::span_between;
+use graph_core::scan::{span_between, NestedEnds, Step};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -67,6 +67,7 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         tokens,
         code: &code,
         out: Vec::new(),
+        braces: NestedEnds::new(),
     };
     for c in 0..code.len() {
         if s.command_position(c) {
@@ -102,6 +103,8 @@ struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
     out: Vec<SymbolDecl>,
+    /// `{` closers, remembered between lookups.
+    braces: NestedEnds,
 }
 
 impl Scanner<'_> {
@@ -219,11 +222,22 @@ impl Scanner<'_> {
     /// kind of delimiter counts; inside `case ... esac` a `)` that would close
     /// below the `case`'s own depth is a pattern terminator.
     fn close_of(&self, open: usize) -> Option<usize> {
-        let (o, cl) = if self.text(open) == "{" {
-            ("{", "}")
-        } else {
-            ("(", ")")
-        };
+        if self.text(open) == "{" {
+            // Memoized: one `{` scan per `function f() {` over a long
+            // unclosed run would be quadratic.
+            return self.braces.find(open, self.code.len(), |k| {
+                let t = self.tok(k);
+                match t.text.as_str() {
+                    _ if matches!(t.class, TokenClass::Identifier | TokenClass::Literal) => {
+                        Step::Other
+                    }
+                    "{" => Step::Open,
+                    "}" => Step::Close,
+                    _ => Step::Other,
+                }
+            });
+        }
+        let (o, cl) = ("(", ")");
         let mut depth = 0usize;
         let mut cases: Vec<usize> = Vec::new();
         for k in open..self.code.len() {

@@ -130,6 +130,10 @@ pub fn code_index(tokens: &[TokenDecl], skip: &[TokenClass]) -> Vec<usize> {
 /// literals are ignored; `ignore_case` compares ASCII case-insensitively.
 /// Openers used as plain words (Ruby-style `x if y`) are the caller's
 /// business: filter them out of `tokens` first or pass a pre-checked slice.
+///
+/// Each call scans forward from `open`, so it is O(n) per call: an
+/// extractor that looks up many blocks should build a
+/// [`keyword_close_table`] once instead.
 pub fn keyword_block(
     tokens: &[TokenDecl],
     open: usize,
@@ -165,6 +169,147 @@ pub fn keyword_block(
         }
     }
     None
+}
+
+/// [`keyword_block`] for every token at once: `keyword_close_table(tokens,
+/// pairs, ignore_case)[i] == keyword_block(tokens, i, pairs, ignore_case)`
+/// for every index `i`, in one linear pass (times the number of `pairs`).
+/// Use it whenever an extractor looks up keyword blocks in a loop: calling
+/// [`keyword_block`] per opener is quadratic on long unclosed runs such as
+/// 100k `do`.
+pub fn keyword_close_table(
+    tokens: &[TokenDecl],
+    pairs: &[(&str, &str)],
+    ignore_case: bool,
+) -> Vec<Option<usize>> {
+    let eq = |a: &str, b: &str| {
+        if ignore_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let mut out = vec![None; tokens.len()];
+    // (opener index, index into `pairs` of its closer).
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if is_trivia(t) {
+            continue;
+        }
+        if let Some(k) = pairs.iter().position(|(o, _)| eq(&t.text, o)) {
+            stack.push((i, k));
+        } else if pairs.iter().any(|(_, c)| eq(&t.text, c)) {
+            // A mismatched (or unopened) closer ends every block still open:
+            // `keyword_block` from any of them returns `None` here.
+            match stack.pop() {
+                Some((open, k)) if eq(&t.text, pairs[k].1) => out[open] = Some(i),
+                _ => stack.clear(),
+            }
+        }
+    }
+    out
+}
+
+/// What a [`NestedEnds`] scan does at one position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Opens a nested list (e.g. `<`).
+    Open,
+    /// Closes the innermost open list (e.g. `>`).
+    Close,
+    /// Ends the scan: every list still open fails (e.g. `;`).
+    Stop,
+    /// A group to jump over: `Some(close)` is the group's closer and the
+    /// scan resumes at `close + 1`; `None` fails the scan (e.g. an
+    /// unmatched `(`).
+    Skip(Option<usize>),
+    /// Anything else.
+    Other,
+}
+
+/// Ends of nested lists that no bracket table covers, such as generic
+/// `<...>` lists, found by a forward scan whose next move depends only on
+/// the position (a [`Step`]) and the range end `hi`. The scan from any
+/// opener it passes would follow the same path, so one scan answers every
+/// opener on it and later lookups reuse the answers: looking up every
+/// opener of a long unclosed run (100k `<`) is linear, where a plain
+/// forward scan per lookup is quadratic.
+///
+/// Answers are cached by `(open, hi)` only, so use one instance per step
+/// function (and token sequence): sharing an instance between different
+/// rules returns stale answers.
+#[derive(Debug, Default)]
+pub struct NestedEnds {
+    memo: std::cell::RefCell<std::collections::HashMap<(usize, usize), Option<usize>>>,
+}
+
+impl NestedEnds {
+    /// An empty cache, for one step function over one token sequence.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The position closing the list opened at `open` (whose step must be
+    /// [`Step::Open`]), scanning `[open, hi)`; `None` if a [`Step::Stop`],
+    /// a failed [`Step::Skip`] or `hi` comes first. `step` must give the
+    /// same answer for a position every time it is called with this `hi`.
+    /// If `open` is not an opener the answer is meaningless (it may be the
+    /// end of a later list, and is cached as such): callers check first.
+    pub fn find(&self, open: usize, hi: usize, step: impl Fn(usize) -> Step) -> Option<usize> {
+        if let Some(&r) = self.memo.borrow().get(&(open, hi)) {
+            return r;
+        }
+        // Openers on the path not yet closed, and the answers found.
+        let mut stack: Vec<usize> = Vec::new();
+        let mut found = Vec::new();
+        let mut c = open;
+        let result = loop {
+            if c >= hi {
+                break None;
+            }
+            match step(c) {
+                Step::Open => {
+                    // An opener answered before: skip its list, or fail
+                    // with it (the path from here on is the same).
+                    let known = if c == open {
+                        None
+                    } else {
+                        self.memo.borrow().get(&(c, hi)).copied()
+                    };
+                    match known {
+                        Some(Some(close)) => {
+                            c = close + 1;
+                            continue;
+                        }
+                        Some(None) => break None,
+                        None => stack.push(c),
+                    }
+                }
+                Step::Close => match stack.pop() {
+                    Some(o) => {
+                        found.push((o, Some(c)));
+                        if stack.is_empty() {
+                            break Some(c);
+                        }
+                    }
+                    // `open` was not an opener.
+                    None => break None,
+                },
+                Step::Stop | Step::Skip(None) => break None,
+                Step::Skip(Some(to)) => c = to,
+                Step::Other => {}
+            }
+            c += 1;
+        };
+        let mut memo = self.memo.borrow_mut();
+        for (o, r) in found {
+            memo.insert((o, hi), r);
+        }
+        for o in stack {
+            memo.insert((o, hi), None);
+        }
+        result
+    }
 }
 
 /// Index of the last token of the indented block headed by `tokens[header]`
@@ -310,9 +455,24 @@ impl<'a> Cursor<'a> {
     /// If the next non-comment token opens a delimiter, jump past its match
     /// and return `(open, close)` indices. On an unmatched delimiter, the
     /// cursor does not move.
+    ///
+    /// This scans forward with [`matching_close`], O(n) per call, so it is
+    /// quadratic if called once per opener over a long unbalanced run; an
+    /// extractor calling it in a loop should build a [`close_table`] once
+    /// and use [`Cursor::skip_balanced_with`].
     pub fn skip_balanced(&mut self) -> Option<(usize, usize)> {
         let (open, _) = self.peek_code(0)?;
         let close = matching_close(self.tokens, open)?;
+        self.pos = close + 1;
+        Some((open, close))
+    }
+
+    /// [`Cursor::skip_balanced`] with closers looked up in `table`, which
+    /// must be [`close_table`] of this cursor's tokens: O(1) per call apart
+    /// from skipping comments.
+    pub fn skip_balanced_with(&mut self, table: &[Option<usize>]) -> Option<(usize, usize)> {
+        let (open, _) = self.peek_code(0)?;
+        let close = (*table.get(open)?)?;
         self.pos = close + 1;
         Some((open, close))
     }
@@ -547,6 +707,129 @@ mod close_table_tests {
                 prop_assert_eq!(by_code[c], expected, "{} at {}", src, c);
             }
         }
+    }
+
+    proptest! {
+        /// `keyword_close_table` equals `keyword_block` at every index, with
+        /// shared closers, nesting, mismatches, literals and comments.
+        #[test]
+        fn keyword_close_table_matches_keyword_block(
+            parts in proptest::collection::vec(
+                prop_oneof![
+                    Just("if"), Just("fi"), Just("do"), Just("done"), Just("end"),
+                    Just("fn"), Just("IF"), Just("End"), Just("x"), Just("'if'"),
+                    Just("# fi\n"), Just("\"done\""),
+                ],
+                0..48,
+            ),
+            ignore_case in any::<bool>(),
+            which in 0usize..3,
+        ) {
+            use crate::tokenizer::{tokenize_with, TokenizerOptions};
+            let src = parts.join(" ");
+            let tokens = tokenize_with(&src, TokenizerOptions::SHELL);
+            let pair_sets: [&[(&str, &str)]; 3] = [
+                &[("if", "fi"), ("do", "done")],
+                &[("do", "end"), ("fn", "end")],
+                &[("if", "end"), ("do", "end"), ("do", "done")],
+            ];
+            let pairs = pair_sets[which];
+            let table = keyword_close_table(&tokens, pairs, ignore_case);
+            prop_assert_eq!(table.len(), tokens.len());
+            for (i, got) in table.iter().enumerate() {
+                prop_assert_eq!(*got, keyword_block(&tokens, i, pairs, ignore_case), "{} at {}", src, i);
+            }
+            // `skip_balanced_with` agrees with `skip_balanced`.
+            let ct = close_table(&tokens);
+            for i in 0..tokens.len() {
+                let mut a = Cursor::new(&tokens);
+                a.set_pos(i);
+                let mut b = a.clone();
+                prop_assert_eq!(a.skip_balanced(), b.skip_balanced_with(&ct));
+                prop_assert_eq!(a.pos(), b.pos());
+            }
+        }
+    }
+
+    /// Plain forward scan: the reference for [`NestedEnds::find`].
+    fn nested_reference(s: &[u8], skip: &[Option<usize>], open: usize, hi: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut c = open;
+        while c < hi {
+            match s[c] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(c);
+                    }
+                }
+                b'(' => c = skip[c].filter(|&x| x < hi)?,
+                b';' => return None,
+                _ => {}
+            }
+            c += 1;
+        }
+        None
+    }
+
+    proptest! {
+        /// `NestedEnds::find` equals a plain forward scan for every opener,
+        /// with one memo reused across all calls and several `hi` values,
+        /// queried in random order.
+        #[test]
+        fn nested_ends_match_forward_scan(
+            s in proptest::collection::vec(
+                prop_oneof![Just(b'<'), Just(b'>'), Just(b'('), Just(b')'), Just(b';'), Just(b'x')],
+                0..60,
+            ),
+            order in proptest::collection::vec(any::<prop::sample::Index>(), 0..120),
+            his in proptest::collection::vec(any::<prop::sample::Index>(), 1..4),
+        ) {
+            // `(` skips to its `)` (the next one), like a close table.
+            let skip: Vec<Option<usize>> = (0..s.len())
+                .map(|i| (s[i] == b'(').then(|| (i + 1..s.len()).find(|&j| s[j] == b')')).flatten())
+                .collect();
+            let step = |c: usize| match s[c] {
+                b'<' => Step::Open,
+                b'>' => Step::Close,
+                b'(' => Step::Skip(skip[c]),
+                b';' => Step::Stop,
+                _ => Step::Other,
+            };
+            let his: Vec<usize> = his.iter().map(|h| h.index(s.len() + 1)).collect();
+            // One memo for every `hi`: answers are keyed by `(open, hi)`.
+            let memo = NestedEnds::new();
+            let opens: Vec<usize> = (0..s.len()).filter(|&i| s[i] == b'<').collect();
+            if !opens.is_empty() {
+                for q in order.iter().chain(order.iter()) {
+                    let open = opens[q.index(opens.len())];
+                    for &hi in &his {
+                        if open >= hi {
+                            continue;
+                        }
+                        let step_hi = |c: usize| match step(c) {
+                            Step::Skip(t) => Step::Skip(t.filter(|&x| x < hi)),
+                            other => other,
+                        };
+                        prop_assert_eq!(
+                            memo.find(open, hi, step_hi),
+                            nested_reference(&s, &skip, open, hi),
+                            "{:?} open {} hi {}", String::from_utf8_lossy(&s), open, hi
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyword_close_table_is_linear_on_unclosed_runs() {
+        let tokens = tokenize(&"do ".repeat(100_000));
+        let start = std::time::Instant::now();
+        let t = keyword_close_table(&tokens, &[("do", "end")], false);
+        assert!(t.iter().all(Option::is_none));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

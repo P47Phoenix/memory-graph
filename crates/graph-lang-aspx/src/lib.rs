@@ -138,6 +138,16 @@ fn aspx_symbol(tag: &Tag) -> Option<(String, String)> {
 /// `<%@ %>`, `<% %>`, `<%= %>`, `<%: %>`, `<%# %>`, `<%$ %>` blocks.
 fn server_blocks(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     let mut out = Vec::new();
+    // `next_close[i]`: the first `%>` after `i`, found in one backward
+    // pass (a forward search per `<%` is quadratic on a long unclosed run).
+    let mut next_close = vec![None; tokens.len()];
+    for j in (1..tokens.len()).rev() {
+        next_close[j - 1] = if tokens[j].text == "%>" {
+            Some(j)
+        } else {
+            next_close[j]
+        };
+    }
     let mut i = 0;
     while i < tokens.len() {
         let lang = match tokens[i].text.as_str() {
@@ -151,7 +161,7 @@ fn server_blocks(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
                 continue;
             }
         };
-        let close = (i + 1..tokens.len()).find(|&j| tokens[j].text == "%>");
+        let close = next_close[i];
         let end = close.unwrap_or(i);
         let name = (i + 1..end)
             .find(|&j| tokens[j].class == TokenClass::Identifier)

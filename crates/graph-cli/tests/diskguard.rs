@@ -208,6 +208,12 @@ fn deterministic_stop_keeps_the_partial_batch() {
     let stored = describe(&db)["repos"][0]["files"].as_u64().unwrap();
     // At least one whole batch, plus whatever partial batch was pending.
     assert!((256..600).contains(&stored), "stored {stored}");
+    // Each fixed batch, the partial one too, is one commit and is counted.
+    let txns = stored.div_ceil(256);
+    assert!(
+        err.contains(&format!("{stored} files stored in {txns} transactions")),
+        "{err}"
+    );
     assert!(
         !stored.is_multiple_of(256) || stored == 256 || stored == 512,
         "stored {stored}"
