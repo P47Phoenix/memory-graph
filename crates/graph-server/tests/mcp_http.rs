@@ -268,6 +268,50 @@ fn requests_past_max_inflight_get_429() {
     );
 }
 
+/// Mutation survivors (epic story 34): `initialize` over HTTP names the
+/// server and its version; a chunked body (no Content-Length) past 1 MiB
+/// gets 413 and one cut short gets 400, not the same answer.
+#[test]
+fn server_info_and_chunked_body_errors() {
+    let d = tempfile::tempdir().unwrap();
+    let (_srv, addr) = server(&d, loopback());
+    let r = post(addr, &[], &initialize());
+    let info = &r.json()["result"]["serverInfo"];
+    assert_eq!(info["name"], "memory-graph", "{info}");
+    assert_eq!(info["version"], graph_server::SERVER_VERSION, "{info}");
+
+    let raw = |body: &[u8]| {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        let _ = s.write_all(body);
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    // Over the limit in 64 KiB chunks.
+    let chunk = vec![b' '; 64 * 1024];
+    let mut big = Vec::new();
+    for _ in 0..17 {
+        big.extend(format!("{:x}\r\n", chunk.len()).as_bytes());
+        big.extend(&chunk);
+        big.extend(b"\r\n");
+    }
+    big.extend(b"0\r\n\r\n");
+    let out = raw(&big);
+    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+    // A chunk size line that is not hex: the body read fails.
+    let out = raw(b"zz\r\n{}\r\n0\r\n\r\n");
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    assert!(out.contains("reading the request body failed"), "{out}");
+}
+
 fn metrics(srv: &TestServer) -> String {
     RemoteStore::connect(ClientConfig::new(srv.endpoint()))
         .unwrap()
