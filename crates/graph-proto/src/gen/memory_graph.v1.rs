@@ -3262,6 +3262,11 @@ pub struct StatusResponse {
     /// `mg_apply_duration_seconds`).
     #[prost(uint64, tag = "31")]
     pub entries_applied_total: u64,
+    /// Where this node's MCP endpoint listens (`serve --mcp-listen`, ADR 0005
+    /// D5), as bound: `host:port`, the endpoint being `<http://<it>/mcp`.>
+    /// Empty: MCP is off (or the server predates the field).
+    #[prost(string, tag = "33")]
+    pub mcp_addr: ::prost::alloc::string::String,
     /// Snapshot backups (ADR 0006, `serve --backup-url`); absent when this
     /// node has no backup location.
     #[prost(message, optional, tag = "32")]

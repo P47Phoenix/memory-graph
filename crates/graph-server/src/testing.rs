@@ -11,6 +11,7 @@ use std::time::Duration;
 
 pub mod cluster;
 pub mod fake_s3;
+pub mod mcp_http;
 pub use cluster::{ClusterTestbed, TestNode, CLUSTER_WAIT, TEST_RAFT};
 pub use fake_s3::{FakeS3, Faults};
 

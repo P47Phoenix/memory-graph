@@ -48,6 +48,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # The per-RPC tower layer (spans and metrics) on the tonic server.
 tower-layer = "0.3"
 tower-service = "0.3"
+# The MCP streamable HTTP endpoint in `serve` (ADR 0005 D1): axum is already
+# in the tree through tonic's router; only its tokio + http1 server is added.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 
 # Optimise dependencies (redb, serde_json, ...) in dev/test builds so the
 # corpus test does not spend ~20s in unoptimised storage code.

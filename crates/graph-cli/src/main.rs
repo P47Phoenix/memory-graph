@@ -1,3 +1,5 @@
+// `cluster status --json` is one `json!` literal past the default limit.
+#![recursion_limit = "256"]
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use graph_cli::target::{Target, TargetArgs};
@@ -126,6 +128,13 @@ fn remote(addr: &str, read: ReadMode, overrides: Overrides) -> Result<RemoteStor
 /// Values the retired `--backend` flag still parses. Kept so `--backend v2`
 /// in an existing script keeps working and `--backend v1` fails with a
 /// pointer to the migration path instead of an unknown-flag error.
+/// `serve --mcp-read`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum McpReadArg {
+    Local,
+    Linearizable,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum LegacyBackend {
     V1,
@@ -401,6 +410,36 @@ enum Cmd {
         /// Serve Prometheus metrics (text format 0.0.4) at http://<HOST:PORT>/metrics
         #[arg(long, value_name = "HOST:PORT")]
         metrics_listen: Option<String>,
+        /// Serve MCP (Model Context Protocol, streamable HTTP; read-only tools) at
+        /// http://<HOST:PORT>/mcp, on a port of its own. Off unless given. Loopback only
+        /// (127.0.0.1, ::1) unless --mcp-allow-remote. See docs/mcp.md.
+        /// +----------------------------------------------------------------------+
+        /// | WARNING: The MCP endpoint has no authentication. Anyone who can      |
+        /// | reach it can read every indexed source token. Keep it on loopback    |
+        /// | or behind an authenticating proxy until #105.                        |
+        /// +----------------------------------------------------------------------+
+        #[arg(long, value_name = "HOST:PORT", verbatim_doc_comment)]
+        mcp_listen: Option<String>,
+        /// Let --mcp-listen be a non-loopback address (logs a warning at every start)
+        #[arg(long, requires = "mcp_listen")]
+        mcp_allow_remote: bool,
+        /// A browser Origin the MCP endpoint accepts, exactly (`http://localhost:6274`);
+        /// repeatable. A request with any other Origin gets 403 (default: none; requests
+        /// without an Origin, such as non-browser clients, are accepted)
+        #[arg(long, value_name = "URL", requires = "mcp_listen")]
+        mcp_allow_origin: Vec<String>,
+        /// How MCP tools read: local (this node's replica; answers say stale_possible when it
+        /// may lag) or linearizable (every read after the leader's read barrier). Default local
+        #[arg(long, value_enum, requires = "mcp_listen")]
+        mcp_read: Option<McpReadArg>,
+        /// MCP requests served at once; more get 429 (default 16)
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "mcp_listen",
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        mcp_max_inflight: Option<u64>,
         /// The memory-graph.ready health service is SERVING only while a leader is known and
         /// this node's applied index is within this many entries of the leader's commit index
         #[arg(long, value_name = "N", default_value_t = graph_server::DEFAULT_READY_MAX_LAG)]
@@ -880,6 +919,20 @@ fn server_sysinfo(db: &std::path::Path) -> serde_json::Value {
 }
 
 /// `server <addr> node N (leader: M)`.
+/// How an MCP bound address is shown: `off` when empty, the URL for a
+/// specific address, and no URL for a wildcard bind (0.0.0.0 / [::]),
+/// which is not an address a client can use.
+fn mcp_url(addr: &str) -> String {
+    match addr.parse::<std::net::SocketAddr>() {
+        Err(_) if addr.is_empty() => "off".into(),
+        Ok(a) if a.ip().is_unspecified() => format!(
+            "bound on all interfaces, port {} (path /mcp; use this host's address)",
+            a.port()
+        ),
+        _ => format!("http://{addr}/mcp"),
+    }
+}
+
 fn server_header(addr: &str, st: &graph_proto::pb::StatusResponse) -> String {
     format!(
         "server {addr} node {} (leader: {})",
@@ -956,6 +1009,11 @@ fn run() -> Result<i32> {
         log_format,
         log_level,
         metrics_listen,
+        mcp_listen,
+        mcp_allow_remote,
+        mcp_allow_origin,
+        mcp_read,
+        mcp_max_inflight,
         ready_max_lag,
         snapshot_log_entries,
         snapshot_log_bytes,
@@ -1158,6 +1216,25 @@ fn run() -> Result<i32> {
                     })?,
             );
         }
+        if let Some(m) = mcp_listen {
+            use std::net::ToSocketAddrs;
+            let listen = m
+                .to_socket_addrs()
+                .with_context(|| format!("--mcp-listen {m}: not a host:port"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--mcp-listen {m}: resolves to no address"))?;
+            let mut mc = graph_server::mcp::McpConfig::new(listen);
+            mc.allow_remote = *mcp_allow_remote;
+            mc.allow_origins = mcp_allow_origin.clone();
+            mc.read = match mcp_read {
+                Some(McpReadArg::Linearizable) => graph_server::mcp::McpRead::Linearizable,
+                _ => graph_server::mcp::McpRead::Local,
+            };
+            if let Some(n) = mcp_max_inflight {
+                mc.max_inflight = usize::try_from(*n).unwrap_or(usize::MAX);
+            }
+            cfg.mcp = Some(mc);
+        }
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.restore_allow_extractor_mismatch = *restore_allow_extractor_mismatch;
         if let Some(url) = backup_url {
@@ -1201,6 +1278,10 @@ fn run() -> Result<i32> {
                     "{}",
                     start_line(log_format, "metrics", &msg, &m.to_string())
                 );
+            }
+            if let Some(m) = r.mcp_addr {
+                let msg = format!("mcp on {}", mcp_url(&m.to_string()));
+                println!("{}", start_line(log_format, "mcp", &msg, &m.to_string()));
             }
             let msg = format!("listening on {} ({shown})", r.addr);
             println!(
@@ -1334,6 +1415,7 @@ fn run() -> Result<i32> {
                                 "writes_forwarded_total": st.writes_forwarded_total,
                                 "rpcs_total": st.rpcs_total,
                                 "entries_applied_total": st.entries_applied_total,
+                                "mcp_addr": st.mcp_addr,
                                 "members": st.members.iter().map(|m| serde_json::json!({
                                     "node_id": m.node_id,
                                     "addr": m.addr,
@@ -1375,6 +1457,7 @@ fn run() -> Result<i32> {
                             },
                             st.current_term
                         );
+                        out!("  mcp       {}", mcp_url(&st.mcp_addr));
                         for m in &st.members {
                             let lag = st
                                 .replication
@@ -2243,6 +2326,17 @@ mod serve_config_tests {
                 "debug",
                 "--metrics-listen",
                 "0.0.0.0:9100",
+                "--mcp-listen",
+                "0.0.0.0:7071",
+                "--mcp-allow-remote",
+                "--mcp-allow-origin",
+                "http://localhost:6274",
+                "--mcp-allow-origin",
+                "https://a.example",
+                "--mcp-read",
+                "linearizable",
+                "--mcp-max-inflight",
+                "4",
                 "--ready-max-lag",
                 "50",
                 "--snapshot-log-entries",
@@ -2301,6 +2395,11 @@ node-id = 3
 log-format = "json"
 log_level = "debug"
 metrics-listen = "0.0.0.0:9100"
+mcp-listen = "0.0.0.0:7071"
+mcp_allow_remote = true
+mcp-allow-origin = ["http://localhost:6274", "https://a.example"]
+mcp-read = "linearizable"
+mcp-max-inflight = 4
 ready-max-lag = 50
 snapshot-log-entries = 500
 snapshot-log-bytes = "64M"

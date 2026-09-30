@@ -7,7 +7,7 @@
 //! (`common::Client`).
 mod common;
 
-use common::Client;
+use common::{Client, HttpClient, Tools};
 use graph_client::{ClientConfig, RemoteStore};
 use graph_core::{Extractor, NodeKind, TokenClass};
 use graph_mcp::StoreBackend;
@@ -222,10 +222,18 @@ fn oracle(store: &dyn StoreRead, name: &str, a: &Value) -> Value {
 
 /// Run every case through `client` and compare with the precomputed
 /// oracle answers.
-fn check(client: &mut Client<StoreBackend>, expected: &[Value], label: &str) {
+fn check(client: &mut impl Tools, expected: &[Value], label: &str) {
+    check_with(client, expected, label, true)
+}
+
+/// [`check`]; `fresh`: every answer must also say `stale_possible: false`.
+fn check_with(client: &mut impl Tools, expected: &[Value], label: &str, fresh: bool) {
     for ((name, args), want) in cases().iter().zip(expected) {
         let mut got = client.ok(name, args.clone());
-        assert_eq!(got["stale_possible"], false, "{label} {name} {args}");
+        assert!(got["stale_possible"].is_boolean(), "{label} {name} {args}");
+        if fresh {
+            assert_eq!(got["stale_possible"], false, "{label} {name} {args}");
+        }
         got.as_object_mut().unwrap().remove("stale_possible");
         assert_eq!(&got, want, "{label}: {name} {args}");
     }
@@ -250,7 +258,7 @@ fn expected(store: &dyn StoreRead) -> Vec<Value> {
 }
 
 /// Refusals are the same on both targets and list the valid values.
-fn check_refusals(c: &mut Client<StoreBackend>) {
+fn check_refusals(c: &mut impl Tools) {
     let e = c.tool_error("search", json!({"text": "x", "language": "cobolx"}));
     assert_eq!(e["code"], "invalid_argument");
     assert!(e["message"].as_str().unwrap().contains("rust"), "{e}");
@@ -378,4 +386,120 @@ fn stale_possible_follows_the_counter_per_call() {
     assert_eq!(c.ok("describe", json!({}))["stale_possible"], true);
     bump.store(false, Ordering::SeqCst);
     assert_eq!(c.ok("list_repos", json!({}))["stale_possible"], false);
+}
+
+// ------------------------------------------------ the in-serve HTTP adapter
+
+use graph_server::mcp::{McpConfig, McpRead};
+use graph_server::testing::{ClusterTestbed, CLUSTER_WAIT};
+use std::time::{Duration, Instant};
+
+/// A 3-node cluster whose every node serves MCP on a free loopback port
+/// with `read`, filled through the leader and caught up everywhere.
+fn mcp_cluster(read: impl Fn(u64) -> McpRead) -> ClusterTestbed {
+    let mut tb = ClusterTestbed::with_config(3, rust(), |id, cfg| {
+        let mut m = McpConfig::new("127.0.0.1:0".parse().unwrap());
+        m.read = read(id);
+        cfg.mcp = Some(m);
+    });
+    tb.form();
+    tb.write_via_leader(|c| fill(c));
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    tb
+}
+
+fn mcp_addr(tb: &ClusterTestbed, id: u64) -> std::net::SocketAddr {
+    tb.node(id).running().unwrap().mcp_addr.expect("MCP is on")
+}
+
+fn wait_until(what: &str, mut probe: impl FnMut() -> bool) {
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    while !probe() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The third backend of ADR 0005 test plan 1: the `/mcp` endpoint inside
+/// `serve`, over the in-process Store service, on every node of a 3-node
+/// cluster (leader and followers, local and linearizable reads), equals
+/// `StoreRead` embedded, call for call.
+#[test]
+fn in_serve_http_adapter_on_a_cluster_equals_store_read() {
+    let d = tempfile::tempdir().unwrap();
+    let want = {
+        let store = open_store(&d.path().join("g.redb"), rust()).unwrap();
+        fill(&*store);
+        expected(&*store)
+    };
+    // Node 2 reads linearizably, the others locally.
+    let tb = mcp_cluster(|id| {
+        if id == 2 {
+            McpRead::Linearizable
+        } else {
+            McpRead::Local
+        }
+    });
+    let leader = tb.leader();
+    for id in tb.ids() {
+        let label = format!("http node {id} (leader {leader})");
+        let mut c = HttpClient::new(mcp_addr(&tb, id));
+        // A linearizable read is never stale_possible; a local one on a
+        // caught-up member of a healthy cluster may be, briefly.
+        check_with(&mut c, &want, &label, id == 2);
+        check_refusals(&mut c);
+        // Per-tool call and error counters on that node.
+        let metrics = tb.client(id).admin_metrics().unwrap();
+        for line in [
+            "mg_mcp_tool_calls_total{tool=\"unknown\",outcome=\"rejected\"} 1",
+            "mg_mcp_tool_calls_total{tool=\"find_symbols\",outcome=\"error\"}",
+            "mg_mcp_tool_calls_total{tool=\"search\",outcome=\"ok\"}",
+        ] {
+            assert!(
+                metrics.contains(line),
+                "node {id}: no `{line}` in\n{metrics}"
+            );
+        }
+    }
+}
+
+/// Linearizable MCP reads on a node cut off in a minority fail with the
+/// retryable `no_leader`, as a gRPC client's do; never a stale answer.
+#[test]
+fn http_linearizable_read_in_a_minority_is_no_leader() {
+    let tb = mcp_cluster(|_| McpRead::Linearizable);
+    let leader = tb.leader();
+    let m = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    let majority: Vec<u64> = tb.ids().into_iter().filter(|i| *i != m).collect();
+    let mut c = HttpClient::new(mcp_addr(&tb, m));
+    assert_eq!(c.ok("list_repos", json!({}))["stale_possible"], false);
+    tb.partition(&[m], &majority);
+    let e = c.tool_error("list_repos", json!({}));
+    assert_eq!(e["code"], "no_leader", "{e}");
+    assert_eq!(e["retryable"], true, "{e}");
+    tb.heal();
+}
+
+/// Local MCP reads on a partitioned follower keep answering, and say
+/// `stale_possible` as a gRPC `LOCAL` read there does.
+#[test]
+fn http_local_read_in_a_minority_answers_stale_possible() {
+    let tb = mcp_cluster(|_| McpRead::Local);
+    let leader = tb.leader();
+    let m = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    let majority: Vec<u64> = tb.ids().into_iter().filter(|i| *i != m).collect();
+    let mut c = HttpClient::new(mcp_addr(&tb, m));
+    let grpc = tb.client(m);
+    tb.partition(&[m], &majority);
+    wait_until("a stale_possible MCP read in the minority", || {
+        let got = c.ok("list_repos", json!({}));
+        assert_eq!(got["items"].as_array().unwrap().len(), 3, "{got}");
+        got["stale_possible"] == true
+    });
+    grpc.roots().unwrap();
+    assert!(
+        grpc.read_log().last().unwrap().stale_possible,
+        "a gRPC LOCAL read there agrees"
+    );
+    tb.heal();
 }

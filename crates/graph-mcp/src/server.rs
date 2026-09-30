@@ -20,6 +20,14 @@ use std::io::{BufRead, Write};
 /// at build time and the one before it (ADR 0005 D1).
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-11-25", "2025-06-18"];
 
+/// `v` as one of [`SUPPORTED_PROTOCOL_VERSIONS`], if it is one.
+pub fn supported_version(v: &str) -> Option<&'static str> {
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|s| *s == v)
+}
+
 pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -61,6 +69,23 @@ impl<B: McpBackend> McpServer<B> {
             protocol: None,
             initialized: false,
         }
+    }
+
+    /// A server for a session that was initialized earlier with
+    /// `protocol` (a stateless transport, such as streamable HTTP, keeps
+    /// only the negotiated revision per session and builds a server per
+    /// request). `None` if `protocol` is not a supported revision.
+    pub fn resumed(
+        backend: B,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        protocol: &str,
+    ) -> Option<Self> {
+        let v = supported_version(protocol)?;
+        let mut s = Self::new(backend, name, version);
+        s.protocol = Some(v);
+        s.initialized = true;
+        Some(s)
     }
 
     /// The negotiated protocol revision, once initialized.

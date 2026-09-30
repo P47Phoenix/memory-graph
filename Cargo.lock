@@ -132,6 +132,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -140,6 +142,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -952,12 +955,14 @@ dependencies = [
 name = "graph-server"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "graph-client",
  "graph-core",
  "graph-lang-csharp",
  "graph-lang-javascript",
  "graph-lang-rust",
+ "graph-mcp",
  "graph-proto",
  "graph-store",
  "hmac",
