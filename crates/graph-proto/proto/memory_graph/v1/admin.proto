@@ -106,6 +106,10 @@ message StatusResponse {
   // Log entries this node applied since it started (the count of
   // `mg_apply_duration_seconds`).
   uint64 entries_applied_total = 31;
+  // Where this node's MCP endpoint listens (`serve --mcp-listen`, ADR 0005
+  // D5), as bound: `host:port`, the endpoint being `http://<it>/mcp`.
+  // Empty: MCP is off (or the server predates the field).
+  string mcp_addr = 33;
   // Snapshot backups (ADR 0006, `serve --backup-url`); absent when this
   // node has no backup location.
   optional BackupStatus backup = 32;

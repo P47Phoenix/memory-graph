@@ -114,6 +114,9 @@ pub struct ServeConfig {
     /// `--metrics-listen`: serve Prometheus text at `/metrics` here (port
     /// 0 picks a free one, see [`Running::metrics_addr`]); `None`: off.
     pub metrics_listen: Option<SocketAddr>,
+    /// `--mcp-listen` and the other `--mcp-*` flags (ADR 0005 D4): the
+    /// MCP endpoint; `None` (the default): no MCP endpoint listens.
+    pub mcp: Option<crate::mcp::McpConfig>,
     /// `--ready-max-lag`: `memory-graph.ready` is `SERVING` only while this
     /// node's applied index is within this many entries of the leader's
     /// committed index (default [`crate::DEFAULT_READY_MAX_LAG`]).
@@ -217,6 +220,7 @@ impl ServeConfig {
             storage_backend: None,
             install_gate: None,
             metrics_listen: None,
+            mcp: None,
             ready_max_lag: crate::DEFAULT_READY_MAX_LAG,
             testing_apply_gate: None,
             backup: None,
@@ -257,6 +261,7 @@ impl std::fmt::Debug for ServeConfig {
             .field("sysinfo", &self.sysinfo.is_some())
             .field("testing", &self.testing)
             .field("metrics_listen", &self.metrics_listen)
+            .field("mcp", &self.mcp)
             .field("ready_max_lag", &self.ready_max_lag)
             .field("backup", &self.backup)
             .field(
@@ -308,6 +313,9 @@ pub struct Running {
     pub addr: SocketAddr,
     /// Where `/metrics` is served (`--metrics-listen`), as bound.
     pub metrics_addr: Option<SocketAddr>,
+    /// Where the MCP endpoint listens (`--mcp-listen`), as bound; `None`:
+    /// off. The endpoint is `http://<mcp_addr>/mcp`.
+    pub mcp_addr: Option<SocketAddr>,
     shutdown: ShutdownHandle,
     task: tokio::task::JoinHandle<Result<(), StoreError>>,
     pub slot: Arc<StoreSlot>,
@@ -455,6 +463,21 @@ pub async fn start(
         ),
         None => None,
     };
+    // `--mcp-listen` (ADR 0005 D4): loopback unless allowed, bound before
+    // anything is written like the other listeners.
+    let mcp_listener = match &cfg.mcp {
+        Some(m) => {
+            crate::mcp::check_bind(m)?;
+            let l = TcpListener::bind(m.listen)
+                .await
+                .map_err(|e| io_err(&format!("cannot listen on {} (--mcp-listen)", m.listen), e))?;
+            let bound = l.local_addr().map_err(|e| io_err("MCP local address", e))?;
+            crate::mcp::warn_at_start(m, bound);
+            Some((l, bound))
+        }
+        None => None,
+    };
+    let mcp_addr = mcp_listener.as_ref().map(|(_, a)| *a);
     if let Some(dir) = &paths.data_dir {
         std::fs::create_dir_all(dir)
             .map_err(|e| io_err(&format!("creating `{}`", dir.display()), e))?;
@@ -739,6 +762,7 @@ pub async fn start(
                 .map(|d| d.display().to_string())
                 .unwrap_or_default(),
             advertise,
+            mcp_addr,
         },
         shutdown: shutdown.clone(),
         sysinfo: cfg.sysinfo.clone(),
@@ -829,6 +853,10 @@ pub async fn start(
         ));
     }
 
+    if let (Some((l, _)), Some(m)) = (mcp_listener, cfg.mcp.clone()) {
+        tokio::spawn(crate::mcp::serve(l, m, Arc::clone(&ctx), shutdown.clone()));
+    }
+
     let no_limit = usize::MAX;
     let router = tonic::transport::Server::builder()
         .layer(crate::observe::RpcLayer::new(Arc::clone(&obs)))
@@ -885,6 +913,7 @@ pub async fn start(
     tracing::info!(
         %addr,
         metrics = ?metrics_addr,
+        mcp = ?mcp_addr,
         store = %paths.store.display(),
         node_id,
         "serving"
@@ -1091,6 +1120,7 @@ pub async fn start(
     Ok(Running {
         addr,
         metrics_addr,
+        mcp_addr,
         shutdown,
         task,
         slot,

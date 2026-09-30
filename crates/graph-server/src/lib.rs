@@ -51,6 +51,7 @@ pub mod extractors;
 pub mod forward;
 pub mod join;
 pub mod lock;
+pub mod mcp;
 pub mod observe;
 pub mod paths;
 pub mod powercut;
