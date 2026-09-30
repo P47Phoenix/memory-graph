@@ -255,7 +255,15 @@ pub fn restore_from_sink(
 /// `--restore <url>`: a `file://` URL naming `.../snap-T-I.redb` or
 /// `.../latest`.
 pub fn restore_from_url(url: &str, store: &Path, c: &RestoreChecks) -> Result<(), StoreError> {
-    let Location::File(path) = parse_url(url).map_err(refuse)?;
+    let path = match parse_url(url).map_err(refuse)? {
+        Location::File(path) => path,
+        Location::S3(_) => {
+            return Err(refuse(format!(
+                "`{url}`: restoring from s3:// is not in this release yet (ADR 0006 story 37); \
+                 copy the backup's .redb and .meta to a directory and restore from file://"
+            )))
+        }
+    };
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

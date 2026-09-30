@@ -261,9 +261,10 @@ enum Cmd {
         /// affected files re-extract on their next index). The store format check has no override
         #[arg(long, requires = "restore")]
         restore_allow_extractor_mismatch: bool,
-        /// Copy each snapshot this server builds to a backup location, `file://<dir>`, as
-        /// <dir>/<cluster_id>/snap-T-I.redb plus .meta (written last: a backup without its .meta
-        /// does not count). Uploads run in the background and never delay snapshots or purges
+        /// Copy each snapshot this server builds to a backup location, `file://<dir>` or
+        /// `s3://bucket/prefix` (with --backup-endpoint), as <dir>/<cluster_id>/snap-T-I.redb plus
+        /// .meta (written last: a backup without its .meta does not count). Uploads run in the
+        /// background and never delay snapshots or purges
         #[arg(long, value_name = "URL")]
         backup_url: Option<String>,
         /// With --backup-url: keep this many backups of this cluster (0: keep all); older ones
@@ -278,6 +279,26 @@ enum Cmd {
             default_value = "leader"
         )]
         backup_on: graph_server::backup::BackupOn,
+        /// With an s3:// --backup-url: the S3-compatible endpoint, http://host:port (MinIO, Ceph
+        /// RGW, R2, B2, Garage, or a TLS sidecar in front of AWS). Plain HTTP only: https:// is
+        /// refused (no pure-Rust TLS yet, #104)
+        #[arg(long, requires = "backup_url", value_name = "URL")]
+        backup_endpoint: Option<String>,
+        /// With an s3:// --backup-url: the region requests are signed for
+        #[arg(long, requires = "backup_url", value_name = "REGION", default_value = graph_server::backup::s3::DEFAULT_REGION)]
+        backup_region: String,
+        /// With an s3:// --backup-url: virtual-hosted addressing (http://bucket.host/key) instead
+        /// of path-style (http://host/bucket/key)
+        #[arg(long, requires = "backup_url")]
+        backup_virtual_host: bool,
+        /// With an s3:// --backup-url: an AWS credentials file (INI) to read the keys from when
+        /// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) are not set, which
+        /// win. Keys are never taken from flags or the config file
+        #[arg(long, requires = "backup_url", value_name = "FILE")]
+        backup_credentials_file: Option<PathBuf>,
+        /// With --backup-credentials-file: the profile to read (default: default)
+        #[arg(long, requires = "backup_credentials_file", value_name = "NAME")]
+        backup_profile: Option<String>,
         /// With --data-dir: join the cluster that the node at this host:port belongs to (any
         /// member; it forwards to the leader). On an empty directory the node asks to be added as
         /// a learner and catches up; on one that already belongs to that cluster it is a plain
@@ -975,6 +996,11 @@ fn run() -> Result<i32> {
         backup_url,
         backup_keep,
         backup_on,
+        backup_endpoint,
+        backup_region,
+        backup_virtual_host,
+        backup_credentials_file,
+        backup_profile,
         join,
         bootstrap_or_join,
         peers,
@@ -1224,6 +1250,11 @@ fn run() -> Result<i32> {
             let mut b = graph_server::backup::BackupConfig::new(url.clone());
             b.keep = *backup_keep;
             b.on = *backup_on;
+            b.s3.endpoint = backup_endpoint.clone();
+            b.s3.region = backup_region.clone();
+            b.s3.virtual_host = *backup_virtual_host;
+            b.s3.credentials_file = backup_credentials_file.clone();
+            b.s3.profile = backup_profile.clone();
             cfg.backup = Some(b);
         }
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
@@ -2343,9 +2374,23 @@ mod serve_config_tests {
                 "3",
                 "--backup-on",
                 "all",
+                "--backup-endpoint",
+                "http://minio:9000",
+                "--backup-region",
+                "eu-west-1",
+                "--backup-virtual-host",
+                "--backup-credentials-file",
+                "/etc/mg/aws",
+                "--backup-profile",
+                "backup",
             ],
             r#"
 backup-url = "file:///srv/backups"
+backup-endpoint = "http://minio:9000"
+backup_region = "eu-west-1"
+backup-virtual-host = true
+backup-credentials-file = "/etc/mg/aws"
+backup-profile = "backup"
 backup_keep = 3
 backup-on = "all"
 data-dir = "/data"
@@ -2455,6 +2500,36 @@ listen = "0.0.0.0:7000"
         a.push(f.into_os_string());
         let args = graph_cli::serve_config::apply(&Cli::command(), a).unwrap();
         assert!(Cli::command().try_get_matches_from(args).is_err());
+    }
+
+    /// A secret in the config file is refused (ADR 0006 E6), in whatever
+    /// spelling, and never echoed.
+    #[test]
+    fn a_secret_in_the_config_file_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("serve.toml");
+        for key in [
+            "aws_secret_access_key",
+            "aws-access-key-id",
+            "aws_session_token",
+            "backup-secret",
+            "backup_access_key",
+            "backup-password",
+        ] {
+            std::fs::write(
+                &f,
+                format!("backup-url = \"s3://b/p\"\n{key} = \"hunter2-SECRET\"\n"),
+            )
+            .unwrap();
+            let mut a = os(&["memory-graph", "serve", "--config"]);
+            a.push(f.clone().into_os_string());
+            let e = format!(
+                "{:#}",
+                graph_cli::serve_config::apply(&Cli::command(), a).unwrap_err()
+            );
+            assert!(e.contains("secrets are never read"), "{key}: {e}");
+            assert!(!e.contains("hunter2-SECRET"), "{key}: {e}");
+        }
     }
 
     /// QA 1: a flag on the command line whose `requires` target (the data
