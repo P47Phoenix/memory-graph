@@ -10,11 +10,18 @@
 //!    never a hint, see [`hint_from_label`]);
 //! 3. BOM-less UTF-16, sniffed from the NUL pattern, *before* the UTF-8
 //!    check (ASCII-only UTF-16 is valid UTF-8 as bytes);
+//!    Then (step 3b, amended 2026-09-30) 7-bit ISO-2022-JP, recognised by a
+//!    JIS X 0208 designation, since it too is valid UTF-8 as bytes;
 //! 4. valid UTF-8, borrowed unchanged;
 //! 5. `chardetng`, restricted to the non-UTF-8 encodings it can return;
 //! 6. windows-1252, which maps every byte.
 //!
 //! `lossy` is reachable only through steps 1 and 2.
+//!
+//! `chardetng` can guess wrong on short legacy files (a one-line
+//! windows-1252 or Shift_JIS file may come out as another code page). No
+//! length gate is applied, because it would misdecode short CJK files the
+//! other way; `--encoding` or `.memory-graph.toml` is the remedy.
 
 use std::borrow::Cow;
 
@@ -81,6 +88,17 @@ pub fn decode<'a>(bytes: &'a [u8], hint: Option<&'static Encoding>) -> Decoded<'
     if let Some(encoding) = sniff_utf16(bytes) {
         return decode_with(encoding, bytes);
     }
+    // 3b. 7-bit ISO-2022-JP, by its escapes, before the UTF-8 check
+    // (amended 2026-09-30); only a clean decode is accepted.
+    if looks_like_iso_2022_jp(bytes) {
+        if let Some(text) = ISO_2022_JP.decode_without_bom_handling_and_without_replacement(bytes) {
+            return Decoded {
+                text,
+                encoding: ISO_2022_JP,
+                lossy: false,
+            };
+        }
+    }
     // 4. Valid UTF-8, borrowed.
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Decoded {
@@ -104,6 +122,16 @@ pub fn decode<'a>(bytes: &'a [u8], hint: Option<&'static Encoding>) -> Decoded<'
     }
     // 6. windows-1252 maps every byte, so this is never lossy.
     decode_with(WINDOWS_1252, bytes)
+}
+
+/// True when `bytes` are all 7-bit and contain a JIS X 0208 designation
+/// (ESC $ @ or ESC $ B). ESC ( B / ESC ( J alone prove nothing: they only
+/// switch back to ASCII / JIS-Roman.
+fn looks_like_iso_2022_jp(bytes: &[u8]) -> bool {
+    bytes.is_ascii()
+        && bytes
+            .windows(3)
+            .any(|w| matches!(w, [0x1B, b'$', b'@'] | [0x1B, b'$', b'B']))
 }
 
 fn decode_with<'a>(encoding: &'static Encoding, bytes: &'a [u8]) -> Decoded<'a> {
@@ -158,11 +186,17 @@ fn is_detectable(encoding: &'static Encoding) -> bool {
     DETECTABLE.contains(&encoding)
 }
 
-/// The BOM-less UTF-16 sniff (ADR 0007 C3 step 3). In the first
-/// [`UTF16_SNIFF_WINDOW`] bytes (trimmed to an even length), at least 3/4 of
-/// the high-byte positions (even offsets for BE, odd for LE) must be NUL and
-/// fewer than 1/16 of the low-byte positions; the whole file must then
-/// decode as that encoding without error.
+/// The BOM-less UTF-16 sniff (ADR 0007 C3 step 3, amended 2026-09-30 for
+/// CJK). Both byte orders are tried. In the first [`UTF16_SNIFF_WINDOW`]
+/// bytes (trimmed to an even length), a candidate needs NULs in its
+/// high-byte positions (even offsets for BE, odd for LE) in at least 1/64 of
+/// the code units (and at least one), and NULs in fewer than 1/16 of its
+/// low-byte positions; the whole file must then decode strictly as that
+/// encoding, and the decoded text must have no C0 control other than tab,
+/// LF, FF and CR (so no U+0000). ASCII-heavy UTF-16 has NULs in almost every
+/// high byte; CJK UTF-16 has them only on its ASCII (newlines, spaces,
+/// punctuation). If both orders pass, the one with more high-byte NULs wins
+/// (LE on a tie).
 pub fn sniff_utf16(bytes: &[u8]) -> Option<&'static Encoding> {
     let window = &bytes[..bytes.len().min(UTF16_SNIFF_WINDOW) & !1];
     if window.is_empty() {
@@ -176,28 +210,35 @@ pub fn sniff_utf16(bytes: &[u8]) -> Option<&'static Encoding> {
         .step_by(2)
         .filter(|b| **b == 0)
         .count();
-    // high >= 3/4 of units, low < 1/16 of units (integer arithmetic).
-    let fits = |high: usize, low: usize| high * 4 >= units * 3 && low * 16 < units;
-    let candidate = if fits(even_nuls, odd_nuls) {
-        UTF_16BE
-    } else if fits(odd_nuls, even_nuls) {
-        UTF_16LE
-    } else {
-        return None;
+    let candidate = |high: usize, low: usize, encoding: &'static Encoding| {
+        if high == 0 || high * 64 < units || low * 16 >= units {
+            return None;
+        }
+        let text = encoding.decode_without_bom_handling_and_without_replacement(bytes)?;
+        let clean = !text
+            .chars()
+            .any(|c| c < ' ' && !matches!(c, '\t' | '\n' | '\x0C' | '\r'));
+        clean.then_some((high, encoding))
     };
-    candidate
-        .decode_without_bom_handling_and_without_replacement(bytes)
-        .map(|_| candidate)
+    let be = candidate(even_nuls, odd_nuls, UTF_16BE);
+    let le = candidate(odd_nuls, even_nuls, UTF_16LE);
+    match (le, be) {
+        (Some(l), Some(b)) => Some(if b.0 > l.0 { b.1 } else { l.1 }),
+        (l, b) => l.or(b).map(|(_, e)| e),
+    }
 }
 
 /// True when the file should be skipped as binary (ADR 0007 C5): it has a
-/// NUL byte, no BOM, and does not sniff as UTF-16.
+/// NUL byte, no BOM, and does not sniff as UTF-16. Because the sniff needs a
+/// strict decode, a single invalid UTF-16 unit (an unpaired surrogate, or an
+/// odd length) makes a BOM-less NUL-bearing file binary.
 pub fn is_binary(bytes: &[u8]) -> bool {
     is_binary_with_hint(bytes, None)
 }
 
 /// [`is_binary`] for a file with a resolved hint: an explicit UTF-16 hint
-/// also makes a file with NULs text.
+/// also makes a file with NULs text. Any other hint changes nothing here,
+/// but [`decode`] still uses it over the sniff.
 pub fn is_binary_with_hint(bytes: &[u8], hint: Option<&'static Encoding>) -> bool {
     bytes.contains(&0)
         && Encoding::for_bom(bytes).is_none()
@@ -307,6 +348,39 @@ mod tests {
     }
 
     #[test]
+    fn bom_only_files_are_exactly_feff() {
+        for bom in [&b"\xEF\xBB\xBF"[..], b"\xFF\xFE", b"\xFE\xFF"] {
+            let d = decode(bom, None);
+            assert_eq!(d.text, "\u{FEFF}");
+            assert!(!d.lossy);
+            assert!(!is_binary(bom));
+        }
+        // A BOM makes NUL-bearing bytes that fail the sniff text, not binary.
+        let bytes = b"\xEF\xBB\xBF\0\0\0\x07";
+        assert_eq!(sniff_utf16(bytes), None);
+        assert!(!is_binary(bytes));
+    }
+
+    #[test]
+    fn a_disagreeing_hint_wins_over_the_sniff() {
+        let bytes = utf16(ASCII_SRC, false, false);
+        assert!(!is_binary_with_hint(&bytes, Some(WINDOWS_1252)));
+        let d = decode(&bytes, Some(WINDOWS_1252));
+        assert_eq!(d.encoding, WINDOWS_1252);
+        assert!(d.text.contains('\0'));
+    }
+
+    #[test]
+    fn short_legacy_files_can_be_misdetected() {
+        // Pinned so a behaviour change is visible (ADR 0007 C9): a short
+        // windows-1252 file is guessed as ISO-8859-4.
+        let bytes = encode(WINDOWS_1252, "naïve = 1;\n");
+        let d = decode(&bytes, None);
+        assert_eq!(d.encoding, ISO_8859_4);
+        assert!(!d.lossy);
+    }
+
+    #[test]
     fn bom_followed_by_invalid_bytes_is_lossy() {
         let d = decode(b"\xEF\xBB\xBFok \xFF\xFE!", None);
         assert_eq!(d.encoding, UTF_8);
@@ -355,28 +429,80 @@ mod tests {
         }
     }
 
+    /// 64 units; `high_nul` of them have a NUL high byte, the next `low_nul`
+    /// a NUL low byte (with a CJK-range high byte, so no unit is U+0000).
+    fn units64(high_nul: usize, low_nul: usize, be: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        for i in 0..64 {
+            let (low, high) = if i < high_nul {
+                (b'a', 0)
+            } else if i < high_nul + low_nul {
+                (0, 0x4E)
+            } else {
+                (b'a', 0x4E)
+            };
+            v.extend_from_slice(&if be { [high, low] } else { [low, high] });
+        }
+        v
+    }
+
     #[test]
     fn sniff_thresholds_at_their_edges() {
-        // 16 LE units: high bytes (odd offsets) NUL in exactly 12 (3/4).
-        let mk = |high_nul: usize, low_nul: usize| {
-            let mut v = Vec::new();
-            for i in 0..16 {
-                let low = if i < low_nul { 0 } else { b'a' };
-                // A non-NUL high byte of 0x30 keeps the unit a valid BMP char.
-                let high = if i < high_nul { 0 } else { 0x30 };
-                v.extend_from_slice(&[low, high]);
-            }
-            v
-        };
-        assert_eq!(sniff_utf16(&mk(12, 0)), Some(UTF_16LE));
-        assert_eq!(sniff_utf16(&mk(11, 0)), None);
-        // low NULs must be < 1/16 of 16 units, i.e. 0.
-        assert_eq!(sniff_utf16(&mk(16, 1)), None);
+        for (be, enc) in [(false, UTF_16LE), (true, UTF_16BE)] {
+            // high NULs >= 1/64 of units (here 1 of 64), and at least one.
+            assert_eq!(sniff_utf16(&units64(1, 0, be)), Some(enc));
+            assert_eq!(sniff_utf16(&units64(0, 0, be)), None);
+            // low NULs < 1/16 of units: 3 of 64 passes, 4 fails.
+            assert_eq!(sniff_utf16(&units64(10, 3, be)), Some(enc));
+            assert_eq!(sniff_utf16(&units64(10, 4, be)), None);
+        }
         // An odd total length fails the whole-file decode.
-        let mut odd = mk(16, 0);
+        let mut odd = units64(64, 0, false);
         odd.push(b'x');
         assert_eq!(sniff_utf16(&odd), None);
         assert_eq!(sniff_utf16(b""), None);
+        // A C0 control other than tab/LF/FF/CR rejects the candidate.
+        let mut ctl = units64(64, 0, false);
+        ctl.extend_from_slice(&[0x07, 0]);
+        assert_eq!(sniff_utf16(&ctl), None);
+        for ok in [b'\t', b'\n', 0x0C, b'\r'] {
+            let mut v = units64(64, 0, false);
+            v.extend_from_slice(&[ok, 0]);
+            assert_eq!(sniff_utf16(&v), Some(UTF_16LE));
+        }
+    }
+
+    #[test]
+    fn bomless_cjk_utf16_is_sniffed_not_binary() {
+        let cases = [
+            "// 日本語\n",
+            "-- 名前\n",
+            "// 这是一个用于测试的中文注释，客户信息更新函数。我们需要检查编码是否正确识别。\nint x;\n",
+            "/* 고객 정보를 업데이트하는 함수입니다 */\n",
+            "日本語のテキストだけ。\n",
+        ];
+        for src in cases {
+            for (be, enc) in [(false, UTF_16LE), (true, UTF_16BE)] {
+                let bytes = utf16(src, be, false);
+                assert!(!is_binary(&bytes), "{src:?} be={be}");
+                let d = decode(&bytes, None);
+                assert_eq!((d.encoding, d.text.as_ref(), d.lossy), (enc, src, false));
+            }
+        }
+    }
+
+    #[test]
+    fn real_binaries_stay_binary() {
+        let png: &[u8] =
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x10\x08\x06\0\0\0\x1f\xf3\xffa";
+        let zip: &[u8] = b"PK\x03\x04\x14\0\0\0\x08\0\x9c\x5e\x3e\x5b\xa1\x2c\x11\x07\x0c\0\0\0\x0a\0\0\0\x05\0\0\0a.txt";
+        let mut exe = b"MZ\x90\0\x03\0\0\0\x04\0\0\0\xff\xff\0\0\xb8\0\0\0\0\0\0\0@\0".to_vec();
+        exe.extend_from_slice(&[0; 32]);
+        exe.extend_from_slice(b"This program cannot be run in DOS mode.\r\r\n$\0\0\0");
+        for bin in [png, zip, &exe[..], &[0u8; 64][..]] {
+            assert!(is_binary(bin));
+            assert_eq!(sniff_utf16(bin), None);
+        }
     }
 
     #[test]
@@ -433,9 +559,31 @@ mod tests {
         assert_eq!(d.encoding, ISO_2022_JP);
         assert_eq!(d.text, src);
         assert!(!d.lossy);
-        // ISO-2022-JP is 7-bit, so its bytes are always valid UTF-8 and the
-        // C3 order takes them as UTF-8 before chardetng runs.
-        assert_eq!(decode(&bytes, None).encoding, UTF_8);
+        // Auto-detected by its escapes, before the UTF-8 check.
+        let d = decode(&bytes, None);
+        assert_eq!(
+            (d.encoding, d.text.as_ref(), d.lossy),
+            (ISO_2022_JP, src, false)
+        );
+        // Both JIS X 0208 designations are recognised; ESC ( B / ESC ( J
+        // alone are not, and plain ASCII is UTF-8.
+        for esc in [&b"\x1b$@"[..], b"\x1b$B"] {
+            assert!(looks_like_iso_2022_jp(&[b"x ", esc, b" y"].concat()));
+        }
+        for esc in [&b"\x1b(B"[..], b"\x1b(J"] {
+            let bytes = [b"x ", esc, b" y"].concat();
+            assert!(!looks_like_iso_2022_jp(&bytes));
+            assert_eq!(decode(&bytes, None).encoding, UTF_8);
+        }
+        assert_eq!(decode(b"int x = 0;", None).encoding, UTF_8);
+        // Escapes that do not decode cleanly fall through to UTF-8.
+        let bad = b"\x1b$B\x7f\x7f";
+        assert!(ISO_2022_JP
+            .decode_without_bom_handling_and_without_replacement(bad)
+            .is_none());
+        assert_eq!(decode(bad, None).encoding, UTF_8);
+        // Not 7-bit: not ISO-2022-JP.
+        assert!(!looks_like_iso_2022_jp("\x1b$B é".as_bytes()));
     }
 
     #[test]
@@ -443,6 +591,7 @@ mod tests {
         // Every byte value that is not valid UTF-8 on its own.
         let bytes: Vec<u8> = (0x80u8..=0xFF).collect();
         let d = decode(&bytes, None);
+        assert_eq!(d.encoding, WINDOWS_1252);
         assert!(!d.lossy);
         assert_eq!(d.text.chars().count(), bytes.len());
     }
