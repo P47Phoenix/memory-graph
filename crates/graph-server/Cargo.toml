@@ -44,3 +44,4 @@ rustix = { version = "1", features = ["fs"] }
 graph-lang-rust = { path = "../graph-lang-rust" }
 graph-lang-csharp = { path = "../graph-lang-csharp" }
 graph-lang-javascript = { path = "../graph-lang-javascript" }
+proptest.workspace = true

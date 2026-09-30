@@ -516,6 +516,50 @@ proptest! {
         check_reply(Some(&v), reply);
     }
 
+    /// The stdio framing (epic story 34): any stream of lines, JSON-RPC
+    /// messages mixed with random bytes, `\n` and `\r\n` endings, blank
+    /// lines and a last line without a newline, gets one JSON-RPC line per
+    /// reply and nothing else, never more replies than non-blank lines.
+    #[test]
+    fn arbitrary_stdio_streams_frame_one_reply_per_line(
+        lines in prop::collection::vec(
+            prop_oneof![
+                arb_json().prop_map(|v| serde_json::to_vec(&v).unwrap()),
+                Just(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#.to_vec()),
+                Just(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe"}}"#.to_vec()),
+                prop::collection::vec(any::<u8>().prop_filter("no newline", |b| *b != b'\n'), 0..64),
+                Just(Vec::new()),
+            ],
+            0..24,
+        ),
+        crlf in any::<bool>(),
+        trailing_newline in any::<bool>(),
+    ) {
+        let mut input = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            input.extend_from_slice(l);
+            if i + 1 < lines.len() || trailing_newline {
+                input.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+            }
+        }
+        let mut s = server();
+        let mut out = Vec::new();
+        serve_stdio(&mut s, &input[..], &mut out).unwrap();
+        let text = String::from_utf8(out).expect("stdout is UTF-8");
+        prop_assert!(text.is_empty() || text.ends_with('\n'));
+        let non_blank = input
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.trim_ascii().is_empty())
+            .count();
+        let replies: Vec<&str> = text.lines().collect();
+        prop_assert!(replies.len() <= non_blank, "{} replies to {} lines", replies.len(), non_blank);
+        for r in replies {
+            let v: Value = serde_json::from_str(r).expect("each line is JSON");
+            prop_assert_eq!(&v["jsonrpc"], &json!("2.0"));
+            prop_assert!(v.get("result").is_some() != v.get("error").is_some(), "{}", v);
+        }
+    }
+
     #[test]
     fn arbitrary_tool_arguments_are_answered_or_refused(
         name in prop_oneof![Just("describe"), Just("list_repos"), Just("search"), Just("find_symbols"),

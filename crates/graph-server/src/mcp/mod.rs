@@ -493,16 +493,6 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             );
         }
     }
-    // Taken only now: a request with a bad session gets its own error.
-    let Ok(permit) = Arc::clone(&st.inflight).try_acquire_owned() else {
-        let mut r = plain(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many MCP requests in flight (serve --mcp-max-inflight); retry",
-        );
-        r.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        return r;
-    };
     let tool = (method.as_deref() == Some("tools/call")).then(|| {
         let n = parsed
             .as_ref()
@@ -511,6 +501,19 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             .unwrap_or("");
         tool_label(n)
     });
+    // Taken only now: a request with a bad session gets its own error.
+    let Ok(permit) = Arc::clone(&st.inflight).try_acquire_owned() else {
+        if let Some(t) = &tool {
+            st.ctx.raft.obs.observe_mcp_call(t, "refused");
+        }
+        let mut r = plain(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many MCP requests in flight (serve --mcp-max-inflight); retry",
+        );
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return r;
+    };
     let rt = tokio::runtime::Handle::current();
     let svc = Arc::clone(&st.svc);
     let view = st.view;
@@ -538,7 +541,7 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "MCP call failed");
             if let Some(t) = &tool {
-                st.ctx.raft.obs.observe_mcp_call(t, "error");
+                st.ctx.raft.obs.observe_mcp_call(t, "internal");
             }
             let id = parsed.as_ref().and_then(|v| v.get("id")).cloned();
             return json_reply(

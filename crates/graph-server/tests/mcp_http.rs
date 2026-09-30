@@ -255,8 +255,76 @@ fn requests_past_max_inflight_get_429() {
     let r = c.post(&msg);
     assert_eq!(r.status, 429, "{r:?}");
     assert_eq!(r.header("retry-after"), Some("1"));
+    // A refused tools/call is counted as `refused` for its tool.
+    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                      "params": {"name": "search", "arguments": {"text": "x"}}});
+    assert_eq!(c.post(&call).status, 429);
     assert_eq!(slow.join().unwrap().status, 200);
     assert_eq!(c.post(&msg).status, 200, "the slot is free again");
+    let metrics = metrics(&_srv);
+    assert!(
+        metrics.contains("mg_mcp_tool_calls_total{tool=\"search\",outcome=\"refused\"} 1"),
+        "{metrics}"
+    );
+}
+
+fn metrics(srv: &TestServer) -> String {
+    RemoteStore::connect(ClientConfig::new(srv.endpoint()))
+        .unwrap()
+        .admin_metrics()
+        .unwrap()
+}
+
+/// Epic story 34: per-tool call counters with every outcome a call can
+/// have short of a timeout or a 429 (both tested above): `ok`, `error`
+/// (an isError result), `rejected` (a JSON-RPC error), and an unknown tool
+/// name counted as `unknown`.
+#[test]
+fn per_tool_counters_cover_each_outcome() {
+    let d = tempfile::tempdir().unwrap();
+    let (srv, addr) = server(&d, loopback());
+    let mut c = McpHttpClient::new(addr);
+    let call = |c: &mut McpHttpClient, name: &str, args: Value| {
+        c.request("tools/call", json!({"name": name, "arguments": args}))
+    };
+    for _ in 0..2 {
+        let r = call(&mut c, "search", json!({"text": "origin"}));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+    }
+    let r = call(
+        &mut c,
+        "search",
+        json!({"text": "x", "language": "klingon"}),
+    );
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    // Invalid arguments are a tool error too (an isError result).
+    let r = call(&mut c, "search", json!({"text": "x", "limit": 501}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    // `arguments` that are not an object: a JSON-RPC error.
+    let r = c.request("tools/call", json!({"name": "search", "arguments": [1]}));
+    assert!(r.get("error").is_some(), "{r}");
+    let r = call(&mut c, "drop_tables", json!({}));
+    assert!(r.get("error").is_some(), "{r}");
+    let r = call(&mut c, "describe", json!({}));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    // Not a tool call: not counted.
+    c.request("tools/list", json!({}));
+    let m = metrics(&srv);
+    let lines: Vec<&str> = m
+        .lines()
+        .filter(|l| l.starts_with("mg_mcp_tool_calls_total{"))
+        .collect();
+    let mut want = vec![
+        "mg_mcp_tool_calls_total{tool=\"describe\",outcome=\"ok\"} 1",
+        "mg_mcp_tool_calls_total{tool=\"search\",outcome=\"error\"} 2",
+        "mg_mcp_tool_calls_total{tool=\"search\",outcome=\"ok\"} 2",
+        "mg_mcp_tool_calls_total{tool=\"search\",outcome=\"rejected\"} 1",
+        "mg_mcp_tool_calls_total{tool=\"unknown\",outcome=\"rejected\"} 1",
+    ];
+    let mut got = lines.clone();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "{m}");
 }
 
 #[test]

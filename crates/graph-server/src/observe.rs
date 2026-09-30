@@ -153,7 +153,8 @@ impl Observability {
     }
 
     /// One MCP `tools/call` of `tool` (a known tool name or `unknown`)
-    /// ended with `outcome` (`ok`, `error`, `rejected`, `timeout`).
+    /// ended with `outcome` (`ok`, `error`, `rejected`, `timeout`,
+    /// `refused`, `internal`).
     pub fn observe_mcp_call(&self, tool: &str, outcome: &str) {
         let mut m = self
             .mcp_calls
@@ -454,7 +455,7 @@ pub fn render(ctx: &Ctx) -> String {
         &mut out,
         "mg_mcp_tool_calls_total",
         "counter",
-        "MCP tools/call requests on --mcp-listen, by tool and outcome (ok, error: an isError result, rejected: a JSON-RPC error, timeout).",
+        "MCP tools/call requests on --mcp-listen, by tool and outcome (ok, error: an isError result, rejected: a JSON-RPC error, timeout: past the per-call deadline, refused: past --mcp-max-inflight (429), internal: the call itself failed).",
     );
     for ((tool, outcome), n) in obs.mcp_calls() {
         let _ = writeln!(

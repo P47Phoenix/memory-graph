@@ -679,6 +679,15 @@ enum Cmd {
     /// this command and calls its tools (describe, list_repos, search, find_symbols, file_outline,
     /// file_tokens, list_files). Reads --db, or --server / MEMORY_GRAPH_SERVER with --read. Stdout
     /// carries only protocol messages; logs go to stderr. Client configuration: docs/mcp.md
+    ///
+    /// Over stdio no port is opened: only the client that started the process can talk to it.
+    /// The HTTP endpoint (`serve --mcp-listen`) is another matter:
+    /// +----------------------------------------------------------------------+
+    /// | WARNING: The MCP endpoint has no authentication. Anyone who can      |
+    /// | reach it can read every indexed source token. Keep it on loopback    |
+    /// | or behind an authenticating proxy until #105.                        |
+    /// +----------------------------------------------------------------------+
+    #[command(verbatim_doc_comment)]
     Mcp,
 }
 
