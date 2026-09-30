@@ -73,7 +73,11 @@ fn settings(cmd: &Command, sm: &clap::ArgMatches, text: &str) -> Result<Vec<OsSt
         .find_subcommand("serve")
         .expect("the CLI has a serve command");
     let mut out = Vec::new();
-    for (key, value) in &table {
+    // Key order, as before toml's `preserve_order` (enabled for the ordered
+    // `.memory-graph.toml` globs): the flags do not depend on file order.
+    let mut entries: Vec<_> = table.iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in entries {
         let long = key.replace('_', "-");
         if is_secret_key(&long) {
             bail!(

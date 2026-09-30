@@ -714,6 +714,7 @@ dependencies = [
  "clap",
  "console",
  "crossbeam-channel",
+ "globset",
  "graph-client",
  "graph-core",
  "graph-lang-asm",

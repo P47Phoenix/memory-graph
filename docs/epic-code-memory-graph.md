@@ -525,7 +525,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C3, C4, C8.
 - Given `index --encoding <label>` or `index-file --encoding <label>` with any `encoding_rs` label or `ansi`, When run, Then files must decode with it (a BOM still wins); an unknown label must be a usage error.
 - Given a `.memory-graph.toml` at the indexed root with an `[encoding]` table of globs, When a directory is indexed, Then precedence must be BOM > `--encoding` > the first matching glob > auto, resolved on the client and sent per file; an edit to the file must re-index exactly the affected files without `--reindex`.
 - Given `--strict-encoding` and a file that would decode lossily, When indexed, Then that file must be refused and reported, and the rest indexed; and `--encoding utf-8 --strict-encoding` must reproduce today's `NotUtf8` refusal.
-- Given a directory run, When it finishes, Then the tallies must no longer skip UTF-16 files as binary and must count transcoded and lossy files.
+- Given a directory run, When it finishes, Then the tallies must no longer skip UTF-16 files as binary. (The transcoded and lossy counts moved to story 43, owner, 2026-09-30.)
 
 **43. Encodings on the wire, in `describe`/`--stats` and in MCP (5 pts)**
 Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
@@ -536,6 +536,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C8.
 - Given `--server`, When a client sends `FileBytes.encoding_hint` (with `ansi` resolved on the client) and `strict_encoding`, Then the server must honour them, and the proto change must be additive and regenerated with the xtask.
 - Given a repo with non-UTF-8 files, When `describe` (text and `--json`) runs, Then it must list the encodings and the lossy count per repo, from the catalog, in O(repos).
 - Given `symbols` and `search --json`, When a hit is in a non-UTF-8 file, Then its `encoding` (and `lossy` when set) must be shown; and `--stats` must show transcoded and lossy counts.
+- Given a directory run, When it finishes, Then its tallies must count transcoded and lossy files (moved from story 42, owner, 2026-09-30).
 - Given the MCP `describe` and `list_files` tools, When called, Then they must include the encoding where it is not UTF-8.
 
 **44. Encoding fixtures, cross-encoding search tests and docs (3 pts)**

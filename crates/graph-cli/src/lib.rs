@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 
 pub mod dataflow;
 pub mod diskinfo;
+pub mod encoding_config;
 pub mod logging;
 use diskinfo::{DiskInputs, DiskPolicy, DiskProbe, MinFree};
 pub mod progress;
@@ -122,6 +123,11 @@ pub struct DirOpts<'a> {
     /// disk as a typed error); the board shows send / replicate stages and
     /// counts the RPCs.
     pub remote: Option<progress::RemoteBoard>,
+    /// `--encoding` resolved on the client (`ansi` included); `None` is `auto`.
+    /// It wins over the `.memory-graph.toml` globs at `dir`; a BOM wins over both.
+    pub encoding: Option<&'static graph_core::encoding::Encoding>,
+    /// `--strict-encoding`: refuse (and report) a file whose decode is lossy.
+    pub strict_encoding: bool,
 }
 
 /// Source bytes per redb transaction unless `--chunk-bytes` says otherwise
@@ -233,6 +239,9 @@ fn compact_hint(store: &dyn Store) {
 const BATCH_FILES: usize = 256;
 const BATCH_BYTES: usize = 32 * 1024 * 1024;
 
+/// Skip reason for a file refused by `--strict-encoding` (its decode was lossy).
+pub const STRICT_ENCODING_REFUSED: &str = "invalid in its encoding (--strict-encoding)";
+
 /// Skip reason for a file the store cannot hold: spans are 32-bit offsets.
 pub const TOO_LARGE_FOR_SPANS: &str = "larger than 4 GiB (span limit)";
 
@@ -331,9 +340,11 @@ fn flush_batch(
             Err(graph_store::StoreError::Binary(_)) => {
                 t.skipped.entry("binary".into()).or_default().push(rel)
             }
-            Err(graph_store::StoreError::NotUtf8(_)) => t
+            // ADR 0007 C3: only --strict-encoding refuses a file for its
+            // encoding, as NotUtf8 (decoded as UTF-8) or Rejected naming it.
+            Err(e) if graph_store::is_strict_encoding_refusal(&e) => t
                 .skipped
-                .entry("not valid UTF-8".into())
+                .entry(STRICT_ENCODING_REFUSED.into())
                 .or_default()
                 .push(rel),
             // The store's only `TooLarge` cause is `MAX_SOURCE_BYTES`, the
@@ -391,6 +402,7 @@ enum Outcome {
 fn read_and_prepare(
     store: &dyn Store,
     o: &DirOpts,
+    cfg: &encoding_config::EncodingConfig,
     item: &Item,
     board: &Board,
     k: usize,
@@ -437,10 +449,10 @@ fn read_and_prepare(
     if let Some(reason) = size_skip_reason(bytes.len() as u64, o.max_file_size) {
         return skip(reason, false);
     }
-    // ADR 0007 C5: the store's own binary check (a NUL, no BOM, not
-    // UTF-16), so a UTF-16 file is indexed, not skipped. The walk resolves
-    // no hint yet (`--encoding` is story 42), so the file goes auto.
-    let hint = None;
+    // ADR 0007 C8: the hint is resolved here, on the client (--encoding,
+    // then the first matching .memory-graph.toml glob), and sent with the
+    // file; C5: the store's own binary check (a NUL, no BOM, not UTF-16).
+    let hint = cfg.resolve(o.encoding, rel);
     if graph_core::encoding::is_binary_with_hint(&bytes, hint) {
         return skip("binary", false);
     }
@@ -450,7 +462,7 @@ fn read_and_prepare(
         language: None,
         origin: Some(ORIGIN_DIRECTORY),
         encoding: hint,
-        strict_encoding: false,
+        strict_encoding: o.strict_encoding,
     };
     let p = board
         .parse
@@ -474,9 +486,16 @@ fn read_and_prepare(
 /// This relies on unwinding: building with `panic = "abort"` would undo #82.
 /// The default panic hook still prints its one `thread ... panicked` line
 /// to stderr for such a file; that is kept, as the backtrace pointer.
-fn work(store: &dyn Store, o: &DirOpts, item: &Item, board: &Board, k: usize) -> Result<Outcome> {
+fn work(
+    store: &dyn Store,
+    o: &DirOpts,
+    cfg: &encoding_config::EncodingConfig,
+    item: &Item,
+    board: &Board,
+    k: usize,
+) -> Result<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        read_and_prepare(store, o, item, board, k)
+        read_and_prepare(store, o, cfg, item, board, k)
     }))
     .unwrap_or_else(|e| {
         let what = match item {
@@ -642,6 +661,7 @@ fn walk(
 fn run_pipeline(
     store: &dyn Store,
     o: &DirOpts,
+    cfg: &encoding_config::EncodingConfig,
     board: &Board,
     display: &mut Display,
 ) -> Result<Collected> {
@@ -707,7 +727,7 @@ fn run_pipeline(
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(seq, rel.clone());
                     }
-                    let oc = work(store, o, &item, board, k);
+                    let oc = work(store, o, cfg, &item, board, k);
                     let mut fp = 0;
                     if let Ok(Outcome::Prepared(_, p)) = &oc {
                         board.parse.count(1, size);
@@ -1145,6 +1165,8 @@ pub fn index_dir_with(
             );
         }
     }
+    // Read before the store is opened, so a bad config writes nothing.
+    let cfg = encoding_config::EncodingConfig::load(o.dir)?;
     let start = std::time::Instant::now();
     let store = open(o.db)?;
     warn_extractor_gaps(&*store, o.org, o.repo);
@@ -1167,7 +1189,7 @@ pub fn index_dir_with(
     board
         .db_len_start
         .store(std::fs::metadata(o.db).map_or(0, |m| m.len()), Relaxed);
-    let run = run_pipeline(&*store, &o, &board, display);
+    let run = run_pipeline(&*store, &o, &cfg, &board, display);
     let view = board.view();
     if let (Some(path), Some(t)) = (o.trace, trace) {
         t.write(path)
