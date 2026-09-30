@@ -80,6 +80,11 @@ impl EncodingConfig {
                 })?;
                 let enc =
                     resolve_label(label).map_err(|e| err(format!("`encoding.\"{glob}\"`: {e}")))?;
+                if glob.starts_with("./") || glob.starts_with('/') {
+                    return Err(err(format!(
+                        "`encoding.\"{glob}\"`: a glob is matched against the path relative to the root; drop the leading `./` or `/`"
+                    )));
+                }
                 let matcher = globset::GlobBuilder::new(glob)
                     .literal_separator(true)
                     .build()
@@ -188,14 +193,34 @@ mod tests {
         assert!(e.contains("a[") && e.contains("invalid glob"), "{e}");
         let e = cfg("[encoding\n").unwrap_err().to_string();
         assert!(e.contains(".memory-graph.toml"), "{e}");
+        for g in ["./a/**", "/a/**"] {
+            let e = cfg(&format!("[encoding]\n\"{g}\" = \"utf-8\"\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(g) && e.contains("relative to the root"), "{e}");
+        }
     }
 
     #[test]
     fn a_missing_file_is_an_empty_config() {
-        let d = std::env::temp_dir().join(format!("mg-enc-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let c = EncodingConfig::load(&d).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let c = EncodingConfig::load(d.path()).unwrap();
         assert_eq!(c.lookup("x.rs"), None);
-        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_unreadable_config_is_an_error_naming_it() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join(CONFIG_FILE)).unwrap();
+        let e = EncodingConfig::load(d.path()).unwrap_err().to_string();
+        assert!(e.contains("cannot read") && e.contains(CONFIG_FILE), "{e}");
+    }
+
+    #[test]
+    fn globs_are_case_sensitive_and_auto_stops_the_search() {
+        let c = cfg("[encoding]\n\"a/*.txt\" = \"auto\"\n\"**/*.txt\" = \"latin1\"\n").unwrap();
+        assert_eq!(c.lookup("a/x.txt"), Some(None));
+        assert_eq!(c.resolve(None, "a/x.txt"), None);
+        assert_eq!(c.lookup("b/X.TXT"), None);
     }
 }

@@ -28,6 +28,24 @@ If a file fails span validation (an extractor or tokenizer bug), only that file 
 
 A panicking extractor fails only that file the same way (`failed: <path>: extractor panicked: ...`; the panic's own `thread ... panicked` line also appears on stderr). Failed files are listed in path order. With `index --server`, `--stats` `transactions` counts write requests; the commits happen on the server.
 
+## Source encodings
+
+Every file is decoded to UTF-8 before it is tokenized (ADR 0007). Detection is automatic; to override it:
+
+- `--encoding <auto|ansi|LABEL>` on `index` and `index-file` (also `MEMORY_GRAPH_ENCODING`; the flag wins). `ansi` is the Windows system code page (windows-1252 elsewhere), resolved on the client. `replacement` and unknown labels are refused.
+- A `.memory-graph.toml` at the root of the directory given to `index`:
+
+  ```toml
+  [encoding]
+  "legacy/**/*.pas" = "windows-1252"
+  "docs/jp/**" = "shift_jis"
+  ```
+
+  Globs match the path relative to the root, with `/` separators; `*` does not cross `/`, `**` does. They are case-sensitive on every OS. A glob starting with `./` or `/` is refused (write it relative to the root). The first matching glob decides, and a glob set to `auto` also stops the search (that file is auto-detected). `index-file` does not read this file; use `--encoding`. An invalid file is an error naming it and the key, before anything is written.
+- Precedence per file: BOM > `--encoding` (other than `auto`) > the first matching glob > auto. Hints are resolved on the client and sent with each file, so `--server` decodes the same way. A changed hint re-indexes the affected files without `--reindex`.
+
+`--strict-encoding` refuses a file whose decode is lossy (bytes invalid in its encoding) instead of storing it with U+FFFD replacements. Such a file is skipped with the reason `invalid in its encoding (--strict-encoding)`. Earlier releases called this bucket `not valid UTF-8`. As with other skips, a file indexed earlier keeps its stored content, and `--prune` removes it.
+
 ## Sizing: threads, memory, disk
 
 `index` streams the directory through three concurrent stages, *walk → parse → commit*, and sizes itself from the machine. Nothing needs tuning on a normal box; these are the knobs.

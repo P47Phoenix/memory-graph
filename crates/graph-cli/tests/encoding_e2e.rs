@@ -362,6 +362,25 @@ fn config_errors_name_the_file_and_key_and_write_nothing() {
             assert!(t.contains(want), "{body}: {t}");
         }
         assert!(!db.exists(), "{body}: a database was written");
+        // With --server the config is checked before connecting.
+        let o = run_env(
+            &[
+                "--server",
+                "127.0.0.1:1",
+                "index",
+                "--org",
+                "o",
+                "--repo",
+                "r",
+                src.to_str().unwrap(),
+            ],
+            &[],
+        );
+        assert!(
+            text(&o).contains(".memory-graph.toml"),
+            "{body}: {}",
+            text(&o)
+        );
     }
 }
 
