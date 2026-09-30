@@ -532,13 +532,18 @@ pub(crate) fn describe_in(
     Ok(infos.into_values().collect())
 }
 
-/// The extractor version inside a fingerprint
-/// (`sha256:<hash>|<lang>|<version>|<format>`), if it has that shape.
-pub(crate) fn fingerprint_extractor_version(fp: &str) -> Option<&str> {
-    let (_, rest) = fp.split_once('|')?;
+/// The extractor version inside a fingerprint of a file stored as `lang`
+/// (`sha256:<hex>|<lang>|<version>|<format>`, see [`fingerprint`]), if it
+/// has that shape. Anchored on the known language and format version, so
+/// a `|` inside the language or the version cannot shift the fields.
+pub(crate) fn fingerprint_extractor_version<'a>(fp: &'a str, lang: &str) -> Option<&'a str> {
+    let rest = fp.strip_prefix("sha256:")?;
+    // The hash is hex: its end is the first `|`.
     let (_, rest) = rest.split_once('|')?;
-    let (version, _) = rest.rsplit_once('|')?;
-    Some(version)
+    let rest = rest.strip_prefix(lang.to_ascii_lowercase().as_str())?;
+    let rest = rest.strip_prefix('|')?;
+    let suffix = format!("|{FINGERPRINT_FORMAT_VERSION}");
+    rest.strip_suffix(suffix.as_str())
 }
 
 /// [`crate::Store::extractor_gaps`] inside the caller's read transaction.
@@ -595,7 +600,12 @@ pub(crate) fn extractor_gaps_in(
             if found.contains_key(l.as_str()) {
                 continue;
             }
-            if let Some(v) = fingerprint_extractor_version(fp) {
+            // Not redundant with the `!registry.has` filter above: that one
+            // picks candidate languages from the catalog; this skips files
+            // of the language indexed tokens-only (the fallback's version,
+            // which is what `registry.version` returns without an
+            // extractor), e.g. next to pre-extracted symbols.
+            if let Some(v) = fingerprint_extractor_version(fp, lang) {
                 if v != registry.version(l) {
                     found.insert(l.as_str(), v.to_string());
                 }
@@ -629,15 +639,27 @@ mod tests {
         let r = Registry::default();
         let fp = fingerprint(&r, b"x", "Toy");
         assert_eq!(
-            fingerprint_extractor_version(&fp),
+            fingerprint_extractor_version(&fp, "toy"),
             Some(r.version("toy").as_str())
         );
+        // A `|` in the language or the version does not shift the fields.
+        let fp = fingerprint(&r, b"x", "a|b");
         assert_eq!(
-            fingerprint_extractor_version("sha256:ab|toy|v|1|x"),
-            Some("v|1")
+            fingerprint_extractor_version(&fp, "a|b"),
+            Some(r.version("a|b").as_str())
         );
-        assert_eq!(fingerprint_extractor_version("nope"), None);
-        assert_eq!(fingerprint_extractor_version("a|b"), None);
+        let f = FINGERPRINT_FORMAT_VERSION;
+        assert_eq!(
+            fingerprint_extractor_version(&format!("sha256:ab|a|b|v|2|{f}"), "a|b"),
+            Some("v|2")
+        );
+        // Wrong language, wrong format version, or not a fingerprint.
+        assert_eq!(fingerprint_extractor_version(&fp, "c"), None);
+        assert_eq!(
+            fingerprint_extractor_version("sha256:ab|toy|v|999", "toy"),
+            None
+        );
+        assert_eq!(fingerprint_extractor_version("nope", "toy"), None);
     }
 
     fn sp(s: u32, e: u32) -> Span {

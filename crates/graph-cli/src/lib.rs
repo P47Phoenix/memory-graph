@@ -191,9 +191,13 @@ pub fn warn_extractor_gaps(store: &dyn Store, org: &str, repo: &str) {
     }
 }
 
-/// The file is this many times its live data or more after `--reindex`
-/// before the `vacuum --compact` hint is shown (#90).
-pub const COMPACT_HINT_RATIO: f64 = 1.5;
+/// The file is this many times its live data or more after a `--reindex`
+/// that replaced files before the `vacuum --compact` hint is shown (#90).
+/// Not 1.0: a fresh or just-compacted file already measures about 1.65x
+/// (redb's doubling growth, page rounding), and compact cannot go below
+/// that. 2.5 is 1.5x that baseline; a full `--reindex` measures about 3.2x
+/// on the vendored corpus (size_gate pins both sides).
+pub const COMPACT_HINT_RATIO: f64 = 2.5;
 
 /// The `--reindex` hint (#90), if `u` warrants one. A full re-index writes
 /// every file's replacement before the old pages can be reused, and redb
@@ -255,6 +259,8 @@ fn read_cap(max_file_size: Option<u64>) -> u64 {
 struct Tally {
     files: usize,
     unchanged: usize,
+    /// Files that replaced a stored copy (#90: only these leave old pages).
+    replaced: usize,
     symbols: usize,
     tokens: usize,
     by_lang: std::collections::BTreeMap<String, usize>,
@@ -305,6 +311,7 @@ fn flush_batch(
             Ok(st) => {
                 t.files += 1;
                 t.unchanged += usize::from(st.unchanged);
+                t.replaced += usize::from(st.replaced);
                 if st.unchanged {
                     unchanged_bytes += len;
                 }
@@ -1152,6 +1159,7 @@ pub fn index_dir_with(
     let Tally {
         files,
         unchanged,
+        replaced,
         symbols,
         tokens,
         by_lang,
@@ -1246,7 +1254,8 @@ pub fn index_dir_with(
             out!(out, "  failed: {p}: {r}");
         }
     }
-    if o.reindex {
+    // Only a run that replaced stored files leaves the old pages behind.
+    if o.reindex && replaced > 0 {
         compact_hint(&*store);
     }
     if !failed.is_empty() {
@@ -1264,14 +1273,16 @@ mod hygiene_tests {
     use graph_store::SpaceUsage;
 
     #[test]
-    fn compact_hint_fires_at_one_and_a_half_times_live() {
+    fn compact_hint_fires_at_two_and_a_half_times_live() {
         let u = |file_bytes, live_bytes| SpaceUsage {
             file_bytes,
             live_bytes,
         };
-        assert_eq!(compact_hint_text(u(149, 100)), None);
-        let h = compact_hint_text(u(150, 100)).unwrap();
-        assert!(h.contains("vacuum --compact") && h.contains("1.5x"), "{h}");
+        // A fresh or compacted file's ~1.65x never hints.
+        assert_eq!(compact_hint_text(u(165, 100)), None);
+        assert_eq!(compact_hint_text(u(249, 100)), None);
+        let h = compact_hint_text(u(250, 100)).unwrap();
+        assert!(h.contains("vacuum --compact") && h.contains("2.5x"), "{h}");
         assert!(compact_hint_text(u(64 << 20, 16 << 20))
             .unwrap()
             .contains("64M"));

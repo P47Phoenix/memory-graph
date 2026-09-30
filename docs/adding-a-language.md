@@ -181,7 +181,9 @@ re-indexes files that a full build indexed with symbols. Use the same feature
 set for every binary that writes to a database. `index` and `index-file` warn
 before indexing (and `serve` logs a warning at startup) when the repo holds
 symbols from an extractor the running binary lacks, naming the language and
-the stored extractor version (`Store::extractor_gaps`).
+the stored extractor version (`Store::extractor_gaps`). Only languages with
+symbols stored are checked: files of a language whose extractor found no
+symbols, or whose symbols were ingested pre-extracted, raise no warning.
 
 ## Test checklist
 

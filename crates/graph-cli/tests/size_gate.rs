@@ -171,8 +171,10 @@ fn reindex_hints_at_compact_and_compact_restores_the_size() {
         assert!(ok, "{out}{err}");
         err
     };
-    let err = index(&[]);
-    assert!(!err.contains("vacuum --compact"), "fresh index: {err}");
+    // `--reindex` into an empty database replaces nothing: no hint, though
+    // the file measures ~1.65x its live data (compact cannot beat that).
+    let err = index(&["--reindex"]);
+    assert!(!err.contains("vacuum --compact"), "fresh --reindex: {err}");
     let fresh = std::fs::metadata(db).unwrap().len();
     let err = index(&[]);
     assert!(!err.contains("vacuum --compact"), "unchanged rerun: {err}");
@@ -190,6 +192,29 @@ fn reindex_hints_at_compact_and_compact_restores_the_size() {
     assert!(
         compacted as f64 <= 1.2 * fresh as f64,
         "vacuum --compact left {compacted} B, fresh index was {fresh} B (limit 1.2x)"
+    );
+    // A `--reindex` that replaces nothing (an empty tree) gives no hint on
+    // the compacted file; a real one does again.
+    let empty = d.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let (ok, out, err) = run(&[
+        "--db",
+        db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--no-progress",
+        "--reindex",
+        empty.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(!err.contains("vacuum --compact"), "no-op --reindex: {err}");
+    let err = index(&["--reindex"]);
+    assert!(
+        err.contains("vacuum --compact"),
+        "reindex after compact: {err}"
     );
 }
 

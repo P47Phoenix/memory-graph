@@ -474,8 +474,9 @@ pub trait Store: StoreRead + Send + Sync {
     /// The database file's size and the bytes of it in live pages (#90),
     /// for the "run `vacuum --compact`" hint after `--reindex`. `None` when
     /// the backend has no local file (the default, e.g. a remote store).
-    /// May commit empty write transactions so pages freed by earlier
-    /// commits are counted as free; never changes what any read returns.
+    /// May commit empty write transactions (so pages freed by earlier
+    /// commits are counted as free); do not call it on a read-only or
+    /// replicated path. Never changes what any read returns.
     fn space_usage(&self) -> Result<Option<SpaceUsage>> {
         Ok(None)
     }
