@@ -37,7 +37,8 @@ fn type_ok(t: &str, v: &Value) -> Result<bool, String> {
         "null" => v.is_null(),
         "number" => v.is_number(),
         // An integral float (5.0) is an integer, as JSON Schema says.
-        "integer" => v.is_i64() || v.is_u64() || v.as_f64().is_some_and(|f| f.fract() == 0.0),
+        // (Every JSON integer is also a finite f64 with no fraction.)
+        "integer" => v.as_f64().is_some_and(|f| f.fract() == 0.0),
         other => return Err(format!("schema uses unsupported type `{other}`")),
     })
 }

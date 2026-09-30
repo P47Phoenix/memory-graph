@@ -12,11 +12,17 @@
 //!   old leader restarted from its data directory (no flags) catches up and
 //!   answers the same;
 //! * on unix, the new leader stopped with SIGTERM: it exits cleanly and the
-//!   last two nodes elect a leader again.
+//!   last two nodes elect a leader again;
+//! * MCP (`serve --mcp-listen`) on a follower answers with the replicated
+//!   data and keeps answering, `stale_possible: true`, after the leader is
+//!   killed (ADR 0005 test plan item 5, epic story 34).
 //!
 //! Every wait polls a condition with a hard deadline and says what it was
 //! waiting for; nothing sleeps and hopes.
+use graph_server::testing::mcp_http::{http, McpHttpClient};
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -128,6 +134,10 @@ struct Node {
     dir: PathBuf,
     child: Option<Child>,
     addr: String,
+    /// The MCP endpoint, when started with `--mcp-listen`.
+    mcp: Option<SocketAddr>,
+    /// The metrics endpoint, when started with `--metrics-listen`.
+    metrics: Option<SocketAddr>,
 }
 
 impl Node {
@@ -155,12 +165,24 @@ impl Node {
                 let _ = tx.send(l);
             }
         });
-        let line = match rx.recv_timeout(WAIT) {
-            Ok(l) => l,
-            Err(e) => {
-                let st = child.try_wait();
-                let _ = child.kill();
-                panic!("node {id} printed no listening line ({e}); exit: {st:?}");
+        // `metrics on ...` and `mcp on ...` (when enabled) come before the
+        // listening line, which is the start signal.
+        let (mut mcp, mut metrics) = (None, None);
+        let line = loop {
+            let l = match rx.recv_timeout(WAIT) {
+                Ok(l) => l,
+                Err(e) => {
+                    let st = child.try_wait();
+                    let _ = child.kill();
+                    panic!("node {id} printed no listening line ({e}); exit: {st:?}");
+                }
+            };
+            if let Some((_, rest)) = l.split_once("mcp on http://") {
+                mcp = Some(rest.trim_end_matches("/mcp").parse().unwrap());
+            } else if let Some((_, rest)) = l.split_once("metrics on http://") {
+                metrics = Some(rest.trim_end_matches("/metrics").parse().unwrap());
+            } else {
+                break l;
             }
         };
         let addr = line
@@ -174,7 +196,16 @@ impl Node {
             dir: dir.to_path_buf(),
             child: Some(child),
             addr,
+            mcp,
+            metrics,
         }
+    }
+
+    /// Kill the process outright (no shutdown, no flush): a crash.
+    fn kill(&mut self) {
+        let mut c = self.child.take().expect("running");
+        c.kill().unwrap();
+        c.wait().unwrap();
     }
 
     /// Restart from the data directory with no init flag (a plain
@@ -1299,4 +1330,150 @@ fn measure_replication_at_scale() {
     }
     drop(local);
     drop((n1, n2, n3));
+}
+
+/// One MCP `tools/call`; its `structuredContent`, which must not be an
+/// error.
+fn mcp_tool(c: &mut McpHttpClient, name: &str, args: Value) -> Value {
+    let r = c.request("tools/call", json!({"name": name, "arguments": args}));
+    assert_eq!(r["result"]["isError"], false, "{name}: {r}");
+    r["result"]["structuredContent"].clone()
+}
+
+/// ADR 0005 test plan item 5, epic story 34: MCP on a follower of a real
+/// three-process cluster returns the replicated data (equal to the CLI's
+/// `--json` on an embedded copy), and its `LOCAL` reads keep working after
+/// the leader is killed, saying `stale_possible: true` while no leader
+/// vouches for the replica; with the node left alone, every read still
+/// answers and says so. The follower's metrics count the calls per tool.
+#[test]
+fn mcp_on_a_follower_survives_a_leader_kill() {
+    let d = tempfile::tempdir().unwrap();
+    let repo = corpus().join("anyhow");
+    let repo_s = repo.to_str().unwrap();
+    let index = |target: &[&str]| {
+        let mut a = target.to_vec();
+        a.extend([
+            "index",
+            "--org",
+            "corpus",
+            "--repo",
+            "anyhow",
+            "--no-progress",
+            repo_s,
+        ]);
+        ok(&a);
+    };
+    let local = d.path().join("local.redb");
+    let local_s = local.to_str().unwrap();
+    index(&["--db", local_s]);
+    let cli: Value = serde_json::from_str(&ok(&[
+        "--db", local_s, "search", "Error", "--grain", "token", "--limit", "500", "--json",
+    ]))
+    .unwrap();
+    let expected = cli["results"].clone();
+    assert!(expected.as_array().unwrap().len() > 20, "{expected}");
+
+    let dir = |i: u64| d.path().join(format!("n{i}"));
+    let mut n1 = Node::start(1, &dir(1), "127.0.0.1:0", &["--bootstrap"]);
+    wait_for("node 1 to elect itself", || {
+        (n1.leader() == Some(1)).then_some(())
+    });
+    let mut n2 = Node::start(
+        2,
+        &dir(2),
+        "127.0.0.1:0",
+        &["--join", &n1.addr, "--standby"],
+    );
+    let n3 = Node::start(
+        3,
+        &dir(3),
+        "127.0.0.1:0",
+        &[
+            "--join",
+            &n1.addr,
+            "--standby",
+            "--mcp-listen",
+            "127.0.0.1:0",
+            "--metrics-listen",
+            "127.0.0.1:0",
+        ],
+    );
+    for n in [&n2, &n3] {
+        let id = n.id.to_string();
+        ok(&["--server", &n1.addr, "cluster", "add-learner", &id, &n.addr]);
+        ok(&["--server", &n1.addr, "cluster", "promote", &id]);
+    }
+    index(&n1.server());
+    wait_applied(&n3, committed(&n1));
+    assert_eq!(n3.status().unwrap()["role"], "follower");
+
+    let mcp = n3.mcp.expect("node 3 printed its MCP address");
+    let mut c = McpHttpClient::new(mcp);
+    let args =
+        json!({"text": "Error", "grain": "token", "org": "corpus", "repo": "anyhow", "limit": 500});
+    let sc = mcp_tool(&mut c, "search", args.clone());
+    assert_eq!(sc["items"], expected, "the follower's MCP answer");
+    // The follower hears from its leader: its replica is vouched for.
+    let fresh = wait_for("a fresh read on the follower", || {
+        let sc = mcp_tool(&mut c, "search", args.clone());
+        (sc["stale_possible"] == false).then_some(sc)
+    });
+    assert_eq!(fresh["items"], expected);
+
+    // Kill the leader outright. Node 3's reads keep answering the same
+    // data. Between the old leader's lease running out and a new leader
+    // reaching node 3 they say `stale_possible: true`; that window can be
+    // missed if the election is quick, so either outcome ends this phase:
+    // a stale read, or a new leader already vouching (fresh again). The
+    // lone-node phase below proves `stale_possible` deterministically.
+    n1.kill();
+    wait_for(
+        "a stale read, or a new leader, after the leader kill",
+        || {
+            let sc = mcp_tool(&mut c, "search", args.clone());
+            assert_eq!(sc["items"], expected, "a read after the leader kill");
+            let new_leader = n3.leader().is_some_and(|l| l != 1);
+            (sc["stale_possible"] == true || new_leader).then_some(())
+        },
+    );
+
+    // Kill the other survivor too: node 3 alone has no leader and no
+    // quorum, yet LOCAL reads still answer, every one stale_possible.
+    let _ = wait_for("node 2 or 3 to lead", || n3.leader());
+    n2.kill();
+    wait_for("node 3 to notice it is alone", || {
+        let sc = mcp_tool(&mut c, "search", args.clone());
+        (sc["stale_possible"] == true).then_some(())
+    });
+    for _ in 0..3 {
+        let sc = mcp_tool(&mut c, "search", args.clone());
+        assert_eq!(sc["items"], expected);
+        assert_eq!(sc["stale_possible"], true, "{}", sc["stale_possible"]);
+    }
+    let d = mcp_tool(&mut c, "describe", json!({}));
+    assert_eq!(d["stale_possible"], true);
+    assert!(d["repos"].to_string().contains("anyhow"), "{d}");
+
+    // Per-tool counters on the follower's metrics.
+    let m = http(
+        n3.metrics.expect("node 3 printed its metrics address"),
+        "GET",
+        "/metrics",
+        &[],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(m.status, 200);
+    let calls = |tool: &str| -> u64 {
+        let key = format!("mg_mcp_tool_calls_total{{tool=\"{tool}\",outcome=\"ok\"}} ");
+        m.body
+            .lines()
+            .find_map(|l| l.strip_prefix(&key))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    assert!(calls("search") >= 6, "{}", m.body);
+    assert_eq!(calls("describe"), 1, "{}", m.body);
+    drop(n3);
 }
