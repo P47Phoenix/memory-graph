@@ -55,13 +55,13 @@
 | 37 | Restore from `s3://` and `latest`, `cluster snapshot --upload`, `cluster backups` | Medium | 3 | P2 | 36 |
 | 38 | S3 e2e CI job and backup docs | Medium | 3 | P3 | 37 |
 | 39 | Spike: native HTTPS for backups behind `backup-tls` (**Deferred**, shared with #104) | Low | 5 | P4 | 36, #104 |
-| 40 | Decode any source encoding in `graph_core::encoding` (**Proposed**, ADR 0007) | High | 5 | P2 | 6 |
-| 41 | Store integration: decoded spans, binary rejection, schema 11 restamp, fingerprint rule (**Proposed**) | High | 8 | P2 | 40 |
-| 42 | `--encoding`, `--strict-encoding` and `.memory-graph.toml` per-glob overrides (**Proposed**) | Medium | 3 | P2 | 41 |
-| 43 | Encodings on the wire, in `describe`/`--stats` and in MCP (**Proposed**) | Medium | 5 | P3 | 41, 20, 31 |
-| 44 | Encoding fixtures, cross-encoding search tests and docs (**Proposed**) | Medium | 3 | P3 | 42, 43 |
+| 40 | Decode any source encoding in `graph_core::encoding` (ADR 0007) | High | 5 | P2 | 6 |
+| 41 | Store integration: decoded spans, binary rejection, schema 11 restamp, fingerprint rule | High | 8 | P2 | 40 |
+| 42 | `--encoding`, `--strict-encoding` and `.memory-graph.toml` per-glob overrides | Medium | 3 | P2 | 41 |
+| 43 | Encodings on the wire, in `describe`/`--stats` and in MCP | Medium | 5 | P3 | 41, 20, 31 |
+| 44 | Encoding fixtures, cross-encoding search tests and docs | Medium | 3 | P3 | 42, 43 |
 
-Total: 44 stories, 227 pts (average about 5.2); 219 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), **Proposed**: they start only once the owner accepts it.
+Total: 44 stories, 227 pts (average about 5.2); 219 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -487,7 +487,7 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E5 (Accepted).
 - Given a passing provider, When the `backup-tls` feature is enabled, Then `https://` endpoints must be accepted, and the default build must stay unchanged.
 
 **40. Decode any source encoding in `graph_core::encoding` (5 pts)**
-Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a developer indexing a legacy or Windows codebase
 I want each file decoded to UTF-8 whatever its encoding
 So that UTF-16 and code-page files are indexed instead of skipped.
@@ -501,7 +501,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C2-C5, C10.
 - Given `ansi`, When resolved, Then it must be the system code page on Windows (a mapped `GetACP`) and windows-1252 elsewhere; and `encoding_rs` and `chardetng` must be `=`-pinned and pass `check-no-c-deps.py`, with `DECODER_VERSION` exported for the fingerprint and the cluster hash.
 
 **41. Store integration: decoded spans, binary rejection, schema 11 restamp, fingerprint rule (8 pts)**
-Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a user of any store (embedded, `--server`, a Raft cluster)
 I want every writer to decode and store files the same way
 So that encoded files are searchable and all replicas agree.
@@ -513,10 +513,11 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C1, C2, C5-C8, C10.
 - Given a v10 or v9 database, When opened, Then it must be restamped straight to v11 and read identically, and re-indexing it must re-parse 0 files; given a newer version, Then it must be refused without writing; and a v10 node and a v11 node must refuse to share a cluster (`extractors_hash`, which now includes `DECODER_VERSION`).
 - Given a non-UTF-8 file re-indexed with a different `--encoding` that changes the decode, When indexed, Then only that file must be re-indexed (its fingerprint suffix `enc=<name>[+lossy]@<DECODER_VERSION>` changed); a UTF-8 file's fingerprint must be unchanged.
 - Given a binary file sent through `index-file`, `--server` or a raw `Index` RPC, When indexed, Then it must be rejected as binary.
-- Given encoded inputs, When `run_all`, `run_differential` and `run_crash_rerun_differential` run, Then embedded, remote and Raft stores must answer identically; golden-byte tests must pin UTF-8 (unchanged), UTF-16LE and lossy File nodes.
+- Given encoded inputs, When `run_all`, `run_differential` and `run_crash_rerun_differential` run, Then embedded, remote and Raft stores must answer identically; golden-byte tests must pin UTF-8 (unchanged), UTF-16LE and lossy File nodes, and an unknown stored encoding name must be a `StoreError::Corrupt`, not a panic.
+- Given an encoded file, When `export_ndjson_round_trips_node_counts` runs, Then it must round-trip, with `encoding` and `lossy` in the NDJSON only for non-UTF-8 files; vacuum and snapshot export must need no change.
 
 **42. `--encoding`, `--strict-encoding` and `.memory-graph.toml` per-glob overrides (3 pts)**
-Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a developer whose tree mixes encodings
 I want to override detection per run or per glob
 So that a mis-detected code page can be fixed.
@@ -527,7 +528,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C3, C4, C8.
 - Given a directory run, When it finishes, Then the tallies must no longer skip UTF-16 files as binary and must count transcoded and lossy files.
 
 **43. Encodings on the wire, in `describe`/`--stats` and in MCP (5 pts)**
-Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As an agent or operator reading the graph
 I want to see which files were transcoded or decoded lossily
 So that I can trust, or fix, what a search returns.
@@ -538,7 +539,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C8.
 - Given the MCP `describe` and `list_files` tools, When called, Then they must include the encoding where it is not UTF-8.
 
 **44. Encoding fixtures, cross-encoding search tests and docs (3 pts)**
-Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a maintainer
 I want every supported encoding covered end to end and documented
 So that the feature does not regress and users know how to use it.

@@ -1,6 +1,6 @@
 # ADR 0007: Indexing files in any source encoding
 
-**Status:** Proposed (2026-09-30). The owner's decisions of 2026-09-30 are recorded below, including the answers to the two questions this ADR first left open. The owner accepts this ADR before any code lands. Builds on [ADR 0003](0003-data-model.md) (the v2 store and its on-disk versioning), [ADR 0004](0004-client-server-and-replication.md) (the wire contract, Raft apply and the extractor-set hash) and [ADR 0005](0005-mcp.md) (MCP). Epic amendment: stories 40-44 in the [epic](../epic-code-memory-graph.md).
+**Status:** Accepted (2026-09-30, by the owner), keeping File-record storage (C6). The owner's decisions of 2026-09-30 are recorded below, including the answers to the two questions this ADR first left open. Builds on [ADR 0003](0003-data-model.md) (the v2 store and its on-disk versioning), [ADR 0004](0004-client-server-and-replication.md) (the wire contract, Raft apply and the extractor-set hash) and [ADR 0005](0005-mcp.md) (MCP). Epic amendment: stories 40-44 in the [epic](../epic-code-memory-graph.md).
 
 ## In plain words
 
@@ -124,7 +124,8 @@ Where the encoding is stored, and why:
 
 - The catalog (behind `describe`) gains per-repo, per-encoding file counts for non-UTF-8 files (UTF-8 is the remainder) and a lossy count. An absent entry means zero, so a v10 catalog is already correct for its all-UTF-8 content.
 - `V2_SCHEMA_VERSION` becomes 11. The restamp set becomes **{9, 10}**: opening either restamps it straight to 11 in one small commit (neither has the new fields or catalog entries, and absence means UTF-8), as #137 did for 9 → 10. Anything older or newer is refused as today, without writing.
-- Golden-byte tests pin a UTF-8 File node (unchanged) and a UTF-16LE and a lossy windows-1252 File node; an unknown encoding name is refused on read.
+- Golden-byte tests pin a UTF-8 File node (unchanged) and a UTF-16LE and a lossy windows-1252 File node. An unknown encoding name in a stored File node is refused on read as `StoreError::Corrupt` (a corrupt record, never a panic), checked where the node is deserialized (`common.rs`, the `serde_json::from_slice` node decode, through a validating deserializer for the field).
+- Vacuum, snapshot export and NDJSON export need no change: they copy File nodes as they are. NDJSON shows `encoding` and `lossy` only for non-UTF-8 files, because the fields are omitted when default.
 - `size_gate` must not move: the UTF-8 corpus is byte-identical.
 
 ### C7. The fingerprint
@@ -226,4 +227,4 @@ Acceptance criteria are in the [epic](../epic-code-memory-graph.md).
 
 ## Open questions
 
-None blocking. The owner answered both on 2026-09-30 (above). Acceptance (Proposed → Accepted) is the owner's.
+None. The owner answered both on 2026-09-30 (above) and accepted this ADR the same day.
