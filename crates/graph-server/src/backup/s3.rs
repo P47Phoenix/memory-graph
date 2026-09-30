@@ -340,6 +340,14 @@ pub fn xml_texts(xml: &[u8]) -> Result<Vec<(String, String)>, String> {
 }
 
 /// S3's `<Error><Code>..</Code><Message>..</Message></Error>`, if any.
+fn s3_error_code(body: &[u8]) -> Option<String> {
+    xml_texts(body)
+        .ok()?
+        .into_iter()
+        .find(|(k, _)| k == "Error/Code")
+        .map(|(_, v)| v)
+}
+
 fn s3_error_text(body: &[u8]) -> Option<String> {
     let t = xml_texts(body).ok()?;
     let get = |p: &str| t.iter().find(|(k, _)| k == p).map(|(_, v)| v.clone());
@@ -350,10 +358,35 @@ fn s3_error_text(body: &[u8]) -> Option<String> {
     })
 }
 
-/// The `io::ErrorKind` of an S3 error status: 404 `NotFound`, 403
-/// `PermissionDenied`, another 4xx that retrying cannot fix
-/// `InvalidInput` (the uploader does not retry those two), and anything
-/// else (5xx, 408, 409, 429) `Other`.
+/// S3 error codes that are transient although sent with a 4xx status.
+pub const RETRYABLE_CODES: [&str; 6] = [
+    "RequestTimeout",
+    "BadDigest",
+    "XAmzContentSHA256Mismatch",
+    "IncompleteBody",
+    "SlowDown",
+    "InternalError",
+];
+
+/// The `io::ErrorKind` of an S3 error (status and `<Code>`, if any): 404
+/// `NotFound`; a code in [`RETRYABLE_CODES`] `Other`; 403
+/// `PermissionDenied` (including `RequestTimeTooSkewed` and
+/// `AccessDenied`); another 4xx that retrying cannot fix (405, 411, 413,
+/// `InvalidArgument`, `InvalidRequest`, ...) `InvalidInput`; and anything
+/// else (5xx, 408, 409, 429) `Other`. The uploader does not retry
+/// `PermissionDenied` or `InvalidInput`: the failure is counted at once
+/// and the next snapshot tries again.
+pub fn error_kind(status: u16, code: Option<&str>) -> std::io::ErrorKind {
+    if status == 404 {
+        return std::io::ErrorKind::NotFound;
+    }
+    if code.is_some_and(|c| RETRYABLE_CODES.contains(&c)) {
+        return std::io::ErrorKind::Other;
+    }
+    status_kind(status)
+}
+
+/// [`error_kind`] from the status alone (a HEAD has no body).
 pub fn status_kind(status: u16) -> std::io::ErrorKind {
     match status {
         404 => std::io::ErrorKind::NotFound,
@@ -575,10 +608,15 @@ impl S3Sink {
                     *slot = Some(sender);
                     return Ok(resp);
                 }
-                // A reused connection that the server had closed.
+                // A reused connection that the server had closed: retry on a
+                // fresh one if the request never went out, or if it may
+                // safely be repeated (everything but the POSTs, which
+                // create or complete a multipart upload).
                 Err(e)
                     if !fresh
-                        && (e.is_closed() || e.is_canceled() || e.is_incomplete_message()) =>
+                        && (e.is_closed()
+                            || e.is_canceled()
+                            || (e.is_incomplete_message() && method != "POST")) =>
                 {
                     continue
                 }
@@ -676,7 +714,8 @@ impl S3Sink {
 
     /// The response, or its S3 error as an `io::Error` (404 `NotFound`,
     /// 403 `PermissionDenied`, the code and message verbatim, e.g.
-    /// `RequestTimeTooSkewed`).
+    /// `RequestTimeTooSkewed`, which is a 403 and so is not retried; the
+    /// next snapshot tries again; see [`error_kind`]).
     async fn check(&self, resp: Resp, what: &str) -> std::io::Result<Resp> {
         let status = resp.status();
         if status.is_success() {
@@ -690,7 +729,7 @@ impl S3Sink {
                 .to_string()
         });
         Err(std::io::Error::new(
-            status_kind(status.as_u16()),
+            error_kind(status.as_u16(), s3_error_code(&body).as_deref()),
             format!("S3 {what}: HTTP {} {detail}", status.as_u16()),
         ))
     }
@@ -1138,6 +1177,30 @@ mod tests {
         };
         let e = S3Sink::new("s3://bkt/p", opts).unwrap_err();
         assert!(e.contains("--backup-endpoint") && e.contains("#104"), "{e}");
+    }
+
+    #[test]
+    fn error_kinds_by_code() {
+        use std::io::ErrorKind::*;
+        for code in RETRYABLE_CODES {
+            assert_eq!(error_kind(400, Some(code)), Other, "{code}");
+        }
+        assert_eq!(
+            error_kind(403, Some("RequestTimeTooSkewed")),
+            PermissionDenied
+        );
+        assert_eq!(error_kind(403, Some("AccessDenied")), PermissionDenied);
+        for (st, code) in [
+            (400, "InvalidArgument"),
+            (400, "InvalidRequest"),
+            (405, "MethodNotAllowed"),
+            (411, "MissingContentLength"),
+            (413, "EntityTooLarge"),
+        ] {
+            assert_eq!(error_kind(st, Some(code)), InvalidInput, "{code}");
+        }
+        assert_eq!(error_kind(404, Some("NoSuchKey")), NotFound);
+        assert_eq!(error_kind(503, None), Other);
     }
 
     #[test]

@@ -796,3 +796,32 @@ fn a_403_is_not_retried() {
     assert_eq!(st.failures_total, 1, "{st:?}");
     assert_eq!(f.requests().len(), 1, "{:?}", f.requests());
 }
+
+/// A transient 400 (`RequestTimeout`) is retried and the backup commits;
+/// a store without ListMultipartUploads (501) does not fail retention.
+#[test]
+fn a_transient_400_is_retried_and_a_501_sweep_is_harmless() {
+    let _w = watchdog("s3 transient 400", TEST_LIMIT);
+    let f = FakeS3::start();
+    f.set_faults(Faults {
+        request_timeouts: 1,
+        no_upload_listing: true,
+        ..Default::default()
+    });
+    let tb = ClusterTestbed::with_backup(1, exts(), s3_cfg(&f, 1, f.options()));
+    let a = write_and_snapshot(&tb, 1, 0);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let b = write_and_snapshot(&tb, 1, 1);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let st = tb.client(1).admin_status().unwrap().backup.unwrap();
+    assert_eq!((st.failures_total, st.last_index), (0, b), "{st:?}");
+    let cluster = tb.client(1).admin_status().unwrap().cluster_id;
+    // Retention still ran (keep 1) despite the 501 sweep.
+    let left = metas(&f, &cluster);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(!left[0].ends_with(&format!("-{a}.meta")));
+    assert!(f
+        .requests()
+        .iter()
+        .any(|r| r.contains("uploads=") && r.starts_with("GET ")));
+}

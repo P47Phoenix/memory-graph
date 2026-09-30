@@ -45,6 +45,11 @@ pub struct Faults {
     pub delay: Option<Duration>,
     /// Answer 500 to a PUT of any key ending with this.
     pub fail_puts_ending: Option<String>,
+    /// Answer the next N object PUTs with 400 `RequestTimeout` (then
+    /// succeed).
+    pub request_timeouts: u32,
+    /// Answer ListMultipartUploads with 501 `NotImplemented`.
+    pub no_upload_listing: bool,
 }
 
 struct Obj {
@@ -508,6 +513,11 @@ async fn handle(st: &State, req: hyper::Request<Incoming>) -> Result<Resp, std::
             &q("prefix").unwrap_or_default(),
             q("continuation-token"),
         ),
+        ("GET", true) if q("uploads").is_some() && faults.no_upload_listing => error(
+            501,
+            "NotImplemented",
+            "ListMultipartUploads is not implemented",
+        ),
         ("GET", true) if q("uploads").is_some() => {
             list_uploads(st, &bucket, &q("prefix").unwrap_or_default())
         }
@@ -547,6 +557,17 @@ async fn handle(st: &State, req: hyper::Request<Incoming>) -> Result<Resp, std::
                         "InternalError",
                         "We encountered an internal error.",
                     ));
+                }
+                {
+                    let mut f = lock(&st.faults);
+                    if f.request_timeouts > 0 {
+                        f.request_timeouts -= 1;
+                        return Ok(error(
+                            400,
+                            "RequestTimeout",
+                            "Your socket connection to the server was not read from or written to within the timeout period.",
+                        ));
+                    }
                 }
                 let etag = etag_of(&data);
                 lock(&st.objects).insert(

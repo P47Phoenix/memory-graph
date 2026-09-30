@@ -57,6 +57,8 @@ struct Inner {
     queue: Mutex<Queue>,
     cv: Condvar,
     stats: Mutex<BackupStats>,
+    /// The failing sweep of unfinished uploads was logged at warn once.
+    sweep_warned: std::sync::atomic::AtomicBool,
 }
 
 /// The uploader of one server; cheap to clone.
@@ -81,6 +83,7 @@ impl Backup {
             queue: Mutex::new(Queue::default()),
             cv: Condvar::new(),
             stats: Mutex::new(BackupStats::default()),
+            sweep_warned: Default::default(),
         });
         let worker = Arc::clone(&inner);
         std::thread::Builder::new()
@@ -402,7 +405,18 @@ impl Inner {
         let cutoff = SystemTime::now()
             .checked_sub(self.cfg.orphan_age)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        self.sink.sweep_incomplete(&prefix, cutoff)?;
+        // Not every S3-compatible store lists multipart uploads (some
+        // answer 501): logged, never a failure of the retention pass.
+        if let Err(e) = self.sink.sweep_incomplete(&prefix, cutoff) {
+            if !self
+                .sweep_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(error = %e, "backup: sweeping unfinished uploads failed (warned once)");
+            } else {
+                tracing::debug!(error = %e, "backup: sweeping unfinished uploads failed");
+            }
+        }
         Ok(())
     }
 }
