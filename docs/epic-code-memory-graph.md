@@ -377,6 +377,7 @@ So that the `symbol`, `method` and `class` grains and symbol search work across 
 - Given a suitable MIT or Apache-2.0 public repo, When the corpus test runs, Then a pinned slice must be indexed with spot-checked symbols; languages without one must have a hand-written fixture.
 
 **31. `graph-mcp` core and `memory-graph mcp` over stdio, read-only (5 pts)**
+Status: Delivered in PR #160.
 As an AI-agent integrator
 I want my assistant to start `memory-graph mcp` and call read-only tools over stdio
 So that it can search the graph, find symbols, describe repos and outline files with no network setup.
@@ -389,6 +390,7 @@ Design: [ADR 0005](adr/0005-mcp.md) D1, D2, D3, D5 (Accepted).
 - Given `docs/mcp.md`, When followed, Then it must give working client configuration for stdio.
 
 **32. Streamable HTTP MCP endpoint in `serve` with security guards (5 pts)**
+Status: Delivered in PR #166.
 As a database operator
 I want an opt-in MCP endpoint inside `serve`
 So that assistants can query a running cluster without starting a local process, safely without authentication.
@@ -412,6 +414,7 @@ Design: [ADR 0005](adr/0005-mcp.md) D2 (Accepted).
 - Given `prune` with no `dry_run` argument, When called, Then it must run as a dry run.
 
 **34. MCP real-client e2e and hardening (3 pts)**
+Status: Delivered in PR #168, with `rmcp` (dev-dependency only, no TLS; it passes the gate) as the real client. This completes v1 of ADR 0005 (stories 31, 32 and 34; 33 stays deferred) and closes #109.
 As a database operator
 I want MCP proven with a real client, against a cluster under failure, and under fuzzing
 So that the tool surface can be trusted.
