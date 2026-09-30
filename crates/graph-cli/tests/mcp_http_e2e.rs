@@ -212,16 +212,50 @@ fn a_non_loopback_mcp_listen_needs_allow_remote_and_warns() {
     }
 }
 
+/// Epic story 34: `serve --help`, `mcp --help` and docs/mcp.md all box the
+/// no-authentication warning, with the text of `NO_AUTH_WARNING`.
 #[test]
-fn serve_help_boxes_the_no_auth_warning() {
-    let o = cmd().args(["serve", "--help"]).output().unwrap();
-    let help = String::from_utf8_lossy(&o.stdout);
-    for part in [
-        "WARNING: The MCP endpoint has no authentication. Anyone who can",
-        "reach it can read every indexed source token. Keep it on loopback",
-        "or behind an authenticating proxy until #105.",
-        "+-----",
-    ] {
-        assert!(help.contains(part), "no {part:?} in serve --help:\n{help}");
+fn serve_and_mcp_help_and_the_docs_box_the_no_auth_warning() {
+    let docs =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mcp.md"))
+            .unwrap();
+    let mut texts = vec![("docs/mcp.md".to_string(), docs)];
+    for sub in ["serve", "mcp"] {
+        let o = cmd().args([sub, "--help"]).output().unwrap();
+        assert!(o.status.success());
+        texts.push((
+            format!("{sub} --help"),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        ));
+    }
+    for (what, text) in texts {
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        // The box: a border, the warning in `| ... |` rows, a border.
+        let top = lines
+            .iter()
+            .position(|l| l.starts_with("+---") && l.ends_with("-+"))
+            .unwrap_or_else(|| panic!("no box in {what}:\n{text}"));
+        let rows: Vec<&str> = lines[top + 1..]
+            .iter()
+            .take_while(|l| l.starts_with('|'))
+            .copied()
+            .collect();
+        assert_eq!(lines[top + 1 + rows.len()], lines[top], "{what}: closed");
+        for r in &rows {
+            assert!(
+                r.ends_with('|') && r.len() == lines[top].len(),
+                "{what}: {r:?}"
+            );
+        }
+        let inside = rows
+            .iter()
+            .map(|r| r.trim_matches('|').trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            inside,
+            format!("WARNING: {}", graph_server::mcp::NO_AUTH_WARNING),
+            "{what}"
+        );
     }
 }

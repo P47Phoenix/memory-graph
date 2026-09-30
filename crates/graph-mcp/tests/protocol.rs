@@ -380,6 +380,57 @@ fn tools_list_declares_both_schemas_for_all_seven() {
     }
 }
 
+/// `supported_version` and `McpServer::resumed` (the HTTP transport's
+/// per-request server): only the listed revisions, echoed exactly.
+#[test]
+fn resumed_sessions_accept_only_supported_versions() {
+    for v in SUPPORTED_PROTOCOL_VERSIONS {
+        assert_eq!(graph_mcp::supported_version(v), Some(v));
+        let s = McpServer::resumed(Fake(None), "t", "0", v).expect("supported");
+        assert_eq!(s.protocol_version(), Some(v));
+        assert!(s.client_initialized());
+    }
+    for v in ["", "xyzzy", "2024-11-05", "2025-11-25 ", "2026-07-28"] {
+        assert_eq!(graph_mcp::supported_version(v), None, "{v:?}");
+        assert!(
+            McpServer::resumed(Fake(None), "t", "0", v).is_none(),
+            "{v:?}"
+        );
+    }
+}
+
+/// Mutation survivors (epic story 34): the JSON-RPC error codes are the
+/// spec's, and a one-line `file_tokens` range (start == end) is valid
+/// while an inverted one is not.
+#[test]
+fn error_codes_and_line_range_edges() {
+    assert_eq!(
+        [
+            PARSE_ERROR,
+            INVALID_REQUEST,
+            METHOD_NOT_FOUND,
+            INVALID_PARAMS,
+            graph_mcp::INTERNAL_ERROR
+        ],
+        [-32700, -32600, -32601, -32602, -32603]
+    );
+    let mut s = server();
+    init(&mut s);
+    let call = |s: &mut McpServer<Fake>, a: i64, b: i64| {
+        send(
+            s,
+            &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "file_tokens",
+                "arguments": {"org": "o", "repo": "r", "path": "p", "start_line": a, "end_line": b}}})
+            .to_string(),
+        )
+        .unwrap()
+    };
+    assert_eq!(call(&mut s, 3, 3)["result"]["isError"], false);
+    let r = call(&mut s, 4, 3);
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r.to_string().contains("after end_line"), "{r}");
+}
+
 #[test]
 fn the_stdio_loop_writes_one_line_per_reply_and_nothing_else() {
     let mut s = server();
@@ -514,6 +565,50 @@ proptest! {
         let raw = serde_json::to_vec(&v).unwrap();
         let reply = s.handle_bytes(&raw);
         check_reply(Some(&v), reply);
+    }
+
+    /// The stdio framing (epic story 34): any stream of lines, JSON-RPC
+    /// messages mixed with random bytes, `\n` and `\r\n` endings, blank
+    /// lines and a last line without a newline, gets one JSON-RPC line per
+    /// reply and nothing else, never more replies than non-blank lines.
+    #[test]
+    fn arbitrary_stdio_streams_frame_one_reply_per_line(
+        lines in prop::collection::vec(
+            prop_oneof![
+                arb_json().prop_map(|v| serde_json::to_vec(&v).unwrap()),
+                Just(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#.to_vec()),
+                Just(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe"}}"#.to_vec()),
+                prop::collection::vec(any::<u8>().prop_filter("no newline", |b| *b != b'\n'), 0..64),
+                Just(Vec::new()),
+            ],
+            0..24,
+        ),
+        crlf in any::<bool>(),
+        trailing_newline in any::<bool>(),
+    ) {
+        let mut input = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            input.extend_from_slice(l);
+            if i + 1 < lines.len() || trailing_newline {
+                input.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+            }
+        }
+        let mut s = server();
+        let mut out = Vec::new();
+        serve_stdio(&mut s, &input[..], &mut out).unwrap();
+        let text = String::from_utf8(out).expect("stdout is UTF-8");
+        prop_assert!(text.is_empty() || text.ends_with('\n'));
+        let non_blank = input
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.trim_ascii().is_empty())
+            .count();
+        let replies: Vec<&str> = text.lines().collect();
+        prop_assert!(replies.len() <= non_blank, "{} replies to {} lines", replies.len(), non_blank);
+        for r in replies {
+            let v: Value = serde_json::from_str(r).expect("each line is JSON");
+            prop_assert_eq!(&v["jsonrpc"], &json!("2.0"));
+            prop_assert!(v.get("result").is_some() != v.get("error").is_some(), "{}", v);
+        }
     }
 
     #[test]

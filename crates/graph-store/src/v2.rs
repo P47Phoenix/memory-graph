@@ -368,6 +368,28 @@ pub struct V2Store {
     max_snapshot_age: Duration,
     snapshot_tracker: SharedSnapshotTracker,
     marked_commit_hook: Option<MarkedCommitHook>,
+    /// Orders [`Store::prepare`]'s unchanged pre-check (a read transaction,
+    /// shared) against every write commit of this store (exclusive, through
+    /// `commit_gated`), so no pre-check reader is live while a commit runs
+    /// (#158). This makes the bytes deterministic for an unshared ingest (the
+    /// CLI's `index`); readers the gate does not cover -- concurrent server
+    /// queries, snapshot handles -- can still change the layout. At
+    /// commit redb releases the pages earlier commits freed only up to the
+    /// oldest live reader's snapshot, so a pre-check on a parse thread that
+    /// began before one commit and was still live at the next (a thread
+    /// descheduled under load) delayed that reuse: page allocation, and so
+    /// the file bytes, followed thread timing, and the same `--deterministic`
+    /// input gave different files for different `--jobs` (every query still
+    /// answered the same).
+    pub(crate) commit_gate: std::sync::RwLock<()>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook (#158): run by `prepare`'s pre-check on the calling thread
+    /// while its read transaction is open, under the commit gate.
+    pub(crate) static PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A test hook the server's failpoints use (ADR 0004 stage B): called by
@@ -2225,7 +2247,7 @@ impl V2Store {
             .unwrap()
             .insert(name, id)
             .unwrap();
-        wt.commit().unwrap();
+        self.commit_gated(wt).unwrap();
     }
 
     /// Test hook: make `file`'s content id an *extra* reference on
@@ -2251,7 +2273,7 @@ impl V2Store {
                 .insert(cid, file)
                 .unwrap();
         }
-        wt.commit().unwrap();
+        self.commit_gated(wt).unwrap();
     }
 
     /// Open or create a database file. Refuses a file of any other layout
@@ -2397,6 +2419,7 @@ impl V2Store {
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
             snapshot_tracker: Arc::new(Mutex::new(SnapshotTracker::default())),
             marked_commit_hook: None,
+            commit_gate: std::sync::RwLock::new(()),
         })
     }
 
@@ -2428,7 +2451,7 @@ impl V2Store {
         }
         let wt = self.db.begin_write()?;
         wt.delete_table(RAFT_SM)?;
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok(())
     }
 
@@ -2463,7 +2486,7 @@ impl V2Store {
             // byte-for-byte unchanged (a commit would rewrite its header).
             wt.abort()?;
         } else {
-            wt.commit()?;
+            self.commit_gated(wt)?;
         }
         Ok(stats)
     }
@@ -2634,7 +2657,7 @@ impl V2Store {
         Self::stamp_marker(&wt, marker, membership)?;
         let removed = Self::prune_in(&wt, org, repo, keep, false)?;
         self.before_marked_commit(&marker)?;
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok(removed)
     }
 
@@ -2650,7 +2673,7 @@ impl V2Store {
         Self::stamp_marker(&wt, marker, membership)?;
         let (stats, _) = Self::vacuum_in(&wt)?;
         self.before_marked_commit(&marker)?;
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok(stats)
     }
 
@@ -2674,7 +2697,7 @@ impl V2Store {
         Self::stamp_marker(&wt, marker, membership)?;
         let stats = Self::ingest_validated(&wt, org, repo, path, language, ex, (origin, None))?;
         self.before_marked_commit(&marker)?;
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok(stats)
     }
 
@@ -2685,7 +2708,7 @@ impl V2Store {
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
         self.before_marked_commit(&marker)?;
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok(())
     }
 
@@ -2794,6 +2817,7 @@ impl V2Store {
             max_snapshot_age,
             snapshot_tracker: _,
             marked_commit_hook,
+            commit_gate: _,
         } = self;
         // Drop the old handle before renaming over its path (Windows will
         // not allow the rename while any `Database` still has it open).
@@ -2958,7 +2982,7 @@ impl V2Store {
                 check_unchanged(&wt, org, repo, &path, &lang, &fp, origin)?
             {
                 if dirty {
-                    wt.commit()?;
+                    self.commit_gated(wt)?;
                 }
                 return Ok(stats);
             }
@@ -2966,7 +2990,7 @@ impl V2Store {
         let ex = self.registry.extract(&lang, src);
         validate_spans(&ex)?;
         let stats = Self::ingest_validated(&wt, org, repo, &path, &lang, &ex, (origin, Some(&fp)))?;
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok(stats)
     }
 
@@ -2982,7 +3006,7 @@ impl V2Store {
         validate_spans(ex)?;
         let wt = self.db.begin_write()?;
         let stats = Self::ingest_validated(&wt, org, repo, path, language, ex, (origin, None))?;
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok(stats)
     }
 
@@ -3031,7 +3055,20 @@ impl V2Store {
         opts: IndexOptions,
     ) -> Result<PreparedFile> {
         let mut p = prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
-            stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
+            // Shared with other parse threads, exclusive with a commit (see
+            // `commit_gate`). The read transaction is a local of the inner
+            // block, so it ends there, before the guard: a `begin_read()`
+            // temporary in the closure's tail expression would outlive
+            // `gate` (edition 2021 drop order).
+            let gate = self.commit_gate.read().unwrap_or_else(|e| e.into_inner());
+            let matches = {
+                let rt = self.db.begin_read()?;
+                #[cfg(test)]
+                PRECHECK_HOOK.with(|h| h.borrow().as_ref().map(|h| h()));
+                stored_fingerprint_matches(&rt, org, repo, path, fp)
+            };
+            drop(gate);
+            matches
         })?;
         if let crate::api::Prepared::Extracted(ex) = &p.work {
             p.v2 = Some(Box::new(V2Prep::build(ex)));
@@ -3143,7 +3180,7 @@ impl V2Store {
             }
             in_txn += len;
             if in_txn >= chunk_bytes {
-                wt.commit()?;
+                self.commit_gated(wt)?;
                 commits += 1;
                 wt = self.db.begin_write()?;
                 // This chunk is not (yet) known to be the batch's last, so
@@ -3161,8 +3198,19 @@ impl V2Store {
         if let Some((m, _)) = &marker {
             self.before_marked_commit(m)?;
         }
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok((out, commits + 1))
+    }
+
+    /// Commit a write transaction while no `prepare` pre-check holds a read
+    /// transaction (see `commit_gate`), so which freed pages the commit may
+    /// reuse never depends on parse-thread timing (#158). Every commit of an
+    /// open store goes through here; only `from_db`/`rebuild_refs_in` (before
+    /// the store exists) and `export_snapshot`'s new file commit directly.
+    fn commit_gated(&self, wt: redb::WriteTransaction) -> Result<()> {
+        let _gate = self.commit_gate.write().unwrap_or_else(|e| e.into_inner());
+        wt.commit()?;
+        Ok(())
     }
 
     /// Allocate the next monotonic batch id from `meta.next_batch_id`,
@@ -3215,7 +3263,7 @@ impl V2Store {
         if dry_run {
             wt.abort()?;
         } else {
-            wt.commit()?;
+            self.commit_gated(wt)?;
         }
         Ok(removed)
     }
@@ -3712,7 +3760,7 @@ impl Store for V2Store {
         // Pages freed by a commit are released only by later commits: two
         // empty ones make `allocated_pages` exact (as `compact` does).
         for _ in 0..2 {
-            self.db.begin_write()?.commit()?;
+            self.commit_gated(self.db.begin_write()?)?;
         }
         let wt = self.db.begin_write()?;
         let s = wt.stats()?;

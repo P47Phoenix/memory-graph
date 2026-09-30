@@ -102,3 +102,10 @@ graph-store = { path = "../graph-store" }
 redb.workspace = true
 # deploy_manifests: parse the Kubernetes and Compose YAML (pure Rust).
 yaml-rust2 = "0.10"
+# mcp_rmcp_e2e (ADR 0005 test plan item 4, epic story 34): the official Rust
+# MCP SDK as a real client, dev-only (never at run time, ADR 0005 D1).
+# `transport-streamable-http-client-reqwest` enables reqwest without any TLS
+# (rmcp's `reqwest` feature would add rustls), so the pure-Rust gate
+# (scripts/check-no-c-deps.py) stays clean; test_gate.py checks ring.
+rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+tokio.workspace = true

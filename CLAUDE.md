@@ -20,9 +20,11 @@ cargo test -p graph-cli --test serve_e2e                    # memory-graph serve
 cargo test -p graph-client --test conformance               # run_all / run_differential against RemoteStore over an in-process server
 cargo test -p graph-mcp                                    # MCP protocol, proptest over request bytes, tool differential vs StoreRead (embedded + RemoteStore)
 cargo test -p graph-cli --test mcp_e2e                      # memory-graph mcp over stdio with the real binary (--db and --server) on the corpus
+cargo test -p graph-cli --test mcp_rmcp_e2e                 # a real MCP client (rmcp, dev-dependency only, no TLS) over stdio and serve --mcp-listen
+cargo test -p graph-server --test mcp_http_fuzz             # random bytes / random HTTP requests against the live /mcp endpoint
 cargo test -p graph-server --test cluster                   # replication through the in-process ClusterTestbed (failpoints, fault plan)
 cargo test -p graph-server --test membership                # join/auto-promote, forwarding, remove guards, transfer, partition (ClusterTestbed)
-cargo test -p graph-cli --test cluster_e2e                  # three real `serve --data-dir` processes: form, replicate, fail over, catch up, join, remove, exit 6
+cargo test -p graph-cli --test cluster_e2e                  # three real `serve --data-dir` processes: form, replicate, fail over, catch up, join, remove, exit 6, MCP on a follower across a leader kill
 cargo test --release -p graph-cli --test cluster_e2e measure_replication -- --ignored --nocapture   # docs/spikes/raft-replication.md
 cargo run --manifest-path xtask/Cargo.toml -- proto          # regenerate crates/graph-proto/src/gen from the .proto files (pure Rust, no protoc)
 cargo run --release -p graph-client --example rpc_bench -- <db>   # RPC overhead vs embedded (docs/spikes/rpc-overhead.md)
