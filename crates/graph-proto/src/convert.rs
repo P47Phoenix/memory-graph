@@ -343,6 +343,8 @@ impl From<Hit> for pb::Hit {
             count: to_u64(h.count),
             no_symbols: h.no_symbols,
             no_matching_symbol: h.no_matching_symbol,
+            encoding: h.encoding,
+            lossy: h.lossy,
         }
     }
 }
@@ -364,6 +366,8 @@ impl TryFrom<pb::Hit> for Hit {
             count: to_usize("Hit.count", h.count)?,
             no_symbols: h.no_symbols,
             no_matching_symbol: h.no_matching_symbol,
+            encoding: h.encoding,
+            lossy: h.lossy,
         })
     }
 }
@@ -381,6 +385,8 @@ impl From<SymbolHit> for pb::SymbolHit {
             lang_kind: h.lang_kind,
             span: h.span.map(Into::into),
             owner: h.owner,
+            encoding: h.encoding,
+            lossy: h.lossy,
         }
     }
 }
@@ -399,6 +405,8 @@ impl TryFrom<pb::SymbolHit> for SymbolHit {
             lang_kind: h.lang_kind,
             span: h.span.map(Span::try_from).transpose()?,
             owner: h.owner,
+            encoding: h.encoding,
+            lossy: h.lossy,
         })
     }
 }
@@ -454,6 +462,8 @@ impl From<RepoInfo> for pb::RepoInfo {
                 .collect(),
             token_classes: counts_into(r.token_classes),
             open_batch: r.open_batch,
+            encodings: counts_into(r.encodings),
+            lossy: to_u64(r.lossy),
         }
     }
 }
@@ -472,6 +482,8 @@ impl TryFrom<pb::RepoInfo> for RepoInfo {
                 .collect::<Result<_, _>>()?,
             token_classes: counts_from("RepoInfo.token_classes", r.token_classes)?,
             open_batch: r.open_batch,
+            encodings: counts_from("RepoInfo.encodings", r.encodings)?,
+            lossy: to_usize("RepoInfo.lossy", r.lossy)?,
         })
     }
 }
@@ -489,6 +501,8 @@ impl From<IngestStats> for pb::IngestStats {
             has_errors: s.has_errors,
             path: s.path,
             language: s.language,
+            encoding: s.encoding,
+            lossy: s.lossy,
         }
     }
 }
@@ -505,6 +519,8 @@ impl TryFrom<pb::IngestStats> for IngestStats {
             has_errors: s.has_errors,
             path: s.path,
             language: s.language,
+            encoding: s.encoding,
+            lossy: s.lossy,
         })
     }
 }

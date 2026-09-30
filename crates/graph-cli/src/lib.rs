@@ -268,6 +268,10 @@ struct Tally {
     skipped: std::collections::BTreeMap<String, Vec<String>>,
     /// Files whose extraction failed span validation: (path, reason). Not stored.
     failed: Vec<(String, String)>,
+    /// Stored files decoded from a non-UTF-8 encoding, and those decoded
+    /// lossily (ADR 0007; `--stats`).
+    transcoded: usize,
+    lossy: usize,
 }
 
 /// Store the pending files in one transaction and fold the outcomes into `t`.
@@ -325,6 +329,8 @@ fn flush_batch(
                 t.symbols += st.symbols;
                 t.tokens += st.tokens;
                 *t.by_lang.entry(st.language).or_default() += 1;
+                t.transcoded += usize::from(st.encoding.is_some());
+                t.lossy += usize::from(st.lossy);
                 t.seen.insert(st.path);
             }
             // ADR 0007 C5: the store's binary check, tallied with the walk's.
@@ -1191,7 +1197,12 @@ pub fn index_dir_with(
         seen,
         skipped: batch_skipped,
         mut failed,
+        transcoded,
+        lossy,
     } = tally;
+    if o.stats && !o.json {
+        eprintln!("encodings: transcoded={transcoded} lossy={lossy}");
+    }
     // Span failures are recorded at their batch's flush, panics as they
     // arrive; sort so the report does not depend on batching (paths are
     // unique within a run).
@@ -1239,6 +1250,8 @@ pub fn index_dir_with(
         }
         if o.stats {
             summary["stats"] = view.stats_json();
+            summary["stats"]["transcoded"] = transcoded.into();
+            summary["stats"]["lossy"] = lossy.into();
         }
         out!(out, "{}", serde_json::to_string(&summary)?);
     } else {

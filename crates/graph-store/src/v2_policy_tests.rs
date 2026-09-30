@@ -2077,6 +2077,65 @@ fn schema_versions_9_and_10_are_upgraded_in_place() {
         );
     }
 }
+
+/// Epic story 43: a schema-11 file written before the catalog counted
+/// encodings (catalog_version 1 or absent, no `e`/`l` entries) gets them
+/// counted from its File nodes on open, once; a current file reopens
+/// without writing.
+#[test]
+fn catalog_version_1_gets_encoding_counts_on_open() {
+    for stamp in [Some(1u64), None] {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("v.redb");
+        let s = V2Store::open(&p).unwrap();
+        let le: Vec<u8> = std::iter::once(0xFEFF_u16)
+            .chain("alpha beta\n".encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        s.index_bytes("o", "r", "le.txt", &le, None).unwrap();
+        s.index_bytes("o", "r", "u8.txt", b"alpha\n", None).unwrap();
+        let opts = crate::IndexOptions {
+            encoding: Some(encoding_rs::UTF_8),
+            ..Default::default()
+        };
+        s.index_bytes_opts("o", "q", "bad.txt", b"caf\xe9\n", None, None, opts)
+            .unwrap();
+        let want = s.describe(None, None).unwrap();
+        assert_eq!(want[1].encodings.get("UTF-16LE"), Some(&1), "{want:?}");
+        assert_eq!(want[0].lossy, 1, "{want:?}");
+        // Back to what a pre-story-43 binary wrote.
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut cat = wt.open_table(crate::CATALOG).unwrap();
+            let stale: Vec<String> = cat
+                .iter()
+                .unwrap()
+                .map(|r| r.unwrap().0.value().to_string())
+                .filter(|k| k.starts_with("e\0") || k.starts_with("l\0"))
+                .collect();
+            assert_eq!(stale.len(), 2);
+            for k in stale {
+                cat.remove(k.as_str()).unwrap();
+            }
+            let mut meta = wt.open_table(crate::META).unwrap();
+            match stamp {
+                Some(v) => meta.insert("catalog_version", v).map(|_| ()).unwrap(),
+                None => meta.remove("catalog_version").map(|_| ()).unwrap(),
+            }
+        }
+        wt.commit().unwrap();
+        drop(s);
+        let s = V2Store::open(&p).unwrap();
+        assert_eq!(s.describe(None, None).unwrap(), want, "{stamp:?}");
+        assert_eq!(s.describe_by_scan(None, None).unwrap(), want, "{stamp:?}");
+        drop(s);
+        // Now current: a reopen writes nothing.
+        let before = std::fs::read(&p).unwrap();
+        drop(V2Store::open(&p).unwrap());
+        assert!(std::fs::read(&p).unwrap() == before, "{stamp:?}");
+    }
+}
+
 // --- ADR 0003 story 5: packed single sorted dictionary (D1) ---
 
 /// Interning more than a few [`crate::codec::DICT_BLOCK`]-sized worths of

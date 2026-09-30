@@ -2001,6 +2001,13 @@ fn run() -> Result<i32> {
             } else {
                 for i in &infos {
                     out!("{}/{}: {} files", i.org, i.repo, i.files);
+                    // ADR 0007: non-UTF-8 files per encoding (the rest are UTF-8).
+                    if !i.encodings.is_empty() || i.lossy > 0 {
+                        let utf8 = i.files - i.encodings.values().sum::<usize>().min(i.files);
+                        let mut parts = vec![format!("utf-8 {utf8}")];
+                        parts.extend(i.encodings.iter().map(|(e, n)| format!("{e} {n}")));
+                        out!("  encodings: {} (lossy {})", parts.join(", "), i.lossy);
+                    }
                     if i.open_batch {
                         out!(
                             "  WARNING: repo {}/{} has an incomplete ingest batch \
@@ -2059,14 +2066,15 @@ fn run() -> Result<i32> {
                         .map(|s| format!(":{}:{}", s.start_line, s.start_col))
                         .unwrap_or_default();
                     out!(
-                        "{}/{}/{}{loc}\t{}\t{} ({})\t{}",
+                        "{}/{}/{}{loc}\t{}\t{} ({})\t{}{}",
                         h.org,
                         h.repo,
                         h.file,
                         h.language.as_deref().unwrap_or("-"),
                         h.kind.as_str(),
                         h.lang_kind.as_deref().unwrap_or("-"),
-                        h.qualified
+                        h.qualified,
+                        encoding_column(h.encoding.as_deref(), h.lossy)
                     );
                 }
             }
@@ -2170,7 +2178,7 @@ fn run() -> Result<i32> {
                         .collect::<Vec<_>>()
                         .join("/");
                     out!(
-                        "{path}{loc}\t{}\t{}\thits={}{}",
+                        "{path}{loc}\t{}\t{}\thits={}{}{}",
                         h.language.as_deref().unwrap_or("-"),
                         h.symbol.as_deref().unwrap_or("-"),
                         h.count,
@@ -2180,13 +2188,27 @@ fn run() -> Result<i32> {
                             "\tno_matching_symbol"
                         } else {
                             ""
-                        }
+                        },
+                        encoding_column(h.encoding.as_deref(), h.lossy)
                     );
                 }
             }
         }
     }
     Ok(0)
+}
+
+/// The trailing column of a `symbols`/`search` text row for a file that is
+/// not UTF-8 (ADR 0007): `\tencoding=<name>[,lossy]`; empty for UTF-8.
+fn encoding_column(encoding: Option<&str>, lossy: bool) -> String {
+    match (encoding, lossy) {
+        (None, false) => String::new(),
+        (e, l) => format!(
+            "\tencoding={}{}",
+            e.unwrap_or("utf-8"),
+            if l { ",lossy" } else { "" }
+        ),
+    }
 }
 
 #[cfg(test)]

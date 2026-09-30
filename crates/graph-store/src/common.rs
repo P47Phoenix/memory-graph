@@ -226,6 +226,8 @@ pub(crate) fn check_unchanged(
         has_errors: f.has_errors,
         path: path.to_string(),
         language: lang.to_string(),
+        encoding: f.encoding.clone(),
+        lossy: f.lossy,
         ..IngestStats::default()
     };
     if dirty {
@@ -461,6 +463,10 @@ pub(crate) struct Scope<'a> {
     pub(crate) org: &'a str,
     pub(crate) repo: &'a str,
     pub(crate) lang: &'a str,
+    /// The file's non-UTF-8 encoding (ADR 0007), `None` for UTF-8.
+    pub(crate) encoding: Option<&'a str>,
+    /// The file was decoded lossily.
+    pub(crate) lossy: bool,
 }
 
 /// Catalog deltas accumulated during one write transaction and applied to the
@@ -474,6 +480,18 @@ impl Tally {
     }
     pub(crate) fn file(&mut self, s: &Scope, d: i64) {
         self.add(format!("f\0{}\0{}\0{}", s.org, s.repo, s.lang), d);
+        self.encoding(s, d);
+    }
+    /// The encoding entries of a file (see [`Self::file`]).
+    pub(crate) fn encoding(&mut self, s: &Scope, d: i64) {
+        // ADR 0007 C6: non-UTF-8 files per encoding (UTF-8 is the
+        // remainder) and lossy files; absent means zero.
+        if let Some(e) = s.encoding {
+            self.add(format!("e\0{}\0{}\0{e}", s.org, s.repo), d);
+        }
+        if s.lossy {
+            self.add(format!("l\0{}\0{}", s.org, s.repo), d);
+        }
     }
     /// A symbol or token node appearing (`d` = 1) or disappearing (`d` = -1).
     pub(crate) fn node(&mut self, s: &Scope, n: &Node, d: i64) {
@@ -544,9 +562,15 @@ pub(crate) fn describe_in(
                 languages: BTreeMap::new(),
                 token_classes: BTreeMap::new(),
                 open_batch: false,
+                encodings: BTreeMap::new(),
+                lossy: 0,
             });
         match (f[0], f.len()) {
             ("r", 3) => {}
+            ("e", 4) => {
+                info.encodings.insert(f[3].to_string(), v);
+            }
+            ("l", 3) => info.lossy = v,
             ("c", 4) => {
                 info.token_classes.insert(f[3].to_string(), v);
             }

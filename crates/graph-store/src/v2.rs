@@ -64,7 +64,9 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// `encoding` and `lossy`, which a version-10 reader would drop on a
 /// rewrite. Both are omitted for UTF-8, so every version-9/10 File node is
 /// a valid version-11 one (absence means UTF-8) and the catalog needs no new
-/// entries for all-UTF-8 content: a 9 or 10 file is restamped straight to 11.
+/// entries for all-UTF-8 content: a 9 or 10 file is restamped straight to 11
+/// (and to [`CATALOG_VERSION`] 2). A version-11 file whose catalog predates
+/// the encoding counts (epic story 43) has them recounted on open.
 pub const V2_SCHEMA_VERSION: u64 = 11;
 
 /// The earlier layout versions [`V2Store`] upgrades in place on open (a
@@ -1357,6 +1359,8 @@ impl R {
                         // Default; set to the marker's value (if any) below,
                         // after every repo has been discovered by the scan.
                         open_batch: false,
+                        encodings: BTreeMap::new(),
+                        lossy: 0,
                     });
                     repo_key.insert(n.id, key);
                 }
@@ -1367,6 +1371,10 @@ impl R {
                     let lang = n.language.clone().unwrap_or_else(|| "unknown".into());
                     let info = infos.get_mut(&key).expect("repo registered");
                     info.files += 1;
+                    if let Some(e) = &n.encoding {
+                        *info.encodings.entry(e.clone()).or_default() += 1;
+                    }
+                    info.lossy += usize::from(n.lossy);
                     let l = info.languages.entry(lang).or_default();
                     l.files += 1;
                     let s = self
@@ -1547,6 +1555,8 @@ impl R {
                             .map(|o| self.text(o))
                             .transpose()?
                             .map(|t| t.to_string()),
+                        encoding: c.file.encoding.clone(),
+                        lossy: c.file.lossy,
                     },
                 ));
             }
@@ -1638,6 +1648,8 @@ impl R {
                 count,
                 no_symbols: false,
                 no_matching_symbol: false,
+                encoding: c.file.encoding.clone(),
+                lossy: c.file.lossy,
             };
             let base = (c.org.name.clone(), c.repo.name.clone(), c.file.name.clone());
             let file_key = |g: Grain| -> Key {
@@ -1651,11 +1663,15 @@ impl R {
                 Grain::Repo => {
                     hit.file = None;
                     hit.language = None;
+                    hit.encoding = None;
+                    hit.lossy = false;
                 }
                 Grain::Org => {
                     hit.repo = None;
                     hit.file = None;
                     hit.language = None;
+                    hit.encoding = None;
+                    hit.lossy = false;
                 }
                 _ => {}
             };
@@ -2010,6 +2026,55 @@ fn copy_multimap<K: redb::Key + 'static, V: redb::Key + 'static>(
 /// stamping `derived_version_refs_content_files` to [`REFS_DERIVED_VERSION`]
 /// in the same write transaction. Shared by [`V2Store::rebuild_refs`] (manual
 /// call) and the self-heal check in `open`/`open_with_cache_bytes`.
+/// Bring the catalog up to [`CATALOG_VERSION`] 2 (ADR 0007 C6, epic story
+/// 43): recount the per-repo encoding (`e`) and lossy (`l`) entries from the
+/// File nodes (O(entity rows), never a stream) and stamp the version, in one
+/// write transaction. Only a schema-11 file written before the catalog kept
+/// those entries needs it; everything else is already correct.
+fn rebuild_encoding_catalog_in(db: &Database) -> Result<()> {
+    let wt = db.begin_write()?;
+    {
+        let nodes = wt.open_table(NODES)?;
+        let mut cat = wt.open_table(CATALOG)?;
+        let mut all: HashMap<NodeId, Node> = HashMap::new();
+        for r in nodes.iter()? {
+            let n = dec(r?.1.value())?;
+            all.insert(n.id, n);
+        }
+        let mut stale: Vec<String> = Vec::new();
+        for r in cat.iter()? {
+            let k = r?.0.value().to_string();
+            if k.starts_with("e\0") || k.starts_with("l\0") {
+                stale.push(k);
+            }
+        }
+        for k in stale {
+            cat.remove(k.as_str())?;
+        }
+        let mut tally = Tally::default();
+        for f in all.values().filter(|n| n.kind == NodeKind::File) {
+            let repo = f.parent.and_then(|p| all.get(&p));
+            let org = repo.and_then(|r| r.parent).and_then(|p| all.get(&p));
+            let (Some(repo), Some(org)) = (repo, org) else {
+                continue;
+            };
+            let s = Scope {
+                org: &org.name,
+                repo: &repo.name,
+                lang: "",
+                encoding: f.encoding.as_deref(),
+                lossy: f.lossy,
+            };
+            tally.encoding(&s, 1);
+        }
+        tally.apply(&mut cat)?;
+        wt.open_table(META)?
+            .insert("catalog_version", CATALOG_VERSION)?;
+    }
+    wt.commit()?;
+    Ok(())
+}
+
 fn rebuild_refs_in(db: &Database) -> Result<()> {
     let wt = db.begin_write()?;
     {
@@ -2352,8 +2417,13 @@ impl V2Store {
                 // the new one, so the upgrade is the restamp alone (one
                 // small commit).
                 let wt = db.begin_write()?;
-                wt.open_table(META)?
-                    .insert("schema_version", V2_SCHEMA_VERSION)?;
+                {
+                    let mut m = wt.open_table(META)?;
+                    m.insert("schema_version", V2_SCHEMA_VERSION)?;
+                    // Every 9/10 file is all UTF-8: its catalog is already
+                    // correct at version 2 (absence means zero).
+                    m.insert("catalog_version", CATALOG_VERSION)?;
+                }
                 wt.commit()?;
             }
             Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => {
@@ -2401,6 +2471,21 @@ impl V2Store {
         // automatically, silently -- this is not an error, and never
         // refuses the open. A file already at the current version does not
         // write at all, so a plain reopen stays byte-identical.
+        // ADR 0007 C6 / epic story 43: a schema-11 file written before the
+        // catalog counted encodings gets them counted once, from the File
+        // nodes. A current file does not write at all.
+        let catalog_version = {
+            let rt = db.begin_read()?;
+            match rt.open_table(META) {
+                Ok(t) => t.get("catalog_version")?.map(|v| v.value()),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if catalog_version != Some(CATALOG_VERSION) {
+            rebuild_encoding_catalog_in(&db)?;
+        }
+
         let derived_refs_version = {
             let rt = db.begin_read()?;
             match rt.open_table(META) {
@@ -3370,6 +3455,8 @@ impl V2Store {
                         org,
                         repo,
                         lang: f.language.as_deref().unwrap_or("unknown"),
+                        encoding: f.encoding.as_deref(),
+                        lossy: f.lossy,
                     };
                     w.remove_content(fid, &scope, &mut tally)?;
                     tally.file(&scope, -1);
@@ -3482,6 +3569,8 @@ impl V2Store {
             org,
             repo,
             lang: language,
+            encoding: meta.encoding,
+            lossy: meta.lossy,
         };
         tally.file(&scope, 1);
         if existed {
@@ -3494,6 +3583,8 @@ impl V2Store {
                 org,
                 repo,
                 lang: old.language.as_deref().unwrap_or("unknown"),
+                encoding: old.encoding.as_deref(),
+                lossy: old.lossy,
             };
             tally.file(&old_scope, -1);
             w.remove_content(file_id, &old_scope, &mut tally)?;
@@ -3566,6 +3657,8 @@ impl V2Store {
             has_errors: ex.has_errors,
             path: path.to_string(),
             language: language.to_string(),
+            encoding: meta.encoding.map(Into::into),
+            lossy: meta.lossy,
         })
     }
 }

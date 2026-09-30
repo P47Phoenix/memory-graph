@@ -53,6 +53,9 @@ pub struct RemoveOutcome {
     pub retried: bool,
 }
 
+/// The first store format whose server decodes with `encoding_hint`.
+pub const ENCODING_STORE_FORMAT: u64 = 11;
+
 pub struct RemoteStore {
     rt: Arc<tokio::runtime::Runtime>,
     conn: Arc<Conn>,
@@ -61,6 +64,8 @@ pub struct RemoteStore {
     /// Whether any `Write.Index` answer came from a node that forwarded it
     /// to the leader (`forwarded_to_leader`).
     forwarded: Arc<AtomicBool>,
+    /// The old-server encoding warning was printed (ADR 0007 C8).
+    warned_encoding: Arc<AtomicBool>,
 }
 
 impl RemoteStore {
@@ -80,7 +85,29 @@ impl RemoteStore {
             conn: Arc::new(conn),
             applied: Arc::new(AtomicU64::new(0)),
             forwarded: Arc::new(AtomicBool::new(false)),
+            warned_encoding: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// The server predates source decoding (ADR 0007, store format 11): it
+    /// ignores `FileBytes.encoding_hint` and `strict_encoding`.
+    pub fn ignores_encoding_hints(&self) -> bool {
+        self.hello().store_format_version < ENCODING_STORE_FORMAT
+    }
+
+    /// Warn once on stderr when an encoding hint or `strict_encoding` is
+    /// sent to a server that ignores them (ADR 0007 C8).
+    fn warn_if_hint_ignored(&self, hinted: bool) {
+        if hinted
+            && self.ignores_encoding_hints()
+            && !self.warned_encoding.swap(true, Ordering::Relaxed)
+        {
+            eprintln!(
+                "warning: server {} (store format {}) predates source encodings; it ignores the encoding hint and --strict-encoding",
+                self.hello().endpoint,
+                self.hello().store_format_version
+            );
+        }
     }
 
     /// What the server answered in `Hello`.
@@ -363,6 +390,7 @@ impl RemoteStore {
                     parts.path, parts.org, parts.repo
                 )));
             }
+            self.warn_if_hint_ignored(parts.encoding.is_some() || parts.strict_encoding);
             msgs.push(pb::IndexRequest {
                 msg: Some(pb::index_request::Msg::File(pb::FileBytes {
                     path: parts.path.to_string(),
@@ -583,6 +611,7 @@ impl Store for RemoteStore {
         origin: Option<&str>,
         opts: IndexOptions,
     ) -> Result<IngestStats> {
+        self.warn_if_hint_ignored(opts.encoding.is_some() || opts.strict_encoding);
         let req = pb::IndexFileRequest {
             org: org.into(),
             repo: repo.into(),

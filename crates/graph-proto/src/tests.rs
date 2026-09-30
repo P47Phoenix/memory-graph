@@ -232,11 +232,13 @@ fn hit() -> impl Strategy<Value = Hit> {
             any::<bool>(),
             any::<bool>(),
         ),
+        (option::of(text()), any::<bool>()),
     )
         .prop_map(
             |(
                 (grain, org, repo, file, language, symbol, symbol_kind),
                 (lang_kind, token_class, span, count, no_symbols, no_matching_symbol),
+                (encoding, lossy),
             )| Hit {
                 grain,
                 org,
@@ -251,6 +253,8 @@ fn hit() -> impl Strategy<Value = Hit> {
                 count,
                 no_symbols,
                 no_matching_symbol,
+                encoding,
+                lossy,
             },
         )
 }
@@ -267,9 +271,22 @@ fn symbol_hit() -> impl Strategy<Value = SymbolHit> {
         option::of(text()),
         option::of(span()),
         option::of(text()),
+        (option::of(text()), any::<bool>()),
     )
         .prop_map(
-            |(org, repo, file, language, name, qualified, kind, lang_kind, span, owner)| {
+            |(
+                org,
+                repo,
+                file,
+                language,
+                name,
+                qualified,
+                kind,
+                lang_kind,
+                span,
+                owner,
+                (encoding, lossy),
+            )| {
                 SymbolHit {
                     org,
                     repo,
@@ -281,6 +298,8 @@ fn symbol_hit() -> impl Strategy<Value = SymbolHit> {
                     lang_kind,
                     span,
                     owner,
+                    encoding,
+                    lossy,
                 }
             },
         )
@@ -309,15 +328,19 @@ fn repo_info() -> impl Strategy<Value = RepoInfo> {
         btree_map(text(), language_info(), 0..3),
         counts(),
         any::<bool>(),
+        counts(),
+        any::<usize>(),
     )
         .prop_map(
-            |(org, repo, files, languages, token_classes, open_batch)| RepoInfo {
+            |(org, repo, files, languages, token_classes, open_batch, encodings, lossy)| RepoInfo {
                 org,
                 repo,
                 files,
                 languages,
                 token_classes,
                 open_batch,
+                encodings,
+                lossy,
             },
         )
 }
@@ -332,9 +355,20 @@ fn ingest_stats() -> impl Strategy<Value = IngestStats> {
         any::<bool>(),
         text(),
         text(),
+        (option::of(text()), any::<bool>()),
     )
         .prop_map(
-            |(file_id, symbols, tokens, replaced, unchanged, has_errors, path, language)| {
+            |(
+                file_id,
+                symbols,
+                tokens,
+                replaced,
+                unchanged,
+                has_errors,
+                path,
+                language,
+                (encoding, lossy),
+            )| {
                 IngestStats {
                     file_id,
                     symbols,
@@ -344,6 +378,8 @@ fn ingest_stats() -> impl Strategy<Value = IngestStats> {
                     has_errors,
                     path,
                     language,
+                    encoding,
+                    lossy,
                 }
             },
         )

@@ -24,6 +24,7 @@ impl Point {\n    pub fn new(x: i32, y: i32) -> Self { Point { x, y } }\n    pub
 pub fn origin() -> Point { Point::new(0, 0) }\n";
 const UTIL: &str = "use crate::Point;\n\npub fn shift(p: Point) -> Point {\n    let q = Point::new(p.x + 1, p.y);\n    q\n}\n\npub trait Shape { fn area(&self) -> i32; }\n";
 const MAIN: &str = "fn main() {\n    let p = lib::origin();\n    println!(\"{}\", p.norm());\n}\n";
+const WIDE: &str = "pub fn widen(p: Point) -> Point { p }\n";
 const NOTES: &str = "Point notes: new origin\nshift the Point\n";
 
 fn fill(store: &dyn Store) {
@@ -42,6 +43,32 @@ fn fill(store: &dyn Store) {
     store
         .index_bytes("zeta", "tools", "src/lib.rs", UTIL.as_bytes(), None)
         .unwrap();
+    // ADR 0007 (story 43): a UTF-16LE file and a lossy one, so the
+    // encodings show in describe, list_files, search and find_symbols.
+    let wide: Vec<u8> = std::iter::once(0xFEFF_u16)
+        .chain(WIDE.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let st = store
+        .index_bytes("acme", "geo", "src/wide.rs", &wide, None)
+        .unwrap();
+    assert_eq!(st.encoding.as_deref(), Some("UTF-16LE"));
+    let opts = graph_store::IndexOptions {
+        encoding: Some(encoding_rs::UTF_8),
+        ..Default::default()
+    };
+    let st = store
+        .index_bytes_opts(
+            "acme",
+            "geo",
+            "LOSSY.txt",
+            b"Point caf\xe9\n",
+            None,
+            None,
+            opts,
+        )
+        .unwrap();
+    assert!(st.lossy);
 }
 
 /// Every call the differential runs.
@@ -210,9 +237,17 @@ fn oracle(store: &dyn StoreRead, name: &str, a: &Value) -> Value {
                 .unwrap()
                 .into_iter()
                 .filter(|f| f.kind == NodeKind::File && f.name.starts_with(&prefix))
-                .map(
-                    |f| json!({"path": f.name, "language": f.language, "has_errors": f.has_errors}),
-                )
+                .map(|f| {
+                    let mut v =
+                        json!({"path": f.name, "language": f.language, "has_errors": f.has_errors});
+                    if let Some(e) = f.encoding {
+                        v["encoding"] = e.into();
+                    }
+                    if f.lossy {
+                        v["lossy"] = true.into();
+                    }
+                    v
+                })
                 .collect();
             paged(all, a)
         }
@@ -320,6 +355,28 @@ fn embedded_tools_equal_store_read() {
     let mut c = Client::new(StoreBackend::embedded(store));
     check(&mut c, &want, "embedded");
     check_refusals(&mut c);
+    // ADR 0007 (story 43): the encodings are in the tool answers (and the
+    // answers validated against their outputSchemas in `Client`).
+    let d = c.ok("describe", json!({"org": "acme", "repo": "geo"}));
+    assert_eq!(d["repos"][0]["encodings"], json!({"UTF-16LE": 1}), "{d}");
+    assert_eq!(d["repos"][0]["lossy"], 1, "{d}");
+    let files = c.ok("list_files", json!({"org": "acme", "repo": "geo"}));
+    let by_path = |p: &str| {
+        files["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == p)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(by_path("src/wide.rs")["encoding"], "UTF-16LE");
+    assert!(by_path("src/wide.rs").get("lossy").is_none());
+    assert_eq!(by_path("LOSSY.txt")["lossy"], true);
+    assert!(by_path("LOSSY.txt").get("encoding").is_none());
+    assert!(by_path("src/lib.rs").get("encoding").is_none());
+    let hits = c.ok("find_symbols", json!({"pattern": "widen"}));
+    assert_eq!(hits["items"][0]["encoding"], "UTF-16LE", "{hits}");
 }
 
 #[test]
