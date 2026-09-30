@@ -395,11 +395,14 @@ pub async fn start(
     }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
-    // A bad --backup-url is refused before anything is written.
+    // A bad --backup-url (or s3:// endpoint, region or credentials) is
+    // refused before anything is written. Opening a sink sends nothing.
     if let Some(b) = &cfg.backup {
         if b.sink.is_none() {
-            crate::backup::parse_url(&b.url)
-                .map_err(|e| StoreError::Rejected(format!("--backup-url {e}")))?;
+            drop(
+                b.open_sink()
+                    .map_err(|e| StoreError::Rejected(format!("--backup-url {e}")))?,
+            );
         }
     }
     // `--update-advertise` moves a member: refused before anything is

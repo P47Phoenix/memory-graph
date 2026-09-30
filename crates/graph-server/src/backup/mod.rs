@@ -3,8 +3,8 @@
 //! a new cluster restores straight from that location with verification.
 //!
 //! * [`BackupSink`]: the internal object-store trait (`put`, `get`, `list`,
-//!   `delete`) with [`file::FileSink`] (`file://<dir>`); the S3 sink is
-//!   story 36.
+//!   `delete`) with [`file::FileSink`] (`file://<dir>`) and [`s3::S3Sink`]
+//!   (`s3://bucket/prefix` over plain HTTP with SigV4, story 36).
 //! * [`uploader::Backup`]: the async, best-effort uploader: one upload at a
 //!   time on its own thread, a newer snapshot supersedes a queued one, three
 //!   retries, then a log line, `mg_backup_failures_total` and
@@ -29,11 +29,15 @@
 //! and compared with the sidecar's sha256 before the `.meta` is written, so
 //! a file that changed under the handle can never be committed. A snapshot
 //! already removed before the open is simply superseded by the newer one.
+pub mod creds;
 pub mod file;
 pub mod restore;
+pub mod s3;
+pub mod sigv4;
 pub mod uploader;
 
 pub use file::FileSink;
+pub use s3::{S3Options, S3Sink};
 pub use uploader::{Backup, BackupStats};
 
 use std::io::{Read, Write};
@@ -67,6 +71,13 @@ pub trait BackupSink: Send + Sync {
     fn delete(&self, key: &str) -> std::io::Result<()>;
     /// Where it writes, for logs (never a secret).
     fn describe(&self) -> String;
+    /// Clean up unfinished uploads under `prefix` begun before
+    /// `older_than` (S3: abort stale multipart uploads); how many. A sink
+    /// whose interrupted puts leave only listable objects (`file://`)
+    /// needs nothing here: the orphan sweep removes those.
+    fn sweep_incomplete(&self, _prefix: &str, _older_than: SystemTime) -> std::io::Result<usize> {
+        Ok(0)
+    }
 }
 
 /// `--backup-on`: which nodes upload the snapshots they build.
@@ -119,7 +130,7 @@ pub const UPLOAD_RETRIES: u32 = 3;
 /// The backup settings of a server (`--backup-*`).
 #[derive(Clone)]
 pub struct BackupConfig {
-    /// `--backup-url` (`file://<dir>`).
+    /// `--backup-url` (`file://<dir>` or `s3://bucket/prefix`).
     pub url: String,
     /// `--backup-keep`: committed backups kept (0 = all).
     pub keep: usize,
@@ -129,6 +140,10 @@ pub struct BackupConfig {
     pub retry_backoff: Duration,
     /// [`ORPHAN_AGE`] (tests shorten it).
     pub orphan_age: Duration,
+    /// The `s3://` settings (`--backup-endpoint`, `--backup-region`,
+    /// `--backup-virtual-host`, `--backup-credentials-file`,
+    /// `--backup-profile`); refused with a `file://` URL unless default.
+    pub s3: S3Options,
     /// Tests: this sink instead of the one `url` names.
     pub sink: Option<Arc<dyn BackupSink>>,
 }
@@ -141,6 +156,7 @@ impl BackupConfig {
             on: BackupOn::Leader,
             retry_backoff: Duration::from_secs(1),
             orphan_age: ORPHAN_AGE,
+            s3: S3Options::default(),
             sink: None,
         }
     }
@@ -151,7 +167,24 @@ impl BackupConfig {
             return Ok(Arc::clone(s));
         }
         match parse_url(&self.url)? {
-            Location::File(dir) => Ok(Arc::new(FileSink::new(dir))),
+            Location::File(dir) => {
+                let d = S3Options::default();
+                let s = &self.s3;
+                if s.endpoint.is_some()
+                    || s.region != d.region
+                    || s.virtual_host
+                    || s.credentials_file.is_some()
+                    || s.profile.is_some()
+                {
+                    return Err(format!(
+                        "`{}`: --backup-endpoint, --backup-region, --backup-virtual-host, \
+                         --backup-credentials-file and --backup-profile apply to s3:// only",
+                        self.url
+                    ));
+                }
+                Ok(Arc::new(FileSink::new(dir)))
+            }
+            Location::S3(_) => Ok(Arc::new(S3Sink::new(&self.url, self.s3.clone())?)),
         }
     }
 }
@@ -164,6 +197,7 @@ impl std::fmt::Debug for BackupConfig {
             .field("on", &self.on)
             .field("retry_backoff", &self.retry_backoff)
             .field("orphan_age", &self.orphan_age)
+            .field("s3", &self.s3)
             .field("sink", &self.sink.as_ref().map(|s| s.describe()))
             .finish()
     }
@@ -173,6 +207,7 @@ impl std::fmt::Debug for BackupConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     File(std::path::PathBuf),
+    S3(s3::S3Url),
 }
 
 /// Whether `s` names a backup URL (rather than a plain path).
@@ -181,8 +216,8 @@ pub fn is_url(s: &str) -> bool {
 }
 
 /// Parse `file://<path>` (`file:///srv/b`, `file:///C:/b` or `file://C:/b`
-/// on Windows, or a relative `file://backups`). `s3://` is refused until
-/// story 36 ships it; anything else is refused.
+/// on Windows, or a relative `file://backups`) or `s3://bucket[/prefix]`;
+/// anything else is refused.
 pub fn parse_url(url: &str) -> Result<Location, String> {
     if let Some(rest) = url.strip_prefix("file://") {
         // `file:///C:/x`: drop the slash before a drive letter.
@@ -198,13 +233,10 @@ pub fn parse_url(url: &str) -> Result<Location, String> {
         return Ok(Location::File(std::path::PathBuf::from(rest)));
     }
     if url.starts_with("s3://") {
-        return Err(format!(
-            "`{url}`: s3:// backups are not in this release yet (ADR 0006 story 36); use a \
-             file:// directory (and `aws s3 sync` it) for now"
-        ));
+        return s3::parse_s3_url(url).map(Location::S3);
     }
     Err(format!(
-        "`{url}`: not a supported backup URL (expected file://<dir>)"
+        "`{url}`: not a supported backup URL (expected file://<dir> or s3://bucket/prefix)"
     ))
 }
 
@@ -224,7 +256,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn urls_parse_and_s3_is_refused_for_now() {
+    fn urls_parse() {
         assert_eq!(
             parse_url("file:///srv/b").unwrap(),
             Location::File("/srv/b".into())
@@ -238,7 +270,14 @@ mod tests {
             Location::File("rel/dir".into())
         );
         assert!(parse_url("file://").is_err());
-        assert!(parse_url("s3://bucket/x").unwrap_err().contains("story 36"));
+        assert_eq!(
+            parse_url("s3://bucket/x").unwrap(),
+            Location::S3(s3::S3Url {
+                bucket: "bucket".into(),
+                prefix: "x".into()
+            })
+        );
+        assert!(parse_url("s3://B").is_err());
         assert!(parse_url("http://x").is_err());
         assert!(is_url("file:///x") && !is_url("/x/snap-1-2.redb"));
     }
