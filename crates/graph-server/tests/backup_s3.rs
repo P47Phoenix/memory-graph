@@ -780,6 +780,27 @@ fn stale_multipart_uploads_are_aborted() {
     });
 }
 
+/// `incomplete_uploads` lists the multipart uploads in progress under a
+/// prefix (joined with the URL's prefix), whatever their age, and aborts
+/// none of them.
+#[test]
+fn incomplete_uploads_lists_without_aborting() {
+    let f = FakeS3::start();
+    let sink = f.sink(&format!("s3://{BUCKET}/{PREFIX}"));
+    assert!(sink.incomplete_uploads("c1/").unwrap().is_empty());
+    let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+    let a = format!("{PREFIX}/c1/snap-1-7.redb");
+    let b = format!("{PREFIX}/c1/snap-1-8.redb");
+    let other = format!("{PREFIX}/c2/snap-1-7.redb");
+    f.begin_upload(BUCKET, &a, old);
+    f.begin_upload(BUCKET, &b, SystemTime::now());
+    f.begin_upload(BUCKET, &other, old);
+    let mut got = sink.incomplete_uploads("c1/").unwrap();
+    got.sort();
+    assert_eq!(got, vec![a, b]);
+    assert_eq!(f.pending_uploads(), 3, "nothing aborted");
+}
+
 /// A 403 is not retried: one request per snapshot, counted at once.
 #[test]
 fn a_403_is_not_retried() {

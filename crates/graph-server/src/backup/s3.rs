@@ -475,6 +475,24 @@ impl S3Sink {
         &self.url
     }
 
+    /// The URL prefix joined with a sink prefix.
+    fn full_prefix(&self, prefix: &str) -> String {
+        if self.url.prefix.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{}/{prefix}", self.url.prefix)
+        }
+    }
+
+    /// The object keys of the multipart uploads in progress under `prefix`
+    /// (ListMultipartUploads), without aborting any. Operators and the S3
+    /// e2e test use it to check nothing is left dangling.
+    pub fn incomplete_uploads(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        let full = self.full_prefix(prefix);
+        let uploads = self.run(self.list_uploads(&full))?;
+        Ok(uploads.into_iter().map(|(k, _, _)| k).collect())
+    }
+
     /// The object key of a sink key.
     fn object_key(&self, key: &str) -> std::io::Result<String> {
         if !valid_key(key) {
@@ -1097,11 +1115,7 @@ impl BackupSink for S3Sink {
     /// `older_than` (a crash or an outage mid-upload leaves them behind;
     /// they are billed and invisible to a listing).
     fn sweep_incomplete(&self, prefix: &str, older_than: SystemTime) -> std::io::Result<usize> {
-        let full = if self.url.prefix.is_empty() {
-            prefix.to_string()
-        } else {
-            format!("{}/{prefix}", self.url.prefix)
-        };
+        let full = self.full_prefix(prefix);
         let uploads = self.run(self.list_uploads(&full))?;
         let mut n = 0;
         for (key, id, initiated) in uploads {

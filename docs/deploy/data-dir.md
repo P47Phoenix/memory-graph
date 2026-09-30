@@ -91,8 +91,9 @@ the stored size is checked with a HEAD after each upload.
 
 - `--backup-endpoint http://host:port` is required: stage 1 speaks plain HTTP only, and an
   `https://` endpoint is refused. Works with MinIO, Ceph RGW, R2, B2 and Garage. For AWS S3
-  itself (HTTPS only), run a TLS sidecar (stunnel, envoy) and point the endpoint at it, or back
-  up to `file://` and `aws s3 sync` the directory. Native HTTPS waits on a pure-Rust TLS
+  itself (HTTPS only), run a TLS sidecar (stunnel) reached under the real S3 host name, or back
+  up to `file://` and `aws s3 sync` the directory: see
+  [S3 in production](#s3-in-production-tls-lifecycle-and-iam). Native HTTPS waits on a pure-Rust TLS
   provider (#104).
 - `--backup-region` (default `us-east-1`) is the region requests are signed for.
 - Path-style addressing (`http://host/bucket/key`) is the default; `--backup-virtual-host`
@@ -130,6 +131,132 @@ the stored size is checked with a HEAD after each upload.
   response, which also allows 1 s per MiB of request body.
 - TOML keys: `backup-endpoint`, `backup-region`, `backup-virtual-host`,
   `backup-credentials-file`, `backup-profile`.
+
+### S3 in production: TLS, lifecycle and IAM
+
+**TLS in front of AWS S3.** Stage 1 speaks plain HTTP only (native HTTPS is story 39, deferred
+with #104). AWS S3 accepts HTTPS only, so either run a TLS sidecar next to the node, or back up
+to `file://` and sync that directory (the simpler of the two).
+
+- **The `Host` header matters.** SigV4 signs the `Host` header memory-graph sends, which is the
+  `--backup-endpoint` host (plus `:port` unless it is 80). AWS routes and verifies by that same
+  header, so it must be the real S3 name, e.g. `s3.eu-west-1.amazonaws.com`, and no proxy may
+  rewrite it (a rewrite fails with `SignatureDoesNotMatch`). So an endpoint of
+  `http://127.0.0.1:9080` does **not** work against AWS. Instead, keep the real name on port 80
+  and make that name resolve to the sidecar for memory-graph only:
+- **stunnel sidecar in Docker Compose** (the sidecar resolves the name normally; memory-graph's
+  container maps it to the sidecar with `extra_hosts`):
+
+  `stunnel.conf`:
+
+  ```ini
+  foreground = yes
+  [s3]
+  client = yes
+  accept = 0.0.0.0:80
+  connect = s3.eu-west-1.amazonaws.com:443
+  verifyChain = yes
+  CAfile = /etc/ssl/certs/ca-certificates.crt
+  checkHost = s3.eu-west-1.amazonaws.com
+  ```
+
+  ```yaml
+  services:
+    s3tls:
+      image: debian:stable-slim       # or any image with stunnel installed
+      command: sh -c "apt-get update && apt-get install -y stunnel4 ca-certificates && exec stunnel /etc/stunnel/stunnel.conf"
+      volumes: ["./stunnel.conf:/etc/stunnel/stunnel.conf:ro"]
+      networks: { backup: { ipv4_address: 172.30.0.10 } }
+    memory-graph:
+      image: ghcr.io/p47phoenix/memory-graph:main
+      command: >
+        serve --data-dir /data --bootstrap --node-id 1 --listen 0.0.0.0:7000
+        --backup-url s3://mg-backups/prod --backup-region eu-west-1
+        --backup-endpoint http://s3.eu-west-1.amazonaws.com
+      extra_hosts: ["s3.eu-west-1.amazonaws.com:172.30.0.10"]
+      env_file: aws-backup.env        # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+      networks: [backup]
+  networks:
+    backup: { ipam: { config: [{ subnet: 172.30.0.0/24 }] } }
+  ```
+
+  In Kubernetes, the same shape is a stunnel sidecar container plus a `hostAliases` entry, but
+  `hostAliases` applies to every container in the pod, so the sidecar must then `connect` to
+  a different name for the same region (`s3.dualstack.eu-west-1.amazonaws.com:443`). Use the
+  bucket's regional endpoint and path-style addressing (the default). The hop between
+  memory-graph and the sidecar is plain HTTP, so keep it on a private network. (This recipe is
+  not exercised in CI, which runs MinIO over plain HTTP.)
+- Or keep `--backup-url file:///srv/mg-backups` and copy it off the box on a timer:
+  `aws s3 sync /srv/mg-backups s3://mg-backups/prod --exact-timestamps` (add `--delete` to let
+  retention's deletions follow). A backup is committed by its `.meta`, so a sync that catches an
+  upload half-way copies only data without a `.meta`, which is never restored and is swept
+  later.
+
+**Bucket lifecycle rule.** Retention deletes old backups and aborts this cluster's stale
+multipart uploads itself, but only while a node with `--backup-url` runs. As a backstop, give the
+bucket a lifecycle rule that aborts incomplete multipart uploads and expires objects well past
+what `--backup-keep` would keep (here 2 days and 90 days; pick the expiration longer than
+`--backup-keep` snapshots take to accumulate, or it deletes backups retention meant to keep):
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "memory-graph-backups",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "prod/" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 2 },
+      "Expiration": { "Days": 90 }
+    }
+  ]
+}
+```
+
+`aws s3api put-bucket-lifecycle-configuration --bucket mg-backups --lifecycle-configuration
+file://rule.json` (AWS), or `mc ilm import local/mg-backups < rule.json` (MinIO).
+
+**Minimal IAM policy.** The node needs to put, get, list and delete objects under its prefix,
+and to list and abort multipart uploads. Nothing else (no bucket creation, no ACLs):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListThePrefix",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Resource": "arn:aws:s3:::mg-backups",
+      "Condition": { "StringLike": { "s3:prefix": ["prod/*"] } }
+    },
+    {
+      "Sid": "ObjectsUnderThePrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::mg-backups/prod/*"
+    }
+  ]
+}
+```
+
+HEAD requests are covered by `s3:GetObject`, and the multipart create/upload-part/complete calls
+by `s3:PutObject`. A restore-only machine needs just `s3:ListBucket` and `s3:GetObject`. Add
+`s3:x-amz-server-side-encryption` conditions if the bucket requires SSE. The credentials go in
+the environment or a credentials file readable only by the service user.
+
+**Testing.** CI's `s3-e2e` job runs `crates/graph-cli/tests/s3_e2e.rs` against MinIO on Linux:
+bootstrap, index the vendored corpus, `cluster snapshot --upload` three times with
+`--backup-keep 2`, `cluster backups`, restore `latest` into a new directory and compare the
+answers, a wrong secret refused, a real multipart upload, and no multipart upload left in
+progress. Run it against any S3-compatible server with `MG_S3_ENDPOINT=http://host:port`
+(`MG_S3_BUCKET`, default `mg-e2e`, must exist; `MG_S3_REGION`; `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY`); without `MG_S3_ENDPOINT` it skips.
 
 ## Restore
 

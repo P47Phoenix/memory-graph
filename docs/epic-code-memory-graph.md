@@ -461,6 +461,7 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E1, E8, E10 (Accepted).
 - Given `cluster snapshot --upload` and `cluster backups [--json]`, When run, Then a snapshot must be uploaded on demand and the backups listed.
 
 **38. MinIO e2e CI job and backup docs (3 pts)**
+Status: Delivered in PR #PRNUM (CI job `s3-e2e`, `crates/graph-cli/tests/s3_e2e.rs`; docs in `docs/deploy/data-dir.md` and the README). With it stories 35-38 are delivered; 39 stays deferred with #104.
 As a database operator
 I want backups tested against a real S3-compatible server and documented
 So that I can set them up with confidence.
