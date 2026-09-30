@@ -188,10 +188,13 @@ fn is_detectable(encoding: &'static Encoding) -> bool {
 
 /// The BOM-less UTF-16 sniff (ADR 0007 C3 step 3, amended 2026-09-30 for
 /// CJK). Both byte orders are tried. In the first [`UTF16_SNIFF_WINDOW`]
-/// bytes (trimmed to an even length), a candidate needs NULs in its
-/// high-byte positions (even offsets for BE, odd for LE) in at least 1/64 of
-/// the code units (and at least one), and NULs in fewer than 1/16 of its
-/// low-byte positions; the whole file must then decode strictly as that
+/// bytes (trimmed to an even length), a candidate needs NULs in fewer than
+/// 1/16 of its low-byte positions and, in its high-byte positions (even
+/// offsets for BE, odd for LE), either NULs in at least 1/2 of the code units
+/// (ASCII-heavy text, or short CJK whose code units happen to be valid UTF-8
+/// bytes, like "-- 名前"), or, only when the whole input is *not* valid UTF-8
+/// (CJK text), NULs in at least 1/64 of them and at least one. A UTF-8 file
+/// with a stray NUL is valid UTF-8, so it stays binary; the whole file must then decode strictly as that
 /// encoding, and the decoded text must have no C0 control other than tab,
 /// LF, FF and CR (so no U+0000). ASCII-heavy UTF-16 has NULs in almost every
 /// high byte; CJK UTF-16 has them only on its ASCII (newlines, spaces,
@@ -210,8 +213,11 @@ pub fn sniff_utf16(bytes: &[u8]) -> Option<&'static Encoding> {
         .step_by(2)
         .filter(|b| **b == 0)
         .count();
+    let valid_utf8 = std::str::from_utf8(bytes).is_ok();
     let candidate = |high: usize, low: usize, encoding: &'static Encoding| {
-        if high == 0 || high * 64 < units || low * 16 >= units {
+        let ascii_heavy = high * 2 >= units;
+        let cjk = !valid_utf8 && high > 0 && high * 64 >= units;
+        if !(ascii_heavy || cjk) || low * 16 >= units {
             return None;
         }
         let text = encoding.decode_without_bom_handling_and_without_replacement(bytes)?;
@@ -430,25 +436,35 @@ mod tests {
     }
 
     /// 64 units; `high_nul` of them have a NUL high byte, the next `low_nul`
-    /// a NUL low byte (with a CJK-range high byte, so no unit is U+0000).
-    fn units64(high_nul: usize, low_nul: usize, be: bool) -> Vec<u8> {
+    /// a NUL low byte, the rest `filler` as the high byte (never U+0000).
+    fn units64_with(high_nul: usize, low_nul: usize, be: bool, filler: u8) -> Vec<u8> {
         let mut v = Vec::new();
         for i in 0..64 {
             let (low, high) = if i < high_nul {
                 (b'a', 0)
             } else if i < high_nul + low_nul {
-                (0, 0x4E)
+                (0, filler)
             } else {
-                (b'a', 0x4E)
+                (b'a', filler)
             };
             v.extend_from_slice(&if be { [high, low] } else { [low, high] });
         }
         v
     }
 
+    /// CJK-range filler 0x9E: the bytes are not valid UTF-8 (loose path).
+    fn units64(high_nul: usize, low_nul: usize, be: bool) -> Vec<u8> {
+        units64_with(high_nul, low_nul, be, 0x9E)
+    }
+
     #[test]
     fn sniff_thresholds_at_their_edges() {
         for (be, enc) in [(false, UTF_16LE), (true, UTF_16BE)] {
+            // Valid-UTF-8 input (filler 0x4E): only the 1/2 path applies.
+            assert!(std::str::from_utf8(&units64_with(32, 0, be, 0x4E)).is_ok());
+            assert_eq!(sniff_utf16(&units64_with(32, 0, be, 0x4E)), Some(enc));
+            assert_eq!(sniff_utf16(&units64_with(31, 0, be, 0x4E)), None);
+            assert_eq!(sniff_utf16(&units64_with(1, 0, be, 0x4E)), None);
             // high NULs >= 1/64 of units (here 1 of 64), and at least one.
             assert_eq!(sniff_utf16(&units64(1, 0, be)), Some(enc));
             assert_eq!(sniff_utf16(&units64(0, 0, be)), None);
@@ -488,6 +504,28 @@ mod tests {
                 let d = decode(&bytes, None);
                 assert_eq!((d.encoding, d.text.as_ref(), d.lossy), (enc, src, false));
             }
+        }
+    }
+
+    #[test]
+    fn a_stray_nul_in_short_utf8_is_binary() {
+        let bytes = [
+            &b"public class A {\n  // caf\xc3\xa9\n}\n"[..],
+            b"\0",
+            b"int x = 1;\n",
+        ]
+        .concat();
+        assert_eq!(bytes.len(), 42);
+        assert_eq!(sniff_utf16(&bytes), None);
+        assert!(is_binary(&bytes));
+    }
+
+    #[test]
+    fn short_cjk_utf16_is_detected() {
+        for (be, enc) in [(false, UTF_16LE), (true, UTF_16BE)] {
+            let bytes = utf16("日本語\n", be, false);
+            assert!(!is_binary(&bytes));
+            assert_eq!(decode(&bytes, None).encoding, enc);
         }
     }
 
