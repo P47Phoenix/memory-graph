@@ -18,6 +18,10 @@ use std::time::Duration;
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// The deadline of `Admin.UploadSnapshot`. The server answers a little
+/// before it; an upload still running then continues in the background.
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(3660);
+
 /// A request carrying `msg` with `deadline` as its `grpc-timeout` (the
 /// channel enforces it, and the server stops working on it).
 fn timed<T>(msg: T, deadline: Duration) -> tonic::Request<T> {
@@ -280,6 +284,36 @@ impl RemoteStore {
             let out = out.clone();
             async move { download_snapshot(ch, out).await }
         }))
+    }
+
+    /// `Admin.UploadSnapshot` (`cluster snapshot --upload`, ADR 0006): the
+    /// leader (any node forwards it) builds a snapshot now, uploads it to
+    /// its backup location and answers once it committed. Waits up to an
+    /// hour (an upload of a large store takes a while); the server answers
+    /// `DEADLINE_EXCEEDED` just before that, and the upload continues in
+    /// the background (also when this call is given up). Sent once to the
+    /// connected node, never retried or moved to another endpoint.
+    pub fn admin_upload_snapshot(&self) -> Result<pb::UploadSnapshotResponse> {
+        let d = self.config().admin_deadline.max(UPLOAD_DEADLINE);
+        self.run(self.conn.call_once(|ch| async move {
+            admin_client(ch)
+                .upload_snapshot(timed(pb::UploadSnapshotRequest {}, d))
+                .await
+        }))
+        .map(|r| r.into_inner())
+    }
+
+    /// `Admin.ListBackups` (`cluster backups`, ADR 0006): the committed
+    /// backups of the cluster in the connected node's backup location,
+    /// newest first.
+    pub fn admin_list_backups(&self) -> Result<pb::ListBackupsResponse> {
+        let d = self.config().admin_deadline;
+        self.run(self.conn.call(Kind::Read, |ch| async move {
+            admin_client(ch)
+                .list_backups(timed(pb::ListBackupsRequest {}, d))
+                .await
+        }))
+        .map(|r| r.into_inner())
     }
 
     /// `grpc.health.v1.Health/Check` for `service` (`""` for the server,

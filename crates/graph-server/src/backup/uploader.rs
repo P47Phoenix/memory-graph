@@ -37,9 +37,61 @@ pub struct BackupStats {
     pub last_error: String,
 }
 
+/// A committed backup, as [`Backup::upload_now`] reports it.
+#[derive(Debug, Clone)]
+pub struct Uploaded {
+    /// The data object's key in the sink (`<cluster_id>/snap-T-I.redb`).
+    pub key: String,
+    /// Its restorable URL ([`BackupSink::url_of`]).
+    pub url: String,
+    pub side: SnapshotSidecar,
+}
+
+/// Why an on-demand upload ([`Backup::upload_now`]) did not commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadError {
+    /// A newer snapshot replaced the file before the upload opened it:
+    /// upload the current snapshot instead.
+    Replaced(String),
+    /// This node has no cluster id to key the backup by yet.
+    NoClusterId,
+    /// The uploader stopped (the server is shutting down).
+    Stopped,
+    /// The upload failed (after its retries).
+    Failed(String),
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replaced(m) | Self::Failed(m) => f.write_str(m),
+            Self::NoClusterId => f.write_str("this node has no cluster id yet"),
+            Self::Stopped => f.write_str("the server is shutting down"),
+        }
+    }
+}
+
+/// The answer [`Backup::upload_now`] hands back.
+pub type UploadResult = Result<Uploaded, UploadError>;
+
+/// Who waits for a job's outcome (`cluster snapshot --upload`).
+type Waiter = tokio::sync::oneshot::Sender<UploadResult>;
+
 struct Job {
     side: SnapshotSidecar,
     path: PathBuf,
+    waiters: Vec<Waiter>,
+}
+
+/// How one job ended, for its waiters.
+enum JobEnd {
+    /// Committed now, or already committed before.
+    Done(Box<Uploaded>),
+    /// Failed (after the retries), or skipped for a reason that is not a
+    /// commit.
+    Failed(UploadError),
+    /// A newer snapshot (or a stop) replaced it: its waiters move on.
+    Superseded,
 }
 
 #[derive(Default)]
@@ -130,22 +182,74 @@ impl Backup {
         if !upload {
             return;
         }
+        let _ = self.enqueue(side, path, None);
+    }
+
+    /// Queue `side` (replacing a queued job, whose waiters then wait for
+    /// this one); once stopped, the waiter comes back.
+    fn enqueue(
+        &self,
+        side: &SnapshotSidecar,
+        path: &Path,
+        waiter: Option<Waiter>,
+    ) -> Result<(), Option<Waiter>> {
+        let i = &self.inner;
         let mut q = lock(&i.queue);
         if q.stop {
-            return;
+            return Err(waiter);
         }
-        if let Some(old) = &q.pending {
-            tracing::info!(
-                superseded = old.side.index,
-                by = side.index,
-                "backup: a newer snapshot supersedes the queued upload"
-            );
+        let mut waiters: Vec<Waiter> = waiter.into_iter().collect();
+        if let Some(old) = q.pending.take() {
+            if old.side.index > side.index {
+                // A newer one is already queued: it stands, and serves
+                // this waiter too.
+                let mut old = old;
+                old.waiters.append(&mut waiters);
+                q.pending = Some(old);
+                return Ok(());
+            }
+            if old.side.index != side.index {
+                tracing::info!(
+                    superseded = old.side.index,
+                    by = side.index,
+                    "backup: a newer snapshot supersedes the queued upload"
+                );
+            }
+            waiters.extend(old.waiters);
         }
         q.pending = Some(Job {
             side: side.clone(),
             path: path.to_path_buf(),
+            waiters,
         });
         i.cv.notify_all();
+        Ok(())
+    }
+
+    /// `cluster backups`: this cluster's committed backups in the sink,
+    /// highest index first. Blocking: call it off the async runtime.
+    pub fn list(&self) -> Result<Vec<super::restore::Listed>, UploadError> {
+        let prefix = self.inner.prefix().map_err(|_| UploadError::NoClusterId)?;
+        super::restore::list_committed(self.inner.sink.as_ref(), &prefix)
+            .map_err(|e| UploadError::Failed(e.to_string()))
+    }
+
+    /// `cluster snapshot --upload`: queue `side` (the snapshot at `path`)
+    /// now, whatever `--backup-on` says, and return a receiver of its
+    /// outcome. Never blocks. A newer snapshot that supersedes it while it
+    /// is queued is what gets committed (and reported); a pair already
+    /// committed counts as done. Dropping the receiver (a caller that gave
+    /// up) does not cancel the upload: it goes on in the background.
+    pub fn upload_now(
+        &self,
+        side: &SnapshotSidecar,
+        path: &Path,
+    ) -> tokio::sync::oneshot::Receiver<UploadResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Err(Some(tx)) = self.enqueue(side, path, Some(tx)) {
+            let _ = tx.send(Err(UploadError::Stopped));
+        }
+        rx
     }
 
     /// Wait until nothing is queued or uploading (tests), up to `timeout`;
@@ -194,7 +298,10 @@ enum Outcome {
     Fatal(String),
     /// Not a failure: a newer snapshot replaced the file before it was
     /// opened, or there is no cluster id to key it by yet.
-    Skipped(String),
+    Skipped(UploadError),
+    /// Not a failure: the pair is already committed (by another node
+    /// sharing the URL, or before a restart).
+    Committed(Box<Uploaded>),
 }
 
 /// A sink error as an outcome: `PermissionDenied` and `InvalidInput` are
@@ -224,9 +331,28 @@ impl Inner {
                 q.busy = true;
                 q.pending.take().expect("woken with a job")
             };
-            self.upload_with_retries(&job);
+            let end = self.upload_with_retries(&job);
             let mut q = lock(&self.queue);
             q.busy = false;
+            match end {
+                JobEnd::Done(u) => {
+                    for w in job.waiters {
+                        let _ = w.send(Ok((*u).clone()));
+                    }
+                }
+                JobEnd::Failed(e) => {
+                    for w in job.waiters {
+                        let _ = w.send(Err(e.clone()));
+                    }
+                }
+                // The newer job answers them (a stop drops them: the
+                // waiters see the disconnect).
+                JobEnd::Superseded => {
+                    if let Some(next) = q.pending.as_mut() {
+                        next.waiters.extend(job.waiters);
+                    }
+                }
+            }
             self.cv.notify_all();
         }
     }
@@ -236,11 +362,11 @@ impl Inner {
         q.stop || q.pending.is_some()
     }
 
-    fn upload_with_retries(&self, job: &Job) {
+    fn upload_with_retries(&self, job: &Job) -> JobEnd {
         let mut attempt = 0;
         loop {
             match self.upload_once(job) {
-                Ok(bytes) => {
+                Ok((bytes, done)) => {
                     let mut s = lock(&self.stats);
                     s.last_index = job.side.index;
                     s.last_success_unix = crate::paths::now_secs();
@@ -260,17 +386,27 @@ impl Inner {
                         // of the backup that just committed.
                         tracing::warn!(error = %e, "backup: retention failed");
                     }
-                    return;
+                    return JobEnd::Done(Box::new(done));
+                }
+                Err(Outcome::Committed(done)) => {
+                    tracing::info!(
+                        index = job.side.index,
+                        "backup: skipped: `{}` is already committed",
+                        done.key
+                    );
+                    return JobEnd::Done(done);
                 }
                 Err(Outcome::Skipped(why)) => {
                     tracing::info!(index = job.side.index, "backup: skipped: {why}");
-                    return;
+                    return JobEnd::Failed(why);
                 }
                 Err(o) => {
                     let (e, fatal) = match o {
                         Outcome::Fatal(e) => (e, true),
                         Outcome::Failed(e) => (e, false),
-                        Outcome::Skipped(_) => unreachable!("handled above"),
+                        Outcome::Skipped(_) | Outcome::Committed(_) => {
+                            unreachable!("handled above")
+                        }
                     };
                     if self.superseded_or_stopped() {
                         // Not counted: a newer snapshot (or the shutdown)
@@ -280,7 +416,7 @@ impl Inner {
                             error = %e,
                             "backup: upload failed and was superseded (or stopped); not retried"
                         );
-                        return;
+                        return JobEnd::Superseded;
                     }
                     if fatal || attempt >= UPLOAD_RETRIES {
                         let msg = format!(
@@ -292,8 +428,8 @@ impl Inner {
                         tracing::error!("backup failed after {} attempts: {msg}", attempt + 1);
                         let mut s = lock(&self.stats);
                         s.failures_total += 1;
-                        s.last_error = msg;
-                        return;
+                        s.last_error = msg.clone();
+                        return JobEnd::Failed(UploadError::Failed(msg));
                     }
                     let delay = self.cfg.retry_backoff * 2u32.pow(attempt);
                     tracing::warn!(
@@ -317,7 +453,7 @@ impl Inner {
     fn prefix(&self) -> Result<String, Outcome> {
         match self.identity.get() {
             Some(id) if !id.is_empty() => Ok(format!("{id}/")),
-            _ => Err(Outcome::Skipped("this node has no cluster id yet".into())),
+            _ => Err(Outcome::Skipped(UploadError::NoClusterId)),
         }
     }
 
@@ -331,25 +467,28 @@ impl Inner {
     }
 
     /// Data first, verified against the sidecar, then the `.meta`.
-    fn upload_once(&self, job: &Job) -> Result<u64, Outcome> {
+    fn upload_once(&self, job: &Job) -> Result<(u64, Uploaded), Outcome> {
         let prefix = self.prefix()?;
         let stem = crate::raft::snapshot_dir::stem(job.side.last_log_id.as_ref());
         let data_key = format!("{prefix}{stem}.redb");
         let meta_key = format!("{prefix}{stem}.meta");
+        let done = Uploaded {
+            url: self.sink.url_of(&data_key),
+            key: data_key.clone(),
+            side: job.side.clone(),
+        };
         // Already committed (by another node sharing the URL, or before a
         // restart): never overwrite a committed pair's data.
         if self.meta_exists(&meta_key)? {
-            return Err(Outcome::Skipped(format!(
-                "`{meta_key}` is already committed"
-            )));
+            return Err(Outcome::Committed(Box::new(done)));
         }
         let file = match std::fs::File::open(&job.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Outcome::Skipped(format!(
+                return Err(Outcome::Skipped(UploadError::Replaced(format!(
                     "`{}` was replaced by a newer snapshot before the upload began",
                     job.path.display()
-                )))
+                ))))
             }
             Err(e) => return Err(Outcome::Failed(format!("opening the snapshot: {e}"))),
         };
@@ -379,7 +518,7 @@ impl Inner {
         self.sink
             .put(&meta_key, &mut meta.as_slice())
             .map_err(|e| failed(format!("writing `{meta_key}`: {e}"), &e))?;
-        Ok(put + meta.len() as u64)
+        Ok((put + meta.len() as u64, done))
     }
 
     /// Keep the newest `keep` committed backups of this cluster (the
@@ -698,6 +837,81 @@ mod tests {
         assert!(b.wait_idle(WAIT), "the worker left the backoff");
         assert!(t.elapsed() < Duration::from_secs(60));
         assert_eq!(b.stats().failures_total, 0);
+    }
+
+    /// `upload_now` uploads under `--backup-on none` and reports the commit;
+    /// a pair already committed counts as done; a failure is reported to
+    /// the waiter; after a stop it is refused at once.
+    #[test]
+    fn upload_now_waits_for_the_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let sink = Arc::new(FileSink::new(d.path().join("b")));
+        let mut cfg = BackupConfig::new("file:///unused");
+        cfg.on = BackupOn::None;
+        cfg.retry_backoff = Duration::from_millis(5);
+        cfg.sink = Some(sink.clone());
+        let b = Backup::start(cfg, Arc::new(ClusterIdentity::fixed("c"))).unwrap();
+        let (side, path) = snapshot(d.path(), 4, b"four");
+        // `none`: a build alone uploads nothing.
+        b.snapshot_built(&side, &path);
+        assert!(b.wait_idle(WAIT));
+        assert!(sink.list("").unwrap().is_empty());
+        let up = b.upload_now(&side, &path).blocking_recv().unwrap().unwrap();
+        assert_eq!(up.key, "c/snap-1-4.redb");
+        assert_eq!(up.url, format!("{}/c/snap-1-4.redb", sink.describe()));
+        assert_eq!(up.side.sha256, side.sha256);
+        assert!(sink.get("c/snap-1-4.meta", &mut std::io::sink()).is_ok());
+        let again = b.upload_now(&side, &path).blocking_recv().unwrap().unwrap();
+        assert_eq!(again.key, up.key);
+        assert_eq!(b.stats().uploads_total, 1);
+        // A snapshot whose bytes do not match its sidecar: the error.
+        let (mut bad, bad_path) = snapshot(d.path(), 5, b"five");
+        bad.sha256 = "00".repeat(32);
+        let e = b
+            .upload_now(&bad, &bad_path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert!(e.to_string().contains("sha256"), "{e}");
+        // The file replaced (removed) before the upload opened it.
+        let (gone, gone_path) = snapshot(d.path(), 6, b"six");
+        std::fs::remove_file(&gone_path).unwrap();
+        let e = b
+            .upload_now(&gone, &gone_path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(e, UploadError::Replaced(_)), "{e:?}");
+        // A caller that gave up does not cancel the upload.
+        let (late, late_path) = snapshot(d.path(), 7, b"seven");
+        drop(b.upload_now(&late, &late_path));
+        assert!(b.wait_idle(WAIT));
+        assert!(sink.get("c/snap-1-7.meta", &mut std::io::sink()).is_ok());
+        b.stop();
+        let e = b
+            .upload_now(&side, &path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e, UploadError::Stopped);
+    }
+
+    /// Without a cluster id the upload says so (typed, for the RPC's code).
+    #[test]
+    fn upload_now_without_a_cluster_id() {
+        let d = tempfile::tempdir().unwrap();
+        let sink = Arc::new(FileSink::new(d.path().join("b")));
+        let mut cfg = BackupConfig::new("file:///unused");
+        cfg.sink = Some(sink);
+        let b = Backup::start(cfg, Arc::new(ClusterIdentity::fixed(""))).unwrap();
+        let (side, path) = snapshot(d.path(), 4, b"four");
+        let e = b
+            .upload_now(&side, &path)
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e, UploadError::NoClusterId);
+        assert_eq!(b.list().unwrap_err(), UploadError::NoClusterId);
     }
 
     /// A pair already committed (another node on the same URL) is neither

@@ -3540,6 +3540,56 @@ pub struct UpdateAdvertiseResponse {
     #[prost(uint64, tag = "1")]
     pub log_index: u64,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UploadSnapshotRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UploadSnapshotResponse {
+    /// The committed backup (the one uploaded, or a newer snapshot that
+    /// superseded it while it was queued).
+    #[prost(message, optional, tag = "1")]
+    pub backup: ::core::option::Option<BackupEntry>,
+    /// The node that uploaded it (the leader).
+    #[prost(uint64, tag = "2")]
+    pub node_id: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListBackupsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBackupsResponse {
+    /// The backup location, e.g. `s3://bucket/prefix` (never a secret).
+    #[prost(string, tag = "1")]
+    pub location: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub cluster_id: ::prost::alloc::string::String,
+    /// Newest (highest index) first.
+    #[prost(message, repeated, tag = "3")]
+    pub backups: ::prost::alloc::vec::Vec<BackupEntry>,
+}
+/// One committed backup: a `snap-T-I.redb` with its `.meta`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BackupEntry {
+    /// What `serve --bootstrap --restore` takes, e.g.
+    /// `s3://bucket/prefix/<cluster_id>/snap-T-I.redb`.
+    #[prost(string, tag = "1")]
+    pub url: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub term: u64,
+    #[prost(uint64, tag = "3")]
+    pub index: u64,
+    /// From the `.meta`: the data object's size and lowercase hex SHA-256.
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+    #[prost(string, tag = "5")]
+    pub sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub extractors_hash: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub store_format_version: u64,
+    /// Set when the `.meta` could not be read or parsed (the other fields
+    /// from it are then empty); such a backup does not restore.
+    #[prost(string, tag = "8")]
+    pub error: ::prost::alloc::string::String,
+}
 /// Generated client implementations.
 pub mod admin_client {
     #![allow(
@@ -4014,6 +4064,60 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Admin", "UpdateAdvertise"));
             self.inner.unary(req, path, codec).await
         }
+        /// `cluster snapshot --upload` (ADR 0006 E1): the leader builds a snapshot
+        /// now and uploads it to its backup location (`serve --backup-url`),
+        /// whatever `--backup-on` says, and answers once the `.meta` committed.
+        /// May be sent to any member: a follower forwards it to the leader.
+        pub async fn upload_snapshot(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UploadSnapshotRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadSnapshotResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Admin/UploadSnapshot",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Admin", "UploadSnapshot"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `cluster backups` (ADR 0006): the committed backups (a `.meta` exists)
+        /// of this cluster in this node's backup location, newest first.
+        pub async fn list_backups(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListBackupsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListBackupsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Admin/ListBackups",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Admin", "ListBackups"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -4140,6 +4244,26 @@ pub mod admin_server {
             request: tonic::Request<super::UpdateAdvertiseRequest>,
         ) -> std::result::Result<
             tonic::Response<super::UpdateAdvertiseResponse>,
+            tonic::Status,
+        >;
+        /// `cluster snapshot --upload` (ADR 0006 E1): the leader builds a snapshot
+        /// now and uploads it to its backup location (`serve --backup-url`),
+        /// whatever `--backup-on` says, and answers once the `.meta` committed.
+        /// May be sent to any member: a follower forwards it to the leader.
+        async fn upload_snapshot(
+            &self,
+            request: tonic::Request<super::UploadSnapshotRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadSnapshotResponse>,
+            tonic::Status,
+        >;
+        /// `cluster backups` (ADR 0006): the committed backups (a `.meta` exists)
+        /// of this cluster in this node's backup location, newest first.
+        async fn list_backups(
+            &self,
+            request: tonic::Request<super::ListBackupsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListBackupsResponse>,
             tonic::Status,
         >;
     }
@@ -4902,6 +5026,94 @@ pub mod admin_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = UpdateAdvertiseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Admin/UploadSnapshot" => {
+                    #[allow(non_camel_case_types)]
+                    struct UploadSnapshotSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::UnaryService<super::UploadSnapshotRequest>
+                    for UploadSnapshotSvc<T> {
+                        type Response = super::UploadSnapshotResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UploadSnapshotRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::upload_snapshot(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UploadSnapshotSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Admin/ListBackups" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListBackupsSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::ListBackupsRequest>
+                    for ListBackupsSvc<T> {
+                        type Response = super::ListBackupsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListBackupsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::list_backups(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListBackupsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

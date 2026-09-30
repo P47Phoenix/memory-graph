@@ -51,6 +51,14 @@ service Admin {
   // learners unchanged). Idempotent: the address already in effect changes
   // nothing. May be sent to any member: a follower forwards it.
   rpc UpdateAdvertise(UpdateAdvertiseRequest) returns (UpdateAdvertiseResponse);
+  // `cluster snapshot --upload` (ADR 0006 E1): the leader builds a snapshot
+  // now and uploads it to its backup location (`serve --backup-url`),
+  // whatever `--backup-on` says, and answers once the `.meta` committed.
+  // May be sent to any member: a follower forwards it to the leader.
+  rpc UploadSnapshot(UploadSnapshotRequest) returns (UploadSnapshotResponse);
+  // `cluster backups` (ADR 0006): the committed backups (a `.meta` exists)
+  // of this cluster in this node's backup location, newest first.
+  rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
 }
 
 message StatusRequest {}
@@ -292,4 +300,39 @@ message UpdateAdvertiseResponse {
   // Log index of the membership change (the membership in effect when the
   // address was already this one).
   uint64 log_index = 1;
+}
+
+message UploadSnapshotRequest {}
+message UploadSnapshotResponse {
+  // The committed backup (the one uploaded, or a newer snapshot that
+  // superseded it while it was queued).
+  BackupEntry backup = 1;
+  // The node that uploaded it (the leader).
+  uint64 node_id = 2;
+}
+
+message ListBackupsRequest {}
+message ListBackupsResponse {
+  // The backup location, e.g. `s3://bucket/prefix` (never a secret).
+  string location = 1;
+  string cluster_id = 2;
+  // Newest (highest index) first.
+  repeated BackupEntry backups = 3;
+}
+
+// One committed backup: a `snap-T-I.redb` with its `.meta`.
+message BackupEntry {
+  // What `serve --bootstrap --restore` takes, e.g.
+  // `s3://bucket/prefix/<cluster_id>/snap-T-I.redb`.
+  string url = 1;
+  uint64 term = 2;
+  uint64 index = 3;
+  // From the `.meta`: the data object's size and lowercase hex SHA-256.
+  uint64 size = 4;
+  string sha256 = 5;
+  string extractors_hash = 6;
+  uint64 store_format_version = 7;
+  // Set when the `.meta` could not be read or parsed (the other fields
+  // from it are then empty); such a backup does not restore.
+  string error = 8;
 }
