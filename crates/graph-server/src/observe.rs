@@ -11,8 +11,7 @@
 //! pure-Rust gate's surface) unchanged and avoids hyper-util's server glue.
 //!
 //! Metric names are a contract (dashboards and alerts key on them), listed
-//! in [`METRIC_NAMES`] and documented in the README's observability
-//! section.
+//! in [`METRIC_NAMES`] and documented in docs/guide/observability.md.
 use crate::conn::ConnInfo;
 use crate::server::ShutdownHandle;
 use crate::services::Ctx;

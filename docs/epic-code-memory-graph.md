@@ -328,7 +328,7 @@ Design: ADR 0004 D7, D8.
 - Given the CI `cluster` job, When it spawns three binaries, kills the leader with SIGKILL mid-batch and restarts it, Then every acknowledged batch must be present on all nodes.
 
 **24. Observability and packaging (5 pts)**
-Status: Delivered in PR #121; see the README's Observability section and [docs/deploy/](deploy/kubernetes.md).
+Status: Delivered in PR #121; see [docs/guide/observability.md](guide/observability.md) (formerly the README's Observability section) and [docs/deploy/](deploy/kubernetes.md).
 As a database operator
 I want logs, metrics, health probes and ready-made deployments
 So that I can run the cluster in Docker Compose or Kubernetes and see what it is doing.
@@ -464,13 +464,13 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E1, E8, E10 (Accepted).
 - Given `cluster snapshot --upload` and `cluster backups [--json]`, When run, Then a snapshot must be uploaded on demand and the backups listed.
 
 **38. S3 e2e CI job and backup docs (3 pts)**
-Status: Delivered in PR #171 (CI job `s3-e2e` against SeaweedFS rather than MinIO, whose images can no longer be pulled from Docker Hub; `crates/graph-cli/tests/s3_e2e.rs`; docs in `docs/deploy/data-dir.md` and the README). With it stories 35-38 are delivered; 39 stays deferred with #104.
+Status: Delivered in PR #171 (CI job `s3-e2e` against SeaweedFS rather than MinIO, whose images can no longer be pulled from Docker Hub; `crates/graph-cli/tests/s3_e2e.rs`; docs in `docs/deploy/data-dir.md` and the README, whose walkthrough now lives in [docs/guide/cluster.md](guide/cluster.md#walkthrough-backups-to-s3-compatible-storage)). With it stories 35-38 are delivered; 39 stays deferred with #104.
 As a database operator
 I want backups tested against a real S3-compatible server and documented
 So that I can set them up with confidence.
 Design: [ADR 0006](adr/0006-snapshots-object-storage.md) testing (Accepted).
 - Given an S3-compatible server (SeaweedFS in CI; MinIO's image is no longer pullable) over plain HTTP on Linux, When the CI job runs upload, retention and restore, Then it must be green.
-- Given the docs, When read, Then they must cover the sidecar TLS recipe, bucket lifecycle rules and a minimal IAM policy, and the README walkthrough must work.
+- Given the docs, When read, Then they must cover the sidecar TLS recipe, bucket lifecycle rules and a minimal IAM policy, and the README walkthrough (now in docs/guide/cluster.md) must work.
 
 **39. Spike: native HTTPS for backups behind `backup-tls` (5 pts)**
 Status: **Deferred**, shared with #104 (TLS on the wire); it waits for a pure-Rust rustls crypto provider that passes the gate.
