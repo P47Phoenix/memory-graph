@@ -85,8 +85,10 @@ fn initialize_negotiates_one_of_the_supported_versions() {
 }
 
 #[test]
-fn an_unsupported_version_is_refused_with_the_supported_list() {
-    for v in ["2024-11-05", "1.0.0", ""] {
+fn an_unsupported_version_gets_the_latest_supported_one() {
+    // MCP lifecycle: the server answers with a version it supports; the
+    // client decides whether to go on.
+    for v in ["2024-11-05", "1.0.0", "", "2099-01-01"] {
         let mut s = server();
         let r = send(
             &mut s,
@@ -94,22 +96,77 @@ fn an_unsupported_version_is_refused_with_the_supported_list() {
                 .to_string(),
         )
         .unwrap();
-        assert_eq!(code(&r), INVALID_PARAMS, "{r}");
-        assert_eq!(r["error"]["message"], "Unsupported protocol version");
-        assert_eq!(r["error"]["data"]["requested"], v);
-        assert_eq!(
-            r["error"]["data"]["supported"],
-            json!(SUPPORTED_PROTOCOL_VERSIONS)
-        );
-        assert_eq!(s.protocol_version(), None, "still uninitialized");
+        assert_eq!(r["result"]["protocolVersion"], "2025-11-25", "{r}");
+        assert_eq!(s.protocol_version(), Some("2025-11-25"));
     }
+    // A missing or non-string version is still invalid params, exactly.
+    for params in [
+        "{}",
+        r#"{"protocolVersion":20250618}"#,
+        r#"{"protocolVersion":null}"#,
+    ] {
+        let mut s = server();
+        let r = send(
+            &mut s,
+            &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{params}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32602,
+                   "message": "initialize needs a string `protocolVersion`"}})
+        );
+        assert_eq!(s.protocol_version(), None);
+    }
+}
+
+#[test]
+fn exact_error_codes_and_objects() {
+    // The constants are the JSON-RPC and MCP numbers.
+    assert_eq!(
+        [
+            PARSE_ERROR,
+            INVALID_REQUEST,
+            METHOD_NOT_FOUND,
+            INVALID_PARAMS,
+            NOT_INITIALIZED
+        ],
+        [-32700, -32600, -32601, -32602, -32002]
+    );
     let mut s = server();
+    let r = send(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+    assert_eq!(
+        r,
+        json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32002,
+               "message": "`tools/list` before `initialize`: send initialize first"}})
+    );
+    init(&mut s);
+    let r = send(&mut s, r#"{"jsonrpc":"2.0","id":2,"method":"nope"}"#).unwrap();
+    assert_eq!(
+        r,
+        json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -32601,
+               "message": "method `nope` not found; this server has initialize, ping, tools/list and tools/call"}})
+    );
+    let r = send(&mut s, "[]").unwrap();
+    assert_eq!(
+        r,
+        json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600,
+               "message": "JSON-RPC batches are not supported (MCP 2025-06-18 and later send one message at a time)"}})
+    );
+    let r = send(&mut s, "{").unwrap();
+    assert_eq!(r["id"], Value::Null);
+    assert_eq!(r["error"]["code"], -32700);
+    assert!(r["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("parse error: "));
     let r = send(
         &mut s,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}}"#,
     )
     .unwrap();
-    assert_eq!(code(&r), INVALID_PARAMS);
+    assert_eq!(r["error"]["code"], -32602);
+    assert_eq!(r["id"], 3);
 }
 
 #[test]
@@ -247,6 +304,28 @@ fn tools_call_errors() {
     // Absent arguments are an empty object.
     let r = call(&mut s, json!({"name": "list_repos"}));
     assert_eq!(r["result"]["isError"], false, "{r}");
+    // Bad arguments of a known tool are a tool execution error the model
+    // can read (SEP-1303), listing the valid values.
+    for args in [
+        json!({"text": "x", "grain": "function"}),
+        json!({"text": "x", "limit": 501}),
+        json!({"text": "x", "colour": 1}),
+    ] {
+        let r = call(&mut s, json!({"name": "search", "arguments": args}));
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        let body: Value =
+            serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["code"], "invalid_params");
+        assert_eq!(body["retryable"], false);
+    }
+    let r = call(
+        &mut s,
+        json!({"name": "file_tokens", "arguments": {"org": "o", "repo": "r", "path": "p", "start_line": 3, "end_line": 2}}),
+    );
+    assert!(r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("start_line 3 is after end_line 2"));
     // Store errors are isError results with a typed code.
     let mut s = McpServer::new(
         Fake(Some(|| {
@@ -449,13 +528,22 @@ proptest! {
                          "params": {"name": name, "arguments": args}});
         let reply: Value = serde_json::from_str(&s.handle_bytes(msg.to_string().as_bytes()).unwrap()).unwrap();
         prop_assert_eq!(&reply["id"], &json!(1));
-        if reply.get("result").is_some() {
-            // Accepted input fits the tool's inputSchema.
-            let schema = graph_mcp::tools::input_schema(name).unwrap();
-            prop_assert!(args.is_null() || graph_mcp::schema::validate(&schema, &args).is_ok()
-                || args.as_object().is_some_and(|o| o.values().any(Value::is_null)),
-                "{} accepted {}", name, args);
+        let known = name != "x";
+        let obj = args.is_null() || args.is_object();
+        if let Some(res) = reply.get("result") {
+            prop_assert!(known && obj, "{}", reply);
+            if res["isError"] == json!(false) {
+                // Accepted input fits the tool's inputSchema.
+                let schema = graph_mcp::tools::input_schema(name).unwrap();
+                let a = if args.is_null() { json!({}) } else { args.clone() };
+                prop_assert!(graph_mcp::schema::validate(&schema, &a).is_ok(), "{} accepted {}", name, args);
+            } else {
+                let body: Value = serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+                prop_assert_eq!(&body["code"], &json!("invalid_params"));
+                prop_assert_eq!(&body["retryable"], &json!(false));
+            }
         } else {
+            prop_assert!(!known || !obj, "{}", reply);
             prop_assert!(reply["error"]["code"] == json!(INVALID_PARAMS), "{}", reply);
         }
     }

@@ -73,7 +73,7 @@ Edit `claude_desktop_config.json` (Settings > Developer > Edit Config; on macOS 
 }
 ```
 
-On Windows use `memory-graph.exe` and escaped backslashes (`"C:\\tools\\memory-graph.exe"`, `"C:\\data\\graph.redb"`). For a server, the args are `["--server", "127.0.0.1:7000", "mcp"]`, optionally with `"--read", "linearizable"` before `mcp`.
+On Windows give the full path to `memory-graph.exe` as `command` (clients do not always search `PATH` for it), with escaped backslashes: `"C:\\tools\\memory-graph.exe"`, `"C:\\data\\graph.redb"`. The same holds for Claude Code's `.mcp.json` on Windows. A launcher that is itself a script (an `npx`-based one, or anything installed as a `.cmd`) cannot be started directly by some clients; wrap it as `"command": "cmd", "args": ["/c", "C:\\path\\launcher.cmd", ...]`. `memory-graph.exe` is a plain executable and needs no wrapper. For a server, the args are `["--server", "127.0.0.1:7000", "mcp"]`, optionally with `"--read", "linearizable"` before `mcp`.
 
 ### Other clients
 
@@ -81,7 +81,7 @@ Any MCP client with a stdio transport works: the command is `memory-graph`, the 
 
 ## Protocol
 
-- MCP revisions **2025-11-25** and **2025-06-18** (the latest stable one at build time and the one before it). Another `protocolVersion` in `initialize` is refused with JSON-RPC error `-32602` "Unsupported protocol version" and `data: {supported, requested}`.
+- MCP revisions **2025-11-25** and **2025-06-18** (the latest stable one at build time and the one before it). A client asking for another `protocolVersion` gets a normal `initialize` result carrying 2025-11-25, as the MCP lifecycle prescribes; the client then disconnects if it cannot speak that. A missing or non-string `protocolVersion` is JSON-RPC error `-32602`.
 - One JSON-RPC 2.0 message per line on stdin, one reply per line on stdout. Batches are refused (`-32600`), as MCP dropped them in 2025-06-18. Ids are strings or integers.
 - Methods: `initialize`, `ping`, `tools/list`, `tools/call`; notifications `notifications/initialized` and `notifications/cancelled` (accepted; requests are answered one at a time, so a cancelled request has already finished). Before `initialize` only `initialize` and `ping` are answered (`-32002` otherwise).
 - **stdout carries only protocol messages.** Logs and errors go to stderr.
@@ -102,11 +102,15 @@ All seven are read-only (`readOnlyHint: true`), address things by org, repo and 
 
 A span is `{start, end, start_line, start_col, end_line, end_col}`: byte offsets `[start, end)` and 1-based lines and columns, as in the CLI's `--json`.
 
-**Paging.** List tools take `limit` (default 50, at most 500) and `offset` (default 0) and answer `{items, next_offset, stale_possible}`. `next_offset` is the `offset` of the next page, or `null` at the end. Each page is read from the database as it is at that moment (there is no snapshot across pages in v1). A page whose items would exceed 4 MiB is cut short, with `next_offset` pointing at the first item left out.
+**Paging.** List tools take `limit` (default 50, at most 500; `file_tokens` at most 20000) and `offset` (default 0, at most 4294967295) and answer `{items, next_offset, stale_possible}`. `next_offset` is the `offset` of the next page, or `null` at the end. Each page is read from the database as it is at that moment (there is no snapshot across pages in v1). A page whose items would exceed 4 MiB is cut short, with `next_offset` pointing at the first item left out.
 
 **`stale_possible`** is `true` when a read of that call went to a server node that may have missed acknowledged writes (ADR 0004 D8). It is always `false` with `--db`.
 
-**Errors.**
-- Arguments that do not fit the `inputSchema` (a wrong type, an unknown argument, `limit` above 500, an unknown `grain` or `token_class`) are a JSON-RPC `-32602` error; the message lists the valid values.
-- Arguments that name something not indexed (an org, repo, language, symbol kind or file) are a result with `isError: true` and a text block `{"code": "invalid_argument", "message": ..., "retryable": false}`; the message lists what is present.
-- A store error is a result with `isError: true` and `{code, message, retryable}`, the code being the error kind (`no_leader`, `locked`, `corrupt`, `rejected`, ...). `no_leader` is retryable and carries `retry_after_ms`.
+**Arguments.** An optional argument may be left out or given as `null` (the same thing). Integers may also be written as integral floats (`5.0`).
+
+**Errors.** Every refusal of a call to a known tool is a tool result with `isError: true` (a tool execution error, so the model sees it and can correct the call) whose text block is `{"code", "message", "retryable"}`:
+- `invalid_params`: the arguments do not fit the `inputSchema` (a wrong type, an unknown argument, `limit` out of range, an unknown `grain` or `token_class`, `start_line` after `end_line`, `symbol_kind` with a grain that cannot hold it). The message lists the valid values.
+- `invalid_argument`: the arguments name something not indexed (an org, repo, language, symbol kind or file). The message lists what is present.
+- A store error has its kind as the code (`no_leader`, `locked`, `corrupt`, `rejected`, ...). `unavailable` is a lost connection to the server (a transport error, a deadline, the server unreachable). `no_leader`, `not_leader` and `unavailable` are retryable; `no_leader` carries `retry_after_ms`.
+
+An unknown tool name and a malformed request (bad JSON, a batch, a bad id, a non-object `arguments`) are JSON-RPC errors instead.

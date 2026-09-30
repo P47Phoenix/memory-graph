@@ -50,7 +50,6 @@ fn cases() -> Vec<(&'static str, Value)> {
         ("describe", json!({})),
         ("describe", json!({"org": "acme"})),
         ("describe", json!({"org": "acme", "repo": "geo"})),
-        ("describe", json!({"org": "nobody"})),
         ("list_repos", json!({})),
         ("list_repos", json!({"org": "acme"})),
         ("list_repos", json!({"limit": 1, "offset": 1})),
@@ -281,8 +280,8 @@ fn check_refusals(c: &mut Client<StoreBackend>) {
     // A store refusal (an ambiguous pattern) is a typed isError result.
     let e = c.tool_error("find_symbols", json!({"pattern": "**"}));
     assert_eq!(e["code"], "rejected", "{e}");
-    let e = c.rpc_error("search", json!({"text": "x", "grain": "function"}));
-    assert_eq!(e["code"], graph_mcp::INVALID_PARAMS);
+    let e = c.tool_error("search", json!({"text": "x", "grain": "function"}));
+    assert_eq!(e["code"], "invalid_params");
     assert!(
         e["message"]
             .as_str()
@@ -290,7 +289,17 @@ fn check_refusals(c: &mut Client<StoreBackend>) {
             .contains("token, symbol, method"),
         "{e}"
     );
-    let e = c.rpc_error("search", json!({"text": "x", "limit": 501}));
+    let e = c.tool_error("search", json!({"text": "x", "limit": 501}));
+    assert_eq!(e["code"], "invalid_params");
+    for args in [
+        json!({"org": "nobody"}),
+        json!({"org": "acme", "repo": "nope"}),
+    ] {
+        let e = c.tool_error("describe", args);
+        assert_eq!(e["code"], "invalid_argument");
+        assert!(e["message"].as_str().unwrap().contains("acme/geo"), "{e}");
+    }
+    let e = c.rpc_error("nope", json!({}));
     assert_eq!(e["code"], graph_mcp::INVALID_PARAMS);
 }
 
@@ -319,7 +328,7 @@ fn remote_tools_equal_store_read_and_the_embedded_answers() {
         let store = open_store(&db, rust()).unwrap();
         expected(&*store)
     };
-    let server = TestServer::start(&db, rust());
+    let mut server = TestServer::start(&db, rust());
     let oracle_client = RemoteStore::connect(ClientConfig::new(server.endpoint())).unwrap();
     assert_eq!(
         cases()
@@ -329,7 +338,9 @@ fn remote_tools_equal_store_read_and_the_embedded_answers() {
         want,
         "StoreRead over the wire equals StoreRead embedded"
     );
-    let store = RemoteStore::connect(ClientConfig::new(server.endpoint())).unwrap();
+    let mut cfg = ClientConfig::new(server.endpoint());
+    cfg.retry.budget = std::time::Duration::from_millis(500);
+    let store = RemoteStore::connect(cfg).unwrap();
     let log = store.read_log();
     let mut c = Client::new(StoreBackend::remote(
         Box::new(store),
@@ -337,6 +348,11 @@ fn remote_tools_equal_store_read_and_the_embedded_answers() {
     ));
     check(&mut c, &want, "remote");
     check_refusals(&mut c);
+    // A connection lost mid-session is retryable, not a storage failure.
+    server.stop();
+    let e = c.tool_error("describe", json!({}));
+    assert_eq!(e["code"], "unavailable", "{e}");
+    assert_eq!(e["retryable"], true);
 }
 
 /// `stale_possible` is per call: set only when a read of that call was.

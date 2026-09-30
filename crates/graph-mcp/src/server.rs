@@ -215,19 +215,14 @@ impl<B: McpBackend> McpServer<B> {
                 ))
             }
         };
-        let Some(v) = SUPPORTED_PROTOCOL_VERSIONS
+        // MCP lifecycle: a supported version is echoed; for any other the
+        // server answers with the latest one it supports, and the client
+        // disconnects if it cannot speak that.
+        let v = SUPPORTED_PROTOCOL_VERSIONS
             .iter()
-            .find(|v| **v == requested)
-        else {
-            return Err((
-                INVALID_PARAMS,
-                "Unsupported protocol version".into(),
-                Some(json!({
-                    "supported": SUPPORTED_PROTOCOL_VERSIONS,
-                    "requested": requested,
-                })),
-            ));
-        };
+            .copied()
+            .find(|v| *v == requested)
+            .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0]);
         self.protocol = Some(v);
         Ok(json!({
             "protocolVersion": v,
@@ -270,7 +265,7 @@ impl<B: McpBackend> McpServer<B> {
                     "isError": false
                 }))
             }
-            Err(ToolError::InvalidParams(m)) => Err((INVALID_PARAMS, m, None)),
+            Err(ToolError::UnknownTool(m)) => Err((INVALID_PARAMS, m, None)),
             Err(e) => {
                 let body = error_body(&e).expect("not invalid params");
                 let text = serde_json::to_string(&body).expect("a Value serializes");
