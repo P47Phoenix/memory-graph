@@ -109,6 +109,7 @@ pub const CASES: &[(&str, Case)] = &[
         "encoding_hint_strict_and_binary",
         encoding_hint_strict_and_binary,
     ),
+    ("batch_level_encoding_hint", batch_level_encoding_hint),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -3201,6 +3202,63 @@ fn encoding_hint_strict_and_binary(h: &Harness) {
             .unwrap();
         assert_eq!(st.language, "python", "{path}");
     }
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
+}
+
+/// A batch-level `IndexOptions::encoding` is the hint of every file without
+/// its own (ADR 0007 C8), on `index_batch` and on `prepare`; a file's own
+/// hint wins. A `utf-8`-hinted lossy file lists with `lossy` and no
+/// `encoding` (absent means UTF-8).
+fn batch_level_encoding_hint(h: &Harness) {
+    let s = open(h);
+    let latin = legacy("caf\u{e9} au lait\n", encoding_rs::WINDOWS_1252);
+    let opts = IndexOptions {
+        encoding: Some(encoding_rs::UTF_8),
+        ..Default::default()
+    };
+    let files = [
+        BatchFile {
+            path: "batch.txt",
+            bytes: &latin,
+            ..Default::default()
+        },
+        BatchFile {
+            path: "own.txt",
+            bytes: &latin,
+            encoding: Some(encoding_rs::WINDOWS_1252),
+            ..Default::default()
+        },
+    ];
+    let out = s.index_batch("o", "r", &files, opts).unwrap();
+    let prepared = prepare_all(&*s, "p", &files, opts);
+    let out2 = s.index_prepared("o", "p", prepared, opts).unwrap();
+    for st in out.iter().chain(&out2) {
+        let st = st.as_ref().unwrap();
+        let f = file_node(&*s, st);
+        if st.path == "batch.txt" {
+            assert_eq!((f.encoding.as_deref(), f.lossy), (None, true), "{st:?}");
+        } else {
+            assert_eq!(
+                (f.encoding.as_deref(), f.lossy),
+                (Some("windows-1252"), false),
+                "{st:?}"
+            );
+        }
+    }
+    // Listing the repo shows the lossy UTF-8 file as such.
+    let repo = s
+        .roots()
+        .unwrap()
+        .into_iter()
+        .flat_map(|o| s.children(o.id).unwrap())
+        .find(|r| r.name == "r")
+        .unwrap();
+    let listed = s.children(repo.id).unwrap();
+    let lossy = listed.iter().find(|n| n.name == "batch.txt").unwrap();
+    assert!(lossy.lossy && lossy.encoding.is_none(), "{lossy:?}");
     assert_eq!(
         s.describe(None, None).unwrap(),
         s.describe_by_scan(None, None).unwrap()
