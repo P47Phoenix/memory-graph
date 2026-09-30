@@ -6,6 +6,8 @@
 //! knows how tokens are stored: that is `v2.rs`.
 use crate::api::{Prepared, PreparedFile};
 use crate::{BatchFile, IndexOptions, IngestStats, RepoInfo, StoreError};
+use encoding_rs as encoding;
+use graph_core::encoding::{Encoding, DECODER_VERSION};
 use graph_core::{normalize_path, Extraction, Node, NodeId, NodeKind, Registry, SymbolKind};
 use redb::{
     DatabaseError, MultimapTableDefinition, ReadTransaction, ReadableTable, TableDefinition,
@@ -110,19 +112,36 @@ pub(crate) fn validate_spans(ex: &Extraction) -> Result<()> {
     Ok(())
 }
 
-/// Fingerprint of `bytes` indexed as `lang` with `registry`'s extractor.
-/// Pure, so it can run on any thread.
-pub(crate) fn fingerprint(registry: &Registry, bytes: &[u8], lang: &str) -> String {
+/// Fingerprint of `bytes` indexed as `lang` with `registry`'s extractor,
+/// decoded from `encoding` (ADR 0007 C7). A clean UTF-8 decode adds nothing,
+/// so a UTF-8 file's fingerprint is what it always was; any other decode
+/// appends `|enc=<WHATWG name>[+lossy]@<DECODER_VERSION>`. The hash is of the
+/// raw bytes either way. Pure, so it can run on any thread.
+pub(crate) fn fingerprint(
+    registry: &Registry,
+    bytes: &[u8],
+    lang: &str,
+    encoding: &'static Encoding,
+    lossy: bool,
+) -> String {
     use sha2::{Digest, Sha256};
     let hash: String = Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    format!(
+    let mut fp = format!(
         "sha256:{hash}|{}|{}|{FINGERPRINT_FORMAT_VERSION}",
         lang.to_ascii_lowercase(),
         registry.version(lang)
-    )
+    );
+    if encoding != encoding::UTF_8 || lossy {
+        fp.push_str(&format!(
+            "|enc={}{}@{DECODER_VERSION}",
+            encoding.name(),
+            if lossy { "+lossy" } else { "" }
+        ));
+    }
+    fp
 }
 
 /// Whether the file stored under org/repo/path (as of `rt`) carries `fp`.
@@ -217,7 +236,9 @@ pub(crate) fn check_unchanged(
 }
 
 /// The pure half of indexing one file (see [`crate::Store::prepare`]): size
-/// and UTF-8 checks, path normalization, language detection, fingerprint,
+/// and binary checks, decoding (ADR 0007 C2: the one decode site of every
+/// write path), path normalization, language detection on the decoded text,
+/// fingerprint,
 /// then extraction and span validation, unless `unchanged(path, lang, fp)`
 /// says the stored copy already carries this fingerprint (asked only without
 /// `reindex`). Per-file rejections land in the result; only an error from
@@ -241,20 +262,40 @@ pub(crate) fn prepare_file(
         origin: f.origin.map(Into::into),
         work: Prepared::Rejected(StoreError::Rejected(String::new())),
         v2: None,
+        encoding: None,
+        lossy: false,
+        hint: None,
+        strict_encoding: false,
     };
     if f.bytes.len() > MAX_SOURCE_BYTES {
         p.work = Prepared::Rejected(StoreError::TooLarge(format!("`{}`", f.path)));
         return Ok(p);
     }
-    let Ok(src) = std::str::from_utf8(f.bytes) else {
-        p.work = Prepared::Rejected(StoreError::NotUtf8(format!("`{}`", f.path)));
+    let hint = f.encoding.or(opts.encoding);
+    let strict = f.strict_encoding || opts.strict_encoding;
+    if graph_core::encoding::is_binary_with_hint(f.bytes, hint) {
+        p.work = Prepared::Rejected(StoreError::Binary(format!("`{}`", f.path)));
         return Ok(p);
-    };
+    }
+    let decoded = graph_core::encoding::decode(f.bytes, hint);
+    if strict && decoded.lossy {
+        p.work = Prepared::Rejected(strict_refusal(f.path, decoded.encoding));
+        return Ok(p);
+    }
+    let src: &str = &decoded.text;
     p.language = f.language.map_or_else(
         || registry.detect_language(&p.path, src),
         str::to_ascii_lowercase,
     );
-    p.fingerprint = fingerprint(registry, f.bytes, &p.language);
+    p.fingerprint = fingerprint(
+        registry,
+        f.bytes,
+        &p.language,
+        decoded.encoding,
+        decoded.lossy,
+    );
+    p.encoding = (decoded.encoding != encoding::UTF_8).then_some(decoded.encoding);
+    p.lossy = decoded.lossy;
     p.work = if !opts.reindex && unchanged(&p.path, &p.language, &p.fingerprint)? {
         // Keep the source: if the file changed by commit time, the commit
         // extracts it after all (as `index_batch` would have).
@@ -263,6 +304,21 @@ pub(crate) fn prepare_file(
         extract_checked(registry, &p.path, &p.language, src)
     };
     Ok(p)
+}
+
+/// The per-file refusal of a lossy decode under `strict_encoding` (ADR 0007
+/// C3, C8): today's `NotUtf8` when the file was decoded as UTF-8 (a `utf-8`
+/// hint or a UTF-8 BOM), so `--encoding utf-8 --strict-encoding` reproduces
+/// the old refusal exactly; a `Rejected` naming the encoding otherwise.
+fn strict_refusal(path: &str, encoding: &'static Encoding) -> StoreError {
+    if encoding == encoding::UTF_8 {
+        StoreError::NotUtf8(format!("`{path}`"))
+    } else {
+        StoreError::Rejected(format!(
+            "`{path}` has byte sequences that are invalid in {} (strict encoding)",
+            encoding.name()
+        ))
+    }
 }
 
 /// Extract and validate spans, so a bad file only fails itself.
@@ -537,6 +593,7 @@ pub(crate) fn describe_in(
 /// has that shape. Anchored on the known language and format version, so
 /// a `|` inside the language or the version cannot shift the fields.
 pub(crate) fn fingerprint_extractor_version<'a>(fp: &'a str, lang: &str) -> Option<&'a str> {
+    let fp = strip_encoding_suffix(fp);
     let rest = fp.strip_prefix("sha256:")?;
     // The hash is hex: its end is the first `|`.
     let (_, rest) = rest.split_once('|')?;
@@ -544,6 +601,29 @@ pub(crate) fn fingerprint_extractor_version<'a>(fp: &'a str, lang: &str) -> Opti
     let rest = rest.strip_prefix('|')?;
     let suffix = format!("|{FINGERPRINT_FORMAT_VERSION}");
     rest.strip_suffix(suffix.as_str())
+}
+
+/// `fp` without its optional `|enc=<name>[+lossy]@<decoder version>` suffix
+/// (ADR 0007 C7). Only a well-formed suffix is removed: a WHATWG name (no
+/// `|`), an optional `+lossy`, `@` and a decimal version.
+fn strip_encoding_suffix(fp: &str) -> &str {
+    let Some(at) = fp.rfind("|enc=") else {
+        return fp;
+    };
+    let tail = &fp[at + "|enc=".len()..];
+    let Some((name, version)) = tail.rsplit_once('@') else {
+        return fp;
+    };
+    let name = name.strip_suffix("+lossy").unwrap_or(name);
+    let well_formed = !name.is_empty()
+        && !name.contains(['|', '@'])
+        && !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit());
+    if well_formed {
+        &fp[..at]
+    } else {
+        fp
+    }
 }
 
 /// [`crate::Store::extractor_gaps`] inside the caller's read transaction.
@@ -634,16 +714,124 @@ mod tests {
     use super::*;
     use graph_core::{Extractor, Span, SymbolDecl, TokenDecl};
 
+    fn file_node(encoding: Option<&str>, lossy: bool) -> Node {
+        Node {
+            id: 3,
+            parent: Some(2),
+            kind: NodeKind::File,
+            name: "src/a.cs".into(),
+            language: Some("csharp".into()),
+            symbol_kind: None,
+            lang_kind: None,
+            token_class: None,
+            has_errors: false,
+            origin: Some("directory".into()),
+            fingerprint: Some("sha256:ab|csharp|1|1".into()),
+            encoding: encoding.map(Into::into),
+            lossy,
+            span: None,
+        }
+    }
+
+    /// ADR 0007 C6 golden bytes: a UTF-8 File node serializes exactly as it
+    /// did before schema 11 (no `encoding`, no `lossy`), and the new fields
+    /// appear, in a fixed place, only for a non-UTF-8 or lossy decode.
+    #[test]
+    fn file_node_golden_bytes() {
+        let utf8 = br#"{"id":3,"parent":2,"kind":"file","name":"src/a.cs","language":"csharp","symbol_kind":null,"lang_kind":null,"token_class":null,"has_errors":false,"origin":"directory","fingerprint":"sha256:ab|csharp|1|1","span":null}"#;
+        assert_eq!(enc(&file_node(None, false)), utf8.to_vec());
+        let le = br#"{"id":3,"parent":2,"kind":"file","name":"src/a.cs","language":"csharp","symbol_kind":null,"lang_kind":null,"token_class":null,"has_errors":false,"origin":"directory","fingerprint":"sha256:ab|csharp|1|1","encoding":"UTF-16LE","span":null}"#;
+        assert_eq!(enc(&file_node(Some("UTF-16LE"), false)), le.to_vec());
+        let lossy = br#"{"id":3,"parent":2,"kind":"file","name":"src/a.cs","language":"csharp","symbol_kind":null,"lang_kind":null,"token_class":null,"has_errors":false,"origin":"directory","fingerprint":"sha256:ab|csharp|1|1","encoding":"windows-1252","lossy":true,"span":null}"#;
+        assert_eq!(enc(&file_node(Some("windows-1252"), true)), lossy.to_vec());
+        // Each reads back as itself; a v10 record (no fields) reads as UTF-8.
+        for (bytes, want) in [
+            (&utf8[..], file_node(None, false)),
+            (&le[..], file_node(Some("UTF-16LE"), false)),
+            (&lossy[..], file_node(Some("windows-1252"), true)),
+        ] {
+            assert_eq!(dec(bytes).unwrap(), want);
+        }
+    }
+
+    /// An encoding name `encoding_rs` does not know (or a label that is not
+    /// the canonical name, or `replacement`) in a stored File node is a
+    /// corrupt record, never a panic.
+    #[test]
+    fn unknown_stored_encoding_is_corrupt() {
+        for name in ["EBCDIC-9000", "latin1", "utf-16le", "replacement", ""] {
+            let json = String::from_utf8(enc(&file_node(None, false)))
+                .unwrap()
+                .replace(
+                    r#""span":null"#,
+                    &format!(r#""encoding":"{name}","span":null"#),
+                );
+            assert!(
+                matches!(dec(json.as_bytes()), Err(StoreError::Corrupt(m)) if m.contains("encoding")),
+                "{name}"
+            );
+        }
+        let json = String::from_utf8(enc(&file_node(None, false)))
+            .unwrap()
+            .replace(r#""span":null"#, r#""encoding":7,"span":null"#);
+        assert!(matches!(dec(json.as_bytes()), Err(StoreError::Corrupt(_))));
+    }
+
+    /// ADR 0007 C7: a clean UTF-8 decode leaves the fingerprint exactly as
+    /// before (no forced re-index); anything else gets the suffix.
+    #[test]
+    fn utf8_fingerprint_is_unchanged() {
+        let r = Registry::default();
+        let v = r.version("text");
+        assert_eq!(
+            fingerprint(&r, b"x", "text", encoding::UTF_8, false),
+            format!(
+                "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881|text|{v}|{FINGERPRINT_FORMAT_VERSION}"
+            )
+        );
+        assert_eq!(
+            fingerprint(&r, b"x", "text", encoding::UTF_16BE, false),
+            format!(
+                "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881|text|{v}|{FINGERPRINT_FORMAT_VERSION}|enc=UTF-16BE@{DECODER_VERSION}"
+            )
+        );
+        assert!(fingerprint(&r, b"x", "text", encoding::WINDOWS_1252, true)
+            .ends_with(&format!("|enc=windows-1252+lossy@{DECODER_VERSION}")));
+    }
     #[test]
     fn fingerprint_extractor_version_parses_the_fingerprint_shape() {
         let r = Registry::default();
-        let fp = fingerprint(&r, b"x", "Toy");
+        let fp = fingerprint(&r, b"x", "Toy", encoding::UTF_8, false);
         assert_eq!(
             fingerprint_extractor_version(&fp, "toy"),
             Some(r.version("toy").as_str())
         );
+        // The encoding suffix (ADR 0007 C7) is tolerated, lossy or not.
+        for (e, lossy) in [
+            (encoding::UTF_16LE, false),
+            (encoding::SHIFT_JIS, true),
+            (encoding::UTF_8, true),
+        ] {
+            let fp = fingerprint(&r, b"x", "Toy", e, lossy);
+            assert!(fp.contains("|enc="), "{fp}");
+            assert_eq!(
+                fingerprint_extractor_version(&fp, "toy"),
+                Some(r.version("toy").as_str()),
+                "{fp}"
+            );
+        }
+        let f = FINGERPRINT_FORMAT_VERSION;
+        assert_eq!(
+            fingerprint_extractor_version(&format!("sha256:ab|toy|v|{f}|enc=UTF-16BE@1"), "toy"),
+            Some("v")
+        );
+        // A malformed suffix is not stripped, so the shape does not match.
+        assert_eq!(
+            fingerprint_extractor_version(&format!("sha256:ab|toy|v|{f}|enc=x@y"), "toy"),
+            None
+        );
         // A `|` in the language or the version does not shift the fields.
-        let fp = fingerprint(&r, b"x", "a|b");
+        let fp = fingerprint(&r, b"x", "a|b", encoding::UTF_8, false);
         assert_eq!(
             fingerprint_extractor_version(&fp, "a|b"),
             Some(r.version("a|b").as_str())
@@ -787,16 +975,22 @@ mod tests {
         let bare = Registry::default();
         let mut rust = Registry::default();
         rust.register(Box::new(graph_lang_rust::RustExtractor));
-        let fp_fallback = fingerprint(&bare, b"fn f() {}\n", "rust");
-        let fp_rust = fingerprint(&rust, b"fn f() {}\n", "rust");
+        let fp_fallback = fingerprint(&bare, b"fn f() {}\n", "rust", encoding::UTF_8, false);
+        let fp_rust = fingerprint(&rust, b"fn f() {}\n", "rust", encoding::UTF_8, false);
         assert_ne!(fp_fallback, fp_rust);
         assert!(fp_rust.contains(&graph_lang_rust::RustExtractor.version()));
         assert!(fp_fallback.contains(graph_core::FALLBACK_EXTRACTOR_VERSION));
         let tok = format!("tok{}", graph_core::tokenizer::TOKENIZER_VERSION);
         assert!(fp_rust.contains(&tok) && fp_fallback.contains(&tok));
         // Content, language (case-folded) and the scheme version all count.
-        assert_ne!(fp_rust, fingerprint(&rust, b"fn g() {}\n", "rust"));
-        assert_eq!(fp_rust, fingerprint(&rust, b"fn f() {}\n", "RUST"));
+        assert_ne!(
+            fp_rust,
+            fingerprint(&rust, b"fn g() {}\n", "rust", encoding::UTF_8, false)
+        );
+        assert_eq!(
+            fp_rust,
+            fingerprint(&rust, b"fn f() {}\n", "RUST", encoding::UTF_8, false)
+        );
         assert!(fp_rust.ends_with(&format!("|{FINGERPRINT_FORMAT_VERSION}")));
     }
 
@@ -814,6 +1008,8 @@ mod tests {
             has_errors: false,
             origin: None,
             fingerprint: None,
+            encoding: None,
+            lossy: false,
             span: None,
         };
         assert_eq!(kind_label(&n), "type/struct");

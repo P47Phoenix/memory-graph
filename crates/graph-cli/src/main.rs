@@ -1812,7 +1812,10 @@ fn run() -> Result<i32> {
                 &bytes,
                 language.as_deref(),
                 None,
-                IndexOptions { reindex },
+                IndexOptions {
+                    reindex,
+                    ..Default::default()
+                },
             )?;
             let lang = st.language.clone();
             out!(
@@ -2290,6 +2293,7 @@ mod chunk_bytes_flag_tests {
                 bytes: s.as_bytes(),
                 language: Some("poison"),
                 origin: None,
+                ..Default::default()
             })
             .collect()
     }

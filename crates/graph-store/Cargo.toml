@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 graph-core = { path = "../graph-core" }
+encoding_rs.workspace = true
 redb.workspace = true
 serde.workspace = true
 sha2.workspace = true

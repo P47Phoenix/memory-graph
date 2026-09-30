@@ -48,10 +48,21 @@ fn main() {
                 bytes: c.as_bytes(),
                 language: Some("rust"),
                 origin: None,
+                ..Default::default()
             })
             .collect();
         let t = std::time::Instant::now();
-        let r = Store::index_batch(&s, "o", "r", &batch, IndexOptions { reindex: true }).unwrap();
+        let r = Store::index_batch(
+            &s,
+            "o",
+            "r",
+            &batch,
+            IndexOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         toks = r.iter().map(|x| x.as_ref().unwrap().tokens).sum();
         let before = size();
         let v = s.vacuum().unwrap();

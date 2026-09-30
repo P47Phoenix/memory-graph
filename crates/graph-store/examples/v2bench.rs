@@ -170,6 +170,7 @@ fn main() {
                     bytes: f.src.as_bytes(),
                     language: None,
                     origin: Some("directory"),
+                    ..Default::default()
                 })
                 .collect();
             for r in s

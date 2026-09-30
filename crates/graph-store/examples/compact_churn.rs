@@ -44,9 +44,20 @@ fn main() {
             bytes: c.as_bytes(),
             language: Some("rust"),
             origin: Some(ORIGIN_DIRECTORY),
+            ..Default::default()
         })
         .collect();
-    Store::index_batch(&s, "o", "r", &batch, IndexOptions { reindex: false }).unwrap();
+    Store::index_batch(
+        &s,
+        "o",
+        "r",
+        &batch,
+        IndexOptions {
+            reindex: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     println!(
         "index all {} files: {:.2} MiB ({} bytes)",
         files.len(),

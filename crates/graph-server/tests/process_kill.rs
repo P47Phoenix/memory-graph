@@ -104,6 +104,7 @@ fn a_killed_server_process_keeps_every_acked_write() {
             bytes: &f.1,
             language: None,
             origin: None,
+            ..Default::default()
         }];
         graph_store::Store::index_batch(&c, "o", "r", &one, Default::default()).unwrap();
     }

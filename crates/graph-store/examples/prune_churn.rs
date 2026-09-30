@@ -44,9 +44,20 @@ fn main() {
             bytes: c.as_bytes(),
             language: Some("rust"),
             origin: Some(ORIGIN_DIRECTORY),
+            ..Default::default()
         })
         .collect();
-    Store::index_batch(&s, "o", "r", &batch, IndexOptions { reindex: false }).unwrap();
+    Store::index_batch(
+        &s,
+        "o",
+        "r",
+        &batch,
+        IndexOptions {
+            reindex: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let all: HashSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
     println!(
         "round 0 (index all {} files): {:.2} MiB",
@@ -76,7 +87,17 @@ fn main() {
         );
 
         // Restore the full set.
-        Store::index_batch(&s, "o", "r", &batch, IndexOptions { reindex: false }).unwrap();
+        Store::index_batch(
+            &s,
+            "o",
+            "r",
+            &batch,
+            IndexOptions {
+                reindex: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let before_vacuum = size();
         let v = s.vacuum().unwrap();
         println!(

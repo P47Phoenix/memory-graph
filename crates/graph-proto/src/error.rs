@@ -9,7 +9,7 @@
 //!
 //! | `StoreError`                                                | gRPC code             |
 //! |-------------------------------------------------------------|-----------------------|
-//! | `Rejected`, `NotUtf8`, `TooLarge`, `InvalidSpan`, `Schema`, `AlreadyApplied` | `INVALID_ARGUMENT` |
+//! | `Rejected`, `NotUtf8`, `Binary`, `TooLarge`, `InvalidSpan`, `Schema`, `AlreadyApplied` | `INVALID_ARGUMENT` |
 //! | `Locked`, not-leader, no-leader                             | `UNAVAILABLE`         |
 //! | `SchemaMismatch`, `LegacyFormat`, `SnapshotExpired`, `WrongCluster`, protocol | `FAILED_PRECONDITION` |
 //! | `Corrupt`                                                   | `DATA_LOSS`           |
@@ -162,6 +162,7 @@ impl WireError {
             WireError::Store(e) => match e {
                 StoreError::Rejected(_)
                 | StoreError::NotUtf8(_)
+                | StoreError::Binary(_)
                 | StoreError::TooLarge(_)
                 | StoreError::InvalidSpan(_)
                 | StoreError::Schema(_)
@@ -212,6 +213,7 @@ impl WireError {
                     K::Rejected(d::Rejected { msg: e.to_string() })
                 }
                 StoreError::NotUtf8(path) => K::NotUtf8(d::NotUtf8 { path: path.clone() }),
+                StoreError::Binary(path) => K::Binary(d::Binary { path: path.clone() }),
                 StoreError::TooLarge(path) => K::TooLarge(d::TooLarge { path: path.clone() }),
                 StoreError::InvalidSpan(msg) => K::InvalidSpan(d::InvalidSpan { msg: msg.clone() }),
                 StoreError::Corrupt(msg) => K::Corrupt(d::Corrupt { msg: msg.clone() }),
@@ -310,6 +312,7 @@ impl TryFrom<pb::StoreErrorDetail> for WireError {
             .into(),
             K::Rejected(x) => StoreError::Rejected(x.msg).into(),
             K::NotUtf8(x) => StoreError::NotUtf8(x.path).into(),
+            K::Binary(x) => StoreError::Binary(x.path).into(),
             K::TooLarge(x) => StoreError::TooLarge(x.path).into(),
             K::InvalidSpan(x) => StoreError::InvalidSpan(x.msg).into(),
             K::Corrupt(x) => StoreError::Corrupt(x.msg).into(),
@@ -416,6 +419,7 @@ pub fn wire_view(e: &StoreError) -> WireError {
         StoreError::Rejected(m) => StoreError::Rejected(m.clone()),
         StoreError::AlreadyApplied { index } => StoreError::AlreadyApplied { index: *index },
         StoreError::NotUtf8(p) => StoreError::NotUtf8(p.clone()),
+        StoreError::Binary(p) => StoreError::Binary(p.clone()),
         StoreError::TooLarge(p) => StoreError::TooLarge(p.clone()),
         StoreError::InvalidSpan(m) => StoreError::InvalidSpan(m.clone()),
         StoreError::Corrupt(m) => StoreError::Corrupt(m.clone()),

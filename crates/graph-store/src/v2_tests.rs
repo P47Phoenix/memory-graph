@@ -24,14 +24,31 @@ fn space_usage_does_not_count_pages_the_last_commit_freed() {
             bytes: b.as_bytes(),
             language: None,
             origin: None,
+            ..Default::default()
         })
         .collect();
-    s.index_batch("o", "r", &files, IndexOptions { reindex: false })
-        .unwrap();
+    s.index_batch(
+        "o",
+        "r",
+        &files,
+        IndexOptions {
+            reindex: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let fresh = Store::space_usage(&s).unwrap().unwrap().live_bytes;
     // The whole replace fits one transaction (default chunk size).
-    s.index_batch("o", "r", &files, IndexOptions { reindex: true })
-        .unwrap();
+    s.index_batch(
+        "o",
+        "r",
+        &files,
+        IndexOptions {
+            reindex: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let after = Store::space_usage(&s).unwrap().unwrap().live_bytes;
     assert!(
         (after as f64) < 1.3 * fresh as f64,
@@ -1789,6 +1806,7 @@ fn prepared_chunks_count_only_stored_files() {
         bytes: b,
         language: Some(l),
         origin: None,
+        ..Default::default()
     };
     let opts = IndexOptions::default();
     // A big unchanged file must not count: with cap 6, only "small" (5
@@ -1837,6 +1855,7 @@ fn prepare_precheck_waits_for_an_index_commit() {
         bytes: b"alpha beta",
         language: None,
         origin: None,
+        ..Default::default()
     };
     let opts = IndexOptions::default();
     s.index_batch("o", "r", &[f], opts).unwrap();
@@ -1875,6 +1894,7 @@ fn index_commit_waits_for_a_prepare_precheck() {
         bytes: b"alpha beta",
         language: None,
         origin: None,
+        ..Default::default()
     };
     let opts = IndexOptions::default();
     let p: Vec<_> = ["a.txt", "b.txt"]
@@ -1919,6 +1939,7 @@ fn a_slow_precheck_leaves_the_same_bytes() {
             bytes: b.as_bytes(),
             language: None,
             origin: None,
+            ..Default::default()
         })
         .collect();
     let run = |slow: bool| {
@@ -1929,7 +1950,10 @@ fn a_slow_precheck_leaves_the_same_bytes() {
         let s = s;
         let done = std::sync::atomic::AtomicBool::new(false);
         let pass = |reindex| {
-            let opts = IndexOptions { reindex };
+            let opts = IndexOptions {
+                reindex,
+                ..Default::default()
+            };
             let p: Vec<_> = files
                 .iter()
                 .map(|f| Store::prepare(&s, "o", "r", f, opts).unwrap())
@@ -2001,4 +2025,74 @@ fn owner_only_terms_are_remapped_kept_by_vacuum_and_checked() {
     s.vacuum().unwrap();
     s.check_consistency(true);
     assert_eq!(owner(&s).as_deref(), Some("Zed"));
+}
+
+/// ADR 0007 C9: the same identifiers in UTF-8, UTF-16LE, UTF-16BE,
+/// windows-1252 (Latin) and Shift_JIS (CJK) files are one dictionary term
+/// each, so one search finds every file; no NUL-bearing or mis-decoded
+/// variant of an identifier is interned.
+#[test]
+fn cross_encoding_identifiers_share_one_dictionary_term() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g.redb")).unwrap();
+    let u16 = |text: &str, be: bool| -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() })
+            .collect()
+    };
+    let both = "CustomerId caf\u{e9} \u{65e5}\u{672c}\n";
+    let latin = "CustomerId caf\u{e9}\n";
+    let cjk = "CustomerId \u{65e5}\u{672c}\n";
+    let (w1252, _, _) = encoding_rs::WINDOWS_1252.encode(latin);
+    let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode(cjk);
+    let files: Vec<(&str, Vec<u8>, Option<&'static encoding_rs::Encoding>)> = vec![
+        ("u8.txt", both.as_bytes().to_vec(), None),
+        ("le.txt", u16(both, false), None),
+        ("be.txt", u16(both, true), None),
+        ("w.txt", w1252.into_owned(), Some(encoding_rs::WINDOWS_1252)),
+        ("j.txt", sjis.into_owned(), Some(encoding_rs::SHIFT_JIS)),
+    ];
+    for (p, b, hint) in &files {
+        let opts = IndexOptions {
+            encoding: *hint,
+            ..Default::default()
+        };
+        s.index_bytes_opts("o", "r", p, b, None, None, opts)
+            .unwrap();
+    }
+    for (id, want) in [("CustomerId", 5), ("caf\u{e9}", 4), ("\u{65e5}\u{672c}", 4)] {
+        let mut q = Query::new(id);
+        q.grain = Grain::File;
+        assert_eq!(s.search(&q).unwrap().len(), want, "{id}");
+    }
+    let rt = s.db.begin_read().unwrap();
+    let dict = rt.open_table(crate::v2::DICT).unwrap();
+    let terms: Vec<String> = dict
+        .iter()
+        .unwrap()
+        .map(|r| r.unwrap().0.value().to_string())
+        .collect();
+    for id in ["CustomerId", "caf\u{e9}", "\u{65e5}\u{672c}"] {
+        assert_eq!(
+            terms.iter().filter(|t| *t == id).count(),
+            1,
+            "{id}: {terms:?}"
+        );
+    }
+    assert!(
+        terms
+            .iter()
+            .all(|t| !t.contains('\0') && !t.contains('\u{fffd}')),
+        "{terms:?}"
+    );
+    let mut sorted = terms.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        ["CustomerId", "caf\u{e9}", "\u{65e5}\u{672c}"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        "only the three identifiers (whitespace is not interned)"
+    );
 }

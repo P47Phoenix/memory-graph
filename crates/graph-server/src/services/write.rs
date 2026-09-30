@@ -218,6 +218,8 @@ impl pb::write_server::Write for WriteService {
                 }
                 None => return Err(ConvertError("empty IndexRequest".into()).into()),
             };
+            // A bad encoding hint is refused before anything is proposed.
+            file.resolved_encoding_hint()?;
             if !pending.is_empty() && pending_bytes + file.bytes.len() > RAFT_ENTRY_MAX_BYTES {
                 let (r, idx) = self
                     .index_chunk(
@@ -259,6 +261,7 @@ impl pb::write_server::Write for WriteService {
         let file = r.file.ok_or_else(|| {
             ConvertError("required field `IndexFileRequest.file` is missing".into())
         })?;
+        file.resolved_encoding_hint()?;
         let reindex = r.options.map(|o| o.reindex).unwrap_or(false);
         let (mut results, applied_index) = self
             .index_chunk(&r.org, &r.repo, reindex, vec![file])
@@ -376,6 +379,7 @@ mod tests {
             bytes: vec![0; n],
             language: None,
             origin: None,
+            ..Default::default()
         }
     }
 

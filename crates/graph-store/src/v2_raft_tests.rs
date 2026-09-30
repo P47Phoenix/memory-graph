@@ -20,6 +20,7 @@ fn bf<'a>(path: &'a str, bytes: &'a [u8], language: &'a str) -> BatchFile<'a> {
         bytes,
         language: Some(language),
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     }
 }
 

@@ -1248,6 +1248,7 @@ fn payload_too_large_backlog_and_a_20_mib_file_replicate() {
             bytes: b,
             language: None,
             origin: Some(ORIGIN_DIRECTORY),
+            ..Default::default()
         })
         .collect();
     c.index_batch("o", "r", &chunk, IndexOptions::default())

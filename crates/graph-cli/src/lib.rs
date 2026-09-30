@@ -287,8 +287,15 @@ fn flush_batch(
     let (rels, prepared): (Vec<String>, Vec<PreparedFile>) = pending.drain(..).unzip();
     let n = prepared.len();
     let t0 = std::time::Instant::now();
-    let outcomes =
-        store.index_prepared_counted(o.org, o.repo, prepared, IndexOptions { reindex: o.reindex });
+    let outcomes = store.index_prepared_counted(
+        o.org,
+        o.repo,
+        prepared,
+        IndexOptions {
+            reindex: o.reindex,
+            ..Default::default()
+        },
+    );
     if let Some(r) = board_remote {
         r.record(lens.iter().sum(), t0.elapsed());
     }
@@ -319,6 +326,10 @@ fn flush_batch(
                 t.tokens += st.tokens;
                 *t.by_lang.entry(st.language).or_default() += 1;
                 t.seen.insert(st.path);
+            }
+            // ADR 0007 C5: the store's binary check, tallied with the walk's.
+            Err(graph_store::StoreError::Binary(_)) => {
+                t.skipped.entry("binary".into()).or_default().push(rel)
             }
             Err(graph_store::StoreError::NotUtf8(_)) => t
                 .skipped
@@ -426,7 +437,11 @@ fn read_and_prepare(
     if let Some(reason) = size_skip_reason(bytes.len() as u64, o.max_file_size) {
         return skip(reason, false);
     }
-    if bytes.contains(&0) {
+    // ADR 0007 C5: the store's own binary check (a NUL, no BOM, not
+    // UTF-16), so a UTF-16 file is indexed, not skipped. The walk resolves
+    // no hint yet (`--encoding` is story 42), so the file goes auto.
+    let hint = None;
+    if graph_core::encoding::is_binary_with_hint(&bytes, hint) {
         return skip("binary", false);
     }
     let file = graph_store::BatchFile {
@@ -434,11 +449,21 @@ fn read_and_prepare(
         bytes: &bytes,
         language: None,
         origin: Some(ORIGIN_DIRECTORY),
+        encoding: hint,
+        strict_encoding: false,
     };
     let p = board
         .parse
         .busy(k, "parsing", rel, || {
-            store.prepare(o.org, o.repo, &file, IndexOptions { reindex: o.reindex })
+            store.prepare(
+                o.org,
+                o.repo,
+                &file,
+                IndexOptions {
+                    reindex: o.reindex,
+                    ..Default::default()
+                },
+            )
         })
         .with_context(|| format!("database error while preparing `{rel}`"))?;
     Ok(Outcome::Prepared(rel.clone(), Box::new(p)))
