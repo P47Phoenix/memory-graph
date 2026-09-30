@@ -90,8 +90,9 @@ jobs:
       - name: Anonymous requests are refused
         run: |
           for i in $(seq 60); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "$MG_S3_ENDPOINT/$MG_S3_BUCKET?list-type=2")
-            [ "$code" != 000 ] && break
+            # Until the gateway listens curl fails (7, 56); keep waiting.
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$MG_S3_ENDPOINT/$MG_S3_BUCKET?list-type=2" || true)
+            [ "$code" != 000 ] && [ -n "$code" ] && break
             sleep 1
           done
           echo "anonymous ListObjectsV2: $code"
