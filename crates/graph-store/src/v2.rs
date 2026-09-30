@@ -56,7 +56,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// (`has_owners`, see `codec`), which a version-9 reader would ignore and
 /// then misread the symbol section. Every version-9 stream is still a valid
 /// version-10 stream (bit 1 clear), so a version-9 file is upgraded on open
-/// by restamping `schema_version` only ([`UPGRADABLE_SCHEMA_VERSION`]); no
+/// by restamping `schema_version` only ([`UPGRADABLE_SCHEMA_VERSIONS`]); no
 /// data is rewritten, and an older binary then refuses the file with
 /// `SchemaMismatch` instead of misreading it.
 ///

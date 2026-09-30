@@ -142,15 +142,17 @@ All seven are read-only (`readOnlyHint: true`), address things by org, repo and 
 
 | Tool | Arguments | Answer |
 |---|---|---|
-| `describe` | `org?`, `repo?` | `{repos, stale_possible}`: per repo its files, languages, symbol kinds and token classes (the same as `describe --json`) |
+| `describe` | `org?`, `repo?` | `{repos, stale_possible}`: per repo its files, languages, symbol kinds and token classes, `encodings` (files per non-UTF-8 source encoding) and `lossy` (the same as `describe --json`) |
 | `list_repos` | `org?`, paging | items `{org, repo}` |
-| `search` | `text`, `grain?` (`token`, `symbol` (default), `method`, `class`, `file`, `repo`, `org`), `language?`, `org?`, `repo?`, `token_class?`, `symbol_kind?`, paging | items as in `search --json`: `{grain, org, repo, file, language, symbol, symbol_kind, lang_kind, token_class, span, count, no_symbols, no_matching_symbol}` |
+| `search` | `text`, `grain?` (`token`, `symbol` (default), `method`, `class`, `file`, `repo`, `org`), `language?`, `org?`, `repo?`, `token_class?`, `symbol_kind?`, paging | items as in `search --json`: `{grain, org, repo, file, language, symbol, symbol_kind, lang_kind, token_class, span, count, no_symbols, no_matching_symbol}`, plus `encoding`/`lossy` for a non-UTF-8 file |
 | `find_symbols` | `pattern` (`name`, `prefix*`, `*`), `kind?`, `language?`, `org?`, `repo?`, `file?`, paging | items as in `symbols --json` |
 | `file_outline` | `org`, `repo`, `path`, paging | the file's symbols in source order |
 | `file_tokens` | `org`, `repo`, `path`, `start_line?`, `end_line?`, paging | items `{text, token_class, span}` of the tokens starting on those lines |
-| `list_files` | `org`, `repo`, `prefix?`, paging | items `{path, language, has_errors}` |
+| `list_files` | `org`, `repo`, `prefix?`, paging | items `{path, language, has_errors}`, plus `encoding`/`lossy` for a non-UTF-8 file |
 
 A span is `{start, end, start_line, start_col, end_line, end_col}`: byte offsets `[start, end)` and 1-based lines and columns, as in the CLI's `--json`.
+
+**Encodings.** Files in another encoding are decoded to UTF-8 before indexing ([ADR 0007](adr/0007-source-encodings.md)), and their spans point into the decoded text. An item about such a file (from `search`, `find_symbols`, `file_outline` or `list_files`) carries `encoding` (the WHATWG name, e.g. `UTF-16LE`, `windows-1252`, `Shift_JIS`) and, when invalid bytes were replaced with U+FFFD, `lossy: true`; both are absent for UTF-8. `describe` gives per repo `encodings` (files per non-UTF-8 encoding; the rest are UTF-8) and `lossy` (a count). See [Source encodings](guide/indexing.md#source-encodings).
 
 **Paging.** List tools take `limit` (default 50, at most 500; `file_tokens` at most 20000) and `offset` (default 0, at most 4294967295) and answer `{items, next_offset, stale_possible}`. `next_offset` is the `offset` of the next page, or `null` at the end. Each page is read from the database as it is at that moment (there is no snapshot across pages in v1). A page whose items would exceed 4 MiB is cut short, with `next_offset` pointing at the first item left out.
 

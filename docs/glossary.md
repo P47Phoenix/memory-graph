@@ -15,6 +15,9 @@ A "story" is one small piece of planned work. There are two numbering schemes, s
 
 Used in: [ADR 0002](adr/0002-parsing-and-crate-layout.md), [ADR 0003](adr/0003-data-model.md).
 
+## BOM (byte order mark)
+A few bytes at the very start of a text file that say which encoding it is in: `EF BB BF` for UTF-8, `FF FE` for UTF-16 little-endian, `FE FF` for UTF-16 big-endian. When a file has one, memory-graph believes it over any `--encoding` or `.memory-graph.toml` hint. The BOM is kept in the decoded text as the character U+FEFF, which counts as whitespace. Used in: [ADR 0007](adr/0007-source-encodings.md), [indexing guide](guide/indexing.md#source-encodings).
+
 ## B-tree
 The sorted tree structure redb uses to keep data in order on disk, so lookups are fast. It packs data into fixed-size pages, which is where page slack comes from. Used in: [ADR 0003](adr/0003-data-model.md), [learnings](learnings.md).
 
@@ -52,11 +55,17 @@ The directory a cluster node keeps everything in (`serve --data-dir`):
 
 **Bootstrap** (`--bootstrap`) creates a new cluster in an empty data directory, with a new random cluster id and this node as its only voter. On a directory that already has a `node.json` it is a plain restart. **Restore** (`--restore <file>`, with `--bootstrap`) seeds that new cluster's store from a snapshot file. **Join** (`--join <peer>`) asks an existing cluster, through any of its members, to add this node as a learner; with `--auto-promote` the leader makes it a voter once it has caught up, with `--standby` it stays a learner. On a directory of the same cluster it is a plain restart; one of another cluster is refused with **WrongCluster** (exit code 6). Used in: [ADR 0004](adr/0004-client-server-and-replication.md) D6/D9, [cluster guide](guide/cluster.md).
 
+## Decoded source
+The text of a file after it has been converted to UTF-8. Spans (byte offsets, lines, columns) point into this text, not into the raw file. For a UTF-8 file the decoded source is the file itself, unchanged. Used in: [ADR 0007](adr/0007-source-encodings.md), [indexing guide](guide/indexing.md#source-encodings).
+
 ## Dictionary
 A table that gives each distinct piece of text one small number (its id). Like a school register: instead of writing "Alexandra Petrovna" everywhere, you write "17". Used in: [ADR 0003](adr/0003-data-model.md).
 
 ## Differential test
 A test that runs the old code and the new code on the same input and checks they give the same answer. Used in: [ADR 0003](adr/0003-data-model.md).
+
+## Encoding (source encoding)
+The way a file's characters are turned into bytes: UTF-8, UTF-16, Windows-1252, Shift_JIS and so on. memory-graph detects each file's encoding (or takes it from `--encoding` or `.memory-graph.toml`), decodes the file to UTF-8 and records the encoding on the file, by its WHATWG name (for example `UTF-16LE`). UTF-8 is the default and is never shown. Used in: [ADR 0007](adr/0007-source-encodings.md), [indexing guide](guide/indexing.md#source-encodings).
 
 ## Epoch (commit epoch)
 A per-shard counter that goes up once each time an ingest finishes; it is recorded in the manifest so a snapshot can check the shard and manifest agree. Used in: [ADR 0003](adr/0003-data-model.md).
@@ -96,6 +105,9 @@ Tags on numbers in the docs. **[M]** means measured: we ran something and saw th
 
 ## LOCK sidecar
 A small file `<db>.LOCK` that `memory-graph serve` writes next to the database while it serves it, holding its process id and listen address. The database's own lock is what keeps other programs out; the sidecar only lets their error message say who holds the file and which `--server` address to use instead. Removed when the server stops cleanly; a leftover one whose process is gone is ignored. Used in: [ADR 0004](adr/0004-client-server-and-replication.md), [server guide](guide/server.md#serve-options-and-the-lock-file).
+
+## Lossy (decode)
+A decode is **lossy** when some bytes were not valid in the file's encoding and were replaced with U+FFFD (the replacement character). It happens only when a hint does not fit the bytes, or a BOM is followed by invalid bytes; automatic detection never produces one. Lossy files are counted in `describe` and flagged `lossy` in results; `--strict-encoding` refuses them instead. Used in: [ADR 0007](adr/0007-source-encodings.md), [indexing guide](guide/indexing.md#source-encodings).
 
 ## LSM-tree
 **Log-structured merge tree**: a database design that buffers writes and merges sorted files in the background (fjall is a pure-Rust example). It is a different on-disk layout from the B-tree that redb uses; a comparison with fjall is still pending. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0003](adr/0003-data-model.md).
@@ -162,6 +174,9 @@ A named thing in code, such as a function, a struct or a class. It has a kind, a
 
 ## Token
 One small piece of source text, such as a word, a number or a bracket. Reading `let x = 5;` gives the tokens `let`, `x`, `=`, `5`, `;`. Used in: [ADR 0001](adr/0001-storage.md), [ADR 0002](adr/0002-parsing-and-crate-layout.md), [ADR 0003](adr/0003-data-model.md).
+
+## Transcoded
+A file **transcoded** by an index run is one decoded from an encoding other than UTF-8 (UTF-16, a code page, ...). `index --stats` counts them as `transcoded`. Used in: [ADR 0007](adr/0007-source-encodings.md), [indexing guide](guide/indexing.md#source-encodings).
 
 ## Vacuum
 Cleaning up a database file by rewriting it without deleted or unused data, so it gets smaller. Like tidying a cupboard. Used in: [ADR 0003](adr/0003-data-model.md).

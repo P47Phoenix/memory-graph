@@ -110,6 +110,107 @@ fn upload_then_restore_from_latest_equals_the_source() {
     run_differential(&replica(&tb, leader), &r);
 }
 
+/// ADR 0007 C6 (schema-12 amendment): a backup taken by a schema-11 build
+/// restores and is upgraded on open, with the per-repo encoding and lossy
+/// counts recounted from its File nodes. The schema-11 backup is a real
+/// backup of encoded files whose stamp is put back to 11 the way an 11
+/// build left it: `schema_version` 11, no `catalog_version`, no `e`/`l`
+/// catalog entries.
+#[test]
+fn a_schema_11_backup_restores_and_is_upgraded_to_12() {
+    let _w = watchdog("a_schema_11_backup_restores", TEST_LIMIT);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("b");
+    let tb = ClusterTestbed::with_backup(1, exts(), cfg(file_url(&dir), 0));
+    let c = tb.client(1);
+    let le: Vec<u8> = std::iter::once(0xFEFF_u16)
+        .chain("class CustomerId {}\n".encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    c.index_bytes("o", "r", "a.cs", &le, None).unwrap();
+    c.index_bytes("o", "r", "u.txt", b"CustomerId\n", None)
+        .unwrap();
+    let hint = |label: &[u8]| graph_store::IndexOptions {
+        encoding: graph_core::encoding::Encoding::for_label(label),
+        ..Default::default()
+    };
+    c.index_bytes_opts(
+        "o",
+        "r",
+        "w.pas",
+        b"caf\xe9\n",
+        None,
+        None,
+        hint(b"windows-1252"),
+    )
+    .unwrap();
+    c.index_bytes_opts(
+        "o",
+        "r",
+        "bad.txt",
+        b"caf\xe9\n",
+        None,
+        None,
+        hint(b"utf-8"),
+    )
+    .unwrap();
+    let want = c.describe(None, None).unwrap();
+    assert_eq!(want.len(), 1);
+    assert_eq!(want[0].files, 4);
+    assert_eq!(want[0].encodings.get("UTF-16LE"), Some(&1), "{want:?}");
+    assert_eq!(want[0].encodings.get("windows-1252"), Some(&1), "{want:?}");
+    assert_eq!(want[0].lossy, 1, "{want:?}");
+    let hits = c.search(&graph_store::Query::new("CustomerId")).unwrap();
+    let index = c.admin_trigger_snapshot(None).unwrap().last_applied_index;
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let cluster = c.admin_status().unwrap().cluster_id;
+
+    // The backup as a schema-11 build would have written it.
+    let p = root.path().join("v11.redb");
+    std::fs::copy(data_of(&dir, &cluster, index), &p).unwrap();
+    {
+        let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
+        let catalog: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("catalog");
+        let db = redb::Database::open(&p).unwrap();
+        let wt = db.begin_write().unwrap();
+        {
+            use redb::ReadableTable;
+            let mut cat = wt.open_table(catalog).unwrap();
+            let keys: Vec<String> = cat
+                .iter()
+                .unwrap()
+                .map(|r| r.unwrap().0.value().to_string())
+                .filter(|k| k.starts_with("e\0") || k.starts_with("l\0"))
+                .collect();
+            assert!(!keys.is_empty(), "no encoding catalog entries to strip");
+            for k in keys {
+                cat.remove(k.as_str()).unwrap();
+            }
+            let mut m = wt.open_table(meta).unwrap();
+            m.insert("schema_version", 11).unwrap();
+            m.remove("catalog_version").unwrap();
+        }
+        wt.commit().unwrap();
+    }
+    assert_eq!(graph_store::detect_format(&p).unwrap(), Some(11));
+
+    // A plain-path restore (no `.meta`: its checksum no longer matches).
+    let to = root.path().join("restored");
+    let restored = TestServer::try_start_config(restore_cfg(&to, &p), exts()).unwrap();
+    let r = RemoteStore::connect(ClientConfig::new(restored.endpoint())).unwrap();
+    assert_eq!(r.describe(None, None).unwrap(), want);
+    assert_eq!(
+        r.search(&graph_store::Query::new("CustomerId")).unwrap(),
+        hits
+    );
+    drop(r);
+    drop(restored);
+    assert_eq!(
+        graph_store::detect_format(&to.join("graph.redb")).unwrap(),
+        Some(graph_store::SCHEMA_VERSION)
+    );
+}
+
 /// Only the newest `keep` committed backups remain.
 #[test]
 fn retention_keeps_the_newest_n() {

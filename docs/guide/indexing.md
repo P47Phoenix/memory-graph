@@ -30,21 +30,75 @@ A panicking extractor fails only that file the same way (`failed: <path>: extrac
 
 ## Source encodings
 
-Every file is decoded to UTF-8 before it is tokenized (ADR 0007). Detection is automatic; to override it:
+Every file is decoded to UTF-8 before it is tokenized ([ADR 0007](../adr/0007-source-encodings.md)). UTF-16, Windows-1252/Latin-1, the Windows "ANSI" code page, Shift_JIS, EUC-JP, ISO-2022-JP, GBK/GB18030, EUC-KR, Big5 and the other WHATWG encodings are all indexed; no text file is skipped for its encoding. UTF-8 files are untouched: same text, same spans, same fingerprint as before.
 
-- `--encoding <auto|ansi|LABEL>` on `index` and `index-file` (also `MEMORY_GRAPH_ENCODING`; the flag wins). `ansi` is the Windows system code page (windows-1252 elsewhere), resolved on the client. `replacement` and unknown labels are refused.
-- A `.memory-graph.toml` at the root of the directory given to `index`:
+**Spans point into the decoded text.** For a non-UTF-8 file, a token's byte range, line and column are exact against its UTF-8 decoding, not the raw file. Each file records the encoding it was decoded from; to map a span back to raw-file bytes, re-decode the file with that encoding.
+
+### Automatic detection
+
+For each file, the first rule that applies decides:
+
+1. **A BOM** (`EF BB BF` UTF-8, `FF FE` UTF-16LE, `FE FF` UTF-16BE). A BOM beats every hint, including `--encoding`. The BOM stays in the text as U+FEFF (whitespace, no column), as a UTF-8 BOM always has.
+2. **A hint**: `--encoding`, `MEMORY_GRAPH_ENCODING` or a `.memory-graph.toml` glob (see below).
+3. **BOM-less UTF-16** (LE or BE), sniffed from the pattern of NUL bytes in the first 4 KiB. This runs before the UTF-8 check, because ASCII text in UTF-16 is also valid UTF-8 as bytes. CJK UTF-16 (few NULs) is detected too, but only when the file is not valid UTF-8.
+4. **7-bit ISO-2022-JP**: an all-ASCII file containing a JIS X 0208 escape (`ESC $ B` or `ESC $ @`) that decodes cleanly.
+5. **Valid UTF-8**, used as is.
+6. **A guess** by `chardetng` (the detector Firefox uses): a legacy single-byte code page, Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, GBK/GB18030 or Big5.
+7. **windows-1252**, which maps every byte and so never fails.
+
+The result depends only on the bytes, the hint and the decoder version, so every machine and every cluster node decodes a file the same way.
+
+### Overrides
+
+- **`--encoding <auto|ansi|LABEL>`** on `index` and `index-file`; `MEMORY_GRAPH_ENCODING` sets the default and the flag wins. LABEL is any WHATWG label: `utf-8`, `utf-16le`, `utf-16be`, `windows-1252`, `latin1`, `shift_jis`, `euc-jp`, `iso-2022-jp`, `gbk`, `gb18030`, `euc-kr`, `big5`, .... `replacement` and unknown labels are a usage error. `auto` (the default) means detect.
+- **`ansi`** is the Windows "ANSI" code page of the machine running the command (`GetACP`: 1252 → windows-1252, 932 → Shift_JIS, 936 → GBK, 949 → EUC-KR, 950 → Big5, 125x → windows-125x, 874 → windows-874; 65001 or an unmapped page is an error). Elsewhere it is windows-1252. It is resolved on the client, never on a server.
+- **`.memory-graph.toml`** at the root of the directory given to `index`, committed with the code so everyone indexing the repo gets the same decode:
 
   ```toml
+  # .memory-graph.toml
   [encoding]
   "legacy/**/*.pas" = "windows-1252"
   "docs/jp/**" = "shift_jis"
+  "win/*.rc" = "utf-16le"
+  "vendor/**" = "auto"      # stop here: auto-detect vendor/, even if a later glob matches
+  "**/*.bas" = "ansi"
   ```
 
-  Globs match the path relative to the root, with `/` separators; `*` does not cross `/`, `**` does. They are case-sensitive on every OS. A glob starting with `./` or `/` is refused (write it relative to the root). The first matching glob decides, and a glob set to `auto` also stops the search (that file is auto-detected). `index-file` does not read this file; use `--encoding`. An invalid file is an error naming it and the key, before anything is written.
-- Precedence per file: BOM > `--encoding` (other than `auto`) > the first matching glob > auto. Hints are resolved on the client and sent with each file, so `--server` decodes the same way. A changed hint re-indexes the affected files without `--reindex`.
+  Globs match the path relative to the root, with `/` separators; `*` does not cross `/`, `**` does. They are case-sensitive on every OS. A glob starting with `./` or `/` is refused (write it relative to the root). The first matching glob decides, and a glob set to `auto` also stops the search. `index-file` does not read this file; use `--encoding`. An invalid file (bad TOML, bad glob, unknown label) is an error naming the file and the key, before anything is written.
+- **Precedence per file:** BOM > `--encoding` / `MEMORY_GRAPH_ENCODING` (other than `auto`) > the first matching glob > automatic detection.
+- Hints are resolved on the client and sent with each file, so `index --server` decodes exactly like an embedded run; the server never reads `.memory-graph.toml`. A changed hint that changes a file's decode (a new `--encoding`, an edit to the TOML) re-indexes exactly that file on the next run, without `--reindex`: the decode is part of a non-UTF-8 file's fingerprint.
 
-`--strict-encoding` refuses a file whose decode is lossy (bytes invalid in its encoding) instead of storing it with U+FFFD replacements. Such a file is skipped with the reason `invalid in its encoding (--strict-encoding)`. Earlier releases called this bucket `not valid UTF-8`. As with other skips, a file indexed earlier keeps its stored content, and `--prune` removes it.
+### Lossy decodes and `--strict-encoding`
+
+A file is **lossy** when bytes invalid in its encoding were replaced with U+FFFD. That happens only two ways: a hint that does not fit the bytes (for example `--encoding utf-8` on a windows-1252 file), or a BOM followed by invalid sequences. Automatic detection never produces a lossy file (it may pick the wrong code page, see below, but always one that decodes cleanly).
+
+`--strict-encoding` refuses a lossy file instead of storing it with replacements. It is skipped with the reason `invalid in its encoding (--strict-encoding)` and the rest of the run goes on. Earlier releases called this bucket `not valid UTF-8`; `--encoding utf-8 --strict-encoding` reproduces their refusal exactly. As with other skips, a file indexed earlier keeps its stored content, and `--prune` removes it.
+
+### Binary files
+
+A file is **binary**, and skipped as `binary`, when it contains a NUL byte and has no BOM, does not sniff as UTF-16 and has no UTF-16 hint. The same check runs on every path (`index`, `index-file`, `--server`, a raw `Index` RPC), so a PNG is skipped everywhere and a UTF-16 file nowhere.
+
+### Matching across encodings
+
+All text is UTF-8 in one dictionary, so `CustomerId` in a UTF-16 C# file, a windows-1252 Pascal file and a UTF-8 Rust file is one term, and one `search CustomerId` finds all three; `café` and `日本` behave the same way when the files are decoded correctly. The limits:
+
+- A **mis-detected** code page garbles the non-ASCII tokens of that file. ASCII tokens still match for every ASCII-compatible encoding (all of them except UTF-16 and ISO-2022-JP); a file mis-detected as or from UTF-16 or ISO-2022-JP can garble ASCII too.
+- A **lossy** token (with U+FFFD in it) does not match its original spelling.
+- **Unicode normalization** is not applied: `é` as one code point (NFC) and as `e` plus a combining accent (NFD) are different terms, whatever the encoding.
+
+### Short files can be mis-detected
+
+`chardetng` guesses from byte statistics, so a short legacy file gives it little to go on: a one-line windows-1252 file can come out as ISO-8859-4, a short Shift_JIS file as windows-1250. No minimum length is applied, because that would misdecode short CJK files the other way. To spot it, look at the recorded encoding (below); to fix it, name the encoding with `--encoding` or a `.memory-graph.toml` glob and index again. Only the affected files are re-indexed.
+
+### Seeing what was decoded how
+
+UTF-8 is never shown; everything else is.
+
+- **`describe`** prints an `encodings:` line per repo with non-UTF-8 files, for example `encodings: utf-8 40, UTF-16LE 3, windows-1252 2 (lossy 1)`. `describe --json` has, per repo, `encodings` (files per non-UTF-8 encoding, by WHATWG name; the rest are UTF-8) and `lossy` (a count). Both come from the catalog, so they cost O(repos).
+- **`symbols`** and **`search`** (text) end a hit's line with `encoding=<name>` (`encoding=<name>,lossy` when lossy) when its file is not UTF-8; with `--json` a hit has `encoding` and, when set, `lossy: true`.
+- **`index --stats`** prints `encodings: transcoded=N lossy=N` (the files of this run decoded from a non-UTF-8 encoding, and those decoded lossily); with `--json` they are `stats.transcoded` and `stats.lossy`.
+- **MCP**: `describe` has `encodings` and `lossy` per repo; `list_files`, `search`, `find_symbols` and `file_outline` items have `encoding` (and `lossy`) when not UTF-8. See [docs/mcp.md](../mcp.md).
+- **`export`** (NDJSON) has `encoding` and `lossy` on File records only for non-UTF-8 files.
 
 ## Sizing: threads, memory, disk
 

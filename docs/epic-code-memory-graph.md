@@ -487,7 +487,7 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E5 (Accepted).
 - Given a passing provider, When the `backup-tls` feature is enabled, Then `https://` endpoints must be accepted, and the default build must stay unchanged.
 
 **40. Decode any source encoding in `graph_core::encoding` (5 pts)**
-Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
+Status: Delivered in PR #176 ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a developer indexing a legacy or Windows codebase
 I want each file decoded to UTF-8 whatever its encoding
 So that UTF-16 and code-page files are indexed instead of skipped.
@@ -501,7 +501,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C2-C5, C10.
 - Given `ansi`, When resolved, Then it must be the system code page on Windows (a mapped `GetACP`) and windows-1252 elsewhere; and `encoding_rs` and `chardetng` must be `=`-pinned and pass `check-no-c-deps.py`, with `DECODER_VERSION` exported for the fingerprint and the cluster hash.
 
 **41. Store integration: decoded spans, binary rejection, schema 11 restamp, fingerprint rule (8 pts)**
-Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
+Status: Delivered in PR #177 ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a user of any store (embedded, `--server`, a Raft cluster)
 I want every writer to decode and store files the same way
 So that encoded files are searchable and all replicas agree.
@@ -510,14 +510,14 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C1, C2, C5-C8, C10.
 - Given the same encoded file through `index_batch`, `index_bytes_opts` (`index-file`), `--server` and a raw `Index` RPC, When indexed, Then each must go through `prepare_file` and give the same encoding, spans and fingerprint; `index_bytes_opts` must no longer have its own `from_utf8` or fingerprint.
 - Given `BatchFile` and the `index_bytes*` options with the new `encoding` and `strict_encoding` inputs, When the conformance suite runs against embedded and `RemoteStore`, Then the hint and strict flag must behave identically on both.
 - Given the UTF-8 corpus, When indexed, Then the output and the stored stream bytes must be identical to `main`, and `size_gate` must pass unchanged.
-- Given a v10 or v9 database, When opened, Then it must be restamped straight to v11 and read identically, and re-indexing it must re-parse 0 files; given a newer version, Then it must be refused without writing; and a v10 node and a v11 node must refuse to share a cluster (`extractors_hash`, which now includes `DECODER_VERSION`).
+- Given a v10 or v9 database, When opened, Then it must be restamped straight to v11 and read identically, and re-indexing it must re-parse 0 files; given a newer version, Then it must be refused without writing; and a v10 node and a v11 node must refuse to share a cluster (`extractors_hash`, which now includes `DECODER_VERSION`). *(Superseded by the schema-12 amendment in ADR 0007 C6: the target is now v12, the restamp set is {9, 10, 11}, and a v11 file also gets its encoding counts recounted.)*
 - Given a non-UTF-8 file re-indexed with a different `--encoding` that changes the decode, When indexed, Then only that file must be re-indexed (its fingerprint suffix `enc=<name>[+lossy]@<DECODER_VERSION>` changed); a UTF-8 file's fingerprint must be unchanged.
 - Given a binary file sent through `index-file`, `--server` or a raw `Index` RPC, When indexed, Then it must be rejected as binary.
 - Given encoded inputs, When `run_all`, `run_differential` and `run_crash_rerun_differential` run, Then embedded, remote and Raft stores must answer identically; golden-byte tests must pin UTF-8 (unchanged), UTF-16LE and lossy File nodes, and an unknown stored encoding name must be a `StoreError::Corrupt`, not a panic.
 - Given an encoded file, When `export_ndjson_round_trips_node_counts` runs, Then it must round-trip, with `encoding` and `lossy` in the NDJSON only for non-UTF-8 files; vacuum and snapshot export must need no change.
 
 **42. `--encoding`, `--strict-encoding` and `.memory-graph.toml` per-glob overrides (3 pts)**
-Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
+Status: Delivered in PR #178 ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a developer whose tree mixes encodings
 I want to override detection per run or per glob
 So that a mis-detected code page can be fixed.
@@ -528,7 +528,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C3, C4, C8.
 - Given a directory run, When it finishes, Then the tallies must no longer skip UTF-16 files as binary. (The transcoded and lossy counts moved to story 43, owner, 2026-09-30.)
 
 **43. Encodings on the wire, in `describe`/`--stats` and in MCP (5 pts)**
-Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
+Status: Delivered in PR #179 ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As an agent or operator reading the graph
 I want to see which files were transcoded or decoded lossily
 So that I can trust, or fix, what a search returns.
@@ -540,7 +540,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C8.
 - Given the MCP `describe` and `list_files` tools, When called, Then they must include the encoding where it is not UTF-8.
 
 **44. Encoding fixtures, cross-encoding search tests and docs (3 pts)**
-Status: Planned ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
+Status: Delivered in PR #181 ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a maintainer
 I want every supported encoding covered end to end and documented
 So that the feature does not regress and users know how to use it.

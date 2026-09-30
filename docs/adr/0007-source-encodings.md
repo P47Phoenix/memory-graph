@@ -9,7 +9,7 @@
 3. Spans (byte, line, column) point into the **decoded UTF-8 text**, not the raw file. Each file records the encoding it was decoded from. For a UTF-8 file the decoded text is the file, so nothing changes for it.
 4. Detection is automatic. `--encoding <name>` on the command line, and a `.memory-graph.toml` committed at the root of the indexed tree, override it.
 5. Because every file becomes UTF-8 before tokenizing, `CustomerId` in a UTF-16 C# file, a Windows-1252 Pascal file and a UTF-8 Rust file is one term, and one search finds all three.
-6. The on-disk schema goes from 10 to 11. Every existing (UTF-8) file stays byte-identical and an old database upgrades by a restamp, with no re-index. Old and new nodes cannot share a Raft log across that change.
+6. The on-disk schema goes from 10 to 11 (to 12 under the C6 amendment, which also upgrades 11). Every existing (UTF-8) file stays byte-identical and an old database upgrades by a restamp, with no re-index. Old and new nodes cannot share a Raft log across that change.
 
 ## Owner decisions (2026-09-30)
 
@@ -214,18 +214,18 @@ Every file is decoded to UTF-8 before tokenizing, so token text is interned in t
 - **No regression.** The UTF-8 corpus output is byte-identical to `main` and the corpus hash is unchanged; `size_gate` passes unchanged.
 - **Binary.** A PNG is still skipped as `binary`; a UTF-16 file is not; the same through every path above.
 - **Conformance and differential.** A `run_all` case with an encoded file and a hint (encoding and spans read back), run against embedded and `RemoteStore`; `run_differential` / `run_crash_rerun_differential` inputs that include encoded files, so embedded, `--server` and Raft all agree.
-- **Upgrade.** A v10 and a v9 database open, are restamped to v11, read identically, and re-indexing them is a no-op; `--encoding` forces a re-index of just the affected file; a v12 file is refused without writing; a v10 node and a v11 node refuse to form one cluster.
+- **Upgrade.** A v10 and a v9 database open, are restamped to v11, read identically, and re-indexing them is a no-op; `--encoding` forces a re-index of just the affected file; a v12 file is refused without writing; a v10 node and a v11 node refuse to form one cluster. *(Superseded by the schema-12 amendment in C6: the target is now v12, the restamp set is {9, 10, 11}, and a v11 file also gets its encoding counts recounted.)*
 - **Gates.** fmt, clippy, `cargo test --workspace`, `test_gate.py`, `check-no-c-deps.py`, the proto-regen job.
 
 ## Stories (epic 40-44)
 
 | # | Story | Points | Delivery |
 |---|---|---|---|
-| 40 | E1: `graph_core::encoding` (decode, detection order, UTF-16 sniff, `is_binary`, `ansi` resolution, `DECODER_VERSION`) | 5 | PR B |
-| 41 | E2: store integration: every decode site through `prepare_file`, the `Store` input change, binary rejection, File node fields and the {9,10} → 11 restamp, fingerprint rule, `extractors_hash`, conformance/differential | 8 | PR B |
-| 42 | E3: CLI `--encoding`/`--strict-encoding`, `.memory-graph.toml`, walk tallies | 3 | PR B |
-| 43 | E4: exposure: proto fields (xtask), server honours the hint, catalog counts, `describe`/`--json`/`symbols`/`--stats`, MCP | 5 | PR C |
-| 44 | E5: encoding fixtures and cross-encoding tests, the guide's Encodings section, glossary, ADR 0003 note, CLAUDE.md invariant | 3 | PR C |
+| 40 | E1: `graph_core::encoding` (decode, detection order, UTF-16 sniff, `is_binary`, `ansi` resolution, `DECODER_VERSION`) | 5 | Delivered in PR #176 |
+| 41 | E2: store integration: every decode site through `prepare_file`, the `Store` input change, binary rejection, File node fields and the {9,10} → 11 restamp, fingerprint rule, `extractors_hash`, conformance/differential (schema 12 per the C6 amendment) | 8 | Delivered in PR #177 |
+| 42 | E3: CLI `--encoding`/`--strict-encoding`, `.memory-graph.toml`, walk tallies | 3 | Delivered in PR #178 |
+| 43 | E4: exposure: proto fields (xtask), server honours the hint, catalog counts, `describe`/`--json`/`symbols`/`--stats`, MCP | 5 | Delivered in PR #179 |
+| 44 | E5: encoding fixtures and cross-encoding tests, the guide's Encodings section, glossary, ADR 0003 note, CLAUDE.md invariant | 3 | Delivered in PR #181 |
 
 Acceptance criteria are in the [epic](../epic-code-memory-graph.md).
 

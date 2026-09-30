@@ -8,6 +8,16 @@ What the database file holds, how big it gets, and how to give space back.
 - **Catalog.** `describe` and filter validation read a small counter catalog kept in step with every write, so they cost O(repos), not O(tokens). It is part of the format, written from the first index.
 - **Versioned on disk.** Any change to the stored bytes bumps the schema version; a file from another version is refused without being written to.
 
+## Schema 12: source encodings (upgrade notes)
+
+Schema 12 ([ADR 0007](../adr/0007-source-encodings.md) C6) lets a File record carry its source `encoding` and `lossy` flag, and adds per-repo encoding and lossy counts to the catalog behind `describe`.
+
+- **Upgraded on open.** A schema 9, 10 or 11 database is upgraded the first time a schema-12 binary opens it, in one small commit, with no re-index: 9 and 10 are only restamped (everything in them is UTF-8); 11 also has its encoding counts recounted from its File nodes. UTF-8 files keep their bytes and fingerprints, so the next `index` re-parses none of them.
+- **Older binaries refuse it.** Once upgraded, a binary older than schema 12 refuses the file with a schema mismatch and leaves it untouched. Keep a copy before the first open if you may need to roll back.
+- **No rolling cluster upgrade.** The schema change and the decoder version both change the cluster's extractor hash, so old and new nodes cannot share a Raft log. Upgrade every node together, or snapshot, upgrade and restore (`serve --bootstrap --restore`).
+- **Backups.** A backup or snapshot taken before the upgrade (schema 9, 10 or 11) restores into a schema-12 server and is upgraded on open, with correct encoding counts.
+- **Anything else** (older than 9, newer than 12, or the retired v1 format) is refused without being written to.
+
 ## The v1 format is retired (2026-09-25)
 
 The original per-node layout cost about 525 bytes per token (a fresh index of a 10 GB tree reached 420 GB). Opening a v1 file fails with a message naming its schema version and leaves it untouched. Re-index from source into a new file, or convert it with the last v1-capable release, git tag `v1-last`, using `memory-graph migrate <new.redb>`.
