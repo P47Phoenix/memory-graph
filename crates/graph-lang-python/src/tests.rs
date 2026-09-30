@@ -217,3 +217,29 @@ fn inconsistent_tabs_and_spaces_are_errors() {
     let s = syms("class A:\n\tdef m(self):\n\t\treturn 1\n");
     assert_eq!(find(&s, "m").1, SymbolKind::Method);
 }
+
+/// #143: reserved words are classed `keyword`; contextual words stay
+/// identifiers (this language has no escaped identifiers).
+#[test]
+fn keywords_are_classed_keyword() {
+    let toks = PythonExtractor
+        .extract("def f(match, type):\n    return None if match else type\nnonlocal_ = lambda: 0\n")
+        .tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    for w in ["def", "return", "None", "if", "else", "lambda"] {
+        assert_eq!(class(w), [graph_core::TokenClass::Keyword], "{w}");
+    }
+    assert_eq!(class("f"), [graph_core::TokenClass::Identifier]);
+    // Soft keywords.
+    for w in ["match", "type"] {
+        assert_eq!(class(w), [graph_core::TokenClass::Identifier; 2], "{w}");
+    }
+    assert!(PythonExtractor
+        .version()
+        .starts_with("python-scan-2+kw1+tok"));
+}

@@ -108,6 +108,26 @@ fn is_trivia(t: &TokenDecl) -> bool {
     matches!(t.class, TokenClass::Comment | TokenClass::Literal)
 }
 
+/// Relabels every `Identifier` token whose text is one of `keywords` as
+/// `Keyword`, unless `is_escaped(tokens, i)` says that occurrence is used as
+/// a plain name (an escaped identifier, a property name, ...). The list and
+/// the escape rule are the extractor's; this only applies them. Comparison
+/// is exact (case-sensitive). Spans and texts are untouched.
+pub fn mark_keywords(
+    tokens: &mut [TokenDecl],
+    keywords: &[&str],
+    is_escaped: impl Fn(&[TokenDecl], usize) -> bool,
+) {
+    for i in 0..tokens.len() {
+        if tokens[i].class == TokenClass::Identifier
+            && keywords.contains(&tokens[i].text.as_str())
+            && !is_escaped(tokens, i)
+        {
+            tokens[i].class = TokenClass::Keyword;
+        }
+    }
+}
+
 /// Indices of the tokens whose class is not in `skip`, in order. With
 /// `skip = &[TokenClass::Comment]` this is the code tokens an extractor walks.
 pub fn code_index(tokens: &[TokenDecl], skip: &[TokenClass]) -> Vec<usize> {
@@ -482,6 +502,18 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
     use crate::tokenizer::tokenize;
+
+    #[test]
+    fn mark_keywords_relabels_listed_identifiers_unless_escaped() {
+        let mut t = tokenize(r#"if x . if "if" If"#);
+        mark_keywords(&mut t, &["if"], |t, i| i > 0 && t[i - 1].text == ".");
+        let classes: Vec<_> = t.iter().map(|t| t.class).collect();
+        assert_eq!(classes[0], TokenClass::Keyword);
+        assert_eq!(classes[1], TokenClass::Identifier);
+        assert_eq!(classes[3], TokenClass::Identifier, "escaped");
+        assert_eq!(classes[4], TokenClass::Literal);
+        assert_eq!(classes[5], TokenClass::Identifier, "case-sensitive");
+    }
 
     #[test]
     fn matching_close_balances_and_skips_literals() {

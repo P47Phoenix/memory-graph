@@ -332,3 +332,32 @@ proptest! {
             prop_assert_eq!(ex.extract(&src).symbols, without_memo(ex, &src), "{}", src);
     }
 }
+
+/// #143: reserved words are classed `keyword`; a contextual keyword (`var`)
+/// and a verbatim identifier (`@class`) stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "public class C { void M() { var @class = 1; switch (1) { default: break; } } }";
+    let toks = CSharpExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("public"), [TokenClass::Keyword]);
+    assert_eq!(class("void"), [TokenClass::Keyword]);
+    assert_eq!(class("default"), [TokenClass::Keyword]);
+    // `@ class` with a space is no verbatim identifier.
+    let spaced = CSharpExtractor.extract("x @ class").tokens;
+    assert_eq!(spaced[2].class, TokenClass::Keyword);
+    assert_eq!(class("var"), [TokenClass::Identifier]);
+    assert_eq!(class("C"), [TokenClass::Identifier]);
+    assert_eq!(
+        class("class"),
+        [TokenClass::Keyword, TokenClass::Identifier]
+    );
+    assert!(CSharpExtractor
+        .version()
+        .starts_with("csharp-scan-1+kw1+tok"));
+}

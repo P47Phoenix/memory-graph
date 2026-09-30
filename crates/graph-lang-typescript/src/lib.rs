@@ -41,12 +41,17 @@ impl Extractor for TypeScriptExtractor {
     }
 
     fn version(&self) -> String {
-        format!("typescript-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("typescript-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, TS_TOKENIZER);
+        let mut tokens = tokenize_with(source, TS_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        // TypeScript's own words (`interface`, `type`, `number`, ...) are
+        // contextual and stay identifiers.
+        graph_lang_javascript::mark_js_keywords(&mut tokens);
         Extraction {
             symbols,
             tokens,

@@ -23,11 +23,41 @@
 //! automatic semicolon. Function bodies, struct fields and interface
 //! methods are not scanned. A multi-name spec (`var a, b = 1, 2`) yields one
 //! symbol named by its first name. Odd input never sets `has_errors`.
-use graph_core::scan::{code_close_table, code_index, span_between};
+use graph_core::scan::{code_close_table, code_index, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct GoExtractor;
+
+/// Go's 25 keywords. Predeclared identifiers (`true`, `false`, `nil`, `int`,
+/// `string`, ...) can be redeclared and stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+];
 
 impl Extractor for GoExtractor {
     fn language(&self) -> &str {
@@ -39,11 +69,12 @@ impl Extractor for GoExtractor {
     }
 
     fn version(&self) -> String {
-        format!("go-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("go-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, TokenizerOptions::GO);
+        let mut tokens = tokenize_with(source, TokenizerOptions::GO);
         let code = code_index(&tokens, &[TokenClass::Comment]);
         let mut s = Scanner {
             tokens: &tokens,
@@ -53,6 +84,9 @@ impl Extractor for GoExtractor {
         };
         s.file();
         let symbols = s.out;
+        // After the symbol scan, which reads identifiers as it always has.
+        // Go has no escaped identifiers.
+        mark_keywords(&mut tokens, KEYWORDS, |_, _| false);
         Extraction {
             symbols,
             tokens,

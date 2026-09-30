@@ -20,7 +20,7 @@
 //! its first declarator. Odd input never sets `has_errors`: unbalanced
 //! braces make the scanner resynchronize one token later. Type bodies nested
 //! more than [`MAX_DEPTH`] deep are not scanned (the outer types are kept).
-use graph_core::scan::{code_close_table, code_index, span_between};
+use graph_core::scan::{code_close_table, code_index, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::cell::RefCell;
@@ -41,12 +41,16 @@ impl Extractor for JavaExtractor {
     }
 
     fn version(&self) -> String {
-        format!("java-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("java-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, JAVA_TOKENIZER);
+        let mut tokens = tokenize_with(source, JAVA_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        // Java has no escaped identifiers.
+        mark_keywords(&mut tokens, KEYWORDS, |_, _| false);
         Extraction {
             symbols,
             tokens,
@@ -54,6 +58,67 @@ impl Extractor for JavaExtractor {
         }
     }
 }
+
+/// Java's reserved keywords, `_` (a keyword since Java 9) and literals
+/// (`true`, `false`, `null`).
+/// Contextual keywords (`var`, `record`, `yield`, `sealed`, `permits`,
+/// `module`, ...) are valid identifiers and stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "_",
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "native",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "true",
+    "try",
+    "void",
+    "volatile",
+    "while",
+];
 
 /// Symbols in Java tokens (as produced with [`JAVA_TOKENIZER`]).
 pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
