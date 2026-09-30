@@ -486,21 +486,29 @@ fn a_restore_without_disk_room_is_refused() {
     assert!(!to.join("graph.redb").exists() && !to.join("graph.redb.restore.tmp").exists());
 }
 
-/// `--backup-url s3://` is refused at start-up, before anything is written.
+/// `--backup-url s3://` without a plain-HTTP endpoint (AWS itself, or an
+/// `https://` endpoint) is refused at start-up with guidance to a TLS
+/// sidecar and #104, before anything is written.
 #[test]
-fn an_s3_backup_url_is_refused_before_anything_is_written() {
+fn an_s3_backup_url_without_an_http_endpoint_is_refused_before_anything_is_written() {
     let root = tempfile::tempdir().unwrap();
-    let to = root.path().join("n");
-    let mut c = ServeConfig::for_data_dir(
-        &to,
-        "127.0.0.1:0".parse().unwrap(),
-        InitMode::Bootstrap { restore: None },
-        Some(1),
-    );
-    c.backup = Some(BackupConfig::new("s3://bucket/prefix"));
-    let e = TestServer::try_start_config(c, exts())
-        .err()
-        .expect("refused");
-    assert!(e.to_string().contains("story 36"), "{e}");
-    assert!(!to.exists(), "nothing written");
+    for endpoint in [None, Some("https://s3.amazonaws.com")] {
+        let to = root.path().join("n");
+        let mut c = ServeConfig::for_data_dir(
+            &to,
+            "127.0.0.1:0".parse().unwrap(),
+            InitMode::Bootstrap { restore: None },
+            Some(1),
+        );
+        let mut b = BackupConfig::new("s3://bucket/prefix");
+        b.s3.endpoint = endpoint.map(str::to_string);
+        b.s3.credentials_from_env = false;
+        c.backup = Some(b);
+        let e = TestServer::try_start_config(c, exts())
+            .err()
+            .expect("refused");
+        let e = e.to_string();
+        assert!(e.contains("sidecar") && e.contains("#104"), "{e}");
+        assert!(!to.exists(), "nothing written");
+    }
 }
