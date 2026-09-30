@@ -1,6 +1,7 @@
 //! Verified restores (ADR 0006 E8, E10).
 //!
-//! `--restore file://<dir>/<cluster_id>/snap-T-I.redb` (or `.../latest`,
+//! `--restore file://<dir>/<cluster_id>/snap-T-I.redb` or
+//! `s3://bucket/prefix/<cluster_id>/snap-T-I.redb` (or `.../latest`,
 //! the highest committed index there): read the `.meta`, check the store
 //! format and the extractors against this binary, check the disk, download
 //! the data to `<store>.restore.tmp` while hashing it, check size and
@@ -97,6 +98,59 @@ fn committed(sink: &dyn BackupSink, dir_key: &str) -> Result<Vec<String>, StoreE
         .into_iter()
         .map(|(_, k)| k.strip_suffix(".meta").expect("a meta").to_string())
         .collect())
+}
+
+/// One committed backup as `cluster backups` lists it.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    /// The data object's key (`<dir_key>snap-T-I.redb`).
+    pub key: String,
+    pub term: u64,
+    pub index: u64,
+    /// Its `.meta`, or why it could not be read.
+    pub meta: Result<SnapshotSidecar, String>,
+}
+
+/// The committed backups (a `.meta` exists) directly under `dir_key`,
+/// highest index first, each with its `.meta` read.
+pub fn list_committed(sink: &dyn BackupSink, dir_key: &str) -> Result<Vec<Listed>, StoreError> {
+    let data: std::collections::BTreeSet<String> = sink
+        .list(dir_key)
+        .map_err(|e| refuse(format!("listing `{}`: {e}", sink.describe())))?
+        .into_iter()
+        .map(|o| o.key)
+        .filter(|k| k.ends_with(".redb"))
+        .collect();
+    committed(sink, dir_key)?
+        .into_iter()
+        .map(|stem| {
+            let (term, index) = parse_stem(&format!("{stem}.meta")).expect("a committed stem");
+            let meta_key = format!("{stem}.meta");
+            let mut buf = Vec::new();
+            let meta = match sink.get(&meta_key, &mut buf) {
+                // Listed, then gone (retention): not committed any more.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => Err(format!("reading `{meta_key}`: {e}")),
+                Ok(_) => serde_json::from_slice::<SnapshotSidecar>(&buf)
+                    .map_err(|e| format!("`{meta_key}` is not a snapshot meta: {e}")),
+            };
+            // A `.meta` without its data does not restore.
+            let meta = meta.and_then(|side| {
+                if data.contains(&format!("{stem}.redb")) {
+                    Ok(side)
+                } else {
+                    Err(format!("`{stem}.redb` is missing (only its .meta exists)"))
+                }
+            });
+            Ok(Some(Listed {
+                key: format!("{stem}.redb"),
+                term,
+                index,
+                meta,
+            }))
+        })
+        .filter_map(Result::transpose)
+        .collect()
 }
 
 /// Read the sidecar of `stem`.
@@ -252,10 +306,25 @@ pub fn restore_from_sink(
         )),
     })
 }
-/// `--restore <url>`: a `file://` URL naming `.../snap-T-I.redb` or
-/// `.../latest`.
-pub fn restore_from_url(url: &str, store: &Path, c: &RestoreChecks) -> Result<(), StoreError> {
-    let Location::File(path) = parse_url(url).map_err(refuse)?;
+/// `--restore <url>`: a `file://` or `s3://` URL naming
+/// `.../snap-T-I.redb` or `.../latest`. `s3` holds the `s3://` settings
+/// (`--backup-endpoint`, `--backup-region`, `--backup-virtual-host`,
+/// `--backup-credentials-file`, `--backup-profile`). Blocking: an `s3://`
+/// restore must run off the async runtime (e.g. in `spawn_blocking`).
+pub fn restore_from_url(
+    url: &str,
+    store: &Path,
+    c: &RestoreChecks,
+    s3: &super::S3Options,
+) -> Result<(), StoreError> {
+    let path = match parse_url(url).map_err(refuse)? {
+        Location::File(path) => path,
+        Location::S3(_) => {
+            let (sink_url, name) = split_s3_restore(url)?;
+            let sink = super::S3Sink::new(&sink_url, s3.clone()).map_err(refuse)?;
+            return restore_from_sink(&sink, "", &name, store, c).map(|_| ());
+        }
+    };
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -266,6 +335,35 @@ pub fn restore_from_url(url: &str, store: &Path, c: &RestoreChecks) -> Result<()
         .unwrap_or(Path::new("."));
     let sink = FileSink::new(dir);
     restore_from_sink(&sink, "", &name, store, c).map(|_| ())
+}
+
+/// An `s3://` `--restore` URL as (the sink's URL, the backup's name): the
+/// last segment names the backup (`snap-T-I.redb` or `latest`), and must
+/// be there (a trailing slash names none).
+pub fn split_s3_restore(url: &str) -> Result<(String, String), StoreError> {
+    let none = || {
+        refuse(format!(
+            "`{url}` names no snapshot: expected \
+             s3://bucket/prefix/<cluster_id>/snap-<term>-<index>.redb or .../latest"
+        ))
+    };
+    if url.ends_with('/') {
+        return Err(none());
+    }
+    let u = super::s3::parse_s3_url(url).map_err(refuse)?;
+    let (dir, name) = match u.prefix.rsplit_once('/') {
+        Some((dir, name)) => (dir.to_string(), name.to_string()),
+        None => (String::new(), u.prefix.clone()),
+    };
+    if name.is_empty() {
+        return Err(none());
+    }
+    let sink_url = if dir.is_empty() {
+        format!("s3://{}", u.bucket)
+    } else {
+        format!("s3://{}/{dir}", u.bucket)
+    };
+    Ok((sink_url, name))
 }
 
 /// `--restore <file>`: verify a sibling `.meta` if there is one (warn if
@@ -299,4 +397,30 @@ pub fn restore_from_path(
         );
     }
     crate::paths::restore_into(snapshot, store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_s3_restore;
+
+    #[test]
+    fn s3_restore_urls_split() {
+        let ok = |u: &str| split_s3_restore(u).unwrap();
+        assert_eq!(
+            ok("s3://bkt/p/c/snap-1-2.redb"),
+            ("s3://bkt/p/c".to_string(), "snap-1-2.redb".to_string())
+        );
+        assert_eq!(
+            ok("s3://bkt/c/latest"),
+            ("s3://bkt/c".into(), "latest".into())
+        );
+        // At the bucket root.
+        assert_eq!(ok("s3://bkt/latest"), ("s3://bkt".into(), "latest".into()));
+        // A trailing slash (or nothing after the bucket) names no backup.
+        for u in ["s3://bkt/p/c/", "s3://bkt/", "s3://bkt"] {
+            let e = split_s3_restore(u).unwrap_err().to_string();
+            assert!(e.contains("names no snapshot"), "{u}: {e}");
+        }
+        assert!(split_s3_restore("s3://B/latest").is_err());
+    }
 }

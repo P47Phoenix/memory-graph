@@ -377,6 +377,7 @@ So that the `symbol`, `method` and `class` grains and symbol search work across 
 - Given a suitable MIT or Apache-2.0 public repo, When the corpus test runs, Then a pinned slice must be indexed with spot-checked symbols; languages without one must have a hand-written fixture.
 
 **31. `graph-mcp` core and `memory-graph mcp` over stdio, read-only (5 pts)**
+Status: Delivered in PR #160.
 As an AI-agent integrator
 I want my assistant to start `memory-graph mcp` and call read-only tools over stdio
 So that it can search the graph, find symbols, describe repos and outline files with no network setup.
@@ -389,6 +390,7 @@ Design: [ADR 0005](adr/0005-mcp.md) D1, D2, D3, D5 (Accepted).
 - Given `docs/mcp.md`, When followed, Then it must give working client configuration for stdio.
 
 **32. Streamable HTTP MCP endpoint in `serve` with security guards (5 pts)**
+Status: Delivered in PR #166.
 As a database operator
 I want an opt-in MCP endpoint inside `serve`
 So that assistants can query a running cluster without starting a local process, safely without authentication.
@@ -412,6 +414,7 @@ Design: [ADR 0005](adr/0005-mcp.md) D2 (Accepted).
 - Given `prune` with no `dry_run` argument, When called, Then it must run as a dry run.
 
 **34. MCP real-client e2e and hardening (3 pts)**
+Status: Delivered in PR #168, with `rmcp` (dev-dependency only, no TLS; it passes the gate) as the real client. This completes v1 of ADR 0005 (stories 31, 32 and 34; 33 stays deferred) and closes #109.
 As a database operator
 I want MCP proven with a real client, against a cluster under failure, and under fuzzing
 So that the tool surface can be trusted.
@@ -423,6 +426,7 @@ Design: [ADR 0005](adr/0005-mcp.md) test plan (Accepted).
 - Given `docs/mcp.md` and `serve --help`, When read, Then both must carry the boxed no-authentication warning.
 
 **35. Snapshot backups: `file://` sink and verified restore (5 pts)**
+Status: Delivered in PR #159.
 As a database operator
 I want the leader to copy each snapshot to a backup directory and restore from it with verification
 So that a cluster can be rebuilt after losing every node.
@@ -437,6 +441,7 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E1-E3, E7-E10 (Accepted
 - Given the flags, When configured through TOML, Then they must behave the same; metrics and `cluster status` must report the last backup and the last error.
 
 **36. S3 client over plain HTTP (8 pts)**
+Status: Delivered in PR #167.
 As a database operator
 I want backups written to S3-compatible object storage
 So that they live off the cluster's own disks.
@@ -448,6 +453,7 @@ Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E3-E6 (Accepted).
 - Given the change, When CI runs, Then the gate must be clean and every new crate must be MIT or Apache licensed.
 
 **37. Restore from `s3://` and `latest`, `cluster snapshot --upload`, `cluster backups` (3 pts)**
+Status: Delivered in PR #170.
 As a database operator
 I want to restore from object storage by URL and see what backups exist
 So that recovery is one command.

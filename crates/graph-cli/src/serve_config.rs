@@ -56,6 +56,15 @@ pub fn apply(cmd: &Command, args: Vec<OsString>) -> Result<Vec<OsString>> {
     Ok(args)
 }
 
+/// Whether a (kebab-case) key looks like a secret: refused outright, with
+/// guidance, rather than as an unknown key (ADR 0006 E6).
+fn is_secret_key(long: &str) -> bool {
+    let k = long.to_ascii_lowercase();
+    ["secret", "access-key", "session-token", "password"]
+        .iter()
+        .any(|s| k.contains(s))
+}
+
 /// The arguments the TOML `text` adds, given what `sm` (the `serve`
 /// matches of the command line) already sets.
 fn settings(cmd: &Command, sm: &clap::ArgMatches, text: &str) -> Result<Vec<OsString>> {
@@ -66,6 +75,13 @@ fn settings(cmd: &Command, sm: &clap::ArgMatches, text: &str) -> Result<Vec<OsSt
     let mut out = Vec::new();
     for (key, value) in &table {
         let long = key.replace('_', "-");
+        if is_secret_key(&long) {
+            bail!(
+                "`{key}`: secrets are never read from the config file (ADR 0006 E6); set \
+                 AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) in the \
+                 environment, or name an AWS credentials file with backup-credentials-file"
+            );
+        }
         let arg = serve
             .get_arguments()
             .chain(

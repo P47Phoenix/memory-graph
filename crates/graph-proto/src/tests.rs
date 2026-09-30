@@ -1073,5 +1073,5 @@ fn rpc_paths_match_the_proto_files() {
     let got: std::collections::BTreeSet<String> =
         crate::rpc_paths().iter().map(|s| s.to_string()).collect();
     assert_eq!(got, want);
-    assert_eq!(got.len(), 42, "16 Admin + 3 Raft + 18 Store + 5 Write");
+    assert_eq!(got.len(), 44, "18 Admin + 3 Raft + 18 Store + 5 Write");
 }

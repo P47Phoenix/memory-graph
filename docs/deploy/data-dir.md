@@ -55,8 +55,7 @@ memory-graph serve --data-dir ./n1 ... --backup-url file:///srv/mg-backups --bac
 With `--backup-url file://<dir>` (ADR 0006), each snapshot the leader builds is copied to
 `<dir>/<cluster_id>/snap-<term>-<index>.redb`, and then its `.meta` (size, SHA-256, store format,
 extractors hash) is written. A backup counts only once its `.meta` exists, so an upload that was
-cut short (a crash, a full disk) is never restorable. The directory may be local or mounted; to
-get backups into S3 before `s3://` ships, `aws s3 sync` the directory.
+cut short (a crash, a full disk) is never restorable. The directory may be local or mounted.
 
 - `--backup-on leader|all|none` (default `leader`): which nodes upload the snapshots they build.
   With `all`, give each node its own `--backup-url`: the keys carry no node id.
@@ -64,13 +63,73 @@ get backups into S3 before `s3://` ships, `aws s3 sync` the directory.
   first, and only after a newer one committed. Data without a `.meta` older than 24 h (an
   interrupted upload) is swept. Other clusters' prefixes are never touched.
 - Uploads run on their own thread, one at a time; a newer snapshot replaces a queued one. They
-  never block or delay a snapshot or a log purge. A failed upload is retried 3 times, then logged
-  and counted: `mg_backup_failures_total`, and `cluster status` shows `last_backup_error`. The
-  last success is `mg_backup_last_success_timestamp` / `mg_backup_last_index`.
+  never block or delay a snapshot or a log purge. A failed upload is retried 3 times (a 403 or
+  another request error that retrying cannot fix is not retried), then logged and counted:
+  `mg_backup_failures_total`, and `cluster status` shows `last_backup_error`. The last success
+  is `mg_backup_last_success_timestamp` / `mg_backup_last_index`.
+- An upload that ran out of retries is not tried again: the next snapshot's upload catches up
+  (it carries everything). An upload that fails while a newer snapshot is already queued is
+  dropped for the newer one and is not counted as a failure, so `failures_total` counts only
+  backups that are actually missing.
 - The upload reads the snapshot through an open handle, not a copy: on Windows the handle is
   opened with delete sharing, so (on NTFS with POSIX delete semantics, Windows 10 1809 and later) a newer snapshot can still replace the old one while it is read,
   and the bytes read are checked against the snapshot's SHA-256 before the `.meta` is written.
 - All of these are also `serve --config` TOML keys (`backup-url`, `backup-keep`, `backup-on`).
+
+### Automatic backups to S3-compatible storage (`s3://`)
+
+```sh
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+memory-graph serve --data-dir ./n1 ... --backup-url s3://mg-backups/prod \
+  --backup-endpoint http://minio:9000
+```
+
+The same layout, `.meta` rule, retention and failure handling as `file://`, written through the
+S3 REST API with SigV4 (a small built-in client, no AWS SDK). Uploads over 64 MiB go in 16 MiB
+parts; a failed multipart upload is aborted. Each request body is signed with its SHA-256, and
+the stored size is checked with a HEAD after each upload.
+
+- `--backup-endpoint http://host:port` is required: stage 1 speaks plain HTTP only, and an
+  `https://` endpoint is refused. Works with MinIO, Ceph RGW, R2, B2 and Garage. For AWS S3
+  itself (HTTPS only), run a TLS sidecar (stunnel, envoy) and point the endpoint at it, or back
+  up to `file://` and `aws s3 sync` the directory. Native HTTPS waits on a pure-Rust TLS
+  provider (#104).
+- `--backup-region` (default `us-east-1`) is the region requests are signed for.
+- Path-style addressing (`http://host/bucket/key`) is the default; `--backup-virtual-host`
+  uses `http://bucket.host/key`.
+- Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`),
+  which win, else from `--backup-credentials-file <file>` (the AWS INI format) with
+  `--backup-profile` (default `default`). They are never taken from a flag or a TOML key (a
+  secret-looking key in the config file is refused), never logged, and instance roles (IMDS)
+  are not supported.
+- Restore straight from S3 into an empty data directory with the same S3 settings:
+  `serve --data-dir ./new --node-id 1 --bootstrap --restore s3://mg-backups/prod/<cluster_id>/latest
+  --backup-endpoint http://minio:9000` (or `.../snap-T-I.redb`). It is verified like a `file://`
+  restore (size, sha256, store format, extractors with `--restore-allow-extractor-mismatch`,
+  free disk), downloaded to `<store>.restore.tmp` and removed on any refusal; `latest` falls
+  back past orphans and damaged pairs to the highest committed backup that verifies.
+- `--restore s3://` and `--backup-url s3://` share one set of S3 flags (`--backup-endpoint`,
+  `--backup-region`, `--backup-virtual-host`, `--backup-credentials-file`, `--backup-profile`);
+  with a `file://` backup URL they serve the restore alone.
+- `memory-graph --server <any node> cluster snapshot --upload` has the leader build a snapshot
+  now and upload it (whatever `--backup-on` says), and prints its URL and sha256 (if a newer
+  snapshot replaced it first, that one is uploaded and reported). The call waits up to an hour
+  and is never resent; if the server answers `DEADLINE_EXCEEDED`, or the client gives up, the
+  upload continues in the background (check `cluster status` and `cluster backups`).
+- `cluster backups [--json]` lists the committed backups of the cluster in the backup location
+  of the node you connect to (its own `--backup-url`), newest first, with the URLs `--restore`
+  takes. A `.meta` that cannot be read, or whose data object is missing, is listed with an
+  error.
+- A multipart upload cut short by a crash or an outage is invisible (no `.meta`) but still
+  stored and billed until aborted. Retention aborts those under the cluster's prefix once they
+  are older than 24 h. As belt and braces, also give the bucket a lifecycle rule that aborts
+  incomplete uploads, e.g. for AWS / MinIO:
+  `{"Rules":[{"ID":"abort-mpu","Status":"Enabled","Filter":{"Prefix":"prod/"},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":2}}]}`
+  (`aws s3api put-bucket-lifecycle-configuration --bucket mg-backups --lifecycle-configuration file://rule.json`).
+- The request timeout (60 s) bounds connecting, each chunk of a response, and the wait for a
+  response, which also allows 1 s per MiB of request body.
+- TOML keys: `backup-endpoint`, `backup-region`, `backup-virtual-host`,
+  `backup-credentials-file`, `backup-profile`.
 
 ## Restore
 

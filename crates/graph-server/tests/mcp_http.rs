@@ -255,8 +255,120 @@ fn requests_past_max_inflight_get_429() {
     let r = c.post(&msg);
     assert_eq!(r.status, 429, "{r:?}");
     assert_eq!(r.header("retry-after"), Some("1"));
+    // A refused tools/call is counted as `refused` for its tool.
+    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                      "params": {"name": "search", "arguments": {"text": "x"}}});
+    assert_eq!(c.post(&call).status, 429);
     assert_eq!(slow.join().unwrap().status, 200);
     assert_eq!(c.post(&msg).status, 200, "the slot is free again");
+    let metrics = metrics(&_srv);
+    assert!(
+        metrics.contains("mg_mcp_tool_calls_total{tool=\"search\",outcome=\"refused\"} 1"),
+        "{metrics}"
+    );
+}
+
+/// Mutation survivors (epic story 34): `initialize` over HTTP names the
+/// server and its version; a chunked body (no Content-Length) past 1 MiB
+/// gets 413 and one cut short gets 400, not the same answer.
+#[test]
+fn server_info_and_chunked_body_errors() {
+    let d = tempfile::tempdir().unwrap();
+    let (_srv, addr) = server(&d, loopback());
+    let r = post(addr, &[], &initialize());
+    let info = &r.json()["result"]["serverInfo"];
+    assert_eq!(info["name"], "memory-graph", "{info}");
+    assert_eq!(info["version"], graph_server::SERVER_VERSION, "{info}");
+
+    let raw = |body: &[u8]| {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        let _ = s.write_all(body);
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    // Over the limit in 64 KiB chunks.
+    let chunk = vec![b' '; 64 * 1024];
+    let mut big = Vec::new();
+    for _ in 0..17 {
+        big.extend(format!("{:x}\r\n", chunk.len()).as_bytes());
+        big.extend(&chunk);
+        big.extend(b"\r\n");
+    }
+    big.extend(b"0\r\n\r\n");
+    let out = raw(&big);
+    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+    // A chunk size line that is not hex: the body read fails.
+    let out = raw(b"zz\r\n{}\r\n0\r\n\r\n");
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    assert!(out.contains("reading the request body failed"), "{out}");
+}
+
+fn metrics(srv: &TestServer) -> String {
+    RemoteStore::connect(ClientConfig::new(srv.endpoint()))
+        .unwrap()
+        .admin_metrics()
+        .unwrap()
+}
+
+/// Epic story 34: per-tool call counters with every outcome a call can
+/// have short of a timeout or a 429 (both tested above): `ok`, `error`
+/// (an isError result), `rejected` (a JSON-RPC error), and an unknown tool
+/// name counted as `unknown`.
+#[test]
+fn per_tool_counters_cover_each_outcome() {
+    let d = tempfile::tempdir().unwrap();
+    let (srv, addr) = server(&d, loopback());
+    let mut c = McpHttpClient::new(addr);
+    let call = |c: &mut McpHttpClient, name: &str, args: Value| {
+        c.request("tools/call", json!({"name": name, "arguments": args}))
+    };
+    for _ in 0..2 {
+        let r = call(&mut c, "search", json!({"text": "origin"}));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+    }
+    let r = call(
+        &mut c,
+        "search",
+        json!({"text": "x", "language": "klingon"}),
+    );
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    // Invalid arguments are a tool error too (an isError result).
+    let r = call(&mut c, "search", json!({"text": "x", "limit": 501}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    // `arguments` that are not an object: a JSON-RPC error.
+    let r = c.request("tools/call", json!({"name": "search", "arguments": [1]}));
+    assert!(r.get("error").is_some(), "{r}");
+    let r = call(&mut c, "drop_tables", json!({}));
+    assert!(r.get("error").is_some(), "{r}");
+    let r = call(&mut c, "describe", json!({}));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    // Not a tool call: not counted.
+    c.request("tools/list", json!({}));
+    let m = metrics(&srv);
+    let lines: Vec<&str> = m
+        .lines()
+        .filter(|l| l.starts_with("mg_mcp_tool_calls_total{"))
+        .collect();
+    let mut want = vec![
+        "mg_mcp_tool_calls_total{tool=\"describe\",outcome=\"ok\"} 1",
+        "mg_mcp_tool_calls_total{tool=\"search\",outcome=\"error\"} 2",
+        "mg_mcp_tool_calls_total{tool=\"search\",outcome=\"ok\"} 2",
+        "mg_mcp_tool_calls_total{tool=\"search\",outcome=\"rejected\"} 1",
+        "mg_mcp_tool_calls_total{tool=\"unknown\",outcome=\"rejected\"} 1",
+    ];
+    let mut got = lines.clone();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "{m}");
 }
 
 #[test]
@@ -268,7 +380,9 @@ fn a_call_past_the_deadline_times_out() {
     let (srv, addr) = server(&d, m);
     let mut c = McpHttpClient::new(addr);
     let r = c.request("tools/call", json!({"name": "describe", "arguments": {}}));
-    assert_eq!(r["error"]["code"], REQUEST_TIMEOUT, "{r}");
+    // The wire contract: -32001 (REQUEST_TIMEOUT).
+    assert_eq!(r["error"]["code"], -32001, "{r}");
+    assert_eq!(REQUEST_TIMEOUT, -32001);
     let metrics = RemoteStore::connect(ClientConfig::new(srv.endpoint()))
         .unwrap()
         .admin_metrics()
@@ -350,4 +464,25 @@ fn idle_sessions_expire() {
     assert_eq!(c.post(&list).status, 200);
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(c.post(&list).status, 404);
+}
+
+/// SESSION_IDLE counts from the last use, not from initialize: a session
+/// used more often than the idle timeout lives on; left alone it ends,
+/// and a new initialize works.
+#[test]
+fn session_idle_counts_from_the_last_use() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.session_idle = Duration::from_millis(1500);
+    let (_srv, addr) = server(&d, m);
+    let c = McpHttpClient::new(addr);
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(c.post(&list).status, 200, "used within the idle time");
+    }
+    std::thread::sleep(Duration::from_millis(2000));
+    assert_eq!(c.post(&list).status, 404, "idle past session_idle");
+    let fresh = McpHttpClient::new(addr);
+    assert_eq!(fresh.post(&list).status, 200);
 }

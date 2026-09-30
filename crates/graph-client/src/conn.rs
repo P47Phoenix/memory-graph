@@ -506,6 +506,19 @@ impl Conn {
         self.call_at(kind, None, f).await.map(|(v, _)| v)
     }
 
+    /// Send `f` once to the active endpoint: no retry, no endpoint
+    /// rotation, no resend after a lost connection (for a long, non-
+    /// idempotent-looking call such as `Admin.UploadSnapshot`, whose server
+    /// forwards to the leader itself).
+    pub async fn call_once<T, F, Fut>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(Channel) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        let (endpoint, channel) = self.channel();
+        f(channel).await.map_err(|st| map_status(&endpoint, &st))
+    }
+
     /// [`call`](Self::call), also returning the endpoint that answered.
     /// `pin`: send only there (a snapshot handle's node): no rotation, no
     /// `NotLeader` switch, `UNAVAILABLE` retried on the same endpoint.

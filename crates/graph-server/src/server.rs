@@ -131,6 +131,10 @@ pub struct ServeConfig {
     /// `--restore-allow-extractor-mismatch`: a verified restore accepts a
     /// backup made by other extractors.
     pub restore_allow_extractor_mismatch: bool,
+    /// The `s3://` settings of an `s3://` `--restore` (`--backup-endpoint`,
+    /// `--backup-region`, `--backup-virtual-host`,
+    /// `--backup-credentials-file`, `--backup-profile`).
+    pub restore_s3: crate::backup::S3Options,
 }
 
 /// How long a restart whose `node.json` address differs from the one its
@@ -225,6 +229,7 @@ impl ServeConfig {
             testing_apply_gate: None,
             backup: None,
             restore_allow_extractor_mismatch: false,
+            restore_s3: crate::backup::S3Options::default(),
         }
     }
 
@@ -268,6 +273,7 @@ impl std::fmt::Debug for ServeConfig {
                 "restore_allow_extractor_mismatch",
                 &self.restore_allow_extractor_mismatch,
             )
+            .field("restore_s3", &self.restore_s3)
             .finish()
     }
 }
@@ -395,11 +401,14 @@ pub async fn start(
     }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
-    // A bad --backup-url is refused before anything is written.
+    // A bad --backup-url (or s3:// endpoint, region or credentials) is
+    // refused before anything is written. Opening a sink sends nothing.
     if let Some(b) = &cfg.backup {
         if b.sink.is_none() {
-            crate::backup::parse_url(&b.url)
-                .map_err(|e| StoreError::Rejected(format!("--backup-url {e}")))?;
+            drop(
+                b.open_sink()
+                    .map_err(|e| StoreError::Rejected(format!("--backup-url {e}")))?,
+            );
         }
     }
     // `--update-advertise` moves a member: refused before anything is
@@ -489,9 +498,16 @@ pub async fn start(
             min_free_disk: cfg.min_free_disk,
             probe: Some(cfg.free_space_probe.clone().unwrap_or_else(system_probe)),
         };
-        let s = snap.to_string_lossy();
+        let s = snap.to_string_lossy().into_owned();
         if crate::backup::is_url(&s) {
-            crate::backup::restore::restore_from_url(&s, &paths.store, &checks)?;
+            // Blocking (the s3:// client refuses to run on this runtime).
+            let store = paths.store.clone();
+            let s3 = cfg.restore_s3.clone();
+            crate::backup::off_runtime("--restore", move || {
+                crate::backup::restore::restore_from_url(&s, &store, &checks, &s3)
+            })
+            .await
+            .map_err(StoreError::Storage)??;
         } else {
             crate::backup::restore::restore_from_path(snap, &paths.store, &checks)?;
         }

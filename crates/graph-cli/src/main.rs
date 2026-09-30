@@ -172,8 +172,20 @@ enum ClusterCmd {
     /// seed a new cluster from
     Snapshot {
         /// Where to write the snapshot (on this machine, not the server's)
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE", conflicts_with = "upload")]
         out: Option<PathBuf>,
+        /// Have the leader (any node forwards it) build a snapshot now and upload it to its
+        /// backup location (`serve --backup-url`, whatever --backup-on says); prints the backup's
+        /// URL, which `serve --bootstrap --restore` takes, and its sha256
+        #[arg(long)]
+        upload: bool,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// The committed backups (with their .meta) of this cluster in the connected node's backup
+    /// location (`serve --backup-url`), newest first: URL, term, index, size, sha256
+    Backups {
         /// Print JSON instead of text
         #[arg(long)]
         json: bool,
@@ -231,6 +243,11 @@ enum Cmd {
     /// `--data-dir <dir> --join <peer>` joins an existing one; `--db <file>` serves a single file.
     /// Prints `listening on <addr>` once ready (after joining, with --join); stops on Ctrl-C /
     /// SIGTERM. Exit code 6: the data directory belongs to another cluster than --join's peer
+    #[command(group(
+        clap::ArgGroup::new("backup_or_restore")
+            .args(["backup_url", "restore"])
+            .multiple(true)
+    ))]
     Serve {
         /// Read these settings from a TOML file: every serve flag is a key of the same name
         /// (kebab-case or snake_case: `data-dir = "/data"`, `bootstrap = true`, `peers =
@@ -251,19 +268,22 @@ enum Cmd {
         #[arg(long, requires = "data_dir")]
         bootstrap: bool,
         /// With --bootstrap, into an empty --data-dir: seed the store from this snapshot file
-        /// (`cluster snapshot --out`), or from a backup, `file://<dir>/<cluster_id>/snap-T-I.redb`
-        /// or `file://<dir>/<cluster_id>/latest` (verified against its .meta: size, sha256, store
-        /// format and extractors). A plain file's sibling .meta is verified when present. The
-        /// new cluster gets a new id and a fresh log
+        /// (`cluster snapshot --out`), or from a backup, `file://<dir>/<cluster_id>/snap-T-I.redb`,
+        /// `s3://bucket/prefix/<cluster_id>/snap-T-I.redb` (with --backup-endpoint and the other
+        /// --backup-* S3 settings), or `.../<cluster_id>/latest` (the highest committed index that
+        /// verifies), each verified against its .meta: size, sha256, store format and extractors.
+        /// A plain file's sibling .meta is verified when present. The new cluster gets a new id
+        /// and a fresh log
         #[arg(long, requires = "bootstrap", value_name = "FILE|URL")]
         restore: Option<PathBuf>,
         /// With --restore: accept a backup made with other extractors (the store stays valid;
         /// affected files re-extract on their next index). The store format check has no override
         #[arg(long, requires = "restore")]
         restore_allow_extractor_mismatch: bool,
-        /// Copy each snapshot this server builds to a backup location, `file://<dir>`, as
-        /// <dir>/<cluster_id>/snap-T-I.redb plus .meta (written last: a backup without its .meta
-        /// does not count). Uploads run in the background and never delay snapshots or purges
+        /// Copy each snapshot this server builds to a backup location, `file://<dir>` or
+        /// `s3://bucket/prefix` (with --backup-endpoint), as <dir>/<cluster_id>/snap-T-I.redb plus
+        /// .meta (written last: a backup without its .meta does not count). Uploads run in the
+        /// background and never delay snapshots or purges
         #[arg(long, value_name = "URL")]
         backup_url: Option<String>,
         /// With --backup-url: keep this many backups of this cluster (0: keep all); older ones
@@ -278,6 +298,26 @@ enum Cmd {
             default_value = "leader"
         )]
         backup_on: graph_server::backup::BackupOn,
+        /// With an s3:// --backup-url or --restore: the S3-compatible endpoint, http://host:port
+        /// (MinIO, Ceph RGW, R2, B2, Garage, or a TLS sidecar in front of AWS). Plain HTTP only:
+        /// https:// is refused (no pure-Rust TLS yet, #104)
+        #[arg(long, requires = "backup_or_restore", value_name = "URL")]
+        backup_endpoint: Option<String>,
+        /// With an s3:// --backup-url or --restore: the region requests are signed for
+        #[arg(long, requires = "backup_or_restore", value_name = "REGION", default_value = graph_server::backup::s3::DEFAULT_REGION)]
+        backup_region: String,
+        /// With an s3:// --backup-url or --restore: virtual-hosted addressing
+        /// (http://bucket.host/key) instead of path-style (http://host/bucket/key)
+        #[arg(long, requires = "backup_or_restore")]
+        backup_virtual_host: bool,
+        /// With an s3:// --backup-url or --restore: an AWS credentials file (INI) to read the keys
+        /// from when AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) are not
+        /// set, which win. Keys are never taken from flags or the config file
+        #[arg(long, requires = "backup_or_restore", value_name = "FILE")]
+        backup_credentials_file: Option<PathBuf>,
+        /// With --backup-credentials-file: the profile to read (default: default)
+        #[arg(long, requires = "backup_credentials_file", value_name = "NAME")]
+        backup_profile: Option<String>,
         /// With --data-dir: join the cluster that the node at this host:port belongs to (any
         /// member; it forwards to the leader). On an empty directory the node asks to be added as
         /// a learner and catches up; on one that already belongs to that cluster it is a plain
@@ -679,6 +719,15 @@ enum Cmd {
     /// this command and calls its tools (describe, list_repos, search, find_symbols, file_outline,
     /// file_tokens, list_files). Reads --db, or --server / MEMORY_GRAPH_SERVER with --read. Stdout
     /// carries only protocol messages; logs go to stderr. Client configuration: docs/mcp.md
+    ///
+    /// Over stdio no port is opened: only the client that started the process can talk to it.
+    /// The HTTP endpoint (`serve --mcp-listen`) is another matter:
+    /// +----------------------------------------------------------------------+
+    /// | WARNING: The MCP endpoint has no authentication. Anyone who can      |
+    /// | reach it can read every indexed source token. Keep it on loopback    |
+    /// | or behind an authenticating proxy until #105.                        |
+    /// +----------------------------------------------------------------------+
+    #[command(verbatim_doc_comment)]
     Mcp,
 }
 
@@ -966,6 +1015,11 @@ fn run() -> Result<i32> {
         backup_url,
         backup_keep,
         backup_on,
+        backup_endpoint,
+        backup_region,
+        backup_virtual_host,
+        backup_credentials_file,
+        backup_profile,
         join,
         bootstrap_or_join,
         peers,
@@ -1211,10 +1265,27 @@ fn run() -> Result<i32> {
         }
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.restore_allow_extractor_mismatch = *restore_allow_extractor_mismatch;
+        let s3 = graph_server::backup::S3Options {
+            endpoint: backup_endpoint.clone(),
+            region: backup_region.clone(),
+            virtual_host: *backup_virtual_host,
+            credentials_file: backup_credentials_file.clone(),
+            profile: backup_profile.clone(),
+            ..Default::default()
+        };
+        let restore_is_s3 = restore
+            .as_ref()
+            .is_some_and(|r| r.to_string_lossy().starts_with("s3://"));
+        cfg.restore_s3 = s3.clone();
         if let Some(url) = backup_url {
             let mut b = graph_server::backup::BackupConfig::new(url.clone());
             b.keep = *backup_keep;
             b.on = *backup_on;
+            // The S3 settings serve an s3:// --restore alone when the
+            // backups go to a directory.
+            if !(restore_is_s3 && url.starts_with("file://")) {
+                b.s3 = s3;
+            }
             cfg.backup = Some(b);
         }
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
@@ -1514,7 +1585,97 @@ fn run() -> Result<i32> {
                         out!("{leader} {}", st.leader_addr.as_deref().unwrap_or("-"));
                     }
                 }
-                ClusterCmd::Snapshot { out, json } => {
+                ClusterCmd::Snapshot {
+                    upload: true, json, ..
+                } => {
+                    let r = s
+                        .admin_upload_snapshot()
+                        .context("cluster snapshot --upload")?;
+                    let b = r.backup.unwrap_or_default();
+                    if json {
+                        out!(
+                            "{}",
+                            serde_json::json!({
+                                "node_id": r.node_id,
+                                "url": b.url,
+                                "term": b.term,
+                                "index": b.index,
+                                "size": b.size,
+                                "sha256": b.sha256,
+                                "extractors_hash": b.extractors_hash,
+                                "store_format_version": b.store_format_version,
+                            })
+                        );
+                    } else {
+                        out!(
+                            "uploaded snapshot at log index {} (term {}) from node {}: {} bytes, \
+                             sha256 {}",
+                            b.index,
+                            b.term,
+                            r.node_id,
+                            b.size,
+                            b.sha256
+                        );
+                        out!("  {}", b.url);
+                    }
+                }
+                ClusterCmd::Backups { json } => {
+                    let r = s.admin_list_backups().context("cluster backups")?;
+                    if json {
+                        let list: Vec<_> = r
+                            .backups
+                            .iter()
+                            .map(|b| {
+                                serde_json::json!({
+                                    "url": b.url,
+                                    "term": b.term,
+                                    "index": b.index,
+                                    "size": b.size,
+                                    "sha256": b.sha256,
+                                    "extractors_hash": b.extractors_hash,
+                                    "store_format_version": b.store_format_version,
+                                    "error": (!b.error.is_empty()).then_some(&b.error),
+                                })
+                            })
+                            .collect();
+                        out!(
+                            "{}",
+                            serde_json::json!({
+                                "location": r.location,
+                                "cluster_id": r.cluster_id,
+                                "backups": list,
+                            })
+                        );
+                    } else {
+                        out!(
+                            "{} backup(s) of cluster {} in {}",
+                            r.backups.len(),
+                            r.cluster_id,
+                            r.location
+                        );
+                        for b in &r.backups {
+                            if b.error.is_empty() {
+                                out!(
+                                    "  index {} term {}: {} bytes, sha256 {}\n    {}",
+                                    b.index,
+                                    b.term,
+                                    b.size,
+                                    b.sha256,
+                                    b.url
+                                );
+                            } else {
+                                out!(
+                                    "  index {} term {}: unreadable .meta ({})\n    {}",
+                                    b.index,
+                                    b.term,
+                                    b.error,
+                                    b.url
+                                );
+                            }
+                        }
+                    }
+                }
+                ClusterCmd::Snapshot { out, json, .. } => {
                     let info = s
                         .admin_trigger_snapshot(out.as_deref())
                         .context("cluster snapshot")?;
@@ -2334,9 +2495,23 @@ mod serve_config_tests {
                 "3",
                 "--backup-on",
                 "all",
+                "--backup-endpoint",
+                "http://minio:9000",
+                "--backup-region",
+                "eu-west-1",
+                "--backup-virtual-host",
+                "--backup-credentials-file",
+                "/etc/mg/aws",
+                "--backup-profile",
+                "backup",
             ],
             r#"
 backup-url = "file:///srv/backups"
+backup-endpoint = "http://minio:9000"
+backup_region = "eu-west-1"
+backup-virtual-host = true
+backup-credentials-file = "/etc/mg/aws"
+backup-profile = "backup"
 backup_keep = 3
 backup-on = "all"
 data-dir = "/data"
@@ -2446,6 +2621,36 @@ listen = "0.0.0.0:7000"
         a.push(f.into_os_string());
         let args = graph_cli::serve_config::apply(&Cli::command(), a).unwrap();
         assert!(Cli::command().try_get_matches_from(args).is_err());
+    }
+
+    /// A secret in the config file is refused (ADR 0006 E6), in whatever
+    /// spelling, and never echoed.
+    #[test]
+    fn a_secret_in_the_config_file_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("serve.toml");
+        for key in [
+            "aws_secret_access_key",
+            "aws-access-key-id",
+            "aws_session_token",
+            "backup-secret",
+            "backup_access_key",
+            "backup-password",
+        ] {
+            std::fs::write(
+                &f,
+                format!("backup-url = \"s3://b/p\"\n{key} = \"hunter2-SECRET\"\n"),
+            )
+            .unwrap();
+            let mut a = os(&["memory-graph", "serve", "--config"]);
+            a.push(f.clone().into_os_string());
+            let e = format!(
+                "{:#}",
+                graph_cli::serve_config::apply(&Cli::command(), a).unwrap_err()
+            );
+            assert!(e.contains("secrets are never read"), "{key}: {e}");
+            assert!(!e.contains("hunter2-SECRET"), "{key}: {e}");
+        }
     }
 
     /// QA 1: a flag on the command line whose `requires` target (the data
