@@ -1858,38 +1858,110 @@ fn prepare_precheck_waits_for_an_index_commit() {
     });
 }
 
-/// #158, the other side: an index commit waits for a `prepare` pre-check
-/// that holds the gate. A pre-check reader still live when a commit ran
-/// (e.g. a parse thread descheduled under CPU load across a whole commit)
-/// kept that commit from reusing the pages the previous one freed.
+/// #158, the other side: every index commit, the mid-batch chunk commits
+/// included, waits for a `prepare` pre-check that holds the gate. A
+/// pre-check reader still live when a commit ran (e.g. a parse thread
+/// descheduled under CPU load across a whole commit) kept that commit from
+/// reusing the pages the previous one freed.
 #[test]
 fn index_commit_waits_for_a_prepare_precheck() {
     let d = tempfile::tempdir().unwrap();
-    let s = V2Store::open(d.path().join("g")).unwrap();
-    let f = BatchFile {
-        path: "a.txt",
+    let mut s = V2Store::open(d.path().join("g")).unwrap();
+    // One file per chunk: `a.txt` commits in a mid-batch chunk commit.
+    s.set_chunk_bytes(1);
+    let s = s;
+    let f = |path| BatchFile {
+        path,
         bytes: b"alpha beta",
         language: None,
         origin: None,
     };
     let opts = IndexOptions::default();
-    let p = Store::prepare(&s, "o", "r", &f, opts).unwrap();
+    let p: Vec<_> = ["a.txt", "b.txt"]
+        .into_iter()
+        .map(|n| Store::prepare(&s, "o", "r", &f(n), opts).unwrap())
+        .collect();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|sc| {
         let gate = s.commit_gate.read().unwrap();
         sc.spawn(|| {
-            let r = Store::index_prepared(&s, "o", "r", vec![p], opts).unwrap();
+            let r = Store::index_prepared(&s, "o", "r", p, opts).unwrap();
             tx.send(r.len()).unwrap();
         });
+        std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300))
-                .is_err(),
-            "an index commit ran while a pre-check held the gate"
+            s.file_tokens("o", "r", "a.txt").unwrap().is_none(),
+            "a chunk commit ran while a pre-check held the gate"
         );
+        assert!(rx.try_recv().is_err(), "the batch finished under the gate");
         drop(gate);
-        assert_eq!(rx.recv().unwrap(), 1);
+        assert_eq!(rx.recv().unwrap(), 2);
     });
     assert!(s.file_tokens("o", "r", "a.txt").unwrap().is_some());
+}
+
+/// #158 end to end: a pre-check reader held open (the hook sleeps inside
+/// it) while chunk commits of a replace run on another thread must leave
+/// exactly the bytes of a serial run. Fails if the reader is not covered
+/// by the gate or a commit bypasses it.
+#[test]
+fn a_slow_precheck_leaves_the_same_bytes() {
+    let srcs: Vec<(String, String)> = (0..8)
+        .map(|i| {
+            let body: String = (0..400).map(|j| format!("w{i}_{j} ")).collect();
+            (format!("f{i}.txt"), body)
+        })
+        .collect();
+    let files: Vec<BatchFile> = srcs
+        .iter()
+        .map(|(p, b)| BatchFile {
+            path: p,
+            bytes: b.as_bytes(),
+            language: None,
+            origin: None,
+        })
+        .collect();
+    let run = |slow: bool| {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("g");
+        let mut s = V2Store::open(&path).unwrap();
+        s.set_chunk_bytes(1);
+        let s = s;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let pass = |reindex| {
+            let opts = IndexOptions { reindex };
+            let p: Vec<_> = files
+                .iter()
+                .map(|f| Store::prepare(&s, "o", "r", f, opts).unwrap())
+                .collect();
+            Store::index_prepared(&s, "o", "r", p, opts).unwrap();
+        };
+        pass(false);
+        std::thread::scope(|sc| {
+            if slow {
+                sc.spawn(|| {
+                    crate::v2::PRECHECK_HOOK.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(|| {
+                            std::thread::sleep(std::time::Duration::from_millis(40))
+                        }))
+                    });
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                        Store::prepare(&s, "o", "r", &files[0], IndexOptions::default()).unwrap();
+                    }
+                });
+            }
+            pass(true);
+            pass(true);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        drop(s);
+        std::fs::read(&path).unwrap()
+    };
+    let serial = run(false);
+    assert!(
+        run(true) == serial,
+        "database bytes depend on a slow pre-check"
+    );
 }
 
 /// Issue #137 owner ids: remapped from file-local to global dictionary ids
