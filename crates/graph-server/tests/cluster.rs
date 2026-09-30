@@ -1225,6 +1225,9 @@ fn payload_too_large_backlog_and_a_20_mib_file_replicate() {
     let away = tb.ids().into_iter().find(|i| *i != leader).unwrap();
     tb.node_mut(away).stop();
     let c = tb.client(leader);
+    // How long the leader took to write (and apply) the backlog: the
+    // follower's catch-up has to apply the same entries again.
+    let wrote = Instant::now();
     for i in 0..6u8 {
         c.index_bytes(
             "o",
@@ -1249,8 +1252,14 @@ fn payload_too_large_backlog_and_a_20_mib_file_replicate() {
         .collect();
     c.index_batch("o", "r", &chunk, IndexOptions::default())
         .unwrap();
+    let backlog_work = wrote.elapsed();
     tb.node_mut(away).restart();
-    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    // Issue #147: under CPU load the entries reach the follower within
+    // about a second, but applying them (the 100-file batch above all)
+    // costs the follower what it cost the leader, which on a loaded
+    // runner was 11-14 s by itself. So the wait scales with the measured
+    // cost of this payload on this machine, not a fixed deadline.
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT + backlog_work * 2);
     assert!(
         tb.node(leader)
             .raft()
