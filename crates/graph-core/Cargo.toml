@@ -7,6 +7,12 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+
+# `ansi` (ADR 0007 C4): the system code page via GetACP.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Globalization"] }
 
 [dev-dependencies]
 proptest.workspace = true
