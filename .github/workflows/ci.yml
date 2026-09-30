@@ -59,6 +59,53 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p graph-cli
       - run: bash scripts/disk-full-tmpfs.sh target/release/memory-graph
+  s3-e2e:
+    # Backups against a real S3 server (epic story 38, ADR 0006 testing), over
+    # plain HTTP with credentials enforced. The ADR named MinIO, but its
+    # images are no longer pullable from Docker Hub (`pull access denied for
+    # minio/minio` on the runner), so this runs SeaweedFS's S3 gateway, which
+    # enables SigV4 auth from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+    # Started with `docker run` because `services:` cannot pass its command.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: mg-e2e-key
+      AWS_SECRET_ACCESS_KEY: mg-e2e-secret-0123456789
+      MG_S3_ENDPOINT: http://127.0.0.1:8333
+      MG_S3_BUCKET: mg-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start SeaweedFS (S3 on 8333, auth on)
+        run: |
+          docker run -d --name s3 -p 8333:8333 \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+            chrislusf/seaweedfs:4.48 server -s3 -dir=/data
+          created=
+          for i in $(seq 90); do
+            if docker exec s3 sh -c "echo 's3.bucket.create -name $MG_S3_BUCKET' | weed shell -master=localhost:9333" 2>&1 \
+              | grep -q "created bucket"; then created=1; break; fi
+            sleep 1
+          done
+          if [ -z "$created" ]; then
+            echo "::error::SeaweedFS did not create bucket $MG_S3_BUCKET within 90 s"
+            exit 1
+          fi
+      - name: Anonymous requests are refused
+        run: |
+          for i in $(seq 60); do
+            # Until the gateway listens curl fails (7, 56); keep waiting.
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$MG_S3_ENDPOINT/$MG_S3_BUCKET?list-type=2" || true)
+            [ "$code" != 000 ] && [ -n "$code" ] && break
+            sleep 1
+          done
+          echo "anonymous ListObjectsV2: $code"
+          test "$code" = 403
+      - run: cargo test -p graph-cli --test s3_e2e -- --nocapture
+      - name: S3 server log on failure
+        if: failure()
+        run: docker logs s3 2>&1 | tail -n 200
   probes:
     # The machine probes on each platform with one: memory must be known
     # (and say where it came from), disk must be known. macOS only runs here.

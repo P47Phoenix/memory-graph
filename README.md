@@ -200,6 +200,31 @@ memory-graph serve --data-dir ./n1 --listen 127.0.0.1:7001   # later: a restart 
   ```
 - **Backup.** `cluster snapshot --out FILE` downloads a consistent copy of the store from any node (SHA-256 and size verified); `serve --data-dir <empty dir> --bootstrap --restore FILE` seeds a new cluster from it. `serve --backup-url file://<dir>` copies every snapshot the leader builds to `<dir>/<cluster_id>/` (data, then a `.meta` that commits it; `--backup-keep N`, default 7), and `--restore file://<dir>/<cluster_id>/latest` restores the newest one after checking its size, SHA-256, store format and extractors. See [docs/deploy/data-dir.md](docs/deploy/data-dir.md).
 
+#### Backups to S3-compatible storage
+
+`--backup-url s3://bucket/prefix` writes the same backups to an S3-compatible server over plain HTTP (ADR 0006): MinIO, Ceph RGW, R2, B2, Garage, or AWS S3 through a TLS sidecar (native HTTPS waits on #104). A walkthrough on one machine with SeaweedFS's S3 gateway in Docker (which turns SigV4 auth on from the two variables; any S3-compatible server works the same way):
+
+```sh
+export AWS_ACCESS_KEY_ID=mg-demo AWS_SECRET_ACCESS_KEY=mg-demo-secret-123
+docker run -d --name s3 -p 8333:8333 -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY chrislusf/seaweedfs:4.48 server -s3 -dir=/data
+until docker exec s3 sh -c "echo 's3.bucket.create -name mg-backups' | weed shell -master=localhost:9333" 2>&1 \
+  | grep -q "created bucket"; do sleep 1; done   # retries until SeaweedFS is up
+
+memory-graph serve --data-dir ./n1 --bootstrap --node-id 1 --listen 127.0.0.1:7001 \
+  --backup-url s3://mg-backups/prod --backup-endpoint http://127.0.0.1:8333 &
+memory-graph --server 127.0.0.1:7001 index --org acme --repo api ./api
+memory-graph --server 127.0.0.1:7001 cluster snapshot --upload   # upload now; prints the URL and sha256
+memory-graph --server 127.0.0.1:7001 cluster backups             # newest first, with the URLs --restore takes
+
+# Rebuild from the newest backup into an empty directory (a new cluster):
+CLUSTER=$(memory-graph --server 127.0.0.1:7001 cluster status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["cluster_id"])')
+memory-graph serve --data-dir ./restored --bootstrap --node-id 1 --listen 127.0.0.1:7002 \
+  --restore s3://mg-backups/prod/$CLUSTER/latest --backup-endpoint http://127.0.0.1:8333 &
+memory-graph --server 127.0.0.1:7002 describe                    # the same answers as 127.0.0.1:7001
+```
+
+The leader also uploads every snapshot it builds (`--backup-on leader`, the default) and keeps the newest 7 (`--backup-keep`). Credentials come from the environment or `--backup-credentials-file`, never from a flag. For production, [docs/deploy/data-dir.md](docs/deploy/data-dir.md#s3-in-production-tls-lifecycle-and-iam) has the TLS sidecar recipe for AWS, the bucket lifecycle rule and a minimal IAM policy. CI runs this path against SeaweedFS on every push (`s3-e2e` job, `crates/graph-cli/tests/s3_e2e.rs`).
+
 Measurements (ingest on one and three nodes, snapshots, read latency, the corpus and 10 M tokens, a 60-minute soak): [docs/spikes/raft-replication.md](docs/spikes/raft-replication.md).
 
 #### More nodes: join, promote, remove

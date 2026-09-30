@@ -7,7 +7,7 @@
 1. Today a cluster's only backups are `cluster snapshot --out <file>` and `serve --bootstrap --restore <file>`. Each node keeps just one snapshot on its own disk.
 2. This ADR lets the leader copy each snapshot it builds to a backup location, keep the last few there, and restore a new cluster straight from that location.
 3. Stage 1 supports a local or mounted directory (`file://`) and S3-compatible object storage over plain HTTP (`s3://`, for AWS through a sidecar, MinIO, Ceph, R2, B2, Garage).
-4. Talking to AWS directly over HTTPS needs a TLS library that passes our pure-Rust gate; that is deferred (story 39, shared with #104). Until then, use a TLS sidecar or sync a `file://` directory with `aws s3 sync`.
+4. Talking to AWS directly over HTTPS needs a TLS library that passes our pure-Rust gate; that is deferred (story 39, shared with #104). Until then, use a TLS sidecar reached under the real S3 host name (SigV4 signs `Host`, so `--backup-endpoint` cannot be `127.0.0.1`; see `docs/deploy/data-dir.md`, and #173 for a `--backup-connect-to` flag) or sync a `file://` directory with `aws s3 sync`.
 5. A backup only counts once its small `.meta` file (checksum, size, versions) is written after the data. Restores check that `.meta` before touching anything.
 6. The snapshot format does not change, so there is no schema bump.
 
@@ -70,7 +70,7 @@ Hand-written in `graph-server/src/backup/`:
 
 ### E5. TLS
 
-Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance pointing to a sidecar (stunnel, envoy, or `aws s3 sync` from a `file://` directory) and to #104. Stage 2 goes behind a `backup-tls` feature once a pure-Rust rustls provider passes the gate (candidates: rustls-rustcrypto, graviola), through spike S5 (story 39).
+Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance pointing to a sidecar (stunnel, or `aws s3 sync` from a `file://` directory) and to #104. The sidecar must be reached under the real S3 host name (e.g. `http://s3.eu-west-1.amazonaws.com`, resolved to the sidecar for memory-graph only): SigV4 signs the `Host` header and AWS routes on it, so `--backup-endpoint http://127.0.0.1:<port>` cannot work (recipe in `docs/deploy/data-dir.md`; #173 tracks a `--backup-connect-to` flag). Stage 2 goes behind a `backup-tls` feature once a pure-Rust rustls provider passes the gate (candidates: rustls-rustcrypto, graviola), through spike S5 (story 39).
 
 ### E6. Credentials
 
@@ -135,7 +135,7 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
   - a failure does not block purge;
   - `latest` resolution;
   - leader-only upload across a leadership transfer.
-- A MinIO CI job on Linux with a service container over plain HTTP.
+- A CI job on Linux against an S3-compatible server over plain HTTP (SeaweedFS in CI; MinIO's image is no longer pullable).
 - The gate stays clean.
 
 ## Alternatives rejected
@@ -155,10 +155,10 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 
 | # | Story | Points | Status |
 |---|---|---|---|
-| 35 | S1: the `file://` sink and verified restore | 5 | |
-| 36 | S2: the S3 client over plain HTTP | 8 | |
-| 37 | S3: `--restore s3://` + `latest`, `cluster snapshot --upload`, `cluster backups` | 3 | |
-| 38 | S4: MinIO e2e CI job + docs | 3 | |
+| 35 | S1: the `file://` sink and verified restore | 5 | Delivered in PR #159 |
+| 36 | S2: the S3 client over plain HTTP | 8 | Delivered in PR #167 |
+| 37 | S3: `--restore s3://` + `latest`, `cluster snapshot --upload`, `cluster backups` | 3 | Delivered in PR #170 |
+| 38 | S4: S3 e2e CI job + docs | 3 | Delivered in PR #171 (SeaweedFS in CI; MinIO's image is no longer pullable) |
 | 39 | S5: native HTTPS spike behind `backup-tls` | 5 | Deferred, shared with #104 |
 
 Acceptance criteria are in the [epic](../epic-code-memory-graph.md).
