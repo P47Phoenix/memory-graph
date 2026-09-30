@@ -198,7 +198,7 @@ memory-graph serve --data-dir ./n1 --listen 127.0.0.1:7001   # later: a restart 
   metrics-listen = "0.0.0.0:9100"
   log-format = "json"
   ```
-- **Backup.** `cluster snapshot --out FILE` downloads a consistent copy of the store from any node (SHA-256 and size verified); `serve --data-dir <empty dir> --bootstrap --restore FILE` seeds a new cluster from it. See [docs/deploy/data-dir.md](docs/deploy/data-dir.md).
+- **Backup.** `cluster snapshot --out FILE` downloads a consistent copy of the store from any node (SHA-256 and size verified); `serve --data-dir <empty dir> --bootstrap --restore FILE` seeds a new cluster from it. `serve --backup-url file://<dir>` copies every snapshot the leader builds to `<dir>/<cluster_id>/` (data, then a `.meta` that commits it; `--backup-keep N`, default 7), and `--restore file://<dir>/<cluster_id>/latest` restores the newest one after checking its size, SHA-256, store format and extractors. See [docs/deploy/data-dir.md](docs/deploy/data-dir.md).
 
 Measurements (ingest on one and three nodes, snapshots, read latency, the corpus and 10 M tokens, a 60-minute soak): [docs/spikes/raft-replication.md](docs/spikes/raft-replication.md).
 
@@ -253,6 +253,8 @@ MEMORY_GRAPH_LOG=debug memory-graph serve ...                     # RPC and appl
   | `mg_quorum_probes_total{outcome}` | counter | Leader only: health probes of voters that went silent while a write waited (`--quorum-loss-timeout`); `outcome` `alive` (answered `SERVING`) or `dead` |
   | `mg_apply_duration_seconds` | histogram | Time to apply one committed log entry |
   | `mg_build_info{version,protocol,store_format}` | gauge | Always 1 |
+  | `mg_backup_last_success_timestamp`, `mg_backup_last_index` | gauge | Unix time and log index of the last snapshot backup committed (`--backup-url`; 0: none) |
+  | `mg_backup_failures_total`, `mg_backup_bytes_total` | counter | Backups that failed after every retry; bytes written by successful ones |
 
   `cluster status --json` reports the same Raft and store numbers, `writes_forwarded_total`, `rpcs_total` and `entries_applied_total`. Contract note on `outcome`: it is read from the response headers, so an error a streaming call (`Descendants`, `FileTokens`, snapshot download) reports in its trailers after its first message counts as `ok`; alert on stream failures from the client side.
 - **Health.** gRPC `grpc.health.v1`: the default service (`""`) is `SERVING` once the store is open; `memory-graph.ready` is `SERVING` only while a leader is known, a leader's `AppendEntries` (heartbeats included; learners get them too) reached this node within three maximum election timeouts, and it has applied to within `--ready-max-lag` entries (default 1000) of the leader's commit index: a learner still catching up, or one cut off from the leader, is not ready; an idle, caught-up one is. Both go `NOT_SERVING` as soon as a shutdown starts. `memory-graph health [--ready] --server <addr>` exits 0 when serving, 1 otherwise; it is the probe for the shell-less image (the Docker `HEALTHCHECK` runs `health`, Compose and Kubernetes use `--ready`).

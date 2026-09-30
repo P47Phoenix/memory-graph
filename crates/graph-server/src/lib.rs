@@ -26,6 +26,8 @@
 //!   linearizable read barrier to the leader (stage C, ADR 0004 D8/D9).
 //! * [`observe`]: metrics (Prometheus text, `Admin.Metrics`), the per-RPC
 //!   tracing/metrics layer and the `/metrics` HTTP responder (stage E).
+//! * [`backup`]: snapshot backups to a `file://` directory and verified
+//!   restores from one (ADR 0006).
 //! * [`disk`]: the disk guard (`--min-free-disk`).
 //! * [`lock`]: the LOCK sidecar naming the holder.
 //! * [`powercut`]: a test-only in-memory redb storage backend that can
@@ -42,6 +44,7 @@
 //! and a `snapshot_id` reads a frozen handle.
 
 pub mod advertise;
+pub mod backup;
 pub mod conn;
 pub mod disk;
 pub mod extractors;

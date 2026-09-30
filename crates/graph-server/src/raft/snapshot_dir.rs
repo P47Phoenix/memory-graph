@@ -112,7 +112,12 @@ pub struct SnapshotDir {
     installed: AtomicU64,
     /// Snapshots built since start.
     built: AtomicU64,
+    /// Told about every new build (the backup uploader); must not block.
+    on_built: std::sync::RwLock<Option<OnBuilt>>,
 }
+
+/// Called with each newly built snapshot pair (not a reused one).
+pub type OnBuilt = std::sync::Arc<dyn Fn(&SnapshotSidecar, &Path) + Send + Sync>;
 
 impl SnapshotDir {
     /// Create the directory if needed and drop leftover temp files.
@@ -131,7 +136,16 @@ impl SnapshotDir {
             extractors_hash: extractors_hash.to_string(),
             installed: AtomicU64::new(0),
             built: AtomicU64::new(0),
+            on_built: std::sync::RwLock::new(None),
         })
+    }
+
+    /// Set (or clear) the hook told about each new build.
+    pub fn set_on_built(&self, f: Option<OnBuilt>) {
+        *self
+            .on_built
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = f;
     }
 
     pub fn dir(&self) -> &Path {
@@ -298,6 +312,14 @@ impl SnapshotDir {
         let _ = std::fs::remove_file(&tmp);
         let (side, path) = r?;
         self.built.fetch_add(1, Ordering::SeqCst);
+        let hook = self
+            .on_built
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(f) = hook {
+            f(&side, &path);
+        }
         Ok(Snapshot {
             meta: side.meta(),
             snapshot: Box::new(SnapshotFile { path }),

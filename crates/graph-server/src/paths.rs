@@ -717,17 +717,41 @@ pub fn restore_into(snapshot: &Path, store: &Path) -> Result<(), StoreError> {
         }
         Err(e) => return Err(e),
     }
-    let tmp = with_suffix(store, ".restore.tmp");
+    let tmp = restore_tmp(store);
     let _ = std::fs::remove_file(&tmp);
     std::fs::copy(snapshot, &tmp)
         .map_err(|e| StoreError::Storage(format!("copying `{}`: {e}", snapshot.display())))?;
-    let stripped = graph_store::V2Store::open(&tmp).and_then(|s| s.clear_raft_state());
+    place_restore(&tmp, store)
+}
+
+/// `<store>.restore.tmp`: the one file a restore writes before the store
+/// is in place (a copy of the snapshot, or a verified backup download).
+pub fn restore_tmp(store: &Path) -> PathBuf {
+    with_suffix(store, ".restore.tmp")
+}
+
+/// Put a staged restore (`tmp`, normally [`restore_tmp`]) in place as the
+/// store: check it is a store, strip its Raft state, rename it. `tmp` is
+/// removed on any failure.
+pub fn place_restore(tmp: &Path, store: &Path) -> Result<(), StoreError> {
+    let checked = match graph_store::detect_format(tmp) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(StoreError::Rejected(format!(
+            "`{}` is not a memory-graph store file",
+            tmp.display()
+        ))),
+        Err(e) => Err(e),
+    };
+    let stripped =
+        checked.and_then(|()| graph_store::V2Store::open(tmp).and_then(|s| s.clear_raft_state()));
     if let Err(e) = stripped {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
-    std::fs::rename(&tmp, store)
-        .map_err(|e| StoreError::Storage(format!("placing `{}`: {e}", store.display())))
+    std::fs::rename(tmp, store).map_err(|e| {
+        let _ = std::fs::remove_file(tmp);
+        StoreError::Storage(format!("placing `{}`: {e}", store.display()))
+    })
 }
 
 #[cfg(test)]

@@ -46,6 +46,32 @@ behind the leader.
 A file-level copy of `graph.redb` from a stopped node also works, but a running node's files are
 not a consistent backup.
 
+### Automatic backups to a directory (`--backup-url`)
+
+```sh
+memory-graph serve --data-dir ./n1 ... --backup-url file:///srv/mg-backups --backup-keep 7
+```
+
+With `--backup-url file://<dir>` (ADR 0006), each snapshot the leader builds is copied to
+`<dir>/<cluster_id>/snap-<term>-<index>.redb`, and then its `.meta` (size, SHA-256, store format,
+extractors hash) is written. A backup counts only once its `.meta` exists, so an upload that was
+cut short (a crash, a full disk) is never restorable. The directory may be local or mounted; to
+get backups into S3 before `s3://` ships, `aws s3 sync` the directory.
+
+- `--backup-on leader|all|none` (default `leader`): which nodes upload the snapshots they build.
+  With `all`, give each node its own `--backup-url`: the keys carry no node id.
+- `--backup-keep N` (default 7, 0 = all): older backups of this cluster are deleted, `.meta`
+  first, and only after a newer one committed. Data without a `.meta` older than 24 h (an
+  interrupted upload) is swept. Other clusters' prefixes are never touched.
+- Uploads run on their own thread, one at a time; a newer snapshot replaces a queued one. They
+  never block or delay a snapshot or a log purge. A failed upload is retried 3 times, then logged
+  and counted: `mg_backup_failures_total`, and `cluster status` shows `last_backup_error`. The
+  last success is `mg_backup_last_success_timestamp` / `mg_backup_last_index`.
+- The upload reads the snapshot through an open handle, not a copy: on Windows the handle is
+  opened with delete sharing, so (on NTFS with POSIX delete semantics, Windows 10 1809 and later) a newer snapshot can still replace the old one while it is read,
+  and the bytes read are checked against the snapshot's SHA-256 before the `.meta` is written.
+- All of these are also `serve --config` TOML keys (`backup-url`, `backup-keep`, `backup-on`).
+
 ## Restore
 
 A restore creates a **new** cluster (a new cluster id and a fresh log) whose store is the backup:
@@ -59,6 +85,21 @@ memory-graph serve --data-dir ./n3 --node-id 3 --join n1:7000 --auto-promote --l
 `--restore` works only with `--bootstrap` and only into an empty directory; the file is checked to
 be a store of the current format. Nodes of the old cluster refuse the new one (`WrongCluster`),
 so wipe their directories before they join it.
+
+From a `--backup-url` directory, name the backup or `latest` (the highest committed index):
+
+```sh
+memory-graph serve --data-dir ./n1 --bootstrap --node-id 1 \
+  --restore file:///srv/mg-backups/<cluster_id>/latest --listen 0.0.0.0:7000
+```
+
+The `.meta` is read first: the store format must match this binary, and so must the extractors
+hash (`--restore-allow-extractor-mismatch` accepts other extractors: the store stays valid and
+affected files re-extract on their next index; the format check has no override). The free disk
+must cover `--min-free-disk` plus the backup. The data is downloaded to `graph.redb.restore.tmp`
+and its size and SHA-256 are checked against the `.meta` before it becomes the store; any
+mismatch is refused and the temporary file removed. A refused restore leaves the data directory without a store (the directory itself may remain), and the same command can be retried. With `latest`, a pair that fails verification is skipped for the next-highest committed one. A missing `--backup-url` directory is created on the first upload. A plain `--restore <file>` with a `.meta` next
+to it (a copy of a backup pair) is verified the same way; without one it restores with a warning.
 
 In Compose: `down -v`, then start node1 once by hand with `--restore` on its volume (for example
 `docker compose run --rm -v "$PWD/backup.redb:/backup.redb:ro" node1 serve --data-dir /data

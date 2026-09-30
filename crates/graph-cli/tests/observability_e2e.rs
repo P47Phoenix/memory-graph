@@ -360,7 +360,7 @@ fn check_histograms(types: &BTreeMap<String, String>, samples: &[Sample]) {
     }
 }
 
-const METRIC_NAMES: [&str; 18] = [
+const METRIC_NAMES: [&str; 22] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -379,6 +379,10 @@ const METRIC_NAMES: [&str; 18] = [
     "mg_quorum_probes_total",
     "mg_apply_duration_seconds",
     "mg_build_info",
+    "mg_backup_last_success_timestamp",
+    "mg_backup_last_index",
+    "mg_backup_failures_total",
+    "mg_backup_bytes_total",
 ];
 
 fn src_file(dir: &Path) -> String {

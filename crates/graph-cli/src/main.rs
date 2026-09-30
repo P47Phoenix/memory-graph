@@ -242,9 +242,33 @@ enum Cmd {
         #[arg(long, requires = "data_dir")]
         bootstrap: bool,
         /// With --bootstrap, into an empty --data-dir: seed the store from this snapshot file
-        /// (`cluster snapshot --out`); the new cluster gets a new id and a fresh log
-        #[arg(long, requires = "bootstrap", value_name = "FILE")]
+        /// (`cluster snapshot --out`), or from a backup, `file://<dir>/<cluster_id>/snap-T-I.redb`
+        /// or `file://<dir>/<cluster_id>/latest` (verified against its .meta: size, sha256, store
+        /// format and extractors). A plain file's sibling .meta is verified when present. The
+        /// new cluster gets a new id and a fresh log
+        #[arg(long, requires = "bootstrap", value_name = "FILE|URL")]
         restore: Option<PathBuf>,
+        /// With --restore: accept a backup made with other extractors (the store stays valid;
+        /// affected files re-extract on their next index). The store format check has no override
+        #[arg(long, requires = "restore")]
+        restore_allow_extractor_mismatch: bool,
+        /// Copy each snapshot this server builds to a backup location, `file://<dir>`, as
+        /// <dir>/<cluster_id>/snap-T-I.redb plus .meta (written last: a backup without its .meta
+        /// does not count). Uploads run in the background and never delay snapshots or purges
+        #[arg(long, value_name = "URL")]
+        backup_url: Option<String>,
+        /// With --backup-url: keep this many backups of this cluster (0: keep all); older ones
+        /// are deleted .meta first, and data without a .meta older than 24 h is swept
+        #[arg(long, requires = "backup_url", value_name = "N", default_value_t = graph_server::backup::DEFAULT_KEEP)]
+        backup_keep: usize,
+        /// With --backup-url: which nodes upload the snapshots they build: leader, all or none
+        #[arg(
+            long,
+            requires = "backup_url",
+            value_name = "WHO",
+            default_value = "leader"
+        )]
+        backup_on: graph_server::backup::BackupOn,
         /// With --data-dir: join the cluster that the node at this host:port belongs to (any
         /// member; it forwards to the leader). On an empty directory the node asks to be added as
         /// a learner and catches up; on one that already belongs to that cluster it is a plain
@@ -885,6 +909,10 @@ fn run() -> Result<i32> {
         data_dir,
         bootstrap,
         restore,
+        restore_allow_extractor_mismatch,
+        backup_url,
+        backup_keep,
+        backup_on,
         join,
         bootstrap_or_join,
         peers,
@@ -1105,6 +1133,13 @@ fn run() -> Result<i32> {
             );
         }
         cfg.snapshot_max_age = *snapshot_max_age;
+        cfg.restore_allow_extractor_mismatch = *restore_allow_extractor_mismatch;
+        if let Some(url) = backup_url {
+            let mut b = graph_server::backup::BackupConfig::new(url.clone());
+            b.keep = *backup_keep;
+            b.on = *backup_on;
+            cfg.backup = Some(b);
+        }
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
         // Test-only fault injection (serve_e2e): park writes after N
         // proposals so a test can kill the server mid-run. Not a feature.
@@ -1279,6 +1314,15 @@ fn run() -> Result<i32> {
                                     "matched_index": p.matched_index,
                                     "lag": p.lag,
                                 })).collect::<Vec<_>>(),
+                                "backup": st.backup.as_ref().map(|b| serde_json::json!({
+                                    "url": b.url,
+                                    "on": b.on,
+                                    "last_index": b.last_index,
+                                    "last_success_unix": b.last_success_unix,
+                                    "failures_total": b.failures_total,
+                                    "bytes_total": b.bytes_total,
+                                    "last_backup_error": b.last_backup_error,
+                                })),
                             }))?
                         );
                     } else {
@@ -1351,6 +1395,23 @@ fn run() -> Result<i32> {
                             st.uptime_secs,
                             st.snapshot_handles
                         );
+                        if let Some(b) = &st.backup {
+                            out!(
+                                "  backup    {} (on {}): last {}, {} failed, {} bytes",
+                                b.url,
+                                b.on,
+                                if b.last_index == 0 {
+                                    "none yet".to_string()
+                                } else {
+                                    format!("at {} (unix {})", b.last_index, b.last_success_unix)
+                                },
+                                b.failures_total,
+                                b.bytes_total
+                            );
+                            if !b.last_backup_error.is_empty() {
+                                out!("  backup    last error: {}", b.last_backup_error);
+                            }
+                        }
                     }
                 }
                 ClusterCmd::Leader { json } => {
@@ -2172,8 +2233,17 @@ mod serve_config_tests {
                 "10m",
                 "--cache-bytes",
                 "1000000",
+                "--backup-url",
+                "file:///srv/backups",
+                "--backup-keep",
+                "3",
+                "--backup-on",
+                "all",
             ],
             r#"
+backup-url = "file:///srv/backups"
+backup_keep = 3
+backup-on = "all"
 data-dir = "/data"
 join = "peer:7000"
 auto_promote = true

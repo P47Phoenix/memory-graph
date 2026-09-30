@@ -841,6 +841,18 @@ impl pb::admin_server::Admin for AdminService {
             writes_forwarded_total: self.ctx.fwd.forwarded_total(),
             rpcs_total: self.ctx.raft.obs.rpc_total(),
             entries_applied_total: self.ctx.raft.obs.apply_total(),
+            backup: self.ctx.backup.as_ref().map(|b| {
+                let s = b.stats();
+                pb::BackupStatus {
+                    url: b.sink().describe(),
+                    on: b.on().to_string(),
+                    last_index: s.last_index,
+                    last_success_unix: s.last_success_unix,
+                    failures_total: s.failures_total,
+                    bytes_total: s.bytes_total,
+                    last_backup_error: s.last_error,
+                }
+            }),
         }))
     }
 
