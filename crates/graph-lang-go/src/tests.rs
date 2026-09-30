@@ -263,7 +263,7 @@ proptest! {
 #[test]
 fn keywords_are_classed_keyword() {
     let toks = GoExtractor
-        .extract("package p\nfunc f() { x := nil; _ = x }\n")
+        .extract("package p\nfunc f() { x := nil; _ = x; switch { default: } }\n")
         .tokens;
     let class = |text: &str| {
         toks.iter()
@@ -271,7 +271,7 @@ fn keywords_are_classed_keyword() {
             .map(|t| t.class)
             .collect::<Vec<_>>()
     };
-    for w in ["package", "func"] {
+    for w in ["package", "func", "switch", "default"] {
         assert_eq!(class(w), [graph_core::TokenClass::Keyword], "{w}");
     }
     for w in ["nil", "p", "f"] {

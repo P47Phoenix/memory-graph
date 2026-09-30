@@ -375,3 +375,33 @@ fn keywords_are_classed_keyword() {
         .version()
         .starts_with("typescript-scan-2+kw1+tok"));
 }
+
+/// Review of #164: interface and type-literal members with reserved names
+/// (after `;`, optional `?:`) and methods with a return type are names.
+#[test]
+fn keyword_classing_members() {
+    use graph_core::TokenClass::{Identifier as I, Keyword as K};
+    let classes = |src: &str, word: &str| {
+        TypeScriptExtractor
+            .extract(src)
+            .tokens
+            .iter()
+            .filter(|t| t.text == word)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        classes("interface I { a: T; default?: U; }", "default"),
+        [I]
+    );
+    assert_eq!(classes("type T = { a: 1; new: 2 };", "new"), [I]);
+    assert_eq!(
+        classes("class A { delete(): boolean { return true; } }", "delete"),
+        [I]
+    );
+    assert_eq!(
+        classes("class A { delete(): boolean { return true; } }", "return"),
+        [K]
+    );
+    assert_eq!(classes("switch (x) { default: break; }", "default"), [K]);
+}

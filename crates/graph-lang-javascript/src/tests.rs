@@ -274,3 +274,71 @@ fn keywords_are_classed_keyword() {
         .version()
         .starts_with("javascript-scan-1+kw1+tok"));
 }
+
+/// Review of #164: `default:` in a switch body is the keyword; reserved
+/// method names in classes and object literals are names, statements stay
+/// keywords; JSX attributes `class=` / `for=` are names; `o?.class` too.
+#[test]
+fn keyword_classing_edge_cases() {
+    use graph_core::TokenClass::{Identifier as I, Keyword as K};
+    let classes = |src: &str, word: &str| {
+        JavaScriptExtractor
+            .extract(src)
+            .tokens
+            .iter()
+            .filter(|t| t.text == word)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(classes("switch (x) { default: f(); }", "default"), [K]);
+    assert_eq!(
+        classes("switch (x) { case 1: g(); default: f(); }", "default"),
+        [K]
+    );
+    assert_eq!(
+        classes("switch (x) { case 1: { if (a) { b(); } } }", "if"),
+        [K]
+    );
+    assert_eq!(
+        classes("class A { delete() { if (x) { y(); } } }", "delete"),
+        [I]
+    );
+    assert_eq!(
+        classes("class A { delete() { if (x) { y(); } } }", "if"),
+        [K]
+    );
+    assert_eq!(
+        classes("class A { static get default() { return 1; } }", "default"),
+        [I]
+    );
+    assert_eq!(
+        classes("const o = { new() { return 1; }, x: 2 };", "new"),
+        [I]
+    );
+    assert_eq!(
+        classes(
+            "function f() { if (a) { b(); } ; while (c) { d(); } }",
+            "if"
+        ),
+        [K]
+    );
+    assert_eq!(
+        classes(
+            "function f() { if (a) { b(); } ; while (c) { d(); } }",
+            "while"
+        ),
+        [K]
+    );
+    assert_eq!(classes("const o = { default: 1 };", "default"), [I]);
+    assert_eq!(classes("x = o?.class;", "class"), [I]);
+    assert_eq!(
+        classes("const e = <label for=\"n\" class={c}>x</label>;", "for"),
+        [I]
+    );
+    assert_eq!(
+        classes("const e = <label for=\"n\" class={c}>x</label>;", "class"),
+        [I]
+    );
+    assert_eq!(classes("for (const k in o) {}", "for"), [K]);
+    assert_eq!(classes("export default f;", "default"), [K]);
+}

@@ -21,7 +21,7 @@
 //! (`x = () => {}`), object-literal methods, anonymous
 //! `module.exports = function () {}`.
 use graph_core::scan::{
-    code_close_table, mark_keywords, matching_close, span_between, NestedEnds, Step,
+    close_table, code_close_table, mark_keywords, matching_close, span_between, NestedEnds, Step,
 };
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -73,22 +73,166 @@ pub const KEYWORDS: &[&str] = &[
     "with",
 ];
 
+/// What a `{` opens, as far as keyword classing needs to know.
+#[derive(Clone, Copy, PartialEq)]
+enum Brace {
+    /// `switch (...) {`: `default:` there is the keyword.
+    Switch,
+    /// A class/interface body or an object/type literal: members live here.
+    Members,
+    /// Anything else (a block).
+    Block,
+}
+
 /// Classes [`KEYWORDS`] as `keyword` in JavaScript/TypeScript tokens, except
-/// where a reserved word is a property name: after `.` / `?.` or a private
-/// `#`, or an object-literal key (`{ default: 1, new: 2 }`: preceded by `{`
-/// or `,` and followed by `:`).
+/// where a reserved word is a name:
+/// - a property: after `.` / `?.` or a private `#`;
+/// - a key or member (`{ default: 1 }`, `{ a; new?: T }`): after `{`, `,`
+///   or `;` and before `:` or `?:`, unless the `{` is a switch body;
+/// - a method (`delete() {}`, `static get default() {}`, TS
+///   `new(): T {}`): in a class body or object literal, after `{ ; } ,`,
+///   `static`, `get`, `set`, `async` or `*`, and before `(...)` then `{`
+///   (or `:` and a return type, then `{`);
+/// - a JSX attribute (`<label for="x" class={c}>`): after an identifier,
+///   keyword or string and before a lone `=`.
+///
+/// Known limits: a brace's kind is guessed from the tokens just before it,
+/// so unusual layouts can misclass a member name either way.
 pub fn mark_js_keywords(tokens: &mut [TokenDecl]) {
-    mark_keywords(tokens, KEYWORDS, |t, i| {
-        let code = |d: &&TokenDecl| d.class != TokenClass::Comment;
-        let prev = t[..i].iter().rev().find(code);
-        let next = t[i + 1..].iter().find(code);
-        match prev.map(|p| p.text.as_str()) {
-            Some("." | "?.") => true,
-            Some("#") => t[i - 1].span.end == t[i].span.start,
-            Some("{" | ",") => next.is_some_and(|n| n.text == ":"),
-            _ => false,
+    let closes = close_table(tokens);
+    let code: Vec<usize> = (0..tokens.len())
+        .filter(|&i| tokens[i].class != TokenClass::Comment)
+        .collect();
+    let mut pos = vec![usize::MAX; tokens.len()];
+    for (k, &i) in code.iter().enumerate() {
+        pos[i] = k;
+    }
+    let mut opens = vec![None; tokens.len()];
+    for (o, c) in closes.iter().enumerate() {
+        if let Some(c) = *c {
+            opens[c] = Some(o);
         }
+    }
+    fn text<'a>(t: &'a [TokenDecl], code: &[usize], k: usize) -> &'a str {
+        code.get(k).map_or("", |&i| t[i].text.as_str())
+    }
+    // `encl[k]`: kind of the innermost `{` enclosing code token `k`.
+    let mut encl = vec![Brace::Block; code.len()];
+    let mut stack: Vec<Brace> = Vec::new();
+    for (k, e) in encl.iter_mut().enumerate() {
+        *e = stack.last().copied().unwrap_or(Brace::Block);
+        match text(tokens, &code, k) {
+            "{" => {
+                let kind = brace_kind(tokens, &code, &pos, &opens, k, *e);
+                stack.push(kind);
+            }
+            "}" => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    mark_keywords(tokens, KEYWORDS, |t, i| {
+        let k = pos[i];
+        let prev = if k == 0 { "" } else { text(t, &code, k - 1) };
+        let (next, next2) = (text(t, &code, k + 1), text(t, &code, k + 2));
+        match prev {
+            "." | "?." => return true,
+            "#" if t[i - 1].span.end == t[i].span.start => return true,
+            _ => {}
+        }
+        if matches!(prev, "{" | "," | ";")
+            && (next == ":" || next == "?" && next2 == ":")
+            && encl[k] != Brace::Switch
+        {
+            return true;
+        }
+        if encl[k] == Brace::Members
+            && matches!(
+                prev,
+                "{" | ";" | "}" | "," | "static" | "get" | "set" | "async" | "*"
+            )
+            && next == "("
+            && method_body_follows(t, &code, &pos, &closes, k + 1)
+        {
+            return true;
+        }
+        let attr_prev = k > 0 && {
+            let p = &t[code[k - 1]];
+            matches!(p.class, TokenClass::Identifier | TokenClass::Keyword)
+                || p.class == TokenClass::Literal && p.text.starts_with(['"', '\''])
+        };
+        attr_prev && next == "=" && next2 != "=" && next2 != ">"
     });
+}
+
+/// Kind of the `{` at code position `k`, whose own enclosing brace is `outer`.
+fn brace_kind(
+    t: &[TokenDecl],
+    code: &[usize],
+    pos: &[usize],
+    opens: &[Option<usize>],
+    k: usize,
+    outer: Brace,
+) -> Brace {
+    let Some(p) = k.checked_sub(1) else {
+        return Brace::Block;
+    };
+    let prev = t[code[p]].text.as_str();
+    if prev == ")" {
+        // `switch (...) {`: find the `(` matching this `)`.
+        if let Some(o) = opens[code[p]] {
+            let before = pos[o].checked_sub(1).map(|b| t[code[b]].text.as_str());
+            if before == Some("switch") {
+                return Brace::Switch;
+            }
+        }
+        return Brace::Block;
+    }
+    if matches!(
+        prev,
+        "=" | "(" | "," | "[" | "?" | "return" | "||" | "&&" | "??"
+    ) || prev == ":" && outer != Brace::Switch
+    {
+        return Brace::Members;
+    }
+    // `class A extends B<C> implements D {`, `interface I<T> {`: a short
+    // walk back to the declaring word.
+    for b in (p.saturating_sub(32)..=p).rev() {
+        match t[code[b]].text.as_str() {
+            "class" | "interface" => return Brace::Members,
+            ";" | "{" | "}" | "(" | ")" | "=" | "=>" => break,
+            _ => {}
+        }
+    }
+    Brace::Block
+}
+
+/// Whether the `(` at code position `k` closes and is followed by a method
+/// body `{`, directly or after a `:` return type.
+fn method_body_follows(
+    t: &[TokenDecl],
+    code: &[usize],
+    pos: &[usize],
+    closes: &[Option<usize>],
+    k: usize,
+) -> bool {
+    let Some(close) = code.get(k).and_then(|&i| closes[i]) else {
+        return false;
+    };
+    let after = pos[close] + 1;
+    match code.get(after).map(|&i| t[i].text.as_str()) {
+        Some("{") => true,
+        Some(":") => {
+            code[after + 1..]
+                .iter()
+                .take(64)
+                .map(|&i| t[i].text.as_str())
+                .find(|s| matches!(*s, "{" | ";" | "}" | "=>"))
+                == Some("{")
+        }
+        _ => false,
+    }
 }
 
 /// Tokenizer dialect used for JavaScript.

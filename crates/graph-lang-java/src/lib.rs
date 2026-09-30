@@ -59,10 +59,12 @@ impl Extractor for JavaExtractor {
     }
 }
 
-/// Java's reserved keywords and literals (`true`, `false`, `null`).
+/// Java's reserved keywords, `_` (a keyword since Java 9) and literals
+/// (`true`, `false`, `null`).
 /// Contextual keywords (`var`, `record`, `yield`, `sealed`, `permits`,
 /// `module`, ...) are valid identifiers and stay identifiers.
 const KEYWORDS: &[&str] = &[
+    "_",
     "abstract",
     "assert",
     "boolean",

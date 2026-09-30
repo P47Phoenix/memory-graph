@@ -223,7 +223,7 @@ fn inconsistent_tabs_and_spaces_are_errors() {
 #[test]
 fn keywords_are_classed_keyword() {
     let toks = PythonExtractor
-        .extract("def f(match, type):\n    return None if match else type\n")
+        .extract("def f(match, type):\n    return None if match else type\nnonlocal_ = lambda: 0\n")
         .tokens;
     let class = |text: &str| {
         toks.iter()
@@ -231,7 +231,7 @@ fn keywords_are_classed_keyword() {
             .map(|t| t.class)
             .collect::<Vec<_>>()
     };
-    for w in ["def", "return", "None", "if", "else"] {
+    for w in ["def", "return", "None", "if", "else", "lambda"] {
         assert_eq!(class(w), [graph_core::TokenClass::Keyword], "{w}");
     }
     assert_eq!(class("f"), [graph_core::TokenClass::Identifier]);

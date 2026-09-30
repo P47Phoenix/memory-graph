@@ -357,7 +357,7 @@ fn semi_after_memo_matches_fresh_scans() {
 #[test]
 fn keywords_are_classed_keyword() {
     let toks = JavaExtractor
-        .extract("public class C { void m() { var record = null; } }")
+        .extract("public class C { void m(int _) { var record = null; switch (1) { default: } } }")
         .tokens;
     let class = |text: &str| {
         toks.iter()
@@ -365,7 +365,7 @@ fn keywords_are_classed_keyword() {
             .map(|t| t.class)
             .collect::<Vec<_>>()
     };
-    for w in ["public", "class", "void", "null"] {
+    for w in ["public", "class", "void", "null", "_", "default", "switch"] {
         assert_eq!(class(w), [graph_core::TokenClass::Keyword], "{w}");
     }
     for w in ["var", "record", "C"] {
