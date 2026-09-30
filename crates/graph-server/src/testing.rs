@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod cluster;
+pub mod mcp_http;
 pub use cluster::{ClusterTestbed, TestNode, CLUSTER_WAIT, TEST_RAFT};
 
 pub struct TestServer {

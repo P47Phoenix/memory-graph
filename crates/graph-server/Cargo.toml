@@ -11,6 +11,9 @@ graph-store = { path = "../graph-store" }
 graph-proto = { path = "../graph-proto" }
 # `testing::ClusterTestbed::client` hands tests a RemoteStore.
 graph-client = { path = "../graph-client" }
+# The MCP tool core behind `--mcp-listen` (ADR 0005 D1/D3).
+graph-mcp = { path = "../graph-mcp" }
+axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 openraft.workspace = true

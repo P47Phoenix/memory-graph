@@ -1,12 +1,20 @@
 # MCP: the memory graph for AI assistants
 
-`memory-graph mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so an assistant (Claude Code, Claude Desktop, or any MCP client) can search the graph, find symbols, describe repos and outline files. The design is [ADR 0005](adr/0005-mcp.md).
+`memory-graph mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so an assistant (Claude Code, Claude Desktop, or any MCP client) can search the graph, find symbols, describe repos and outline files. A running `memory-graph serve` can also serve the same tools over streamable HTTP (`--mcp-listen`, [below](#http-inside-serve)). The design is [ADR 0005](adr/0005-mcp.md).
 
 - **Read-only.** There are no tools that write.
-- **stdio only** in this release. The client starts `memory-graph mcp` itself; no port is opened. The HTTP endpoint inside `serve` (`--mcp-listen`) is story 32 and not built yet.
+- **stdio is the default and the recommended way.** The client starts `memory-graph mcp` itself; no port is opened. The HTTP endpoint inside `serve` is opt-in, off by default and loopback only.
 - **No MCP SDK.** The protocol code is hand-written (`crates/graph-mcp`), so the pure-Rust gate stays clean.
 
-> **Warning: no authentication.** MCP in memory-graph has no authentication (#105). Over stdio this is fine: only the client that started the process can talk to it. The future HTTP endpoint will be off by default and loopback only. *The MCP endpoint has no authentication. Anyone who can reach it can read every indexed source token. Keep it on loopback or behind an authenticating proxy until #105.*
+```text
++----------------------------------------------------------------------+
+| WARNING: The MCP endpoint has no authentication. Anyone who can      |
+| reach it can read every indexed source token. Keep it on loopback    |
+| or behind an authenticating proxy until #105.                        |
++----------------------------------------------------------------------+
+```
+
+Over stdio this is fine: only the client that started the process can talk to it. It matters for the HTTP endpoint (`serve --mcp-listen`), which is why that one is off by default and refuses a non-loopback address unless told otherwise.
 
 ## Quick start
 
@@ -79,10 +87,51 @@ On Windows give the full path to `memory-graph.exe` as `command` (clients do not
 
 Any MCP client with a stdio transport works: the command is `memory-graph`, the arguments are the target flags followed by `mcp`.
 
+## HTTP inside `serve`
+
+`memory-graph serve ... --mcp-listen 127.0.0.1:7071` also serves the tools at `http://127.0.0.1:7071/mcp` (the MCP streamable HTTP transport), on a port of its own: the gRPC port must reach the other cluster members, this one stays on loopback. Port 0 picks a free port; `serve` then prints `mcp on http://<addr>/mcp` before its `listening on` line. Without `--mcp-listen` no MCP endpoint listens.
+
+```text
++----------------------------------------------------------------------+
+| WARNING: The MCP endpoint has no authentication. Anyone who can      |
+| reach it can read every indexed source token. Keep it on loopback    |
+| or behind an authenticating proxy until #105.                        |
++----------------------------------------------------------------------+
+```
+
+| Flag (TOML key in `serve --config`) | Default | Meaning |
+|---|---|---|
+| `--mcp-listen HOST:PORT` (`mcp-listen`) | off | Serve MCP here. |
+| `--mcp-allow-remote` (`mcp-allow-remote`) | off | Allow a non-loopback `--mcp-listen` (without it `serve` refuses to start). Logs a warning at every start. |
+| `--mcp-allow-origin URL` (`mcp-allow-origin = [..]`) | none | A browser `Origin` accepted, exactly (`http://localhost:6274`); repeatable. |
+| `--mcp-read local\|linearizable` (`mcp-read`) | `local` | How the tools read: this node's replica (a follower answers from its own copy and says `stale_possible` when it may lag), or after the leader's read barrier (`no_leader` without a quorum). |
+| `--mcp-max-inflight N` (`mcp-max-inflight`) | 16 | Requests served at once; more get HTTP 429 with `Retry-After: 1`. |
+
+Guards (ADR 0005 D4), in the order they apply:
+- **Host.** On a loopback address, a `Host` header other than `localhost` or the bound address (with the bound port, if it names a port) gets **403**. This stops DNS rebinding: a web page cannot reach the endpoint through a name of its own. On a non-loopback address (`--mcp-allow-remote`) the Host check is left to the proxy in front, which decides the names clients use.
+- **Origin.** A request carrying an `Origin` not listed by `--mcp-allow-origin` gets **403**. Requests without an `Origin` (command-line and desktop clients) pass.
+- **Size.** A body over 1 MiB gets **413**. An answer is at most about 4 MiB: a longer list is cut short with `next_offset`.
+- **Load.** Past `--mcp-max-inflight` requests at once: **429**. A call that runs past 30 s is answered with JSON-RPC error `-32001` (its read finishes in the background and still holds its slot until then).
+- **Read-only.** There are no write tools.
+- **No TLS.** As for gRPC (ADR 0004): put a TLS-terminating, authenticating proxy in front if the endpoint must leave the host.
+
+The transport: `POST /mcp` with one JSON-RPC message. `initialize` (sent without a session) answers with an `Mcp-Session-Id` header; every later message carries it (**400** without it, **404** for an unknown or ended session: initialize again). A session holds only the negotiated protocol version; a request whose `MCP-Protocol-Version` header names another gets **400**. A request is answered with `application/json`; a notification gets **202** with no body. `GET /mcp` is **405**: this version opens no server-to-client stream (no SSE). `DELETE /mcp` with the session header ends the session. At most 1024 sessions are kept; the oldest is dropped first.
+
+Every tool reads through the node's own gRPC Store service in process, so answers, `stale_possible`, linearizable reads and errors (for example `unavailable` while a snapshot is installed) are the same as a gRPC client's on that node.
+
+`memory-graph --server <node> health` prints a second line `mcp: http://<addr>/mcp` (or `mcp: off`); `cluster status --json` has `mcp_addr` (empty when off). `/metrics` counts calls as `mg_mcp_tool_calls_total{tool, outcome}`, where `outcome` is `ok`, `error` (an `isError` result), `rejected` (a JSON-RPC error) or `timeout`.
+
+A client that speaks streamable HTTP is configured with the URL, for example in Claude Code:
+
+```sh
+memory-graph serve --data-dir /data --mcp-listen 127.0.0.1:7071
+claude mcp add --transport http memory-graph http://127.0.0.1:7071/mcp
+```
+
 ## Protocol
 
 - MCP revisions **2025-11-25** and **2025-06-18** (the latest stable one at build time and the one before it). A client asking for another `protocolVersion` gets a normal `initialize` result carrying 2025-11-25, as the MCP lifecycle prescribes; the client then disconnects if it cannot speak that. A missing or non-string `protocolVersion` is JSON-RPC error `-32602`.
-- One JSON-RPC 2.0 message per line on stdin, one reply per line on stdout. Batches are refused (`-32600`), as MCP dropped them in 2025-06-18. Ids are strings or integers.
+- stdio: one JSON-RPC 2.0 message per line on stdin, one reply per line on stdout (HTTP: one message per POST, see above). Batches are refused (`-32600`), as MCP dropped them in 2025-06-18. Ids are strings or integers.
 - Methods: `initialize`, `ping`, `tools/list`, `tools/call`; notifications `notifications/initialized` and `notifications/cancelled` (accepted; requests are answered one at a time, so a cancelled request has already finished). Before `initialize` only `initialize` and `ping` are answered (`-32002` otherwise).
 - **stdout carries only protocol messages.** Logs and errors go to stderr.
 

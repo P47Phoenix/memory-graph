@@ -1,0 +1,280 @@
+//! The MCP endpoint's transport and D4 guards (ADR 0005 D1/D4, epic story
+//! 32): off by default, loopback only unless allowed, Origin/Host 403s, the
+//! 1 MiB body limit, sessions, the in-flight limit and the call deadline.
+//! Tool answers themselves are checked in `graph-mcp`'s differential test.
+use graph_client::{ClientConfig, RemoteStore};
+use graph_core::Extractor;
+use graph_server::mcp::{McpConfig, MAX_BODY_BYTES, REQUEST_TIMEOUT};
+use graph_server::testing::mcp_http::{http, HttpReply, McpHttpClient};
+use graph_server::testing::TestServer;
+use graph_store::open_store;
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+use std::time::Duration;
+
+fn rust() -> Vec<Box<dyn Extractor>> {
+    vec![Box::new(graph_lang_rust::RustExtractor)]
+}
+
+fn loopback() -> McpConfig {
+    McpConfig::new("127.0.0.1:0".parse().unwrap())
+}
+
+/// A server over a small store with MCP configured by `mcp`.
+fn server(d: &tempfile::TempDir, mcp: McpConfig) -> (TestServer, SocketAddr) {
+    let db = d.path().join("g.redb");
+    {
+        let s = open_store(&db, rust()).unwrap();
+        s.index_bytes("acme", "geo", "src/lib.rs", b"pub fn origin() {}\n", None)
+            .unwrap();
+    }
+    let srv = TestServer::start_with(&db, rust(), |c| c.mcp = Some(mcp));
+    let addr = srv.running().unwrap().mcp_addr.expect("MCP listens");
+    (srv, addr)
+}
+
+fn post(addr: SocketAddr, headers: &[(&str, &str)], body: &Value) -> HttpReply {
+    let mut h = vec![("Content-Type", "application/json")];
+    h.extend_from_slice(headers);
+    http(addr, "POST", "/mcp", &h, body.to_string().as_bytes()).unwrap()
+}
+
+fn initialize() -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}
+    })
+}
+
+fn status_mcp_addr(srv: &TestServer) -> String {
+    RemoteStore::connect(ClientConfig::new(srv.endpoint()))
+        .unwrap()
+        .admin_status()
+        .unwrap()
+        .mcp_addr
+}
+
+#[test]
+fn off_by_default() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let srv = TestServer::start(&db, rust());
+    assert!(srv.running().unwrap().mcp_addr.is_none());
+    assert_eq!(status_mcp_addr(&srv), "", "Admin.Status says MCP is off");
+}
+
+#[test]
+fn status_reports_the_bound_address() {
+    let d = tempfile::tempdir().unwrap();
+    let (srv, addr) = server(&d, loopback());
+    assert_ne!(addr.port(), 0);
+    assert_eq!(status_mcp_addr(&srv), addr.to_string());
+}
+
+#[test]
+fn a_non_loopback_bind_is_refused_without_allow_remote() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let e = TestServer::try_start_with(&db, rust(), |c| {
+        c.mcp = Some(McpConfig::new("0.0.0.0:0".parse().unwrap()))
+    })
+    .err()
+    .expect("refused");
+    assert!(e.to_string().contains("--mcp-allow-remote"), "{e}");
+    assert!(!db.exists(), "refused before anything is written");
+    // With the flag it starts; the Host check is left to the operator's
+    // proxy on a non-loopback bind.
+    let mut m = McpConfig::new("0.0.0.0:0".parse().unwrap());
+    m.allow_remote = true;
+    let srv = TestServer::try_start_with(&db, rust(), |c| c.mcp = Some(m)).unwrap();
+    let port = srv.running().unwrap().mcp_addr.unwrap().port();
+    let at: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let r = post(at, &[("Host", "mcp.example.com")], &initialize());
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[test]
+fn a_foreign_origin_gets_403_and_an_allowed_one_passes() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.allow_origins = vec!["http://localhost:6274/".into()];
+    let (_srv, addr) = server(&d, m);
+    for bad in ["http://evil.example", "null", "http://localhost:6275"] {
+        let r = post(addr, &[("Origin", bad)], &initialize());
+        assert_eq!(r.status, 403, "{bad}: {r:?}");
+    }
+    let r = post(addr, &[("Origin", "http://LOCALHOST:6274")], &initialize());
+    assert_eq!(r.status, 200, "{r:?}");
+    // No Origin: not a browser; accepted.
+    assert_eq!(post(addr, &[], &initialize()).status, 200);
+    // The default allows no browser origin at all.
+    let d2 = tempfile::tempdir().unwrap();
+    let (_s2, a2) = server(&d2, loopback());
+    let r = post(a2, &[("Origin", "http://localhost:6274")], &initialize());
+    assert_eq!(r.status, 403, "{r:?}");
+}
+
+#[test]
+fn a_host_that_is_not_the_bound_loopback_gets_403() {
+    let d = tempfile::tempdir().unwrap();
+    let (_srv, addr) = server(&d, loopback());
+    let port = addr.port();
+    for bad in [
+        "evil.example".to_string(),
+        format!("evil.example:{port}"),
+        format!("127.0.0.1:{}", port.wrapping_add(1)),
+        format!("localhost.evil.example:{port}"),
+        "".to_string(),
+    ] {
+        let r = post(addr, &[("Host", &bad)], &initialize());
+        assert_eq!(r.status, 403, "Host {bad:?}: {r:?}");
+    }
+    for good in [
+        addr.to_string(),
+        format!("localhost:{port}"),
+        "localhost".into(),
+    ] {
+        let r = post(addr, &[("Host", &good)], &initialize());
+        assert_eq!(r.status, 200, "Host {good:?}: {r:?}");
+    }
+    // The guards run before the method, too.
+    let r = http(addr, "GET", "/mcp", &[("Host", "evil.example")], b"").unwrap();
+    assert_eq!(r.status, 403);
+}
+
+#[test]
+fn a_body_over_1_mib_gets_413() {
+    let d = tempfile::tempdir().unwrap();
+    let (_srv, addr) = server(&d, loopback());
+    let big = vec![b' '; MAX_BODY_BYTES + 1];
+    let r = http(addr, "POST", "/mcp", &[], &big).unwrap();
+    assert_eq!(r.status, 413, "{r:?}");
+    // A declared length over the limit is refused before the body is read.
+    let r = http(
+        addr,
+        "POST",
+        "/mcp",
+        &[("Content-Length", &(64u64 << 20).to_string())],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(r.status, 413, "{r:?}");
+    // Exactly the limit is read (and is not JSON: a parse error, 400).
+    let at = vec![b' '; MAX_BODY_BYTES];
+    let r = http(addr, "POST", "/mcp", &[], &at).unwrap();
+    assert_eq!(r.status, 400, "{r:?}");
+    assert_eq!(r.json()["error"]["code"], graph_mcp::PARSE_ERROR);
+}
+
+#[test]
+fn sessions_are_issued_and_checked() {
+    let d = tempfile::tempdir().unwrap();
+    let (_srv, addr) = server(&d, loopback());
+    let mut c = McpHttpClient::new(addr);
+    assert_eq!(c.protocol, graph_mcp::SUPPORTED_PROTOCOL_VERSIONS[0]);
+    let r = c.request("tools/list", json!({}));
+    assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 7, "{r}");
+    let r = c.request(
+        "tools/call",
+        json!({"name": "search", "arguments": {"text": "origin"}}),
+    );
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(
+        r["result"]["structuredContent"]["items"][0]["symbol"], "origin",
+        "{r}"
+    );
+    // Without a session: 400; an unknown one: 404.
+    let list = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list"});
+    assert_eq!(post(addr, &[], &list).status, 400);
+    assert_eq!(post(addr, &[("Mcp-Session-Id", "nope")], &list).status, 404);
+    // Another protocol version than the session's: 400.
+    let r = post(
+        addr,
+        &[
+            ("Mcp-Session-Id", &c.session),
+            ("MCP-Protocol-Version", "2024-11-05"),
+        ],
+        &list,
+    );
+    assert_eq!(r.status, 400, "{r:?}");
+    // Negotiation is graph-mcp's: an old revision gets the latest.
+    let mut old = initialize();
+    old["params"]["protocolVersion"] = json!("2024-11-05");
+    let r = post(addr, &[], &old);
+    assert_eq!(
+        r.json()["result"]["protocolVersion"],
+        graph_mcp::SUPPORTED_PROTOCOL_VERSIONS[0]
+    );
+    // A notification or a response gets 202 and no body.
+    let r = c.post(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}),
+    );
+    assert_eq!((r.status, r.body.as_str()), (202, ""));
+    // GET (no server-initiated stream in v1): 405; another path: 404.
+    let r = http(addr, "GET", "/mcp", &[], b"").unwrap();
+    assert_eq!(r.status, 405);
+    assert_eq!(r.header("allow"), Some("POST, DELETE"));
+    assert_eq!(
+        http(addr, "POST", "/other", &[], b"{}").unwrap().status,
+        404
+    );
+    // DELETE ends the session.
+    let r = http(
+        addr,
+        "DELETE",
+        "/mcp",
+        &[("Mcp-Session-Id", &c.session)],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(c.post(&list).status, 404);
+}
+
+#[test]
+fn requests_past_max_inflight_get_429() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.max_inflight = 1;
+    m.testing_call_delay = Some(Duration::from_millis(1500));
+    let (_srv, addr) = server(&d, m);
+    let c = McpHttpClient::new(addr);
+    let msg = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let slow = {
+        let (s, p) = (c.session.clone(), c.protocol.clone());
+        let msg = msg.clone();
+        std::thread::spawn(move || {
+            post(
+                addr,
+                &[("Mcp-Session-Id", &s), ("MCP-Protocol-Version", &p)],
+                &msg,
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let r = c.post(&msg);
+    assert_eq!(r.status, 429, "{r:?}");
+    assert_eq!(r.header("retry-after"), Some("1"));
+    assert_eq!(slow.join().unwrap().status, 200);
+    assert_eq!(c.post(&msg).status, 200, "the slot is free again");
+}
+
+#[test]
+fn a_call_past_the_deadline_times_out() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.call_timeout = Duration::from_millis(200);
+    m.testing_call_delay = Some(Duration::from_millis(1000));
+    let (srv, addr) = server(&d, m);
+    let mut c = McpHttpClient::new(addr);
+    let r = c.request("tools/call", json!({"name": "describe", "arguments": {}}));
+    assert_eq!(r["error"]["code"], REQUEST_TIMEOUT, "{r}");
+    let metrics = RemoteStore::connect(ClientConfig::new(srv.endpoint()))
+        .unwrap()
+        .admin_metrics()
+        .unwrap();
+    assert!(
+        metrics.contains("mg_mcp_tool_calls_total{tool=\"describe\",outcome=\"timeout\"} 1"),
+        "{metrics}"
+    );
+}

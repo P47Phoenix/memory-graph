@@ -32,6 +32,8 @@ pub struct ServerInfo {
     pub data_dir: String,
     /// This node's advertised address.
     pub advertise: String,
+    /// Where the MCP endpoint listens (`--mcp-listen`); `None`: off.
+    pub mcp_addr: Option<std::net::SocketAddr>,
 }
 
 impl ServerInfo {

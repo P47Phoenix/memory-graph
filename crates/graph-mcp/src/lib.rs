@@ -14,8 +14,8 @@ mod server;
 pub mod tools;
 
 pub use server::{
-    serve_stdio, McpServer, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
-    NOT_INITIALIZED, PARSE_ERROR, SUPPORTED_PROTOCOL_VERSIONS,
+    serve_stdio, supported_version, McpServer, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
+    METHOD_NOT_FOUND, NOT_INITIALIZED, PARSE_ERROR, SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use tools::{
     tool_definitions, McpBackend, PageArgs, StaleCounter, StoreBackend, ToolCall, ToolError,

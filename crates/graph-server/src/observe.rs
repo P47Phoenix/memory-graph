@@ -132,6 +132,8 @@ pub struct Observability {
     /// and a `LOCAL` read's `stale_possible` (D8, see
     /// [`crate::raft::node::RaftNode::read_meta`]) judge by.
     last_contact: Mutex<Option<(Instant, Option<u64>)>>,
+    /// `(tool, outcome)` -> MCP `tools/call`s on `--mcp-listen`.
+    mcp_calls: Mutex<BTreeMap<(String, String), u64>>,
 }
 
 impl Observability {
@@ -144,6 +146,25 @@ impl Observability {
         m.entry((rpc.to_string(), outcome.to_string()))
             .or_default()
             .observe(secs);
+    }
+
+    /// One MCP `tools/call` of `tool` (a known tool name or `unknown`)
+    /// ended with `outcome` (`ok`, `error`, `rejected`, `timeout`).
+    pub fn observe_mcp_call(&self, tool: &str, outcome: &str) {
+        let mut m = self
+            .mcp_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *m.entry((tool.to_string(), outcome.to_string()))
+            .or_default() += 1;
+    }
+
+    /// MCP `tools/call`s so far, by `(tool, outcome)`.
+    pub fn mcp_calls(&self) -> BTreeMap<(String, String), u64> {
+        self.mcp_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn observe_apply(&self, secs: f64) {
@@ -425,6 +446,20 @@ pub fn render(ctx: &Ctx) -> String {
     let (alive, dead) = ctx.raft.net_stats.probes();
     let _ = writeln!(out, "mg_quorum_probes_total{{outcome=\"alive\"}} {alive}");
     let _ = writeln!(out, "mg_quorum_probes_total{{outcome=\"dead\"}} {dead}");
+    head(
+        &mut out,
+        "mg_mcp_tool_calls_total",
+        "counter",
+        "MCP tools/call requests on --mcp-listen, by tool and outcome (ok, error: an isError result, rejected: a JSON-RPC error, timeout).",
+    );
+    for ((tool, outcome), n) in obs.mcp_calls() {
+        let _ = writeln!(
+            out,
+            "mg_mcp_tool_calls_total{{tool=\"{}\",outcome=\"{}\"}} {n}",
+            label(&tool),
+            label(&outcome)
+        );
+    }
     head(
         &mut out,
         "mg_apply_duration_seconds",

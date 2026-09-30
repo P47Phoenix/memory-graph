@@ -3262,6 +3262,11 @@ pub struct StatusResponse {
     /// `mg_apply_duration_seconds`).
     #[prost(uint64, tag = "31")]
     pub entries_applied_total: u64,
+    /// Where this node's MCP endpoint listens (`serve --mcp-listen`, ADR 0005
+    /// D5), as bound: `host:port`, the endpoint being `<http://<it>/mcp`.>
+    /// Empty: MCP is off (or the server predates the field).
+    #[prost(string, tag = "32")]
+    pub mcp_addr: ::prost::alloc::string::String,
 }
 /// Replication progress of one peer, as the leader sees it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
