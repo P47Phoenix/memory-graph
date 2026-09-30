@@ -532,10 +532,135 @@ pub(crate) fn describe_in(
     Ok(infos.into_values().collect())
 }
 
+/// The extractor version inside a fingerprint of a file stored as `lang`
+/// (`sha256:<hex>|<lang>|<version>|<format>`, see [`fingerprint`]), if it
+/// has that shape. Anchored on the known language and format version, so
+/// a `|` inside the language or the version cannot shift the fields.
+pub(crate) fn fingerprint_extractor_version<'a>(fp: &'a str, lang: &str) -> Option<&'a str> {
+    let rest = fp.strip_prefix("sha256:")?;
+    // The hash is hex: its end is the first `|`.
+    let (_, rest) = rest.split_once('|')?;
+    let rest = rest.strip_prefix(lang.to_ascii_lowercase().as_str())?;
+    let rest = rest.strip_prefix('|')?;
+    let suffix = format!("|{FINGERPRINT_FORMAT_VERSION}");
+    rest.strip_suffix(suffix.as_str())
+}
+
+/// [`crate::Store::extractor_gaps`] inside the caller's read transaction.
+pub(crate) fn extractor_gaps_in(
+    rt: &ReadTransaction,
+    registry: &Registry,
+    org: Option<&str>,
+    repo: Option<&str>,
+) -> Result<Vec<crate::ExtractorGap>> {
+    let mut gaps = Vec::new();
+    for info in describe_in(rt, org, repo)? {
+        // Only a registered extractor produces symbols from source; the
+        // fallback never does. So a language with symbols stored and no
+        // extractor now is the only candidate (O(repos) from the catalog).
+        let suspects: Vec<(&String, usize)> = info
+            .languages
+            .iter()
+            .filter(|(l, li)| li.symbols > 0 && !registry.has(l))
+            .map(|(l, li)| (l, li.symbols))
+            .collect();
+        if suspects.is_empty() {
+            continue;
+        }
+        let names = rt.open_table(NAMES)?;
+        let nodes = rt.open_table(NODES)?;
+        let children = rt.open_multimap_table(CHILDREN)?;
+        let find = |parent: Option<NodeId>, kind: NodeKind, name: &str| -> Result<Option<NodeId>> {
+            Ok(names
+                .get(name_key(parent, kind, name).as_str())?
+                .map(|v| v.value()))
+        };
+        let Some(repo_id) = find(None, NodeKind::Org, &info.org)?
+            .map(|o| find(Some(o), NodeKind::Repo, &info.repo))
+            .transpose()?
+            .flatten()
+        else {
+            continue;
+        };
+        // One pass over the repo's files, stopping once every suspect has a
+        // fingerprinted file (pre-extracted ingests carry none and never
+        // count: their symbols did not come from a registered extractor).
+        let mut found: BTreeMap<&str, String> = BTreeMap::new();
+        for c in children.get(repo_id)? {
+            let Some(raw) = nodes.get(c?.value())? else {
+                continue;
+            };
+            let n = dec(raw.value())?;
+            let (Some(lang), Some(fp)) = (n.language.as_deref(), n.fingerprint.as_deref()) else {
+                continue;
+            };
+            let Some(&(l, _)) = suspects.iter().find(|(l, _)| l.as_str() == lang) else {
+                continue;
+            };
+            if found.contains_key(l.as_str()) {
+                continue;
+            }
+            // Not redundant with the `!registry.has` filter above: that one
+            // picks candidate languages from the catalog; this skips files
+            // of the language indexed tokens-only (the fallback's version,
+            // which is what `registry.version` returns without an
+            // extractor), e.g. next to pre-extracted symbols.
+            if let Some(v) = fingerprint_extractor_version(fp, lang) {
+                if v != registry.version(l) {
+                    found.insert(l.as_str(), v.to_string());
+                }
+            }
+            if found.len() == suspects.len() {
+                break;
+            }
+        }
+        for (l, symbols) in suspects {
+            if let Some(v) = found.remove(l.as_str()) {
+                gaps.push(crate::ExtractorGap {
+                    org: info.org.clone(),
+                    repo: info.repo.clone(),
+                    language: l.clone(),
+                    stored_version: v,
+                    symbols,
+                });
+            }
+        }
+    }
+    Ok(gaps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use graph_core::{Extractor, Span, SymbolDecl, TokenDecl};
+
+    #[test]
+    fn fingerprint_extractor_version_parses_the_fingerprint_shape() {
+        let r = Registry::default();
+        let fp = fingerprint(&r, b"x", "Toy");
+        assert_eq!(
+            fingerprint_extractor_version(&fp, "toy"),
+            Some(r.version("toy").as_str())
+        );
+        // A `|` in the language or the version does not shift the fields.
+        let fp = fingerprint(&r, b"x", "a|b");
+        assert_eq!(
+            fingerprint_extractor_version(&fp, "a|b"),
+            Some(r.version("a|b").as_str())
+        );
+        let f = FINGERPRINT_FORMAT_VERSION;
+        assert_eq!(
+            fingerprint_extractor_version(&format!("sha256:ab|a|b|v|2|{f}"), "a|b"),
+            Some("v|2")
+        );
+        // Wrong language, wrong format version, or not a fingerprint.
+        assert_eq!(fingerprint_extractor_version(&fp, "c"), None);
+        assert_eq!(
+            fingerprint_extractor_version("sha256:ab|toy|v|999", "toy"),
+            None
+        );
+        assert_eq!(fingerprint_extractor_version("nope", "toy"), None);
+    }
 
     fn sp(s: u32, e: u32) -> Span {
         Span {

@@ -3,6 +3,42 @@
 //! Each named test kills the mutant it is named for.
 use super::*;
 
+/// #90: `space_usage` commits twice before reading the page count, because
+/// pages a commit freed are only released by later commits. Without them
+/// (the `0..0` mutant) a one-transaction full replace still counts every
+/// old page as live, about twice the true figure.
+#[test]
+fn space_usage_does_not_count_pages_the_last_commit_freed() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g.redb")).unwrap();
+    let srcs: Vec<(String, String)> = (0..300)
+        .map(|i| {
+            let body: String = (0..400).map(|j| format!("w{i}_{j} ")).collect();
+            (format!("f{i}.txt"), body)
+        })
+        .collect();
+    let files: Vec<BatchFile> = srcs
+        .iter()
+        .map(|(p, b)| BatchFile {
+            path: p,
+            bytes: b.as_bytes(),
+            language: None,
+            origin: None,
+        })
+        .collect();
+    s.index_batch("o", "r", &files, IndexOptions { reindex: false })
+        .unwrap();
+    let fresh = Store::space_usage(&s).unwrap().unwrap().live_bytes;
+    // The whole replace fits one transaction (default chunk size).
+    s.index_batch("o", "r", &files, IndexOptions { reindex: true })
+        .unwrap();
+    let after = Store::space_usage(&s).unwrap().unwrap().live_bytes;
+    assert!(
+        (after as f64) < 1.3 * fresh as f64,
+        "live after a full replace {after} B vs fresh {fresh} B: freed pages were counted"
+    );
+}
+
 /// Build an extraction from `(name, kind, start, end)` symbols and
 /// `(text, start, end)` tokens (one line, so columns follow bytes).
 pub(crate) fn span_ext(

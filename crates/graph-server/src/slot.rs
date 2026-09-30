@@ -57,6 +57,26 @@ impl Drop for Installing<'_> {
     }
 }
 
+/// #74: at startup, warn for every language whose stored symbols came from
+/// an extractor this server was built without (clients' `index --server`
+/// is parsed here, so this is where the gap is known). Never fatal.
+fn warn_extractor_gaps(store: &V2Store) {
+    match graph_store::Store::extractor_gaps(store, None, None) {
+        Ok(gaps) => {
+            for g in gaps {
+                tracing::warn!(
+                    org = %g.org,
+                    repo = %g.repo,
+                    language = %g.language,
+                    stored_extractor = %g.stored_version,
+                    "{g}"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "checking stored extractors failed"),
+    }
+}
+
 impl StoreSlot {
     /// Open the store at `path` (redb's exclusive lock: `Locked` while
     /// another process holds it) with `extractors` registered.
@@ -86,6 +106,7 @@ impl StoreSlot {
             None,
             backend.as_ref(),
         )?;
+        warn_extractor_gaps(&store);
         Ok(Arc::new(Self {
             store: RwLock::new(Some(store)),
             path: path.to_path_buf(),

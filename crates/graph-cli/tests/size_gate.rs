@@ -142,6 +142,82 @@ fn database_size_stays_within_bounds_of_source_and_tokens() {
     assert!(ok && out.contains("o/r1") && out.contains("o/r2"), "{out}");
 }
 
+/// #90: a full `--reindex` leaves the file about twice its live data (every
+/// replacement is written before the old pages can be reused, and redb grows
+/// a file under 4 GiB by doubling it). The run says so and names
+/// `vacuum --compact`, which brings the file back within 1.2x of a fresh
+/// index; an unchanged re-run (nothing replaced) prints no hint.
+#[test]
+fn reindex_hints_at_compact_and_compact_restores_the_size() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let db = db.to_str().unwrap();
+    let corpus = corpus_dir();
+    let corpus_s = corpus.to_str().unwrap();
+    let index = |extra: &[&str]| {
+        let mut args = vec![
+            "--db",
+            db,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--no-progress",
+        ];
+        args.extend_from_slice(extra);
+        args.push(corpus_s);
+        let (ok, out, err) = run(&args);
+        assert!(ok, "{out}{err}");
+        err
+    };
+    // `--reindex` into an empty database replaces nothing: no hint, though
+    // the file measures ~1.65x its live data (compact cannot beat that).
+    let err = index(&["--reindex"]);
+    assert!(!err.contains("vacuum --compact"), "fresh --reindex: {err}");
+    let fresh = std::fs::metadata(db).unwrap().len();
+    let err = index(&[]);
+    assert!(!err.contains("vacuum --compact"), "unchanged rerun: {err}");
+    let err = index(&["--reindex"]);
+    let reindexed = std::fs::metadata(db).unwrap().len();
+    println!("reindex: fresh={fresh} B, after --reindex={reindexed} B");
+    assert!(
+        err.contains("hint:") && err.contains("memory-graph vacuum --compact"),
+        "--reindex grew the file {fresh} -> {reindexed} B without a hint: {err}"
+    );
+    let (ok, out, err) = run(&["--db", db, "vacuum", "--compact"]);
+    assert!(ok, "{out}{err}");
+    let compacted = std::fs::metadata(db).unwrap().len();
+    println!("reindex: after vacuum --compact={compacted} B");
+    assert!(
+        compacted as f64 <= 1.2 * fresh as f64,
+        "vacuum --compact left {compacted} B, fresh index was {fresh} B (limit 1.2x)"
+    );
+    // A `--reindex` that replaces nothing (an empty tree) gives no hint on
+    // the compacted file; a real one does again.
+    let empty = d.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let (ok, out, err) = run(&[
+        "--db",
+        db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--no-progress",
+        "--reindex",
+        empty.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(!err.contains("vacuum --compact"), "no-op --reindex: {err}");
+    let err = index(&["--reindex"]);
+    assert!(
+        err.contains("vacuum --compact"),
+        "reindex after compact: {err}"
+    );
+}
+
 /// The Raft log (ADR 0004 D7): every write is a log entry that carries the
 /// source bytes, so before a snapshot `raft.redb` holds the source again
 /// (and more: redb rounds large values up). After `cluster snapshot`
