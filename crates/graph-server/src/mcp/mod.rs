@@ -12,9 +12,15 @@
 //! - on a loopback bind, a `Host` other than `localhost` or the bound
 //!   address (with the bound port, if it names one) gets 403 (DNS
 //!   rebinding). A non-loopback bind (`--mcp-allow-remote`) is reached by
-//!   whatever name the operator's proxy uses, so it skips the Host check;
-//! - a body over [`MAX_BODY_BYTES`] gets 413;
-//! - past `--mcp-max-inflight` requests at once, 429 (with `Retry-After`);
+//!   whatever names the operator's proxy uses, which this server cannot
+//!   know, so it skips the Host check: DNS-rebinding protection then rests
+//!   on the Origin allowlist (a browser always sends `Origin` on these
+//!   requests) plus the operator's proxy;
+//! - a body over [`MAX_BODY_BYTES`] gets 413 (with `Connection: close`,
+//!   the rest being unread); every other answer comes after the whole body
+//!   was read, so it reaches a client still sending;
+//! - past `--mcp-max-inflight` requests at once, 429 (with `Retry-After`),
+//!   decided after the session checks;
 //! - a call past [`CALL_DEADLINE`] answers a JSON-RPC error
 //!   ([`REQUEST_TIMEOUT`]);
 //! - results are cut at 4 MiB with `next_offset` and tools are read-only
@@ -25,7 +31,9 @@
 //! `Mcp-Session-Id`; every later message must carry it (400 without, 404
 //! for an unknown or ended one). The session holds only the negotiated
 //! protocol version; a request naming another one in `MCP-Protocol-Version`
-//! gets 400. A request's answer is `application/json`; a notification or a
+//! gets 400, and one without the header is served with the session's
+//! (lenient: clients of 2025-03-26 do not send it). Sessions are bounded
+//! by [`MAX_SESSIONS`] (least recently used evicted) and [`SESSION_IDLE`]. A request's answer is `application/json`; a notification or a
 //! response gets 202 with no body. `GET /mcp` is 405: v1 has no
 //! server-initiated stream and no SSE resumability. `DELETE /mcp` ends the
 //! session.
@@ -43,11 +51,11 @@ use graph_mcp::{McpServer, StoreBackend};
 use graph_proto::View;
 use graph_store::StoreError;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
@@ -59,8 +67,11 @@ pub const MAX_BODY_BYTES: usize = 1 << 20;
 pub const DEFAULT_MAX_INFLIGHT: usize = 16;
 /// How long one call may run before it is answered with a timeout.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
-/// Sessions kept at once; the oldest is ended when a new one would pass it.
+/// Sessions kept at once; the least recently used is ended when a new one
+/// would pass it.
 pub const MAX_SESSIONS: usize = 1024;
+/// A session unused for this long ends (its next request gets 404).
+pub const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 /// The JSON-RPC error code of a call past [`CALL_DEADLINE`] (the code MCP
 /// SDKs use for a request timeout).
 pub const REQUEST_TIMEOUT: i64 = -32001;
@@ -105,6 +116,8 @@ pub struct McpConfig {
     /// first, so a test can hold requests in flight or pass the deadline.
     #[doc(hidden)]
     pub testing_call_delay: Option<Duration>,
+    /// A session unused this long ends ([`SESSION_IDLE`]; tests shorten it).
+    pub session_idle: Duration,
 }
 
 impl McpConfig {
@@ -117,6 +130,7 @@ impl McpConfig {
             max_inflight: DEFAULT_MAX_INFLIGHT,
             call_timeout: CALL_DEADLINE,
             testing_call_delay: None,
+            session_idle: SESSION_IDLE,
         }
     }
 }
@@ -144,9 +158,15 @@ pub fn check_bind(cfg: &McpConfig) -> Result<(), StoreError> {
 /// listening is allowed (at every start).
 pub fn warn_at_start(cfg: &McpConfig, bound: SocketAddr) {
     if cfg.allow_remote {
+        let at = if bound.ip().is_unspecified() {
+            format!("bound on all interfaces, port {}", bound.port())
+        } else {
+            format!("at http://{bound}/mcp")
+        };
         eprintln!(
-            "memory-graph serve: WARNING: --mcp-allow-remote: the MCP endpoint at \
-             http://{bound}/mcp may be reachable from other hosts. {NO_AUTH_WARNING}"
+            "memory-graph serve: WARNING: --mcp-allow-remote: the MCP endpoint ({at}) may be \
+             reachable from other hosts; the Host check is off, so DNS-rebinding protection \
+             rests on the Origin allowlist and your proxy. {NO_AUTH_WARNING}"
         );
         tracing::warn!(
             %bound,
@@ -157,10 +177,8 @@ pub fn warn_at_start(cfg: &McpConfig, bound: SocketAddr) {
 }
 
 struct Sessions {
-    /// Session id -> negotiated protocol version.
-    map: HashMap<String, &'static str>,
-    /// Creation order, for the [`MAX_SESSIONS`] bound.
-    order: VecDeque<String>,
+    /// Session id -> (negotiated protocol version, last use).
+    map: HashMap<String, (&'static str, Instant)>,
 }
 
 struct McpState {
@@ -173,6 +191,7 @@ struct McpState {
     call_timeout: Duration,
     delay: Option<Duration>,
     sessions: Mutex<Sessions>,
+    session_idle: Duration,
 }
 
 /// Serve `/mcp` on `listener` until `shutdown`.
@@ -204,8 +223,8 @@ pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdow
         delay: cfg.testing_call_delay,
         sessions: Mutex::new(Sessions {
             map: HashMap::new(),
-            order: VecDeque::new(),
         }),
+        session_idle: cfg.session_idle,
     });
     let app = axum::Router::new()
         .route("/mcp", axum::routing::any(handle))
@@ -230,6 +249,25 @@ fn plain(status: StatusCode, msg: &str) -> Response {
         format!("{msg}\n"),
     )
         .into_response()
+}
+
+/// `r` with `Connection: close` (an early answer whose body was not read).
+fn closing(mut r: Response) -> Response {
+    r.headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    r
+}
+
+/// Whether a body read failed on the size limit (not on the transport).
+fn is_length_limit(e: &axum::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(x) = cur {
+        if x.to_string().contains("length limit exceeded") {
+            return true;
+        }
+        cur = x.source();
+    }
+    false
 }
 
 fn json_reply(status: StatusCode, body: String) -> Response {
@@ -294,36 +332,44 @@ impl McpState {
 
     fn new_session(&self, protocol: &'static str) -> String {
         let id = format!("{:032x}", rand::random::<u128>());
+        let now = Instant::now();
+        let idle = self.session_idle;
         let mut s = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        s.map
+            .retain(|_, (_, used)| now.duration_since(*used) < idle);
         while s.map.len() >= MAX_SESSIONS {
-            match s.order.pop_front() {
-                Some(old) => {
-                    s.map.remove(&old);
-                }
-                None => break,
-            }
+            // The least recently used goes first.
+            let Some(lru) = s
+                .map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            s.map.remove(&lru);
         }
-        s.map.insert(id.clone(), protocol);
-        s.order.push_back(id.clone());
+        s.map.insert(id.clone(), (protocol, now));
         id
     }
 
+    /// The session's protocol version, marking it used now; `None` for an
+    /// unknown, ended or idle-expired one.
     fn session(&self, id: &str) -> Option<&'static str> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .map
-            .get(id)
-            .copied()
+        let now = Instant::now();
+        let mut s = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let (protocol, used) = s.map.get_mut(id)?;
+        if now.duration_since(*used) >= self.session_idle {
+            s.map.remove(id);
+            return None;
+        }
+        *used = now;
+        Some(*protocol)
     }
 
     fn end_session(&self, id: &str) -> bool {
         let mut s = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        let found = s.map.remove(id).is_some();
-        if found {
-            s.order.retain(|x| x != id);
-        }
-        found
+        s.map.remove(id).is_some()
     }
 }
 
@@ -360,15 +406,6 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             return r;
         }
     }
-    let Ok(permit) = Arc::clone(&st.inflight).try_acquire_owned() else {
-        let mut r = plain(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many MCP requests in flight (serve --mcp-max-inflight); retry",
-        );
-        r.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        return r;
-    };
     let too_long = req
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -380,11 +417,29 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         .get(PROTOCOL_HEADER)
         .map(|v| v.to_str().unwrap_or("").to_string());
     if too_long {
-        return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body over 1 MiB");
+        // The body is left unread: the connection must not be reused.
+        return closing(plain(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body over 1 MiB",
+        ));
     }
+    // The whole body is read before any other answer (429 included), so a
+    // refusal reaches a client still sending instead of a reset.
     let body: Body = req.into_body();
-    let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body over 1 MiB");
+    let bytes = match to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(e) if is_length_limit(&e) => {
+            return closing(plain(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body over 1 MiB",
+            ))
+        }
+        Err(e) => {
+            return closing(plain(
+                StatusCode::BAD_REQUEST,
+                &format!("reading the request body failed: {e}"),
+            ))
+        }
     };
     let parsed: Option<Value> = serde_json::from_slice(&bytes).ok();
     let method = parsed
@@ -399,7 +454,6 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         // Parse errors and `initialize` need no store and no session.
         let mut server = McpServer::new(NoBackend, name, version);
         let reply = server.handle_bytes(&bytes);
-        drop(permit);
         let Some(reply) = reply else {
             return StatusCode::ACCEPTED.into_response();
         };
@@ -429,6 +483,8 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             "unknown or ended MCP session: initialize again",
         );
     };
+    // A missing MCP-Protocol-Version is accepted (the session's version
+    // applies); one naming another version is refused.
     if let Some(h) = protocol_header {
         if h != protocol {
             return plain(
@@ -437,6 +493,16 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             );
         }
     }
+    // Taken only now: a request with a bad session gets its own error.
+    let Ok(permit) = Arc::clone(&st.inflight).try_acquire_owned() else {
+        let mut r = plain(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many MCP requests in flight (serve --mcp-max-inflight); retry",
+        );
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return r;
+    };
     let tool = (method.as_deref() == Some("tools/call")).then(|| {
         let n = parsed
             .as_ref()

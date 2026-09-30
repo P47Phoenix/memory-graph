@@ -1,13 +1,18 @@
 //! Pins the extractor versions bumped by PR #150 (#72, #127, #145): their
 //! token or symbol output changed, so indexed files must be re-extracted.
+//! `+kw1` (#143): reserved words are classed `keyword`.
 
 #[test]
 fn bumped_extractor_versions_are_pinned() {
     let extractors = graph_cli::shipped_extractors();
     for (lang, prefix) in [
         ("aspx", "aspx-scan-2+tok"),
-        ("typescript", "typescript-scan-2+tok"),
-        ("python", "python-scan-2+tok"),
+        ("typescript", "typescript-scan-2+kw1+tok"),
+        ("python", "python-scan-2+kw1+tok"),
+        ("csharp", "csharp-scan-1+kw1+tok"),
+        ("javascript", "javascript-scan-1+kw1+tok"),
+        ("java", "java-scan-1+kw1+tok"),
+        ("go", "go-scan-2+kw1+tok"),
         ("gdscript", "gdscript-scan-2+tok"),
         ("r", "r-scan-2+tok"),
         ("sql", "sql-scan-2+tok"),

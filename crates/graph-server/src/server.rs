@@ -126,6 +126,11 @@ pub struct ServeConfig {
     /// [`crate::raft::state_machine::TestingApplyGate`]).
     #[doc(hidden)]
     pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
+    /// `--backup-url` and friends (ADR 0006): upload snapshots; `None`: off.
+    pub backup: Option<crate::backup::BackupConfig>,
+    /// `--restore-allow-extractor-mismatch`: a verified restore accepts a
+    /// backup made by other extractors.
+    pub restore_allow_extractor_mismatch: bool,
 }
 
 /// How long a restart whose `node.json` address differs from the one its
@@ -218,6 +223,8 @@ impl ServeConfig {
             mcp: None,
             ready_max_lag: crate::DEFAULT_READY_MAX_LAG,
             testing_apply_gate: None,
+            backup: None,
+            restore_allow_extractor_mismatch: false,
         }
     }
 
@@ -256,6 +263,11 @@ impl std::fmt::Debug for ServeConfig {
             .field("metrics_listen", &self.metrics_listen)
             .field("mcp", &self.mcp)
             .field("ready_max_lag", &self.ready_max_lag)
+            .field("backup", &self.backup)
+            .field(
+                "restore_allow_extractor_mismatch",
+                &self.restore_allow_extractor_mismatch,
+            )
             .finish()
     }
 }
@@ -312,6 +324,8 @@ pub struct Running {
     pub paths: NodePaths,
     /// The cluster id as this node knows it.
     pub identity: Arc<ClusterIdentity>,
+    /// The backup uploader (`--backup-url`).
+    pub backup: Option<crate::backup::Backup>,
 }
 
 impl Running {
@@ -381,6 +395,13 @@ pub async fn start(
     }
     let hash = extractors_hash(&extractors);
     let (paths, plan) = resolve(&cfg)?;
+    // A bad --backup-url is refused before anything is written.
+    if let Some(b) = &cfg.backup {
+        if b.sink.is_none() {
+            crate::backup::parse_url(&b.url)
+                .map_err(|e| StoreError::Rejected(format!("--backup-url {e}")))?;
+        }
+    }
     // `--update-advertise` moves a member: refused before anything is
     // opened or written for a node that is not one.
     if cfg.update_advertise.is_some() {
@@ -462,7 +483,18 @@ pub async fn start(
             .map_err(|e| io_err(&format!("creating `{}`", dir.display()), e))?;
     }
     if let Some(snap) = plan.as_ref().and_then(|p| p.restore.as_deref()) {
-        paths::restore_into(snap, &paths.store)?;
+        let checks = crate::backup::restore::RestoreChecks {
+            extractors_hash: hash.clone(),
+            allow_extractor_mismatch: cfg.restore_allow_extractor_mismatch,
+            min_free_disk: cfg.min_free_disk,
+            probe: Some(cfg.free_space_probe.clone().unwrap_or_else(system_probe)),
+        };
+        let s = snap.to_string_lossy();
+        if crate::backup::is_url(&s) {
+            crate::backup::restore::restore_from_url(&s, &paths.store, &checks)?;
+        } else {
+            crate::backup::restore::restore_from_path(snap, &paths.store, &checks)?;
+        }
     }
     if plan.as_ref().is_some_and(|p| p.overwrite) {
         let to = paths::move_aside(&paths)?;
@@ -685,6 +717,30 @@ pub async fn start(
     let check_address = moved.is_none() && plan.as_ref().is_some_and(|p| p.existing.is_some());
     raft.withhold_leader = cfg.testing.withhold_leader;
     raft.hold_proposal = cfg.testing.hold_proposal_ms.map(Duration::from_millis);
+    // Backups (ADR 0006): each new snapshot build hands the uploader a job
+    // and returns; the uploader decides by the leadership at that moment.
+    let backup = match &cfg.backup {
+        Some(b) => {
+            let backup = crate::backup::Backup::start(b.clone(), Arc::clone(&identity))
+                .map_err(|e| StoreError::Rejected(format!("--backup-url {e}")))?;
+            // The metrics channel, not the Raft handle: the hook lives in
+            // the snapshot directory, which the Raft node owns.
+            let rx = raft.raft.metrics();
+            let withhold = raft.withhold_leader;
+            backup.set_is_leader(Box::new(move || {
+                let m = rx.borrow();
+                !withhold
+                    && m.state == openraft::ServerState::Leader
+                    && m.current_leader == Some(node_id)
+            }));
+            let hook = backup.clone();
+            snapshots.set_on_built(Some(Arc::new(move |side, path| {
+                hook.snapshot_built(side, path)
+            })));
+            Some(backup)
+        }
+        None => None,
+    };
     let shutdown = ShutdownHandle::new();
     let ctx = Arc::new(Ctx {
         slot: Arc::clone(&slot),
@@ -717,6 +773,7 @@ pub async fn start(
             .with_default_timeout(cfg.testing.forward_timeout_ms.map(Duration::from_millis)),
         auto_promoting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         last_elect: std::sync::Mutex::new(None),
+        backup: backup.clone(),
     });
 
     // Health (D10): "" is SERVING once the store is open (now);
@@ -868,6 +925,8 @@ pub async fn start(
         let raft = raft.clone();
         let reporter = reporter.clone();
         let grace = cfg.shutdown_grace;
+        let backup = backup.clone();
+        let snapshots = Arc::clone(&snapshots);
         tokio::spawn(async move {
             let result = tokio::select! {
                 r = &mut serve => match r {
@@ -884,6 +943,12 @@ pub async fn start(
             // Health already went NOT_SERVING when shutdown began (above);
             // re-assert it in case serving ended on its own.
             mark_not_serving(&reporter).await;
+            // Backups stop taking jobs (an upload in progress is left to
+            // finish or fail on its own thread; nothing waits for it).
+            snapshots.set_on_built(None);
+            if let Some(b) = &backup {
+                b.stop();
+            }
             if tokio::time::timeout(grace, raft.shutdown()).await.is_err() {
                 tracing::warn!(
                     ?grace,
@@ -1062,6 +1127,7 @@ pub async fn start(
         raft,
         paths,
         identity,
+        backup,
     })
 }
 

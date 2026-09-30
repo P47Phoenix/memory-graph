@@ -177,6 +177,59 @@ fn human_size(bytes: u64) -> String {
     format!("{bytes}B")
 }
 
+/// #74: warn (stderr) for each language of `org/repo` whose stored symbols
+/// came from an extractor this build lacks: re-indexing those files would
+/// store them tokens-only. A failed check is itself only a warning.
+pub fn warn_extractor_gaps(store: &dyn Store, org: &str, repo: &str) {
+    match store.extractor_gaps(Some(org), Some(repo)) {
+        Ok(gaps) => {
+            for g in gaps {
+                eprintln!("warning: {g}");
+            }
+        }
+        Err(e) => eprintln!("warning: could not check stored extractors: {e}"),
+    }
+}
+
+/// The file is this many times its live data or more after a `--reindex`
+/// that replaced files before the `vacuum --compact` hint is shown (#90).
+/// Not 1.0: a fresh or just-compacted file already measures about 1.65x
+/// (redb's doubling growth, page rounding), and compact cannot go below
+/// that. 2.5 is 1.5x that baseline; a full `--reindex` measures about 3.2x
+/// on the vendored corpus (size_gate pins both sides).
+pub const COMPACT_HINT_RATIO: f64 = 2.5;
+
+/// The `--reindex` hint (#90), if `u` warrants one. A full re-index writes
+/// every file's replacement before the old pages can be reused, and redb
+/// grows a file under 4 GiB by doubling it, so the file stays about twice
+/// its live data until `vacuum --compact`.
+pub fn compact_hint_text(u: graph_store::SpaceUsage) -> Option<String> {
+    (u.live_bytes > 0 && u.file_bytes as f64 >= COMPACT_HINT_RATIO * u.live_bytes as f64).then(
+        || {
+            format!(
+                "hint: the database file is {} but holds {} of live data ({:.1}x) after --reindex; run `memory-graph vacuum --compact` to reclaim the space",
+                human_size(u.file_bytes),
+                human_size(u.live_bytes),
+                u.file_bytes as f64 / u.live_bytes as f64
+            )
+        },
+    )
+}
+
+/// Print [`compact_hint_text`] for `store` on stderr (embedded stores only:
+/// a remote store reports no space usage).
+fn compact_hint(store: &dyn Store) {
+    match store.space_usage() {
+        Ok(Some(u)) => {
+            if let Some(h) = compact_hint_text(u) {
+                eprintln!("{h}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("warning: could not measure the database's free space: {e}"),
+    }
+}
+
 const BATCH_FILES: usize = 256;
 const BATCH_BYTES: usize = 32 * 1024 * 1024;
 
@@ -206,6 +259,8 @@ fn read_cap(max_file_size: Option<u64>) -> u64 {
 struct Tally {
     files: usize,
     unchanged: usize,
+    /// Files that replaced a stored copy (#90: only these leave old pages).
+    replaced: usize,
     symbols: usize,
     tokens: usize,
     by_lang: std::collections::BTreeMap<String, usize>,
@@ -256,6 +311,7 @@ fn flush_batch(
             Ok(st) => {
                 t.files += 1;
                 t.unchanged += usize::from(st.unchanged);
+                t.replaced += usize::from(st.replaced);
                 if st.unchanged {
                     unchanged_bytes += len;
                 }
@@ -1066,6 +1122,7 @@ pub fn index_dir_with(
     }
     let start = std::time::Instant::now();
     let store = open(o.db)?;
+    warn_extractor_gaps(&*store, o.org, o.repo);
     let trace: Option<&'static Trace> = o.trace.map(|_| &*Box::leak(Box::new(Trace::new())));
     // A fixed batch holds its files' bytes until it commits, so in
     // deterministic mode the budget must always fit one whole batch; the
@@ -1102,6 +1159,7 @@ pub fn index_dir_with(
     let Tally {
         files,
         unchanged,
+        replaced,
         symbols,
         tokens,
         by_lang,
@@ -1196,6 +1254,10 @@ pub fn index_dir_with(
             out!(out, "  failed: {p}: {r}");
         }
     }
+    // Only a run that replaced stored files leaves the old pages behind.
+    if o.reindex && replaced > 0 {
+        compact_hint(&*store);
+    }
     if !failed.is_empty() {
         bail!(
             "{} file(s) failed to index (all other files were stored)",
@@ -1203,6 +1265,56 @@ pub fn index_dir_with(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hygiene_tests {
+    use super::compact_hint_text;
+    use graph_store::SpaceUsage;
+
+    #[test]
+    fn compact_hint_fires_at_two_and_a_half_times_live() {
+        let u = |file_bytes, live_bytes| SpaceUsage {
+            file_bytes,
+            live_bytes,
+        };
+        // A fresh or compacted file's ~1.65x never hints.
+        assert_eq!(compact_hint_text(u(165, 100)), None);
+        assert_eq!(compact_hint_text(u(249, 100)), None);
+        let h = compact_hint_text(u(250, 100)).unwrap();
+        assert!(h.contains("vacuum --compact") && h.contains("2.5x"), "{h}");
+        assert!(compact_hint_text(u(64 << 20, 16 << 20))
+            .unwrap()
+            .contains("64M"));
+        // Nothing measured: no hint rather than a division by zero.
+        assert_eq!(compact_hint_text(u(100, 0)), None);
+    }
+
+    /// #74 with the shipped registry: a database indexed with the Rust
+    /// extractor, opened by a build without it (an empty registry stands in
+    /// for `--no-default-features`), reports the gap by language and stored
+    /// extractor version; the full build reports none.
+    #[cfg(feature = "lang-rust")]
+    #[test]
+    fn a_build_without_an_extractor_reports_the_gap() {
+        use graph_core::Extractor;
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("g.redb");
+        let full = graph_store::open_store(&db, super::shipped_extractors()).unwrap();
+        full.index_bytes("o", "r", "lib.rs", b"fn main() {}\n", None)
+            .unwrap();
+        assert!(full.extractor_gaps(None, None).unwrap().is_empty());
+        let rust_version = graph_lang_rust::RustExtractor.version();
+        drop(full);
+        let bare = graph_store::open_store(&db, vec![]).unwrap();
+        let gaps = bare.extractor_gaps(Some("o"), Some("r")).unwrap();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(
+            (gaps[0].language.as_str(), gaps[0].stored_version.as_str()),
+            ("rust", rust_version.as_str())
+        );
+        assert!(gaps[0].to_string().contains(&rust_version));
+    }
 }
 
 #[cfg(test)]

@@ -84,6 +84,11 @@ fn serve(db: &Path, extra: &[&str]) -> Serve {
         if let Some((_, rest)) = l.split_once("mcp on http://") {
             mcp = Some(rest.trim_end_matches("/mcp").parse().unwrap());
         }
+        if let Some((_, rest)) = l.split_once("mcp on bound on all interfaces, port ") {
+            // A wildcard bind is not advertised as a URL.
+            let port: u16 = rest.split_whitespace().next().unwrap().parse().unwrap();
+            mcp = Some(SocketAddr::from(([127, 0, 0, 1], port)));
+        }
         if let Some((_, rest)) = l.split_once("listening on ") {
             let grpc = rest.split_whitespace().next().unwrap().to_string();
             return Serve {
@@ -144,17 +149,29 @@ fn mcp_over_http_answers_with_exact_spans_and_health_names_it() {
     assert_eq!(span["start_line"], 3, "{span}");
     assert_eq!(r["result"]["structuredContent"]["stale_possible"], false);
 
+    // `health` stays one line; `cluster status` names the endpoint.
     let o = cmd()
         .args(["--server", &s.grpc, "health"])
         .output()
         .unwrap();
     assert!(o.status.success());
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "SERVING");
+    let o = cmd()
+        .args(["--server", &s.grpc, "cluster", "status"])
+        .output()
+        .unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
-    assert_eq!(
-        out.lines().collect::<Vec<_>>(),
-        ["SERVING".to_string(), format!("mcp: http://{addr}/mcp")],
+    assert!(
+        out.lines()
+            .any(|l| l.trim() == format!("mcp       http://{addr}/mcp")),
         "{out}"
     );
+    let o = cmd()
+        .args(["--server", &s.grpc, "cluster", "status", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["mcp_addr"], addr.to_string());
 }
 
 #[test]

@@ -100,6 +100,11 @@ impl TestNode {
         self.running.as_ref()
     }
 
+    /// The backup uploader (`None` while stopped or without one).
+    pub fn backup(&self) -> Option<&crate::backup::Backup> {
+        self.running.as_ref().and_then(|r| r.backup.as_ref())
+    }
+
     /// The Raft node (`None` while stopped).
     pub fn raft(&self) -> Option<&RaftNode> {
         self.running.as_ref().map(|r| &r.raft)
@@ -231,6 +236,29 @@ impl ClusterTestbed {
     /// one cluster.
     pub fn new(n: usize, extractors: Vec<Box<dyn Extractor>>) -> Self {
         Self::with_config(n, extractors, |_, _| {})
+    }
+
+    /// [`new`](Self::new) with every node backing its snapshots up per
+    /// `backup` (ADR 0006).
+    pub fn with_backup(
+        n: usize,
+        extractors: Vec<Box<dyn Extractor>>,
+        backup: crate::backup::BackupConfig,
+    ) -> Self {
+        Self::with_config(n, extractors, |_, c| c.backup = Some(backup.clone()))
+    }
+
+    /// Wait until no running node has a backup queued or uploading.
+    pub fn wait_backups_idle(&self, timeout: Duration) {
+        for n in self.live() {
+            if let Some(b) = n.backup() {
+                assert!(
+                    b.wait_idle(timeout),
+                    "node {}: backups still busy after {timeout:?}",
+                    n.id
+                );
+            }
+        }
     }
 
     /// [`new`](Self::new) with a hook to adjust each node's configuration

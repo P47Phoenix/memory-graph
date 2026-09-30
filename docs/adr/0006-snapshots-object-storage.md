@@ -109,7 +109,7 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 |---|---|
 | Partial upload | No `.meta`, so the backup is invisible. A multipart upload is aborted on error; the orphan sweep covers a crash. |
 | Upload failure | 3 retries with backoff, then a log line, `mg_backup_failures_total` and `last_backup_error` in `cluster status`. It never blocks or delays a snapshot or purge: uploads are async, one at a time, and a newer snapshot supersedes a queued one. |
-| Local snapshot replaced mid-upload | Keep an open handle (Windows share flags) or copy to a `<snapshot>.backup.tmp` sibling first; decided in S1 (story 35). |
+| Local snapshot replaced mid-upload | Decided in S1 (story 35): an open handle. Rust's `File::open` on Windows shares read, write and delete, so (on NTFS with POSIX delete semantics, Windows 10 1809 and later) a newer build can still remove the old pair while it is read (as an unlinked file stays readable on Unix); a `.backup.tmp` copy would need a second snapshot's worth of disk the disk guard does not budget for. The bytes read are hashed and checked against the sidecar before the `.meta` is written; a snapshot already removed before the open is superseded by the newer one's upload. |
 | Corrupt download, wrong format or extractors | Refused; the only file written, `<store>.restore.tmp`, is removed. |
 | Clock skew | SigV4 `RequestTimeTooSkewed` is surfaced verbatim. |
 | Disk | The restore download checks `--min-free-disk` plus the object size first. |

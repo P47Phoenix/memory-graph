@@ -293,6 +293,42 @@ pub struct LanguageInfo {
     pub symbol_kinds: BTreeMap<String, usize>,
 }
 
+/// A language whose stored files were indexed by an extractor the running
+/// store does not have (#74): re-indexing them now would store them
+/// tokens-only and drop their symbols. See [`Store::extractor_gaps`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractorGap {
+    pub org: String,
+    pub repo: String,
+    /// Lowercased language name, as stored.
+    pub language: String,
+    /// The extractor version recorded in a stored file's fingerprint.
+    pub stored_version: String,
+    /// Symbols of this language currently stored in the repo.
+    pub symbols: usize,
+}
+
+impl std::fmt::Display for ExtractorGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{}: {} file(s) were indexed with extractor `{}` ({} symbols stored), which this build does not have; re-indexing them stores tokens only and drops their symbols (use a build with that language's extractor)",
+            self.org, self.repo, self.language, self.stored_version, self.symbols
+        )
+    }
+}
+
+/// How much of the database file holds live data (#90). See
+/// [`Store::space_usage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceUsage {
+    /// The file's length on disk.
+    pub file_bytes: u64,
+    /// Bytes in allocated pages (what `vacuum --compact` would keep, give
+    /// or take the allocator's rounding).
+    pub live_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub org: String,

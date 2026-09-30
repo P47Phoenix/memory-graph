@@ -3265,8 +3265,37 @@ pub struct StatusResponse {
     /// Where this node's MCP endpoint listens (`serve --mcp-listen`, ADR 0005
     /// D5), as bound: `host:port`, the endpoint being `<http://<it>/mcp`.>
     /// Empty: MCP is off (or the server predates the field).
-    #[prost(string, tag = "32")]
+    #[prost(string, tag = "33")]
     pub mcp_addr: ::prost::alloc::string::String,
+    /// Snapshot backups (ADR 0006, `serve --backup-url`); absent when this
+    /// node has no backup location.
+    #[prost(message, optional, tag = "32")]
+    pub backup: ::core::option::Option<BackupStatus>,
+}
+/// This node's snapshot backups since it started.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BackupStatus {
+    /// The location, e.g. `file:///srv/backups` (never a secret).
+    #[prost(string, tag = "1")]
+    pub url: ::prost::alloc::string::String,
+    /// `--backup-on`: `leader`, `all` or `none`.
+    #[prost(string, tag = "2")]
+    pub on: ::prost::alloc::string::String,
+    /// Log index of the last snapshot committed to the location (0: none).
+    #[prost(uint64, tag = "3")]
+    pub last_index: u64,
+    /// Unix seconds of that commit (0: none).
+    #[prost(uint64, tag = "4")]
+    pub last_success_unix: u64,
+    /// Uploads that failed after every retry.
+    #[prost(uint64, tag = "5")]
+    pub failures_total: u64,
+    /// Bytes written by successful uploads.
+    #[prost(uint64, tag = "6")]
+    pub bytes_total: u64,
+    /// The last failure; empty once an upload succeeds again.
+    #[prost(string, tag = "7")]
+    pub last_backup_error: ::prost::alloc::string::String,
 }
 /// Replication progress of one peer, as the leader sees it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

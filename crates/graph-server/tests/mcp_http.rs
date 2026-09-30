@@ -278,3 +278,76 @@ fn a_call_past_the_deadline_times_out() {
         "{metrics}"
     );
 }
+
+/// Refusals under load arrive as HTTP answers, not connection resets:
+/// 40 concurrent calls with a real (padded) body against one slot each get
+/// 200 or 429, and a bad session still gets its own 404, not 429.
+#[test]
+fn refusals_under_load_are_received_with_a_real_body() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.max_inflight = 1;
+    m.testing_call_delay = Some(Duration::from_millis(300));
+    let (_srv, addr) = server(&d, m);
+    let c = McpHttpClient::new(addr);
+    // A valid request padded to ~256 KiB with whitespace.
+    let mut body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
+    body.push_str(&" ".repeat(256 << 10));
+    let body = std::sync::Arc::new(body);
+    let calls: Vec<_> = (0..40)
+        .map(|_| {
+            let (s, p, b) = (c.session.clone(), c.protocol.clone(), body.clone());
+            std::thread::spawn(move || {
+                http(
+                    addr,
+                    "POST",
+                    "/mcp",
+                    &[
+                        ("Content-Type", "application/json"),
+                        ("Mcp-Session-Id", &s),
+                        ("MCP-Protocol-Version", &p),
+                    ],
+                    b.as_bytes(),
+                )
+            })
+        })
+        .collect();
+    let bad = http(
+        addr,
+        "POST",
+        "/mcp",
+        &[("Mcp-Session-Id", "nope")],
+        body.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(bad.status, 404, "{bad:?}");
+    let (mut ok, mut busy) = (0, 0);
+    for t in calls {
+        let r = t.join().unwrap().expect("an HTTP answer, not a reset");
+        match r.status {
+            200 => ok += 1,
+            429 => busy += 1,
+            s => panic!("unexpected {s}: {r:?}"),
+        }
+    }
+    assert!(ok >= 1 && busy >= 1, "ok {ok}, 429 {busy}");
+    // A body over the limit, really sent, is answered 413 too.
+    let big = vec![b' '; MAX_BODY_BYTES + 4096];
+    let r = http(addr, "POST", "/mcp", &[], &big).unwrap();
+    assert_eq!(r.status, 413, "{r:?}");
+    assert_eq!(r.header("connection"), Some("close"));
+}
+
+/// An idle session ends after the idle timeout (404: initialize again).
+#[test]
+fn idle_sessions_expire() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.session_idle = Duration::from_millis(300);
+    let (_srv, addr) = server(&d, m);
+    let c = McpHttpClient::new(addr);
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    assert_eq!(c.post(&list).status, 200);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(c.post(&list).status, 404);
+}

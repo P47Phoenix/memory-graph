@@ -490,9 +490,7 @@ fn health_cluster_and_sysinfo() {
     let d = tempfile::tempdir().unwrap();
     let server = Server::start(&d.path().join("g.redb"));
     let addr = server.addr.clone();
-    let h = ok(&["--server", &addr, "health"]);
-    let lines: Vec<&str> = h.lines().collect();
-    assert_eq!(lines, ["SERVING", "mcp: off"], "{h}");
+    assert_eq!(ok(&["--server", &addr, "health"]).trim(), "SERVING");
     // The ready service follows the leader, which a single node elects at
     // once; allow it a moment.
     let deadline = Instant::now() + Duration::from_secs(20);

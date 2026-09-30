@@ -351,3 +351,57 @@ fn overload_signatures_without_semicolons() {
         ]
     );
 }
+
+/// #143: JavaScript's reserved words are classed `keyword` in TypeScript;
+/// TypeScript's contextual words (`type`, `interface`) and a property name
+/// (`x.import`) stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    use graph_core::TokenClass;
+    let src = "export interface I { a: number }\ntype T = string;\nconst x = y.import;";
+    let toks = TypeScriptExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("export"), [TokenClass::Keyword]);
+    assert_eq!(class("const"), [TokenClass::Keyword]);
+    assert_eq!(class("interface"), [TokenClass::Identifier]);
+    assert_eq!(class("type"), [TokenClass::Identifier]);
+    assert_eq!(class("import"), [TokenClass::Identifier]);
+    assert!(TypeScriptExtractor
+        .version()
+        .starts_with("typescript-scan-2+kw1+tok"));
+}
+
+/// Review of #164: interface and type-literal members with reserved names
+/// (after `;`, optional `?:`) and methods with a return type are names.
+#[test]
+fn keyword_classing_members() {
+    use graph_core::TokenClass::{Identifier as I, Keyword as K};
+    let classes = |src: &str, word: &str| {
+        TypeScriptExtractor
+            .extract(src)
+            .tokens
+            .iter()
+            .filter(|t| t.text == word)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        classes("interface I { a: T; default?: U; }", "default"),
+        [I]
+    );
+    assert_eq!(classes("type T = { a: 1; new: 2 };", "new"), [I]);
+    assert_eq!(
+        classes("class A { delete(): boolean { return true; } }", "delete"),
+        [I]
+    );
+    assert_eq!(
+        classes("class A { delete(): boolean { return true; } }", "return"),
+        [K]
+    );
+    assert_eq!(classes("switch (x) { default: break; }", "default"), [K]);
+}

@@ -847,6 +847,18 @@ impl pb::admin_server::Admin for AdminService {
                 .mcp_addr
                 .map(|a| a.to_string())
                 .unwrap_or_default(),
+            backup: self.ctx.backup.as_ref().map(|b| {
+                let s = b.stats();
+                pb::BackupStatus {
+                    url: b.sink().describe(),
+                    on: b.on().to_string(),
+                    last_index: s.last_index,
+                    last_success_unix: s.last_success_unix,
+                    failures_total: s.failures_total,
+                    bytes_total: s.bytes_total,
+                    last_backup_error: s.last_error,
+                }
+            }),
         }))
     }
 

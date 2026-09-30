@@ -1,3 +1,5 @@
+// `cluster status --json` is one `json!` literal past the default limit.
+#![recursion_limit = "256"]
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use graph_cli::target::{Target, TargetArgs};
@@ -249,9 +251,33 @@ enum Cmd {
         #[arg(long, requires = "data_dir")]
         bootstrap: bool,
         /// With --bootstrap, into an empty --data-dir: seed the store from this snapshot file
-        /// (`cluster snapshot --out`); the new cluster gets a new id and a fresh log
-        #[arg(long, requires = "bootstrap", value_name = "FILE")]
+        /// (`cluster snapshot --out`), or from a backup, `file://<dir>/<cluster_id>/snap-T-I.redb`
+        /// or `file://<dir>/<cluster_id>/latest` (verified against its .meta: size, sha256, store
+        /// format and extractors). A plain file's sibling .meta is verified when present. The
+        /// new cluster gets a new id and a fresh log
+        #[arg(long, requires = "bootstrap", value_name = "FILE|URL")]
         restore: Option<PathBuf>,
+        /// With --restore: accept a backup made with other extractors (the store stays valid;
+        /// affected files re-extract on their next index). The store format check has no override
+        #[arg(long, requires = "restore")]
+        restore_allow_extractor_mismatch: bool,
+        /// Copy each snapshot this server builds to a backup location, `file://<dir>`, as
+        /// <dir>/<cluster_id>/snap-T-I.redb plus .meta (written last: a backup without its .meta
+        /// does not count). Uploads run in the background and never delay snapshots or purges
+        #[arg(long, value_name = "URL")]
+        backup_url: Option<String>,
+        /// With --backup-url: keep this many backups of this cluster (0: keep all); older ones
+        /// are deleted .meta first, and data without a .meta older than 24 h is swept
+        #[arg(long, requires = "backup_url", value_name = "N", default_value_t = graph_server::backup::DEFAULT_KEEP)]
+        backup_keep: usize,
+        /// With --backup-url: which nodes upload the snapshots they build: leader, all or none
+        #[arg(
+            long,
+            requires = "backup_url",
+            value_name = "WHO",
+            default_value = "leader"
+        )]
+        backup_on: graph_server::backup::BackupOn,
         /// With --data-dir: join the cluster that the node at this host:port belongs to (any
         /// member; it forwards to the leader). On an empty directory the node asks to be added as
         /// a learner and catches up; on one that already belongs to that cluster it is a plain
@@ -872,6 +898,20 @@ fn server_sysinfo(db: &std::path::Path) -> serde_json::Value {
 }
 
 /// `server <addr> node N (leader: M)`.
+/// How an MCP bound address is shown: `off` when empty, the URL for a
+/// specific address, and no URL for a wildcard bind (0.0.0.0 / [::]),
+/// which is not an address a client can use.
+fn mcp_url(addr: &str) -> String {
+    match addr.parse::<std::net::SocketAddr>() {
+        Err(_) if addr.is_empty() => "off".into(),
+        Ok(a) if a.ip().is_unspecified() => format!(
+            "bound on all interfaces, port {} (path /mcp; use this host's address)",
+            a.port()
+        ),
+        _ => format!("http://{addr}/mcp"),
+    }
+}
+
 fn server_header(addr: &str, st: &graph_proto::pb::StatusResponse) -> String {
     format!(
         "server {addr} node {} (leader: {})",
@@ -922,6 +962,10 @@ fn run() -> Result<i32> {
         data_dir,
         bootstrap,
         restore,
+        restore_allow_extractor_mismatch,
+        backup_url,
+        backup_keep,
+        backup_on,
         join,
         bootstrap_or_join,
         peers,
@@ -1166,6 +1210,13 @@ fn run() -> Result<i32> {
             cfg.mcp = Some(mc);
         }
         cfg.snapshot_max_age = *snapshot_max_age;
+        cfg.restore_allow_extractor_mismatch = *restore_allow_extractor_mismatch;
+        if let Some(url) = backup_url {
+            let mut b = graph_server::backup::BackupConfig::new(url.clone());
+            b.keep = *backup_keep;
+            b.on = *backup_on;
+            cfg.backup = Some(b);
+        }
         cfg.sysinfo = Some(std::sync::Arc::new(server_sysinfo));
         // Test-only fault injection (serve_e2e): park writes after N
         // proposals so a test can kill the server mid-run. Not a feature.
@@ -1198,7 +1249,7 @@ fn run() -> Result<i32> {
                 );
             }
             if let Some(m) = r.mcp_addr {
-                let msg = format!("mcp on http://{m}/mcp");
+                let msg = format!("mcp on {}", mcp_url(&m.to_string()));
                 println!("{}", start_line(log_format, "mcp", &msg, &m.to_string()));
             }
             let msg = format!("listening on {} ({shown})", r.addr);
@@ -1277,28 +1328,13 @@ fn run() -> Result<i32> {
                 read,
                 Some(std::time::Duration::from_secs(2)),
             )
-            .and_then(|s| {
-                let serving = s.health(service)?;
-                // Whether MCP is on, and where (ADR 0005 D5); best effort:
-                // a server without `Admin.Status` just gets no line.
-                let mcp = if serving {
-                    s.admin_status().ok().map(|st| st.mcp_addr)
-                } else {
-                    None
-                };
-                Ok((serving, mcp))
-            });
+            .and_then(|s| Ok(s.health(service)?));
             return Ok(match r {
-                Ok((true, mcp)) => {
+                Ok(true) => {
                     out!("SERVING");
-                    match mcp.as_deref() {
-                        Some("") => out!("mcp: off"),
-                        Some(a) => out!("mcp: http://{a}/mcp"),
-                        None => {}
-                    }
                     0
                 }
-                Ok((false, _)) => {
+                Ok(false) => {
                     out!("NOT_SERVING");
                     graph_cli::target::exit::NOT_SERVING
                 }
@@ -1360,6 +1396,15 @@ fn run() -> Result<i32> {
                                     "matched_index": p.matched_index,
                                     "lag": p.lag,
                                 })).collect::<Vec<_>>(),
+                                "backup": st.backup.as_ref().map(|b| serde_json::json!({
+                                    "url": b.url,
+                                    "on": b.on,
+                                    "last_index": b.last_index,
+                                    "last_success_unix": b.last_success_unix,
+                                    "failures_total": b.failures_total,
+                                    "bytes_total": b.bytes_total,
+                                    "last_backup_error": b.last_backup_error,
+                                })),
                             }))?
                         );
                     } else {
@@ -1381,6 +1426,7 @@ fn run() -> Result<i32> {
                             },
                             st.current_term
                         );
+                        out!("  mcp       {}", mcp_url(&st.mcp_addr));
                         for m in &st.members {
                             let lag = st
                                 .replication
@@ -1432,6 +1478,23 @@ fn run() -> Result<i32> {
                             st.uptime_secs,
                             st.snapshot_handles
                         );
+                        if let Some(b) = &st.backup {
+                            out!(
+                                "  backup    {} (on {}): last {}, {} failed, {} bytes",
+                                b.url,
+                                b.on,
+                                if b.last_index == 0 {
+                                    "none yet".to_string()
+                                } else {
+                                    format!("at {} (unix {})", b.last_index, b.last_success_unix)
+                                },
+                                b.failures_total,
+                                b.bytes_total
+                            );
+                            if !b.last_backup_error.is_empty() {
+                                out!("  backup    last error: {}", b.last_backup_error);
+                            }
+                        }
                     }
                 }
                 ClusterCmd::Leader { json } => {
@@ -1580,6 +1643,7 @@ fn run() -> Result<i32> {
                 }
             }
             let store = open_for_indexing(&target, overrides)?;
+            graph_cli::warn_extractor_gaps(&*store, &org, &repo);
             let st = store.index_bytes_opts(
                 &org,
                 &repo,
@@ -2264,8 +2328,17 @@ mod serve_config_tests {
                 "10m",
                 "--cache-bytes",
                 "1000000",
+                "--backup-url",
+                "file:///srv/backups",
+                "--backup-keep",
+                "3",
+                "--backup-on",
+                "all",
             ],
             r#"
+backup-url = "file:///srv/backups"
+backup_keep = 3
+backup-on = "all"
 data-dir = "/data"
 join = "peer:7000"
 auto_promote = true

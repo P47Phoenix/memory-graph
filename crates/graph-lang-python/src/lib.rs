@@ -21,7 +21,7 @@
 //! Python raises `TabError`.
 //! Not symbols: instance attributes, non-constant module variables, class
 //! attributes other than lambdas, conditional imports.
-use graph_core::scan::{code_index, span_between};
+use graph_core::scan::{code_index, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -40,28 +40,39 @@ impl Extractor for PythonExtractor {
     }
 
     fn version(&self) -> String {
-        format!("python-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("python-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, PYTHON_TOKENIZER);
+        let mut tokens = tokenize_with(source, PYTHON_TOKENIZER);
         let code = code_index(&tokens, &[TokenClass::Comment]);
         let lines = logical_lines(&tokens, &code);
-        if has_syntax_errors(&tokens, &code, &lines) {
-            return Extraction {
-                symbols: vec![],
-                tokens,
-                has_errors: true,
-            };
-        }
-        let symbols = scan(&tokens, &code, &lines);
+        let has_errors = has_syntax_errors(&tokens, &code, &lines);
+        let symbols = if has_errors {
+            vec![]
+        } else {
+            scan(&tokens, &code, &lines)
+        };
+        // After the symbol scan, which reads identifiers as it always has.
+        // Python has no escaped identifiers.
+        mark_keywords(&mut tokens, KEYWORDS, |_, _| false);
         Extraction {
             symbols,
             tokens,
-            has_errors: false,
+            has_errors,
         }
     }
 }
+
+/// Python's hard keywords. Soft keywords (`match`, `case`, `type`, `_`) are
+/// ordinary names outside their statements and stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield",
+];
 
 /// Symbols in Python tokens (as produced with [`PYTHON_TOKENIZER`]), best
 /// effort even when the source has syntax errors.
