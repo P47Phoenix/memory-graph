@@ -1825,6 +1825,73 @@ fn prepared_chunks_count_only_stored_files() {
     );
 }
 
+/// #158: `prepare`'s unchanged pre-check (a read transaction) waits while an
+/// index commit holds the commit gate, so no pre-check reader is live when
+/// a commit decides which freed pages it may reuse.
+#[test]
+fn prepare_precheck_waits_for_an_index_commit() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g")).unwrap();
+    let f = BatchFile {
+        path: "a.txt",
+        bytes: b"alpha beta",
+        language: None,
+        origin: None,
+    };
+    let opts = IndexOptions::default();
+    s.index_batch("o", "r", &[f], opts).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|sc| {
+        let gate = s.commit_gate.write().unwrap();
+        sc.spawn(|| {
+            let p = Store::prepare(&s, "o", "r", &f, opts).unwrap();
+            tx.send(matches!(p.work, crate::api::Prepared::Unchanged(_)))
+                .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "prepare read the store while a commit held the gate"
+        );
+        drop(gate);
+        assert!(rx.recv().unwrap(), "the pre-check still runs afterwards");
+    });
+}
+
+/// #158, the other side: an index commit waits for a `prepare` pre-check
+/// that holds the gate. A pre-check reader still live when a commit ran
+/// (e.g. a parse thread descheduled under CPU load across a whole commit)
+/// kept that commit from reusing the pages the previous one freed.
+#[test]
+fn index_commit_waits_for_a_prepare_precheck() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g")).unwrap();
+    let f = BatchFile {
+        path: "a.txt",
+        bytes: b"alpha beta",
+        language: None,
+        origin: None,
+    };
+    let opts = IndexOptions::default();
+    let p = Store::prepare(&s, "o", "r", &f, opts).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|sc| {
+        let gate = s.commit_gate.read().unwrap();
+        sc.spawn(|| {
+            let r = Store::index_prepared(&s, "o", "r", vec![p], opts).unwrap();
+            tx.send(r.len()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "an index commit ran while a pre-check held the gate"
+        );
+        drop(gate);
+        assert_eq!(rx.recv().unwrap(), 1);
+    });
+    assert!(s.file_tokens("o", "r", "a.txt").unwrap().is_some());
+}
+
 /// Issue #137 owner ids: remapped from file-local to global dictionary ids
 /// on commit (the dictionary is already populated, so they differ), kept
 /// live by vacuum even when the owner text is used nowhere else, and counted

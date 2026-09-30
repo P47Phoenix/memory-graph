@@ -368,6 +368,17 @@ pub struct V2Store {
     max_snapshot_age: Duration,
     snapshot_tracker: SharedSnapshotTracker,
     marked_commit_hook: Option<MarkedCommitHook>,
+    /// Orders [`Store::prepare`]'s unchanged pre-check (a read transaction,
+    /// shared) against index commits (exclusive), so no read transaction of
+    /// this store's own is live while an indexing batch commits (#158). At
+    /// commit redb releases the pages earlier commits freed only up to the
+    /// oldest live reader's snapshot, so a pre-check on a parse thread that
+    /// began before one commit and was still live at the next (a thread
+    /// descheduled under load) delayed that reuse: page allocation, and so
+    /// the file bytes, followed thread timing, and the same `--deterministic`
+    /// input gave different files for different `--jobs` (every query still
+    /// answered the same).
+    pub(crate) commit_gate: std::sync::RwLock<()>,
 }
 
 /// A test hook the server's failpoints use (ADR 0004 stage B): called by
@@ -2397,6 +2408,7 @@ impl V2Store {
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
             snapshot_tracker: Arc::new(Mutex::new(SnapshotTracker::default())),
             marked_commit_hook: None,
+            commit_gate: std::sync::RwLock::new(()),
         })
     }
 
@@ -2794,6 +2806,7 @@ impl V2Store {
             max_snapshot_age,
             snapshot_tracker: _,
             marked_commit_hook,
+            commit_gate: _,
         } = self;
         // Drop the old handle before renaming over its path (Windows will
         // not allow the rename while any `Database` still has it open).
@@ -3031,6 +3044,9 @@ impl V2Store {
         opts: IndexOptions,
     ) -> Result<PreparedFile> {
         let mut p = prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
+            // Shared with other parse threads, exclusive with an index commit
+            // (see `commit_gate`): the read transaction ends inside it.
+            let _gate = self.commit_gate.read().unwrap_or_else(|e| e.into_inner());
             stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
         })?;
         if let crate::api::Prepared::Extracted(ex) = &p.work {
@@ -3143,7 +3159,7 @@ impl V2Store {
             }
             in_txn += len;
             if in_txn >= chunk_bytes {
-                wt.commit()?;
+                self.commit_gated(wt)?;
                 commits += 1;
                 wt = self.db.begin_write()?;
                 // This chunk is not (yet) known to be the batch's last, so
@@ -3161,8 +3177,17 @@ impl V2Store {
         if let Some((m, _)) = &marker {
             self.before_marked_commit(m)?;
         }
-        wt.commit()?;
+        self.commit_gated(wt)?;
         Ok((out, commits + 1))
+    }
+
+    /// Commit an indexing transaction while no `prepare` pre-check holds a
+    /// read transaction (see `commit_gate`), so which freed pages the commit
+    /// may reuse never depends on parse-thread timing (#158).
+    fn commit_gated(&self, wt: redb::WriteTransaction) -> Result<()> {
+        let _gate = self.commit_gate.write().unwrap_or_else(|e| e.into_inner());
+        wt.commit()?;
+        Ok(())
     }
 
     /// Allocate the next monotonic batch id from `meta.next_batch_id`,
