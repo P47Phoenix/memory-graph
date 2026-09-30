@@ -97,7 +97,7 @@ Every pod serves Prometheus text on `:9100/metrics` (`--metrics-listen`); the po
 common `prometheus.io/*` annotations. For the Prometheus Operator, a PodMonitor selecting
 `app.kubernetes.io/name: memory-graph` on port `metrics` does the same. Logs are JSON lines on
 stderr (`--log-format json`), level from `MEMORY_GRAPH_LOG`. The metric names are listed in the
-[README](../../README.md#observability).
+[observability guide](../guide/observability.md#metrics).
 
 ## Scaling
 

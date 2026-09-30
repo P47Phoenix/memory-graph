@@ -3,11 +3,25 @@
 Start here. Each document opens with a TL;DR, then details, then links to raw data.
 
 ## Suggested reading order for a newcomer
-1. [Glossary](glossary.md): plain meanings of every technical word. Skim it, and come back when a word is unclear.
-2. The "In plain words" box at the top of [ADR 0001](adr/0001-storage.md) and [ADR 0002](adr/0002-parsing-and-crate-layout.md). [ADR 0003](adr/0003-data-model.md) and [ADR 0004](adr/0004-client-server-and-replication.md) also open with an "In plain words" section (no special vocabulary, then a table of the decisions made and the questions still open).
-3. The [epic](epic-code-memory-graph.md), to see the goal and the planned stories.
-4. The technical sections of the ADRs, then the [spikes](#spikes-evidence) for evidence.
-5. [Learnings](learnings.md) as a quick list of key facts and pitfalls.
+1. The [README](../README.md) quick start, then the [guides](#guides) for the parts you use.
+2. [Glossary](glossary.md): plain meanings of every technical word. Skim it, and come back when a word is unclear.
+3. The "In plain words" box at the top of [ADR 0001](adr/0001-storage.md) and [ADR 0002](adr/0002-parsing-and-crate-layout.md). [ADR 0003](adr/0003-data-model.md) and [ADR 0004](adr/0004-client-server-and-replication.md) also open with an "In plain words" section (no special vocabulary, then a table of the decisions made and the questions still open).
+4. The [epic](epic-code-memory-graph.md), to see the goal and the planned stories.
+5. The technical sections of the ADRs, then the [spikes](#spikes-evidence) for evidence.
+6. [Learnings](learnings.md) as a quick list of key facts and pitfalls.
+
+## Guides
+How to use and run memory-graph (the [README](../README.md) has the quick start):
+- [guide/indexing.md](guide/indexing.md): incremental indexing, pruning, paths, per-file failures, sizing (threads, memory, disk), progress and traces.
+- [guide/querying.md](guide/querying.md): search grains, `--kind`, symbol patterns, paging, JSON output, MCP.
+- [guide/server.md](guide/server.md): `memory-graph serve`, choosing `--db` or `--server`, the LOCK file, exit codes, retries and write deadlines.
+- [guide/cluster.md](guide/cluster.md): a Raft cluster: bootstrap, tuning, TOML config, backups (with an S3 walkthrough), join/promote/remove, read modes.
+- [guide/observability.md](guide/observability.md): logs, metrics (the stable metric names) and health probes.
+- [guide/docker.md](guide/docker.md): the container image.
+- [guide/languages.md](guide/languages.md): supported languages, extensions and tokenizer dialects.
+- [guide/storage.md](guide/storage.md): the on-disk format, size, reclaiming space, the retired v1 format.
+- [guide/development.md](guide/development.md): building, tests, CI gates, the test corpus, using it as a library.
+- [mcp.md](mcp.md): connecting AI assistants over MCP.
 
 ## Glossary
 - [glossary.md](glossary.md): every technical term in plain words, in alphabetical order.
@@ -22,6 +36,8 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 | [0002 Parsing and crate layout](adr/0002-parsing-and-crate-layout.md) | Accepted | How the code is split into three crates, how language readers report spans, the fallback tokenizer for any language, and the pure-Rust check in CI. |
 | [0003 Data model](adr/0003-data-model.md) | **Proposed** (not accepted; Q4 and Q5 decided by the user 2026-09-20) | A proposal to store tokens in a much smaller form (a dictionary, one stream per file, and count postings) instead of one record per token; also covers sharding, snapshots and migration. Opens with an "In plain words" section. Decided: an owning daemon for cross-process access, and shard by (org, repo) with the sharding build deferred. |
 | [0004 Client/server and replication](adr/0004-client-server-and-replication.md) | **Accepted** (by the user, 2026-09-28) | Runs memory-graph as a real database: `memory-graph serve` reached over gRPC from any machine, hostable as a Raft cluster where every node serves reads, any node accepts writes, and a write is acknowledged only once a majority has it on disk. Supersedes the Unix-socket transport of ADR 0003 Q5. Opens with an "In plain words" section. |
+| [0005 MCP access](adr/0005-mcp.md) | **Accepted** (by the user, 2026-09-29) | Read-only MCP tools over stdio (`memory-graph mcp`) and an opt-in loopback streamable HTTP endpoint (`serve --mcp-listen`), so AI assistants can query the graph. |
+| [0006 Snapshots to object storage](adr/0006-snapshots-object-storage.md) | **Accepted** (by the user, 2026-09-29) | The leader copies each Raft snapshot to `file://` or S3-compatible storage (`--backup-url`), and `--restore` seeds a new cluster from one. |
 
 ## Spikes (evidence)
 | Spike | TL;DR | Raw data |
@@ -39,7 +55,7 @@ Start here. Each document opens with a TL;DR, then details, then links to raw da
 - [deploy/compose.md](deploy/compose.md): a three-node cluster with Docker Compose (`deploy/compose/cluster.yml`), and the CI check that runs it end to end.
 - [deploy/kubernetes.md](deploy/kubernetes.md): a StatefulSet with a headless Service, node ids from the pod ordinal, gRPC readiness, a PodDisruptionBudget and the scale-down procedure (manifests in `deploy/kubernetes/`).
 - [deploy/data-dir.md](deploy/data-dir.md): what a node's data directory holds, backup with `cluster snapshot --out` and restore with `serve --bootstrap --restore`.
-- Logs, metrics and health probes: the README's [Observability](../README.md#observability) section.
+- Logs, metrics and health probes: [guide/observability.md](guide/observability.md).
 
 ## Learnings
 - [learnings.md](learnings.md): a short list of lasting facts, measured numbers, rules and review mistakes to avoid, each linking to the details.

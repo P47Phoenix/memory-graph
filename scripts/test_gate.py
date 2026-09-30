@@ -86,4 +86,9 @@ for crate in ["ring", "aws-lc-sys"]:
         f"`cargo tree -i {crate}` must report the crate absent "
         f"(exit {r.returncode}):\n{r.stdout}{r.stderr}"
     )
+# Documentation links: every relative link and #anchor in README.md and docs/ resolves.
+DOC_LINKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-doc-links.py")
+for args in (["--self-test"], []):
+    r = subprocess.run([sys.executable, DOC_LINKS, *args], cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode == 0, f"check-doc-links.py {' '.join(args)} failed:\n{r.stdout}{r.stderr}"
 print("gate tests passed")
