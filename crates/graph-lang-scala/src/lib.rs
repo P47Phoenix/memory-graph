@@ -35,6 +35,8 @@
 use graph_core::scan::{code_close_table, code_index, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub struct ScalaExtractor;
 
@@ -60,6 +62,7 @@ impl Extractor for ScalaExtractor {
             closes: code_close_table(&tokens, &code),
             out: Vec::new(),
             depth: 0,
+            modifier_walks: RefCell::default(),
         };
         s.body(0, code.len(), Ctx::Other);
         let symbols = s.out;
@@ -115,6 +118,8 @@ struct Scanner<'a> {
     closes: Vec<Option<usize>>,
     out: Vec<SymbolDecl>,
     depth: usize,
+    /// `(c, hi)` -> [`Scanner::keyword_after_modifiers`] from `c`.
+    modifier_walks: RefCell<HashMap<(usize, usize), Option<usize>>>,
 }
 
 impl Scanner<'_> {
@@ -185,9 +190,32 @@ impl Scanner<'_> {
 
     /// If modifiers and annotations starting at `c` lead to a declaration
     /// keyword, its position.
+    ///
+    /// The walk depends only on the position, so every position it passes
+    /// gets the same answer; remembering them keeps a long run of modifiers
+    /// (`case case ...`) linear instead of one walk per token.
     fn keyword_after_modifiers(&self, c: usize, hi: usize) -> Option<usize> {
+        let mut visited = Vec::new();
+        let r = self.keyword_after_modifiers_walk(c, hi, &mut visited);
+        let mut memo = self.modifier_walks.borrow_mut();
+        for v in visited {
+            memo.insert((v, hi), r);
+        }
+        r
+    }
+
+    fn keyword_after_modifiers_walk(
+        &self,
+        c: usize,
+        hi: usize,
+        visited: &mut Vec<usize>,
+    ) -> Option<usize> {
         let mut k = c;
         while k < hi {
+            if let Some(&r) = self.modifier_walks.borrow().get(&(k, hi)) {
+                return r;
+            }
+            visited.push(k);
             let t = self.text(k);
             if DECL_KEYWORDS.contains(&t) {
                 return Some(k);
