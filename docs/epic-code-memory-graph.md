@@ -55,8 +55,13 @@
 | 37 | Restore from `s3://` and `latest`, `cluster snapshot --upload`, `cluster backups` | Medium | 3 | P2 | 36 |
 | 38 | S3 e2e CI job and backup docs | Medium | 3 | P3 | 37 |
 | 39 | Spike: native HTTPS for backups behind `backup-tls` (**Deferred**, shared with #104) | Low | 5 | P4 | 36, #104 |
+| 40 | Decode any source encoding in `graph_core::encoding` (**Proposed**, ADR 0007) | High | 5 | P2 | 6 |
+| 41 | Store integration: decoded spans, binary rejection, schema 11 restamp, fingerprint rule (**Proposed**) | High | 8 | P2 | 40 |
+| 42 | `--encoding`, `--strict-encoding` and the per-glob `[encoding]` table (**Proposed**) | Medium | 3 | P2 | 41 |
+| 43 | Encodings on the wire, in `describe`/`--stats` and in MCP (**Proposed**) | Medium | 5 | P3 | 41, 20, 31 |
+| 44 | Encoding fixtures, cross-encoding search tests and docs (**Proposed**) | Medium | 3 | P3 | 42, 43 |
 
-Total: 39 stories, 203 pts (average about 5.2); 195 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29.
+Total: 44 stories, 227 pts (average about 5.2); 219 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), **Proposed**: they start only once the owner accepts it.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -480,6 +485,64 @@ So that the deployment has one less moving part.
 Design: [ADR 0006](adr/0006-snapshots-object-storage.md) E5 (Accepted).
 - Given candidate providers (rustls-rustcrypto, graviola), When evaluated, Then the spike must record whether one passes `scripts/check-no-c-deps.py` and works against AWS S3.
 - Given a passing provider, When the `backup-tls` feature is enabled, Then `https://` endpoints must be accepted, and the default build must stay unchanged.
+
+**40. Decode any source encoding in `graph_core::encoding` (5 pts)**
+Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+As a developer indexing a legacy or Windows codebase
+I want each file decoded to UTF-8 whatever its encoding
+So that UTF-16 and code-page files are indexed instead of skipped.
+Design: [ADR 0007](adr/0007-source-encodings.md) C2-C5, C10.
+- Given a file with a UTF-8, UTF-16LE or UTF-16BE BOM, When decoded, Then that encoding must be used and U+FEFF must stay at the start of the text, even when a different hint is given.
+- Given valid UTF-8 without a BOM, When decoded, Then the text must be the input borrowed unchanged, with encoding `UTF-8` and `lossy` false.
+- Given BOM-less UTF-16 source, When decoded, Then it must be sniffed as UTF-16LE or BE; and given windows-1252, Shift_JIS, GBK, EUC-KR or Big5 source, Then `chardetng` must pick that encoding, falling back to windows-1252.
+- Given a hint that does not fit the bytes, When decoded, Then invalid sequences must become U+FFFD and `lossy` must be true; and given random bytes (proptest), Then decoding must never panic and `lossy` must be set iff a replacement was inserted.
+- Given a PNG, When checked, Then `is_binary` must be true; given a BOM-less UTF-16 file, Then it must be false.
+- Given `ansi`, When resolved, Then it must be the system code page on Windows (a mapped `GetACP`) and windows-1252 elsewhere; and `encoding_rs` and `chardetng` must be pinned and pass `check-no-c-deps.py`.
+
+**41. Store integration: decoded spans, binary rejection, schema 11 restamp, fingerprint rule (8 pts)**
+Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+As a user of any store (embedded, `--server`, a Raft cluster)
+I want every writer to decode and store files the same way
+So that encoded files are searchable and all replicas agree.
+Design: [ADR 0007](adr/0007-source-encodings.md) C1, C2, C5-C7.
+- Given a non-UTF-8 file, When indexed, Then every token's and symbol's text, byte range, line and column must be exact against the decoded text, and the file must record its encoding and `lossy` flag.
+- Given the UTF-8 corpus, When indexed, Then the output and the stored stream bytes must be identical to `main`, and `size_gate` must pass unchanged.
+- Given a v10 (or v9) database, When opened, Then it must be restamped to v11 and read identically, and re-indexing it must re-parse 0 files; given a newer version, Then it must be refused without writing.
+- Given a non-UTF-8 file re-indexed with a different `--encoding` that changes the decode, When indexed, Then only that file must be re-indexed; a UTF-8 file's fingerprint must be unchanged.
+- Given a binary file sent through `index-file`, `--server` or a raw `Index` RPC, When indexed, Then it must be rejected as binary.
+- Given encoded inputs, When `run_all`, `run_differential` and `run_crash_rerun_differential` run, Then embedded, remote and Raft stores must answer identically; golden-byte tests must pin the new flag bit.
+
+**42. `--encoding`, `--strict-encoding` and the per-glob `[encoding]` table (3 pts)**
+Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+As a developer whose tree mixes encodings
+I want to override detection per run or per glob
+So that a mis-detected code page can be fixed.
+Design: [ADR 0007](adr/0007-source-encodings.md) C3, C4, C8.
+- Given `index --encoding <label>` or `index-file --encoding <label>` with any `encoding_rs` label or `ansi`, When run, Then files must decode with it (a BOM still wins); an unknown label must be a usage error.
+- Given an `[encoding]` table mapping globs to labels, When a directory is indexed, Then the first matching glob must apply, and a non-`auto` `--encoding` must override it.
+- Given `--strict-encoding` and a file that would decode lossily, When indexed, Then that file must be refused and reported, and the rest indexed; and `--encoding utf-8 --strict-encoding` must reproduce today's `NotUtf8` refusal.
+- Given a directory run, When it finishes, Then the tallies must no longer skip UTF-16 files as binary and must count transcoded and lossy files.
+
+**43. Encodings on the wire, in `describe`/`--stats` and in MCP (5 pts)**
+Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+As an agent or operator reading the graph
+I want to see which files were transcoded or decoded lossily
+So that I can trust, or fix, what a search returns.
+Design: [ADR 0007](adr/0007-source-encodings.md) C8.
+- Given `--server`, When a client sends `FileBytes.encoding_hint` (with `ansi` resolved on the client) and `strict_encoding`, Then the server must honour them, and the proto change must be additive and regenerated with the xtask.
+- Given a repo with non-UTF-8 files, When `describe` (text and `--json`) runs, Then it must list the encodings and the lossy count per repo, from the catalog, in O(repos).
+- Given `symbols` and `search --json`, When a hit is in a non-UTF-8 file, Then its `encoding` (and `lossy` when set) must be shown; and `--stats` must show transcoded and lossy counts.
+- Given the MCP `describe` and `list_files` tools, When called, Then they must include the encoding where it is not UTF-8.
+
+**44. Encoding fixtures, cross-encoding search tests and docs (3 pts)**
+Status: **Proposed** ([ADR 0007](adr/0007-source-encodings.md), not yet accepted).
+As a maintainer
+I want every supported encoding covered end to end and documented
+So that the feature does not regress and users know how to use it.
+Design: [ADR 0007](adr/0007-source-encodings.md) test plan.
+- Given one fixture per encoding (UTF-16LE/BE with and without a BOM, windows-1252, Shift_JIS, GBK, EUC-KR, Big5) and one invalid-bytes file, When indexed, Then each must record the expected encoding, exact spans against the decoded text, and its symbols (e.g. a C# class in a UTF-16 file).
+- Given the same identifiers (e.g. `CustomerId`, `café`, `日本`) in UTF-8, UTF-16LE, UTF-16BE, windows-1252 and Shift_JIS files, When searched, Then one search must return hits from every file and the dictionary must hold one term per identifier.
+- Given the docs, When read, Then `docs/guide/indexing.md` must have an Encodings section (detection order, overrides, limits of cross-encoding matching), the glossary must define decoded source and lossy, ADR 0003 must point to ADR 0007, and the CLAUDE.md exact-spans invariant must read as in ADR 0007 C1.
 
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.

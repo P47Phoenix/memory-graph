@@ -38,6 +38,7 @@ How to use and run memory-graph (the [README](../README.md) has the quick start)
 | [0004 Client/server and replication](adr/0004-client-server-and-replication.md) | **Accepted** (by the user, 2026-09-28) | Runs memory-graph as a real database: `memory-graph serve` reached over gRPC from any machine, hostable as a Raft cluster where every node serves reads, any node accepts writes, and a write is acknowledged only once a majority has it on disk. Supersedes the Unix-socket transport of ADR 0003 Q5. Opens with an "In plain words" section. |
 | [0005 MCP access](adr/0005-mcp.md) | **Accepted** (by the user, 2026-09-29) | Read-only MCP tools over stdio (`memory-graph mcp`) and an opt-in loopback streamable HTTP endpoint (`serve --mcp-listen`), so AI assistants can query the graph. |
 | [0006 Snapshots to object storage](adr/0006-snapshots-object-storage.md) | **Accepted** (by the user, 2026-09-29) | The leader copies each Raft snapshot to `file://` or S3-compatible storage (`--backup-url`), and `--restore` seeds a new cluster from one. |
+| [0007 Source encodings](adr/0007-source-encodings.md) | **Proposed** (2026-09-30) | Index files in any encoding (UTF-16, Windows-1252, the ANSI code page, Shift_JIS, GBK, Big5, ...): each file is decoded to UTF-8, spans point into the decoded text, the encoding is recorded, and `--encoding` overrides detection. |
 
 ## Spikes (evidence)
 | Spike | TL;DR | Raw data |
