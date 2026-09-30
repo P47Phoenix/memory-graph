@@ -369,6 +369,8 @@ impl RemoteStore {
                     bytes: parts.bytes.to_vec(),
                     language: parts.language.map(str::to_string),
                     origin: parts.origin.map(str::to_string),
+                    encoding_hint: parts.encoding.map(|e| e.name().to_string()),
+                    strict_encoding: parts.strict_encoding,
                 })),
             });
         }
@@ -591,6 +593,8 @@ impl Store for RemoteStore {
                 bytes: bytes.to_vec(),
                 language: language.map(str::to_string),
                 origin: origin.map(str::to_string),
+                encoding_hint: opts.encoding.map(|e| e.name().to_string()),
+                strict_encoding: opts.strict_encoding,
             }),
             options: Some(opts.into()),
         };
@@ -652,8 +656,9 @@ impl Store for RemoteStore {
         org: &str,
         repo: &str,
         file: &BatchFile<'_>,
-        _opts: IndexOptions,
+        opts: IndexOptions,
     ) -> Result<PreparedFile> {
+        // ADR 0007 C8: the hint travels with the file; the server decodes.
         Ok(PreparedFile::remote(
             org,
             repo,
@@ -661,6 +666,10 @@ impl Store for RemoteStore {
             file.bytes.to_vec(),
             file.language.map(str::to_string),
             file.origin.map(str::to_string),
+        )
+        .with_encoding(
+            file.encoding.or(opts.encoding),
+            file.strict_encoding || opts.strict_encoding,
         ))
     }
 

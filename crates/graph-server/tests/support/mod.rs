@@ -60,6 +60,7 @@ pub fn index_files(s: &dyn Store, org: &str, repo: &str, files: &[(String, Vec<u
                 bytes: b,
                 language: None,
                 origin: Some(ORIGIN_DIRECTORY),
+                ..Default::default()
             })
             .collect();
         s.index_batch(org, repo, &batch, IndexOptions::default())

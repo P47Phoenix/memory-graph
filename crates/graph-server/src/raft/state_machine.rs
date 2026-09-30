@@ -92,6 +92,7 @@ fn is_refusal(e: &StoreError) -> bool {
         e,
         StoreError::Rejected(_)
             | StoreError::NotUtf8(_)
+            | StoreError::Binary(_)
             | StoreError::TooLarge(_)
             | StoreError::InvalidSpan(_)
             | StoreError::Schema(_)
@@ -269,7 +270,10 @@ impl StoreStateMachine {
         span.record("files", files);
         match cmd {
             Cmd::IndexChunk(c) => {
-                let opts = IndexOptions { reindex: c.reindex };
+                let opts = IndexOptions {
+                    reindex: c.reindex,
+                    ..Default::default()
+                };
                 let prepared = c
                     .files
                     .iter()
@@ -278,7 +282,8 @@ impl StoreStateMachine {
                             store,
                             &c.org,
                             &c.repo,
-                            &f.as_batch_file(),
+                            &f.as_batch_file()
+                                .map_err(|e| StoreError::Protocol(e.to_string()))?,
                             opts,
                         )
                     })

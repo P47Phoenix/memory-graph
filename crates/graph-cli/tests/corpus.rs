@@ -313,6 +313,7 @@ fn every_parsed_token_is_stored() {
                     bytes,
                     language: None,
                     origin: None,
+                    ..Default::default()
                 })
                 .collect();
             let stats = store

@@ -164,8 +164,42 @@ pub struct Node {
     /// pre-built extraction (content unknown); such files re-index once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// File only: the WHATWG name of the encoding the source was decoded
+    /// from (ADR 0007 C6), e.g. `UTF-16LE` or `Shift_JIS`. Absent for UTF-8,
+    /// so a UTF-8 File node's bytes are unchanged. A name `encoding_rs` does
+    /// not know (or `replacement`) is refused when a node is deserialized.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_encoding_name"
+    )]
+    pub encoding: Option<String>,
+    /// File only: an invalid sequence was replaced with U+FFFD while
+    /// decoding (ADR 0007 C3). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lossy: bool,
     /// Symbol and token.
     pub span: Option<Span>,
+}
+
+/// True when `name` is the canonical WHATWG name of an encoding a source can
+/// be decoded from (anything `encoding_rs` knows except `replacement`).
+pub fn is_known_encoding_name(name: &str) -> bool {
+    encoding_rs::Encoding::for_label(name.as_bytes())
+        .is_some_and(|e| e.name() == name && e != encoding_rs::REPLACEMENT)
+}
+
+fn de_encoding_name<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<String> = Option::deserialize(d)?;
+    match v {
+        Some(name) if !is_known_encoding_name(&name) => Err(serde::de::Error::custom(format!(
+            "unknown source encoding `{name}` in a File node"
+        ))),
+        v => Ok(v),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -211,6 +245,8 @@ mod tests {
             has_errors: false,
             origin: None,
             fingerprint: None,
+            encoding: None,
+            lossy: false,
             span: Some(Span {
                 start: 0,
                 end: 5,

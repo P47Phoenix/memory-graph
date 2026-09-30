@@ -761,6 +761,7 @@ dependencies = [
 name = "graph-client"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "graph-core",
  "graph-lang-rust",
  "graph-proto",
@@ -1039,6 +1040,7 @@ dependencies = [
 name = "graph-store"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "graph-core",
  "graph-lang-rust",
  "proptest",

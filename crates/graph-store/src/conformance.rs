@@ -104,6 +104,12 @@ pub const CASES: &[(&str, Case)] = &[
         extractor_gaps_name_a_missing_extractor,
     ),
     ("space_usage_is_consistent", space_usage_is_consistent),
+    ("encoded_files", encoded_files),
+    (
+        "encoding_hint_strict_and_binary",
+        encoding_hint_strict_and_binary,
+    ),
+    ("batch_level_encoding_hint", batch_level_encoding_hint),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -486,7 +492,10 @@ fn unchanged_skip_and_reindex(h: &Harness) {
             b"foo bar",
             None,
             None,
-            IndexOptions { reindex: true },
+            IndexOptions {
+                reindex: true,
+                ..Default::default()
+            },
         )
         .unwrap();
     assert!(!forced.unchanged && forced.tokens == first.tokens);
@@ -494,12 +503,23 @@ fn unchanged_skip_and_reindex(h: &Harness) {
     assert!(!changed.unchanged && changed.replaced);
     assert_eq!(s.search(&Query::new("bar")).unwrap().len(), 0);
     assert_eq!(s.search(&Query::new("baz")).unwrap().len(), 1);
-    // Rejections store nothing.
+    // Rejections store nothing: a binary file (ADR 0007 C5), and invalid
+    // UTF-8 under a strict `utf-8` hint (today's `NotUtf8`, ADR 0007 C8).
     assert!(matches!(
-        s.index_bytes("o", "r", "bin", &[0xff, 0xfe], None),
-        Err(StoreError::NotUtf8(_))
+        s.index_bytes("o", "r", "bin", PNG, None),
+        Err(StoreError::Binary(_))
     ));
     assert!(s.file_tokens("o", "r", "bin").unwrap().is_none());
+    let strict_utf8 = IndexOptions {
+        encoding: Some(encoding_rs::UTF_8),
+        strict_encoding: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        s.index_bytes_opts("o", "r", "bad", b"a \xff b", None, None, strict_utf8),
+        Err(StoreError::NotUtf8(_))
+    ));
+    assert!(s.file_tokens("o", "r", "bad").unwrap().is_none());
 }
 
 fn prune(h: &Harness) {
@@ -599,6 +619,7 @@ fn invalid_span_slots(h: &Harness) {
         bytes: b,
         language: Some(l),
         origin: None,
+        ..Default::default()
     };
     let files = [
         f("ok1.c", b"xxxx", "text"),
@@ -712,6 +733,7 @@ fn bf<'a>(path: &'a str, bytes: &'a [u8]) -> BatchFile<'a> {
         bytes,
         language: Some("text"),
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     }
 }
 
@@ -725,6 +747,7 @@ fn failed_batch_leaves_consistent_state(h: &Harness) {
         bytes: b"foo bar",
         language: Some("a\0b"), // NUL in the language: a whole-batch error
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     };
     let names = ["a.txt", "b.txt", "c.txt"];
     let bytes: [&[u8]; 3] = [b"foo bar", b"foo baz", b"foo qux"];
@@ -787,7 +810,15 @@ fn batch_reindex_and_unchanged(h: &Harness) {
         assert_eq!(a.file_id, f.file_id, "skipped file keeps its node");
     }
     let forced = s
-        .index_batch("o", "r", &files, IndexOptions { reindex: true })
+        .index_batch(
+            "o",
+            "r",
+            &files,
+            IndexOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(forced.iter().all(|r| !ok(r).unchanged && ok(r).replaced));
     // Mixed: one changed, one unchanged.
@@ -1245,9 +1276,14 @@ fn nul_handling(h: &Harness) {
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 0);
     assert_eq!(s.count_nodes(NodeKind::Org).unwrap(), 0);
     assert!(s.describe(None, None).unwrap().is_empty());
-    // NUL in file content is fine (it is text), and NUL in a query matches
-    // nothing rather than erroring.
-    s.index_bytes("o", "r", "n.txt", b"foo\0bar", None).unwrap();
+    // NUL in file content makes it binary unless it is UTF-16 (ADR 0007 C5,
+    // one check on every path), and NUL in a query matches nothing rather
+    // than erroring.
+    assert!(matches!(
+        s.index_bytes("o", "r", "n.txt", b"foo\0bar", None),
+        Err(StoreError::Binary(_))
+    ));
+    s.index_bytes("o", "r", "n.txt", b"foo bar", None).unwrap();
     assert!(s.search(&Query::new("fo\0o")).unwrap().is_empty());
     let mut q = Query::new("foo");
     q.org = Some("o\0".into());
@@ -1370,6 +1406,9 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         "x",
         "\u{1F600}",
         "let",
+        ENC_ID,
+        ENC_LATIN,
+        ENC_CJK,
     ] {
         for grain in grains {
             let mut q = Query::new(text);
@@ -1472,6 +1511,12 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         ("o1", "r3", "eq.rs"),
         ("o2", "r3", "astral.txt"),
         ("o2", "r3", "empty.txt"),
+        ("o2", "enc", "u8.txt"),
+        ("o2", "enc", "le.txt"),
+        ("o2", "enc", "be.txt"),
+        ("o2", "enc", "w1252.txt"),
+        ("o2", "enc", "sjis.txt"),
+        ("o2", "enc", "hinted.txt"),
     ] {
         // Node ids are opaque, so compare content and spans only.
         let tok = |s: &dyn Store| {
@@ -1494,14 +1539,21 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
 /// so a crashed-and-resumed index is indistinguishable from a clean one
 /// whatever the chunking. Both stores must be empty on entry.
 pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
-    let names = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"];
-    let bodies: [&[u8]; 6] = [
+    let names = [
+        "a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt", "h.txt",
+    ];
+    // ADR 0007: a UTF-16 file (auto) and a Shift_JIS one (hinted) too.
+    let le = utf16("foo \u{e9}t\u{e9} bar\n", false, true);
+    let sjis = legacy("foo \u{65e5}\u{672c}\n", encoding_rs::SHIFT_JIS);
+    let bodies: [&[u8]; 8] = [
         b"foo bar baz",
         b"foo (bar) qux",
         b"let x = foo;",
         b"bar bar bar",
         "\u{1F600} foo".as_bytes(),
         b"fn dup() { dup(); }",
+        &le,
+        &sjis,
     ];
     let good: Vec<BatchFile<'_>> = names
         .iter()
@@ -1511,6 +1563,8 @@ pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
             bytes: b,
             language: Some("text"),
             origin: Some(ORIGIN_DIRECTORY),
+            encoding: (*n == "h.txt").then_some(encoding_rs::SHIFT_JIS),
+            ..Default::default()
         })
         .collect();
     // Poison after the third file: with small chunks the first files commit
@@ -1521,6 +1575,7 @@ pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
         bytes: b"foo",
         language: Some("a\0b"),
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     });
     poisoned.extend_from_slice(&good[3..]);
     assert!(
@@ -1570,7 +1625,17 @@ pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
             };
             assert_eq!(tok(fresh), tok(crashed), "file_tokens {n} {what}");
         }
-        for text in ["foo", "bar", "dup", "x", "(", "\u{1F600}", "missing"] {
+        for text in [
+            "foo",
+            "bar",
+            "dup",
+            "x",
+            "(",
+            "\u{1F600}",
+            "missing",
+            "\u{e9}t\u{e9}",
+            "\u{65e5}\u{672c}",
+        ] {
             for grain in [
                 Grain::Token,
                 Grain::Symbol,
@@ -1622,6 +1687,17 @@ fn differential_seed(s: &dyn Store) {
     // A Windows-style path (#100, #120): stored as `sub/dir/.gitignore`.
     s.index_bytes("o1", "r2", r"sub\dir\.gitignore", b"foo x\n", None)
         .unwrap();
+    // ADR 0007: encoded files (auto-detected and hinted) answer alike on
+    // every backend and configuration.
+    for fx in enc_fixtures() {
+        let opts = IndexOptions {
+            encoding: fx.hint,
+            ..Default::default()
+        };
+        let path = fx.path.replace(".toy", ".txt");
+        s.index_bytes_opts("o2", "enc", &path, &fx.bytes, None, None, opts)
+            .unwrap();
+    }
 }
 
 /// A batch re-index of unchanged bytes still refreshes the file's origin, in
@@ -1638,6 +1714,7 @@ fn batch_origin_refresh(h: &Harness) {
             bytes: b"foo bar",
             language: Some("text"),
             origin,
+            ..Default::default()
         };
         s.index_batch("o", "r", &[f], IndexOptions::default())
             .unwrap()
@@ -2031,7 +2108,10 @@ fn extractor_gaps_name_a_missing_extractor(h: &Harness) {
         b"gamma\n",
         Some("toylang"),
         None,
-        IndexOptions { reindex: true },
+        IndexOptions {
+            reindex: true,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(s.extractor_gaps(Some("o"), Some("r2")).unwrap().is_empty());
@@ -2084,6 +2164,7 @@ fn prepared_counted_matches_uncounted(h: &Harness) {
         bytes: b,
         language: None,
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     };
     let files = [f("a.txt", b"foo bar\n"), f("b.txt", b"baz foo\n")];
     let d = IndexOptions::default();
@@ -2119,6 +2200,7 @@ fn prepared_matches_batch(h: &Harness) {
         bytes: b,
         language: l,
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     };
     let files = [
         f("src/lib.rs", lib, Some("rust")),
@@ -2128,7 +2210,13 @@ fn prepared_matches_batch(h: &Harness) {
         f("m.txt", b"foo mfoo m\n", None),
         f("src/lib.rs", b"fn dup() {}\n", Some("rust")),
     ];
-    for opts in [IndexOptions::default(), IndexOptions { reindex: true }] {
+    for opts in [
+        IndexOptions::default(),
+        IndexOptions {
+            reindex: true,
+            ..Default::default()
+        },
+    ] {
         let batch = s.index_batch("o", "a", &files, opts).unwrap();
         let prepared: Vec<_> = std::thread::scope(|sc| {
             let hs: Vec<_> = files
@@ -2211,6 +2299,7 @@ fn prepare_skips_unchanged(h: &Harness) {
         bytes: b"foo bar",
         language: Some("conf-count"),
         origin,
+        ..Default::default()
     };
     let first = prepare_all(&*s, "r", &[file(None)], IndexOptions::default());
     assert!(!first[0].is_unchanged());
@@ -2249,13 +2338,29 @@ fn prepare_skips_unchanged(h: &Harness) {
         "origin refreshed"
     );
 
-    let forced = prepare_all(&*s, "r", &[file(None)], IndexOptions { reindex: true });
+    let forced = prepare_all(
+        &*s,
+        "r",
+        &[file(None)],
+        IndexOptions {
+            reindex: true,
+            ..Default::default()
+        },
+    );
     assert!(!forced[0].is_unchanged());
     if local {
         assert_eq!(calls(), 2, "reindex extracts");
     }
     let out = s
-        .index_prepared("o", "r", forced, IndexOptions { reindex: true })
+        .index_prepared(
+            "o",
+            "r",
+            forced,
+            IndexOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(out[0].as_ref().unwrap().replaced);
     assert_eq!(calls(), 2, "reindex extracts exactly once more");
@@ -2270,11 +2375,12 @@ fn prepared_rejections_in_order(h: &Harness) {
         bytes: b,
         language: l,
         origin: None,
+        ..Default::default()
     };
     let files = [
         f("ok1.c", b"xxxx", Some("text")),
         f("bad.c", b"bad", Some("conf-bad")),
-        f("bin.c", b"\xff", None),
+        f("bin.c", b"\x00\xff\x00", None),
         f("ok2.c", b"yyyy", Some("text")),
     ];
     let p = prepare_all(&*s, "r", &files, IndexOptions::default());
@@ -2284,7 +2390,7 @@ fn prepared_rejections_in_order(h: &Harness) {
     assert_eq!(out.len(), 4);
     assert!(out[0].is_ok() && out[3].is_ok());
     assert!(matches!(&out[1], Err(StoreError::InvalidSpan(m)) if m.contains("bad.c")));
-    assert!(matches!(&out[2], Err(StoreError::NotUtf8(m)) if m.contains("bin.c")));
+    assert!(matches!(&out[2], Err(StoreError::Binary(m)) if m.contains("bin.c")));
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
     assert!(s
         .index_prepared("o", "r", vec![], IndexOptions::default())
@@ -2350,6 +2456,7 @@ fn backslash_paths(h: &Harness) {
         bytes: b"foo",
         language: None,
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     };
     s.index_batch(
         "o",
@@ -2668,5 +2775,492 @@ fn owner_hint_class_grain(h: &Harness) {
             (Some("A".into()), 1, a, false),
             (Some("B".into()), 1, b, false),
         ]
+    );
+}
+
+// --- ADR 0007: source encodings (epic story 41) ---
+
+/// A PNG header: NULs, no BOM, not UTF-16, so binary (ADR 0007 C5).
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0";
+
+/// The shared identifiers every encoded fixture carries (ADR 0007 C9).
+const ENC_ID: &str = "CustomerId";
+const ENC_LATIN: &str = "café";
+const ENC_CJK: &str = "日本";
+
+fn utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+    let units = bom
+        .then_some(0xFEFF_u16)
+        .into_iter()
+        .chain(text.encode_utf16());
+    if big_endian {
+        units.flat_map(u16::to_be_bytes).collect()
+    } else {
+        units.flat_map(u16::to_le_bytes).collect()
+    }
+}
+
+fn legacy(text: &str, e: &'static encoding_rs::Encoding) -> Vec<u8> {
+    let (bytes, _, unmappable) = e.encode(text);
+    assert!(!unmappable, "{} cannot encode {text:?}", e.name());
+    bytes.into_owned()
+}
+
+/// One encoded fixture: its path, raw bytes, the hint to send, and what the
+/// store must record and decode (ADR 0007 C1, C3, C6).
+struct EncFixture {
+    path: &'static str,
+    bytes: Vec<u8>,
+    hint: Option<&'static encoding_rs::Encoding>,
+    /// The WHATWG name recorded on the File node (`None`: UTF-8).
+    encoding: Option<&'static str>,
+    decoded: String,
+    ids: &'static [&'static str],
+}
+
+/// UTF-8, UTF-16LE (BOM), UTF-16BE (BOM-less, sniffed), windows-1252 and
+/// Shift_JIS (auto-detected), and a windows-1252 file sent with a hint: the
+/// same identifiers in each (Latin only in windows-1252, CJK only in
+/// Shift_JIS, which cannot encode the other).
+fn enc_fixtures() -> Vec<EncFixture> {
+    let both = format!("{ENC_ID} {ENC_LATIN} {ENC_CJK}\n");
+    let latin = format!(
+        "// Kundennummer für das Café: crème brûlée, naïve résumé, déjà vu, à la carte\n{ENC_ID} {ENC_LATIN}\n"
+    );
+    let cjk =
+        format!("// 顧客番号のクラスです。日本語のコメントを含みます。\n{ENC_ID} {ENC_CJK}\n");
+    let fx = |path, bytes, hint, encoding, decoded: &str, ids| EncFixture {
+        path,
+        bytes,
+        hint,
+        encoding,
+        decoded: decoded.to_string(),
+        ids,
+    };
+    vec![
+        fx(
+            "u8.toy",
+            both.clone().into_bytes(),
+            None,
+            None,
+            &both,
+            &[ENC_ID, ENC_LATIN, ENC_CJK],
+        ),
+        fx(
+            "le.toy",
+            utf16(&both, false, true),
+            None,
+            Some("UTF-16LE"),
+            &format!("\u{feff}{both}"),
+            &[ENC_ID, ENC_LATIN, ENC_CJK],
+        ),
+        fx(
+            "be.toy",
+            utf16(&both, true, false),
+            None,
+            Some("UTF-16BE"),
+            &both,
+            &[ENC_ID, ENC_LATIN, ENC_CJK],
+        ),
+        fx(
+            "w1252.toy",
+            legacy(&latin, encoding_rs::WINDOWS_1252),
+            None,
+            Some("windows-1252"),
+            &latin,
+            &[ENC_ID, ENC_LATIN],
+        ),
+        fx(
+            "sjis.toy",
+            legacy(&cjk, encoding_rs::SHIFT_JIS),
+            None,
+            Some("Shift_JIS"),
+            &cjk,
+            &[ENC_ID, ENC_CJK],
+        ),
+        fx(
+            "hinted.toy",
+            legacy(
+                &format!("{ENC_ID} {ENC_LATIN}\n"),
+                encoding_rs::WINDOWS_1252,
+            ),
+            Some(encoding_rs::WINDOWS_1252),
+            Some("windows-1252"),
+            &format!("{ENC_ID} {ENC_LATIN}\n"),
+            &[ENC_ID, ENC_LATIN],
+        ),
+    ]
+}
+
+/// The stored File node of `org/repo/path`.
+fn file_node(s: &dyn Store, stats: &crate::IngestStats) -> Node {
+    let f = s.get(stats.file_id).unwrap().expect("file node");
+    assert_eq!(f.kind, NodeKind::File);
+    f
+}
+
+/// Every stored token of `path` is exactly what the tokenizer gives for the
+/// decoded text (text, byte range, line, column, class), and its byte range
+/// slices that text out of the decoded source (ADR 0007 C1).
+fn assert_exact_against_decoded(s: &dyn Store, repo: &str, path: &str, decoded: &str) {
+    let stored: Vec<_> = s
+        .file_tokens("o", repo, path)
+        .unwrap()
+        .expect("file stored")
+        .into_iter()
+        .map(|n| (n.name, n.span.expect("token span"), n.token_class))
+        .collect();
+    let want: Vec<_> = tokenize(decoded)
+        .into_iter()
+        .map(|t| (t.text, t.span, Some(t.class)))
+        .collect();
+    assert_eq!(stored, want, "{repo}/{path}: tokens of the decoded text");
+    for (text, span, _) in &stored {
+        assert_eq!(
+            &decoded[span.start as usize..span.end as usize],
+            text,
+            "{repo}/{path}"
+        );
+    }
+    // The toy extractor's one symbol spans the decoded body.
+    let mut q = SymbolQuery::new("whole");
+    q.repo = Some(repo.into());
+    q.file = Some(path.into());
+    let hits = s.search_symbols(&q).unwrap();
+    assert_eq!(hits.len(), 1, "{repo}/{path}: {hits:?}");
+    assert_eq!(
+        hits[0].span,
+        Some(span_of(decoded, decoded.trim_end())),
+        "{repo}/{path}: symbol span"
+    );
+}
+
+/// Encoded files through every write entry point (`index_bytes_opts`,
+/// `index_batch`, `prepare` + `index_prepared`) are decoded the same way:
+/// the File node records `encoding` (absent for UTF-8) and `lossy`, tokens
+/// and symbols are exact against the decoded text, the fingerprint carries
+/// the encoding suffix for non-UTF-8 files only, and the same identifiers
+/// match across encodings (ADR 0007 C1, C2, C6, C7, C9).
+fn encoded_files(h: &Harness) {
+    let s = (h.open)(vec![Box::new(ToyExtractor)]).expect("open store");
+    let fixtures = enc_fixtures();
+    let mut fingerprints = Vec::new();
+    for fx in &fixtures {
+        let opts = IndexOptions {
+            encoding: fx.hint,
+            ..Default::default()
+        };
+        let one = s
+            .index_bytes_opts("o", "single", fx.path, &fx.bytes, None, None, opts)
+            .unwrap();
+        let file = BatchFile {
+            path: fx.path,
+            bytes: &fx.bytes,
+            encoding: fx.hint,
+            ..Default::default()
+        };
+        let batch = s
+            .index_batch("o", "batch", &[file], IndexOptions::default())
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        let prepared = prepare_all(&*s, "prepared", &[file], IndexOptions::default());
+        let prepared = s
+            .index_prepared("o", "prepared", prepared, IndexOptions::default())
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        let mut seen = Vec::new();
+        for (repo, st) in [("single", &one), ("batch", &batch), ("prepared", &prepared)] {
+            assert_eq!(st.language, "toylang", "{repo}/{}", fx.path);
+            let f = file_node(&*s, st);
+            assert_eq!(f.encoding.as_deref(), fx.encoding, "{repo}/{}", fx.path);
+            assert!(
+                !f.lossy,
+                "{repo}/{}: auto and fitting hints are never lossy",
+                fx.path
+            );
+            let fp = f.fingerprint.clone().expect("fingerprint");
+            match fx.encoding {
+                None => assert!(!fp.contains("|enc="), "{fp}"),
+                Some(name) => assert!(
+                    fp.ends_with(&format!(
+                        "|enc={name}@{}",
+                        graph_core::encoding::DECODER_VERSION
+                    )),
+                    "{fp}"
+                ),
+            }
+            assert_exact_against_decoded(&*s, repo, fx.path, &fx.decoded);
+            seen.push(fp);
+        }
+        assert!(
+            seen.iter().all(|fp| *fp == seen[0]),
+            "{}: every write path fingerprints alike: {seen:?}",
+            fx.path
+        );
+        fingerprints.push(seen.remove(0));
+        // Unchanged bytes and hint: a no-op on every path.
+        let again = s
+            .index_bytes_opts("o", "single", fx.path, &fx.bytes, None, None, opts)
+            .unwrap();
+        assert!(again.unchanged, "{}", fx.path);
+    }
+    // One search per identifier finds every file that holds it, whatever
+    // its source encoding (ADR 0007 C9).
+    for id in [ENC_ID, ENC_LATIN, ENC_CJK] {
+        let mut q = Query::new(id);
+        q.repo = Some("single".into());
+        q.grain = Grain::File;
+        let mut files: Vec<String> = s
+            .search(&q)
+            .unwrap()
+            .into_iter()
+            .filter_map(|h| h.file)
+            .collect();
+        files.sort();
+        let mut want: Vec<String> = fixtures
+            .iter()
+            .filter(|fx| fx.ids.contains(&id))
+            .map(|fx| fx.path.to_string())
+            .collect();
+        want.sort();
+        assert_eq!(files, want, "search {id}");
+    }
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
+}
+
+/// Hints, BOMs, lossy decodes, `strict_encoding`, binary files and language
+/// detection on the decoded text behave the same on every backend (ADR 0007
+/// C3, C5, C7, C8).
+fn encoding_hint_strict_and_binary(h: &Harness) {
+    let s = open(h);
+    let meta = |st: &crate::IngestStats| {
+        let f = file_node(&*s, st);
+        (f.encoding, f.lossy, f.fingerprint.unwrap_or_default())
+    };
+    let hinted = |e: &'static encoding_rs::Encoding, strict: bool| IndexOptions {
+        encoding: Some(e),
+        strict_encoding: strict,
+        ..Default::default()
+    };
+    // A BOM wins over a hint: still UTF-16LE, U+FEFF kept.
+    let le = utf16("alpha beta\n", false, true);
+    let st = s
+        .index_bytes_opts(
+            "o",
+            "r",
+            "bom.txt",
+            &le,
+            None,
+            None,
+            hinted(encoding_rs::WINDOWS_1252, true),
+        )
+        .unwrap();
+    assert_eq!(meta(&st).0.as_deref(), Some("UTF-16LE"));
+    let toks = s.file_tokens("o", "r", "bom.txt").unwrap().unwrap();
+    assert_eq!(toks[0].name, "alpha");
+    assert_eq!(
+        toks[0].span.unwrap().start,
+        3,
+        "U+FEFF (3 bytes) stays first"
+    );
+
+    // A hint that does not fit the bytes: lossy, recorded and fingerprinted.
+    let latin = legacy("caf\u{e9} au lait\n", encoding_rs::WINDOWS_1252);
+    let st = s
+        .index_bytes_opts(
+            "o",
+            "r",
+            "lossy.txt",
+            &latin,
+            None,
+            None,
+            hinted(encoding_rs::UTF_8, false),
+        )
+        .unwrap();
+    let (enc, lossy, fp) = meta(&st);
+    assert_eq!((enc, lossy), (None, true), "lossy UTF-8");
+    assert!(
+        fp.ends_with(&format!(
+            "|enc=UTF-8+lossy@{}",
+            graph_core::encoding::DECODER_VERSION
+        )),
+        "{fp}"
+    );
+    let toks = s.file_tokens("o", "r", "lossy.txt").unwrap().unwrap();
+    assert!(toks.iter().any(|t| t.name.contains('\u{fffd}')), "{toks:?}");
+    // The same bytes auto-detected: windows-1252, not lossy, and a
+    // different fingerprint, so the file is re-indexed (not unchanged).
+    let st = s.index_bytes("o", "r", "lossy.txt", &latin, None).unwrap();
+    assert!(!st.unchanged && st.replaced, "a changed decode re-indexes");
+    let (enc, lossy, fp2) = meta(&st);
+    assert_eq!((enc.as_deref(), lossy), (Some("windows-1252"), false));
+    assert_ne!(fp, fp2);
+    assert_eq!(s.search(&Query::new("caf\u{e9}")).unwrap().len(), 1);
+    assert!(
+        s.index_bytes("o", "r", "lossy.txt", &latin, None)
+            .unwrap()
+            .unchanged
+    );
+
+    // strict_encoding refuses a lossy decode and stores nothing: today's
+    // `NotUtf8` for UTF-8, a `Rejected` naming the encoding otherwise.
+    for (path, bytes, e) in [
+        ("s1.txt", latin.clone(), encoding_rs::UTF_8),
+        ("s2.txt", b"ok \x82".to_vec(), encoding_rs::SHIFT_JIS),
+    ] {
+        let r = s.index_bytes_opts("o", "r", path, &bytes, None, None, hinted(e, true));
+        match (&r, e == encoding_rs::UTF_8) {
+            (Err(StoreError::NotUtf8(m)), true) => assert!(m.contains(path), "{m}"),
+            (Err(StoreError::Rejected(m)), false) => {
+                assert!(m.contains(path) && m.contains("Shift_JIS"), "{m}")
+            }
+            _ => panic!("{path}: {r:?}"),
+        }
+        assert!(s.file_tokens("o", "r", path).unwrap().is_none());
+    }
+    // Strict in a batch is per file: the others are stored.
+    let files = [
+        BatchFile {
+            path: "b1.txt",
+            bytes: &latin,
+            encoding: Some(encoding_rs::UTF_8),
+            strict_encoding: true,
+            ..Default::default()
+        },
+        BatchFile {
+            path: "b2.txt",
+            bytes: b"plain words\n",
+            strict_encoding: true,
+            ..Default::default()
+        },
+        BatchFile {
+            path: "b3.png",
+            bytes: PNG,
+            ..Default::default()
+        },
+        BatchFile {
+            path: "b4.txt",
+            bytes: &le,
+            ..Default::default()
+        },
+    ];
+    let out = s
+        .index_batch("o", "r", &files, IndexOptions::default())
+        .unwrap();
+    assert!(matches!(&out[0], Err(StoreError::NotUtf8(_))), "{out:?}");
+    assert!(out[1].is_ok() && out[3].is_ok(), "{out:?}");
+    assert!(
+        matches!(&out[2], Err(StoreError::Binary(m)) if m.contains("b3.png")),
+        "{out:?}"
+    );
+    let prepared = prepare_all(&*s, "r", &files[2..3], IndexOptions::default());
+    let out = s
+        .index_prepared("o", "r", prepared, IndexOptions::default())
+        .unwrap();
+    assert!(matches!(&out[0], Err(StoreError::Binary(_))), "{out:?}");
+    assert!(matches!(
+        s.index_bytes("o", "r", "img.png", PNG, None),
+        Err(StoreError::Binary(_))
+    ));
+    // An explicit UTF-16 hint makes a NUL-bearing file text.
+    let odd = utf16("x\0y\n", false, false);
+    assert!(matches!(
+        s.index_bytes("o", "r", "odd.txt", &odd, None),
+        Err(StoreError::Binary(_))
+    ));
+    let st = s
+        .index_bytes_opts(
+            "o",
+            "r",
+            "odd.txt",
+            &odd,
+            None,
+            None,
+            hinted(encoding_rs::UTF_16LE, false),
+        )
+        .unwrap();
+    assert_eq!(meta(&st).0.as_deref(), Some("UTF-16LE"));
+    assert!(s.file_tokens("o", "r", "img.png").unwrap().is_none());
+    assert!(s.file_tokens("o", "r", "b3.png").unwrap().is_none());
+
+    // The language is detected from the decoded text: a UTF-16 script's
+    // shebang is seen, BOM or not.
+    for (path, bom) in [("tool", true), ("tool2", false)] {
+        let st = s
+            .index_bytes(
+                "o",
+                "r",
+                path,
+                &utf16("#!/usr/bin/env python3\nprint(1)\n", false, bom),
+                None,
+            )
+            .unwrap();
+        assert_eq!(st.language, "python", "{path}");
+    }
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
+}
+
+/// A batch-level `IndexOptions::encoding` is the hint of every file without
+/// its own (ADR 0007 C8), on `index_batch` and on `prepare`; a file's own
+/// hint wins. A `utf-8`-hinted lossy file lists with `lossy` and no
+/// `encoding` (absent means UTF-8).
+fn batch_level_encoding_hint(h: &Harness) {
+    let s = open(h);
+    let latin = legacy("caf\u{e9} au lait\n", encoding_rs::WINDOWS_1252);
+    let opts = IndexOptions {
+        encoding: Some(encoding_rs::UTF_8),
+        ..Default::default()
+    };
+    let files = [
+        BatchFile {
+            path: "batch.txt",
+            bytes: &latin,
+            ..Default::default()
+        },
+        BatchFile {
+            path: "own.txt",
+            bytes: &latin,
+            encoding: Some(encoding_rs::WINDOWS_1252),
+            ..Default::default()
+        },
+    ];
+    let out = s.index_batch("o", "r", &files, opts).unwrap();
+    let prepared = prepare_all(&*s, "p", &files, opts);
+    let out2 = s.index_prepared("o", "p", prepared, opts).unwrap();
+    for st in out.iter().chain(&out2) {
+        let st = st.as_ref().unwrap();
+        let f = file_node(&*s, st);
+        if st.path == "batch.txt" {
+            assert_eq!((f.encoding.as_deref(), f.lossy), (None, true), "{st:?}");
+        } else {
+            assert_eq!(
+                (f.encoding.as_deref(), f.lossy),
+                (Some("windows-1252"), false),
+                "{st:?}"
+            );
+        }
+    }
+    // Listing the repo shows the lossy UTF-8 file as such.
+    let repo = s
+        .roots()
+        .unwrap()
+        .into_iter()
+        .flat_map(|o| s.children(o.id).unwrap())
+        .find(|r| r.name == "r")
+        .unwrap();
+    let listed = s.children(repo.id).unwrap();
+    let lossy = listed.iter().find(|n| n.name == "batch.txt").unwrap();
+    assert!(lossy.lossy && lossy.encoding.is_none(), "{lossy:?}");
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
     );
 }

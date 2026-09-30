@@ -107,20 +107,25 @@ fn node() -> impl Strategy<Value = Node> {
         option::of(text()),
         option::of(span()),
     )
+        .prop_flat_map(|t| (Just(t), option::of(encoding_name()), any::<bool>()))
         .prop_map(
             |(
-                id,
-                parent,
-                kind,
-                name,
-                language,
-                symbol_kind,
-                lang_kind,
-                token_class,
-                has_errors,
-                origin,
-                fingerprint,
-                span,
+                (
+                    id,
+                    parent,
+                    kind,
+                    name,
+                    language,
+                    symbol_kind,
+                    lang_kind,
+                    token_class,
+                    has_errors,
+                    origin,
+                    fingerprint,
+                    span,
+                ),
+                encoding,
+                lossy,
             )| Node {
                 id,
                 parent,
@@ -133,9 +138,27 @@ fn node() -> impl Strategy<Value = Node> {
                 has_errors,
                 origin,
                 fingerprint,
+                encoding,
+                lossy,
                 span,
             },
         )
+}
+
+/// Canonical WHATWG names a File node may record (ADR 0007 C6).
+fn encoding_name() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![
+        "UTF-8",
+        "UTF-16LE",
+        "UTF-16BE",
+        "windows-1252",
+        "Shift_JIS",
+        "GBK",
+        "EUC-KR",
+        "Big5",
+        "ISO-2022-JP",
+    ])
+    .prop_map(str::to_string)
 }
 
 fn query() -> impl Strategy<Value = Query> {
@@ -382,6 +405,7 @@ fn store_error() -> impl Strategy<Value = StoreError> {
         (text(), text()).prop_map(|(path, reason)| StoreError::OpenFailed { path, reason }),
         text().prop_map(StoreError::Rejected),
         text().prop_map(StoreError::NotUtf8),
+        text().prop_map(StoreError::Binary),
         text().prop_map(StoreError::TooLarge),
         text().prop_map(StoreError::InvalidSpan),
         text().prop_map(StoreError::Corrupt),
@@ -515,7 +539,7 @@ proptest! {
 
     #[test]
     fn index_options_round_trips(reindex in any::<bool>()) {
-        let o = IndexOptions { reindex };
+        let o = IndexOptions { reindex, ..Default::default() };
         prop_assert_eq!(IndexOptions::from(pb::IndexOptions::from(o)), o);
     }
 
@@ -542,13 +566,18 @@ proptest! {
 
     #[test]
     fn file_bytes_round_trips(path in text(), bytes in vec(any::<u8>(), 0..16),
-                              language in option::of(text()), origin in option::of(text())) {
+                              language in option::of(text()), origin in option::of(text()),
+                              encoding in option::of(encoding_name()), strict in any::<bool>()) {
         let bf = graph_store::BatchFile {
             path: &path, bytes: &bytes, language: language.as_deref(), origin: origin.as_deref(),
+            encoding: encoding.map(|e| graph_core::encoding::hint_from_label(&e).unwrap()),
+            strict_encoding: strict,
         };
         let msg = pb::FileBytes::from(bf);
         let decoded = pb::FileBytes::decode(msg.encode_to_vec().as_slice()).unwrap();
-        let back = decoded.as_batch_file();
+        let back = decoded.as_batch_file().unwrap();
+        prop_assert_eq!(back.encoding, bf.encoding);
+        prop_assert_eq!(back.strict_encoding, bf.strict_encoding);
         prop_assert_eq!(back.path, bf.path);
         prop_assert_eq!(back.bytes, bf.bytes);
         prop_assert_eq!(back.language, bf.language);
@@ -672,6 +701,7 @@ fn code_table_matches_adr_0004() {
     let cases: Vec<(WireError, Code)> = vec![
         (E::Rejected("x".into()).into(), Code::InvalidArgument),
         (E::NotUtf8("x".into()).into(), Code::InvalidArgument),
+        (E::Binary("x".into()).into(), Code::InvalidArgument),
         (E::TooLarge("x".into()).into(), Code::InvalidArgument),
         (E::InvalidSpan("x".into()).into(), Code::InvalidArgument),
         (
@@ -1074,4 +1104,31 @@ fn rpc_paths_match_the_proto_files() {
         crate::rpc_paths().iter().map(|s| s.to_string()).collect();
     assert_eq!(got, want);
     assert_eq!(got.len(), 44, "18 Admin + 3 Raft + 18 Store + 5 Write");
+}
+
+/// ADR 0007 C8: an encoding hint that is not a usable label is a protocol
+/// error, never a silent auto-detect; so is an unknown stored encoding.
+#[test]
+fn bad_encoding_labels_are_refused() {
+    for label in ["no-such-encoding", "replacement"] {
+        let f = pb::FileBytes {
+            encoding_hint: Some(label.into()),
+            ..Default::default()
+        };
+        assert!(f.as_batch_file().is_err(), "{label}");
+    }
+    let f = pb::FileBytes {
+        encoding_hint: Some("latin1".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        f.as_batch_file().unwrap().encoding.map(|e| e.name()),
+        Some("windows-1252")
+    );
+    let n = pb::Node {
+        kind: pb::NodeKind::File as i32,
+        encoding: Some("EBCDIC-9000".into()),
+        ..Default::default()
+    };
+    assert!(Node::try_from(n).is_err());
 }

@@ -59,6 +59,7 @@ fn file_bytes(i: usize) -> pb::FileBytes {
         bytes,
         language: None,
         origin: Some(ORIGIN_DIRECTORY.into()),
+        ..Default::default()
     }
 }
 
@@ -728,6 +729,7 @@ fn membership_change_under_load_loses_no_acked_write() {
                         bytes: b,
                         language: None,
                         origin: Some(ORIGIN_DIRECTORY),
+                        ..Default::default()
                     })
                     .collect();
                 match c.index_batch("o", "r", &files, IndexOptions::default()) {
@@ -796,6 +798,7 @@ fn duplicate_index_chunk_after_leader_change_is_idempotent() {
             bytes: b,
             language: None,
             origin: Some(ORIGIN_DIRECTORY),
+            ..Default::default()
         })
         .collect();
     let first = tb

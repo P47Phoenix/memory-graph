@@ -52,6 +52,13 @@ pub struct Node {
     /// Symbol and token.
     #[prost(message, optional, tag = "12")]
     pub span: ::core::option::Option<Span>,
+    /// File only: the WHATWG name of the encoding the source was decoded from
+    /// (ADR 0007 C6); absent for UTF-8.
+    #[prost(string, optional, tag = "13")]
+    pub encoding: ::core::option::Option<::prost::alloc::string::String>,
+    /// File only: an invalid sequence was replaced with U+FFFD while decoding.
+    #[prost(bool, tag = "14")]
+    pub lossy: bool,
 }
 /// A batch of nodes on a server stream (`Descendants`, `FileTokens`): at most
 /// 4096 nodes each, in the order the unstreamed call would return them.
@@ -262,6 +269,14 @@ pub struct FileBytes {
     /// `Node::origin` to record (`directory` for a directory run).
     #[prost(string, optional, tag = "4")]
     pub origin: ::core::option::Option<::prost::alloc::string::String>,
+    /// A concrete WHATWG encoding label resolved on the client (ADR 0007 C8;
+    /// `ansi` is resolved before sending). Absent means auto-detect; a BOM
+    /// still wins.
+    #[prost(string, optional, tag = "5")]
+    pub encoding_hint: ::core::option::Option<::prost::alloc::string::String>,
+    /// Refuse the file when its decode is lossy (`--strict-encoding`).
+    #[prost(bool, tag = "6")]
+    pub strict_encoding: bool,
 }
 /// graph_store::IndexOptions.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -341,7 +356,7 @@ pub struct Extraction {
 pub struct StoreErrorDetail {
     #[prost(
         oneof = "store_error_detail::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
     )]
     pub kind: ::core::option::Option<store_error_detail::Kind>,
 }
@@ -449,6 +464,13 @@ pub mod store_error_detail {
         #[prost(string, tag = "2")]
         pub found: ::prost::alloc::string::String,
     }
+    /// The file is binary (ADR 0007 C5): a NUL byte, no BOM, and it does not
+    /// decode as UTF-16.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Binary {
+        #[prost(string, tag = "1")]
+        pub path: ::prost::alloc::string::String,
+    }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
@@ -483,6 +505,8 @@ pub mod store_error_detail {
         Protocol(Protocol),
         #[prost(message, tag = "16")]
         WrongCluster(WrongCluster),
+        #[prost(message, tag = "17")]
+        Binary(Binary),
     }
 }
 /// The view every read request carries: a read mode, or a snapshot handle

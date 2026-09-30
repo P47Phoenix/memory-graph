@@ -293,6 +293,7 @@ fn batch<'a>(srcs: &'a [String], paths: &'a [String]) -> Vec<BatchFile<'a>> {
             bytes: s.as_bytes(),
             language: Some("poison"),
             origin: None,
+            ..Default::default()
         })
         .collect()
 }
@@ -362,6 +363,7 @@ fn chunked_and_unchunked_batches_store_the_same_data() {
             bytes: s.as_bytes(),
             language: Some("rust"),
             origin: None,
+            ..Default::default()
         })
         .collect();
     let one = V2Store::open(d.path().join("one.redb")).unwrap();
@@ -483,6 +485,7 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
             bytes: s.as_bytes(),
             language: Some("rust"),
             origin: None,
+            ..Default::default()
         })
         .collect();
 
@@ -962,9 +965,10 @@ mod consistency {
                                 bytes: src.as_bytes(),
                                 language: Some("text"),
                                 origin: None,
+                                ..Default::default()
                             })
                             .collect();
-                        V2Store::index_batch(&s, "o", "r", &files, IndexOptions { reindex: true }).unwrap();
+                        V2Store::index_batch(&s, "o", "r", &files, IndexOptions { reindex: true, ..Default::default() }).unwrap();
                     }
                 }
                 s.check_consistency(vacuumed);
@@ -1404,9 +1408,20 @@ fn chunked_batch_ingest_holds_the_refcount_invariant() {
             bytes: Box::leak(format!("word{i} other{}", i % 3).into_boxed_str().into()),
             language: Some("text"),
             origin: None,
+            ..Default::default()
         })
         .collect();
-    V2Store::index_batch(&s, "o", "r", &files, IndexOptions { reindex: false }).unwrap();
+    V2Store::index_batch(
+        &s,
+        "o",
+        "r",
+        &files,
+        IndexOptions {
+            reindex: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let (refs, content_files) = refs_snapshot(&s);
     assert_eq!(refs.len(), 12);
@@ -1979,9 +1994,13 @@ fn schema_version_mismatch_still_hard_refuses() {
     let wt = s.db.begin_write().unwrap();
     {
         let mut meta = wt.open_table(crate::META).unwrap();
-        // The version before the upgradable one (#137 upgrades 9 in place).
-        meta.insert("schema_version", crate::v2::UPGRADABLE_SCHEMA_VERSION - 1)
-            .unwrap();
+        // The version before the oldest upgradable one (#137 upgrades 9,
+        // ADR 0007 upgrades 10, both in place).
+        meta.insert(
+            "schema_version",
+            crate::v2::UPGRADABLE_SCHEMA_VERSIONS[0] - 1,
+        )
+        .unwrap();
     }
     wt.commit().unwrap();
     drop(s);
@@ -1989,7 +2008,7 @@ fn schema_version_mismatch_still_hard_refuses() {
 
     match V2Store::open(&p) {
         Err(StoreError::SchemaMismatch { found }) => {
-            assert_eq!(found, crate::v2::UPGRADABLE_SCHEMA_VERSION - 1)
+            assert_eq!(found, crate::v2::UPGRADABLE_SCHEMA_VERSIONS[0] - 1)
         }
         Err(other) => panic!("expected StoreError::SchemaMismatch, got a different error: {other}"),
         Ok(_) => panic!("expected a hard refusal, got Ok"),
@@ -2001,43 +2020,63 @@ fn schema_version_mismatch_still_hard_refuses() {
     );
 }
 
-/// Issue #137: a version-9 file (no owner hints anywhere) is upgraded in
-/// place on open by a restamp alone, and reads exactly as before.
+/// Issue #137 and ADR 0007 C6: a version-9 or version-10 file (no owner
+/// hints, no encodings anywhere) is restamped straight to the current
+/// version on open, reads exactly as before, and re-indexing its (UTF-8)
+/// files re-parses none of them: their fingerprints are unchanged.
 #[test]
-fn schema_version_9_is_upgraded_in_place() {
-    let d = tempfile::tempdir().unwrap();
-    let p = d.path().join("v.redb");
-    let s = V2Store::open(&p).unwrap();
-    s.ingest_file(
-        "o",
-        "r",
-        "x.rs",
-        "rust",
-        &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
-    )
-    .unwrap();
-    let want = s.search(&crate::Query::new("alpha")).unwrap();
-    let wt = s.db.begin_write().unwrap();
-    {
-        let mut meta = wt.open_table(crate::META).unwrap();
-        meta.insert("schema_version", crate::v2::UPGRADABLE_SCHEMA_VERSION)
-            .unwrap();
+fn schema_versions_9_and_10_are_upgraded_in_place() {
+    assert_eq!(crate::v2::UPGRADABLE_SCHEMA_VERSIONS, &[9, 10]);
+    assert_eq!(crate::v2::V2_SCHEMA_VERSION, 11);
+    for &old in crate::v2::UPGRADABLE_SCHEMA_VERSIONS {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("v.redb");
+        let s = V2Store::open(&p).unwrap();
+        s.ingest_file(
+            "o",
+            "r",
+            "x.rs",
+            "rust",
+            &span_ext(&[("S", SymbolKind::Function, 0, 9)], &[("alpha", 1, 2)]),
+        )
+        .unwrap();
+        let srcs: [(&str, &[u8]); 2] =
+            [("a.txt", b"alpha beta\n"), ("b.py", b"def gamma(): pass\n")];
+        for (path, bytes) in srcs {
+            s.index_bytes("o", "r", path, bytes, None).unwrap();
+        }
+        let nodes_before = s.descendants(1).unwrap();
+        let want = s.search(&crate::Query::new("alpha")).unwrap();
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut meta = wt.open_table(crate::META).unwrap();
+            meta.insert("schema_version", old).unwrap();
+        }
+        wt.commit().unwrap();
+        drop(s);
+        assert_eq!(crate::detect_format(&p).unwrap(), Some(old));
+        let s = V2Store::open(&p).unwrap();
+        assert_eq!(
+            s.search(&crate::Query::new("alpha")).unwrap(),
+            want,
+            "v{old}"
+        );
+        assert_eq!(s.descendants(1).unwrap(), nodes_before, "v{old}");
+        for (path, bytes) in srcs {
+            let st = s.index_bytes("o", "r", path, bytes, None).unwrap();
+            assert!(
+                st.unchanged,
+                "v{old}: {path} was re-parsed after the upgrade"
+            );
+        }
+        drop(s);
+        assert_eq!(
+            crate::detect_format(&p).unwrap(),
+            Some(crate::v2::V2_SCHEMA_VERSION),
+            "v{old}"
+        );
     }
-    wt.commit().unwrap();
-    drop(s);
-    assert_eq!(
-        crate::detect_format(&p).unwrap(),
-        Some(crate::v2::UPGRADABLE_SCHEMA_VERSION)
-    );
-    let s = V2Store::open(&p).unwrap();
-    assert_eq!(s.search(&crate::Query::new("alpha")).unwrap(), want);
-    drop(s);
-    assert_eq!(
-        crate::detect_format(&p).unwrap(),
-        Some(crate::v2::V2_SCHEMA_VERSION)
-    );
 }
-
 // --- ADR 0003 story 5: packed single sorted dictionary (D1) ---
 
 /// Interning more than a few [`crate::codec::DICT_BLOCK`]-sized worths of
@@ -2822,12 +2861,22 @@ fn overall_store_size_and_ingest_throughput_stay_within_generous_bounds_on_this_
             bytes: c.as_bytes(),
             language: Some("rust"),
             origin: None,
+            ..Default::default()
         })
         .collect();
 
     let start = std::time::Instant::now();
-    let results = Store::index_batch(&s, "o", "r", &batch, IndexOptions { reindex: false })
-        .expect("index_batch");
+    let results = Store::index_batch(
+        &s,
+        "o",
+        "r",
+        &batch,
+        IndexOptions {
+            reindex: false,
+            ..Default::default()
+        },
+    )
+    .expect("index_batch");
     let ingest_secs = start.elapsed().as_secs_f64();
 
     let total_tokens: usize = results
@@ -2929,11 +2978,22 @@ fn store_size_stays_within_1_5x_after_vacuum_and_compact_across_churn_rounds() {
                 bytes: c.as_bytes(),
                 language: Some("rust"),
                 origin: None,
+                ..Default::default()
             })
             .collect();
 
         let s = V2Store::open(&path).unwrap();
-        Store::index_batch(&s, "o", "r", &batch, IndexOptions { reindex: true }).unwrap();
+        Store::index_batch(
+            &s,
+            "o",
+            "r",
+            &batch,
+            IndexOptions {
+                reindex: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         s.vacuum().unwrap();
         let (s, _) = s.compact().unwrap();
         drop(s);

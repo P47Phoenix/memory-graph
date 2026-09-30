@@ -33,9 +33,9 @@ pub use api::{
 };
 pub use codec::{encode_posting, POSTING_BLOCK};
 pub(crate) use common::{
-    check_unchanged, commit_prepared, dec, describe_in, enc, fingerprint, grain_accepts,
-    kind_label, kind_matches, name_key, open_failed, prepare_file, stored_fingerprint_matches,
-    validate_spans, Scope, Tally, CATALOG, CHILDREN, META, NAMES, NODES, SYMBOLS,
+    check_unchanged, commit_prepared, dec, describe_in, enc, grain_accepts, kind_label,
+    kind_matches, name_key, open_failed, prepare_file, stored_fingerprint_matches, validate_spans,
+    Scope, Tally, CATALOG, CHILDREN, META, NAMES, NODES, SYMBOLS,
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
 pub use v2::V2_SCHEMA_VERSION as SCHEMA_VERSION;
@@ -67,8 +67,16 @@ pub enum StoreError {
     OpenFailed { path: String, reason: String },
     #[error("rejected: {0}")]
     Rejected(String),
+    /// Produced only with `strict_encoding` when a file decoded as UTF-8
+    /// (a hint of `utf-8`, or a UTF-8 BOM) has invalid sequences (ADR 0007
+    /// C8); without it the invalid sequences become U+FFFD and the file is
+    /// stored `lossy`. Kept for API and wire compatibility.
     #[error("rejected: {0} is not valid UTF-8")]
     NotUtf8(String),
+    /// The file is binary (ADR 0007 C5): it has a NUL byte, no BOM, no
+    /// UTF-16 hint, and does not sniff as UTF-16.
+    #[error("rejected: {0} is binary")]
+    Binary(String),
     #[error("rejected: {0} is larger than 4 GiB")]
     TooLarge(String),
     #[error("invalid span: {0}")]
@@ -142,6 +150,13 @@ impl<E: Into<redb::Error>> From<E> for StoreError {
 pub struct IndexOptions {
     /// Re-index files even when their fingerprint is unchanged.
     pub reindex: bool,
+    /// The encoding hint for `index_bytes_opts` (ADR 0007 C8), and the
+    /// default for a [`BatchFile`] without one of its own. `None` means
+    /// auto-detect; a BOM always wins.
+    pub encoding: Option<&'static graph_core::encoding::Encoding>,
+    /// Refuse a file whose decode is lossy (`--strict-encoding`); for a
+    /// batch, a file is strict when this or its own flag is set.
+    pub strict_encoding: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,12 +406,19 @@ pub struct Hit {
 }
 
 /// One input of `Store::index_batch`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BatchFile<'a> {
     pub path: &'a str,
     pub bytes: &'a [u8],
     pub language: Option<&'a str>,
     pub origin: Option<&'a str>,
+    /// The file's resolved encoding hint (ADR 0007 C8; `ansi` and
+    /// `.memory-graph.toml` are resolved by the client). `None` means
+    /// the batch's [`IndexOptions::encoding`], else auto-detect; a BOM
+    /// always wins.
+    pub encoding: Option<&'static graph_core::encoding::Encoding>,
+    /// Refuse this file when its decode is lossy.
+    pub strict_encoding: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]

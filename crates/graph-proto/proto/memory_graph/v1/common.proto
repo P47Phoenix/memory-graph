@@ -90,6 +90,11 @@ message Node {
   optional string fingerprint = 11;
   // Symbol and token.
   optional Span span = 12;
+  // File only: the WHATWG name of the encoding the source was decoded from
+  // (ADR 0007 C6); absent for UTF-8.
+  optional string encoding = 13;
+  // File only: an invalid sequence was replaced with U+FFFD while decoding.
+  bool lossy = 14;
 }
 
 // A batch of nodes on a server stream (`Descendants`, `FileTokens`): at most
@@ -225,6 +230,12 @@ message FileBytes {
   optional string language = 3;
   // `Node::origin` to record (`directory` for a directory run).
   optional string origin = 4;
+  // A concrete WHATWG encoding label resolved on the client (ADR 0007 C8;
+  // `ansi` is resolved before sending). Absent means auto-detect; a BOM
+  // still wins.
+  optional string encoding_hint = 5;
+  // Refuse the file when its decode is lossy (`--strict-encoding`).
+  bool strict_encoding = 6;
 }
 
 // graph_store::IndexOptions.
@@ -307,6 +318,9 @@ message StoreErrorDetail {
   // `expected` is the cluster it was asked to take part in, `found` the one
   // it belongs to.
   message WrongCluster { string expected = 1; string found = 2; }
+  // The file is binary (ADR 0007 C5): a NUL byte, no BOM, and it does not
+  // decode as UTF-16.
+  message Binary { string path = 1; }
 
   oneof kind {
     Locked locked = 1;
@@ -325,6 +339,7 @@ message StoreErrorDetail {
     NoLeader no_leader = 14;
     Protocol protocol = 15;
     WrongCluster wrong_cluster = 16;
+    Binary binary = 17;
   }
 }
 

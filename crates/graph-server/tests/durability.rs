@@ -73,6 +73,7 @@ fn acked_write_survives(mode: CutMode) {
             bytes: b,
             language: None,
             origin: None,
+            ..Default::default()
         })
         .collect();
     c.index_batch("o", "r", &batch, IndexOptions::default())

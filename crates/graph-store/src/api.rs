@@ -59,6 +59,14 @@ pub struct PreparedFile {
     /// Held alongside the extraction until commit, so a prepared v2 file
     /// takes roughly twice the memory of its extraction.
     pub(crate) v2: Option<Box<crate::v2::V2Prep>>,
+    /// The encoding the source was decoded from (ADR 0007 C6); `None` for
+    /// UTF-8 (and for a remote-prepared file, which is decoded server side).
+    pub(crate) encoding: Option<&'static graph_core::encoding::Encoding>,
+    /// A U+FFFD was inserted while decoding.
+    pub(crate) lossy: bool,
+    /// Remote-prepared files only: the hint and strict flag to send.
+    pub(crate) hint: Option<&'static graph_core::encoding::Encoding>,
+    pub(crate) strict_encoding: bool,
 }
 
 pub(crate) enum Prepared {
@@ -66,7 +74,8 @@ pub(crate) enum Prepared {
     /// extracted. The source is kept in case it changed by commit time.
     Unchanged(String),
     Extracted(Extraction),
-    /// Not UTF-8, too large, or invalid spans: reported in the file's slot.
+    /// Binary, a strict decode that was lossy, too large, or invalid spans:
+    /// reported in the file's slot.
     Rejected(StoreError),
     /// The raw source bytes, kept for a remote server to parse (ADR 0004
     /// D2): nothing was extracted or fingerprinted on this side. Only a
@@ -87,6 +96,9 @@ pub struct RemoteParts<'a> {
     /// As given by the caller; `None` when the server should detect it.
     pub language: Option<&'a str>,
     pub origin: Option<&'a str>,
+    /// The resolved encoding hint to send (`None`: the server detects it).
+    pub encoding: Option<&'static graph_core::encoding::Encoding>,
+    pub strict_encoding: bool,
 }
 
 impl PreparedFile {
@@ -118,7 +130,24 @@ impl PreparedFile {
             origin,
             work: Prepared::Remote(bytes),
             v2: None,
+            encoding: None,
+            lossy: false,
+            hint: None,
+            strict_encoding: false,
         }
+    }
+
+    /// Sets the encoding hint and strict flag a remote-prepared file carries
+    /// to the server (ADR 0007 C8). Ignored for an embedded-prepared file,
+    /// which was decoded when prepared.
+    pub fn with_encoding(
+        mut self,
+        hint: Option<&'static graph_core::encoding::Encoding>,
+        strict_encoding: bool,
+    ) -> PreparedFile {
+        self.hint = hint;
+        self.strict_encoding = strict_encoding;
+        self
     }
 
     /// The parts a client sends for a file made by [`PreparedFile::remote`];
@@ -132,6 +161,8 @@ impl PreparedFile {
                 bytes,
                 language: (!self.language.is_empty()).then_some(self.language.as_str()),
                 origin: self.origin.as_deref(),
+                encoding: self.hint,
+                strict_encoding: self.strict_encoding,
             }),
             _ => None,
         }
@@ -139,6 +170,15 @@ impl PreparedFile {
     /// The normalized path the file will be stored under.
     pub fn path(&self) -> &str {
         &self.path
+    }
+    /// The WHATWG name of the encoding the source was decoded from, `None`
+    /// for UTF-8 or a remote-prepared file (ADR 0007 C6).
+    pub fn encoding(&self) -> Option<&'static str> {
+        self.encoding.map(|e| e.name())
+    }
+    /// A U+FFFD was inserted while decoding.
+    pub fn lossy(&self) -> bool {
+        self.lossy
     }
     /// The language detected (or given), lowercased.
     pub fn language(&self) -> &str {
@@ -396,7 +436,8 @@ pub trait Store: StoreRead + Send + Sync {
     ) -> Result<Vec<Result<IngestStats>>>;
 
     /// The parallel-safe half of [`Store::index_batch`] for one file: size
-    /// and UTF-8 checks, path normalization, language detection, fingerprint
+    /// and binary checks, decoding (ADR 0007), path normalization, language
+    /// detection on the decoded text, fingerprint
     /// and extraction with span validation. Takes `&self` and writes nothing,
     /// so many threads may call it while another commits. Without `reindex`
     /// it first reads the last committed state and skips extraction when the
@@ -534,8 +575,8 @@ pub trait Store: StoreRead + Send + Sync {
 
 /// Schema version stamped in the database file at `path`, without opening a
 /// store. `Ok(None)` when there is no file or it holds no schema yet (empty
-/// or freshly created). `Ok(Some(v))` is the current layout, or the one
-/// earlier layout an open upgrades in place (`v2::UPGRADABLE_SCHEMA_VERSION`). A file in the
+/// or freshly created). `Ok(Some(v))` is the current layout, or an earlier
+/// layout an open upgrades in place (`v2::UPGRADABLE_SCHEMA_VERSIONS`). A file in the
 /// retired per-node format is [`StoreError::LegacyFormat`]; any other
 /// version is [`StoreError::SchemaMismatch`]. Reads only; it fails with
 /// `Locked` while another process holds the file.
@@ -565,7 +606,7 @@ pub fn detect_format(path: &Path) -> Result<Option<u64>> {
         None => Ok(None),
         Some(v) if v == crate::v2::V2_SCHEMA_VERSION => Ok(Some(v)),
         // Opening upgrades it in place (a restamp; issue #137).
-        Some(v) if v == crate::v2::UPGRADABLE_SCHEMA_VERSION => Ok(Some(v)),
+        Some(v) if crate::v2::UPGRADABLE_SCHEMA_VERSIONS.contains(&v) => Ok(Some(v)),
         Some(v) if crate::LEGACY_SCHEMA_VERSIONS.contains(&v) => Err(StoreError::LegacyFormat {
             path: path.display().to_string(),
             version: v,
@@ -606,6 +647,8 @@ mod cycle_tests {
             has_errors: false,
             origin: None,
             fingerprint: None,
+            encoding: None,
+            lossy: false,
             span: None,
         }
     }

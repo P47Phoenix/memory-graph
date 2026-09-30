@@ -314,7 +314,8 @@ fn errors() {
     ]);
     assert!(!ok && err.contains("/no/such/file"));
     let bin = d.path().join("x.bin");
-    std::fs::write(&bin, [0xff, 0xfe, 0x00]).unwrap();
+    // ADR 0007 C5: NULs, no BOM, not UTF-16 (odd length): binary.
+    std::fs::write(&bin, [0x00, 0xff, 0x00]).unwrap();
     let (ok, _, err) = run(&[
         "--db",
         &db,
@@ -325,7 +326,7 @@ fn errors() {
         "r",
         bin.to_str().unwrap(),
     ]);
-    assert!(!ok && err.contains("UTF-8"));
+    assert!(!ok && err.contains("binary"), "{err}");
 }
 
 #[test]
@@ -384,7 +385,9 @@ fn non_utf8_stores_nothing_and_lock_is_reported() {
     let db = d.path().join("g");
     let dbs = db.to_string_lossy().into_owned();
     let bad = d.path().join("bad.txt");
-    std::fs::write(&bad, [b'f', 0xff]).unwrap();
+    // ADR 0007: invalid UTF-8 now decodes (windows-1252); a binary file is
+    // what the store still refuses.
+    std::fs::write(&bad, [b'f', 0, 0xff]).unwrap();
     let ok_file = d.path().join("ok.txt");
     std::fs::write(&ok_file, "x").unwrap();
     run(&[
@@ -407,7 +410,7 @@ fn non_utf8_stores_nothing_and_lock_is_reported() {
         "r",
         bad.to_str().unwrap(),
     ]);
-    assert!(!ok && err.contains("UTF-8"));
+    assert!(!ok && err.contains("binary"), "{err}");
     let (_, out, _) = run(&["--db", &dbs, "search", "f", "--grain", "file"]);
     assert!(out.is_empty());
     // Held lock -> clear message.
@@ -650,12 +653,10 @@ fn index_directory() {
         v["skipped_by_reason"]["binary"].as_array().unwrap().len(),
         1
     );
-    assert_eq!(
-        v["skipped_by_reason"]["not valid UTF-8"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+    // ADR 0007: `latin1.txt` is decoded (windows-1252), not skipped.
+    assert!(
+        v["skipped_by_reason"].get("not valid UTF-8").is_none(),
+        "{v}"
     );
     assert!(v["elapsed_ms"].is_u64() && v["symbols"].as_u64().unwrap() >= 1);
     let (_, out, _) = run(&["--db", &db, "search", "foo", "--grain", "file", "--json"]);
@@ -2143,19 +2144,29 @@ fn export_ndjson_round_trips_node_counts() {
 ",
     )
     .unwrap();
+    // ADR 0007: a UTF-16LE file (BOM) is indexed, and its File node carries
+    // `encoding`; the UTF-8 one carries neither `encoding` nor `lossy`.
+    let u16 = d.path().join("b.txt");
+    let bytes: Vec<u8> = std::iter::once(0xFEFF_u16)
+        .chain("alpha beta\n".encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    std::fs::write(&u16, bytes).unwrap();
     {
         let db = d.path().join("g.redb");
-        let (ok, out, err) = run(&[
-            "--db",
-            db.to_str().unwrap(),
-            "index-file",
-            "--org",
-            "o",
-            "--repo",
-            "r",
-            f.to_str().unwrap(),
-        ]);
-        assert!(ok, "{out}{err}");
+        for file in [&f, &u16] {
+            let (ok, out, err) = run(&[
+                "--db",
+                db.to_str().unwrap(),
+                "index-file",
+                "--org",
+                "o",
+                "--repo",
+                "r",
+                file.to_str().unwrap(),
+            ]);
+            assert!(ok, "{out}{err}");
+        }
 
         let out_path = d.path().join("g.ndjson");
         let (ok, _, err) = run(&[
@@ -2177,10 +2188,23 @@ fn export_ndjson_round_trips_node_counts() {
             *kinds
                 .entry(v["kind"].as_str().unwrap().to_string())
                 .or_default() += 1;
+            if v["kind"] == "file" {
+                let name = v["name"].as_str().unwrap();
+                let enc = v.get("encoding").and_then(|e| e.as_str());
+                if name.ends_with("b.txt") {
+                    assert_eq!(enc, Some("UTF-16LE"), "{line}");
+                } else {
+                    assert_eq!(enc, None, "{line}");
+                }
+                assert!(v.get("lossy").is_none(), "lossy only when set: {line}");
+                // The line reads back as the store's node type.
+                let n: graph_core::Node = serde_json::from_str(line).unwrap();
+                assert_eq!(n.encoding.as_deref(), enc);
+            }
         }
         assert_eq!(kinds.get("org").copied().unwrap_or(0), 1, "{kinds:?}");
         assert_eq!(kinds.get("repo").copied().unwrap_or(0), 1, "{kinds:?}");
-        assert_eq!(kinds.get("file").copied().unwrap_or(0), 1, "{kinds:?}");
+        assert_eq!(kinds.get("file").copied().unwrap_or(0), 2, "{kinds:?}");
         assert!(kinds.get("token").copied().unwrap_or(0) > 0, "{kinds:?}");
     }
 }

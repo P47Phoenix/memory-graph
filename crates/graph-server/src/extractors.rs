@@ -40,10 +40,15 @@ pub fn register_all(store: &mut graph_store::V2Store, extractors: &[Arc<dyn Extr
 }
 
 /// SHA-256 (hex) over the sorted `language\0version\0ext,ext...` lines of
-/// the extractor set, plus the store format and fingerprint versions: two
-/// nodes with the same hash extract identically, so their stores stay
-/// query-identical (ADR 0004 D5). Order-independent.
+/// the extractor set, plus the store format, fingerprint, tokenizer and
+/// source decoder versions: two nodes with the same hash decode and extract
+/// identically, so their stores stay query-identical (ADR 0004 D5, ADR 0007
+/// C10). Order-independent.
 pub fn extractors_hash(extractors: &[Arc<dyn Extractor>]) -> String {
+    hash_with(extractors, graph_core::encoding::DECODER_VERSION)
+}
+
+fn hash_with(extractors: &[Arc<dyn Extractor>], decoder_version: u32) -> String {
     let mut lines: Vec<String> = extractors
         .iter()
         .map(|e| {
@@ -55,7 +60,7 @@ pub fn extractors_hash(extractors: &[Arc<dyn Extractor>]) -> String {
     lines.sort_unstable();
     let mut h = Sha256::new();
     h.update(format!(
-        "format={}\0fingerprint={}\0tokenizer={}\n",
+        "format={}\0fingerprint={}\0tokenizer={}\0decoder={decoder_version}\n",
         graph_store::SCHEMA_VERSION,
         graph_store::FINGERPRINT_FORMAT_VERSION,
         graph_core::tokenizer::TOKENIZER_VERSION
@@ -93,5 +98,15 @@ mod tests {
         assert_ne!(extractors_hash(&a), extractors_hash(&c));
         assert_ne!(extractors_hash(&a), extractors_hash(&[]));
         assert_eq!(extractors_hash(&a).len(), 64);
+    }
+
+    #[test]
+    fn hash_includes_the_decoder_version() {
+        // ADR 0007 C10: nodes that would decode differently refuse to share
+        // a cluster.
+        let a: Vec<Arc<dyn Extractor>> = vec![Arc::new(Toy("a", "1"))];
+        let now = graph_core::encoding::DECODER_VERSION;
+        assert_eq!(extractors_hash(&a), hash_with(&a, now));
+        assert_ne!(hash_with(&a, now), hash_with(&a, now + 1));
     }
 }

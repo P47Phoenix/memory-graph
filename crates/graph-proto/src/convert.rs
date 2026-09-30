@@ -181,6 +181,8 @@ impl From<Node> for pb::Node {
             origin: n.origin,
             fingerprint: n.fingerprint,
             span: n.span.map(Into::into),
+            encoding: n.encoding,
+            lossy: n.lossy,
         }
     }
 }
@@ -200,6 +202,15 @@ impl TryFrom<pb::Node> for Node {
             has_errors: n.has_errors,
             origin: n.origin,
             fingerprint: n.fingerprint,
+            encoding: match n.encoding {
+                Some(e) if !graph_core::is_known_encoding_name(&e) => {
+                    return Err(ConvertError(format!(
+                        "Node.encoding: unknown source encoding `{e}`"
+                    )))
+                }
+                e => e,
+            },
+            lossy: n.lossy,
             span: n.span.map(Span::try_from).transpose()?,
         })
     }
@@ -506,7 +517,10 @@ impl From<IndexOptions> for pb::IndexOptions {
 
 impl From<pb::IndexOptions> for IndexOptions {
     fn from(o: pb::IndexOptions) -> Self {
-        IndexOptions { reindex: o.reindex }
+        IndexOptions {
+            reindex: o.reindex,
+            ..Default::default()
+        }
     }
 }
 
@@ -664,6 +678,8 @@ impl From<BatchFile<'_>> for pb::FileBytes {
             bytes: f.bytes.to_vec(),
             language: f.language.map(str::to_string),
             origin: f.origin.map(str::to_string),
+            encoding_hint: f.encoding.map(|e| e.name().to_string()),
+            strict_encoding: f.strict_encoding,
         }
     }
 }
@@ -671,13 +687,31 @@ impl From<BatchFile<'_>> for pb::FileBytes {
 impl pb::FileBytes {
     /// Borrow this message as the store's batch input (`BatchFile` borrows
     /// its strings and bytes, so this is the reverse of `From<BatchFile>`).
-    pub fn as_batch_file(&self) -> BatchFile<'_> {
-        BatchFile {
+    /// An `encoding_hint` that is not a usable label (unknown, or
+    /// `replacement`) is a [`ConvertError`], so a server refuses it before
+    /// anything is proposed or written.
+    pub fn as_batch_file(&self) -> Result<BatchFile<'_>, ConvertError> {
+        Ok(BatchFile {
             path: &self.path,
             bytes: &self.bytes,
             language: self.language.as_deref(),
             origin: self.origin.as_deref(),
-        }
+            encoding: self.resolved_encoding_hint()?,
+            strict_encoding: self.strict_encoding,
+        })
+    }
+
+    /// The resolved `encoding_hint`, `None` when absent (auto-detect).
+    pub fn resolved_encoding_hint(
+        &self,
+    ) -> Result<Option<&'static graph_core::encoding::Encoding>, ConvertError> {
+        self.encoding_hint
+            .as_deref()
+            .map(|l| {
+                graph_core::encoding::hint_from_label(l)
+                    .map_err(|e| ConvertError(format!("FileBytes.encoding_hint: {e}")))
+            })
+            .transpose()
     }
 }
 

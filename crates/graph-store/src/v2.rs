@@ -25,8 +25,8 @@ use crate::{commit_prepared, prepare_file, stored_fingerprint_matches, PreparedF
 use crate::{
     grain_accepts, kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile,
     Grain, Hit, IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit,
-    SymbolQuery, Tally, CATALOG, CATALOG_VERSION, CHILDREN, MAX_SOURCE_BYTES, META, NAMES, NODES,
-    ORIGIN_DIRECTORY, SYMBOLS,
+    SymbolQuery, Tally, CATALOG, CATALOG_VERSION, CHILDREN, META, NAMES, NODES, ORIGIN_DIRECTORY,
+    SYMBOLS,
 };
 use graph_core::{
     normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, SymbolKind, TokenClass,
@@ -59,11 +59,17 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// by restamping `schema_version` only ([`UPGRADABLE_SCHEMA_VERSION`]); no
 /// data is rewritten, and an older binary then refuses the file with
 /// `SchemaMismatch` instead of misreading it.
-pub const V2_SCHEMA_VERSION: u64 = 10;
+///
+/// Bumped to 11 for ADR 0007 (source encodings): a File node may carry
+/// `encoding` and `lossy`, which a version-10 reader would drop on a
+/// rewrite. Both are omitted for UTF-8, so every version-9/10 File node is
+/// a valid version-11 one (absence means UTF-8) and the catalog needs no new
+/// entries for all-UTF-8 content: a 9 or 10 file is restamped straight to 11.
+pub const V2_SCHEMA_VERSION: u64 = 11;
 
-/// The one earlier layout version [`V2Store`] upgrades in place on open (a
+/// The earlier layout versions [`V2Store`] upgrades in place on open (a
 /// restamp, see [`V2_SCHEMA_VERSION`]); every other version is refused.
-pub const UPGRADABLE_SCHEMA_VERSION: u64 = 9;
+pub const UPGRADABLE_SCHEMA_VERSIONS: &[u64] = &[9, 10];
 
 /// Version of the `refs`/`content_files` derived tables (ADR 0003 story 9).
 /// Unlike `V2_SCHEMA_VERSION` (a hard gate on the on-disk *layout*), this is
@@ -312,6 +318,8 @@ fn blank(id: NodeId, parent: Option<NodeId>, kind: NodeKind, name: String) -> No
         has_errors: false,
         origin: None,
         fingerprint: None,
+        encoding: None,
+        lossy: false,
         span: None,
     }
 }
@@ -2339,9 +2347,10 @@ impl V2Store {
         };
         match found {
             Some(V2_SCHEMA_VERSION) => {}
-            Some(UPGRADABLE_SCHEMA_VERSION) => {
-                // Issue #137: the old layout is a subset of the new one, so
-                // the upgrade is the restamp alone (one small commit).
+            Some(v) if UPGRADABLE_SCHEMA_VERSIONS.contains(&v) => {
+                // Issue #137, ADR 0007 C6: the old layouts are subsets of
+                // the new one, so the upgrade is the restamp alone (one
+                // small commit).
                 let wt = db.begin_write()?;
                 wt.open_table(META)?
                     .insert("schema_version", V2_SCHEMA_VERSION)?;
@@ -2695,7 +2704,15 @@ impl V2Store {
         validate_spans(ex)?;
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
-        let stats = Self::ingest_validated(&wt, org, repo, path, language, ex, (origin, None))?;
+        let stats = Self::ingest_validated(
+            &wt,
+            org,
+            repo,
+            path,
+            language,
+            ex,
+            FileMeta::extracted(origin),
+        )?;
         self.before_marked_commit(&marker)?;
         self.commit_gated(wt)?;
         Ok(stats)
@@ -2950,10 +2967,6 @@ impl V2Store {
         self.registry.register(e);
     }
 
-    fn fingerprint(&self, bytes: &[u8], lang: &str) -> String {
-        crate::fingerprint(&self.registry, bytes, lang)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn index_bytes_opts(
         &self,
@@ -2965,31 +2978,62 @@ impl V2Store {
         origin: Option<&str>,
         opts: IndexOptions,
     ) -> Result<IngestStats> {
-        if bytes.len() > MAX_SOURCE_BYTES {
-            return Err(StoreError::TooLarge(format!("`{path}`")));
-        }
-        let src =
-            std::str::from_utf8(bytes).map_err(|_| StoreError::NotUtf8(format!("`{path}`")))?;
-        let path = normalize_path(path);
-        let lang = language.map_or_else(
-            || self.registry.detect_language(&path, src),
-            str::to_ascii_lowercase,
-        );
-        let fp = self.fingerprint(bytes, &lang);
+        // ADR 0007 C2: the single-file path decodes, detects and
+        // fingerprints through `prepare_file`, like every other write path,
+        // so it cannot drift from `index_batch`, `--server` or Raft.
+        let f = BatchFile {
+            path,
+            bytes,
+            language,
+            origin,
+            encoding: opts.encoding,
+            strict_encoding: opts.strict_encoding,
+        };
+        // The unchanged check runs inside this write transaction, so it is
+        // authoritative, and nothing is extracted for an unchanged file.
         let wt = self.db.begin_write()?;
-        if !opts.reindex {
-            if let Some((stats, dirty)) =
-                check_unchanged(&wt, org, repo, &path, &lang, &fp, origin)?
-            {
+        let mut unchanged = None;
+        let mut p = prepare_file(&self.registry, org, repo, &f, opts, |p, l, fp| {
+            unchanged = check_unchanged(&wt, org, repo, p, l, fp, origin)?;
+            Ok(unchanged.is_some())
+        })?;
+        let work = std::mem::replace(
+            &mut p.work,
+            crate::api::Prepared::Rejected(StoreError::Rejected(String::new())),
+        );
+        let ex = match work {
+            crate::api::Prepared::Rejected(StoreError::InvalidSpan(why)) => {
+                // The single-file path reports the span error bare (as it
+                // did before it went through `prepare_file`).
+                let why = why
+                    .strip_prefix(&format!("`{}`: ", p.path))
+                    .map(str::to_owned)
+                    .unwrap_or(why);
+                return Err(StoreError::InvalidSpan(why));
+            }
+            crate::api::Prepared::Rejected(e) => return Err(e),
+            crate::api::Prepared::Unchanged(_) => {
+                // The check ran in this transaction and refreshed `origin`
+                // if it differed; commit that.
+                let (stats, dirty) = unchanged.expect("found unchanged in this transaction");
                 if dirty {
                     self.commit_gated(wt)?;
                 }
                 return Ok(stats);
             }
-        }
-        let ex = self.registry.extract(&lang, src);
-        validate_spans(&ex)?;
-        let stats = Self::ingest_validated(&wt, org, repo, &path, &lang, &ex, (origin, Some(&fp)))?;
+            crate::api::Prepared::Extracted(ex) => ex,
+            crate::api::Prepared::Remote(_) => unreachable!("prepare_file never keeps raw bytes"),
+        };
+        let stats = Self::ingest_prepped(
+            &wt,
+            org,
+            repo,
+            &p.path,
+            &p.language,
+            &ex,
+            FileMeta::of(&p),
+            None,
+        )?;
         self.commit_gated(wt)?;
         Ok(stats)
     }
@@ -3005,7 +3049,15 @@ impl V2Store {
     ) -> Result<IngestStats> {
         validate_spans(ex)?;
         let wt = self.db.begin_write()?;
-        let stats = Self::ingest_validated(&wt, org, repo, path, language, ex, (origin, None))?;
+        let stats = Self::ingest_validated(
+            &wt,
+            org,
+            repo,
+            path,
+            language,
+            ex,
+            FileMeta::extracted(origin),
+        )?;
         self.commit_gated(wt)?;
         Ok(stats)
     }
@@ -3018,7 +3070,7 @@ impl V2Store {
     /// end of the batch. A storage error aborts only the chunk in progress:
     /// earlier chunks stay committed and visible, the current chunk leaves
     /// nothing behind, and later files are not extracted. Per-file failures
-    /// (not UTF-8, too large, invalid spans) yield a per-file `Err` and never
+    /// (binary, a lossy strict decode, too large, invalid spans) yield a per-file `Err` and never
     /// abort a chunk. A batch smaller than the cap is one transaction, so it
     /// is all-or-nothing, as before. Re-running the batch after a failure
     /// skips the files already stored (unchanged fingerprint).
@@ -3167,7 +3219,7 @@ impl V2Store {
                     &p.path,
                     &p.language,
                     ex,
-                    (p.origin.as_deref(), Some(&p.fingerprint)),
+                    FileMeta::of(p),
                     prep.map(|b| *b),
                 )
             })?;
@@ -3342,7 +3394,7 @@ impl V2Store {
         path: &str,
         language: &str,
         ex: &Extraction,
-        meta: (Option<&str>, Option<&str>),
+        meta: FileMeta<'_>,
     ) -> Result<IngestStats> {
         Self::ingest_prepped(wt, org, repo, path, language, ex, meta, None)
     }
@@ -3357,7 +3409,7 @@ impl V2Store {
         path: &str,
         language: &str,
         ex: &Extraction,
-        (origin, fingerprint): (Option<&str>, Option<&str>),
+        meta: FileMeta<'_>,
         prep: Option<V2Prep>,
     ) -> Result<IngestStats> {
         if org.is_empty() || repo.is_empty() {
@@ -3449,8 +3501,10 @@ impl V2Store {
         let mut f = blank(file_id, Some(repo_id), NodeKind::File, path.into());
         f.language = Some(language.into());
         f.has_errors = ex.has_errors;
-        f.origin = origin.map(Into::into);
-        f.fingerprint = fingerprint.map(Into::into);
+        f.origin = meta.origin.map(Into::into);
+        f.fingerprint = meta.fingerprint.map(Into::into);
+        f.encoding = meta.encoding.map(Into::into);
+        f.lossy = meta.lossy;
         w.nodes.insert(file_id, enc(&f).as_slice())?;
 
         let V2Prep {
@@ -3769,6 +3823,40 @@ impl Store for V2Store {
             file_bytes: std::fs::metadata(&self.path).map_or(0, |m| m.len()),
             live_bytes: s.allocated_pages() * s.page_size() as u64,
         }))
+    }
+}
+
+/// What a File node records besides its extraction: how the ingest was
+/// requested, the fingerprint (absent for a pre-extracted ingest) and the
+/// source encoding (ADR 0007 C6; `None` for UTF-8).
+#[derive(Clone, Copy)]
+pub(crate) struct FileMeta<'a> {
+    pub(crate) origin: Option<&'a str>,
+    pub(crate) fingerprint: Option<&'a str>,
+    pub(crate) encoding: Option<&'static str>,
+    pub(crate) lossy: bool,
+}
+
+impl<'a> FileMeta<'a> {
+    /// A caller-supplied extraction: no source, so no fingerprint and no
+    /// encoding.
+    pub(crate) fn extracted(origin: Option<&'a str>) -> Self {
+        Self {
+            origin,
+            fingerprint: None,
+            encoding: None,
+            lossy: false,
+        }
+    }
+
+    /// A file decoded and fingerprinted by `prepare_file`.
+    pub(crate) fn of(p: &'a PreparedFile) -> Self {
+        Self {
+            origin: p.origin.as_deref(),
+            fingerprint: Some(&p.fingerprint),
+            encoding: p.encoding.map(|e| e.name()),
+            lossy: p.lossy,
+        }
     }
 }
 

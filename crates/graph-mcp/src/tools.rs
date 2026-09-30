@@ -124,6 +124,7 @@ pub fn store_error_code(e: &StoreError) -> &'static str {
         StoreError::OpenFailed { .. } => "open_failed",
         StoreError::Rejected(_) => "rejected",
         StoreError::NotUtf8(_) => "not_utf8",
+        StoreError::Binary(_) => "binary",
         StoreError::TooLarge(_) => "too_large",
         StoreError::InvalidSpan(_) => "invalid_span",
         StoreError::Corrupt(_) => "corrupt",

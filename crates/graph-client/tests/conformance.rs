@@ -95,6 +95,7 @@ fn backslash_batch_through_server_equals_embedded() {
                 bytes: b,
                 language: None,
                 origin: Some(ORIGIN_DIRECTORY),
+                ..Default::default()
             })
             .collect();
         for r in s
@@ -179,6 +180,7 @@ fn server_restart_mid_batch_equals_fresh() {
             bytes: b,
             language: Some("text"),
             origin: Some(ORIGIN_DIRECTORY),
+            ..Default::default()
         })
         .collect();
     let mut poisoned = good[..2].to_vec();
@@ -187,6 +189,7 @@ fn server_restart_mid_batch_equals_fresh() {
         bytes: b"foo",
         language: Some("a\0b"),
         origin: Some(ORIGIN_DIRECTORY),
+        ..Default::default()
     });
     poisoned.extend_from_slice(&good[2..]);
     let err = remote
@@ -315,16 +318,38 @@ fn store_errors_round_trip_through_a_real_rpc() {
             "r",
             &[BatchFile {
                 path: "bin.c",
-                bytes: b"\xff",
+                bytes: b"\x00\xff\x00",
                 language: None,
                 origin: None,
+                ..Default::default()
             }],
             IndexOptions::default(),
         )
         .unwrap();
     assert!(
-        matches!(&out[0], Err(StoreError::NotUtf8(m)) if m.contains("bin.c")),
+        matches!(&out[0], Err(StoreError::Binary(m)) if m.contains("bin.c")),
         "{out:?}"
+    );
+    // ADR 0007: the single-file RPC (`index-file --server`) refuses a
+    // binary file too, and a strict `utf-8` hint gives today's `NotUtf8`.
+    let err = remote
+        .index_bytes("o", "r", "img.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", None)
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Binary(m) if m.contains("img.png")),
+        "{err:?}"
+    );
+    let strict = IndexOptions {
+        encoding: Some(graph_core::encoding::Encoding::for_label(b"utf-8").unwrap()),
+        strict_encoding: true,
+        ..Default::default()
+    };
+    let err = remote
+        .index_bytes_opts("o", "r", "bad.txt", b"a \xff b", None, None, strict)
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::NotUtf8(m) if m.contains("bad.txt")),
+        "{err:?}"
     );
     // A whole-call refusal.
     let err = remote
@@ -380,6 +405,7 @@ fn server_normalizes_raw_backslash_paths() {
                 bytes: b"foo\n".to_vec(),
                 language: None,
                 origin: Some(ORIGIN_DIRECTORY.into()),
+                ..Default::default()
             }),
             options: Some(IndexOptions::default().into()),
         })
@@ -550,6 +576,7 @@ fn a_second_client_reads_while_another_indexes() {
                 bytes: b,
                 language: Some("text"),
                 origin: None,
+                ..Default::default()
             })
             .collect();
         writer
@@ -564,4 +591,126 @@ fn a_second_client_reads_while_another_indexes() {
     assert!(out.iter().all(|r| r.is_ok()));
     assert_eq!(reader.count_nodes(graph_core::NodeKind::File).unwrap(), 8);
     assert!(!seen.is_empty(), "reads were answered during the index run");
+}
+
+/// ADR 0007 C2, C8: a raw `Index` / `IndexFile` RPC (as another client might
+/// send) decodes through the server's `prepare_file` with the hint it
+/// carries, exactly as `index_bytes_opts` through `RemoteStore` and the
+/// embedded store do: same encoding, fingerprint and tokens. A hint that is
+/// not a usable label is refused (a malformed message) before anything is
+/// written.
+#[test]
+fn raw_index_rpc_honours_the_encoding_hint() {
+    let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode("CustomerId \u{65e5}\u{672c}\n");
+    let sjis = sjis.into_owned();
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), vec![]);
+    let remote = connect(&server);
+    let embedded = graph_store::open_store(&d.path().join("e.redb"), vec![]).unwrap();
+    let opts = IndexOptions {
+        encoding: Some(encoding_rs::SHIFT_JIS),
+        ..Default::default()
+    };
+    let via_trait = |s: &dyn Store, path: &str| {
+        let st = s
+            .index_bytes_opts("o", "r", path, &sjis, None, None, opts)
+            .unwrap();
+        s.get(st.file_id).unwrap().unwrap()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let file = |path: &str, hint: &str| pb::FileBytes {
+        path: path.into(),
+        bytes: sjis.clone(),
+        encoding_hint: Some(hint.into()),
+        ..Default::default()
+    };
+    rt.block_on(async {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{}", server.endpoint()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut w = pb::write_client::WriteClient::new(ch);
+        w.index_file(pb::IndexFileRequest {
+            org: "o".into(),
+            repo: "r".into(),
+            file: Some(file("raw1.txt", "sjis")),
+            options: None,
+        })
+        .await
+        .unwrap();
+        let msgs = vec![
+            pb::IndexRequest {
+                msg: Some(pb::index_request::Msg::Header(pb::IndexHeader {
+                    org: "o".into(),
+                    repo: "r".into(),
+                    options: None,
+                })),
+            },
+            pb::IndexRequest {
+                msg: Some(pb::index_request::Msg::File(file("raw2.txt", "shift_jis"))),
+            },
+        ];
+        w.index(tokio_stream::iter(msgs)).await.unwrap();
+        for bad in ["no-such-encoding", "replacement"] {
+            let err = w
+                .index_file(pb::IndexFileRequest {
+                    org: "o".into(),
+                    repo: "r".into(),
+                    file: Some(file("bad.txt", bad)),
+                    options: None,
+                })
+                .await
+                .unwrap_err();
+            // A malformed message, like every other `ConvertError`.
+            assert_eq!(
+                err.code(),
+                tonic::Code::FailedPrecondition,
+                "{bad}: {err:?}"
+            );
+            assert!(err.message().contains("encoding_hint"), "{err:?}");
+        }
+    });
+    assert!(remote.file_tokens("o", "r", "bad.txt").unwrap().is_none());
+    let want = via_trait(&*embedded, "e.txt");
+    assert_eq!(want.encoding.as_deref(), Some("Shift_JIS"));
+    let toks = |s: &dyn Store, p: &str| {
+        s.file_tokens("o", "r", p)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name, n.span))
+            .collect::<Vec<_>>()
+    };
+    let want_toks = toks(&*embedded, "e.txt");
+    assert_eq!(want_toks[1].0, "\u{65e5}\u{672c}");
+    let remote_node = via_trait(&remote, "t.txt");
+    for (path, n) in [
+        ("t.txt", remote_node),
+        (
+            "raw1.txt",
+            remote
+                .get(toks_parent(&remote, "raw1.txt"))
+                .unwrap()
+                .unwrap(),
+        ),
+        (
+            "raw2.txt",
+            remote
+                .get(toks_parent(&remote, "raw2.txt"))
+                .unwrap()
+                .unwrap(),
+        ),
+    ] {
+        assert_eq!(n.encoding, want.encoding, "{path}");
+        assert_eq!(n.lossy, want.lossy, "{path}");
+        assert_eq!(n.fingerprint, want.fingerprint, "{path}");
+        assert_eq!(toks(&remote, path), want_toks, "{path}");
+    }
+}
+
+fn toks_parent(s: &dyn Store, path: &str) -> graph_core::NodeId {
+    s.file_tokens("o", "r", path).unwrap().unwrap()[0]
+        .parent
+        .unwrap()
 }
