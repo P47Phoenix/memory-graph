@@ -225,7 +225,7 @@ Every file is decoded to UTF-8 before tokenizing, so token text is interned in t
 | 41 | E2: store integration: every decode site through `prepare_file`, the `Store` input change, binary rejection, File node fields and the {9,10} → 11 restamp, fingerprint rule, `extractors_hash`, conformance/differential (schema 12 per the C6 amendment) | 8 | Delivered in PR #177 |
 | 42 | E3: CLI `--encoding`/`--strict-encoding`, `.memory-graph.toml`, walk tallies | 3 | Delivered in PR #178 |
 | 43 | E4: exposure: proto fields (xtask), server honours the hint, catalog counts, `describe`/`--json`/`symbols`/`--stats`, MCP | 5 | Delivered in PR #179 |
-| 44 | E5: encoding fixtures and cross-encoding tests, the guide's Encodings section, glossary, ADR 0003 note, CLAUDE.md invariant | 3 | Delivered in PR #TBD |
+| 44 | E5: encoding fixtures and cross-encoding tests, the guide's Encodings section, glossary, ADR 0003 note, CLAUDE.md invariant | 3 | Delivered in PR #181 |
 
 Acceptance criteria are in the [epic](../epic-code-memory-graph.md).
 

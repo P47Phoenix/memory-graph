@@ -540,7 +540,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) C8.
 - Given the MCP `describe` and `list_files` tools, When called, Then they must include the encoding where it is not UTF-8.
 
 **44. Encoding fixtures, cross-encoding search tests and docs (3 pts)**
-Status: Delivered in PR #TBD ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
+Status: Delivered in PR #181 ([ADR 0007](adr/0007-source-encodings.md), Accepted 2026-09-30).
 As a maintainer
 I want every supported encoding covered end to end and documented
 So that the feature does not regress and users know how to use it.
