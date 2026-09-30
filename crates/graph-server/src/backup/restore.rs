@@ -41,7 +41,11 @@ fn refuse(msg: String) -> StoreError {
 
 /// The version checks of a sidecar against this binary.
 pub fn check_versions(side: &SnapshotSidecar, c: &RestoreChecks) -> Result<(), StoreError> {
-    if side.store_format_version != graph_store::SCHEMA_VERSION {
+    // A backup in a format this binary upgrades on open (e.g. 11 -> 12) is
+    // restored as it is and upgraded when the store opens it.
+    if side.store_format_version != graph_store::SCHEMA_VERSION
+        && !graph_store::UPGRADABLE_SCHEMA_VERSIONS.contains(&side.store_format_version)
+    {
         return Err(refuse(format!(
             "the backup is store format {} and this binary reads format {} (no override)",
             side.store_format_version,

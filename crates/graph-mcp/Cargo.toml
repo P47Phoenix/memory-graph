@@ -17,5 +17,6 @@ serde_json.workspace = true
 graph-server = { path = "../graph-server" }
 graph-client = { path = "../graph-client" }
 graph-lang-rust = { path = "../graph-lang-rust" }
+encoding_rs.workspace = true
 tempfile.workspace = true
 proptest.workspace = true

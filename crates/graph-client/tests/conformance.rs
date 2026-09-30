@@ -52,6 +52,16 @@ fn remote_harness() -> Harness {
     }
 }
 
+/// ADR 0007 C8: a current server decodes with the hint, so the client's
+/// old-server warning stays off (the threshold is the schema that added it).
+#[test]
+fn current_server_honours_encoding_hints() {
+    assert_eq!(graph_client::ENCODING_STORE_FORMAT, 11);
+    let d = tempfile::tempdir().unwrap();
+    let ts = TestServer::start(&d.path().join("g.redb"), rust());
+    assert!(!connect(&ts).ignores_encoding_hints());
+}
+
 #[test]
 fn remote_store_passes_conformance_suite() {
     conformance::run_all(&remote_harness);

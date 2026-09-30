@@ -38,6 +38,8 @@ pub(crate) use common::{
     Scope, Tally, CATALOG, CHILDREN, META, NAMES, NODES, SYMBOLS,
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
+/// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
+pub use v2::UPGRADABLE_SCHEMA_VERSIONS;
 pub use v2::V2_SCHEMA_VERSION as SCHEMA_VERSION;
 pub use v2::{CompactStats, MarkedCommitHook, RaftMarker, V2Snapshot, V2Store, VacuumStats};
 
@@ -47,7 +49,10 @@ pub use v2::{CompactStats, MarkedCommitHook, RaftMarker, V2Snapshot, V2Store, Va
 pub const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<u64> = 1..=2;
 /// Version of the derived describe catalog (per-repo/language counts kept in
 /// step with every write). Databases with another value rebuild it on open.
-pub const CATALOG_VERSION: u64 = 1;
+/// 2 (ADR 0007, epic story 43): per-repo counts of non-UTF-8 files per
+/// encoding (`e`) and of lossy files (`l`); a lower or missing value has
+/// them recounted from the File nodes on open.
+pub const CATALOG_VERSION: u64 = 2;
 /// `Node::origin` of files written by a directory run; only these are pruned.
 pub const ORIGIN_DIRECTORY: &str = "directory";
 
@@ -312,6 +317,14 @@ pub struct SymbolHit {
     /// receiver type. Omitted from JSON when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// The file's WHATWG encoding when it is not UTF-8 (ADR 0007). Omitted
+    /// from JSON for UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// The file was decoded lossily (U+FFFD replacements). Omitted from JSON
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lossy: bool,
 }
 
 /// Per-language contents of a repo. `symbol_kinds` keys are `generic` or
@@ -374,6 +387,13 @@ pub struct RepoInfo {
     /// rest of the struct.
     #[serde(default)]
     pub open_batch: bool,
+    /// Files per non-UTF-8 WHATWG encoding (ADR 0007); UTF-8 files are the
+    /// remainder of `files`. Kept in the catalog, so `describe` stays O(repos).
+    #[serde(default)]
+    pub encodings: BTreeMap<String, usize>,
+    /// Files decoded lossily (U+FFFD replacements).
+    #[serde(default)]
+    pub lossy: usize,
 }
 
 impl RepoInfo {
@@ -419,6 +439,14 @@ pub struct Hit {
     /// enclosing the match satisfies the grain (and the requested kind);
     /// rolled up to the file.
     pub no_matching_symbol: bool,
+    /// The hit's file's WHATWG encoding when it is not UTF-8 (ADR 0007).
+    /// Omitted from JSON for UTF-8, and always absent on repo and org rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// The file was decoded lossily (U+FFFD replacements). Omitted from JSON
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lossy: bool,
 }
 
 /// One input of `Store::index_batch`.
@@ -453,6 +481,14 @@ pub struct IngestStats {
     /// Normalized path and language actually stored.
     pub path: String,
     pub language: String,
+    /// The file's WHATWG encoding when it is not UTF-8 (ADR 0007). Omitted
+    /// from JSON for UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// The file was decoded lossily (U+FFFD replacements). Omitted from JSON
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lossy: bool,
 }
 
 /// What the test modules below reach through `use super::*`.

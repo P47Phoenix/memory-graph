@@ -222,6 +222,16 @@ fn token_class_schema(nullable: bool) -> Value {
     json!({"type": t, "enum": e})
 }
 
+/// The file's source encoding (ADR 0007), present only when not UTF-8.
+fn encoding_schema() -> Value {
+    json!({"type": "string", "description": "The file's source encoding (WHATWG name), present only when it is not UTF-8"})
+}
+
+/// Present (true) only when the file was decoded lossily.
+fn lossy_schema() -> Value {
+    json!({"type": "boolean", "description": "Present (true) only when invalid sequences were replaced with U+FFFD while decoding the file"})
+}
+
 fn hit_schema() -> Value {
     json!({
         "type": "object",
@@ -238,7 +248,9 @@ fn hit_schema() -> Value {
             "span": span_schema(),
             "count": {"type": "integer", "minimum": 0},
             "no_symbols": {"type": "boolean"},
-            "no_matching_symbol": {"type": "boolean"}
+            "no_matching_symbol": {"type": "boolean"},
+            "encoding": encoding_schema(),
+            "lossy": lossy_schema()
         },
         "required": ["grain", "org", "repo", "file", "language", "symbol", "symbol_kind",
                      "lang_kind", "token_class", "span", "count", "no_symbols", "no_matching_symbol"],
@@ -259,7 +271,9 @@ fn symbol_hit_schema() -> Value {
             "kind": symbol_kind_schema(false),
             "lang_kind": opt_str(),
             "span": span_schema(),
-            "owner": {"type": "string"}
+            "owner": {"type": "string"},
+            "encoding": encoding_schema(),
+            "lossy": lossy_schema()
         },
         "required": ["org", "repo", "file", "language", "name", "qualified", "kind", "lang_kind", "span"],
         "additionalProperties": false
@@ -287,9 +301,14 @@ fn repo_info_schema() -> Value {
                 }
             },
             "token_classes": counts,
-            "open_batch": {"type": "boolean"}
+            "open_batch": {"type": "boolean"},
+            "encodings": {
+                "type": "object", "additionalProperties": count,
+                "description": "Files per non-UTF-8 source encoding (WHATWG name); the rest of files are UTF-8"
+            },
+            "lossy": {"type": "integer", "minimum": 0, "description": "Files decoded lossily (invalid sequences replaced with U+FFFD)"}
         },
-        "required": ["org", "repo", "files", "languages", "token_classes", "open_batch"],
+        "required": ["org", "repo", "files", "languages", "token_classes", "open_batch", "encodings", "lossy"],
         "additionalProperties": false
     })
 }
@@ -424,7 +443,9 @@ pub fn tool_definitions() -> Vec<Value> {
         "properties": {
             "path": {"type": "string"},
             "language": opt_str(),
-            "has_errors": {"type": "boolean"}
+            "has_errors": {"type": "boolean"},
+            "encoding": encoding_schema(),
+            "lossy": lossy_schema()
         },
         "required": ["path", "language", "has_errors"],
         "additionalProperties": false
@@ -448,7 +469,7 @@ pub fn tool_definitions() -> Vec<Value> {
     };
     vec![
         def("describe", "Describe the index",
-            "What is indexed: per repo, its files, languages, symbol kinds and token classes. Start here to learn the valid org, repo, language and kind values.",
+            "What is indexed: per repo, its files, languages, symbol kinds and token classes, and how many files were decoded from a non-UTF-8 source encoding or lossily. Start here to learn the valid org, repo, language and kind values.",
             describe_in, describe_out),
         def("list_repos", "List repositories",
             "The indexed repositories (org and repo names), optionally of one org.",
@@ -982,7 +1003,17 @@ impl StoreBackend {
                     .into_iter()
                     .filter(|n| n.kind == NodeKind::File)
                     .filter(|n| prefix.as_ref().is_none_or(|p| n.name.starts_with(p.as_str())))
-                    .map(|n| json!({"path": n.name, "language": n.language, "has_errors": n.has_errors}))
+                    .map(|n| {
+                        let mut v = json!({"path": n.name, "language": n.language, "has_errors": n.has_errors});
+                        // ADR 0007: only for a file that is not plain UTF-8.
+                        if let Some(e) = n.encoding {
+                            v["encoding"] = e.into();
+                        }
+                        if n.lossy {
+                            v["lossy"] = true.into();
+                        }
+                        v
+                    })
                     .collect();
                 page_of(items, *page)
             }

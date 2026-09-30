@@ -25,7 +25,7 @@ use crate::{
 };
 use graph_core::tokenizer::tokenize;
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind, Span, SymbolDecl, SymbolKind};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 type Opened = Result<Box<dyn Store>, StoreError>;
 type OpenFn = dyn Fn(Vec<Box<dyn Extractor>>) -> Opened;
@@ -110,6 +110,7 @@ pub const CASES: &[(&str, Case)] = &[
         encoding_hint_strict_and_binary,
     ),
     ("batch_level_encoding_hint", batch_level_encoding_hint),
+    ("encoding_exposure", encoding_exposure),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1698,6 +1699,24 @@ fn differential_seed(s: &dyn Store) {
         s.index_bytes_opts("o2", "enc", &path, &fx.bytes, None, None, opts)
             .unwrap();
     }
+    // And a lossy one (a `utf-8` hint on windows-1252 bytes), so the
+    // catalog's lossy count and the hits' `lossy` are compared too.
+    let lossy = IndexOptions {
+        encoding: Some(encoding_rs::UTF_8),
+        ..Default::default()
+    };
+    let st = s
+        .index_bytes_opts(
+            "o2",
+            "enc",
+            "lossy.txt",
+            &legacy("CustomerId caf\u{e9}\n", encoding_rs::WINDOWS_1252),
+            None,
+            None,
+            lossy,
+        )
+        .unwrap();
+    assert!(st.lossy);
 }
 
 /// A batch re-index of unchanged bytes still refreshes the file's origin, in
@@ -3206,6 +3225,170 @@ fn encoding_hint_strict_and_binary(h: &Harness) {
         s.describe(None, None).unwrap(),
         s.describe_by_scan(None, None).unwrap()
     );
+}
+
+/// Encodings are visible on every read (ADR 0007 C8, epic story 43):
+/// `describe` counts non-UTF-8 files per encoding and lossy files per repo
+/// (from the catalog, kept in step with replace and prune, and equal to the
+/// reference scan); `IngestStats`, `search` hits and `search_symbols` hits
+/// carry the file's `encoding`/`lossy` (absent for UTF-8, and on repo and
+/// org rows).
+fn encoding_exposure(h: &Harness) {
+    let s = (h.open)(vec![Box::new(ToyExtractor)]).expect("open store");
+    let dir = Some(ORIGIN_DIRECTORY);
+    let mut expect_enc = BTreeMap::new();
+    for fx in enc_fixtures() {
+        let opts = IndexOptions {
+            encoding: fx.hint,
+            ..Default::default()
+        };
+        let st = s
+            .index_bytes_opts("o", "r", fx.path, &fx.bytes, None, dir, opts)
+            .unwrap();
+        assert_eq!(st.encoding.as_deref(), fx.encoding, "{}", fx.path);
+        assert!(!st.lossy, "{}", fx.path);
+        if let Some(e) = fx.encoding {
+            *expect_enc.entry(e.to_string()).or_insert(0usize) += 1;
+        }
+    }
+    // A lossy UTF-8 file: lossy, no encoding.
+    let latin = legacy("caf\u{e9} lossyword\n", encoding_rs::WINDOWS_1252);
+    let utf8_hint = IndexOptions {
+        encoding: Some(encoding_rs::UTF_8),
+        ..Default::default()
+    };
+    let st = s
+        .index_bytes_opts("o", "r", "lossy.toy", &latin, None, dir, utf8_hint)
+        .unwrap();
+    assert_eq!((st.encoding.as_deref(), st.lossy), (None, true));
+    // An unchanged re-index reports the stored encoding too.
+    let le = utf16("again\n", false, true);
+    s.index_bytes_opts(
+        "o",
+        "r",
+        "again.toy",
+        &le,
+        None,
+        dir,
+        IndexOptions::default(),
+    )
+    .unwrap();
+    let again = s
+        .index_bytes_opts(
+            "o",
+            "r",
+            "again.toy",
+            &le,
+            None,
+            dir,
+            IndexOptions::default(),
+        )
+        .unwrap();
+    assert!(again.unchanged);
+    assert_eq!(again.encoding.as_deref(), Some("UTF-16LE"));
+    *expect_enc.entry("UTF-16LE".to_string()).or_insert(0) += 1;
+    // Another repo stays separate and all UTF-8.
+    s.index_bytes("o", "plain", "a.toy", b"plain\n", None)
+        .unwrap();
+
+    let check = |enc: &BTreeMap<String, usize>, lossy: usize, files: usize| {
+        let d = s.describe(None, None).unwrap();
+        assert_eq!(
+            d,
+            s.describe_by_scan(None, None).unwrap(),
+            "catalog vs scan"
+        );
+        let r = d.iter().find(|i| i.repo == "r").expect("repo r");
+        assert_eq!((&r.encodings, r.lossy, r.files), (enc, lossy, files));
+        let p = d.iter().find(|i| i.repo == "plain").expect("repo plain");
+        assert!(p.encodings.is_empty() && p.lossy == 0, "{p:?}");
+        let scoped = s.describe(Some("o"), Some("r")).unwrap();
+        assert_eq!(scoped, s.describe_by_scan(Some("o"), Some("r")).unwrap());
+        assert_eq!(scoped[0].encodings, *enc);
+    };
+    let n = enc_fixtures().len() + 2;
+    check(&expect_enc, 1, n);
+
+    // Search hits carry their file's encoding at file-level grains.
+    let mut q = Query::new(ENC_ID);
+    q.repo = Some("r".into());
+    for grain in [Grain::Token, Grain::Symbol, Grain::File] {
+        q.grain = grain;
+        let hits = s.search(&q).unwrap();
+        assert!(!hits.is_empty());
+        for hit in &hits {
+            let want = enc_fixtures()
+                .into_iter()
+                .find(|f| Some(f.path) == hit.file.as_deref())
+                .expect("fixture")
+                .encoding;
+            assert_eq!(hit.encoding.as_deref(), want, "{grain:?} {hit:?}");
+            assert!(!hit.lossy);
+        }
+    }
+    for grain in [Grain::Repo, Grain::Org] {
+        q.grain = grain;
+        for hit in s.search(&q).unwrap() {
+            assert!(hit.encoding.is_none() && !hit.lossy, "{hit:?}");
+        }
+    }
+    let hits = s.search(&Query::new("lossyword")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].encoding.as_deref(), hits[0].lossy), (None, true));
+    // Symbol hits too.
+    let mut sq = SymbolQuery::new("whole");
+    sq.repo = Some("r".into());
+    for hit in s.search_symbols(&sq).unwrap() {
+        let (enc, lossy) = match hit.file.as_str() {
+            "lossy.toy" => (None, true),
+            "again.toy" => (Some("UTF-16LE"), false),
+            p => (
+                enc_fixtures()
+                    .into_iter()
+                    .find(|f| f.path == p)
+                    .expect("fixture")
+                    .encoding,
+                false,
+            ),
+        };
+        assert_eq!(
+            (hit.encoding.as_deref(), hit.lossy),
+            (enc, lossy),
+            "{hit:?}"
+        );
+    }
+
+    // Replacing a file moves its count; pruning removes it.
+    s.index_bytes_opts(
+        "o",
+        "r",
+        "lossy.toy",
+        b"now utf8\n",
+        None,
+        dir,
+        IndexOptions::default(),
+    )
+    .unwrap();
+    check(&expect_enc, 0, n);
+    s.index_bytes_opts(
+        "o",
+        "r",
+        "sjis.toy",
+        b"now utf8\n",
+        None,
+        dir,
+        IndexOptions::default(),
+    )
+    .unwrap();
+    expect_enc.remove("Shift_JIS");
+    check(&expect_enc, 0, n);
+    let keep: HashSet<String> = ["u8.toy", "lossy.toy", "sjis.toy", "be.toy"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    s.prune_files("o", "r", &keep, false).unwrap();
+    let only_be: BTreeMap<String, usize> = [("UTF-16BE".to_string(), 1)].into();
+    check(&only_be, 0, keep.len());
 }
 
 /// A batch-level `IndexOptions::encoding` is the hint of every file without

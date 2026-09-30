@@ -166,6 +166,13 @@ pub struct Hit {
     /// satisfies the grain; rolled up to the file.
     #[prost(bool, tag = "13")]
     pub no_matching_symbol: bool,
+    /// The hit's file was decoded from this WHATWG encoding (ADR 0007);
+    /// absent for UTF-8 and for repo/org rows.
+    #[prost(string, optional, tag = "14")]
+    pub encoding: ::core::option::Option<::prost::alloc::string::String>,
+    /// The hit's file was decoded lossily (U+FFFD replacements).
+    #[prost(bool, tag = "15")]
+    pub lossy: bool,
 }
 /// graph_store::SymbolHit: a symbol with its containment path.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -192,6 +199,12 @@ pub struct SymbolHit {
     /// graph_core::SymbolDecl::owner, e.g. a Go method's receiver type.
     #[prost(string, optional, tag = "10")]
     pub owner: ::core::option::Option<::prost::alloc::string::String>,
+    /// The file's WHATWG encoding (ADR 0007); absent for UTF-8.
+    #[prost(string, optional, tag = "11")]
+    pub encoding: ::core::option::Option<::prost::alloc::string::String>,
+    /// The file was decoded lossily.
+    #[prost(bool, tag = "12")]
+    pub lossy: bool,
 }
 /// graph_store::LanguageInfo: per-language contents of a repo.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -231,6 +244,15 @@ pub struct RepoInfo {
     /// The repo has an open (in-progress or crashed) chunked ingest batch.
     #[prost(bool, tag = "6")]
     pub open_batch: bool,
+    /// Files per non-UTF-8 WHATWG encoding (ADR 0007); UTF-8 is the remainder.
+    #[prost(btree_map = "string, uint64", tag = "7")]
+    pub encodings: ::prost::alloc::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        u64,
+    >,
+    /// Files decoded lossily.
+    #[prost(uint64, tag = "8")]
+    pub lossy: u64,
 }
 /// graph_store::IngestStats: the outcome of indexing one file.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -254,6 +276,12 @@ pub struct IngestStats {
     pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]
     pub language: ::prost::alloc::string::String,
+    /// The file's WHATWG encoding (ADR 0007); absent for UTF-8.
+    #[prost(string, optional, tag = "9")]
+    pub encoding: ::core::option::Option<::prost::alloc::string::String>,
+    /// The file was decoded lossily.
+    #[prost(bool, tag = "10")]
+    pub lossy: bool,
 }
 /// One source file as raw bytes (`graph_store::BatchFile`), for `Write.Index`
 /// and the replicated `LogCommand.IndexChunk`.

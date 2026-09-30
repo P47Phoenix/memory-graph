@@ -2538,3 +2538,98 @@ fn memory_share_follows_free_ram() {
     ]);
     assert!(!ok && err.contains("at most 100"), "{err}");
 }
+
+/// ADR 0007 C8 (epic story 43): the encodings of indexed files show in
+/// `index --stats` (transcoded and lossy counts), `describe` (text and
+/// `--json`, per repo), `symbols` and `search --json` (per hit's file, only
+/// when not UTF-8).
+#[test]
+fn encodings_show_in_stats_describe_symbols_and_search() {
+    let d = tempfile::tempdir().unwrap();
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.rs"), "fn plain() { shared(); }\n").unwrap();
+    let wide: Vec<u8> = std::iter::once(0xFEFF_u16)
+        .chain("fn wide() { shared(); }\n".encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    std::fs::write(src.join("w.rs"), wide).unwrap();
+    let latin = "// Kundennummer f\u{fc}r das Caf\u{e9}: cr\u{e8}me br\u{fb}l\u{e9}e, na\u{ef}ve r\u{e9}sum\u{e9}, d\u{e9}j\u{e0} vu, \u{e0} la carte\nshared caf\u{e9}\n";
+    let (bytes, _, bad) = encoding_rs::WINDOWS_1252.encode(latin);
+    assert!(!bad);
+    std::fs::write(src.join("l.txt"), &bytes).unwrap();
+    let db = d.path().join("g.redb").display().to_string();
+    let s = src.display().to_string();
+
+    let (ok, out, err) = run(&[
+        "--db", &db, "index", "--org", "o", "--repo", "r", "--json", "--stats", &s,
+    ]);
+    assert!(ok, "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["stats"]["transcoded"], 2, "{v}");
+    assert_eq!(v["stats"]["lossy"], 0, "{v}");
+    // Text mode (a re-run: unchanged files still count).
+    let (ok, out, err) = run(&[
+        "--db", &db, "index", "--org", "o", "--repo", "r", "--stats", &s,
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(err.contains("encodings: transcoded=2 lossy=0"), "{err}");
+    // Without --stats, nothing about encodings.
+    let (ok, out, err) = run(&["--db", &db, "index", "--org", "o", "--repo", "r", &s]);
+    assert!(
+        ok && !err.contains("transcoded") && !out.contains("transcoded"),
+        "{out}{err}"
+    );
+
+    let (ok, out, err) = run(&["--db", &db, "describe"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("  encodings: utf-8 1, UTF-16LE 1, windows-1252 1 (lossy 0)"),
+        "{out}"
+    );
+    let (ok, out, err) = run(&["--db", &db, "describe", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        v["repos"][0]["encodings"],
+        serde_json::json!({"UTF-16LE": 1, "windows-1252": 1}),
+        "{v}"
+    );
+    assert_eq!(v["repos"][0]["lossy"], 0, "{v}");
+
+    let (ok, out, err) = run(&["--db", &db, "symbols", "wide", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["results"][0]["encoding"], "UTF-16LE", "{v}");
+    assert!(v["results"][0].get("lossy").is_none(), "{v}");
+    let (ok, out, err) = run(&["--db", &db, "symbols", "plain", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(v["results"][0].get("encoding").is_none(), "{v}");
+    let (ok, out, err) = run(&["--db", &db, "symbols", "wide"]);
+    assert!(
+        ok && out.trim_end().ends_with("\tencoding=UTF-16LE"),
+        "{out}{err}"
+    );
+    let (ok, out, err) = run(&["--db", &db, "symbols", "plain"]);
+    assert!(ok && !out.contains("encoding="), "{out}{err}");
+
+    let (ok, out, err) = run(&["--db", &db, "search", "shared", "--grain", "file", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let hits = v["results"].as_array().unwrap();
+    assert_eq!(hits.len(), 3, "{v}");
+    for h in hits {
+        let want = match h["file"].as_str().unwrap() {
+            "a.rs" => None,
+            "w.rs" => Some("UTF-16LE"),
+            "l.txt" => Some("windows-1252"),
+            f => panic!("{f}"),
+        };
+        assert_eq!(h.get("encoding").and_then(|e| e.as_str()), want, "{h}");
+    }
+    let (ok, out, err) = run(&["--db", &db, "search", "shared", "--grain", "repo", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(v["results"][0].get("encoding").is_none(), "{v}");
+}

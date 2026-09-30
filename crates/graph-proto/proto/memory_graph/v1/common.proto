@@ -168,6 +168,11 @@ message Hit {
   // Symbolic grains only: the file has symbols, but none enclosing the match
   // satisfies the grain; rolled up to the file.
   bool no_matching_symbol = 13;
+  // The hit's file was decoded from this WHATWG encoding (ADR 0007);
+  // absent for UTF-8 and for repo/org rows.
+  optional string encoding = 14;
+  // The hit's file was decoded lossily (U+FFFD replacements).
+  bool lossy = 15;
 }
 
 // graph_store::SymbolHit: a symbol with its containment path.
@@ -184,6 +189,10 @@ message SymbolHit {
   optional Span span = 9;
   // graph_core::SymbolDecl::owner, e.g. a Go method's receiver type.
   optional string owner = 10;
+  // The file's WHATWG encoding (ADR 0007); absent for UTF-8.
+  optional string encoding = 11;
+  // The file was decoded lossily.
+  bool lossy = 12;
 }
 
 // graph_store::LanguageInfo: per-language contents of a repo.
@@ -204,6 +213,10 @@ message RepoInfo {
   map<string, uint64> token_classes = 5;
   // The repo has an open (in-progress or crashed) chunked ingest batch.
   bool open_batch = 6;
+  // Files per non-UTF-8 WHATWG encoding (ADR 0007); UTF-8 is the remainder.
+  map<string, uint64> encodings = 7;
+  // Files decoded lossily.
+  uint64 lossy = 8;
 }
 
 // graph_store::IngestStats: the outcome of indexing one file.
@@ -219,6 +232,10 @@ message IngestStats {
   // Normalized path and language actually stored.
   string path = 7;
   string language = 8;
+  // The file's WHATWG encoding (ADR 0007); absent for UTF-8.
+  optional string encoding = 9;
+  // The file was decoded lossily.
+  bool lossy = 10;
 }
 
 // One source file as raw bytes (`graph_store::BatchFile`), for `Write.Index`

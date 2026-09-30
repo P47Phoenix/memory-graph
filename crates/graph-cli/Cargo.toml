@@ -99,6 +99,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+encoding_rs.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 graph-store = { path = "../graph-store" }

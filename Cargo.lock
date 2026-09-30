@@ -714,6 +714,7 @@ dependencies = [
  "clap",
  "console",
  "crossbeam-channel",
+ "encoding_rs",
  "globset",
  "graph-client",
  "graph-core",
@@ -969,6 +970,7 @@ dependencies = [
 name = "graph-mcp"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "graph-client",
  "graph-core",
  "graph-lang-rust",
