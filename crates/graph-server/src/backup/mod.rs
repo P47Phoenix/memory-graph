@@ -10,8 +10,10 @@
 //!   retries, then a log line, `mg_backup_failures_total` and
 //!   `last_backup_error`. It never blocks or delays a snapshot build or a
 //!   log purge (the build only hands it a job).
-//! * [`restore`]: `--restore file://.../snap-T-I.redb` or `.../latest`, and
-//!   the `.meta` check of a plain-path `--restore`.
+//! * [`restore`]: `--restore file://.../snap-T-I.redb`, `s3://.../snap-T-I.redb`
+//!   or `.../latest`, the `.meta` check of a plain-path `--restore`, and the
+//!   listing behind `cluster backups` (story 37).
+//! * [`Backup::upload_now`]: `cluster snapshot --upload` (story 37).
 //!
 //! Object layout (E7): `<prefix>/<cluster_id>/snap-T-I.redb` plus
 //! `snap-T-I.meta` (the unchanged snapshot sidecar JSON). The data object
@@ -38,7 +40,7 @@ pub mod uploader;
 
 pub use file::FileSink;
 pub use s3::{S3Options, S3Sink};
-pub use uploader::{Backup, BackupStats};
+pub use uploader::{Backup, BackupStats, Uploaded};
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -71,6 +73,10 @@ pub trait BackupSink: Send + Sync {
     fn delete(&self, key: &str) -> std::io::Result<()>;
     /// Where it writes, for logs (never a secret).
     fn describe(&self) -> String;
+    /// The URL of `key` that `--restore` takes (never a secret).
+    fn url_of(&self, key: &str) -> String {
+        format!("{}/{key}", self.describe())
+    }
     /// Clean up unfinished uploads under `prefix` begun before
     /// `older_than` (S3: abort stale multipart uploads); how many. A sink
     /// whose interrupted puts leave only listable objects (`file://`)
@@ -201,6 +207,23 @@ impl std::fmt::Debug for BackupConfig {
             .field("sink", &self.sink.as_ref().map(|s| s.describe()))
             .finish()
     }
+}
+
+/// Run `f` on a plain thread of its own and await it: the sinks are
+/// synchronous, and the `s3://` one refuses a thread inside a tokio
+/// runtime's context (which `spawn_blocking` threads are).
+pub async fn off_runtime<T: Send + 'static>(
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("backup-call".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(|e| format!("{what}: starting a thread: {e}"))?;
+    rx.await.map_err(|_| format!("{what}: the thread panicked"))
 }
 
 /// A parsed backup URL.

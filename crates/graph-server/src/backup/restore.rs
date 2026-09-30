@@ -1,6 +1,7 @@
 //! Verified restores (ADR 0006 E8, E10).
 //!
-//! `--restore file://<dir>/<cluster_id>/snap-T-I.redb` (or `.../latest`,
+//! `--restore file://<dir>/<cluster_id>/snap-T-I.redb` or
+//! `s3://bucket/prefix/<cluster_id>/snap-T-I.redb` (or `.../latest`,
 //! the highest committed index there): read the `.meta`, check the store
 //! format and the extractors against this binary, check the disk, download
 //! the data to `<store>.restore.tmp` while hashing it, check size and
@@ -97,6 +98,44 @@ fn committed(sink: &dyn BackupSink, dir_key: &str) -> Result<Vec<String>, StoreE
         .into_iter()
         .map(|(_, k)| k.strip_suffix(".meta").expect("a meta").to_string())
         .collect())
+}
+
+/// One committed backup as `cluster backups` lists it.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    /// The data object's key (`<dir_key>snap-T-I.redb`).
+    pub key: String,
+    pub term: u64,
+    pub index: u64,
+    /// Its `.meta`, or why it could not be read.
+    pub meta: Result<SnapshotSidecar, String>,
+}
+
+/// The committed backups (a `.meta` exists) directly under `dir_key`,
+/// highest index first, each with its `.meta` read.
+pub fn list_committed(sink: &dyn BackupSink, dir_key: &str) -> Result<Vec<Listed>, StoreError> {
+    committed(sink, dir_key)?
+        .into_iter()
+        .map(|stem| {
+            let (term, index) = parse_stem(&format!("{stem}.meta")).expect("a committed stem");
+            let meta_key = format!("{stem}.meta");
+            let mut buf = Vec::new();
+            let meta = match sink.get(&meta_key, &mut buf) {
+                // Listed, then gone (retention): not committed any more.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => Err(format!("reading `{meta_key}`: {e}")),
+                Ok(_) => serde_json::from_slice::<SnapshotSidecar>(&buf)
+                    .map_err(|e| format!("`{meta_key}` is not a snapshot meta: {e}")),
+            };
+            Ok(Some(Listed {
+                key: format!("{stem}.redb"),
+                term,
+                index,
+                meta,
+            }))
+        })
+        .filter_map(Result::transpose)
+        .collect()
 }
 
 /// Read the sidecar of `stem`.
@@ -252,16 +291,38 @@ pub fn restore_from_sink(
         )),
     })
 }
-/// `--restore <url>`: a `file://` URL naming `.../snap-T-I.redb` or
-/// `.../latest`.
-pub fn restore_from_url(url: &str, store: &Path, c: &RestoreChecks) -> Result<(), StoreError> {
+/// `--restore <url>`: a `file://` or `s3://` URL naming
+/// `.../snap-T-I.redb` or `.../latest`. `s3` holds the `s3://` settings
+/// (`--backup-endpoint`, `--backup-region`, `--backup-virtual-host`,
+/// `--backup-credentials-file`, `--backup-profile`). Blocking: an `s3://`
+/// restore must run off the async runtime (e.g. in `spawn_blocking`).
+pub fn restore_from_url(
+    url: &str,
+    store: &Path,
+    c: &RestoreChecks,
+    s3: &super::S3Options,
+) -> Result<(), StoreError> {
     let path = match parse_url(url).map_err(refuse)? {
         Location::File(path) => path,
-        Location::S3(_) => {
-            return Err(refuse(format!(
-                "`{url}`: restoring from s3:// is not in this release yet (ADR 0006 story 37); \
-                 copy the backup's .redb and .meta to a directory and restore from file://"
-            )))
+        Location::S3(u) => {
+            // The last segment names the backup; the rest is the sink.
+            let (dir, name) = match u.prefix.rsplit_once('/') {
+                Some((dir, name)) => (dir.to_string(), name.to_string()),
+                None => (String::new(), u.prefix.clone()),
+            };
+            if name.is_empty() {
+                return Err(refuse(format!(
+                    "`{url}` names no snapshot: expected \
+                     s3://bucket/prefix/<cluster_id>/snap-<term>-<index>.redb or .../latest"
+                )));
+            }
+            let sink_url = if dir.is_empty() {
+                format!("s3://{}", u.bucket)
+            } else {
+                format!("s3://{}/{dir}", u.bucket)
+            };
+            let sink = super::S3Sink::new(&sink_url, s3.clone()).map_err(refuse)?;
+            return restore_from_sink(&sink, "", &name, store, c).map(|_| ());
         }
     };
     let name = path

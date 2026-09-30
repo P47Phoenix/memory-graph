@@ -752,6 +752,21 @@ macro_rules! on_leader {
     };
 }
 
+/// How long `UploadSnapshot` waits for the upload's commit once the
+/// snapshot is built.
+const UPLOAD_WAIT: Duration = Duration::from_secs(3600);
+
+/// This node's uploader, or `FAILED_PRECONDITION` without `--backup-url`.
+fn backup_of(ctx: &Ctx) -> Result<crate::backup::Backup, Status> {
+    ctx.backup.clone().ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "node {} has no backup location (start it with --backup-url file://<dir> or \
+             s3://bucket/prefix)",
+            ctx.info.node_id
+        ))
+    })
+}
+
 type SnapshotStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::TriggerSnapshotResponse, Status>> + Send>>;
 
@@ -1153,6 +1168,84 @@ impl pb::admin_server::Admin for AdminService {
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
+    }
+
+    async fn upload_snapshot(
+        &self,
+        req: Request<pb::UploadSnapshotRequest>,
+    ) -> Result<Response<pb::UploadSnapshotResponse>, Status> {
+        // The leader uploads (its backup settings count, not this node's).
+        on_leader!(self, req, upload_snapshot);
+        let backup = backup_of(&self.ctx)?;
+        self.ctx
+            .raft
+            .snapshot_now(SNAPSHOT_WAIT)
+            .await
+            .map_err(status)?;
+        let (side, path) = self
+            .ctx
+            .raft
+            .snapshots
+            .current()
+            .ok_or_else(|| Status::internal("the snapshot was built but is not on disk"))?;
+        let up = tokio::task::spawn_blocking(move || backup.upload_now(&side, &path, UPLOAD_WAIT))
+            .await
+            .map_err(|e| Status::internal(format!("upload task: {e}")))?
+            .map_err(|e| status(StoreError::Storage(format!("--upload: {e}"))))?;
+        tracing::info!(url = %up.url, index = up.side.index, "cluster snapshot --upload: committed");
+        Ok(Response::new(pb::UploadSnapshotResponse {
+            backup: Some(pb::BackupEntry {
+                url: up.url,
+                term: up.side.term,
+                index: up.side.index,
+                size: up.side.size,
+                sha256: up.side.sha256,
+                extractors_hash: up.side.extractors_hash,
+                store_format_version: up.side.store_format_version,
+                error: String::new(),
+            }),
+            node_id: self.ctx.info.node_id,
+        }))
+    }
+
+    async fn list_backups(
+        &self,
+        _req: Request<pb::ListBackupsRequest>,
+    ) -> Result<Response<pb::ListBackupsResponse>, Status> {
+        let backup = backup_of(&self.ctx)?;
+        let location = backup.sink().describe();
+        let b = backup.clone();
+        let listed = crate::backup::off_runtime("listing the backups", move || b.list())
+            .await
+            .map_err(Status::internal)?
+            .map_err(|e| status(StoreError::Storage(format!("listing the backups: {e}"))))?;
+        let sink = backup.sink();
+        let backups = listed
+            .into_iter()
+            .map(|l| {
+                let mut e = pb::BackupEntry {
+                    url: sink.url_of(&l.key),
+                    term: l.term,
+                    index: l.index,
+                    ..Default::default()
+                };
+                match l.meta {
+                    Ok(side) => {
+                        e.size = side.size;
+                        e.sha256 = side.sha256;
+                        e.extractors_hash = side.extractors_hash;
+                        e.store_format_version = side.store_format_version;
+                    }
+                    Err(err) => e.error = err,
+                }
+                e
+            })
+            .collect();
+        Ok(Response::new(pb::ListBackupsResponse {
+            location,
+            cluster_id: self.ctx.info.cluster_id(),
+            backups,
+        }))
     }
 
     async fn metrics(

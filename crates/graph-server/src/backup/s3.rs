@@ -1117,6 +1117,10 @@ impl BackupSink for S3Sink {
     fn describe(&self) -> String {
         format!("{} via {}", self.url, self.endpoint)
     }
+
+    fn url_of(&self, key: &str) -> String {
+        format!("{}/{key}", self.url)
+    }
 }
 
 #[cfg(test)]
