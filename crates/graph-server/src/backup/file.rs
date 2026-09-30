@@ -62,7 +62,14 @@ impl BackupSink for FileSink {
             .parent()
             .expect("a key has a file name")
             .to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+        // A missing backup directory (and `<cluster>/`) is created; the new
+        // directory's entry is made durable in its parent.
+        if !dir.is_dir() {
+            std::fs::create_dir_all(&dir)?;
+            if let Some(parent) = dir.parent() {
+                sync_dir(parent);
+            }
+        }
         let mut part = target.as_os_str().to_owned();
         part.push(format!("{PART_MARK}{:08x}", rand::random::<u32>()));
         let part = PathBuf::from(part);

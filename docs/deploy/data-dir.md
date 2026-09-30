@@ -68,7 +68,7 @@ get backups into S3 before `s3://` ships, `aws s3 sync` the directory.
   and counted: `mg_backup_failures_total`, and `cluster status` shows `last_backup_error`. The
   last success is `mg_backup_last_success_timestamp` / `mg_backup_last_index`.
 - The upload reads the snapshot through an open handle, not a copy: on Windows the handle is
-  opened with delete sharing, so a newer snapshot can still replace the old one while it is read,
+  opened with delete sharing, so (on NTFS with POSIX delete semantics, Windows 10 1809 and later) a newer snapshot can still replace the old one while it is read,
   and the bytes read are checked against the snapshot's SHA-256 before the `.meta` is written.
 - All of these are also `serve --config` TOML keys (`backup-url`, `backup-keep`, `backup-on`).
 
@@ -98,7 +98,7 @@ hash (`--restore-allow-extractor-mismatch` accepts other extractors: the store s
 affected files re-extract on their next index; the format check has no override). The free disk
 must cover `--min-free-disk` plus the backup. The data is downloaded to `graph.redb.restore.tmp`
 and its size and SHA-256 are checked against the `.meta` before it becomes the store; any
-mismatch is refused and the temporary file removed. A plain `--restore <file>` with a `.meta` next
+mismatch is refused and the temporary file removed. A refused restore leaves the data directory without a store (the directory itself may remain), and the same command can be retried. With `latest`, a pair that fails verification is skipped for the next-highest committed one. A missing `--backup-url` directory is created on the first upload. A plain `--restore <file>` with a `.meta` next
 to it (a copy of a backup pair) is verified the same way; without one it restores with a warning.
 
 In Compose: `down -v`, then start node1 once by hand with `--restore` on its volume (for example

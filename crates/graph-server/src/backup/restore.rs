@@ -5,7 +5,8 @@
 //! format and the extractors against this binary, check the disk, download
 //! the data to `<store>.restore.tmp` while hashing it, check size and
 //! sha256, and only then put it in place ([`crate::paths::place_restore`]).
-//! Any refusal removes `<store>.restore.tmp`, the only file written.
+//! Any refusal removes `<store>.restore.tmp`; the data directory is left
+//! without a store, so the same restore can be retried.
 //!
 //! A plain-path `--restore <file>` verifies a sibling `.meta` the same way
 //! when there is one, and warns when there is none (a `cluster snapshot
@@ -64,53 +65,56 @@ pub fn check_versions(side: &SnapshotSidecar, c: &RestoreChecks) -> Result<(), S
     Ok(())
 }
 
-/// Resolve `key` (a `snap-T-I.redb` name or `latest`) in `sink`, relative
-/// to `dir_key` (`""` or `<something>/`): the data key and its sidecar.
-fn resolve(
-    sink: &dyn BackupSink,
-    dir_key: &str,
-    name: &str,
-) -> Result<(String, SnapshotSidecar), StoreError> {
-    let io = |what: &str, e: std::io::Error| refuse(format!("{what}: {e}"));
-    let stem = if name == "latest" {
-        let objects = sink
-            .list(dir_key)
-            .map_err(|e| io(&format!("listing `{}`", sink.describe()), e))?;
-        let best = objects
-            .iter()
-            .filter(|o| o.key.ends_with(".meta") && !o.key[dir_key.len()..].contains('/'))
-            .filter_map(|o| parse_stem(&o.key).map(|(t, i)| ((i, t), o.key.clone())))
-            .max();
-        let Some((_, meta)) = best else {
-            return Err(refuse(format!(
-                "no committed backup (no snap-*.meta) under {}/{dir_key}",
-                sink.describe()
-            )));
-        };
-        meta.strip_suffix(".meta").expect("a meta").to_string()
-    } else {
-        let Some(stem) = name.strip_suffix(".redb") else {
-            return Err(refuse(format!(
-                "`{name}`: name a snapshot (`snap-<term>-<index>.redb`) or `latest`"
-            )));
-        };
-        format!("{dir_key}{stem}")
-    };
+/// A failed attempt at one backup: `next` says whether `latest` may fall
+/// back to the next-highest committed pair (a damaged or incomplete pair),
+/// or must stop (versions, disk, local I/O).
+struct Attempt {
+    err: StoreError,
+    next: bool,
+}
+
+fn stop(err: StoreError) -> Attempt {
+    Attempt { err, next: false }
+}
+
+fn skip(err: StoreError) -> Attempt {
+    Attempt { err, next: true }
+}
+
+/// The committed stems (`<dir_key>snap-T-I`) under `dir_key`, highest
+/// index first.
+fn committed(sink: &dyn BackupSink, dir_key: &str) -> Result<Vec<String>, StoreError> {
+    let objects = sink
+        .list(dir_key)
+        .map_err(|e| refuse(format!("listing `{}`: {e}", sink.describe())))?;
+    let mut metas: Vec<((u64, u64), String)> = objects
+        .iter()
+        .filter(|o| o.key.ends_with(".meta") && !o.key[dir_key.len()..].contains('/'))
+        .filter_map(|o| parse_stem(&o.key).map(|(t, i)| ((i, t), o.key.clone())))
+        .collect();
+    metas.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(metas
+        .into_iter()
+        .map(|(_, k)| k.strip_suffix(".meta").expect("a meta").to_string())
+        .collect())
+}
+
+/// Read the sidecar of `stem`.
+fn fetch_meta(sink: &dyn BackupSink, stem: &str) -> Result<SnapshotSidecar, Attempt> {
     let meta_key = format!("{stem}.meta");
     let mut buf = Vec::new();
     match sink.get(&meta_key, &mut buf) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(refuse(format!(
+            return Err(skip(refuse(format!(
                 "`{meta_key}` does not exist, so `{stem}.redb` is not a committed backup (an \
                  upload that never finished)"
-            )))
+            ))))
         }
-        Err(e) => return Err(io(&format!("reading `{meta_key}`"), e)),
+        Err(e) => return Err(stop(refuse(format!("reading `{meta_key}`: {e}")))),
     }
-    let side: SnapshotSidecar = serde_json::from_slice(&buf)
-        .map_err(|e| refuse(format!("`{meta_key}` is not a snapshot meta: {e}")))?;
-    Ok((format!("{stem}.redb"), side))
+    serde_json::from_slice(&buf)
+        .map_err(|e| skip(refuse(format!("`{meta_key}` is not a snapshot meta: {e}"))))
 }
 
 /// Writes through to a file, hashing and counting.
@@ -132,16 +136,16 @@ impl Write for HashingFile {
     }
 }
 
-/// Download, verify and place a backup from `sink` into `store`.
-pub fn restore_from_sink(
+/// Download, verify and place the backup `stem` into `store`.
+fn restore_one(
     sink: &dyn BackupSink,
-    dir_key: &str,
-    name: &str,
+    stem: &str,
     store: &Path,
     c: &RestoreChecks,
-) -> Result<SnapshotSidecar, StoreError> {
-    let (data_key, side) = resolve(sink, dir_key, name)?;
-    check_versions(&side, c)?;
+) -> Result<SnapshotSidecar, Attempt> {
+    let side = fetch_meta(sink, stem)?;
+    let data_key = format!("{stem}.redb");
+    check_versions(&side, c).map_err(stop)?;
     if let Some(probe) = &c.probe {
         let dir = store
             .parent()
@@ -150,13 +154,13 @@ pub fn restore_from_sink(
         if let Some(free) = probe(dir) {
             let need = c.min_free_disk.saturating_add(side.size);
             if free < need {
-                return Err(StoreError::Storage(format!(
+                return Err(stop(StoreError::Storage(format!(
                     "disk full: --restore needs {need} bytes free in `{}` (the backup's {} \
                      plus --min-free-disk {}), and {free} are",
                     dir.display(),
                     side.size,
                     c.min_free_disk
-                )));
+                ))));
             }
         }
     }
@@ -168,7 +172,7 @@ pub fn restore_from_sink(
     };
     let mut w = HashingFile {
         f: std::fs::File::create(&tmp)
-            .map_err(|e| refuse(format!("creating `{}`: {e}", tmp.display())))?,
+            .map_err(|e| stop(refuse(format!("creating `{}`: {e}", tmp.display()))))?,
         hash: Sha256::new(),
         n: 0,
     };
@@ -177,19 +181,23 @@ pub fn restore_from_sink(
         .and_then(|n| w.f.sync_all().map(|()| n));
     if let Err(e) = got {
         drop(w);
-        return Err(fail(refuse(format!("downloading `{data_key}`: {e}"))));
+        let next = e.kind() == std::io::ErrorKind::NotFound;
+        return Err(Attempt {
+            err: fail(refuse(format!("downloading `{data_key}`: {e}"))),
+            next,
+        });
     }
     let sha = hex(&w.hash.clone().finalize());
     let n = w.n;
     drop(w);
     if n != side.size || sha != side.sha256 {
-        return Err(fail(refuse(format!(
+        return Err(skip(fail(refuse(format!(
             "`{data_key}` is {n} bytes with sha256 {sha}, but its meta records {} bytes with \
              sha256 {}: the backup is damaged; refusing it",
             side.size, side.sha256
-        ))));
+        )))));
     }
-    crate::paths::place_restore(&tmp, store)?;
+    crate::paths::place_restore(&tmp, store).map_err(stop)?;
     tracing::info!(
         from = %format!("{}/{data_key}", sink.describe()),
         index = side.index,
@@ -199,6 +207,51 @@ pub fn restore_from_sink(
     Ok(side)
 }
 
+/// Download, verify and place a backup from `sink` into `store`: `name` is
+/// `snap-T-I.redb` under `dir_key` (`""` or `<something>/`), or `latest`,
+/// which falls back to the next-highest committed pair when one fails
+/// verification (e.g. a pair two nodes sharing a URL wrote interleaved).
+pub fn restore_from_sink(
+    sink: &dyn BackupSink,
+    dir_key: &str,
+    name: &str,
+    store: &Path,
+    c: &RestoreChecks,
+) -> Result<SnapshotSidecar, StoreError> {
+    if name != "latest" {
+        let valid = name
+            .strip_suffix(".redb")
+            .filter(|s| parse_stem(&format!("{s}.redb")).is_some());
+        let Some(stem) = valid else {
+            return Err(refuse(format!(
+                "`{name}`: name a backup (`snap-<term>-<index>.redb`) or `latest`"
+            )));
+        };
+        return restore_one(sink, &format!("{dir_key}{stem}"), store, c).map_err(|a| a.err);
+    }
+    let stems = committed(sink, dir_key)?;
+    let mut last = None;
+    for stem in &stems {
+        match restore_one(sink, stem, store, c) {
+            Ok(side) => return Ok(side),
+            Err(Attempt { err, next: true }) => {
+                tracing::warn!(backup = %stem, error = %err, "--restore latest: skipping it");
+                last = Some(err);
+            }
+            Err(Attempt { err, .. }) => return Err(err),
+        }
+    }
+    Err(match last {
+        Some(e) => refuse(format!(
+            "no committed backup under {}/{dir_key} verifies; the newest failure: {e}",
+            sink.describe()
+        )),
+        None => refuse(format!(
+            "no committed backup (no snap-*.meta) under {}/{dir_key}",
+            sink.describe()
+        )),
+    })
+}
 /// `--restore <url>`: a `file://` URL naming `.../snap-T-I.redb` or
 /// `.../latest`.
 pub fn restore_from_url(url: &str, store: &Path, c: &RestoreChecks) -> Result<(), StoreError> {

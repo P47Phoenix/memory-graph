@@ -9,7 +9,7 @@ use graph_server::backup::{BackupConfig, BackupOn, BackupSink, FileSink, ObjectI
 use graph_server::testing::{ClusterTestbed, TestServer, CLUSTER_WAIT, TEST_RAFT};
 use graph_server::{InitMode, RaftSettings, ServeConfig};
 use graph_store::conformance::run_differential;
-use graph_store::Store;
+use graph_store::{Store, StoreRead};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -397,4 +397,110 @@ fn only_the_leader_uploads_across_a_transfer() {
     assert_eq!(uploads(&tb, third), 0);
     let cluster = tb.client(target).admin_status().unwrap().cluster_id;
     assert_eq!(metas(&dir, &cluster).len(), 2);
+}
+
+/// Two nodes sharing a URL wrote one pair interleaved (one node's data,
+/// the other's `.meta`): `latest` skips it for the next committed pair.
+#[test]
+fn latest_skips_an_interleaved_pair() {
+    let _w = watchdog("latest_skips_an_interleaved_pair", TEST_LIMIT);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("b");
+    let tb = ClusterTestbed::with_backup(1, exts(), cfg(file_url(&dir), 0));
+    let first = write_and_snapshot(&tb, 1, 0);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let second = write_and_snapshot(&tb, 1, 1);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let cluster = tb.client(1).admin_status().unwrap().cluster_id;
+    let (old, new) = (
+        data_of(&dir, &cluster, first),
+        data_of(&dir, &cluster, second),
+    );
+    // The other node's data under the newest key, this node's .meta.
+    std::fs::copy(&old, &new).unwrap();
+    let url = format!("{}/{cluster}/latest", file_url(&dir));
+    let to = root.path().join("r");
+    let s = TestServer::try_start_config(restore_cfg(&to, &url), exts()).unwrap();
+    let r = RemoteStore::connect(ClientConfig::new(s.endpoint())).unwrap();
+    assert_eq!(
+        r.count_nodes(graph_core::NodeKind::File).unwrap(),
+        1,
+        "restored the older pair"
+    );
+    // Naming the damaged pair is still refused.
+    let name = new.file_name().unwrap().to_string_lossy().into_owned();
+    let named = format!("{}/{cluster}/{name}", file_url(&dir));
+    let e = TestServer::try_start_config(restore_cfg(&root.path().join("r2"), &named), exts())
+        .err()
+        .expect("a damaged pair is refused by name");
+    assert!(e.to_string().contains("sha256"), "{e}");
+}
+
+/// A plain file whose sibling `.meta` describes another snapshot.
+#[test]
+fn a_plain_restore_with_a_mismatched_meta_is_refused() {
+    let _w = watchdog("a_plain_restore_with_a_mismatched_meta", TEST_LIMIT);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("b");
+    let tb = ClusterTestbed::with_backup(1, exts(), cfg(file_url(&dir), 0));
+    let a = write_and_snapshot(&tb, 1, 0);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let b = write_and_snapshot(&tb, 1, 1);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let cluster = tb.client(1).admin_status().unwrap().cluster_id;
+    let p = root.path().join("x.redb");
+    std::fs::copy(data_of(&dir, &cluster, a), &p).unwrap();
+    std::fs::copy(
+        data_of(&dir, &cluster, b).with_extension("meta"),
+        p.with_extension("meta"),
+    )
+    .unwrap();
+    let to = root.path().join("r");
+    let e = TestServer::try_start_config(restore_cfg(&to, &p), exts())
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("sha256"), "{e}");
+    assert!(!to.join("graph.redb").exists() && !to.join("graph.redb.restore.tmp").exists());
+}
+
+/// Too little free disk for `--min-free-disk` plus the backup: refused
+/// before anything is downloaded.
+#[test]
+fn a_restore_without_disk_room_is_refused() {
+    let _w = watchdog("a_restore_without_disk_room_is_refused", TEST_LIMIT);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("b");
+    let tb = ClusterTestbed::with_backup(1, exts(), cfg(file_url(&dir), 0));
+    write_and_snapshot(&tb, 1, 0);
+    tb.wait_backups_idle(CLUSTER_WAIT);
+    let cluster = tb.client(1).admin_status().unwrap().cluster_id;
+    let url = format!("{}/{cluster}/latest", file_url(&dir));
+    let to = root.path().join("r");
+    let mut c = restore_cfg(&to, &url);
+    c.min_free_disk = 1 << 20;
+    c.free_space_probe = Some(Arc::new(|_: &Path| Some(1 << 20)));
+    let e = TestServer::try_start_config(c, exts())
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("disk full"), "{e}");
+    assert!(!to.join("graph.redb").exists() && !to.join("graph.redb.restore.tmp").exists());
+}
+
+/// `--backup-url s3://` is refused at start-up, before anything is written.
+#[test]
+fn an_s3_backup_url_is_refused_before_anything_is_written() {
+    let root = tempfile::tempdir().unwrap();
+    let to = root.path().join("n");
+    let mut c = ServeConfig::for_data_dir(
+        &to,
+        "127.0.0.1:0".parse().unwrap(),
+        InitMode::Bootstrap { restore: None },
+        Some(1),
+    );
+    c.backup = Some(BackupConfig::new("s3://bucket/prefix"));
+    let e = TestServer::try_start_config(c, exts())
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("story 36"), "{e}");
+    assert!(!to.exists(), "nothing written");
 }

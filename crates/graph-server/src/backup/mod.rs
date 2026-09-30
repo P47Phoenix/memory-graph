@@ -22,7 +22,7 @@
 //! S1) is settled by an open handle, not a `<snapshot>.backup.tmp` copy:
 //! the uploader opens the snapshot file once and streams from that handle.
 //! Rust's `File::open` on Windows asks for `FILE_SHARE_READ | WRITE |
-//! DELETE`, so a newer build can still remove the old pair while it is
+//! DELETE`, so (on NTFS with POSIX delete semantics, Windows 10 1809 and later) a newer build can still remove the old pair while it is
 //! read (as on Unix, where an unlinked file stays readable through an open
 //! handle), and a copy would cost a second snapshot's worth of disk that
 //! the disk guard does not budget for. The bytes read are hashed on the way
