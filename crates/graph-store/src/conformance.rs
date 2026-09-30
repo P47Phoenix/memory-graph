@@ -99,6 +99,11 @@ pub const CASES: &[(&str, Case)] = &[
     ("backslash_paths", backslash_paths),
     ("prune_backslash_keep", prune_backslash_keep),
     ("owner_hint_class_grain", owner_hint_class_grain),
+    (
+        "extractor_gaps_name_a_missing_extractor",
+        extractor_gaps_name_a_missing_extractor,
+    ),
+    ("space_usage_is_consistent", space_usage_is_consistent),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1982,6 +1987,67 @@ fn claimed_extension_extractor(h: &Harness) {
     let info = s.describe(Some("o"), Some("r")).unwrap();
     let langs: Vec<&String> = info[0].languages.keys().collect();
     assert_eq!(langs, vec!["toylang", "zig"]);
+}
+
+/// #74: a store opened without an extractor that indexed stored files names
+/// that language and the stored extractor version. A client backend parses
+/// on its server (which checks at startup), so it may report nothing.
+fn extractor_gaps_name_a_missing_extractor(h: &Harness) {
+    let s = (h.open)(vec![Box::new(ToyExtractor)]).expect("open store");
+    s.index_bytes("o", "r", "a.toy", b"alpha beta\n", None)
+        .unwrap();
+    s.index_bytes("o", "r2", "b.toy", b"gamma\n", None).unwrap();
+    // Pre-extracted symbols (no fingerprint) never count as a gap.
+    s.ingest_file("o", "r", "lib.rs", "rust", &rust_extraction(RUST))
+        .unwrap();
+    assert_eq!(s.extractor_gaps(None, None).unwrap(), vec![]);
+    drop(s);
+    let s = open(h);
+    let gaps = s.extractor_gaps(None, None).unwrap();
+    let scoped = s.extractor_gaps(Some("o"), Some("r2")).unwrap();
+    let unknown = s.extractor_gaps(Some("nope"), None).unwrap();
+    let before = s.search(&Query::new("alpha")).unwrap();
+    if !(h.accepts_remote_prepared && gaps.is_empty()) {
+        let g = |repo: &str| crate::ExtractorGap {
+            org: "o".into(),
+            repo: repo.into(),
+            language: "toylang".into(),
+            stored_version: "toy-1".into(),
+            symbols: 1,
+        };
+        assert_eq!(gaps, vec![g("r"), g("r2")]);
+        assert_eq!(scoped, vec![g("r2")]);
+        let msg = gaps[0].to_string();
+        assert!(msg.contains("toylang") && msg.contains("toy-1"), "{msg}");
+    }
+    assert!(unknown.is_empty());
+    // Asking changes nothing.
+    assert_eq!(s.search(&Query::new("alpha")).unwrap(), before);
+    // Once re-indexed without the extractor, no symbols remain: no gap.
+    s.index_bytes_opts(
+        "o",
+        "r2",
+        "b.toy",
+        b"gamma\n",
+        Some("toylang"),
+        None,
+        IndexOptions { reindex: true },
+    )
+    .unwrap();
+    assert!(s.extractor_gaps(Some("o"), Some("r2")).unwrap().is_empty());
+}
+
+/// #90: `space_usage`, where a backend reports it, is consistent (live
+/// data within the file) and changes no read.
+fn space_usage_is_consistent(h: &Harness) {
+    let s = open(h);
+    s.index_bytes("o", "r", "a.txt", b"alpha beta", None)
+        .unwrap();
+    let before = s.search(&Query::new("alpha")).unwrap();
+    if let Some(u) = s.space_usage().unwrap() {
+        assert!(u.live_bytes > 0 && u.live_bytes <= u.file_bytes, "{u:?}");
+    }
+    assert_eq!(s.search(&Query::new("alpha")).unwrap(), before);
 }
 
 /// Stats with the backend-specific node id blanked, for comparing two repos.

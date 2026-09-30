@@ -3701,6 +3701,27 @@ impl Store for V2Store {
     fn vacuum(&self) -> Result<VacuumStats> {
         V2Store::vacuum(self)
     }
+    fn extractor_gaps(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+    ) -> Result<Vec<crate::ExtractorGap>> {
+        crate::common::extractor_gaps_in(&self.db.begin_read()?, &self.registry, org, repo)
+    }
+    fn space_usage(&self) -> Result<Option<crate::SpaceUsage>> {
+        // Pages freed by a commit are released only by later commits: two
+        // empty ones make `allocated_pages` exact (as `compact` does).
+        for _ in 0..2 {
+            self.db.begin_write()?.commit()?;
+        }
+        let wt = self.db.begin_write()?;
+        let s = wt.stats()?;
+        wt.abort()?;
+        Ok(Some(crate::SpaceUsage {
+            file_bytes: std::fs::metadata(&self.path).map_or(0, |m| m.len()),
+            live_bytes: s.allocated_pages() * s.page_size() as u64,
+        }))
+    }
 }
 
 /// The v2 per-file work that needs no database: done by `Store::prepare` on

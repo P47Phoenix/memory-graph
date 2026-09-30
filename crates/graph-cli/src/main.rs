@@ -1457,6 +1457,7 @@ fn run() -> Result<i32> {
                 }
             }
             let store = open_for_indexing(&target, overrides)?;
+            graph_cli::warn_extractor_gaps(&*store, &org, &repo);
             let st = store.index_bytes_opts(
                 &org,
                 &repo,
