@@ -1,5 +1,6 @@
 //! Language-agnostic schema, `Extractor` trait and fallback tokenizer.
 //! No storage or query dependencies; no language-specific types.
+pub mod encoding;
 pub mod extractor;
 pub mod language;
 pub mod scan;
