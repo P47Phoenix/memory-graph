@@ -20,13 +20,76 @@
 //! computed members (`[Symbol.iterator]() {}`), class-field arrows
 //! (`x = () => {}`), object-literal methods, anonymous
 //! `module.exports = function () {}`.
-use graph_core::scan::{code_close_table, matching_close, span_between, NestedEnds, Step};
+use graph_core::scan::{
+    code_close_table, mark_keywords, matching_close, span_between, NestedEnds, Step,
+};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 pub struct JavaScriptExtractor;
+
+/// JavaScript's reserved words (ECMAScript, always reserved). Words that are
+/// valid identifiers in some code (`let`, `static`, `yield`, `await`,
+/// `async`, `of`, `get`, `set`, and the strict-mode-only `implements`,
+/// `package`, ...) stay identifiers.
+pub const KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+];
+
+/// Classes [`KEYWORDS`] as `keyword` in JavaScript/TypeScript tokens, except
+/// where a reserved word is a property name: after `.` / `?.` or a private
+/// `#`, or an object-literal key (`{ default: 1, new: 2 }`: preceded by `{`
+/// or `,` and followed by `:`).
+pub fn mark_js_keywords(tokens: &mut [TokenDecl]) {
+    mark_keywords(tokens, KEYWORDS, |t, i| {
+        let code = |d: &&TokenDecl| d.class != TokenClass::Comment;
+        let prev = t[..i].iter().rev().find(code);
+        let next = t[i + 1..].iter().find(code);
+        match prev.map(|p| p.text.as_str()) {
+            Some("." | "?.") => true,
+            Some("#") => t[i - 1].span.end == t[i].span.start,
+            Some("{" | ",") => next.is_some_and(|n| n.text == ":"),
+            _ => false,
+        }
+    });
+}
 
 /// Tokenizer dialect used for JavaScript.
 pub const JS_TOKENIZER: TokenizerOptions = TokenizerOptions {
@@ -45,12 +108,15 @@ impl Extractor for JavaScriptExtractor {
     }
 
     fn version(&self) -> String {
-        format!("javascript-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("javascript-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, JS_TOKENIZER);
+        let mut tokens = tokenize_with(source, JS_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        mark_js_keywords(&mut tokens);
         Extraction {
             symbols,
             tokens,

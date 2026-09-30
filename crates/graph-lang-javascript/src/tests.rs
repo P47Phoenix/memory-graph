@@ -245,3 +245,32 @@ proptest! {
             prop_assert_eq!(ex.extract(&src).symbols, without_memo(ex, &src), "{}", src);
     }
 }
+
+/// #143: reserved words are classed `keyword`; a contextual word (`let`) and
+/// reserved words used as property names (`a.new`, `a?.delete`, `#if`,
+/// `{ default: 1 }`) stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    use graph_core::TokenClass;
+    let src = "function f() { let o = { default: 1, class: 2 }; return a.new + a?.delete; }\nclass A { #if = 1 }";
+    let toks = JavaScriptExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("function"), [TokenClass::Keyword]);
+    assert_eq!(class("return"), [TokenClass::Keyword]);
+    assert_eq!(class("let"), [TokenClass::Identifier]);
+    for w in ["default", "new", "delete", "if"] {
+        assert_eq!(class(w), [TokenClass::Identifier], "{w}");
+    }
+    assert_eq!(
+        class("class"),
+        [TokenClass::Identifier, TokenClass::Keyword]
+    );
+    assert!(JavaScriptExtractor
+        .version()
+        .starts_with("javascript-scan-1+kw1+tok"));
+}

@@ -25,11 +25,94 @@
 //! fixed-size buffers (`fixed byte b[4];`) and top-level local functions are
 //! not symbols; a string nested inside an interpolation hole (`$"{"x"}"`)
 //! ends the literal early (a tokenizer limit).
-use graph_core::scan::{code_close_table, span_between};
+use graph_core::scan::{code_close_table, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+/// C#'s reserved keywords. Contextual keywords (`var`, `async`, `await`,
+/// `get`, `set`, `record`, `where`, ...) are also valid identifiers and stay
+/// identifiers.
+const KEYWORDS: &[&str] = &[
+    "abstract",
+    "as",
+    "base",
+    "bool",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "checked",
+    "class",
+    "const",
+    "continue",
+    "decimal",
+    "default",
+    "delegate",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "event",
+    "explicit",
+    "extern",
+    "false",
+    "finally",
+    "fixed",
+    "float",
+    "for",
+    "foreach",
+    "goto",
+    "if",
+    "implicit",
+    "in",
+    "int",
+    "interface",
+    "internal",
+    "is",
+    "lock",
+    "long",
+    "namespace",
+    "new",
+    "null",
+    "object",
+    "operator",
+    "out",
+    "override",
+    "params",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "ref",
+    "return",
+    "sbyte",
+    "sealed",
+    "short",
+    "sizeof",
+    "stackalloc",
+    "static",
+    "string",
+    "struct",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "uint",
+    "ulong",
+    "unchecked",
+    "unsafe",
+    "ushort",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "while",
+];
 
 /// `(c, hi)` -> `expression_end` from `c`.
 type ExprMemo = RefCell<HashMap<(usize, usize), Option<(usize, usize)>>>;
@@ -52,12 +135,18 @@ impl Extractor for CSharpExtractor {
     }
 
     fn version(&self) -> String {
-        format!("csharp-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("csharp-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, CSHARP_TOKENIZER);
+        let mut tokens = tokenize_with(source, CSHARP_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        // `@class` is a verbatim identifier: `@` right before the word.
+        mark_keywords(&mut tokens, KEYWORDS, |t, i| {
+            i > 0 && t[i - 1].text == "@" && t[i - 1].span.end == t[i].span.start
+        });
         Extraction {
             symbols,
             tokens,

@@ -257,3 +257,25 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword`; contextual words stay
+/// identifiers (this language has no escaped identifiers).
+#[test]
+fn keywords_are_classed_keyword() {
+    let toks = GoExtractor
+        .extract("package p\nfunc f() { x := nil; _ = x }\n")
+        .tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    for w in ["package", "func"] {
+        assert_eq!(class(w), [graph_core::TokenClass::Keyword], "{w}");
+    }
+    for w in ["nil", "p", "f"] {
+        assert_eq!(class(w), [graph_core::TokenClass::Identifier], "{w}");
+    }
+    assert!(GoExtractor.version().starts_with("go-scan-2+kw1+tok"));
+}

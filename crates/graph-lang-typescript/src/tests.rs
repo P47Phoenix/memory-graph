@@ -351,3 +351,27 @@ fn overload_signatures_without_semicolons() {
         ]
     );
 }
+
+/// #143: JavaScript's reserved words are classed `keyword` in TypeScript;
+/// TypeScript's contextual words (`type`, `interface`) and a property name
+/// (`x.import`) stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    use graph_core::TokenClass;
+    let src = "export interface I { a: number }\ntype T = string;\nconst x = y.import;";
+    let toks = TypeScriptExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("export"), [TokenClass::Keyword]);
+    assert_eq!(class("const"), [TokenClass::Keyword]);
+    assert_eq!(class("interface"), [TokenClass::Identifier]);
+    assert_eq!(class("type"), [TokenClass::Identifier]);
+    assert_eq!(class("import"), [TokenClass::Identifier]);
+    assert!(TypeScriptExtractor
+        .version()
+        .starts_with("typescript-scan-2+kw1+tok"));
+}

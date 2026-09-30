@@ -351,3 +351,25 @@ fn semi_after_memo_matches_fresh_scans() {
     }
     assert!(fresh.iter().any(Option::is_some) && fresh.iter().any(Option::is_none));
 }
+
+/// #143: reserved words are classed `keyword`; contextual words stay
+/// identifiers (this language has no escaped identifiers).
+#[test]
+fn keywords_are_classed_keyword() {
+    let toks = JavaExtractor
+        .extract("public class C { void m() { var record = null; } }")
+        .tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    for w in ["public", "class", "void", "null"] {
+        assert_eq!(class(w), [graph_core::TokenClass::Keyword], "{w}");
+    }
+    for w in ["var", "record", "C"] {
+        assert_eq!(class(w), [graph_core::TokenClass::Identifier], "{w}");
+    }
+    assert!(JavaExtractor.version().starts_with("java-scan-1+kw1+tok"));
+}
