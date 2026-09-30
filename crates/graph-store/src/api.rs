@@ -30,8 +30,8 @@
 //! `StoreError` and `BatchFile` (borrows its input) do not yet; the daemon
 //! story will add a wire form for them.
 use crate::{
-    BatchFile, Hit, IndexOptions, IngestStats, Query, RepoInfo, StoreError, SymbolHit, SymbolQuery,
-    VacuumStats,
+    BatchFile, ExtractorGap, Hit, IndexOptions, IngestStats, Query, RepoInfo, SpaceUsage,
+    StoreError, SymbolHit, SymbolQuery, VacuumStats,
 };
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind};
 use std::collections::HashSet;
@@ -456,6 +456,30 @@ pub trait Store: StoreRead + Send + Sync {
     /// dictionary terms nothing refers to any more (it does not compact the
     /// file; see `V2Store::compact`). Never changes what any read returns.
     fn vacuum(&self) -> Result<VacuumStats>;
+
+    /// Languages in `org`/`repo` (each `None` = all) whose stored symbols
+    /// came from an extractor this store has not registered (#74): a
+    /// re-index of those files would silently store them tokens-only.
+    /// Only languages with symbols stored are candidates (read from the
+    /// catalog, O(repos)); for each, the stored extractor version is read
+    /// from a file fingerprint (at most one scan of that repo's files).
+    /// Files ingested pre-extracted (no fingerprint) never count. The
+    /// default (no gaps) is for a backend that parses elsewhere, such as a
+    /// remote store: the server checks its own registry at startup.
+    fn extractor_gaps(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<ExtractorGap>> {
+        let _ = (org, repo);
+        Ok(Vec::new())
+    }
+
+    /// The database file's size and the bytes of it in live pages (#90),
+    /// for the "run `vacuum --compact`" hint after `--reindex`. `None` when
+    /// the backend has no local file (the default, e.g. a remote store).
+    /// May commit empty write transactions (so pages freed by earlier
+    /// commits are counted as free); do not call it on a read-only or
+    /// replicated path. Never changes what any read returns.
+    fn space_usage(&self) -> Result<Option<SpaceUsage>> {
+        Ok(None)
+    }
 
     fn index_bytes(
         &self,
