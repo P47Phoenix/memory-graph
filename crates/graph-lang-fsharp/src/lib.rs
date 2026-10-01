@@ -33,11 +33,85 @@
 //! (` ``a b`` `) are not symbols; members inside an object expression
 //! (`{ new IDisposable with ... }`) at a type's top level are reported as
 //! members of that type; light-off (`#light "off"`) syntax is not handled.
-use graph_core::scan::{code_close_table, code_index, indent_block, span_between};
+use graph_core::scan::{code_close_table, code_index, indent_block, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct FSharpExtractor;
+
+/// F# keywords. Reserved-for-future words (`sig`, `process`, ...) and
+/// `not` (a function) stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "abstract",
+    "and",
+    "as",
+    "assert",
+    "base",
+    "begin",
+    "class",
+    "const",
+    "default",
+    "delegate",
+    "do",
+    "done",
+    "downcast",
+    "downto",
+    "elif",
+    "else",
+    "end",
+    "exception",
+    "extern",
+    "false",
+    "finally",
+    "fixed",
+    "for",
+    "fun",
+    "function",
+    "global",
+    "if",
+    "in",
+    "inherit",
+    "inline",
+    "interface",
+    "internal",
+    "lazy",
+    "let",
+    "match",
+    "member",
+    "module",
+    "mutable",
+    "namespace",
+    "new",
+    "null",
+    "of",
+    "open",
+    "or",
+    "override",
+    "private",
+    "public",
+    "rec",
+    "return",
+    "static",
+    "struct",
+    "then",
+    "to",
+    "true",
+    "try",
+    "type",
+    "upcast",
+    "use",
+    "val",
+    "void",
+    "when",
+    "while",
+    "with",
+    "yield",
+];
+
+/// A name in backticks (`` `type` `` / ``` ``type`` ```) is an identifier.
+fn backticked(t: &[TokenDecl], i: usize) -> bool {
+    i > 0 && t[i - 1].text.ends_with('`') && t[i - 1].span.end == t[i].span.start
+}
 
 /// Tokenizer dialect used for F#.
 pub const FSHARP_TOKENIZER: TokenizerOptions = TokenizerOptions::FSHARP;
@@ -52,12 +126,15 @@ impl Extractor for FSharpExtractor {
     }
 
     fn version(&self) -> String {
-        format!("fsharp-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("fsharp-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, FSHARP_TOKENIZER);
+        let mut tokens = tokenize_with(source, FSHARP_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan; a ``backticked`` name is an identifier.
+        mark_keywords(&mut tokens, KEYWORDS, backticked);
         Extraction {
             symbols,
             tokens,

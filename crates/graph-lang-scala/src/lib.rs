@@ -32,13 +32,62 @@
 //! function; a declaration whose continuation lines are indented less than
 //! its first token ends early. Bodies nested deeper than 64 levels are not
 //! scanned.
-use graph_core::scan::{code_close_table, code_index, span_between};
+use graph_core::scan::{code_close_table, code_index, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 pub struct ScalaExtractor;
+
+/// Scala 2 and 3 hard keywords. Soft keywords (`using`, `extension`,
+/// `inline`, `opaque`, `open`, `end`, `derives`, ...) stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "abstract",
+    "case",
+    "catch",
+    "class",
+    "def",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "forSome",
+    "given",
+    "if",
+    "implicit",
+    "import",
+    "lazy",
+    "macro",
+    "match",
+    "new",
+    "null",
+    "object",
+    "override",
+    "package",
+    "private",
+    "protected",
+    "return",
+    "sealed",
+    "super",
+    "then",
+    "this",
+    "throw",
+    "trait",
+    "true",
+    "try",
+    "type",
+    "val",
+    "var",
+    "while",
+    "with",
+    "yield",
+];
 
 impl Extractor for ScalaExtractor {
     fn language(&self) -> &str {
@@ -50,11 +99,12 @@ impl Extractor for ScalaExtractor {
     }
 
     fn version(&self) -> String {
-        format!("scala-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("scala-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, TokenizerOptions::SCALA);
+        let mut tokens = tokenize_with(source, TokenizerOptions::SCALA);
         let code = code_index(&tokens, &[TokenClass::Comment]);
         let mut s = Scanner {
             tokens: &tokens,
@@ -66,6 +116,9 @@ impl Extractor for ScalaExtractor {
         };
         s.body(0, code.len(), Ctx::Other);
         let symbols = s.out;
+        // After the symbol scan. A backticked name (`type`) is a single
+        // token, so it never matches the list.
+        mark_keywords(&mut tokens, KEYWORDS, |_, _| false);
         Extraction {
             symbols,
             tokens,
