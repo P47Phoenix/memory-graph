@@ -318,3 +318,45 @@ fn subroutine_stops_at_procedure_boundary() {
     let s = syms(src);
     assert_eq!(find(&s, "s").3, "begsr s;");
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// #143: every listed word, bare, in upper and lower case, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        for w in [kw.to_string(), kw.to_lowercase()] {
+            let src = format!("**FREE\n{w};\n");
+            let toks = RpgExtractor.extract(&src).tokens;
+            assert_eq!(classes_of(&toks, &w), [TokenClass::Keyword], "{w}");
+        }
+    }
+}
+
+/// Built-ins, special words, qualified subfields and declared names stay
+/// identifiers; symbols are unchanged.
+#[test]
+fn rpg_keyword_escapes() {
+    let src = "**FREE\ndcl-s read ind;\ndcl-proc Main;\n  if %open(f) and not *in99;\n    eval ds.update = 1;\n  endif;\nend-proc;\n";
+    let ex = RpgExtractor.extract(src);
+    let toks = &ex.tokens;
+    for kw in [
+        "dcl-s", "dcl-proc", "if", "and", "not", "eval", "endif", "end-proc",
+    ] {
+        assert_eq!(classes_of(toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+    assert_eq!(classes_of(toks, "read"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(toks, "open"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(toks, "update"), [TokenClass::Identifier]);
+    let names: Vec<_> = ex.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"read") && names.contains(&"Main"),
+        "{names:?}"
+    );
+    assert!(RpgExtractor.version().starts_with("rpg-scan-2+kw1+tok"));
+}

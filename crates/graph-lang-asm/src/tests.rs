@@ -348,3 +348,84 @@ fn local_label_rules() {
     assert!(n.contains(&"Loop"), "{n:?}");
     assert!(n.contains(&"_main"), "{n:?}");
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// #143: every listed directive, bare in its position (`.word` for GNU as,
+/// `word` first on a line for NASM/MASM, `x word` for the named ones), in
+/// lower and upper case, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    let cases = DOT_DIRECTIVES
+        .iter()
+        .map(|d| {
+            (
+                *d,
+                format!(".{d} x\n"),
+                format!(".{} x\n", d.to_uppercase()),
+            )
+        })
+        .chain(
+            BARE_DIRECTIVES
+                .iter()
+                .map(|d| (*d, format!("{d} x\n"), format!("{} x\n", d.to_uppercase()))),
+        )
+        .chain(NAMED_DIRECTIVES.iter().map(|d| {
+            (
+                *d,
+                format!("n {d} 1\n"),
+                format!("n {} 1\n", d.to_uppercase()),
+            )
+        }));
+    for (d, lower, upper) in cases {
+        for (src, w) in [(lower, d.to_string()), (upper, d.to_uppercase())] {
+            let toks = AsmExtractor.extract(&src).tokens;
+            assert_eq!(classes_of(&toks, &w), [TokenClass::Keyword], "{src:?}");
+        }
+    }
+}
+
+/// Mnemonics, operands, labels, assignments, glued words and directives out
+/// of statement position stay identifiers; symbols are unchanged.
+#[test]
+fn asm_directive_positions() {
+    let src = "section .text\nglobal main\nmain:\n  mov eax, end\n  jmp end\nend: ret\nsize = 4\nmsg db 1\n.globl f\nf: .type f, @function\n";
+    let ex = AsmExtractor.extract(src);
+    let toks = &ex.tokens;
+    assert_eq!(classes_of(toks, "section"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(toks, "global"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(toks, "db"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(toks, "globl"), [TokenClass::Keyword]);
+    // `f: .type` is after a label.
+    assert_eq!(classes_of(toks, "type"), [TokenClass::Keyword]);
+    // `section .text`: the section name is an operand.
+    assert_eq!(classes_of(toks, "text"), [TokenClass::Identifier]);
+    // Operands, a label and an assignment named like directives.
+    assert_eq!(classes_of(toks, "end"), [TokenClass::Identifier; 3]);
+    assert_eq!(classes_of(toks, "size"), [TokenClass::Identifier]);
+    for m in ["mov", "jmp", "ret", "eax", "main"] {
+        assert!(
+            classes_of(toks, m)
+                .iter()
+                .all(|c| *c == TokenClass::Identifier),
+            "{m}"
+        );
+    }
+    // Glued to a following word (`text.x`), or more than one word in.
+    let toks = AsmExtractor.extract(".text.x\na b c section\n").tokens;
+    assert!(
+        toks.iter().all(|t| t.class != TokenClass::Keyword),
+        "{toks:?}"
+    );
+    let names: Vec<_> = ex.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"main") && names.contains(&"end"),
+        "{names:?}"
+    );
+    assert!(AsmExtractor.version().starts_with("asm-scan-1+kw1+tok"));
+}

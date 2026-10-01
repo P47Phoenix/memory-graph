@@ -40,7 +40,7 @@
 //! at line start, so an AT&T trailing `# comment` is read as code; ARM32 `@`
 //! comments are not recognised. Macro invocations are not expanded. An
 //! unclosed block (`PROC` without `ENDP`) spans its header line only.
-use graph_core::scan::span_between;
+use graph_core::scan::{mark_keywords_ignore_case, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::collections::HashMap;
@@ -60,17 +60,178 @@ impl Extractor for AsmExtractor {
     }
 
     fn version(&self) -> String {
-        format!("asm-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: assembler directives are classed `keyword` (#143).
+        format!("asm-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, ASM_TOKENIZER);
+        let mut tokens = tokenize_with(source, ASM_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        mark_keywords_ignore_case(&mut tokens, DOT_DIRECTIVES, |t, i| {
+            directive_at(t, i) != Some(DirectiveForm::Dotted)
+        });
+        mark_keywords_ignore_case(&mut tokens, BARE_DIRECTIVES, |t, i| {
+            match directive_at(t, i) {
+                Some(DirectiveForm::Bare) => false,
+                Some(DirectiveForm::Named) => !NAMED_DIRECTIVES
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(&t[i].text)),
+                _ => true,
+            }
+        });
         Extraction {
             symbols,
             tokens,
             has_errors: false,
         }
+    }
+}
+
+/// Keywords (#143) are assembler *directives* only, never instruction
+/// mnemonics (thousands, per architecture, and often reused as label
+/// names). GNU as directives, written with a glued leading `.` (`.globl`;
+/// the word after the `.` is the keyword) as the first statement on a line.
+const DOT_DIRECTIVES: &[&str] = &[
+    "align",
+    "arch",
+    "ascii",
+    "asciz",
+    "balign",
+    "bss",
+    "byte",
+    "comm",
+    "data",
+    "else",
+    "end",
+    "endif",
+    "endm",
+    "endr",
+    "equ",
+    "equiv",
+    "extern",
+    "file",
+    "fill",
+    "global",
+    "globl",
+    "hidden",
+    "ident",
+    "if",
+    "ifdef",
+    "ifndef",
+    "include",
+    "int",
+    "lcomm",
+    "long",
+    "macro",
+    "octa",
+    "p2align",
+    "popsection",
+    "previous",
+    "pushsection",
+    "quad",
+    "rept",
+    "rodata",
+    "section",
+    "set",
+    "short",
+    "size",
+    "skip",
+    "space",
+    "string",
+    "syntax",
+    "text",
+    "type",
+    "weak",
+    "word",
+    "zero",
+];
+
+/// NASM and MASM directives written bare (any case), as the first word of a
+/// statement (after an optional `label:`).
+const BARE_DIRECTIVES: &[&str] = &[
+    "align",
+    "assume",
+    "bits",
+    "db",
+    "dd",
+    "default",
+    "dq",
+    "dt",
+    "dw",
+    "end",
+    "endp",
+    "ends",
+    "endm",
+    "endstruc",
+    "equ",
+    "extern",
+    "externdef",
+    "extrn",
+    "global",
+    "incbin",
+    "include",
+    "includelib",
+    "macro",
+    "org",
+    "proc",
+    "public",
+    "resb",
+    "resd",
+    "resq",
+    "resw",
+    "section",
+    "segment",
+    "struc",
+    "times",
+];
+
+/// The [`BARE_DIRECTIVES`] that may also follow a name (`x db 1`,
+/// `main PROC`, `_TEXT SEGMENT`, `n equ 3`).
+const NAMED_DIRECTIVES: &[&str] = &[
+    "db", "dd", "dq", "dt", "dw", "endp", "ends", "equ", "macro", "proc", "resb", "resd", "resq",
+    "resw", "segment", "times",
+];
+
+#[derive(PartialEq, Eq)]
+enum DirectiveForm {
+    /// `.word` first on its line (after an optional `label:`).
+    Dotted,
+    /// `word` first on its line (after an optional `label:`).
+    Bare,
+    /// `name word`.
+    Named,
+}
+
+/// Where the word at `i` sits, if it is in a directive position: whole (not
+/// glued to a following word), not itself a label (`end:`) or assignment
+/// (`size = 4`), and first in its statement as described by
+/// [`DirectiveForm`]. `None` otherwise.
+fn directive_at(t: &[TokenDecl], i: usize) -> Option<DirectiveForm> {
+    let line = t[i].span.start_line;
+    let glued = |a: &TokenDecl, b: &TokenDecl| a.span.end == b.span.start;
+    if let Some(n) = t.get(i + 1).filter(|n| n.span.start_line == line) {
+        if glued(&t[i], n) || matches!(n.text.as_str(), ":" | "=") {
+            return None;
+        }
+    }
+    let mut start = i;
+    while start > 0 && t[start - 1].span.end_line == line {
+        if i - start >= 3 {
+            return None; // too far into the line (and keeps this O(1))
+        }
+        start -= 1;
+    }
+    let mut before = &t[start..i];
+    if before.len() >= 2 && before[1].text == ":" {
+        before = &before[2..];
+    }
+    let word = |x: &TokenDecl| matches!(x.class, TokenClass::Identifier | TokenClass::Keyword);
+    match before {
+        [] => Some(DirectiveForm::Bare),
+        [dot] if dot.text == "." && glued(dot, &t[i]) => Some(DirectiveForm::Dotted),
+        [name] if word(name) && !glued(name, &t[i]) => Some(DirectiveForm::Named),
+        _ => None,
     }
 }
 

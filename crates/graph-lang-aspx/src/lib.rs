@@ -30,6 +30,11 @@
 //! statements of the page's render method, where a scanner would read
 //! `if (x) {` or `int n = 0;` as declarations.
 //!
+//! Keywords (#143): only the C# tokens of a server script body are classed
+//! `keyword` (C#'s reserved words, as `graph-lang-csharp` does). Markup has
+//! no reserved words, and `<% %>` blocks stay markup tokens: their language
+//! may be VB, so they are left unclassed.
+//!
 //! Element spans follow the HTML scanner's rule;
 //! server blocks are opaque to it (they may sit inside a start tag), so their
 //! spans never cross a tag. An unclosed `<%` hides the rest of the file from
@@ -59,7 +64,9 @@ impl Extractor for AspxExtractor {
     }
 
     fn version(&self) -> String {
-        format!("aspx-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: C# reserved words in server script bodies are classed
+        // `keyword` (#143); markup and `<% %>` blocks are unchanged.
+        format!("aspx-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -269,6 +276,8 @@ fn server_scripts(source: &str, tokens: Vec<TokenDecl>) -> (Vec<TokenDecl>, Vec<
             });
             symbols.extend(graph_lang_csharp::member_symbols(&code));
         }
+        // After the C# symbol scan, which reads identifiers as it always has.
+        graph_lang_csharp::mark_csharp_keywords(&mut code);
         out.extend(code);
         next = lt;
     }

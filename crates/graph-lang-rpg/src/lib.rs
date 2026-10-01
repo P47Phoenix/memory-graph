@@ -33,11 +33,40 @@
 //! with the RPG IV columns. Columns count characters, so a tab in a fixed
 //! spec counts as one column (as the tokenizer does); tab-indented fixed
 //! specs lose their column positions.
-use graph_core::scan::{line_iter, span_between};
+use graph_core::scan::{line_iter, mark_keywords_ignore_case, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct RpgExtractor;
+
+/// RPG IV free-form declaration keywords and common operation codes, upper
+/// case; matched case-insensitively. Built-in functions (`%open`), special
+/// words (`*on`), qualified subfields (`ds.read`) and the name a `dcl-`
+/// keyword declares are left as identifiers (see [`is_name`]).
+const KEYWORDS: &[&str] = &[
+    "AND", "BEGSR", "CALLP", "CHAIN", "CLOSE", "CTL-OPT", "DCL-C", "DCL-DS", "DCL-F", "DCL-PARM",
+    "DCL-PI", "DCL-PR", "DCL-PROC", "DCL-S", "DCL-SUBF", "DELETE", "DOU", "DOW", "DSPLY", "ELSE",
+    "ELSEIF", "END-DS", "END-PI", "END-PR", "END-PROC", "ENDDO", "ENDFOR", "ENDIF", "ENDMON",
+    "ENDSL", "ENDSR", "EVAL", "EXFMT", "EXSR", "FOR", "IF", "ITER", "LEAVE", "LEAVESR", "MONITOR",
+    "NOT", "ON-ERROR", "OPEN", "OR", "OTHER", "READ", "READE", "RETURN", "SELECT", "SETGT",
+    "SETLL", "UPDATE", "WHEN", "WRITE",
+];
+
+/// Whether the listed word at `i` is a name, not a keyword: glued after
+/// `%` (a built-in, `%open`), `*` (a special word) or `.` (a qualified
+/// subfield), or the name declared by the `dcl-` keyword before it
+/// (`dcl-s read ind;`).
+fn is_name(t: &[TokenDecl], i: usize) -> bool {
+    if i == 0 {
+        return false;
+    }
+    let p = &t[i - 1];
+    let glued = p.span.end == t[i].span.start;
+    (glued && matches!(p.text.as_str(), "%" | "*" | "."))
+        // `p` may already be relabeled (marking runs front to back).
+        || (matches!(p.class, TokenClass::Identifier | TokenClass::Keyword)
+            && p.text.to_ascii_lowercase().starts_with("dcl-"))
+}
 
 /// Tokenizer dialect used for RPG.
 pub const RPG_TOKENIZER: TokenizerOptions = TokenizerOptions::RPG;
@@ -52,12 +81,16 @@ impl Extractor for RpgExtractor {
     }
 
     fn version(&self) -> String {
-        format!("rpg-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: declaration keywords and operation codes are classed
+        // `keyword` (#143).
+        format!("rpg-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, RPG_TOKENIZER);
+        let mut tokens = tokenize_with(source, RPG_TOKENIZER);
         let symbols = symbols(source, &tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        mark_keywords_ignore_case(&mut tokens, KEYWORDS, is_name);
         Extraction {
             symbols,
             tokens,

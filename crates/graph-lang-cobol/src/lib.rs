@@ -37,11 +37,107 @@
 //! `>>SOURCE FORMAT` switch after the first line is not followed; unnamed
 //! and `FILLER` level-01 items are not symbols (but still end the previous
 //! item).
-use graph_core::scan::span_between;
+use graph_core::scan::{mark_keywords_ignore_case, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct CobolExtractor;
+
+/// Common COBOL reserved words (division and section headers, verbs and
+/// their scope terminators, clauses), upper case; matched
+/// case-insensitively. Reserved words cannot name data items or
+/// paragraphs; this is a conservative subset of the standard's list.
+const KEYWORDS: &[&str] = &[
+    "ACCEPT",
+    "ADD",
+    "ALSO",
+    "AND",
+    "ARE",
+    "ASSIGN",
+    "AT",
+    "BY",
+    "CALL",
+    "CLOSE",
+    "COMPUTE",
+    "CONFIGURATION",
+    "CONTINUE",
+    "COPY",
+    "DATA",
+    "DELETE",
+    "DISPLAY",
+    "DIVIDE",
+    "DIVISION",
+    "ELSE",
+    "END",
+    "END-CALL",
+    "END-COMPUTE",
+    "END-EVALUATE",
+    "END-IF",
+    "END-PERFORM",
+    "END-READ",
+    "END-SEARCH",
+    "END-STRING",
+    "END-WRITE",
+    "ENVIRONMENT",
+    "EVALUATE",
+    "EXIT",
+    "FD",
+    "FILE",
+    "FILE-CONTROL",
+    "FROM",
+    "GIVING",
+    "GO",
+    "GOBACK",
+    "IDENTIFICATION",
+    "IF",
+    "INITIALIZE",
+    "INPUT",
+    "INPUT-OUTPUT",
+    "INSPECT",
+    "INTO",
+    "IS",
+    "LINKAGE",
+    "MOVE",
+    "MULTIPLY",
+    "NOT",
+    "OCCURS",
+    "OF",
+    "OPEN",
+    "OR",
+    "OTHER",
+    "OUTPUT",
+    "PERFORM",
+    "PIC",
+    "PICTURE",
+    "PROCEDURE",
+    "PROGRAM",
+    "PROGRAM-ID",
+    "READ",
+    "REDEFINES",
+    "RETURN",
+    "REWRITE",
+    "SEARCH",
+    "SECTION",
+    "SELECT",
+    "SET",
+    "STOP",
+    "STRING",
+    "SUBTRACT",
+    "THEN",
+    "THROUGH",
+    "THRU",
+    "TIMES",
+    "TO",
+    "UNSTRING",
+    "UNTIL",
+    "USING",
+    "VALUE",
+    "VARYING",
+    "WHEN",
+    "WITH",
+    "WORKING-STORAGE",
+    "WRITE",
+];
 
 /// Tokenizer dialect for fixed (reference) format COBOL.
 pub const COBOL_TOKENIZER: TokenizerOptions = TokenizerOptions::COBOL;
@@ -63,13 +159,18 @@ impl Extractor for CobolExtractor {
     }
 
     fn version(&self) -> String {
-        format!("cobol-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("cobol-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
         let free = is_free_format(source);
-        let tokens = tokenize(source, free);
+        let mut tokens = tokenize(source, free);
         let symbols = symbols(&tokens, free);
+        // After the symbol scan, which reads identifiers as it always has.
+        // Reserved words cannot be user names, and hyphenated names
+        // (`END-OF-FILE`) are whole tokens, so nothing is escaped.
+        mark_keywords_ignore_case(&mut tokens, KEYWORDS, |_, _| false);
         Extraction {
             symbols,
             tokens,

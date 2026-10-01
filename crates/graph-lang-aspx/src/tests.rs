@@ -207,7 +207,7 @@ fn well_nested_detects_partial_overlap() {
 
 #[test]
 fn version_is_pinned() {
-    assert!(AspxExtractor.version().starts_with("aspx-scan-2+tok"));
+    assert!(AspxExtractor.version().starts_with("aspx-scan-2+kw1+tok"));
 }
 
 #[test]
@@ -273,4 +273,62 @@ proptest! {
         }
         assert_nested(&ex);
     }
+}
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// #143: every C# reserved word, bare in a C# server script body, is a
+/// keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in graph_lang_csharp::KEYWORDS {
+        let src =
+            format!("<%@ Page Language=\"C#\" %>\n<script runat=\"server\">\n{kw}\n</script>\n");
+        let toks = AspxExtractor.extract(&src).tokens;
+        let body = src.find("server\">").unwrap() as u32;
+        let in_body: Vec<_> = toks
+            .iter()
+            .filter(|t| t.text == *kw && t.span.start > body)
+            .map(|t| t.class)
+            .collect();
+        assert_eq!(in_body, [TokenClass::Keyword], "{kw}");
+    }
+}
+
+/// Only C# server script bodies get keywords: markup, attribute values,
+/// `<% %>` blocks (possibly VB) and VB scripts do not; symbols are
+/// unchanged.
+#[test]
+fn keywords_only_in_csharp_server_scripts() {
+    let src = "<%@ Page Language=\"C#\" %>\n<div class=\"if\">for while</div>\n<% if (x) { } %>\n<script runat=\"server\">\nprotected void Page_Load(object s, EventArgs e) { if (@class) return; }\n</script>\n";
+    let ex = AspxExtractor.extract(src);
+    let toks = &ex.tokens;
+    assert_eq!(
+        classes_of(toks, "if"),
+        [TokenClass::Identifier, TokenClass::Keyword],
+        "`<% if %>` stays, the script's `if` is a keyword"
+    );
+    assert_eq!(classes_of(toks, "for"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(toks, "while"), [TokenClass::Identifier]);
+    for kw in ["protected", "void", "object", "return"] {
+        assert_eq!(classes_of(toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+    assert_eq!(
+        classes_of(toks, "class"),
+        [TokenClass::Identifier, TokenClass::Identifier],
+        "the `class` attribute name, then the verbatim `@class`"
+    );
+    assert!(ex.symbols.iter().any(|s| s.name == "Page_Load"));
+    let vb = "<script runat=\"server\" language=\"VB\">\nPublic Sub X()\nIf y Then Return\nEnd Sub\n</script>\n";
+    let toks = AspxExtractor.extract(vb).tokens;
+    assert!(
+        toks.iter().all(|t| t.class != TokenClass::Keyword),
+        "{toks:?}"
+    );
+    assert!(AspxExtractor.version().starts_with("aspx-scan-2+kw1+tok"));
 }
