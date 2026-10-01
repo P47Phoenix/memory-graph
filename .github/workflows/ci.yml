@@ -20,9 +20,9 @@ jobs:
     # The suites where the host OS shows through (#100, #120): path separators
     # in the walk and on the wire, language detection, open errors. Not the
     # whole workspace: the cluster suites spawn several servers and
-    # are OS-neutral, and would roughly triple this leg's time. The one
-    # skipped store test is a wall-clock ceiling (50 ms per fsync'd commit)
-    # calibrated on the Linux runner (#154).
+    # are OS-neutral, and would roughly triple this leg's time. The store's
+    # chunked-ingest timing test runs here too: it gates on a ratio against
+    # an unchunked ingest on the same machine, not on absolute time (#154).
     runs-on: windows-latest
     steps:
       # The runner defaults to core.autocrlf=true. .gitattributes already
@@ -33,7 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p graph-core
-      - run: cargo test -p graph-store -- --skip chunked_ingest_with_the_open_batch_marker_completes_promptly
+      - run: cargo test -p graph-store
       - run: cargo test -p graph-client --test conformance
       - run: cargo test -p graph-cli --test e2e
       - run: cargo test -p graph-cli --test corpus

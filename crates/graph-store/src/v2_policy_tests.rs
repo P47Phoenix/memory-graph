@@ -540,7 +540,10 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
     // (absolute per-chunk ms rises 3-10x under load, so a fixed ms gate
     // cannot separate load from a regression; the ratio can). An injected
     // 30 ms per chunk commit, or per-chunk bookkeeping that grows with the
-    // number of chunks, both land well above the gate: +30 ms per commit\n    // gave 2.84-2.95x, a sleep of 0.2 ms x chunk index 1.59-1.64x.
+    // number of chunks, both land well above the gate: +30 ms per commit
+    // gave 2.84-2.95x, a sleep of 0.2 ms x chunk index 1.59-1.64x. Re-measured
+    // after #187 (Windows debug, 181 files, 4.12 MB, 10 runs): 0.37-0.42x, so
+    // the Windows CI leg runs it too (#154).
     const EXCESS_GATE: f64 = 1.0;
     assert!(
         excess < EXCESS_GATE,
