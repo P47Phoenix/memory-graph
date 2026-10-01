@@ -67,6 +67,7 @@ impl Extractor for RustExtractor {
             bom,
             src: source,
             line_starts: line_starts(source),
+            char_marks: char_marks(source),
             out: vec![],
         };
         v.visit_file(&file);
@@ -144,10 +145,39 @@ fn line_starts(src: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Bytes per checkpoint in [`char_marks`].
+const MARK: usize = 64;
+
+/// Whether byte `i` starts a char that takes a column: any char except
+/// U+FEFF (`EF BB BF`).
+fn counts(b: &[u8], i: usize) -> bool {
+    b[i] & 0xC0 != 0x80 && !b[i..].starts_with(&[0xEF, 0xBB, 0xBF])
+}
+
+/// `marks[k]` = column-taking chars in `src[..k * MARK]`, so a column costs
+/// at most `MARK` bytes of scanning instead of a scan from the line start,
+/// which was quadratic on one long line of items (#157).
+fn char_marks(src: &str) -> Vec<u32> {
+    let b = src.as_bytes();
+    let mut marks = Vec::with_capacity(b.len() / MARK + 2);
+    let mut n = 0u32;
+    for i in 0..b.len() {
+        if i.is_multiple_of(MARK) {
+            marks.push(n);
+        }
+        n += counts(b, i) as u32;
+    }
+    if b.len().is_multiple_of(MARK) {
+        marks.push(n);
+    }
+    marks
+}
+
 struct Collector<'a> {
     bom: usize,
     src: &'a str,
     line_starts: Vec<usize>,
+    char_marks: Vec<u32>,
     out: Vec<SymbolDecl>,
 }
 
@@ -155,11 +185,16 @@ impl Collector<'_> {
     /// 1-based line, 1-based char column (a leading BOM takes no column).
     fn pos(&self, off: usize) -> (u32, u32) {
         let line = self.line_starts.partition_point(|&s| s <= off) - 1;
-        let col = self.src[self.line_starts[line]..off]
-            .chars()
-            .filter(|&c| c != '\u{feff}')
-            .count();
-        (line as u32 + 1, col as u32 + 1)
+        let col = self.chars_before(off) - self.chars_before(self.line_starts[line]);
+        (line as u32 + 1, col + 1)
+    }
+
+    /// Column-taking chars in `src[..off]` (`off` is a char boundary).
+    fn chars_before(&self, off: usize) -> u32 {
+        debug_assert!(self.src.is_char_boundary(off));
+        let b = self.src.as_bytes();
+        let k = off / MARK;
+        self.char_marks[k] + (k * MARK..off).filter(|&i| counts(b, i)).count() as u32
     }
 
     fn push(&mut self, name: String, kind: SymbolKind, lang_kind: &str, span: proc_macro2::Span) {

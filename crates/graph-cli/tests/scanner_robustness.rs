@@ -78,11 +78,6 @@ fn unclosed_keyword_and_declaration_runs_are_linear() {
     for ex in graph_cli::shipped_extractors() {
         let lang = ex.language().to_string();
         for shape in shapes {
-            // Rust is parsed by `syn`, still quadratic on this shape: a
-            // follow-up outside the token scanners.
-            if lang == "rust" && shape == "struct a {} " {
-                continue;
-            }
             let took = time_extract(ex.as_ref(), shape.repeat(n));
             assert!(took < Duration::from_secs(5), "{lang} {shape:?}: {took:?}");
         }
