@@ -442,4 +442,30 @@ fn backup_connect_to_goes_through_a_forwarder() {
         "127.0.0.1:9",
     ]);
     assert!(!o.status.success());
+    let err = text(&o.stderr);
+    assert!(
+        err.contains("--backup-connect-to") || err.contains("required"),
+        "{err}"
+    );
+    // ... and with a restore from a plain file and no backup URL, where it
+    // would silently do nothing.
+    let d5 = root.path().join("d5");
+    let o = run(&[
+        "serve",
+        "--listen",
+        "127.0.0.1:0",
+        "--data-dir",
+        d5.to_str().unwrap(),
+        "--node-id",
+        "1",
+        "--bootstrap",
+        "--restore",
+        root.path().join("snap.redb").to_str().unwrap(),
+        "--backup-connect-to",
+        "127.0.0.1:9",
+    ]);
+    assert!(!o.status.success());
+    let err = text(&o.stderr);
+    assert!(err.contains("--backup-connect-to needs an s3://"), "{err}");
+    assert!(!d5.join("graph.redb").exists());
 }

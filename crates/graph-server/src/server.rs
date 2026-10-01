@@ -133,7 +133,8 @@ pub struct ServeConfig {
     pub restore_allow_extractor_mismatch: bool,
     /// The `s3://` settings of an `s3://` `--restore` (`--backup-endpoint`,
     /// `--backup-region`, `--backup-virtual-host`,
-    /// `--backup-credentials-file`, `--backup-profile`).
+    /// `--backup-credentials-file`, `--backup-profile`,
+    /// `--backup-connect-to`).
     pub restore_s3: crate::backup::S3Options,
 }
 

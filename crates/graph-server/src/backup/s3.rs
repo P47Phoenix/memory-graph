@@ -29,7 +29,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -195,9 +194,12 @@ pub fn parse_endpoint(s: &str) -> Result<Endpoint, String> {
 
 /// Parse `--backup-connect-to host:port` (`[v6]:port` for IPv6): the
 /// TCP address S3 traffic goes to instead of the endpoint's, while the
-/// endpoint's host still names the request (SigV4 and `Host`). A name is
-/// resolved once, here; the port is required and must not be 0.
-pub fn parse_connect_to(s: &str) -> Result<SocketAddr, String> {
+/// endpoint's host still names the request (SigV4 and `Host`). The port is
+/// required and must not be 0, and the name must resolve now (a startup
+/// check); the returned `host:port` is resolved again on every connection,
+/// trying each address in turn, so a sidecar whose IP changes keeps
+/// working.
+pub fn parse_connect_to(s: &str) -> Result<String, String> {
     use std::net::ToSocketAddrs;
     let bad = |why: &str| format!("--backup-connect-to `{s}`: {why}");
     if s.contains("://") || s.contains(['/', '?', '#', '@']) {
@@ -219,7 +221,8 @@ pub fn parse_connect_to(s: &str) -> Result<SocketAddr, String> {
     s.to_socket_addrs()
         .map_err(|e| bad(&format!("does not resolve: {e}")))?
         .next()
-        .ok_or_else(|| bad("resolves to no address"))
+        .ok_or_else(|| bad("resolves to no address"))?;
+    Ok(s.to_string())
 }
 
 /// Everything an [`S3Sink`] needs beyond the URL.
@@ -247,8 +250,9 @@ pub struct S3Options {
     /// `--backup-connect-to`: connect here whatever the host, like curl's
     /// `--connect-to` (a TLS sidecar in front of AWS; tests: a
     /// virtual-hosted name that does not resolve). The endpoint's host is
-    /// still what is signed and sent as `Host`.
-    pub connect_to: Option<SocketAddr>,
+    /// still what is signed and sent as `Host`. A `host:port`, resolved on
+    /// each connection (every address tried in turn).
+    pub connect_to: Option<String>,
 }
 
 impl Default for S3Options {
@@ -685,8 +689,9 @@ impl S3Sink {
     ) -> std::io::Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>> {
         let t = self.opts.timeout;
         let connect = async {
-            match self.opts.connect_to {
-                Some(a) => tokio::net::TcpStream::connect(a).await,
+            match &self.opts.connect_to {
+                // tokio resolves the name now and tries each address.
+                Some(a) => tokio::net::TcpStream::connect(a.as_str()).await,
                 None => {
                     let host = self
                         .endpoint
@@ -1172,20 +1177,14 @@ impl BackupSink for S3Sink {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn connect_to_is_validated() {
-        assert_eq!(
-            super::parse_connect_to("127.0.0.1:9080").unwrap(),
-            "127.0.0.1:9080".parse().unwrap()
-        );
-        assert_eq!(
-            super::parse_connect_to("[::1]:9080").unwrap(),
-            "[::1]:9080".parse().unwrap()
-        );
-        assert_eq!(
-            super::parse_connect_to("localhost:9080").unwrap().port(),
-            9080
-        );
+        // IP literals only: no dependence on the machine's DNS.
+        for ok in ["127.0.0.1:9080", "[::1]:9080"] {
+            assert_eq!(parse_connect_to(ok).unwrap(), ok);
+        }
         for (bad, why) in [
             ("127.0.0.1", "port is required"),
             ("127.0.0.1:0", "is not a port"),
@@ -1198,15 +1197,13 @@ mod tests {
             ("127.0.0.1:9080/x", "no scheme"),
             ("no-such-host.invalid:9080", "does not resolve"),
         ] {
-            let e = super::parse_connect_to(bad).unwrap_err();
+            let e = parse_connect_to(bad).unwrap_err();
             assert!(
                 e.contains("--backup-connect-to") && e.contains(why),
                 "{bad}: {e}"
             );
         }
     }
-
-    use super::*;
 
     #[test]
     fn s3_urls_parse() {

@@ -101,8 +101,11 @@ the stored size is checked with a HEAD after each upload.
 - `--backup-connect-to host:port` (like curl's `--connect-to`) opens every S3 connection to
   that address instead of the `--backup-endpoint` host, while requests are still signed for,
   and carry the `Host` header of, the endpoint's host. It is meant for a local TLS sidecar in
-  front of AWS (below). It takes `host:port` or `[v6]:port`, the port is required, and a host
-  name is resolved once, at startup; anything else is refused before the node starts.
+  front of AWS (below). It takes `host:port` or `[v6]:port` and the port is required. A host
+  name must resolve at startup (anything else is refused before the node starts) and is
+  resolved again on every connection, trying each address in turn, so a recreated sidecar
+  with a new IP keeps working. It needs an s3:// `--backup-url` or an s3:// `--restore`, and
+  is refused otherwise.
 - Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`),
   which win, else from `--backup-credentials-file <file>` (the AWS INI format) with
   `--backup-profile` (default `default`). They are never taken from a flag or a TOML key (a
@@ -183,7 +186,7 @@ to `file://` and sync that directory (the simpler of the two).
         --backup-url s3://mg-backups/prod --backup-region eu-west-1
         --backup-endpoint http://s3.eu-west-1.amazonaws.com
         --backup-connect-to s3tls:80
-      depends_on: [s3tls]             # s3tls is resolved once, at startup
+      depends_on: [s3tls]             # s3tls must resolve when the node starts
       env_file: aws-backup.env        # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
       networks: [backup]
   networks:

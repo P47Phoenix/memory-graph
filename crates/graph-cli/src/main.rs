@@ -322,7 +322,8 @@ enum Cmd {
         /// of the --backup-endpoint host, like curl's --connect-to. Requests are still signed for,
         /// and sent with the Host header of, the --backup-endpoint host, so a local TLS sidecar can
         /// front AWS: --backup-endpoint http://s3.<region>.amazonaws.com --backup-connect-to
-        /// 127.0.0.1:9080. A host name is resolved once, at startup
+        /// 127.0.0.1:9080. A host name must resolve at startup and is resolved again on each
+        /// connection
         #[arg(long, requires = "backup_or_restore", value_name = "HOST:PORT")]
         backup_connect_to: Option<String>,
         /// With --data-dir: join the cluster that the node at this host:port belongs to (any
@@ -1328,6 +1329,13 @@ fn run() -> Result<i32> {
         let restore_is_s3 = restore
             .as_ref()
             .is_some_and(|r| r.to_string_lossy().starts_with("s3://"));
+        let backup_is_s3 = backup_url.as_ref().is_some_and(|u| u.starts_with("s3://"));
+        if backup_connect_to.is_some() && !restore_is_s3 && !backup_is_s3 {
+            anyhow::bail!(
+                "--backup-connect-to needs an s3:// --backup-url or an s3:// --restore \
+                 (it would be ignored otherwise)"
+            );
+        }
         cfg.restore_s3 = s3.clone();
         if let Some(url) = backup_url {
             let mut b = graph_server::backup::BackupConfig::new(url.clone());

@@ -7,7 +7,7 @@
 1. Today a cluster's only backups are `cluster snapshot --out <file>` and `serve --bootstrap --restore <file>`. Each node keeps just one snapshot on its own disk.
 2. This ADR lets the leader copy each snapshot it builds to a backup location, keep the last few there, and restore a new cluster straight from that location.
 3. Stage 1 supports a local or mounted directory (`file://`) and S3-compatible object storage over plain HTTP (`s3://`, for AWS through a sidecar, MinIO, Ceph, R2, B2, Garage).
-4. Talking to AWS directly over HTTPS needs a TLS library that passes our pure-Rust gate; that is deferred (story 39, shared with #104). Until then, use a TLS sidecar reached under the real S3 host name (SigV4 signs `Host`, so `--backup-endpoint` cannot be `127.0.0.1`; so connect to it with `--backup-connect-to` (#173); see `docs/deploy/data-dir.md`) or sync a `file://` directory with `aws s3 sync`.
+4. Talking to AWS directly over HTTPS needs a TLS library that passes our pure-Rust gate; that is deferred (story 39, shared with #104). Until then, use a TLS sidecar or sync a `file://` directory with `aws s3 sync`. SigV4 signs `Host`, so `--backup-endpoint` keeps the real S3 host name and `--backup-connect-to` (#173) sends the connection to the sidecar (see `docs/deploy/data-dir.md`).
 5. A backup only counts once its small `.meta` file (checksum, size, versions) is written after the data. Restores check that `.meta` before touching anything.
 6. The snapshot format does not change, so there is no schema bump.
 

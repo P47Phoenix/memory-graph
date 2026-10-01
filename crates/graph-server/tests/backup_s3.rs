@@ -103,7 +103,7 @@ fn virtual_hosted_addressing() {
     let opts = S3Options {
         virtual_host: true,
         endpoint: Some(format!("http://s3.test:{}", f.addr().port())),
-        connect_to: Some(f.addr()),
+        connect_to: Some(f.addr().to_string()),
         ..f.options()
     };
     let s = f.sink_with("s3://vbucket/p", opts);
@@ -299,7 +299,7 @@ fn credentials_file_through_the_config() {
     assert!(fb.open_sink().err().unwrap().contains("s3:// only"));
     // ... including --backup-connect-to alone (#173).
     let mut fb = BackupConfig::new("file:///tmp/x");
-    fb.s3.connect_to = Some(f.addr());
+    fb.s3.connect_to = Some(f.addr().to_string());
     let e = fb.open_sink().err().unwrap();
     assert!(
         e.contains("s3:// only") && e.contains("--backup-connect-to"),
