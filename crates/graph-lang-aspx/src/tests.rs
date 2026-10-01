@@ -122,8 +122,8 @@ fn server_script_csharp_symbols() {
             .kind
     };
     assert_eq!(kind("server_script"), SymbolKind::Module);
-    // Code blocks are statements, not scanned for declarations.
-    assert!(s.iter().all(|x| x.0 != "n"));
+    // Code blocks on a C# page: their locals, nested in the block.
+    assert_eq!(get("n", "local").2, "int n = 0;");
     assert_eq!(get("int", "code_block").2, "<% int n = 0; %>");
     // Unclosed server scripts, and bodies with server tags, stay markup.
     for src in [
@@ -207,7 +207,9 @@ fn well_nested_detects_partial_overlap() {
 
 #[test]
 fn version_is_pinned() {
-    assert!(AspxExtractor.version().starts_with("aspx-scan-2+kw1+tok"));
+    assert!(AspxExtractor
+        .version()
+        .starts_with("aspx-scan-2+kw1+cb1+tok"));
 }
 
 #[test]
@@ -261,6 +263,7 @@ proptest! {
                 Just("<script runat=server>"), Just("</script>"), Just("//"), Just("\n"),
                 Just("<script runat=server language=cs>"), Just("<%@ Page Language=\"C#\" %>"),
                 Just("class A { void M() { } }"), Just("{"), Just("}"), Just("int P {get;set;}"),
+                Just("var x = 1;"), Just("h\u{e9}\u{1F600}"), Just("foreach (var p in q)"),
             ],
             0..40,
         )
@@ -272,6 +275,9 @@ proptest! {
             prop_assert!(s.span.start < s.span.end && s.span.end as usize <= src.len());
         }
         assert_nested(&ex);
+        for t in &ex.tokens {
+            prop_assert_eq!(&src[t.span.start as usize..t.span.end as usize], t.text.as_str());
+        }
     }
 }
 
@@ -310,8 +316,8 @@ fn keywords_only_in_csharp_server_scripts() {
     let toks = &ex.tokens;
     assert_eq!(
         classes_of(toks, "if"),
-        [TokenClass::Identifier, TokenClass::Keyword],
-        "`<% if %>` stays, the script's `if` is a keyword"
+        [TokenClass::Keyword, TokenClass::Keyword],
+        "a C# page's `<% if %>` and the script's `if` are keywords"
     );
     assert_eq!(classes_of(toks, "for"), [TokenClass::Identifier]);
     assert_eq!(classes_of(toks, "while"), [TokenClass::Identifier]);
@@ -330,5 +336,108 @@ fn keywords_only_in_csharp_server_scripts() {
         toks.iter().all(|t| t.class != TokenClass::Keyword),
         "{toks:?}"
     );
-    assert!(AspxExtractor.version().starts_with("aspx-scan-2+kw1+tok"));
+    assert!(AspxExtractor
+        .version()
+        .starts_with("aspx-scan-2+kw1+cb1+tok"));
+    // No directive language (VB, the default): `<% %>` stays unclassed.
+    let toks = AspxExtractor.extract("<% if (x) { int n = 0; } %>").tokens;
+    assert!(toks.iter().all(|t| t.class != TokenClass::Keyword));
+}
+
+/// Asserts every token's text and line/column span against `src`.
+fn assert_exact_tokens(src: &str, ex: &Extraction) {
+    for t in &ex.tokens {
+        let (s, e) = (t.span.start as usize, t.span.end as usize);
+        assert_eq!(&src[s..e], t.text);
+        let line = 1 + src[..s].matches('\n').count() as u32;
+        let col = 1 + src[..s].rsplit('\n').next().unwrap().chars().count() as u32;
+        assert_eq!((t.span.start_line, t.span.start_col), (line, col), "{t:?}");
+        let line = 1 + src[..e].matches('\n').count() as u32;
+        let col = 1 + src[..e].rsplit('\n').next().unwrap().chars().count() as u32;
+        assert_eq!((t.span.end_line, t.span.end_col), (line, col), "{t:?}");
+    }
+}
+
+/// Multibyte text (2-, 3- and 4-byte UTF-8) right before the first block.
+const CS_BLOCKS: &str = "<%@ Page Language=\"C#\" %>\n<p>h\u{e9}llo \u{1F600} \u{65e5}\u{672c}</p> <% var total = 0;\n  const int Max = 5;\n  List<Dictionary<string, int[]>> rows = Load();\n  foreach (var p in People) { %>\n  <div id=\"row\"><%= p.Name %></div>\n<% }\n  for (int i = 0; i < Max; i++) total += i;\n  try { } catch (Exception ex) { }\n  using (var conn = Open()) { }\n  return x; await y; a = b; x.y = z; Foo(); if (a) b(); else c(); %>\n";
+
+/// #72: locals in `<% %>` blocks of a C# page, nested in the block, with
+/// exact spans after multibyte text.
+#[test]
+fn code_block_locals_on_csharp_page() {
+    let ex = AspxExtractor.extract(CS_BLOCKS);
+    assert_exact_tokens(CS_BLOCKS, &ex);
+    let s = syms(CS_BLOCKS);
+    let locals: Vec<_> = s
+        .iter()
+        .filter(|x| x.1.starts_with("local"))
+        .map(|x| (x.0.as_str(), x.1.as_str(), x.2.as_str()))
+        .collect();
+    assert_eq!(
+        locals,
+        [
+            ("total", "local", "var total = 0;"),
+            ("Max", "local_const", "const int Max = 5;"),
+            (
+                "rows",
+                "local",
+                "List<Dictionary<string, int[]>> rows = Load();"
+            ),
+            ("p", "local", "var p"),
+            ("i", "local", "int i"),
+            ("ex", "local", "Exception ex"),
+            ("conn", "local", "var conn"),
+        ]
+    );
+    // Each local nests in a code block, so it is scoped under the page or
+    // the enclosing element.
+    for l in &ex.symbols {
+        if l.lang_kind
+            .as_deref()
+            .is_some_and(|k| k.starts_with("local"))
+        {
+            assert!(ex
+                .symbols
+                .iter()
+                .any(|b| b.lang_kind.as_deref() == Some("code_block")
+                    && b.span.start <= l.span.start
+                    && l.span.end <= b.span.end));
+        }
+    }
+    let kind = |n: &str| ex.symbols.iter().find(|x| x.name == n).unwrap().kind;
+    assert_eq!(kind("Max"), SymbolKind::Constant);
+    assert_eq!(kind("total"), SymbolKind::Variable);
+    // Keywords in C# code blocks; `<%= %>` expressions stay markup.
+    assert_eq!(classes_of(&ex.tokens, "foreach"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&ex.tokens, "Name"), [TokenClass::Identifier]);
+    // Markup symbols are still found.
+    assert!(s.iter().any(|x| x.0 == "row" && x.1 == "element"));
+    assert!(s.iter().any(|x| x.0 == "p" && x.1 == "expression"));
+    assert!(s.iter().any(|x| x.0 == "var" && x.1 == "code_block"));
+}
+
+/// VB pages (explicit, or by default with no language) are unaffected: no
+/// locals, no keywords, the same tokens as plain markup.
+#[test]
+fn code_blocks_of_vb_pages_unchanged() {
+    for directive in ["<%@ Page Language=\"VB\" %>", "<%@ Page %>", ""] {
+        let src = CS_BLOCKS.replacen("<%@ Page Language=\"C#\" %>", directive, 1);
+        let ex = AspxExtractor.extract(&src);
+        assert!(ex.symbols.iter().all(|x| !x
+            .lang_kind
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("local")));
+        assert!(ex.tokens.iter().all(|t| t.class != TokenClass::Keyword));
+        assert_eq!(
+            ex.tokens,
+            tokenize_with(&src, ASPX_TOKENIZER),
+            "{directive}"
+        );
+    }
+    let vb = "<%@ Page Language=\"VB\" %>\n<% Dim n As Integer = 0 %>";
+    assert!(syms(vb).iter().all(|x| x.0 != "n"));
+    // A C# script's own `language` does not make the page's blocks C#.
+    let src = "<script runat=\"server\" language=\"C#\"> int F; </script><% int n = 0; %>";
+    assert!(syms(src).iter().all(|x| x.0 != "n"));
 }
