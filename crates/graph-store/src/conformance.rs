@@ -85,6 +85,7 @@ pub const CASES: &[(&str, Case)] = &[
         prepared_counted_matches_uncounted,
     ),
     ("prepare_skips_unchanged", prepare_skips_unchanged),
+    ("prepare_with_snapshot", prepare_with_snapshot),
     ("prepared_rejections_in_order", prepared_rejections_in_order),
     (
         "prepared_changed_since_prepare",
@@ -2382,6 +2383,56 @@ fn prepare_skips_unchanged(h: &Harness) {
         .unwrap();
     assert!(out[0].as_ref().unwrap().replaced);
     assert_eq!(calls(), 2, "reindex extracts exactly once more");
+}
+
+/// `prepare_with` against one `fingerprint_snapshot` per batch (#172)
+/// stores exactly what `prepare` would: unchanged files are skipped (a
+/// local backend says so at prepare time), changed and new ones stored, and
+/// a snapshot gone stale before the commit, or one of another repo, still
+/// ends in the right outcome.
+fn prepare_with_snapshot(h: &Harness) {
+    let s = open(h);
+    let d = IndexOptions::default();
+    let local = !h.accepts_remote_prepared;
+    s.index_batch("o", "r", &[bf("a.txt", b"alpha"), bf("b.txt", b"beta")], d)
+        .unwrap();
+    let snap = s.fingerprint_snapshot("o", "r").unwrap();
+    if local {
+        assert_eq!(snap.len(), 2);
+    }
+    let files = [
+        bf("a.txt", b"alpha"),
+        bf("b.txt", b"beta CHANGED"),
+        bf("c.txt", b"gamma"),
+    ];
+    let p: Vec<_> = files
+        .iter()
+        .map(|f| s.prepare_with("o", "r", f, d, &snap).unwrap())
+        .collect();
+    if local {
+        assert!(p[0].is_unchanged() && !p[1].is_unchanged() && !p[2].is_unchanged());
+    }
+    // Stale: `a.txt` changes after the snapshot, before the commit.
+    s.index_bytes("o", "r", "a.txt", b"alpha NEW", Some("text"))
+        .unwrap();
+    let out = s.index_prepared("o", "r", p, d).unwrap();
+    let st: Vec<_> = out.iter().map(|r| r.as_ref().unwrap()).collect();
+    assert!(st[0].replaced && !st[0].unchanged, "{:?}", st[0]);
+    assert!(st[1].replaced, "{:?}", st[1]);
+    assert!(!st[2].replaced && !st[2].unchanged, "{:?}", st[2]);
+    for (q, n) in [("alpha", 1), ("NEW", 0), ("CHANGED", 1), ("gamma", 1)] {
+        assert_eq!(s.search(&Query::new(q)).unwrap().len(), n, "{q}");
+    }
+    // Another repo's snapshot: the same outcome as a plain `prepare`.
+    let other = s.fingerprint_snapshot("o", "elsewhere").unwrap();
+    let p = s
+        .prepare_with("o", "r", &bf("c.txt", b"gamma"), d, &other)
+        .unwrap();
+    if local {
+        assert!(p.is_unchanged());
+    }
+    let out = s.index_prepared("o", "r", vec![p], d).unwrap();
+    assert!(out[0].as_ref().unwrap().unchanged);
 }
 
 /// Per-file rejections (invalid spans, not UTF-8) come back in their slots,

@@ -2279,6 +2279,61 @@ fn no_dict_rev_block_ever_exceeds_dict_block_entries() {
     );
 }
 
+/// Issue #162: a block that reached `DICT_BLOCK_MAX_BYTES` (here, one with a
+/// 200 KiB term) is not extended again, so later new terms never rewrite
+/// it: the long term ends its block, every later term lands in blocks under
+/// the cap, and every term still looks up.
+#[test]
+fn a_long_term_closes_its_dict_rev_block() {
+    use crate::v2::{DICT_BLOCK_MAX_BYTES, DICT_REV};
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    let long = "z".repeat(200 << 10);
+    let toks = [("head", 0, 4), (long.as_str(), 5, 5 + long.len() as u32)];
+    s.ingest_file("o", "r", "a.txt", "text", &span_ext(&[], &toks))
+        .unwrap();
+    let owned: Vec<String> = (0..20).map(|i| format!("after{i}")).collect();
+    for (i, t) in owned.iter().enumerate() {
+        let toks = [(t.as_str(), 0, t.len() as u32)];
+        s.ingest_file(
+            "o",
+            "r",
+            &format!("b{i}.txt"),
+            "text",
+            &span_ext(&[], &toks),
+        )
+        .unwrap();
+    }
+    s.check_consistency(false);
+    let rt = s.db.begin_read().unwrap();
+    let table = rt.open_table(DICT_REV).unwrap();
+    let blocks: Vec<Vec<(u64, String)>> = table
+        .iter()
+        .unwrap()
+        .map(|r| crate::codec::decode_dict_block(r.unwrap().1.value()).unwrap())
+        .collect();
+    let at = blocks
+        .iter()
+        .position(|b| b.iter().any(|(_, t)| *t == long))
+        .expect("the long term is stored");
+    assert_eq!(
+        blocks[at].last().unwrap().1,
+        long,
+        "nothing appended after the long term"
+    );
+    for b in &blocks[at + 1..] {
+        let bytes: usize = b.iter().map(|(_, t)| t.len()).sum();
+        assert!(bytes < DICT_BLOCK_MAX_BYTES);
+    }
+    assert!(
+        blocks.len() > at + 1,
+        "later terms got a block of their own"
+    );
+    for t in &owned {
+        assert_eq!(s.search(&Query::new(t)).unwrap().len(), 1, "{t}");
+    }
+}
+
 /// `vacuum` repacks `dict_rev` densely (ADR 0003 story 5): after removing
 /// terms scattered across several blocks, block boundaries no longer line up
 /// with `id / DICT_BLOCK` (dead ids leave gaps), and lookups must still find

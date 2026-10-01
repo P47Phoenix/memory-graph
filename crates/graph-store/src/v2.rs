@@ -21,7 +21,9 @@
 //! [`StoreError::LegacyFormat`], anything else with `SchemaMismatch`).
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
 use crate::{check_unchanged, dec, describe_in, enc, SnapshotStats, Store, StoreRead};
-use crate::{commit_prepared, prepare_file, stored_fingerprint_matches, PreparedFile};
+use crate::{
+    commit_prepared, prepare_file, stored_fingerprint_matches, stored_fingerprints, PreparedFile,
+};
 use crate::{
     grain_accepts, kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile,
     Grain, Hit, IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit,
@@ -276,17 +278,36 @@ fn dict_rev_lookup<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>
     Ok(entries.into_iter().find(|(i, _)| *i == id).map(|(_, t)| t))
 }
 
+/// The encoded size at which [`dict_rev_append`] stops extending the last
+/// reverse-dictionary block and starts a new one (#162).
+pub(crate) const DICT_BLOCK_MAX_BYTES: usize = 64 << 10;
+
 /// Append `(id, text)` to the packed reverse dictionary (ADR 0003 story 5):
 /// `id` must be larger than every id already stored (true of every call from
 /// `intern`, since term ids come from a monotonic counter). Extends the last
 /// block in place while it has room for another entry, otherwise starts a
 /// new block -- so this touches exactly one row, not the whole table.
+///
+/// A last block of [`DICT_BLOCK_MAX_BYTES`] or more is also full, whatever
+/// its entry count (#162): extending it rewrites it whole, so a block that
+/// holds one very long term (a 20 MiB comment token) made every later new
+/// term cost a 20 MiB decode, encode and insert until the block filled, and
+/// a 100-small-file batch after such a file took 0.8-2.7 s instead of 8 ms.
+/// Readers never assumed `DICT_BLOCK` entries per block (vacuum already
+/// leaves uneven boundaries), so this is a write policy, not a format change.
 fn dict_rev_append(rev: &mut redb::Table<u64, &'static [u8]>, id: u64, text: &str) -> Result<()> {
     let n = rev.len()?;
     if n > 0 {
         let last = n - 1;
-        let mut entries = codec::decode_dict_block(rev.get(last)?.unwrap().value())?;
-        if entries.len() < codec::DICT_BLOCK {
+        let block = rev.get(last)?.unwrap();
+        let room = block.value().len() < DICT_BLOCK_MAX_BYTES;
+        let mut entries = if room {
+            codec::decode_dict_block(block.value())?
+        } else {
+            Vec::new()
+        };
+        drop(block);
+        if room && entries.len() < codec::DICT_BLOCK {
             entries.push((id, text.to_string()));
             let refs: Vec<(u64, &str)> = entries.iter().map(|(i, t)| (*i, t.as_str())).collect();
             rev.insert(last, codec::encode_dict_block(&refs).as_slice())?;
@@ -385,28 +406,6 @@ pub struct V2Store {
     max_snapshot_age: Duration,
     snapshot_tracker: SharedSnapshotTracker,
     marked_commit_hook: Option<MarkedCommitHook>,
-    /// Orders [`Store::prepare`]'s unchanged pre-check (a read transaction,
-    /// shared) against every write commit of this store (exclusive, through
-    /// `commit_gated`), so no pre-check reader is live while a commit runs
-    /// (#158). This makes the bytes deterministic for an unshared ingest (the
-    /// CLI's `index`); readers the gate does not cover -- concurrent server
-    /// queries, snapshot handles -- can still change the layout. At
-    /// commit redb releases the pages earlier commits freed only up to the
-    /// oldest live reader's snapshot, so a pre-check on a parse thread that
-    /// began before one commit and was still live at the next (a thread
-    /// descheduled under load) delayed that reuse: page allocation, and so
-    /// the file bytes, followed thread timing, and the same `--deterministic`
-    /// input gave different files for different `--jobs` (every query still
-    /// answered the same).
-    pub(crate) commit_gate: std::sync::RwLock<()>,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test hook (#158): run by `prepare`'s pre-check on the calling thread
-    /// while its read transaction is open, under the commit gate.
-    pub(crate) static PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 /// A test hook the server's failpoints use (ADR 0004 stage B): called by
@@ -2325,7 +2324,7 @@ impl V2Store {
             .unwrap()
             .insert(name, id)
             .unwrap();
-        self.commit_gated(wt).unwrap();
+        wt.commit().unwrap();
     }
 
     /// Test hook: make `file`'s content id an *extra* reference on
@@ -2351,7 +2350,7 @@ impl V2Store {
                 .insert(cid, file)
                 .unwrap();
         }
-        self.commit_gated(wt).unwrap();
+        wt.commit().unwrap();
     }
 
     /// Open or create a database file. Refuses a file of any other layout
@@ -2525,7 +2524,6 @@ impl V2Store {
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
             snapshot_tracker: Arc::new(Mutex::new(SnapshotTracker::default())),
             marked_commit_hook: None,
-            commit_gate: std::sync::RwLock::new(()),
         })
     }
 
@@ -2557,7 +2555,7 @@ impl V2Store {
         }
         let wt = self.db.begin_write()?;
         wt.delete_table(RAFT_SM)?;
-        self.commit_gated(wt)?;
+        wt.commit()?;
         Ok(())
     }
 
@@ -2592,7 +2590,7 @@ impl V2Store {
             // byte-for-byte unchanged (a commit would rewrite its header).
             wt.abort()?;
         } else {
-            self.commit_gated(wt)?;
+            wt.commit()?;
         }
         Ok(stats)
     }
@@ -2763,7 +2761,7 @@ impl V2Store {
         Self::stamp_marker(&wt, marker, membership)?;
         let removed = Self::prune_in(&wt, org, repo, keep, false)?;
         self.before_marked_commit(&marker)?;
-        self.commit_gated(wt)?;
+        wt.commit()?;
         Ok(removed)
     }
 
@@ -2779,7 +2777,7 @@ impl V2Store {
         Self::stamp_marker(&wt, marker, membership)?;
         let (stats, _) = Self::vacuum_in(&wt)?;
         self.before_marked_commit(&marker)?;
-        self.commit_gated(wt)?;
+        wt.commit()?;
         Ok(stats)
     }
 
@@ -2811,7 +2809,7 @@ impl V2Store {
             FileMeta::extracted(origin),
         )?;
         self.before_marked_commit(&marker)?;
-        self.commit_gated(wt)?;
+        wt.commit()?;
         Ok(stats)
     }
 
@@ -2822,7 +2820,7 @@ impl V2Store {
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
         self.before_marked_commit(&marker)?;
-        self.commit_gated(wt)?;
+        wt.commit()?;
         Ok(())
     }
 
@@ -2931,7 +2929,6 @@ impl V2Store {
             max_snapshot_age,
             snapshot_tracker: _,
             marked_commit_hook,
-            commit_gate: _,
         } = self;
         // Drop the old handle before renaming over its path (Windows will
         // not allow the rename while any `Database` still has it open).
@@ -3114,7 +3111,7 @@ impl V2Store {
                 // if it differed; commit that.
                 let (stats, dirty) = unchanged.expect("found unchanged in this transaction");
                 if dirty {
-                    self.commit_gated(wt)?;
+                    wt.commit()?;
                 }
                 return Ok(stats);
             }
@@ -3131,7 +3128,7 @@ impl V2Store {
             FileMeta::of(&p),
             None,
         )?;
-        self.commit_gated(wt)?;
+        wt.commit()?;
         Ok(stats)
     }
 
@@ -3155,7 +3152,7 @@ impl V2Store {
             ex,
             FileMeta::extracted(origin),
         )?;
-        self.commit_gated(wt)?;
+        wt.commit()?;
         Ok(stats)
     }
 
@@ -3194,8 +3191,12 @@ impl V2Store {
         )
     }
 
-    /// See [`Store::prepare`]. The unchanged pre-check reads the last
-    /// committed state in its own read transaction.
+    /// See [`Store::prepare`]: a one-file
+    /// [`prepare_with`](Self::prepare_with), whose snapshot is the last
+    /// committed state. Its read transaction is not ordered against commits,
+    /// so a caller that needs the file bytes independent of thread timing
+    /// (the CLI's `index`, #158) takes one snapshot per batch before any
+    /// commit and calls `prepare_with` instead (#172).
     fn prepare(
         &self,
         org: &str,
@@ -3204,24 +3205,49 @@ impl V2Store {
         opts: IndexOptions,
     ) -> Result<PreparedFile> {
         let mut p = prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
-            // Shared with other parse threads, exclusive with a commit (see
-            // `commit_gate`). The read transaction is a local of the inner
-            // block, so it ends there, before the guard: a `begin_read()`
-            // temporary in the closure's tail expression would outlive
-            // `gate` (edition 2021 drop order).
-            let gate = self.commit_gate.read().unwrap_or_else(|e| e.into_inner());
-            let matches = {
-                let rt = self.db.begin_read()?;
-                #[cfg(test)]
-                PRECHECK_HOOK.with(|h| h.borrow().as_ref().map(|h| h()));
-                stored_fingerprint_matches(&rt, org, repo, path, fp)
-            };
-            drop(gate);
-            matches
+            stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
         })?;
+        Self::build_v2_prep(&mut p);
+        Ok(p)
+    }
+
+    /// Lay out a prepared extraction off the commit path.
+    fn build_v2_prep(p: &mut PreparedFile) {
         if let crate::api::Prepared::Extracted(ex) = &p.work {
             p.v2 = Some(Box::new(V2Prep::build(ex)));
         }
+    }
+
+    /// See [`Store::fingerprint_snapshot`]: one read transaction, closed
+    /// before this returns.
+    fn fingerprint_snapshot(&self, org: &str, repo: &str) -> Result<crate::FingerprintSnapshot> {
+        let fps = stored_fingerprints(&self.db.begin_read()?, org, repo)?;
+        Ok(crate::FingerprintSnapshot {
+            org: org.to_string(),
+            repo: repo.to_string(),
+            fps,
+            taken: true,
+        })
+    }
+
+    /// See [`Store::prepare_with`]. Opens no transaction: the pre-check
+    /// reads only `known` (a snapshot for another org/repo, or none, means
+    /// "not known unchanged", and the commit decides).
+    fn prepare_with(
+        &self,
+        org: &str,
+        repo: &str,
+        f: &BatchFile<'_>,
+        opts: IndexOptions,
+        known: &crate::FingerprintSnapshot,
+    ) -> Result<PreparedFile> {
+        if !known.is_for(org, repo) {
+            return self.prepare(org, repo, f, opts);
+        }
+        let mut p = prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
+            Ok(known.matches(org, repo, path, fp).unwrap_or(false))
+        })?;
+        Self::build_v2_prep(&mut p);
         Ok(p)
     }
 
@@ -3329,7 +3355,7 @@ impl V2Store {
             }
             in_txn += len;
             if in_txn >= chunk_bytes {
-                self.commit_gated(wt)?;
+                wt.commit()?;
                 commits += 1;
                 wt = self.db.begin_write()?;
                 // This chunk is not (yet) known to be the batch's last, so
@@ -3347,19 +3373,8 @@ impl V2Store {
         if let Some((m, _)) = &marker {
             self.before_marked_commit(m)?;
         }
-        self.commit_gated(wt)?;
-        Ok((out, commits + 1))
-    }
-
-    /// Commit a write transaction while no `prepare` pre-check holds a read
-    /// transaction (see `commit_gate`), so which freed pages the commit may
-    /// reuse never depends on parse-thread timing (#158). Every commit of an
-    /// open store goes through here; only `from_db`/`rebuild_refs_in` (before
-    /// the store exists) and `export_snapshot`'s new file commit directly.
-    fn commit_gated(&self, wt: redb::WriteTransaction) -> Result<()> {
-        let _gate = self.commit_gate.write().unwrap_or_else(|e| e.into_inner());
         wt.commit()?;
-        Ok(())
+        Ok((out, commits + 1))
     }
 
     /// Allocate the next monotonic batch id from `meta.next_batch_id`,
@@ -3412,7 +3427,7 @@ impl V2Store {
         if dry_run {
             wt.abort()?;
         } else {
-            self.commit_gated(wt)?;
+            wt.commit()?;
         }
         Ok(removed)
     }
@@ -3878,6 +3893,19 @@ impl Store for V2Store {
     ) -> Result<PreparedFile> {
         V2Store::prepare(self, org, repo, file, opts)
     }
+    fn fingerprint_snapshot(&self, org: &str, repo: &str) -> Result<crate::FingerprintSnapshot> {
+        V2Store::fingerprint_snapshot(self, org, repo)
+    }
+    fn prepare_with(
+        &self,
+        org: &str,
+        repo: &str,
+        file: &BatchFile<'_>,
+        opts: IndexOptions,
+        known: &crate::FingerprintSnapshot,
+    ) -> Result<PreparedFile> {
+        V2Store::prepare_with(self, org, repo, file, opts, known)
+    }
     fn index_prepared(
         &self,
         org: &str,
@@ -3919,7 +3947,7 @@ impl Store for V2Store {
         // Pages freed by a commit are released only by later commits: two
         // empty ones make `allocated_pages` exact (as `compact` does).
         for _ in 0..2 {
-            self.commit_gated(self.db.begin_write()?)?;
+            self.db.begin_write()?.commit()?;
         }
         let wt = self.db.begin_write()?;
         let s = wt.stats()?;

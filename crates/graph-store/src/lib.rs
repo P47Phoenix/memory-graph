@@ -29,13 +29,15 @@ pub mod conformance;
 pub mod export;
 mod v2;
 pub use api::{
-    detect_format, open_store, Page, PreparedFile, RemoteParts, SnapshotStats, Store, StoreRead,
+    detect_format, open_store, FingerprintSnapshot, Page, PreparedFile, RemoteParts, SnapshotStats,
+    Store, StoreRead,
 };
 pub use codec::{encode_posting, POSTING_BLOCK};
 pub(crate) use common::{
     check_unchanged, commit_prepared, dec, describe_in, enc, grain_accepts, kind_label,
-    kind_matches, name_key, open_failed, prepare_file, stored_fingerprint_matches, validate_spans,
-    Scope, Tally, CATALOG, CHILDREN, META, NAMES, NODES, SYMBOLS,
+    kind_matches, name_key, open_failed, prepare_file, stored_fingerprint_matches,
+    stored_fingerprints, validate_spans, Scope, Tally, CATALOG, CHILDREN, META, NAMES, NODES,
+    SYMBOLS,
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
 /// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).

@@ -39,6 +39,47 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// The stored fingerprints of one org/repo, read once by
+/// [`Store::fingerprint_snapshot`] for a whole batch of
+/// [`Store::prepare_with`] calls (#172): the parse threads then skip
+/// unchanged files without opening a read transaction each. It is only a
+/// hint, as of when it was taken: the commit re-checks every file
+/// authoritatively, so a stale snapshot costs an extraction, never a wrong
+/// result.
+#[derive(Debug, Clone, Default)]
+pub struct FingerprintSnapshot {
+    pub(crate) org: String,
+    pub(crate) repo: String,
+    pub(crate) fps: std::collections::HashMap<String, String>,
+    /// Taken by a store that keeps fingerprints (an empty default snapshot
+    /// is not, and `prepare_with` then falls back to `prepare`).
+    pub(crate) taken: bool,
+}
+
+impl FingerprintSnapshot {
+    /// Whether a store took this snapshot of `org`/`repo`.
+    pub(crate) fn is_for(&self, org: &str, repo: &str) -> bool {
+        self.taken && self.org == org && self.repo == repo
+    }
+
+    /// Whether the snapshot says `path` (normalized) was stored with `fp`;
+    /// `None` when it is not a snapshot of `org`/`repo`.
+    pub(crate) fn matches(&self, org: &str, repo: &str, path: &str, fp: &str) -> Option<bool> {
+        self.is_for(org, repo)
+            .then(|| self.fps.get(path).is_some_and(|s| s == fp))
+    }
+
+    /// How many fingerprinted files the snapshot holds.
+    pub fn len(&self) -> usize {
+        self.fps.len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.fps.is_empty()
+    }
+}
+
 /// One file made ready by [`Store::prepare`] for [`Store::index_prepared`]:
 /// its normalized path, language and fingerprint, plus the extraction (or
 /// the per-file rejection, or a note that the stored copy is unchanged).
@@ -450,6 +491,34 @@ pub trait Store: StoreRead + Send + Sync {
         file: &BatchFile<'_>,
         opts: IndexOptions,
     ) -> Result<PreparedFile>;
+
+    /// Read the stored fingerprints of `org`/`repo` once, for a batch of
+    /// [`prepare_with`](Self::prepare_with) calls (#172). The default (an
+    /// empty snapshot that `prepare_with` ignores) is for a backend whose
+    /// `prepare` checks nothing locally, such as a remote store.
+    fn fingerprint_snapshot(&self, org: &str, repo: &str) -> Result<FingerprintSnapshot> {
+        let _ = (org, repo);
+        Ok(FingerprintSnapshot::default())
+    }
+
+    /// [`prepare`](Self::prepare), with the unchanged pre-check answered
+    /// from `known` (taken by this store's
+    /// [`fingerprint_snapshot`](Self::fingerprint_snapshot) for the same
+    /// org/repo) instead of a read of the store, so preparing opens no read
+    /// transaction at all. A snapshot for another org/repo, or the default
+    /// empty one, falls back to `prepare`. The outcome after
+    /// `index_prepared` is the same either way.
+    fn prepare_with(
+        &self,
+        org: &str,
+        repo: &str,
+        file: &BatchFile<'_>,
+        opts: IndexOptions,
+        known: &FingerprintSnapshot,
+    ) -> Result<PreparedFile> {
+        let _ = known;
+        self.prepare(org, repo, file, opts)
+    }
 
     /// The committing half: store prepared files exactly as `index_batch`
     /// would have stored the same inputs (same transactions, outcomes in

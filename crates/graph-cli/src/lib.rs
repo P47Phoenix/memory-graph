@@ -444,6 +444,7 @@ fn read_and_prepare(
     store: &dyn Store,
     o: &DirOpts,
     cfg: &encoding_config::EncodingConfig,
+    known: &graph_store::FingerprintSnapshot,
     item: &Item,
     board: &Board,
     k: usize,
@@ -508,7 +509,7 @@ fn read_and_prepare(
     let p = board
         .parse
         .busy(k, "parsing", rel, || {
-            store.prepare(
+            store.prepare_with(
                 o.org,
                 o.repo,
                 &file,
@@ -516,6 +517,7 @@ fn read_and_prepare(
                     reindex: o.reindex,
                     ..Default::default()
                 },
+                known,
             )
         })
         .with_context(|| format!("database error while preparing `{rel}`"))?;
@@ -531,12 +533,13 @@ fn work(
     store: &dyn Store,
     o: &DirOpts,
     cfg: &encoding_config::EncodingConfig,
+    known: &graph_store::FingerprintSnapshot,
     item: &Item,
     board: &Board,
     k: usize,
 ) -> Result<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        read_and_prepare(store, o, cfg, item, board, k)
+        read_and_prepare(store, o, cfg, known, item, board, k)
     }))
     .unwrap_or_else(|e| {
         let what = match item {
@@ -714,8 +717,20 @@ fn run_pipeline(
     let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Result<Outcome>, u64, u64)>();
     let inflight = std::sync::Mutex::new(BTreeMap::<u64, String>::new());
     let admit_blocked = AtomicBool::new(false);
+    // The stored fingerprints, read once before any commit of this run
+    // (#172): the parse threads skip unchanged files from this snapshot and
+    // never open a read transaction, so no commit's page reuse depends on
+    // their timing (#158). The writer still re-checks each file. Not needed
+    // with --reindex, which checks nothing.
+    let known = if o.reindex {
+        graph_store::FingerprintSnapshot::default()
+    } else {
+        store
+            .fingerprint_snapshot(o.org, o.repo)
+            .context("database error while reading stored fingerprints")?
+    };
     std::thread::scope(|sc| {
-        let (cancel, board, inflight) = (&cancel, board, &inflight);
+        let (cancel, board, inflight, known) = (&cancel, board, &inflight, &known);
         sc.spawn(move || walk(o, board, walk_tx, cancel));
         // Admission: hold each file's bytes against the budget, in walk
         // order, before it may be read (so the writer can always progress).
@@ -768,7 +783,7 @@ fn run_pipeline(
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(seq, rel.clone());
                     }
-                    let oc = work(store, o, cfg, &item, board, k);
+                    let oc = work(store, o, cfg, known, &item, board, k);
                     let mut fp = 0;
                     if let Ok(Outcome::Prepared(_, p)) = &oc {
                         board.parse.count(1, size);
