@@ -249,6 +249,28 @@ impl pb::store_server::Store for StoreService {
         ))
     }
 
+    /// #165: this node's gaps, from its own registry (the one that parses
+    /// what a client sends). Not a `View` read: the registry is the node's,
+    /// so a snapshot or the leader would not answer for it.
+    async fn extractor_gaps(
+        &self,
+        req: Request<pb::ExtractorGapsRequest>,
+    ) -> Result<Response<pb::ExtractorGapsResponse>, Status> {
+        let r = req.into_inner();
+        let slot = Arc::clone(&self.ctx.slot);
+        let gaps = tokio::task::spawn_blocking(move || {
+            slot.with_store_read(|s| {
+                graph_store::Store::extractor_gaps(s, r.org.as_deref(), r.repo.as_deref())
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("extractor_gaps task failed: {e}")))?
+        .map_err(|e| graph_proto::store_error_to_status(&e))?;
+        Ok(Response::new(pb::ExtractorGapsResponse {
+            gaps: gaps.into_iter().map(Into::into).collect(),
+        }))
+    }
+
     async fn search_symbols(
         &self,
         req: Request<pb::SearchSymbolsRequest>,

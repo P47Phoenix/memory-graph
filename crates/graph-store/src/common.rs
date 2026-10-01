@@ -311,16 +311,16 @@ pub(crate) fn prepare_file(
 /// The per-file refusal of a lossy decode under `strict_encoding` (ADR 0007
 /// C3, C8): today's `NotUtf8` when the file was decoded as UTF-8 (a `utf-8`
 /// hint or a UTF-8 BOM), so `--encoding utf-8 --strict-encoding` reproduces
-/// the old refusal exactly; a `Rejected` naming the encoding otherwise.
+/// the old refusal exactly; a typed `StrictEncoding` naming the encoding
+/// otherwise (#180).
 fn strict_refusal(path: &str, encoding: &'static Encoding) -> StoreError {
     if encoding == encoding::UTF_8 {
         StoreError::NotUtf8(format!("`{path}`"))
     } else {
-        StoreError::Rejected(format!(
-            "`{path}` has byte sequences that are invalid in {} {}",
-            encoding.name(),
-            crate::STRICT_ENCODING_MARK
-        ))
+        StoreError::StrictEncoding {
+            path: path.to_owned(),
+            encoding: encoding.name().to_owned(),
+        }
     }
 }
 

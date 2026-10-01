@@ -30,6 +30,10 @@ service Store {
   rpc Describe(DescribeRequest) returns (DescribeResponse);
   // The reference scan behind `describe` (conformance oracle).
   rpc DescribeByScan(DescribeRequest) returns (DescribeResponse);
+  // Languages whose stored symbols came from an extractor this server lacks
+  // (`Store::extractor_gaps`, #165): the server parses `Write.Index`, so its
+  // registry is the one that matters. Always this node's store, now.
+  rpc ExtractorGaps(ExtractorGapsRequest) returns (ExtractorGapsResponse);
   // A request without `limit` gets the server's default limit (1000); when that
   // fills the page, `applied_default_limit` is set and the client pages to completion.
   rpc SearchSymbols(SearchSymbolsRequest) returns (SearchSymbolsResponse);
@@ -127,6 +131,12 @@ message DescribeRequest {
   optional string repo = 3;
 }
 message DescribeResponse { repeated RepoInfo repos = 1; }
+
+message ExtractorGapsRequest {
+  optional string org = 1;
+  optional string repo = 2;
+}
+message ExtractorGapsResponse { repeated ExtractorGap gaps = 1; }
 
 message SearchSymbolsRequest {
   View view = 1;

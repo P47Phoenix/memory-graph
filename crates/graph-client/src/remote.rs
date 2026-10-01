@@ -736,6 +736,29 @@ impl Store for RemoteStore {
         Ok(r.into_inner().removed)
     }
 
+    /// #165: the server's gaps (`Store.ExtractorGaps`): it parses what this
+    /// client sends, so its registry is the one that decides. A server
+    /// without the RPC answers `Protocol` (UNIMPLEMENTED).
+    fn extractor_gaps(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+    ) -> Result<Vec<graph_store::ExtractorGap>> {
+        let req = pb::ExtractorGapsRequest {
+            org: org.map(Into::into),
+            repo: repo.map(Into::into),
+        };
+        let r = self.run(self.conn.call(Kind::Read, |ch| {
+            let req = req.clone();
+            async move { store_client(ch).extractor_gaps(req).await }
+        }))?;
+        r.into_inner()
+            .gaps
+            .into_iter()
+            .map(|g| graph_store::ExtractorGap::try_from(g).map_err(StoreError::from))
+            .collect()
+    }
+
     fn vacuum(&self) -> Result<VacuumStats> {
         let r = self.run(self.conn.call(Kind::Write, |ch| async move {
             write_client(ch).vacuum(pb::VacuumRequest {}).await

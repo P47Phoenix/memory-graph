@@ -513,3 +513,47 @@ fn embedded_and_server_agree() {
     let s = index(&srv, &src, &["--strict-encoding"], &[]);
     check_strict(&s);
 }
+
+/// #180: the non-UTF-8 strict refusal is a typed error (`StrictEncoding`),
+/// carried in the wire detail: `index-file` fails with the same message
+/// embedded and through `--server`, and `index` buckets it the same (above).
+#[test]
+fn index_file_strict_refusal_is_the_same_typed_error_over_server() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("c.txt");
+    std::fs::write(&f, SJIS_LOSSY).unwrap();
+    let f = f.to_str().unwrap();
+    let emb = Tgt::Db(d.path().join("e.redb").display().to_string());
+    let server = Server::start(&d.path().join("s.redb"));
+    let srv = Tgt::Server(server.addr.clone());
+    let mut msgs = Vec::new();
+    for t in [&emb, &srv] {
+        let mut a = t.args();
+        a.extend([
+            "index-file",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--encoding",
+            "shift_jis",
+            "--strict-encoding",
+            f,
+        ]);
+        let o = run_env(&a, &[]);
+        assert!(!o.status.success(), "{}", text(&o));
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        let line = err
+            .lines()
+            .find(|l| l.contains("strict encoding"))
+            .unwrap_or_else(|| panic!("no strict refusal in {err}"))
+            .to_string();
+        assert!(
+            line.contains("c.txt") && line.contains("invalid in Shift_JIS"),
+            "{line}"
+        );
+        // A client may send `\` paths normalized; the rest is identical.
+        msgs.push(line.replace('\\', "/"));
+    }
+    assert_eq!(msgs[0], msgs[1]);
+}

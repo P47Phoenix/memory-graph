@@ -504,9 +504,10 @@ pub trait Store: StoreRead + Send + Sync {
     /// Only languages with symbols stored are candidates (read from the
     /// catalog, O(repos)); for each, the stored extractor version is read
     /// from a file fingerprint (at most one scan of that repo's files).
-    /// Files ingested pre-extracted (no fingerprint) never count. The
-    /// default (no gaps) is for a backend that parses elsewhere, such as a
-    /// remote store: the server checks its own registry at startup.
+    /// Files ingested pre-extracted (no fingerprint) never count. A remote
+    /// store asks its server (`Store.ExtractorGaps`, #165), whose registry
+    /// is the one that parses. The default (no gaps) is for a backend that
+    /// has no registry of its own to compare against.
     fn extractor_gaps(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<ExtractorGap>> {
         let _ = (org, repo);
         Ok(Vec::new())

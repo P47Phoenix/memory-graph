@@ -178,12 +178,16 @@ registration is the plugin model.
 Note: a binary built **without** a language's feature indexes those files
 tokens-only, and because the extractor version is part of the fingerprint it
 re-indexes files that a full build indexed with symbols. Use the same feature
-set for every binary that writes to a database. `index` and `index-file` warn
-before indexing (and `serve` logs a warning at startup) when the repo holds
-symbols from an extractor the running binary lacks, naming the language and
-the stored extractor version (`Store::extractor_gaps`). Only languages with
-symbols stored are checked: files of a language whose extractor found no
-symbols, or whose symbols were ingested pre-extracted, raise no warning.
+set for every binary that writes to a database. `index` and `index-file`
+(with or without `--reindex`) **refuse**, before writing anything, when the
+repo holds symbols from an extractor that the store parsing the run lacks,
+naming the language and the stored extractor version (`Store::extractor_gaps`);
+`--force` indexes anyway and only warns. Embedded, that store is the running
+binary; with `--server` it is the server, which the client asks through the
+`Store.ExtractorGaps` RPC (and `serve` also logs its gaps at startup). Only
+languages with symbols stored are checked: files of a language whose extractor
+found no symbols, or whose symbols were ingested pre-extracted, are never
+refused.
 
 ## Test checklist
 
