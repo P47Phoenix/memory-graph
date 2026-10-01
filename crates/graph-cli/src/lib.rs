@@ -132,7 +132,8 @@ pub struct DirOpts<'a> {
     /// `--strict-encoding`: refuse (and report) a file whose decode is lossy.
     pub strict_encoding: bool,
     /// `--compact` (#90): the caller compacts the file after a run that
-    /// replaced files, so the `vacuum --compact` hint is not printed.
+    /// replaced files, so the `vacuum --compact` hint is not printed (unless
+    /// files failed: the run then errors before the caller compacts).
     pub compact: bool,
 }
 
@@ -256,6 +257,14 @@ pub fn compact_hint_text(u: graph_store::SpaceUsage) -> Option<String> {
             )
         },
     )
+}
+
+/// Whether a directory run should check for the `vacuum --compact` hint
+/// (#90): only a `--reindex` that replaced files leaves old pages behind.
+/// With `--compact` the caller reclaims them, but only when the run
+/// succeeds; a run with failed files exits before that, so it still hints.
+pub fn wants_compact_hint(reindex: bool, compact: bool, replaced: usize, failed: usize) -> bool {
+    reindex && replaced > 0 && !(compact && failed == 0)
 }
 
 /// Print [`compact_hint_text`] for `store` on stderr (embedded stores only:
@@ -1356,8 +1365,7 @@ pub fn index_dir_with(
         }
     }
     // Only a run that replaced stored files leaves the old pages behind.
-    // With --compact the caller reclaims them instead.
-    if o.reindex && replaced > 0 && !o.compact {
+    if wants_compact_hint(o.reindex, o.compact, replaced, failed.len()) {
         compact_hint(&*store);
     }
     if !failed.is_empty() {
@@ -1373,6 +1381,22 @@ pub fn index_dir_with(
 mod hygiene_tests {
     use super::compact_hint_text;
     use graph_store::SpaceUsage;
+
+    #[test]
+    fn compact_hint_is_wanted_unless_compact_will_run() {
+        use super::wants_compact_hint as w;
+        // Not a reindex, or nothing replaced: no old pages.
+        assert!(!w(false, false, 5, 0));
+        assert!(!w(true, false, 0, 0));
+        assert!(!w(true, true, 0, 3));
+        // A replacing reindex hints, unless --compact will reclaim.
+        assert!(w(true, false, 5, 0));
+        assert!(w(true, false, 5, 2));
+        assert!(!w(true, true, 5, 0));
+        // --compact with failed files: the run errors before compacting,
+        // so the hint must still be printed.
+        assert!(w(true, true, 5, 2));
+    }
 
     #[test]
     fn compact_hint_fires_at_two_and_a_half_times_live() {

@@ -2665,6 +2665,21 @@ fn index_reindex_compact() {
     let (ok, out, err) = idx(&["--reindex", "--compact"], &s);
     assert!(ok, "{out}{err}");
     assert!(!out.contains("compact:"), "fresh: {out}");
+    // What queries answer before the reindex + compact must not change.
+    let answers = || {
+        let mut v = Vec::new();
+        for args in [
+            vec!["--db", db.as_str(), "search", "alpha", "--json"],
+            vec!["--db", db.as_str(), "search", "beta", "--json"],
+            vec!["--db", db.as_str(), "describe", "--json"],
+        ] {
+            let (ok, out, err) = run(&args);
+            assert!(ok, "{args:?}: {err}");
+            v.push(out);
+        }
+        v
+    };
+    let before = answers();
     // A real replace compacts, with no hint left over.
     let (ok, out, err) = idx(&["--reindex", "--compact"], &s);
     assert!(ok, "{out}{err}");
@@ -2673,6 +2688,11 @@ fn index_reindex_compact() {
         "{out}"
     );
     assert!(!err.contains("hint:"), "{err}");
+    assert_eq!(
+        answers(),
+        before,
+        "answers changed after --reindex --compact"
+    );
     // Nothing indexed (an empty tree): nothing replaced, no compaction.
     let (ok, out, err) = idx(&["--reindex", "--compact"], &e);
     assert!(ok, "{out}{err}");
