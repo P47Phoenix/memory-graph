@@ -26,14 +26,27 @@
 //! directive's, and must be `C#`, `cs` or `csharp` (any case). With neither,
 //! Web Forms compiles the script as VB, so it stays markup, as do VB (and
 //! other) scripts. As in ASP.NET, the first `</script>` ends the body even
-//! inside a C# string (`"</script>"`). `<% ... %>` blocks are not scanned for C# symbols: they hold the
-//! statements of the page's render method, where a scanner would read
-//! `if (x) {` or `int n = 0;` as declarations.
+//! inside a C# string (`"</script>"`).
 //!
-//! Keywords (#143): only the C# tokens of a server script body are classed
-//! `keyword` (C#'s reserved words, as `graph-lang-csharp` does). Markup has
-//! no reserved words, and `<% %>` blocks stay markup tokens: their language
-//! may be VB, so they are left unclassed.
+//! Code blocks (#72): on a page whose `<%@ Page/Control/Master %>`
+//! directive says `Language="C#"` (as above), the body of each closed
+//! `<% ... %>` block (not `<%= %>`, `<%# %>`, ...) is tokenized as C# too,
+//! and its local declarations (`int n = 0;`, `var x = ...;`,
+//! `foreach (var p in ...)`, `catch (Exception ex)`; see
+//! `graph_lang_csharp::local_symbols`) become `local` / `local_const`
+//! symbols nested in the block's `code_block` symbol, so they are scoped
+//! under the page or the enclosing control or element. These blocks hold
+//! statement fragments of the page's render method (`<% if (x) { %>`), so
+//! only declarations are reported, never `if (x) {` as a method. A page
+//! with no directive language is VB (the Web Forms default) and VB.NET is
+//! out of scope: its blocks, and those of any non-C# page, stay markup (a
+//! script's own `language` attribute does not change the page's).
+//!
+//! Keywords (#143): only the C# tokens of a server script body or of a code
+//! block on a C# page are classed `keyword` (C#'s reserved words, as
+//! `graph-lang-csharp` does). Markup has no reserved words, and `<% %>`
+//! blocks of other pages stay markup tokens: their language may be VB, so
+//! they are left unclassed.
 //!
 //! Element spans follow the HTML scanner's rule;
 //! server blocks are opaque to it (they may sit inside a start tag), so their
@@ -65,19 +78,22 @@ impl Extractor for AspxExtractor {
 
     fn version(&self) -> String {
         // `kw1`: C# reserved words in server script bodies are classed
-        // `keyword` (#143); markup and `<% %>` blocks are unchanged.
-        format!("aspx-scan-2+kw1+tok{TOKENIZER_VERSION}")
+        // `keyword` (#143). `cb1`: `<% %>` blocks of C# pages are C# tokens
+        // with keywords and `local` symbols (#72).
+        format!("aspx-scan-2+kw1+cb1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
         let markup = tokenize_with(source, ASPX_TOKENIZER);
-        let (tokens, scripts) = server_scripts(source, markup.clone());
+        let (tokens, mut scripts) = server_scripts(source, markup.clone());
+        let (tokens, locals) = code_blocks(source, tokens);
+        scripts.extend(locals);
         let with_scripts = extraction(tokens, scripts);
         if well_nested(&with_scripts) {
             return with_scripts;
         }
-        // Server script bodies re-tokenized as C# confused the markup
-        // scanner (never seen on real pages): keep them as markup.
+        // Server script or code block bodies re-tokenized as C# confused
+        // the markup scanner (never seen on real pages): keep them as markup.
         extraction(markup, Vec::new())
     }
 }
@@ -171,7 +187,14 @@ fn server_blocks(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
         let close = next_close[i];
         let end = close.unwrap_or(i);
         let name = (i + 1..end)
-            .find(|&j| tokens[j].class == TokenClass::Identifier)
+            // Keywords too: a C# page's code block (`<% if (x) { %>`) is
+            // named as on any other page.
+            .find(|&j| {
+                matches!(
+                    tokens[j].class,
+                    TokenClass::Identifier | TokenClass::Keyword
+                )
+            })
             .map_or_else(|| lang.to_string(), |j| tokens[j].text.clone());
         out.push(SymbolDecl {
             owner: None,
@@ -282,6 +305,49 @@ fn server_scripts(source: &str, tokens: Vec<TokenDecl>) -> (Vec<TokenDecl>, Vec<
         next = lt;
     }
     out.extend_from_slice(&tokens[next..]);
+    (out, symbols)
+}
+
+/// On a C# page, re-tokenizes the body of every closed `<% ... %>` code
+/// block as C#: returns the tokens (C# tokens inside the bodies, keywords
+/// classed) and the local declarations found in them.
+fn code_blocks(source: &str, tokens: Vec<TokenDecl>) -> (Vec<TokenDecl>, Vec<SymbolDecl>) {
+    if !directive_language(source, &tokens).is_some_and(|l| is_csharp(&l)) {
+        return (tokens, Vec::new());
+    }
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut symbols = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        out.push(tokens[i].clone());
+        if tokens[i].text != "<%" {
+            i += 1;
+            continue;
+        }
+        // The first server tag after `<%` must be its `%>`.
+        let close = (i + 1..tokens.len())
+            .find(|&j| tokens[j].text.starts_with("<%") || tokens[j].text == "%>")
+            .filter(|&j| tokens[j].text == "%>");
+        let Some(close) = close else {
+            i += 1;
+            continue;
+        };
+        let (from, to) = (tokens[i].span.end, tokens[close].span.start);
+        let base = (tokens[i].span.end_line, tokens[i].span.end_col);
+        let mut code = tokenize_with(
+            &source[from as usize..to as usize],
+            graph_lang_csharp::CSHARP_TOKENIZER,
+        );
+        for t in &mut code {
+            rebase(&mut t.span, from, base);
+        }
+        symbols.extend(graph_lang_csharp::local_symbols(&code));
+        // After the local scan, which reads identifiers as it always has.
+        graph_lang_csharp::mark_csharp_keywords(&mut code);
+        out.extend(code);
+        out.push(tokens[close].clone());
+        i = close + 1;
+    }
     (out, symbols)
 }
 

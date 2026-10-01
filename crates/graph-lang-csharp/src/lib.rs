@@ -204,6 +204,174 @@ pub fn member_symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
     s.out
 }
 
+/// Built-in type keywords that can start a local declaration.
+const BUILTIN_TYPES: &[&str] = &[
+    "bool", "byte", "char", "decimal", "double", "float", "int", "long", "object", "sbyte",
+    "short", "string", "uint", "ulong", "ushort",
+];
+
+/// Longest local declaration statement, in code tokens, whose `;` is found;
+/// a longer one's span ends at its name.
+const MAX_STATEMENT: usize = 4096;
+
+/// Contextual words that start a statement, not a type (`await x;`).
+const NOT_TYPES: &[&str] = &["await", "yield", "nameof", "when", "goto"];
+
+/// Local declarations in a run of C# statements (as produced with
+/// [`CSHARP_TOKENIZER`]), which may be a fragment such as the body of an
+/// ASP.NET `<% ... %>` code block (`if (x) {`, `int n = 0;`, `}`). Not used
+/// by [`CSharpExtractor`] (method bodies are not scanned there), so a change
+/// here needs only `graph-lang-aspx`'s version bumped.
+///
+/// | C# | `SymbolKind` | `lang_kind` | span |
+/// |---|---|---|---|
+/// | `T x = ...;`, `var x;`, `T x, y;` | Variable | `local` | type through `;` |
+/// | `const T x = ...;` | Constant | `local_const` | `const` through `;` |
+/// | `for (T x = ...`, `using (T x = ...`, `foreach (T x in` | Variable | `local` | type through name |
+/// | `catch (T x)` | Variable | `local` | type through name |
+///
+/// A declaration is a type (a name or built-in type keyword, optionally
+/// qualified, generic, nullable or an array) then an identifier then `=`,
+/// `;` or `,` (`in` for `foreach`, `)` for `catch`), at a statement start:
+/// the first token, or after `;`, `{` or `}`. A multi-declarator statement
+/// yields one symbol, named by its first declarator. Not found: tuple
+/// deconstruction, pattern and `out var` variables, local functions.
+pub fn local_symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
+    let code = code_indices(tokens);
+    let t = |c: usize| tokens[code[c]].text.as_str();
+    let n = code.len();
+    let mut out = Vec::new();
+    for c in 0..n {
+        let stmt_start = c == 0 || matches!(t(c - 1), ";" | "{" | "}");
+        // `for (`, `foreach (`, `using (`, `catch (`: the header's first word.
+        let header = (c >= 2 && t(c - 1) == "(")
+            .then(|| t(c - 2))
+            .filter(|w| matches!(*w, "for" | "foreach" | "using" | "catch"));
+        if !stmt_start && header.is_none() {
+            continue;
+        }
+        let constant = stmt_start && t(c) == "const";
+        let ty = if constant { c + 1 } else { c };
+        let Some(name) = type_end(tokens, &code, ty) else {
+            continue;
+        };
+        if name >= n || !is_name(&tokens[code[name]]) {
+            continue;
+        }
+        let after = if name + 1 < n { t(name + 1) } else { "" };
+        let ok = match header {
+            Some("foreach") => after == "in",
+            Some("catch") => after == ")",
+            Some(_) => after == "=",
+            None => matches!(after, "=" | ";" | ","),
+        };
+        if !ok {
+            continue;
+        }
+        let last = if header.is_none() {
+            statement_end(tokens, &code, name + 1).unwrap_or(name)
+        } else {
+            name
+        };
+        out.push(SymbolDecl {
+            owner: None,
+            name: t(name).to_string(),
+            kind: if constant {
+                SymbolKind::Constant
+            } else {
+                SymbolKind::Variable
+            },
+            lang_kind: Some(if constant { "local_const" } else { "local" }.into()),
+            span: span_between(&tokens[code[c]].span, &tokens[code[last]].span),
+        });
+    }
+    out
+}
+
+/// A non-reserved identifier (`int x` is not read as `return x`).
+fn is_name(t: &TokenDecl) -> bool {
+    t.class == TokenClass::Identifier && !KEYWORDS.contains(&t.text.as_str())
+}
+
+fn is_type_word(t: &TokenDecl) -> bool {
+    BUILTIN_TYPES.contains(&t.text.as_str())
+        || (is_name(t) && !NOT_TYPES.contains(&t.text.as_str()))
+}
+
+/// Code position just past a local's type starting at `c`, or `None` when
+/// no type starts there.
+fn type_end(tokens: &[TokenDecl], code: &[usize], c: usize) -> Option<usize> {
+    let n = code.len();
+    let tk = |c: usize| &tokens[code[c]];
+    let simple = |c: usize| c < n && is_type_word(tk(c));
+    if !simple(c) {
+        return None;
+    }
+    let mut c = c + 1;
+    while c + 1 < n && tk(c).text == "." && simple(c + 1) {
+        c += 2;
+    }
+    if c < n && tk(c).text == "<" {
+        // Generic arguments: names, built-ins, `.`, `,`, `?`, `[]`, nested.
+        let mut depth = 0i32;
+        while c < n {
+            match tk(c).text.as_str() {
+                "<" => depth += 1,
+                // The tokenizer emits `>>` and `>>>` as single `>`s.
+                ">" => depth -= 1,
+                "." | "," | "?" | "[" | "]" => {}
+                _ if simple(c) => {}
+                _ => return None,
+            }
+            c += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+    }
+    if c < n && tk(c).text == "?" {
+        c += 1;
+    }
+    while c + 1 < n && tk(c).text == "[" {
+        let mut j = c + 1;
+        while j < n && tk(j).text == "," {
+            j += 1;
+        }
+        if j < n && tk(j).text == "]" {
+            c = j + 1;
+        } else {
+            break;
+        }
+    }
+    Some(c)
+}
+
+/// Code position of the `;` ending the statement from `c` (brackets
+/// balanced), or `None` when the tokens end first or it is more than
+/// [`MAX_STATEMENT`] tokens away (bounding the scan on adversarial input).
+fn statement_end(tokens: &[TokenDecl], code: &[usize], mut c: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let hi = code.len().min(c.saturating_add(MAX_STATEMENT));
+    while c < hi {
+        match tokens[code[c]].text.as_str() {
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ";" if depth == 0 => return Some(c),
+            _ => {}
+        }
+        c += 1;
+    }
+    None
+}
+
 /// Indices of tokens that matter for structure: no comments, no
 /// preprocessor lines (`#region`, `#if`, ...).
 fn code_indices(tokens: &[TokenDecl]) -> Vec<usize> {

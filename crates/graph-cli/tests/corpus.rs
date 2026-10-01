@@ -878,3 +878,38 @@ fn non_rust_corpus_token_streams_are_unchanged() {
         "non-Rust corpus tokens changed"
     );
 }
+
+/// #72 scans ASP.NET `<% %>` code blocks with
+/// `graph_lang_csharp::local_symbols`: every other corpus file's symbols
+/// must be unchanged. Pins a hash of the (path, name, kind, lang_kind, span)
+/// of every symbol the shipped extractors find in every non-ASPX corpus
+/// file, computed before #72. If this fails, an extractor's symbols changed
+/// (bump its version, re-pin) or the corpus did.
+#[test]
+fn non_aspx_corpus_symbols_are_unchanged() {
+    const EXPECTED: (usize, usize, u64) = (787, 6927, 3942956324713085798);
+    let registry = shipped_registry();
+    let (mut n, mut syms, mut h) = (0usize, 0usize, 0xcbf29ce484222325u64);
+    for r in manifest()["repos"].as_array().unwrap() {
+        let dir = corpus_dir().join(r["dir"].as_str().unwrap());
+        for rel in files(&dir) {
+            let src = std::fs::read_to_string(dir.join(&rel)).unwrap();
+            let lang = registry.detect_language(&rel, &src);
+            if lang == "aspx" {
+                continue;
+            }
+            n += 1;
+            for s in registry.extract(&lang, &src).symbols {
+                syms += 1;
+                let line = format!(
+                    "{rel}|{}|{:?}|{:?}|{:?}\n",
+                    s.name, s.kind, s.lang_kind, s.span
+                );
+                for b in line.bytes() {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+    }
+    assert_eq!((n, syms, h), EXPECTED, "non-ASPX corpus symbols changed");
+}

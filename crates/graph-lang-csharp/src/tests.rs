@@ -361,3 +361,81 @@ fn keywords_are_classed_keyword() {
         .version()
         .starts_with("csharp-scan-1+kw1+tok"));
 }
+
+/// `local_symbols` (#72): (name, lang_kind, span text) of each local.
+fn locals(src: &str) -> Vec<(String, String, String)> {
+    let toks = tokenize_with(src, CSHARP_TOKENIZER);
+    local_symbols(&toks)
+        .into_iter()
+        .map(|s| {
+            let text = src[s.span.start as usize..s.span.end as usize].to_string();
+            (s.name, s.lang_kind.unwrap(), text)
+        })
+        .collect()
+}
+
+fn names(src: &str) -> Vec<String> {
+    locals(src).into_iter().map(|l| l.0).collect()
+}
+
+#[test]
+fn local_declarations() {
+    // Multi-declarator: one symbol, the whole statement.
+    assert_eq!(
+        locals("int a, b;"),
+        [("a".into(), "local".into(), "int a, b;".into())]
+    );
+    // Statement start after `}`.
+    assert_eq!(names("} int x = 1;"), ["x"]);
+    assert_eq!(names("{ } int y;"), ["y"]);
+    // A missing `;` before the enclosing `}`: the span ends at the name.
+    assert_eq!(locals("{ int x = 1 }")[0].2, "int x");
+    // A `;` inside brackets does not end the statement.
+    assert_eq!(
+        locals("Action a = () => { f(); };")[0].2,
+        "Action a = () => { f(); };"
+    );
+    assert_eq!(
+        locals("int[] v = new[] { g(x[0]) };")[0].2,
+        "int[] v = new[] { g(x[0]) };"
+    );
+    // Nullable and array types.
+    assert_eq!(names("int? q;"), ["q"]);
+    assert_eq!(names("int[,] m;"), ["m"]);
+    // Header guards: each needs its follower.
+    assert_eq!(names("foreach (var p in q) { }"), ["p"]);
+    assert!(names("foreach (var p of q) { }").is_empty());
+    assert_eq!(names("catch (Exception ex) { }"), ["ex"]);
+    assert!(names("catch (Exception ex when x) { }").is_empty());
+    assert_eq!(names("for (int i = 0; i < n; i++) { }"), ["i"]);
+    assert!(names("for (int i; i < n; i++) { }").is_empty());
+    assert_eq!(names("using (var c = Open()) { }"), ["c"]);
+    assert!(names("using (Foo c) { }").is_empty());
+    // Not declarations.
+    for src in [
+        "return x;",
+        "await y;",
+        "a = b;",
+        "x.y = z;",
+        "Foo();",
+        "a < b;",
+    ] {
+        assert!(names(src).is_empty(), "{src}");
+    }
+}
+
+/// The tokenizer emits `>>` and `>>>` as single `>`s, so nested generics
+/// close with plain `>` tokens.
+#[test]
+fn nested_generic_closers_are_single_tokens() {
+    for src in ["a >> b", "a >>> b"] {
+        let toks = tokenize_with(src, CSHARP_TOKENIZER);
+        assert!(
+            toks.iter().all(|t| t.text != ">>" && t.text != ">>>"),
+            "{toks:?}"
+        );
+    }
+    assert_eq!(names("List<List<int>> x;"), ["x"]);
+    assert_eq!(names("A<B<C<int>>> y = z;"), ["y"]);
+    assert!(names("A<B<int> y;").is_empty());
+}
