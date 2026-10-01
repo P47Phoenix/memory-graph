@@ -419,7 +419,7 @@ pub struct V2Store {
     pub(crate) chunk_bytes: usize,
     /// Test-only (#154): skip the open-batch marker writes, so a timing test
     /// can separate the marker's cost from the raw per-chunk commit cost.
-    /// Test-only: the field exists only under `cfg(test)`, and in every other
+    /// The field exists only under `cfg(test)`, and in every other
     /// build `commit_each_counted` uses a constant `false`, so the marker is
     /// always written.
     #[cfg(test)]
