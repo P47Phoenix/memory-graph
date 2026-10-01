@@ -676,13 +676,33 @@ fn every_parsed_token_is_stored() {
     // IBM-style COBOL: sequence numbers in columns 1-6, an identification
     // area in 73-80, and copybooks.
     spot("CBACT01C", "cobol", "program", "app/cbl/CBACT01C.cbl");
-    spot(
-        "WORKING-STORAGE",
-        "cobol",
-        "section",
-        "app/app-transaction-type-db2/cbl/COBTUPDT.cbl",
-    );
     spot("CC-WORK-AREAS", "cobol", "level-01", "app/cpy/CVCRD01Y.cpy");
+    let span_of = |name: &str, lang: &str, lang_kind: &str| {
+        let mut q = graph_store::SymbolQuery::new(name);
+        q.language = Some(lang.into());
+        store
+            .search_symbols(&q)
+            .unwrap()
+            .into_iter()
+            .find(|h| h.lang_kind.as_deref() == Some(lang_kind))
+            .and_then(|h| h.span)
+            .unwrap_or_else(|| panic!("no span for {lang} {name}"))
+    };
+    // The level-01 item starts after the sequence number (columns 1-6) and
+    // the indicator column, not in them.
+    let s = span_of("CC-WORK-AREAS", "cobol", "level-01");
+    assert_eq!((s.start_line, s.start_col), (1, 8), "{s:?}");
+    let cpy =
+        std::fs::read_to_string(corpus_dir().join("carddemo-cobol/app/cpy/CVCRD01Y.cpy")).unwrap();
+    assert!(cpy[s.start as usize..].starts_with("01  CC-WORK-AREAS"));
+    // In COBTUPDT every line carries an identification area in 73-80; the
+    // program symbol still starts at column 8 of its PROGRAM-ID line.
+    let s = span_of("COBTUPDT", "cobol", "program");
+    assert_eq!((s.start_line, s.start_col), (22, 8), "{s:?}");
+    // A fixed-form P spec runs from its `B` (with the `...` long name on the
+    // line before) to its `E` spec.
+    let s = span_of("list_sort_insertionSort", "rpg", "procedure");
+    assert_eq!((s.start_line, s.end_line), (60, 176), "{s:?}");
     // Shell (an extensionless script found by its shebang) and R.
     spot("canonicalize", "shell", "function", "libexec/rbenv");
     spot("_rbenv", "shell", "function", "completions/rbenv.bash");
@@ -739,6 +759,25 @@ fn token_classes_are_sensible_on_real_code() {
     assert!(cs
         .iter()
         .any(|t| t.text == "AbstractRebusTransport" && t.class == TokenClass::Identifier));
+    // Assembly comments as the asm extractor's dialect classifies them.
+    let asm = |repo: &str, file: &str| {
+        let src = std::fs::read_to_string(corpus_dir().join(repo).join(file)).unwrap();
+        shipped_registry().extract("asm", &src).tokens
+    };
+    // Known limits (#134), pinned on real code so a fix shows up here: an
+    // AT&T trailing `# comment` after code and an ARM32 `@ comment` are not
+    // comments today. Flip these to `TokenClass::Comment` when they are.
+    let att = asm("xv6-asm", "bootasm.S");
+    let line16: Vec<_> = att.iter().filter(|t| t.span.start_line == 16).collect();
+    assert_eq!(line16[0].text, "xorw");
+    let hash = line16.iter().find(|t| t.text == "#").expect("# on line 16");
+    assert_ne!(hash.class, TokenClass::Comment);
+    let arm = asm("arm32-game", "game1/prompt.asm");
+    let at = arm
+        .iter()
+        .find(|t| t.span.start_line == 15 && t.text == "@")
+        .expect("@ on line 15");
+    assert_ne!(at.class, TokenClass::Comment);
     let sh = classes("rbenv", "libexec/rbenv");
     assert!(sh.iter().any(|t| t.class == TokenClass::Comment));
     assert!(sh
@@ -815,7 +854,7 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
     const EXPECTED_FILES: usize = 758;
-    const EXPECTED_HASH: u64 = 12922119727943935660;
+    const EXPECTED_HASH: u64 = 2544251198145975615;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());

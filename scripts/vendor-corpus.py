@@ -71,6 +71,11 @@ def main():
             subprocess.check_call(["git", "init", "-q", u])
             # Byte-identical to upstream even where core.autocrlf is on.
             subprocess.check_call(["git", "-C", u, "config", "core.autocrlf", "false"])
+            # ...and even where the upstream's own .gitattributes asks for
+            # text conversion (`* text=auto` checks out CRLF on Windows):
+            # info/attributes overrides it, so files are the git blobs.
+            with open(os.path.join(u, ".git", "info", "attributes"), "w", newline="\n") as f:
+                f.write("* -text -filter -ident -working-tree-encoding\n")
             subprocess.check_call(["git", "-C", u, "fetch", "-q", "--depth", "1", repo["upstream"], repo["commit"]])
             subprocess.check_call(["git", "-C", u, "checkout", "-q", "FETCH_HEAD"])
             shutil.rmtree(dest, ignore_errors=True)  # only after a successful fetch

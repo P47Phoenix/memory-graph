@@ -397,6 +397,7 @@
     {
       "dir": "ossile-rpg",
       "kind": "RPG IV utilities (fixed, mixed and free form)",
+      "note": "LICENSE_zlib is left out on purpose: it covers only main/zlib, which is not vendored.",
       "upstream": "https://github.com/OSSILE/OSSILE",
       "commit": "7201a67f7e704d73b7da82abd8c520826dd05741",
       "license": "MIT",
