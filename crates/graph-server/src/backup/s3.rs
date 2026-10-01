@@ -29,7 +29,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -53,8 +52,9 @@ pub const MAX_RESPONSE: u64 = 8 << 20;
 /// The guidance of an HTTPS refusal.
 const HTTPS_GUIDANCE: &str = "stage 1 of ADR 0006 speaks plain http:// only (no pure-Rust TLS \
      provider passes the build's gate yet, #104). Reach an HTTPS endpoint (AWS S3 itself) \
-     through a local TLS sidecar (stunnel, envoy) and point --backup-endpoint at it, e.g. \
-     http://127.0.0.1:8080, or back up to a file:// directory and `aws s3 sync` it";
+     through a local TLS sidecar (stunnel, envoy): keep the real name in --backup-endpoint, \
+     e.g. http://s3.eu-west-1.amazonaws.com, and add --backup-connect-to 127.0.0.1:8080 (the \
+     sidecar's address), or back up to a file:// directory and `aws s3 sync` it";
 
 /// A parsed `s3://bucket/prefix`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +192,39 @@ pub fn parse_endpoint(s: &str) -> Result<Endpoint, String> {
     Ok(Endpoint { host, port })
 }
 
+/// Parse `--backup-connect-to host:port` (`[v6]:port` for IPv6): the
+/// TCP address S3 traffic goes to instead of the endpoint's, while the
+/// endpoint's host still names the request (SigV4 and `Host`). The port is
+/// required and must not be 0, and the name must resolve now (a startup
+/// check); the returned `host:port` is resolved again on every connection,
+/// trying each address in turn, so a sidecar whose IP changes keeps
+/// working.
+pub fn parse_connect_to(s: &str) -> Result<String, String> {
+    use std::net::ToSocketAddrs;
+    let bad = |why: &str| format!("--backup-connect-to `{s}`: {why}");
+    if s.contains("://") || s.contains(['/', '?', '#', '@']) {
+        return Err(bad("expected host:port (no scheme or path)"));
+    }
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| bad("expected host:port (the port is required)"))?;
+    if host.is_empty() || host == "[]" {
+        return Err(bad("no host"));
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(bad("an IPv6 address needs brackets, [addr]:port"));
+    }
+    port.parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| bad(&format!("`{port}` is not a port")))?;
+    s.to_socket_addrs()
+        .map_err(|e| bad(&format!("does not resolve: {e}")))?
+        .next()
+        .ok_or_else(|| bad("resolves to no address"))?;
+    Ok(s.to_string())
+}
+
 /// Everything an [`S3Sink`] needs beyond the URL.
 #[derive(Clone)]
 pub struct S3Options {
@@ -214,9 +247,12 @@ pub struct S3Options {
     pub part_size: usize,
     /// [`DEFAULT_TIMEOUT`] (see there for what it bounds).
     pub timeout: Duration,
-    /// Tests: connect here whatever the host (a virtual-hosted name that
-    /// does not resolve), like curl's `--connect-to`.
-    pub connect_to: Option<SocketAddr>,
+    /// `--backup-connect-to`: connect here whatever the host, like curl's
+    /// `--connect-to` (a TLS sidecar in front of AWS; tests: a
+    /// virtual-hosted name that does not resolve). The endpoint's host is
+    /// still what is signed and sent as `Host`. A `host:port`, resolved on
+    /// each connection (every address tried in turn).
+    pub connect_to: Option<String>,
 }
 
 impl Default for S3Options {
@@ -249,6 +285,7 @@ impl std::fmt::Debug for S3Options {
             .field("multipart_threshold", &self.multipart_threshold)
             .field("part_size", &self.part_size)
             .field("timeout", &self.timeout)
+            .field("connect_to", &self.connect_to)
             .finish()
     }
 }
@@ -652,8 +689,9 @@ impl S3Sink {
     ) -> std::io::Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>> {
         let t = self.opts.timeout;
         let connect = async {
-            match self.opts.connect_to {
-                Some(a) => tokio::net::TcpStream::connect(a).await,
+            match &self.opts.connect_to {
+                // tokio resolves the name now and tries each address.
+                Some(a) => tokio::net::TcpStream::connect(a.as_str()).await,
                 None => {
                     let host = self
                         .endpoint
@@ -1140,6 +1178,32 @@ impl BackupSink for S3Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_to_is_validated() {
+        // IP literals only: no dependence on the machine's DNS.
+        for ok in ["127.0.0.1:9080", "[::1]:9080"] {
+            assert_eq!(parse_connect_to(ok).unwrap(), ok);
+        }
+        for (bad, why) in [
+            ("127.0.0.1", "port is required"),
+            ("127.0.0.1:0", "is not a port"),
+            ("127.0.0.1:x", "is not a port"),
+            ("127.0.0.1:70000", "is not a port"),
+            (":9080", "no host"),
+            ("[]:9080", "no host"),
+            ("::1:9080", "brackets"),
+            ("http://127.0.0.1:9080", "no scheme"),
+            ("127.0.0.1:9080/x", "no scheme"),
+            ("no-such-host.invalid:9080", "does not resolve"),
+        ] {
+            let e = parse_connect_to(bad).unwrap_err();
+            assert!(
+                e.contains("--backup-connect-to") && e.contains(why),
+                "{bad}: {e}"
+            );
+        }
+    }
 
     #[test]
     fn s3_urls_parse() {

@@ -181,10 +181,12 @@ impl BackupConfig {
                     || s.virtual_host
                     || s.credentials_file.is_some()
                     || s.profile.is_some()
+                    || s.connect_to.is_some()
                 {
                     return Err(format!(
                         "`{}`: --backup-endpoint, --backup-region, --backup-virtual-host, \
-                         --backup-credentials-file and --backup-profile apply to s3:// only",
+                         --backup-credentials-file, --backup-profile and --backup-connect-to \
+                         apply to s3:// only",
                         self.url
                     ));
                 }

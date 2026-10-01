@@ -265,3 +265,207 @@ fn upload_list_and_restore_from_s3() {
     ]);
     assert!(!o.status.success());
 }
+
+/// A TCP forwarder standing in for a TLS sidecar: every connection to its
+/// address is piped to `to`. It counts the connections it accepted.
+struct Forwarder {
+    addr: std::net::SocketAddr,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Forwarder {
+    fn start(to: std::net::SocketAddr) -> Forwarder {
+        use std::net::{TcpListener, TcpStream};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = std::sync::Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(client) = c else { return };
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Ok(upstream) = TcpStream::connect(to) else {
+                    continue;
+                };
+                let pipe = |mut a: TcpStream, mut b: TcpStream| {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut a, &mut b);
+                        let _ = b.shutdown(std::net::Shutdown::Write);
+                    });
+                };
+                pipe(client.try_clone().unwrap(), upstream.try_clone().unwrap());
+                pipe(upstream, client);
+            }
+        });
+        Forwarder { addr, accepted }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// #173: `--backup-connect-to` sends S3 traffic to another TCP address
+/// (a TLS sidecar) while each request is still signed for, and carries the
+/// `Host` of, the `--backup-endpoint` name, which here does not resolve.
+#[test]
+fn backup_connect_to_goes_through_a_forwarder() {
+    let f = FakeS3::start();
+    let fwd = Forwarder::start(f.addr());
+    let root = tempfile::tempdir().unwrap();
+    let creds = root.path().join("aws-credentials");
+    f.write_credentials(&creds);
+    let src = root.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.rs"), "fn alpha() -> u32 { 1 }\n").unwrap();
+
+    // A name under `.invalid` never resolves, so only --backup-connect-to
+    // reaches the fake. Virtual-hosted, the fake takes the bucket from the
+    // signed Host `backups.s3.mg-test.invalid`.
+    let fwd_addr = fwd.addr.to_string();
+    let s3: Vec<String> = [
+        "--backup-endpoint",
+        "http://s3.mg-test.invalid",
+        "--backup-virtual-host",
+        "--backup-region",
+        FAKE_REGION,
+        "--backup-credentials-file",
+        creds.to_str().unwrap(),
+        "--backup-connect-to",
+        &fwd_addr,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let mut args: Vec<String> = [
+        "--data-dir",
+        root.path().join("d1").to_str().unwrap(),
+        "--node-id",
+        "1",
+        "--bootstrap",
+        "--backup-url",
+        "s3://backups/mg",
+        "--backup-on",
+        "none",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.extend(s3.iter().cloned());
+    let source = serve(&args);
+    ok(&[
+        "--server",
+        &source.addr,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--no-progress",
+        src.to_str().unwrap(),
+    ]);
+    let up = json(&[
+        "--server",
+        &source.addr,
+        "cluster",
+        "snapshot",
+        "--upload",
+        "--json",
+    ]);
+    let url = up["url"].as_str().unwrap().to_string();
+    let key = url.strip_prefix("s3://backups/").unwrap().to_string();
+    assert!(f.object("backups", &key).is_some(), "{up}");
+    assert!(fwd.accepted() > 0, "nothing went through the forwarder");
+    // Virtual-hosted: the bucket is in the Host, not in the path.
+    let reqs = f.requests();
+    assert!(reqs.iter().any(|r| r.starts_with("PUT /mg/")), "{reqs:?}");
+
+    // A restore goes the same way.
+    let before = fwd.accepted();
+    let cluster = key.split('/').nth(1).unwrap().to_string();
+    let latest = format!("s3://backups/mg/{cluster}/latest");
+    let mut args: Vec<String> = [
+        "--data-dir",
+        root.path().join("d2").to_str().unwrap(),
+        "--node-id",
+        "1",
+        "--bootstrap",
+        "--restore",
+        &latest,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.extend(s3.iter().cloned());
+    let restored = serve(&args);
+    assert_eq!(answers(&source.addr), answers(&restored.addr));
+    assert!(
+        fwd.accepted() > before,
+        "the restore bypassed the forwarder"
+    );
+
+    // A bad address is refused at startup, naming the flag.
+    let d3 = root.path().join("d3");
+    for bad in [
+        "127.0.0.1",
+        "127.0.0.1:0",
+        "http://127.0.0.1:9",
+        "no-such-host.invalid:80",
+    ] {
+        let o = run(&[
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            d3.to_str().unwrap(),
+            "--node-id",
+            "1",
+            "--bootstrap",
+            "--backup-url",
+            "s3://backups/mg",
+            "--backup-endpoint",
+            "http://s3.mg-test.invalid",
+            "--backup-connect-to",
+            bad,
+        ]);
+        assert!(!o.status.success(), "{bad}");
+        let err = text(&o.stderr);
+        assert!(err.contains("--backup-connect-to"), "{bad}: {err}");
+    }
+    assert!(!d3.join("graph.redb").exists());
+    // It is an S3 setting: refused without a backup or a restore.
+    let o = run(&[
+        "serve",
+        "--db",
+        root.path().join("x.redb").to_str().unwrap(),
+        "--backup-connect-to",
+        "127.0.0.1:9",
+    ]);
+    assert!(!o.status.success());
+    let err = text(&o.stderr);
+    assert!(
+        err.contains("--backup-connect-to") || err.contains("required"),
+        "{err}"
+    );
+    // ... and with a restore from a plain file and no backup URL, where it
+    // would silently do nothing.
+    let d5 = root.path().join("d5");
+    let o = run(&[
+        "serve",
+        "--listen",
+        "127.0.0.1:0",
+        "--data-dir",
+        d5.to_str().unwrap(),
+        "--node-id",
+        "1",
+        "--bootstrap",
+        "--restore",
+        root.path().join("snap.redb").to_str().unwrap(),
+        "--backup-connect-to",
+        "127.0.0.1:9",
+    ]);
+    assert!(!o.status.success());
+    let err = text(&o.stderr);
+    assert!(err.contains("--backup-connect-to needs an s3://"), "{err}");
+    assert!(!d5.join("graph.redb").exists());
+}

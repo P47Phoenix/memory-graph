@@ -7,7 +7,7 @@
 1. Today a cluster's only backups are `cluster snapshot --out <file>` and `serve --bootstrap --restore <file>`. Each node keeps just one snapshot on its own disk.
 2. This ADR lets the leader copy each snapshot it builds to a backup location, keep the last few there, and restore a new cluster straight from that location.
 3. Stage 1 supports a local or mounted directory (`file://`) and S3-compatible object storage over plain HTTP (`s3://`, for AWS through a sidecar, MinIO, Ceph, R2, B2, Garage).
-4. Talking to AWS directly over HTTPS needs a TLS library that passes our pure-Rust gate; that is deferred (story 39, shared with #104). Until then, use a TLS sidecar reached under the real S3 host name (SigV4 signs `Host`, so `--backup-endpoint` cannot be `127.0.0.1`; see `docs/deploy/data-dir.md`, and #173 for a `--backup-connect-to` flag) or sync a `file://` directory with `aws s3 sync`.
+4. Talking to AWS directly over HTTPS needs a TLS library that passes our pure-Rust gate; that is deferred (story 39, shared with #104). Until then, use a TLS sidecar or sync a `file://` directory with `aws s3 sync`. SigV4 signs `Host`, so `--backup-endpoint` keeps the real S3 host name and `--backup-connect-to` (#173) sends the connection to the sidecar (see `docs/deploy/data-dir.md`).
 5. A backup only counts once its small `.meta` file (checksum, size, versions) is written after the data. Restores check that `.meta` before touching anything.
 6. The snapshot format does not change, so there is no schema bump.
 
@@ -70,7 +70,7 @@ Hand-written in `graph-server/src/backup/`:
 
 ### E5. TLS
 
-Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance pointing to a sidecar (stunnel, or `aws s3 sync` from a `file://` directory) and to #104. The sidecar must be reached under the real S3 host name (e.g. `http://s3.eu-west-1.amazonaws.com`, resolved to the sidecar for memory-graph only): SigV4 signs the `Host` header and AWS routes on it, so `--backup-endpoint http://127.0.0.1:<port>` cannot work (recipe in `docs/deploy/data-dir.md`; #173 tracks a `--backup-connect-to` flag). Stage 2 goes behind a `backup-tls` feature once a pure-Rust rustls provider passes the gate (candidates: rustls-rustcrypto, graviola), through spike S5 (story 39).
+Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance pointing to a sidecar (stunnel, or `aws s3 sync` from a `file://` directory) and to #104. The sidecar must be reached under the real S3 host name (e.g. `http://s3.eu-west-1.amazonaws.com`, resolved to the sidecar for memory-graph only): SigV4 signs the `Host` header and AWS routes on it, so `--backup-endpoint http://127.0.0.1:<port>` cannot work (`--backup-connect-to host:port`, #173, sends the TCP connection to the sidecar while keeping the real name for signing and `Host`; recipe in `docs/deploy/data-dir.md`). Stage 2 goes behind a `backup-tls` feature once a pure-Rust rustls provider passes the gate (candidates: rustls-rustcrypto, graviola), through spike S5 (story 39).
 
 ### E6. Credentials
 
@@ -116,7 +116,7 @@ Stage 1 accepts `http://` endpoints only. `https://` is refused with guidance po
 
 ## CLI
 
-- `serve` flags: `--backup-url`, `--backup-endpoint`, `--backup-region`, `--backup-virtual-host`, `--backup-keep`, `--backup-on`, `--backup-credentials-file`, `--backup-profile`. All are TOML keys except secrets.
+- `serve` flags: `--backup-url`, `--backup-endpoint`, `--backup-region`, `--backup-virtual-host`, `--backup-keep`, `--backup-on`, `--backup-credentials-file`, `--backup-profile`, `--backup-connect-to`. All are TOML keys except secrets.
 - `cluster snapshot --upload`.
 - `cluster backups [--json]`.
 - `--restore` accepts a path, `file://` or `s3://`, including `latest`.

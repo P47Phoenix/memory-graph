@@ -318,6 +318,14 @@ enum Cmd {
         /// With --backup-credentials-file: the profile to read (default: default)
         #[arg(long, requires = "backup_credentials_file", value_name = "NAME")]
         backup_profile: Option<String>,
+        /// With an s3:// --backup-url or --restore: open S3 connections to this host:port instead
+        /// of the --backup-endpoint host, like curl's --connect-to. Requests are still signed for,
+        /// and sent with the Host header of, the --backup-endpoint host, so a local TLS sidecar can
+        /// front AWS: --backup-endpoint http://s3.<region>.amazonaws.com --backup-connect-to
+        /// 127.0.0.1:9080. A host name must resolve at startup and is resolved again on each
+        /// connection
+        #[arg(long, requires = "backup_or_restore", value_name = "HOST:PORT")]
+        backup_connect_to: Option<String>,
         /// With --data-dir: join the cluster that the node at this host:port belongs to (any
         /// member; it forwards to the leader). On an empty directory the node asks to be added as
         /// a learner and catches up; on one that already belongs to that cluster it is a plain
@@ -1059,6 +1067,7 @@ fn run() -> Result<i32> {
         backup_virtual_host,
         backup_credentials_file,
         backup_profile,
+        backup_connect_to,
         join,
         bootstrap_or_join,
         peers,
@@ -1310,11 +1319,23 @@ fn run() -> Result<i32> {
             virtual_host: *backup_virtual_host,
             credentials_file: backup_credentials_file.clone(),
             profile: backup_profile.clone(),
+            connect_to: backup_connect_to
+                .as_deref()
+                .map(graph_server::backup::s3::parse_connect_to)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
             ..Default::default()
         };
         let restore_is_s3 = restore
             .as_ref()
             .is_some_and(|r| r.to_string_lossy().starts_with("s3://"));
+        let backup_is_s3 = backup_url.as_ref().is_some_and(|u| u.starts_with("s3://"));
+        if backup_connect_to.is_some() && !restore_is_s3 && !backup_is_s3 {
+            anyhow::bail!(
+                "--backup-connect-to needs an s3:// --backup-url or an s3:// --restore \
+                 (it would be ignored otherwise)"
+            );
+        }
         cfg.restore_s3 = s3.clone();
         if let Some(url) = backup_url {
             let mut b = graph_server::backup::BackupConfig::new(url.clone());
@@ -2582,6 +2603,8 @@ mod serve_config_tests {
                 "/etc/mg/aws",
                 "--backup-profile",
                 "backup",
+                "--backup-connect-to",
+                "127.0.0.1:9080",
             ],
             r#"
 backup-url = "file:///srv/backups"
@@ -2590,6 +2613,7 @@ backup_region = "eu-west-1"
 backup-virtual-host = true
 backup-credentials-file = "/etc/mg/aws"
 backup-profile = "backup"
+backup-connect-to = "127.0.0.1:9080"
 backup_keep = 3
 backup-on = "all"
 data-dir = "/data"
