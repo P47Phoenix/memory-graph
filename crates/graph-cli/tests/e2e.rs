@@ -140,6 +140,120 @@ fn go_method_rolls_up_under_its_struct() {
     assert!(!out.contains("\"owner\""), "{out}");
 }
 
+/// Issue #149: a Go method declared in one file of a package rolls up under
+/// its receiver struct declared in a sibling file of the same directory; a
+/// struct of that name in a subdirectory (another package) does not count.
+#[test]
+fn go_method_rolls_up_under_a_struct_in_a_sibling_file() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let ty = "package shapes\n\ntype GoBox struct {\n\tw int\n}\n";
+    std::fs::write(root.join("box.go"), ty).unwrap();
+    std::fs::write(
+        root.join("a_methods.go"),
+        "package shapes\n\nfunc (b *GoBox) Width() int {\n\treturn b.w\n}\n\nfunc (o *Other) W() int { return o.w }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sub").join("other.go"),
+        "package sub\n\ntype Other struct{ w int }\n",
+    )
+    .unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = run(&["--db", &db, "search", "w", "--grain", "class", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let rows: Vec<_> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["file"].as_str().unwrap().to_string(),
+                r["symbol"].as_str().map(str::to_string),
+                r["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            // `o.w` in `W`: `Other` lives in another package.
+            ("a_methods.go".to_string(), None, 1),
+            // The field and `b.w` from the sibling file.
+            ("box.go".to_string(), Some("shapes::GoBox".to_string()), 2),
+            (
+                "sub/other.go".to_string(),
+                Some("sub::Other".to_string()),
+                1
+            ),
+        ],
+        "{out}"
+    );
+}
+
+/// Issue #149: the same type declared in two sibling files resolves to the
+/// first by path, and the method's file sorts after both type files.
+#[test]
+fn go_sibling_owner_takes_the_first_file_by_path() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("b_box.go"),
+        "package shapes\n\ntype GoBox struct {\n\tw int\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("c_box.go"),
+        "package shapes\n\ntype GoBox struct {\n\th int\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("z_methods.go"),
+        "package shapes\n\nfunc (b *GoBox) Width() int {\n\treturn b.w\n}\n",
+    )
+    .unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    for limit in [None, Some("1")] {
+        let mut args = vec!["--db", &db, "search", "w", "--grain", "class", "--json"];
+        if let Some(l) = limit {
+            args.extend(["--limit", l]);
+        }
+        let (ok, out, err) = run(&args);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let rows = v["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{out}");
+        assert_eq!(rows[0]["file"], "b_box.go", "{out}");
+        assert_eq!(rows[0]["symbol"], "shapes::GoBox", "{out}");
+        assert_eq!(rows[0]["count"], 2, "{out}");
+    }
+}
+
 /// Epic story 16: a repo with `.rs`, `.py` (and `.ts`, `.java`) files is
 /// searchable by token text across languages, Python classes hold methods,
 /// and a Python syntax error is flagged, not fatal.

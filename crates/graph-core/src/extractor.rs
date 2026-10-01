@@ -13,8 +13,9 @@ pub struct SymbolDecl {
     /// Area()` has owner `Rect`). Language-agnostic: any extractor may set
     /// it. The `class` search grain uses it only when no type-like symbol
     /// encloses the hit by span (whatever `--symbol-kind` says), and resolves it to a type-like symbol of
-    /// that exact name in the same file; `None` (the usual case) means no
-    /// hint.
+    /// that exact name in the same file, else in another file of the same
+    /// repo, directory and language (the first by path: a Go package,
+    /// issue #149); `None` (the usual case) means no hint.
     pub owner: Option<String>,
 }
 

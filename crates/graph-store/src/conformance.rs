@@ -100,6 +100,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("backslash_paths", backslash_paths),
     ("prune_backslash_keep", prune_backslash_keep),
     ("owner_hint_class_grain", owner_hint_class_grain),
+    ("owner_hint_sibling_files", owner_hint_sibling_files),
     (
         "extractor_gaps_name_a_missing_extractor",
         extractor_gaps_name_a_missing_extractor,
@@ -1682,6 +1683,11 @@ fn differential_seed(s: &dyn Store) {
     seed(s);
     s.ingest_file("o1", "r1", "own.toy", "toy", &owner_extraction())
         .unwrap();
+    // Issue #149: owner hints resolved in sibling files of one directory.
+    for (p, src) in PKG_FILES {
+        s.ingest_file("o1", "r1", p, "pkgtoy", &pkg_extraction(src))
+            .unwrap();
+    }
     s.index_bytes("o1", "r1", "notes.md", b"# foo\nbar (foo)\n", None)
         .unwrap();
     s.index_bytes("o1", "r2", "m.txt", b"foo mfoo m\n", None)
@@ -2863,6 +2869,233 @@ fn owner_hint_class_grain(h: &Harness) {
             (Some("A".into()), 1, a, false),
             (Some("B".into()), 1, b, false),
         ]
+    );
+}
+
+/// A one-symbol-per-line extractor for a package-scoped language the store
+/// knows nothing about (the shape of Go, issue #149): `type X ...` is a
+/// struct `X`, `func X.m ...` is a method `m` whose owner hint names `X`,
+/// declared possibly in another file of the same directory.
+pub(crate) struct PkgToy;
+
+/// What [`PkgToy`] extracts from `src`.
+pub(crate) fn pkg_extraction(src: &str) -> Extraction {
+    // Lines are distinct within a file, so the first match is the line.
+    let mut symbols = Vec::new();
+    for line in src.lines() {
+        let body = line.trim_end();
+        if body.is_empty() {
+            continue;
+        }
+        let span = span_of(src, body);
+        let mut w = body.split_whitespace();
+        match (w.next(), w.next()) {
+            (Some("type"), Some(n)) => symbols.push(SymbolDecl::new(
+                n,
+                SymbolKind::Type,
+                Some("struct".into()),
+                span,
+            )),
+            (Some("func"), Some(n)) => {
+                if let Some((o, m)) = n.split_once('.') {
+                    symbols.push(
+                        SymbolDecl::new(m, SymbolKind::Method, Some("method".into()), span)
+                            .with_owner(o),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Extraction {
+        has_errors: false,
+        symbols,
+        tokens: tokenize(src),
+    }
+}
+
+impl Extractor for PkgToy {
+    fn language(&self) -> &str {
+        "pkgtoy"
+    }
+    fn version(&self) -> String {
+        "pkgtoy-1".into()
+    }
+    fn extensions(&self) -> &[&str] {
+        &["ptoy"]
+    }
+    fn extract(&self, source: &str) -> Extraction {
+        pkg_extraction(source)
+    }
+}
+
+/// The [`PkgToy`] files of `owner_hint_sibling_files` and the differential
+/// seed: methods in `pkg/a.ptoy` on types declared in sibling files.
+pub(crate) const PKG_FILES: &[(&str, &str)] = &[
+    ("pkg/a.ptoy", "func P.m foo\nfunc Q.n foo\n"),
+    ("pkg/b.ptoy", "type P foo\n"),
+    // A second `P` later in path order: `b.ptoy` wins.
+    ("pkg/z.ptoy", "type P\n"),
+    // `Q` only outside the directory: another directory, a subdirectory.
+    ("other/c.ptoy", "type Q\n"),
+    ("pkg/sub/d.ptoy", "type Q\n"),
+];
+
+/// Issue #149: under the class grain, an owner hint that names no type in
+/// its own file resolves to a type of that name in another file of the same
+/// repo, directory and language (the first by path), and the row is that
+/// type's, in that file. Other directories, subdirectories, repos and
+/// languages never match; the kind filter applies; limits cut the full
+/// answer; a replace moves the row; and the order the files were indexed in
+/// (separate batches, method file first) does not matter.
+fn owner_hint_sibling_files(h: &Harness) {
+    let s = (h.open)(vec![Box::new(PkgToy)]).expect("open store");
+    let batch = |s: &dyn Store, repo: &str, files: &[(&str, &str)], lang: Option<&str>| {
+        let fs: Vec<BatchFile<'_>> = files
+            .iter()
+            .map(|(p, b)| BatchFile {
+                path: p,
+                bytes: b.as_bytes(),
+                language: lang,
+                ..Default::default()
+            })
+            .collect();
+        let r = s
+            .index_batch("o", repo, &fs, IndexOptions::default())
+            .unwrap();
+        assert!(r.iter().all(|r| r.is_ok()), "{r:?}");
+    };
+    // The method file first, in a batch of its own.
+    batch(&*s, "r", &PKG_FILES[..1], None);
+    batch(&*s, "r", &PKG_FILES[1..], None);
+    // `Q` in another repo, and in the same directory but another language.
+    batch(&*s, "r2", &[("pkg/q.ptoy", "type Q\n")], None);
+    let other_lang = pkg_extraction("type Q\n");
+    s.ingest_file("o", "r", "pkg/q.txt", "otherlang", &other_lang)
+        .unwrap();
+    type Row = (Option<String>, Option<String>, usize, Option<Span>, bool);
+    let rows = |s: &dyn Store, q: &Query| -> Vec<Row> {
+        s.search(q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.file, h.symbol, h.count, h.span, h.no_matching_symbol))
+            .collect()
+    };
+    let b_src = PKG_FILES[1].1;
+    let p_b = Some(span_of(b_src, "type P foo"));
+    let mut q = Query::new("foo");
+    q.grain = Grain::Class;
+    q.repo = Some("r".into());
+    let want: Vec<Row> = vec![
+        // `n` on `Q`: no `Q` in the directory.
+        (Some("pkg/a.ptoy".into()), None, 1, None, true),
+        // `m` on `P` (from a.ptoy) and the token inside `P` itself.
+        (Some("pkg/b.ptoy".into()), Some("P".into()), 2, p_b, false),
+    ];
+    assert_eq!(rows(&*s, &q), want);
+    let hit = &s.search(&q).unwrap()[1];
+    assert_eq!(hit.language.as_deref(), Some("pkgtoy"));
+    assert_eq!(hit.symbol_kind, Some(SymbolKind::Type));
+    for n in 0..=3 {
+        q.limit = Some(n);
+        assert_eq!(rows(&*s, &q), want[..n.min(want.len())], "limit {n}");
+    }
+    q.limit = None;
+    q.offset = Some(1);
+    assert_eq!(rows(&*s, &q), want[1..]);
+    q.offset = None;
+    // The kind filter applies to the sibling type.
+    q.symbol_kind = Some("struct".into());
+    assert_eq!(rows(&*s, &q), want);
+    q.symbol_kind = Some("interface".into());
+    assert_eq!(
+        rows(&*s, &q),
+        [
+            (Some("pkg/a.ptoy".into()), None, 2, None, true),
+            (Some("pkg/b.ptoy".into()), None, 1, None, true),
+        ]
+    );
+    q.symbol_kind = None;
+    // Other grains ignore the hint.
+    q.grain = Grain::Method;
+    assert!(rows(&*s, &q)
+        .iter()
+        .all(|r| r.0.as_deref() != Some("pkg/b.ptoy") || r.1.is_none()));
+    q.grain = Grain::Class;
+    // Replacing b.ptoy without `P` moves the row to the next `P`.
+    batch(&*s, "r", &[("pkg/b.ptoy", "type R foo\n")], None);
+    let z = Some(span_of(PKG_FILES[2].1, "type P"));
+    assert_eq!(
+        rows(&*s, &q),
+        [
+            (Some("pkg/a.ptoy".into()), None, 1, None, true),
+            (
+                Some("pkg/b.ptoy".into()),
+                Some("R".into()),
+                1,
+                Some(span_of("type R foo\n", "type R foo")),
+                false
+            ),
+            (Some("pkg/z.ptoy".into()), Some("P".into()), 1, z, false),
+        ]
+    );
+    // Survives a reopen.
+    drop(s);
+    let s = (h.open)(vec![Box::new(PkgToy)]).expect("reopen store");
+    assert_eq!(rows(&*s, &q).len(), 3);
+
+    // A limit met before the last file must not stop the walk: `m` in
+    // the last file rolls up to `P` in the first, which holds no hit.
+    batch(
+        &*s,
+        "r3",
+        &[
+            ("d/a.ptoy", "type P\n"),
+            ("d/b.ptoy", "type R foo\n"),
+            ("d/c.ptoy", "func P.m foo\n"),
+            ("e/x.ptoy", "type S foo\n"),
+        ],
+        None,
+    );
+    q.repo = Some("r3".into());
+    let full = rows(&*s, &q);
+    assert_eq!(
+        full.iter()
+            .map(|r| (r.0.clone().unwrap(), r.1.clone().unwrap(), r.2))
+            .collect::<Vec<_>>(),
+        [
+            ("d/a.ptoy".to_string(), "P".to_string(), 1),
+            ("d/b.ptoy".to_string(), "R".to_string(), 1),
+            ("e/x.ptoy".to_string(), "S".to_string(), 1),
+        ]
+    );
+    for n in 0..=4 {
+        q.limit = Some(n);
+        assert_eq!(rows(&*s, &q), full[..n.min(full.len())], "r3 limit {n}");
+        q.limit = Some(1);
+        q.offset = Some(n);
+        assert_eq!(
+            rows(&*s, &q),
+            full[n.min(full.len())..(n + 1).min(full.len())],
+            "r3 offset {n}"
+        );
+        q.offset = None;
+    }
+    q.limit = None;
+
+    // A same-file type the kind filter rejects is no match: the sibling
+    // search does not run past it.
+    let mut own = pkg_extraction("type P\nfunc P.m foo\n");
+    own.symbols[0].lang_kind = Some("interface".into());
+    s.ingest_file("o", "r4", "k/a.ptoy", "pkgtoy", &own)
+        .unwrap();
+    s.ingest_file("o", "r4", "k/b.ptoy", "pkgtoy", &pkg_extraction("type P\n"))
+        .unwrap();
+    q.repo = Some("r4".into());
+    q.symbol_kind = Some("struct".into());
+    assert_eq!(
+        rows(&*s, &q),
+        [(Some("k/a.ptoy".into()), None, 1, None, true)]
     );
 }
 

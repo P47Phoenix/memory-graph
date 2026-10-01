@@ -64,7 +64,20 @@ These `graph-core` items are the stable surface for extractors:
   when no type-like symbol encloses the hit by span (whatever
   `--symbol-kind` says), and resolves it to a
   type-like symbol with exactly that name **in the same file** (the first in
-  source order); an owner declared in another file does not roll up.
+  source order). If the file has none, it looks in the other files of the
+  same repo, the **same directory** (not subdirectories) and the same
+  language, and takes the first by path, then source order (issue #149):
+  the package scope of a language like Go, where a method's receiver type
+  may be declared in a sibling file. That row then belongs to the type's
+  file: its `file`, `span` and `language` are the type's, and it counts the
+  hits from every file that rolled up to it. Emit an owner hint only if that
+  same-file-then-same-directory scope is right for your language.
+  `--symbol-kind` applies to the type found: a same-file type of that name
+  that the filter rejects is no match (the other files are not searched),
+  and so is a sibling-file winner the filter rejects. With `--limit`, the
+  class grain keeps reading later files that have owner hints in a
+  directory that could hold an earlier row, since one of them can add to
+  or create a row before the cut-off.
   `symbols --json` reports it as `owner`. Setting it changes `extract`'s
   output, so bump `version()`.
 

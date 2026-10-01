@@ -379,6 +379,49 @@ fn chunked_and_unchunked_batches_store_the_same_data() {
     many.check_consistency(false);
 }
 
+/// Issue #149: an owner hint resolved in a sibling file answers the same
+/// whether the files share one batch and chunk, or land in separate
+/// one-file chunks and batches in reverse order.
+#[test]
+fn sibling_owner_hints_ignore_batching_and_order() {
+    use crate::conformance::{PkgToy, PKG_FILES};
+    let d = tempfile::tempdir().unwrap();
+    let batch = |files: &[(&str, &str)]| -> Vec<BatchFile<'static>> {
+        files
+            .iter()
+            .map(|(p, b)| BatchFile {
+                path: Box::leak(p.to_string().into_boxed_str()),
+                bytes: Box::leak(b.as_bytes().to_vec().into_boxed_slice()),
+                language: None,
+                origin: None,
+                ..Default::default()
+            })
+            .collect()
+    };
+    let mut one = V2Store::open(d.path().join("one.redb")).unwrap();
+    one.register(Box::new(PkgToy));
+    let mut many = V2Store::open(d.path().join("many.redb")).unwrap();
+    many.register(Box::new(PkgToy));
+    many.set_chunk_bytes(1);
+    let all = batch(PKG_FILES);
+    let opts = IndexOptions::default();
+    V2Store::index_batch(&one, "o", "r", &all, opts).unwrap();
+    for f in all.iter().rev() {
+        V2Store::index_batch(&many, "o", "r", std::slice::from_ref(f), opts).unwrap();
+    }
+    let mut q = crate::Query::new("foo");
+    q.grain = crate::Grain::Class;
+    let got = V2Store::search(&one, &q).unwrap();
+    assert!(
+        got.iter()
+            .any(|h| h.file.as_deref() == Some("pkg/b.ptoy") && h.count == 2),
+        "{got:?}"
+    );
+    assert_eq!(got, V2Store::search(&many, &q).unwrap());
+    crate::conformance::run_differential(&one, &many);
+    many.check_consistency(false);
+}
+
 /// Reads the open-batch marker directly out of the raw `meta`/`open_batch`
 /// tables, bypassing any store API, so the test observes exactly what a
 /// slice-3o reader would see on disk (`None` when fully cleared).
