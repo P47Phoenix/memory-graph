@@ -417,3 +417,22 @@ fn keywords_in_a_fixed_format_program() {
     );
     assert!(CobolExtractor.version().starts_with("cobol-scan-1+kw1+tok"));
 }
+
+/// A fixed sample of the list (so dropping a word from `KEYWORDS` fails).
+#[test]
+fn sample_keywords_are_listed_and_classed() {
+    for w in [
+        "END-IF",
+        "END-PERFORM",
+        "WORKING-STORAGE",
+        "PROGRAM-ID",
+        "PERFORM",
+        "MOVE",
+        "THRU",
+    ] {
+        let src = format!(">>SOURCE FORMAT FREE\n{w}\n");
+        let toks = CobolExtractor.extract(&src).tokens;
+        assert_eq!(classes_of(&toks, w), [TokenClass::Keyword], "{w}");
+    }
+    assert_eq!(KEYWORDS.len(), 89);
+}

@@ -33,24 +33,96 @@
 //! with the RPG IV columns. Columns count characters, so a tab in a fixed
 //! spec counts as one column (as the tokenizer does); tab-indented fixed
 //! specs lose their column positions.
+//!
+//! Keywords (#143): declaration keywords (`dcl-*`, `end-*`, `ctl-opt`) and
+//! `and`/`or`/`not` anywhere; operation codes only in opcode position (first
+//! in a free-form statement and not an assignment target, or a fixed C
+//! spec's columns 26-35), and never as the first word of a subfield or
+//! parameter line inside a `dcl-ds`/`dcl-pi`/`dcl-pr` block. Limits: a
+//! statement continued onto a new line whose first word is an
+//! opcode-named variable (`if a and\n  read;`) labels it a keyword; an
+//! unterminated multi-line `dcl-ds` without `likeds`/`likerec` and without
+//! `end-ds` suppresses opcodes until the next `end-*`/`dcl-proc`.
 use graph_core::scan::{line_iter, mark_keywords_ignore_case, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct RpgExtractor;
 
-/// RPG IV free-form declaration keywords and common operation codes, upper
-/// case; matched case-insensitively. Built-in functions (`%open`), special
-/// words (`*on`), qualified subfields (`ds.read`) and the name a `dcl-`
-/// keyword declares are left as identifiers (see [`is_name`]).
-const KEYWORDS: &[&str] = &[
-    "AND", "BEGSR", "CALLP", "CHAIN", "CLOSE", "CTL-OPT", "DCL-C", "DCL-DS", "DCL-F", "DCL-PARM",
-    "DCL-PI", "DCL-PR", "DCL-PROC", "DCL-S", "DCL-SUBF", "DELETE", "DOU", "DOW", "DSPLY", "ELSE",
-    "ELSEIF", "END-DS", "END-PI", "END-PR", "END-PROC", "ENDDO", "ENDFOR", "ENDIF", "ENDMON",
-    "ENDSL", "ENDSR", "EVAL", "EXFMT", "EXSR", "FOR", "IF", "ITER", "LEAVE", "LEAVESR", "MONITOR",
-    "NOT", "ON-ERROR", "OPEN", "OR", "OTHER", "READ", "READE", "RETURN", "SELECT", "SETGT",
-    "SETLL", "UPDATE", "WHEN", "WRITE",
+/// RPG IV free-form declaration keywords and the logical operators, upper
+/// case; matched case-insensitively wherever they appear, except as names
+/// (see [`is_name`]).
+const DECL_KEYWORDS: &[&str] = &[
+    "AND", "CTL-OPT", "DCL-C", "DCL-DS", "DCL-F", "DCL-PARM", "DCL-PI", "DCL-PR", "DCL-PROC",
+    "DCL-S", "DCL-SUBF", "END-DS", "END-PI", "END-PR", "END-PROC", "NOT", "OR",
 ];
+
+/// Common operation codes, upper case; matched case-insensitively. Opcodes
+/// are not reserved (a variable may be named `read`), so they are keywords
+/// only in opcode position (see [`opcode_positions`]).
+const OPCODES: &[&str] = &[
+    "BEGSR", "CALLP", "CHAIN", "CLOSE", "DELETE", "DOU", "DOW", "DSPLY", "ELSE", "ELSEIF", "ENDDO",
+    "ENDFOR", "ENDIF", "ENDMON", "ENDSL", "ENDSR", "EVAL", "EXFMT", "EXSR", "FOR", "IF", "ITER",
+    "LEAVE", "LEAVESR", "MONITOR", "ON-ERROR", "OPEN", "OTHER", "READ", "READE", "RETURN",
+    "SELECT", "SETGT", "SETLL", "UPDATE", "WHEN", "WRITE",
+];
+
+/// Whether the word at `i` is the target of an assignment (`read = *on;`,
+/// `n += 1;`) or qualified (`ds.x = 1;`): a variable, not an opcode.
+fn is_assigned(t: &[TokenDecl], i: usize) -> bool {
+    let next = |k: usize| t.get(k).filter(|x| x.class != TokenClass::Comment);
+    match next(i + 1).map(|x| x.text.as_str()) {
+        Some(s) if s.starts_with('=') || s.ends_with('=') => true,
+        Some(".") => t[i].span.end == t[i + 1].span.start,
+        Some("+" | "-" | "*" | "/") => {
+            next(i + 2).is_some_and(|x| x.text == "=" && x.span.start == t[i + 1].span.end)
+        }
+        _ => false,
+    }
+}
+
+/// Which tokens sit in opcode position: the first code token of a free-form
+/// statement (after a `;`, or first on its line) that is not a subfield or
+/// parameter line inside an open `dcl-ds` / `dcl-pi` / `dcl-pr` block, or a
+/// fixed C spec's operation field (columns 26-35).
+fn opcode_positions(t: &[TokenDecl]) -> Vec<bool> {
+    let mut out = vec![false; t.len()];
+    let mut prev: Option<usize> = None;
+    let mut in_block = false;
+    let mut line_first_col6_c = false;
+    let mut line = u32::MAX;
+    for i in 0..t.len() {
+        if t[i].class == TokenClass::Comment {
+            continue;
+        }
+        let new_line = t[i].span.start_line != line;
+        if new_line {
+            line = t[i].span.start_line;
+            line_first_col6_c = t[i].span.start_col == 6 && t[i].text.eq_ignore_ascii_case("c");
+        }
+        let lower = t[i].text.to_ascii_lowercase();
+        let starts =
+            prev.is_none_or(|p| t[p].text == ";" || t[p].span.end_line < t[i].span.start_line);
+        if starts {
+            match lower.as_str() {
+                "dcl-ds" | "dcl-pi" | "dcl-pr" => {
+                    // A one-statement `dcl-ds x likeds(y);` opens no block.
+                    let end = (i..t.len()).find(|&j| t[j].text == ";").unwrap_or(t.len());
+                    in_block = !t[i..end].iter().any(|x| {
+                        x.text.eq_ignore_ascii_case("likeds")
+                            || x.text.eq_ignore_ascii_case("likerec")
+                    });
+                }
+                "end-ds" | "end-pi" | "end-pr" | "dcl-proc" | "end-proc" => in_block = false,
+                _ => out[i] = !in_block && !is_assigned(t, i),
+            }
+        } else if line_first_col6_c && (26..=35).contains(&t[i].span.start_col) {
+            out[i] = true;
+        }
+        prev = Some(i);
+    }
+    out
+}
 
 /// Whether the listed word at `i` is a name, not a keyword: glued after
 /// `%` (a built-in, `%open`), `*` (a special word) or `.` (a qualified
@@ -90,7 +162,9 @@ impl Extractor for RpgExtractor {
         let mut tokens = tokenize_with(source, RPG_TOKENIZER);
         let symbols = symbols(source, &tokens);
         // After the symbol scan, which reads identifiers as it always has.
-        mark_keywords_ignore_case(&mut tokens, KEYWORDS, is_name);
+        let at_opcode = opcode_positions(&tokens);
+        mark_keywords_ignore_case(&mut tokens, DECL_KEYWORDS, is_name);
+        mark_keywords_ignore_case(&mut tokens, OPCODES, |t, i| !at_opcode[i] || is_name(t, i));
         Extraction {
             symbols,
             tokens,

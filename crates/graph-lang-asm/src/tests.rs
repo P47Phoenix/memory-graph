@@ -429,3 +429,33 @@ fn asm_directive_positions() {
     );
     assert!(AsmExtractor.version().starts_with("asm-scan-1+kw1+tok"));
 }
+
+/// Labels and assignments named like bare directives stay identifiers;
+/// so does a directive word more than three tokens into a line, and the
+/// Named-form edge cases behave as documented.
+#[test]
+fn asm_directive_edge_positions() {
+    let toks = AsmExtractor
+        .extract("global:\nalign = 4\norg: ret\n")
+        .tokens;
+    assert!(
+        toks.iter().all(|t| t.class != TokenClass::Keyword),
+        "{toks:?}"
+    );
+    let toks = AsmExtractor
+        .extract("a b c d section\nl: x y z db\n")
+        .tokens;
+    assert!(
+        toks.iter().all(|t| t.class != TokenClass::Keyword),
+        "{toks:?}"
+    );
+    let toks = AsmExtractor
+        .extract("l: x db 1\ncall proc\ntimes 10 db 0\n")
+        .tokens;
+    assert_eq!(
+        classes_of(&toks, "db"),
+        [TokenClass::Keyword, TokenClass::Identifier]
+    );
+    assert_eq!(classes_of(&toks, "proc"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "times"), [TokenClass::Keyword]);
+}

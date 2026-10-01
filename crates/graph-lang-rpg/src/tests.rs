@@ -329,13 +329,53 @@ fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
 /// #143: every listed word, bare, in upper and lower case, is a keyword.
 #[test]
 fn every_listed_keyword_is_classed_keyword() {
-    for kw in KEYWORDS {
+    for kw in DECL_KEYWORDS.iter().chain(OPCODES) {
         for w in [kw.to_string(), kw.to_lowercase()] {
-            let src = format!("**FREE\n{w};\n");
+            // First in its statement, also after another statement's `;`.
+            let src = format!("**FREE\n{w};\nx = 1; {w};\n");
             let toks = RpgExtractor.extract(&src).tokens;
-            assert_eq!(classes_of(&toks, &w), [TokenClass::Keyword], "{w}");
+            assert_eq!(
+                classes_of(&toks, &w),
+                [TokenClass::Keyword, TokenClass::Keyword],
+                "{w}"
+            );
         }
     }
+}
+
+/// Opcodes are not reserved: a variable, subfield or parameter named like
+/// one stays an identifier outside opcode position.
+#[test]
+fn opcode_named_names_stay_identifiers() {
+    let src = "**FREE\ndcl-s read ind;\nread = *on;\nif read and open;\n  x = 1;\nendif;\ndcl-ds rec;\n  open char(1);\n  update ind;\nend-ds;\ndcl-pr p;\n  write int(10);\nend-pr;\ndcl-ds r2 likeds(rec);\nread f;\n";
+    let toks = RpgExtractor.extract(src).tokens;
+    assert_eq!(
+        classes_of(&toks, "read"),
+        [
+            TokenClass::Identifier, // declared name
+            TokenClass::Identifier, // `read = *on;` is an assignment
+            TokenClass::Identifier, // `if read`
+            TokenClass::Keyword,    // `read f;` after a one-statement dcl-ds
+        ]
+    );
+    assert_eq!(
+        classes_of(&toks, "open"),
+        [TokenClass::Identifier, TokenClass::Identifier]
+    );
+    assert_eq!(classes_of(&toks, "update"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "write"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "endif"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "and"), [TokenClass::Keyword]);
+}
+
+/// A fixed C spec's operation field (columns 26-35) is opcode position;
+/// factor 1 is not.
+#[test]
+fn fixed_c_spec_opcode_column() {
+    let src = "     C     read          READ      FILE\n";
+    let toks = RpgExtractor.extract(src).tokens;
+    assert_eq!(classes_of(&toks, "READ"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "read"), [TokenClass::Identifier]);
 }
 
 /// Built-ins, special words, qualified subfields and declared names stay

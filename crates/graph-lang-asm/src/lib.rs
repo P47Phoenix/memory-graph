@@ -187,7 +187,10 @@ const BARE_DIRECTIVES: &[&str] = &[
 ];
 
 /// The [`BARE_DIRECTIVES`] that may also follow a name (`x db 1`,
-/// `main PROC`, `_TEXT SEGMENT`, `n equ 3`).
+/// `main PROC`, `_TEXT SEGMENT`, `n equ 3`). The name is any one word, so a
+/// mnemonic counts too: `call proc` labels `proc` a keyword. Only the first
+/// directive in a statement is found: NASM `times 10 db 0` labels `times`
+/// and leaves `db` an identifier.
 const NAMED_DIRECTIVES: &[&str] = &[
     "db", "dd", "dq", "dt", "dw", "endp", "ends", "equ", "macro", "proc", "resb", "resd", "resq",
     "resw", "segment", "times",
@@ -230,7 +233,9 @@ fn directive_at(t: &[TokenDecl], i: usize) -> Option<DirectiveForm> {
     match before {
         [] => Some(DirectiveForm::Bare),
         [dot] if dot.text == "." && glued(dot, &t[i]) => Some(DirectiveForm::Dotted),
-        [name] if word(name) && !glued(name, &t[i]) => Some(DirectiveForm::Named),
+        // Two identifier tokens are never adjacent (they would be one), so
+        // `name` is always separated from the directive here.
+        [name] if word(name) => Some(DirectiveForm::Named),
         _ => None,
     }
 }
