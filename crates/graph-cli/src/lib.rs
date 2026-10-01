@@ -87,6 +87,9 @@ pub struct DirOpts<'a> {
     /// below the store's span limit (`size_skip_reason`).
     pub max_file_size: Option<u64>,
     pub prune: bool,
+    /// `--force`: with `prune`, remove files even when the run indexed
+    /// nothing; and index even when it would drop stored symbols of a
+    /// language whose extractor is missing (#165, [`check_extractor_gaps`]).
     pub force: bool,
     pub reindex: bool,
     /// Parsing threads; 0 sizes from the CPUs. Files are committed in walk
@@ -183,18 +186,48 @@ fn human_size(bytes: u64) -> String {
     format!("{bytes}B")
 }
 
-/// #74: warn (stderr) for each language of `org/repo` whose stored symbols
-/// came from an extractor this build lacks: re-indexing those files would
-/// store them tokens-only. A failed check is itself only a warning.
-pub fn warn_extractor_gaps(store: &dyn Store, org: &str, repo: &str) {
-    match store.extractor_gaps(Some(org), Some(repo)) {
-        Ok(gaps) => {
-            for g in gaps {
-                eprintln!("warning: {g}");
-            }
+/// #74, #165: before an index run writes anything, check `org/repo` for
+/// languages whose stored symbols came from an extractor the store that
+/// parses lacks (this build when embedded, the server with `--server`):
+/// re-indexing those files would store them tokens-only and drop their
+/// symbols. The check is repo-wide: any gap in the repo refuses the run,
+/// whichever files it indexes. Refuses, naming each gap, unless `force`,
+/// which only warns. A failed check refuses too (unless `force`), except
+/// `Protocol` from a server too old to have the RPC, which only warns.
+pub fn check_extractor_gaps(store: &dyn Store, org: &str, repo: &str, force: bool) -> Result<()> {
+    let gaps = match store.extractor_gaps(Some(org), Some(repo)) {
+        Ok(gaps) => gaps,
+        // A server too old to have the RPC (UNIMPLEMENTED): fail open.
+        Err(e @ graph_store::StoreError::Protocol(_)) => {
+            eprintln!("warning: could not check stored extractors (the server is too old): {e}");
+            return Ok(());
         }
-        Err(e) => eprintln!("warning: could not check stored extractors: {e}"),
+        Err(e) if force => {
+            eprintln!("warning: could not check stored extractors: {e} (--force: indexing anyway)");
+            return Ok(());
+        }
+        // The typed StoreError stays in the chain (context only), so
+        // `NoLeader` and the like keep their exit codes.
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "refusing to index {org}/{repo}: could not check for symbols stored by a missing extractor; retry, or pass --force to index anyway"
+            )))
+        }
+    };
+    if gaps.is_empty() {
+        return Ok(());
     }
+    if force {
+        for g in &gaps {
+            eprintln!("warning: {g} (--force: indexing anyway)");
+        }
+        return Ok(());
+    }
+    let list: Vec<String> = gaps.iter().map(|g| format!("  - {g}")).collect();
+    bail!(
+        "refusing to index {org}/{repo}: it would drop symbols stored by an extractor that is missing\n{}\nnothing was written; pass --force to index anyway",
+        list.join("\n")
+    )
 }
 
 /// The file is this many times its live data or more after a `--reindex`
@@ -348,7 +381,8 @@ fn flush_batch(
                 t.skipped.entry("binary".into()).or_default().push(rel)
             }
             // ADR 0007 C3: only --strict-encoding refuses a file for its
-            // encoding, as NotUtf8 (decoded as UTF-8) or Rejected naming it.
+            // encoding, as NotUtf8 (decoded as UTF-8) or StrictEncoding
+            // naming it (or, from an older server, its legacy Rejected).
             Err(e) if graph_store::is_strict_encoding_refusal(&e) => t
                 .skipped
                 .entry(STRICT_ENCODING_REFUSED.into())
@@ -1176,7 +1210,7 @@ pub fn index_dir_with(
     let cfg = encoding_config::EncodingConfig::load(o.dir)?;
     let start = std::time::Instant::now();
     let store = open(o.db)?;
-    warn_extractor_gaps(&*store, o.org, o.repo);
+    check_extractor_gaps(&*store, o.org, o.repo, o.force)?;
     let trace: Option<&'static Trace> = o.trace.map(|_| &*Box::leak(Box::new(Trace::new())));
     // A fixed batch holds its files' bytes until it commits, so in
     // deterministic mode the budget must always fit one whole batch; the

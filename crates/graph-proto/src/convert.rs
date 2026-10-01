@@ -488,6 +488,31 @@ impl TryFrom<pb::RepoInfo> for RepoInfo {
     }
 }
 
+impl From<graph_store::ExtractorGap> for pb::ExtractorGap {
+    fn from(g: graph_store::ExtractorGap) -> Self {
+        pb::ExtractorGap {
+            org: g.org,
+            repo: g.repo,
+            language: g.language,
+            stored_version: g.stored_version,
+            symbols: to_u64(g.symbols),
+        }
+    }
+}
+
+impl TryFrom<pb::ExtractorGap> for graph_store::ExtractorGap {
+    type Error = ConvertError;
+    fn try_from(g: pb::ExtractorGap) -> Result<Self, ConvertError> {
+        Ok(graph_store::ExtractorGap {
+            org: g.org,
+            repo: g.repo,
+            language: g.language,
+            stored_version: g.stored_version,
+            symbols: to_usize("ExtractorGap.symbols", g.symbols)?,
+        })
+    }
+}
+
 // ---------------------------------------------------------------- stats --
 
 impl From<IngestStats> for pb::IngestStats {

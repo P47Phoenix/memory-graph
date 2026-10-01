@@ -441,6 +441,7 @@ fn store_error() -> impl Strategy<Value = StoreError> {
         (text(), text()).prop_map(|(path, reason)| StoreError::OpenFailed { path, reason }),
         text().prop_map(StoreError::Rejected),
         text().prop_map(StoreError::NotUtf8),
+        (text(), text()).prop_map(|(path, encoding)| StoreError::StrictEncoding { path, encoding }),
         text().prop_map(StoreError::Binary),
         text().prop_map(StoreError::TooLarge),
         text().prop_map(StoreError::InvalidSpan),
@@ -737,6 +738,14 @@ fn code_table_matches_adr_0004() {
     let cases: Vec<(WireError, Code)> = vec![
         (E::Rejected("x".into()).into(), Code::InvalidArgument),
         (E::NotUtf8("x".into()).into(), Code::InvalidArgument),
+        (
+            E::StrictEncoding {
+                path: "p".into(),
+                encoding: "Shift_JIS".into(),
+            }
+            .into(),
+            Code::InvalidArgument,
+        ),
         (E::Binary("x".into()).into(), Code::InvalidArgument),
         (E::TooLarge("x".into()).into(), Code::InvalidArgument),
         (E::InvalidSpan("x".into()).into(), Code::InvalidArgument),
@@ -1139,7 +1148,7 @@ fn rpc_paths_match_the_proto_files() {
     let got: std::collections::BTreeSet<String> =
         crate::rpc_paths().iter().map(|s| s.to_string()).collect();
     assert_eq!(got, want);
-    assert_eq!(got.len(), 44, "18 Admin + 3 Raft + 18 Store + 5 Write");
+    assert_eq!(got.len(), 45, "18 Admin + 3 Raft + 19 Store + 5 Write");
 }
 
 /// ADR 0007 C8: an encoding hint that is not a usable label is a protocol
@@ -1167,4 +1176,36 @@ fn bad_encoding_labels_are_refused() {
         ..Default::default()
     };
     assert!(Node::try_from(n).is_err());
+}
+
+/// #180: a strict-encoding refusal is classified by its typed detail, not
+/// its message: a proxy that rewrites the status text cannot hide it, and
+/// the fields come back exactly.
+#[test]
+fn strict_encoding_survives_a_rewritten_message() {
+    let e = StoreError::StrictEncoding {
+        path: "a.txt".into(),
+        encoding: "Shift_JIS".into(),
+    };
+    let s = store_error_to_status(&e);
+    assert_eq!(s.code(), Code::InvalidArgument);
+    let rewritten = Status::with_details(s.code(), "upstream said no", s.details().to_vec().into());
+    let back = status_to_store_error(&rewritten);
+    assert!(graph_store::is_strict_encoding_refusal(&back), "{back:?}");
+    match back {
+        StoreError::StrictEncoding { path, encoding } => {
+            assert_eq!((path.as_str(), encoding.as_str()), ("a.txt", "Shift_JIS"))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        e.to_string(),
+        "rejected: `a.txt` has byte sequences that are invalid in Shift_JIS (strict encoding)"
+    );
+    // Version skew, for one release: an older server's `Rejected` ending
+    // in the legacy text still counts; other `Rejected`s do not.
+    let legacy = StoreError::Rejected("`x` has ... invalid in Shift_JIS (strict encoding)".into());
+    assert!(graph_store::is_strict_encoding_refusal(&legacy));
+    let plain = StoreError::Rejected("strict encoding, but not the suffix".into());
+    assert!(!graph_store::is_strict_encoding_refusal(&plain));
 }

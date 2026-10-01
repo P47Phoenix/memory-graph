@@ -545,6 +545,12 @@ enum Cmd {
         /// valid UTF-8. A refused file keeps any content indexed before
         #[arg(long)]
         strict_encoding: bool,
+        /// Index even when the repo has symbols stored by an extractor that the store parsing the file
+        /// (this build, or the cluster leader with --server) lacks; refused by default, since re-indexed
+        /// files of that language are stored tokens-only. The check is repo-wide: it refuses even when this
+        /// file is in another language
+        #[arg(long)]
+        force: bool,
         /// The file to index; stored under the repo by this path as given
         path: PathBuf,
     },
@@ -571,8 +577,12 @@ enum Cmd {
         /// when nothing was indexed and files would be removed, unless --force
         #[arg(long)]
         prune: bool,
-        /// With --prune: allow removing files even when this run indexed nothing
-        #[arg(long, requires = "prune")]
+        /// Index even when the repo has symbols stored by an extractor that the store parsing this run
+        /// (this build, or the cluster leader with --server) lacks: those files are stored tokens-only and
+        /// lose their symbols, so such a run is refused by default. The check is repo-wide: any such file
+        /// in the repo refuses the run, whichever files it indexes. With --prune, --force also overrides
+        /// the empty-run guard (allows removing files even when this run indexed nothing)
+        #[arg(long)]
         force: bool,
         /// Re-index every file even when unchanged since it was last indexed (by default files with the
         /// same content, language and extractor version are skipped). Does not affect --prune's safety checks
@@ -1814,6 +1824,7 @@ fn run() -> Result<i32> {
             reindex,
             encoding,
             strict_encoding,
+            force,
             path,
         } => {
             if let Ok(m) = std::fs::metadata(&path) {
@@ -1835,7 +1846,7 @@ fn run() -> Result<i32> {
                 }
             }
             let store = open_for_indexing(&target, overrides)?;
-            graph_cli::warn_extractor_gaps(&*store, &org, &repo);
+            graph_cli::check_extractor_gaps(&*store, &org, &repo, force)?;
             let st = store.index_bytes_opts(
                 &org,
                 &repo,

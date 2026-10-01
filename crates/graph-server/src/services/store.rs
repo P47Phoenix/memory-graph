@@ -249,6 +249,41 @@ impl pb::store_server::Store for StoreService {
         ))
     }
 
+    /// #165: the leader's gaps, from its registry: writes (`Index`) are
+    /// forwarded to the leader, so its extractors are the ones a client's
+    /// run meets. A follower forwards this call there like a write
+    /// (`mg-forwarded-by` stops loops); the leader answers from its store.
+    async fn extractor_gaps(
+        &self,
+        req: Request<pb::ExtractorGapsRequest>,
+    ) -> Result<Response<pb::ExtractorGapsResponse>, Status> {
+        use crate::forward::{forward_error, within, Forwarder, Route, FORWARD_UNARY_TIMEOUT};
+        if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+            let deadline = self.ctx.fwd.deadline(req.metadata(), FORWARD_UNARY_TIMEOUT);
+            let mut client = self.ctx.fwd.store_client(&addr)?;
+            let resp = within(
+                deadline,
+                client.extractor_gaps(Forwarder::request(req.into_inner(), deadline)),
+            )
+            .await
+            .map_err(forward_error)?;
+            return Ok(Response::new(resp.into_inner()));
+        }
+        let r = req.into_inner();
+        let slot = Arc::clone(&self.ctx.slot);
+        let gaps = tokio::task::spawn_blocking(move || {
+            slot.with_store_read(|s| {
+                graph_store::Store::extractor_gaps(s, r.org.as_deref(), r.repo.as_deref())
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("extractor_gaps task failed: {e}")))?
+        .map_err(|e| graph_proto::store_error_to_status(&e))?;
+        Ok(Response::new(pb::ExtractorGapsResponse {
+            gaps: gaps.into_iter().map(Into::into).collect(),
+        }))
+    }
+
     async fn search_symbols(
         &self,
         req: Request<pb::SearchSymbolsRequest>,

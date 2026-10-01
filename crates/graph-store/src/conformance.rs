@@ -2086,8 +2086,9 @@ fn claimed_extension_extractor(h: &Harness) {
 }
 
 /// #74: a store opened without an extractor that indexed stored files names
-/// that language and the stored extractor version. A client backend parses
-/// on its server (which checks at startup), so it may report nothing.
+/// that language and the stored extractor version. A client backend reports
+/// its server's gaps (#165: the server parses, so its registry decides), so
+/// every backend answers the same.
 fn extractor_gaps_name_a_missing_extractor(h: &Harness) {
     let s = (h.open)(vec![Box::new(ToyExtractor)]).expect("open store");
     s.index_bytes("o", "r", "a.toy", b"alpha beta\n", None)
@@ -2103,19 +2104,17 @@ fn extractor_gaps_name_a_missing_extractor(h: &Harness) {
     let scoped = s.extractor_gaps(Some("o"), Some("r2")).unwrap();
     let unknown = s.extractor_gaps(Some("nope"), None).unwrap();
     let before = s.search(&Query::new("alpha")).unwrap();
-    if !(h.accepts_remote_prepared && gaps.is_empty()) {
-        let g = |repo: &str| crate::ExtractorGap {
-            org: "o".into(),
-            repo: repo.into(),
-            language: "toylang".into(),
-            stored_version: "toy-1".into(),
-            symbols: 1,
-        };
-        assert_eq!(gaps, vec![g("r"), g("r2")]);
-        assert_eq!(scoped, vec![g("r2")]);
-        let msg = gaps[0].to_string();
-        assert!(msg.contains("toylang") && msg.contains("toy-1"), "{msg}");
-    }
+    let g = |repo: &str| crate::ExtractorGap {
+        org: "o".into(),
+        repo: repo.into(),
+        language: "toylang".into(),
+        stored_version: "toy-1".into(),
+        symbols: 1,
+    };
+    assert_eq!(gaps, vec![g("r"), g("r2")]);
+    assert_eq!(scoped, vec![g("r2")]);
+    let msg = gaps[0].to_string();
+    assert!(msg.contains("toylang") && msg.contains("toy-1"), "{msg}");
     assert!(unknown.is_empty());
     // Asking changes nothing.
     assert_eq!(s.search(&Query::new("alpha")).unwrap(), before);
@@ -3127,7 +3126,8 @@ fn encoding_hint_strict_and_binary(h: &Harness) {
     );
 
     // strict_encoding refuses a lossy decode and stores nothing: today's
-    // `NotUtf8` for UTF-8, a `Rejected` naming the encoding otherwise.
+    // `NotUtf8` for UTF-8, a typed `StrictEncoding` naming the encoding
+    // otherwise (#180: no message matching, on any backend).
     for (path, bytes, e) in [
         ("s1.txt", latin.clone(), encoding_rs::UTF_8),
         ("s2.txt", b"ok \x82".to_vec(), encoding_rs::SHIFT_JIS),
@@ -3135,11 +3135,16 @@ fn encoding_hint_strict_and_binary(h: &Harness) {
         let r = s.index_bytes_opts("o", "r", path, &bytes, None, None, hinted(e, true));
         match (&r, e == encoding_rs::UTF_8) {
             (Err(StoreError::NotUtf8(m)), true) => assert!(m.contains(path), "{m}"),
-            (Err(StoreError::Rejected(m)), false) => {
-                assert!(m.contains(path) && m.contains("Shift_JIS"), "{m}")
-            }
+            (
+                Err(StoreError::StrictEncoding {
+                    path: p,
+                    encoding: enc,
+                }),
+                false,
+            ) => assert_eq!((p.as_str(), enc.as_str()), (path, "Shift_JIS")),
             _ => panic!("{path}: {r:?}"),
         }
+        assert!(crate::is_strict_encoding_refusal(r.as_ref().unwrap_err()));
         assert!(s.file_tokens("o", "r", path).unwrap().is_none());
     }
     // Strict in a batch is per file: the others are stored.
@@ -3177,6 +3182,30 @@ fn encoding_hint_strict_and_binary(h: &Harness) {
         matches!(&out[2], Err(StoreError::Binary(m)) if m.contains("b3.png")),
         "{out:?}"
     );
+    // A batch's non-UTF-8 strict refusal is typed too, in its own slot.
+    let sjis = [
+        BatchFile {
+            path: "b5.txt",
+            bytes: b"ok \x82",
+            encoding: Some(encoding_rs::SHIFT_JIS),
+            strict_encoding: true,
+            ..Default::default()
+        },
+        BatchFile {
+            path: "b6.txt",
+            bytes: b"fine\n",
+            ..Default::default()
+        },
+    ];
+    let out = s
+        .index_batch("o", "r", &sjis, IndexOptions::default())
+        .unwrap();
+    assert!(
+        matches!(&out[0], Err(StoreError::StrictEncoding { path, encoding })
+            if path == "b5.txt" && encoding == "Shift_JIS"),
+        "{out:?}"
+    );
+    assert!(out[1].is_ok(), "{out:?}");
     let prepared = prepare_all(&*s, "r", &files[2..3], IndexOptions::default());
     let out = s
         .index_prepared("o", "r", prepared, IndexOptions::default())

@@ -222,6 +222,22 @@ pub struct LanguageInfo {
         u64,
     >,
 }
+/// graph_store::ExtractorGap (#74, #165): a language of a repo whose stored
+/// symbols came from an extractor the answering server lacks; re-indexing
+/// its files there stores them tokens-only.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExtractorGap {
+    #[prost(string, tag = "1")]
+    pub org: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub repo: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub language: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub stored_version: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub symbols: u64,
+}
 /// graph_store::RepoInfo: what `describe` reports for one repo.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RepoInfo {
@@ -384,7 +400,7 @@ pub struct Extraction {
 pub struct StoreErrorDetail {
     #[prost(
         oneof = "store_error_detail::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
     )]
     pub kind: ::core::option::Option<store_error_detail::Kind>,
 }
@@ -499,6 +515,16 @@ pub mod store_error_detail {
         #[prost(string, tag = "1")]
         pub path: ::prost::alloc::string::String,
     }
+    /// Refused under `strict_encoding`: the file has byte sequences invalid in
+    /// `encoding` (a WHATWG name other than UTF-8; UTF-8 is `NotUtf8`), ADR
+    /// 0007 C3/C8, #180.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct StrictEncoding {
+        #[prost(string, tag = "1")]
+        pub path: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub encoding: ::prost::alloc::string::String,
+    }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
@@ -535,6 +561,8 @@ pub mod store_error_detail {
         WrongCluster(WrongCluster),
         #[prost(message, tag = "17")]
         Binary(Binary),
+        #[prost(message, tag = "18")]
+        StrictEncoding(StrictEncoding),
     }
 }
 /// The view every read request carries: a read mode, or a snapshot handle
@@ -911,6 +939,18 @@ pub struct DescribeRequest {
 pub struct DescribeResponse {
     #[prost(message, repeated, tag = "1")]
     pub repos: ::prost::alloc::vec::Vec<RepoInfo>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExtractorGapsRequest {
+    #[prost(string, optional, tag = "1")]
+    pub org: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub repo: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExtractorGapsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub gaps: ::prost::alloc::vec::Vec<ExtractorGap>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SearchSymbolsRequest {
@@ -1345,6 +1385,34 @@ pub mod store_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Store", "DescribeByScan"));
             self.inner.unary(req, path, codec).await
         }
+        /// Languages whose stored symbols came from an extractor the leader lacks
+        /// (`Store::extractor_gaps`, #165): `Write.Index` is forwarded to and parsed
+        /// by the leader, so its registry is the one that matters. A follower
+        /// forwards this call to the leader, as it does a write.
+        pub async fn extractor_gaps(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExtractorGapsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExtractorGapsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Store/ExtractorGaps",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Store", "ExtractorGaps"));
+            self.inner.unary(req, path, codec).await
+        }
         /// A request without `limit` gets the server's default limit (1000); when that
         /// fills the page, `applied_default_limit` is set and the client pages to completion.
         pub async fn search_symbols(
@@ -1569,6 +1637,17 @@ pub mod store_server {
             request: tonic::Request<super::DescribeRequest>,
         ) -> std::result::Result<
             tonic::Response<super::DescribeResponse>,
+            tonic::Status,
+        >;
+        /// Languages whose stored symbols came from an extractor the leader lacks
+        /// (`Store::extractor_gaps`, #165): `Write.Index` is forwarded to and parsed
+        /// by the leader, so its registry is the one that matters. A follower
+        /// forwards this call to the leader, as it does a write.
+        async fn extractor_gaps(
+            &self,
+            request: tonic::Request<super::ExtractorGapsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExtractorGapsResponse>,
             tonic::Status,
         >;
         /// A request without `limit` gets the server's default limit (1000); when that
@@ -2238,6 +2317,51 @@ pub mod store_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DescribeByScanSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Store/ExtractorGaps" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExtractorGapsSvc<T: Store>(pub Arc<T>);
+                    impl<
+                        T: Store,
+                    > tonic::server::UnaryService<super::ExtractorGapsRequest>
+                    for ExtractorGapsSvc<T> {
+                        type Response = super::ExtractorGapsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExtractorGapsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Store>::extractor_gaps(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExtractorGapsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

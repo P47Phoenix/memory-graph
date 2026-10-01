@@ -204,6 +204,17 @@ message LanguageInfo {
   map<string, uint64> symbol_kinds = 4;
 }
 
+// graph_store::ExtractorGap (#74, #165): a language of a repo whose stored
+// symbols came from an extractor the answering server lacks; re-indexing
+// its files there stores them tokens-only.
+message ExtractorGap {
+  string org = 1;
+  string repo = 2;
+  string language = 3;
+  string stored_version = 4;
+  uint64 symbols = 5;
+}
+
 // graph_store::RepoInfo: what `describe` reports for one repo.
 message RepoInfo {
   string org = 1;
@@ -338,6 +349,10 @@ message StoreErrorDetail {
   // The file is binary (ADR 0007 C5): a NUL byte, no BOM, and it does not
   // decode as UTF-16.
   message Binary { string path = 1; }
+  // Refused under `strict_encoding`: the file has byte sequences invalid in
+  // `encoding` (a WHATWG name other than UTF-8; UTF-8 is `NotUtf8`), ADR
+  // 0007 C3/C8, #180.
+  message StrictEncoding { string path = 1; string encoding = 2; }
 
   oneof kind {
     Locked locked = 1;
@@ -357,6 +372,7 @@ message StoreErrorDetail {
     Protocol protocol = 15;
     WrongCluster wrong_cluster = 16;
     Binary binary = 17;
+    StrictEncoding strict_encoding = 18;
   }
 }
 

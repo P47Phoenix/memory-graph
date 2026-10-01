@@ -56,21 +56,26 @@ pub const CATALOG_VERSION: u64 = 2;
 /// `Node::origin` of files written by a directory run; only these are pruned.
 pub const ORIGIN_DIRECTORY: &str = "directory";
 
-/// The end of the [`StoreError::Rejected`] message of a file refused under
-/// `strict_encoding` for a non-UTF-8 lossy decode (ADR 0007 C3).
-pub const STRICT_ENCODING_MARK: &str = "(strict encoding)";
-
 /// Whether `e` is a per-file refusal by `strict_encoding` (ADR 0007 C3, C8):
-/// `NotUtf8` for a file decoded as UTF-8, or the `Rejected` naming the
-/// encoding. Holds for an error that came back over the wire too, since the
-/// message travels with it.
+/// `NotUtf8` for a file decoded as UTF-8, or `StrictEncoding` naming the
+/// encoding. Both are typed variants with their own wire detail (#180), so
+/// this holds for an error that came back over the wire too, whatever a
+/// proxy did to its message.
 pub fn is_strict_encoding_refusal(e: &StoreError) -> bool {
     match e {
-        StoreError::NotUtf8(_) => true,
-        StoreError::Rejected(m) => m.ends_with(STRICT_ENCODING_MARK),
+        StoreError::NotUtf8(_) | StoreError::StrictEncoding { .. } => true,
+        // Version skew (#180): a server from before the typed variant sends
+        // a `Rejected` ending in this text. Kept for one release; removed
+        // in the next (ADR 0007).
+        StoreError::Rejected(m) => m.ends_with(LEGACY_STRICT_ENCODING_SUFFIX),
         _ => false,
     }
 }
+
+/// The end of the `Rejected` message older servers sent for a non-UTF-8
+/// strict refusal, before `StoreError::StrictEncoding` (#180). Recognised
+/// for one release only.
+const LEGACY_STRICT_ENCODING_SUFFIX: &str = "(strict encoding)";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -94,6 +99,14 @@ pub enum StoreError {
     /// stored `lossy`. Kept for API and wire compatibility.
     #[error("rejected: {0} is not valid UTF-8")]
     NotUtf8(String),
+    /// Produced only with `strict_encoding` when a file decoded in an
+    /// encoding other than UTF-8 has byte sequences invalid in it (ADR 0007
+    /// C3, C8, #180). `path` is the file as given, `encoding` the WHATWG
+    /// name it was decoded as (`Shift_JIS`, `windows-1252`, ...).
+    #[error(
+        "rejected: `{path}` has byte sequences that are invalid in {encoding} (strict encoding)"
+    )]
+    StrictEncoding { path: String, encoding: String },
     /// The file is binary (ADR 0007 C5): it has a NUL byte, no BOM, no
     /// UTF-16 hint, and does not sniff as UTF-16.
     #[error("rejected: {0} is binary")]

@@ -20,6 +20,7 @@ use crate::raft::network::FaultPlan;
 use crate::raft::node::NO_LEADER_RETRY_MS;
 use crate::raft::{NodeId, RaftNode};
 use graph_proto::pb::admin_client::AdminClient;
+use graph_proto::pb::store_client::StoreClient;
 use graph_proto::pb::write_client::WriteClient;
 use graph_proto::{store_error_to_status, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use graph_store::StoreError;
@@ -285,6 +286,13 @@ impl Forwarder {
     /// A `Write` client of the leader at `addr`.
     pub fn write_client(&self, addr: &str) -> Result<WriteClient<ForwardChannel>, Status> {
         Ok(WriteClient::new(self.intercepted(addr)?)
+            .max_decoding_message_size(NO_LIMIT)
+            .max_encoding_message_size(NO_LIMIT))
+    }
+
+    /// A `Store` client of the leader at `addr` (`ExtractorGaps`, #165).
+    pub fn store_client(&self, addr: &str) -> Result<StoreClient<ForwardChannel>, Status> {
+        Ok(StoreClient::new(self.intercepted(addr)?)
             .max_decoding_message_size(NO_LIMIT)
             .max_encoding_message_size(NO_LIMIT))
     }

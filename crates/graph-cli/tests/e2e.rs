@@ -1096,9 +1096,15 @@ mod prune_and_limits {
         assert!(files_of(&db, "r").is_empty());
         // Nothing to lose: an empty walk is fine without --force.
         assert!(idx(&db, "r", &["--prune"], &root).0);
-        // --force only makes sense with --prune.
+        // --force alone is allowed (#165: it also overrides the missing-
+        // extractor refusal) and prunes nothing without --prune.
+        std::fs::write(root.join("c.txt"), "foo\n").unwrap();
+        assert!(idx(&db, "r", &["--prune"], &root).0);
+        std::fs::remove_file(root.join("c.txt")).unwrap();
         let (ok, _, err) = idx(&db, "r", &["--force"], &root);
-        assert!(!ok && err.contains("--prune"), "{err}");
+        assert!(ok, "{err}");
+        assert_eq!(files_of(&db, "r"), ["c.txt"]);
+        std::fs::write(root.join("c.txt"), "foo\n").unwrap();
         // --reindex is not --force: it never bypasses the empty-run guard.
         assert!(idx(&db, "r", &[], &root).0);
     }
