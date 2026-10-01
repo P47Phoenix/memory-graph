@@ -463,3 +463,43 @@ int class;
     assert!(CExtractor.version().starts_with("c-scan-1+kw1+tok"));
     assert!(CppExtractor.version().starts_with("cpp-scan-1+kw1+tok"));
 }
+
+/// #143: every listed word, written bare, is classed `keyword`.
+#[test]
+fn every_c_keyword_is_classed_keyword() {
+    for w in C_KEYWORDS {
+        let toks = CExtractor.extract(w).tokens;
+        assert_eq!(toks.len(), 1, "{w}");
+        assert_eq!(toks[0].class, graph_core::TokenClass::Keyword, "{w}");
+    }
+}
+
+/// #143: every listed word, written bare, is classed `keyword`.
+#[test]
+fn every_cpp_keyword_is_classed_keyword() {
+    for w in CPP_KEYWORDS {
+        let toks = CppExtractor.extract(w).tokens;
+        assert_eq!(toks.len(), 1, "{w}");
+        assert_eq!(toks[0].class, graph_core::TokenClass::Keyword, "{w}");
+    }
+}
+
+/// #143: a `.h` header sniffed as C++ gets the C++ list, so `class` is a
+/// keyword there (it is an identifier in plain C).
+#[test]
+fn header_sniffed_as_cpp_uses_the_cpp_keywords() {
+    let toks = CExtractor
+        .extract(
+            "namespace X {
+class A {};
+}
+",
+        )
+        .tokens;
+    let class: Vec<_> = toks
+        .iter()
+        .filter(|t| t.text == "class")
+        .map(|t| t.class)
+        .collect();
+    assert_eq!(class, [graph_core::TokenClass::Keyword]);
+}

@@ -297,3 +297,13 @@ fn keywords_are_classed_keyword() {
         .version()
         .starts_with("fsharp-scan-1+kw1+tok"));
 }
+
+/// #143: every listed word, written bare, is classed `keyword`.
+#[test]
+fn every_keyword_is_classed_keyword() {
+    for w in KEYWORDS {
+        let toks = FSharpExtractor.extract(w).tokens;
+        assert_eq!(toks.len(), 1, "{w}");
+        assert_eq!(toks[0].class, graph_core::TokenClass::Keyword, "{w}");
+    }
+}
