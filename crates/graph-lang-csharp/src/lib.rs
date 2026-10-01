@@ -212,7 +212,7 @@ const BUILTIN_TYPES: &[&str] = &[
 
 /// Longest local declaration statement, in code tokens, whose `;` is found;
 /// a longer one's span ends at its name.
-pub const MAX_STATEMENT: usize = 4096;
+const MAX_STATEMENT: usize = 4096;
 
 /// Contextual words that start a statement, not a type (`await x;`).
 const NOT_TYPES: &[&str] = &["await", "yield", "nameof", "when", "goto"];
@@ -317,8 +317,8 @@ fn type_end(tokens: &[TokenDecl], code: &[usize], c: usize) -> Option<usize> {
         while c < n {
             match tk(c).text.as_str() {
                 "<" => depth += 1,
+                // The tokenizer emits `>>` and `>>>` as single `>`s.
                 ">" => depth -= 1,
-                ">>" => depth -= 2,
                 "." | "," | "?" | "[" | "]" => {}
                 _ if simple(c) => {}
                 _ => return None,

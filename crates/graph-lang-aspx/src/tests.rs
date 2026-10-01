@@ -435,6 +435,15 @@ fn code_blocks_of_vb_pages_unchanged() {
             "{directive}"
         );
     }
+    // On a C# page: a `<%` whose next server tag is not its `%>` stays
+    // markup; a statement after `}` is a declaration.
+    let cs = "<%@ Page Language=\"C#\" %>\n";
+    let ex = AspxExtractor.extract(&format!("{cs}<% int x = 1; <%= y %>"));
+    assert!(ex.tokens.iter().all(|t| t.class != TokenClass::Keyword));
+    assert!(ex.symbols.iter().all(|s| s.name != "x"));
+    assert!(syms(&format!("{cs}<% if (a) {{ %>t<% }} int x = 1; %>"))
+        .iter()
+        .any(|s| s.0 == "x" && s.1 == "local"));
     let vb = "<%@ Page Language=\"VB\" %>\n<% Dim n As Integer = 0 %>";
     assert!(syms(vb).iter().all(|x| x.0 != "n"));
     // A C# script's own `language` does not make the page's blocks C#.
