@@ -191,6 +191,7 @@ impl Collector<'_> {
 
     /// Column-taking chars in `src[..off]` (`off` is a char boundary).
     fn chars_before(&self, off: usize) -> u32 {
+        debug_assert!(self.src.is_char_boundary(off));
         let b = self.src.as_bytes();
         let k = off / MARK;
         self.char_marks[k] + (k * MARK..off).filter(|&i| counts(b, i)).count() as u32
