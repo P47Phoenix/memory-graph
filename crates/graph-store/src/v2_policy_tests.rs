@@ -456,14 +456,28 @@ fn open_batch_marker_is_cleared_after_a_completed_batch() {
 /// (worst case for marker-write overhead) with the marker and, as a baseline
 /// that pays exactly the same per-chunk durable commits, without it (a
 /// test-only switch), and gates on the ratio (issues #125, #136, #154).
+///
+/// Only a fixed subset of the tree is used: `SUBSET` files evenly spaced
+/// through the path-sorted list (every `len / SUBSET`-th file, starting at the
+/// first). It is deterministic for a given tree, and it spreads over every
+/// crate, so file sizes stay representative. The whole tree (~180 files) cost
+/// 16-26 minutes on the windows-latest runner, where a durable commit takes
+/// ~220 ms.
 #[test]
 fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_own_corpus() {
-    let files = this_repos_rust_corpus();
+    const SUBSET: usize = 40;
+    let all = this_repos_rust_corpus();
     assert!(
-        files.len() > 10,
+        all.len() > SUBSET,
         "expected this repo's own .rs corpus, found {}",
-        files.len()
+        all.len()
     );
+    let files: Vec<_> = all
+        .iter()
+        .step_by(all.len() / SUBSET)
+        .take(SUBSET)
+        .cloned()
+        .collect();
     let srcs: Vec<String> = files
         .iter()
         .filter_map(|p| std::fs::read_to_string(p).ok())
@@ -535,9 +549,10 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
         without * 1000.0,
         excess
     );
-    // Measured, marker excess: Windows debug local (181 files, 4.12 MB) within
-    // +-0.01; windows-latest runner -0.10 to +0.03 (per-round noise there is
-    // ~10%). The marker is two small table writes inside a transaction that
+    // Measured, marker excess: Windows debug local, 181 files within +-0.01 and
+    // the 40-file subset -0.007 to +0.007; windows-latest runner, 181 files,
+    // -0.10 to +0.03 (per-round noise there is ~10%). A 15 ms sleep per marker
+    // write gives +1.23x on the subset locally. The marker is two small table writes inside a transaction that
     // commits anyway, so a real regression (extra commits or fsyncs, or
     // bookkeeping that grows with the chunk count) lands far above the gate.
     const EXCESS_GATE: f64 = 0.5;
