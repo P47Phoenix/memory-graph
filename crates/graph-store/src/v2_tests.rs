@@ -1843,89 +1843,50 @@ fn prepared_chunks_count_only_stored_files() {
     );
 }
 
-/// #158: `prepare`'s unchanged pre-check (a read transaction) waits while an
-/// index commit holds the commit gate, so no pre-check reader is live when
-/// a commit decides which freed pages it may reuse.
+/// #172: `prepare_with` answers the unchanged pre-check from its snapshot
+/// alone, never from the store: a snapshot taken before a change still
+/// calls the old content unchanged (it read nothing since), and the commit's
+/// authoritative check then extracts and stores the new content.
 #[test]
-fn prepare_precheck_waits_for_an_index_commit() {
+fn prepare_with_reads_only_its_snapshot() {
     let d = tempfile::tempdir().unwrap();
     let s = V2Store::open(d.path().join("g")).unwrap();
-    let f = BatchFile {
+    let f = |bytes| BatchFile {
         path: "a.txt",
-        bytes: b"alpha beta",
+        bytes,
         language: None,
         origin: None,
         ..Default::default()
     };
     let opts = IndexOptions::default();
-    s.index_batch("o", "r", &[f], opts).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::scope(|sc| {
-        let gate = s.commit_gate.write().unwrap();
-        sc.spawn(|| {
-            let p = Store::prepare(&s, "o", "r", &f, opts).unwrap();
-            tx.send(matches!(p.work, crate::api::Prepared::Unchanged(_)))
-                .unwrap();
-        });
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300))
-                .is_err(),
-            "prepare read the store while a commit held the gate"
-        );
-        drop(gate);
-        assert!(rx.recv().unwrap(), "the pre-check still runs afterwards");
-    });
+    s.index_batch("o", "r", &[f(b"alpha beta")], opts).unwrap();
+    let snap = Store::fingerprint_snapshot(&s, "o", "r").unwrap();
+    assert_eq!(snap.len(), 1);
+    assert!(Store::fingerprint_snapshot(&s, "o", "none")
+        .unwrap()
+        .is_empty());
+    s.index_batch("o", "r", &[f(b"alpha CHANGED")], opts)
+        .unwrap();
+    let p = Store::prepare_with(&s, "o", "r", &f(b"alpha beta"), opts, &snap).unwrap();
+    assert!(p.is_unchanged(), "answered from the stale snapshot");
+    let out = Store::index_prepared(&s, "o", "r", vec![p], opts).unwrap();
+    let st = out[0].as_ref().unwrap();
+    assert!(st.replaced && !st.unchanged, "{st:?}");
+    assert_eq!(s.search(&Query::new("beta")).unwrap().len(), 1);
+    // A snapshot of another repo (or none) falls back to `prepare`.
+    let other = Store::fingerprint_snapshot(&s, "o", "other").unwrap();
+    for known in [&other, &Default::default()] {
+        let p = Store::prepare_with(&s, "o", "r", &f(b"alpha beta"), opts, known).unwrap();
+        assert!(p.is_unchanged(), "read from the store");
+    }
 }
 
-/// #158, the other side: every index commit, the mid-batch chunk commits
-/// included, waits for a `prepare` pre-check that holds the gate. A
-/// pre-check reader still live when a commit ran (e.g. a parse thread
-/// descheduled under CPU load across a whole commit) kept that commit from
-/// reusing the pages the previous one freed.
+/// #158 / #172 end to end: parse threads preparing against a snapshot,
+/// throughout chunk commits of a replace on another thread, leave exactly
+/// the bytes of a serial run: they hold no read transaction, so no commit's
+/// page reuse depends on their timing (there is no commit gate any more).
 #[test]
-fn index_commit_waits_for_a_prepare_precheck() {
-    let d = tempfile::tempdir().unwrap();
-    let mut s = V2Store::open(d.path().join("g")).unwrap();
-    // One file per chunk: `a.txt` commits in a mid-batch chunk commit.
-    s.set_chunk_bytes(1);
-    let s = s;
-    let f = |path| BatchFile {
-        path,
-        bytes: b"alpha beta",
-        language: None,
-        origin: None,
-        ..Default::default()
-    };
-    let opts = IndexOptions::default();
-    let p: Vec<_> = ["a.txt", "b.txt"]
-        .into_iter()
-        .map(|n| Store::prepare(&s, "o", "r", &f(n), opts).unwrap())
-        .collect();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::scope(|sc| {
-        let gate = s.commit_gate.read().unwrap();
-        sc.spawn(|| {
-            let r = Store::index_prepared(&s, "o", "r", p, opts).unwrap();
-            tx.send(r.len()).unwrap();
-        });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            s.file_tokens("o", "r", "a.txt").unwrap().is_none(),
-            "a chunk commit ran while a pre-check held the gate"
-        );
-        assert!(rx.try_recv().is_err(), "the batch finished under the gate");
-        drop(gate);
-        assert_eq!(rx.recv().unwrap(), 2);
-    });
-    assert!(s.file_tokens("o", "r", "a.txt").unwrap().is_some());
-}
-
-/// #158 end to end: a pre-check reader held open (the hook sleeps inside
-/// it) while chunk commits of a replace run on another thread must leave
-/// exactly the bytes of a serial run. Fails if the reader is not covered
-/// by the gate or a commit bypasses it.
-#[test]
-fn a_slow_precheck_leaves_the_same_bytes() {
+fn concurrent_prepares_leave_the_same_bytes() {
     let srcs: Vec<(String, String)> = (0..8)
         .map(|i| {
             let body: String = (0..400).map(|j| format!("w{i}_{j} ")).collect();
@@ -1942,7 +1903,7 @@ fn a_slow_precheck_leaves_the_same_bytes() {
             ..Default::default()
         })
         .collect();
-    let run = |slow: bool| {
+    let run = |busy: bool| {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("g");
         let mut s = V2Store::open(&path).unwrap();
@@ -1954,25 +1915,34 @@ fn a_slow_precheck_leaves_the_same_bytes() {
                 reindex,
                 ..Default::default()
             };
+            let snap = Store::fingerprint_snapshot(&s, "o", "r").unwrap();
             let p: Vec<_> = files
                 .iter()
-                .map(|f| Store::prepare(&s, "o", "r", f, opts).unwrap())
+                .map(|f| Store::prepare_with(&s, "o", "r", f, opts, &snap).unwrap())
                 .collect();
             Store::index_prepared(&s, "o", "r", p, opts).unwrap();
         };
         pass(false);
+        let snap = Store::fingerprint_snapshot(&s, "o", "r").unwrap();
         std::thread::scope(|sc| {
-            if slow {
-                sc.spawn(|| {
-                    crate::v2::PRECHECK_HOOK.with(|h| {
-                        *h.borrow_mut() = Some(Box::new(|| {
-                            std::thread::sleep(std::time::Duration::from_millis(40))
-                        }))
+            if busy {
+                for _ in 0..2 {
+                    sc.spawn(|| {
+                        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                            for f in &files {
+                                Store::prepare_with(
+                                    &s,
+                                    "o",
+                                    "r",
+                                    f,
+                                    IndexOptions::default(),
+                                    &snap,
+                                )
+                                .unwrap();
+                            }
+                        }
                     });
-                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                        Store::prepare(&s, "o", "r", &files[0], IndexOptions::default()).unwrap();
-                    }
-                });
+                }
             }
             pass(true);
             pass(true);
@@ -1984,7 +1954,7 @@ fn a_slow_precheck_leaves_the_same_bytes() {
     let serial = run(false);
     assert!(
         run(true) == serial,
-        "database bytes depend on a slow pre-check"
+        "database bytes depend on concurrent prepares"
     );
 }
 

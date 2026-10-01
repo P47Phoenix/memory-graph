@@ -2279,6 +2279,96 @@ fn no_dict_rev_block_ever_exceeds_dict_block_entries() {
     );
 }
 
+/// Issue #162: a block that reached `DICT_BLOCK_MAX_BYTES` (here, one with a
+/// 200 KiB term) is not extended again, so later new terms never rewrite
+/// it: the long term ends its block, every later term lands in blocks under
+/// the cap, and every term still looks up.
+#[test]
+fn a_long_term_closes_its_dict_rev_block() {
+    use crate::v2::{DICT_BLOCK_MAX_BYTES, DICT_REV};
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    let long = "z".repeat(200 << 10);
+    let toks = [("head", 0, 4), (long.as_str(), 5, 5 + long.len() as u32)];
+    s.ingest_file("o", "r", "a.txt", "text", &span_ext(&[], &toks))
+        .unwrap();
+    let owned: Vec<String> = (0..20).map(|i| format!("after{i}")).collect();
+    for (i, t) in owned.iter().enumerate() {
+        let toks = [(t.as_str(), 0, t.len() as u32)];
+        s.ingest_file(
+            "o",
+            "r",
+            &format!("b{i}.txt"),
+            "text",
+            &span_ext(&[], &toks),
+        )
+        .unwrap();
+    }
+    s.check_consistency(false);
+    let rt = s.db.begin_read().unwrap();
+    let table = rt.open_table(DICT_REV).unwrap();
+    let blocks: Vec<Vec<(u64, String)>> = table
+        .iter()
+        .unwrap()
+        .map(|r| crate::codec::decode_dict_block(r.unwrap().1.value()).unwrap())
+        .collect();
+    let at = blocks
+        .iter()
+        .position(|b| b.iter().any(|(_, t)| *t == long))
+        .expect("the long term is stored");
+    assert_eq!(
+        blocks[at].last().unwrap().1,
+        long,
+        "nothing appended after the long term"
+    );
+    for b in &blocks[at + 1..] {
+        let bytes: usize = b.iter().map(|(_, t)| t.len()).sum();
+        assert!(bytes < DICT_BLOCK_MAX_BYTES);
+    }
+    assert!(
+        blocks.len() > at + 1,
+        "later terms got a block of their own"
+    );
+    for t in &owned {
+        assert_eq!(s.search(&Query::new(t)).unwrap().len(), 1, "{t}");
+    }
+}
+
+/// Issue #162, the boundary: a last block of exactly `DICT_BLOCK_MAX_BYTES`
+/// encoded bytes is full (the next term starts a new block); one byte less
+/// is extended.
+#[test]
+fn a_dict_rev_block_of_exactly_the_cap_is_full() {
+    use crate::codec::encode_dict_block;
+    use crate::v2::{dict_rev_append, DICT_BLOCK_MAX_BYTES, DICT_REV};
+    // A one-entry block whose encoding is exactly `want` bytes (the
+    // header is a few bytes of varints).
+    let sized = |want: usize| {
+        (want - 32..=want)
+            .map(|len| "z".repeat(len))
+            .find(|t| encode_dict_block(&[(0, t.as_str())]).len() == want)
+            .expect("a term length that encodes to exactly `want` bytes")
+    };
+    for (size, blocks) in [(DICT_BLOCK_MAX_BYTES, 2), (DICT_BLOCK_MAX_BYTES - 1, 1)] {
+        let d = tempfile::tempdir().unwrap();
+        let s = V2Store::open(d.path().join("v.redb")).unwrap();
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut rev = wt.open_table(DICT_REV).unwrap();
+            for k in 0..rev.len().unwrap() {
+                rev.remove(k).unwrap();
+            }
+            let t = sized(size);
+            rev.insert(0, encode_dict_block(&[(0, t.as_str())]).as_slice())
+                .unwrap();
+            assert_eq!(rev.get(0).unwrap().unwrap().value().len(), size);
+            dict_rev_append(&mut rev, 1, "x").unwrap();
+            assert_eq!(rev.len().unwrap(), blocks, "block of {size} bytes");
+        }
+        wt.abort().unwrap();
+    }
+}
+
 /// `vacuum` repacks `dict_rev` densely (ADR 0003 story 5): after removing
 /// terms scattered across several blocks, block boundaries no longer line up
 /// with `id / DICT_BLOCK` (dead ids leave gaps), and lookups must still find

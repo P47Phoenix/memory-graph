@@ -144,6 +144,31 @@ pub(crate) fn fingerprint(
     fp
 }
 
+fn open_if_exists<T>(r: std::result::Result<T, redb::TableError>) -> Result<Option<T>> {
+    match r {
+        Ok(t) => Ok(Some(t)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The id of org/repo (as of `names`), if both exist.
+fn repo_id_in(
+    names: &redb::ReadOnlyTable<&'static str, u64>,
+    org: &str,
+    repo: &str,
+) -> Result<Option<NodeId>> {
+    let Some(org_id) = names
+        .get(name_key(None, NodeKind::Org, org).as_str())?
+        .map(|v| v.value())
+    else {
+        return Ok(None);
+    };
+    Ok(names
+        .get(name_key(Some(org_id), NodeKind::Repo, repo).as_str())?
+        .map(|v| v.value()))
+}
+
 /// Whether the file stored under org/repo/path (as of `rt`) carries `fp`.
 pub(crate) fn stored_fingerprint_matches(
     rt: &ReadTransaction,
@@ -152,35 +177,58 @@ pub(crate) fn stored_fingerprint_matches(
     path: &str,
     fp: &str,
 ) -> Result<bool> {
-    fn open<T>(r: std::result::Result<T, redb::TableError>) -> Result<Option<T>> {
-        match r {
-            Ok(t) => Ok(Some(t)),
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-    let (Some(names), Some(nodes)) = (open(rt.open_table(NAMES))?, open(rt.open_table(NODES))?)
+    let (Some(names), Some(nodes)) = (
+        open_if_exists(rt.open_table(NAMES))?,
+        open_if_exists(rt.open_table(NODES))?,
+    ) else {
+        return Ok(false);
+    };
+    let Some(repo_id) = repo_id_in(&names, org, repo)? else {
+        return Ok(false);
+    };
+    let Some(file_id) = names
+        .get(name_key(Some(repo_id), NodeKind::File, path).as_str())?
+        .map(|v| v.value())
     else {
-        return Ok(false);
-    };
-    let find = |parent: Option<NodeId>, kind: NodeKind, name: &str| -> Result<Option<NodeId>> {
-        Ok(names
-            .get(name_key(parent, kind, name).as_str())?
-            .map(|v| v.value()))
-    };
-    let Some(org_id) = find(None, NodeKind::Org, org)? else {
-        return Ok(false);
-    };
-    let Some(repo_id) = find(Some(org_id), NodeKind::Repo, repo)? else {
-        return Ok(false);
-    };
-    let Some(file_id) = find(Some(repo_id), NodeKind::File, path)? else {
         return Ok(false);
     };
     let Some(raw) = nodes.get(file_id)? else {
         return Ok(false);
     };
     Ok(dec(raw.value())?.fingerprint.as_deref() == Some(fp))
+}
+
+/// The fingerprint of every file stored under org/repo (as of `rt`), by
+/// stored (normalized) path; files ingested pre-extracted have none and are
+/// left out. One scan of the repo's file nodes, for
+/// [`Store::fingerprint_snapshot`](crate::Store::fingerprint_snapshot).
+pub(crate) fn stored_fingerprints(
+    rt: &ReadTransaction,
+    org: &str,
+    repo: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    let (Some(names), Some(nodes), Some(children)) = (
+        open_if_exists(rt.open_table(NAMES))?,
+        open_if_exists(rt.open_table(NODES))?,
+        open_if_exists(rt.open_multimap_table(CHILDREN))?,
+    ) else {
+        return Ok(out);
+    };
+    let Some(repo_id) = repo_id_in(&names, org, repo)? else {
+        return Ok(out);
+    };
+    for fid in children.get(repo_id)? {
+        let fid = fid?.value();
+        let Some(raw) = nodes.get(fid)? else {
+            continue;
+        };
+        let f = dec(raw.value())?;
+        if let Some(fp) = f.fingerprint {
+            out.insert(f.name, fp);
+        }
+    }
+    Ok(out)
 }
 
 /// If the file already stored under org/repo/path carries `fp`, leave its
