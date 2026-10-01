@@ -36,6 +36,7 @@ fn run(db: &Path, dir: &Path, reindex: bool) -> String {
             remote: None,
             encoding: None,
             strict_encoding: false,
+            compact: false,
         },
         open,
         &mut out,
