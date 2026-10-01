@@ -234,3 +234,29 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword` in any case; qualified parts,
+/// variables, quoted names and common column words stay as they were.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "select t.select, [from], name from T where x is not null and @from = 1;\nCREATE TABLE Foo (id int);\n";
+    let toks = SqlExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        class("select"),
+        [TokenClass::Keyword, TokenClass::Identifier]
+    );
+    assert_eq!(class("from"), [TokenClass::Keyword, TokenClass::Identifier]);
+    for kw in ["where", "is", "not", "null", "and", "CREATE", "TABLE"] {
+        assert_eq!(class(kw), [TokenClass::Keyword], "{kw}");
+    }
+    assert_eq!(class("[from]"), [TokenClass::Identifier], "quoted name");
+    assert_eq!(class("name"), [TokenClass::Identifier]);
+    assert_eq!(class("Foo"), [TokenClass::Identifier]);
+    assert!(SqlExtractor.version().starts_with("sql-scan-2+kw1+tok"));
+}

@@ -32,11 +32,20 @@
 //! inside `~s(...)` can unbalance a block (the block then ends early or is
 //! found by indentation); declarations are recognised only at the start of
 //! a line (or after `;`).
-use graph_core::scan::{code_index, indent_block, keyword_close_table, span_between};
+use graph_core::scan::{
+    code_index, indent_block, keyword_close_table, mark_keywords, span_between,
+};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct ElixirExtractor;
+
+/// Elixir's reserved words. `def`, `defmodule`, `if`, `case`, ... are macros
+/// and stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "true", "false", "nil", "when", "and", "or", "not", "in", "fn", "do", "end", "catch", "rescue",
+    "after", "else",
+];
 
 /// Tokenizer dialect used for Elixir.
 pub const ELIXIR_TOKENIZER: TokenizerOptions = TokenizerOptions::ELIXIR;
@@ -51,12 +60,15 @@ impl Extractor for ElixirExtractor {
     }
 
     fn version(&self) -> String {
-        format!("elixir-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("elixir-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, ELIXIR_TOKENIZER);
+        let mut tokens = tokenize_with(source, ELIXIR_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        mark_keywords(&mut tokens, KEYWORDS, is_atom_or_field);
         Extraction {
             symbols,
             tokens,
@@ -270,6 +282,22 @@ impl Scanner<'_> {
                 _ => p += 1,
             }
         }
+    }
+}
+
+/// An atom (`:do`), a keyword-list key (`do: x`, `else: y`) or a field
+/// (`map.end`) uses a reserved word as a plain name.
+fn is_atom_or_field(t: &[TokenDecl], i: usize) -> bool {
+    if i > 0 && matches!(t[i - 1].text.as_str(), ":" | ".") && t[i - 1].span.end == t[i].span.start
+    {
+        return true;
+    }
+    // A key: `do:` glued, but not `do::`.
+    match t.get(i + 1) {
+        Some(c) if c.text == ":" && t[i].span.end == c.span.start => !t
+            .get(i + 2)
+            .is_some_and(|n| n.text == ":" && c.span.end == n.span.start),
+        _ => false,
     }
 }
 

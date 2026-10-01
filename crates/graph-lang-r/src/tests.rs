@@ -198,3 +198,36 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword`; member names, backtick names
+/// and Rmd prose stay as they were.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "f <- function(x) if (x) TRUE else NA_real_\ny <- l$if\n`for` <- 1\nT\n";
+    let toks = RExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("function"), [TokenClass::Keyword]);
+    assert_eq!(class("TRUE"), [TokenClass::Keyword]);
+    assert_eq!(class("else"), [TokenClass::Keyword]);
+    assert_eq!(class("NA_real_"), [TokenClass::Keyword]);
+    assert_eq!(class("if"), [TokenClass::Keyword, TokenClass::Identifier]);
+    assert_eq!(class("T"), [TokenClass::Identifier]);
+    assert_eq!(class("`for`"), [TokenClass::Literal]);
+    let doc = "---\ntitle: x\n---\n\nif you function\n\n```{r}\nfor (i in 1) next\n```\n";
+    let toks = RExtractor.extract(doc).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("function"), [TokenClass::Identifier], "prose");
+    assert_eq!(class("for"), [TokenClass::Keyword]);
+    assert_eq!(class("next"), [TokenClass::Keyword]);
+    assert!(RExtractor.version().starts_with("r-scan-2+kw1+tok"));
+}

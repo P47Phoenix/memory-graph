@@ -22,11 +22,19 @@
 //! body; plain `NAME=value` assignments and `local` are not symbols; zsh's
 //! multi-name `function a b c { ... }` is not a symbol (only one name per
 //! definition is recognized).
-use graph_core::scan::{span_between, NestedEnds, Step};
+use graph_core::scan::{mark_keywords, span_between, NestedEnds, Step};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct ShellExtractor;
+
+/// POSIX/bash reserved words. They are only reserved in command position
+/// (`in` only as the third word of `for`/`case`/`select`), so
+/// `is_plain_word` keeps `echo done`, `$if` and `fi.txt` identifiers.
+const KEYWORDS: &[&str] = &[
+    "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in", "select",
+    "then", "time", "until", "while",
+];
 
 /// Tokenizer dialect used for shell scripts.
 pub const SHELL_TOKENIZER: TokenizerOptions = TokenizerOptions::SHELL;
@@ -41,12 +49,15 @@ impl Extractor for ShellExtractor {
     }
 
     fn version(&self) -> String {
-        format!("shell-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("shell-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, SHELL_TOKENIZER);
+        let mut tokens = tokenize_with(source, SHELL_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        mark_keywords(&mut tokens, KEYWORDS, is_plain_word);
         Extraction {
             symbols,
             tokens,
@@ -343,6 +354,36 @@ impl Scanner<'_> {
             k = last + 1;
         }
     }
+}
+
+/// Whether the reserved word at `i` is used as a plain word: glued to a
+/// neighbour (`$if`, `-do`, `fi.txt`, `done=1`) or not in command position
+/// (an argument, as in `echo done`). `in` is reserved only as the third word
+/// of `for`/`case`/`select`.
+fn is_plain_word(t: &[TokenDecl], i: usize) -> bool {
+    let code = |j: &usize| t[*j].class != TokenClass::Comment;
+    if let Some(n) = t.get(i + 1) {
+        if t[i].span.end == n.span.start && !n.text.starts_with([';', '&', '|', ')', '(']) {
+            return true;
+        }
+    }
+    let Some(p) = (0..i).rev().find(code) else {
+        return false;
+    };
+    if t[i].text == "in" {
+        let pp = (0..p).rev().find(code);
+        return !pp.is_some_and(|q| matches!(t[q].text.as_str(), "for" | "case" | "select"));
+    }
+    let op = t[p].text.ends_with([';', '&', '|', '(', '{', '!', '`']);
+    if t[p].span.end == t[i].span.start && !op {
+        return true;
+    }
+    let new_line = t[p].span.end_line < t[i].span.start_line && t[p].text != "\\";
+    let after_kw = matches!(
+        t[p].text.as_str(),
+        "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "time"
+    );
+    !(new_line || op || after_kw)
 }
 
 #[cfg(test)]

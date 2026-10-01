@@ -176,3 +176,45 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words in command position are classed `keyword`; the same
+/// words as arguments or glued to other text stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "if true; then\n  for x in a b; do echo done $if fi.txt; done\nfi\ncase y in\n  *) ;;\nesac\n";
+    let toks = ShellExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("then"), [TokenClass::Keyword]);
+    assert_eq!(class("for"), [TokenClass::Keyword]);
+    assert_eq!(class("in"), [TokenClass::Keyword, TokenClass::Keyword]);
+    assert_eq!(class("do"), [TokenClass::Keyword]);
+    assert_eq!(class("esac"), [TokenClass::Keyword]);
+    // `echo done` is an argument; the second `done` closes the loop.
+    assert_eq!(class("done"), [TokenClass::Identifier, TokenClass::Keyword]);
+    // `$if` and `fi.txt` are words (whole tokens or glued pieces), never
+    // keywords; the lone `fi` closes the `if`.
+    assert_eq!(class("if"), [TokenClass::Keyword]);
+    assert_eq!(class("fi"), [TokenClass::Identifier, TokenClass::Keyword]);
+    let glued: Vec<_> = toks
+        .iter()
+        .filter(|t| t.span.start >= src.find("$if").unwrap() as u32)
+        .take_while(|t| t.text != ";")
+        .collect();
+    assert!(
+        glued.iter().all(|t| t.class != TokenClass::Keyword),
+        "{glued:?}"
+    );
+    // Glued pieces (`done=1`, `-if`) stay words too.
+    let more = ShellExtractor.extract("x=1 -if done=2\n").tokens;
+    assert!(
+        more.iter().all(|t| t.class != TokenClass::Keyword),
+        "{more:?}"
+    );
+    assert_eq!(class("echo"), [TokenClass::Identifier]);
+    assert!(ShellExtractor.version().starts_with("shell-scan-2+kw1+tok"));
+}

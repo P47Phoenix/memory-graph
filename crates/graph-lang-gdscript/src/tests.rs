@@ -238,3 +238,39 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword`; properties and built-in
+/// constants stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "class_name Foo extends Node\nfunc f(x) -> void:\n\tif x is int and not null:\n\t\treturn self.class\n\tvar y = PI\n";
+    let toks = GdscriptExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    for kw in [
+        "class_name",
+        "extends",
+        "func",
+        "void",
+        "if",
+        "is",
+        "and",
+        "not",
+        "null",
+        "return",
+        "self",
+        "var",
+    ] {
+        assert_eq!(class(kw), [TokenClass::Keyword], "{kw}");
+    }
+    assert_eq!(class("class"), [TokenClass::Identifier]);
+    assert_eq!(class("PI"), [TokenClass::Identifier]);
+    assert_eq!(class("int"), [TokenClass::Identifier]);
+    assert!(GdscriptExtractor
+        .version()
+        .starts_with("gdscript-scan-2+kw1+tok"));
+}
