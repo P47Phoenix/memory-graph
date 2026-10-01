@@ -67,11 +67,12 @@ fn run(db: &Path, dir: &Path, json: bool, prune: bool) -> (anyhow::Result<()>, S
             remote: None,
             encoding: None,
             strict_encoding: false,
+            compact: false,
         },
         open,
         &mut out,
     );
-    (r, String::from_utf8(out).unwrap())
+    (r.map(|_| ()), String::from_utf8(out).unwrap())
 }
 
 #[test]
@@ -166,6 +167,7 @@ fn extractor_panic_fails_one_file_for_any_jobs() {
                 remote: None,
                 encoding: None,
                 strict_encoding: false,
+                compact: false,
             },
             open,
             &mut out,
@@ -215,11 +217,12 @@ fn run_mem(
             remote: None,
             encoding: None,
             strict_encoding: false,
+            compact: false,
         },
         open,
         &mut out,
     );
-    (r, serde_json::from_slice(&out).unwrap())
+    (r.map(|_| ()), serde_json::from_slice(&out).unwrap())
 }
 
 /// Span failures are recorded at flush and panics on arrival, so the

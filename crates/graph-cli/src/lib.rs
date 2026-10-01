@@ -131,6 +131,9 @@ pub struct DirOpts<'a> {
     pub encoding: Option<&'static graph_core::encoding::Encoding>,
     /// `--strict-encoding`: refuse (and report) a file whose decode is lossy.
     pub strict_encoding: bool,
+    /// `--compact` (#90): the caller compacts the file after a run that
+    /// replaced files, so the `vacuum --compact` hint is not printed.
+    pub compact: bool,
 }
 
 /// Source bytes per redb transaction unless `--chunk-bytes` says otherwise
@@ -1122,11 +1125,14 @@ fn commit_all(
 /// The directory streams through walk → parse (one thread per spare CPU) →
 /// commit (one writer, walk order), bounded by a memory budget sized from
 /// the machine; a live view on stderr shows what every stage is doing.
+///
+/// Returns how many files replaced a stored copy (#90: only those leave
+/// old pages behind for `--compact` to reclaim).
 pub fn index_dir(
     o: DirOpts,
     open: impl FnOnce(&std::path::Path) -> Result<Box<dyn Store>>,
     out: &mut dyn Write,
-) -> Result<()> {
+) -> Result<usize> {
     use std::io::IsTerminal;
     let show = o
         .progress
@@ -1145,7 +1151,7 @@ pub fn index_dir_with(
     open: impl FnOnce(&std::path::Path) -> Result<Box<dyn Store>>,
     out: &mut dyn Write,
     display: &mut Display,
-) -> Result<()> {
+) -> Result<usize> {
     if o.org.is_empty() || o.repo.is_empty() {
         bail!("--org and --repo must not be empty");
     }
@@ -1350,7 +1356,8 @@ pub fn index_dir_with(
         }
     }
     // Only a run that replaced stored files leaves the old pages behind.
-    if o.reindex && replaced > 0 {
+    // With --compact the caller reclaims them instead.
+    if o.reindex && replaced > 0 && !o.compact {
         compact_hint(&*store);
     }
     if !failed.is_empty() {
@@ -1359,7 +1366,7 @@ pub fn index_dir_with(
             failed.len()
         );
     }
-    Ok(())
+    Ok(replaced)
 }
 
 #[cfg(test)]

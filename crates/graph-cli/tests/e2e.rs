@@ -2639,3 +2639,71 @@ fn encodings_show_in_stats_describe_symbols_and_search() {
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert!(v["results"][0].get("encoding").is_none(), "{v}");
 }
+
+/// #90: `index --reindex --compact` compacts only after a run that replaced
+/// files, keeps stdout one JSON document under `--json`, needs `--reindex`,
+/// and is refused over `--server` before connecting.
+#[test]
+fn index_reindex_compact() {
+    let d = tempfile::tempdir().unwrap();
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.rs"), "fn alpha() {}\n").unwrap();
+    std::fs::write(src.join("b.txt"), "beta gamma\n").unwrap();
+    let empty = d.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let db = d.path().join("g.redb").display().to_string();
+    let s = src.display().to_string();
+    let e = empty.display().to_string();
+    let idx = |extra: &[&str], dir: &str| {
+        let mut args = vec!["--db", &db, "index", "--org", "o", "--repo", "r"];
+        args.extend_from_slice(extra);
+        args.push(dir);
+        run(&args)
+    };
+    // Into an empty database nothing is replaced: no compaction.
+    let (ok, out, err) = idx(&["--reindex", "--compact"], &s);
+    assert!(ok, "{out}{err}");
+    assert!(!out.contains("compact:"), "fresh: {out}");
+    // A real replace compacts, with no hint left over.
+    let (ok, out, err) = idx(&["--reindex", "--compact"], &s);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("compact: ") && out.contains(" bytes -> "),
+        "{out}"
+    );
+    assert!(!err.contains("hint:"), "{err}");
+    // Nothing indexed (an empty tree): nothing replaced, no compaction.
+    let (ok, out, err) = idx(&["--reindex", "--compact"], &e);
+    assert!(ok, "{out}{err}");
+    assert!(!out.contains("compact:"), "no-op: {out}");
+    // --json: stdout stays one JSON document; the compact line is on stderr.
+    let (ok, out, err) = idx(&["--reindex", "--compact", "--json"], &s);
+    assert!(ok, "{out}{err}");
+    serde_json::from_str::<serde_json::Value>(out.trim()).expect("stdout is JSON");
+    assert!(err.contains("compact: "), "{err}");
+    // The store still answers after compaction.
+    let (ok, out, err) = run(&["--db", &db, "search", "alpha"]);
+    assert!(ok && out.contains("alpha"), "{out}{err}");
+    // --compact needs --reindex.
+    let (ok, _, err) = idx(&["--compact"], &s);
+    assert!(!ok && err.contains("--reindex"), "{err}");
+    // Embedded only: refused over --server, before connecting.
+    let (ok, _, err) = run(&[
+        "--server",
+        "http://127.0.0.1:1",
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--reindex",
+        "--compact",
+        &s,
+    ]);
+    assert!(!ok, "{err}");
+    assert!(
+        err.contains("--compact is embedded-only") && err.contains("vacuum --compact"),
+        "{err}"
+    );
+}
