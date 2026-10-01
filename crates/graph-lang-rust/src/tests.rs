@@ -109,3 +109,40 @@ fn version_pins_keyword_classing() {
         )
     );
 }
+
+/// Many items on one line stay linear (#157): each symbol's column used to
+/// be counted from the line start. 4x the input stays well under 16x the
+/// time (allowing 10x for noise).
+#[test]
+fn many_items_on_one_line_is_linear() {
+    let time = |n: usize| {
+        let src = "struct a {} ".repeat(n);
+        let t = std::time::Instant::now();
+        assert_eq!(RustExtractor.extract(&src).symbols.len(), n);
+        t.elapsed()
+    };
+    time(2_000);
+    let small = time(10_000).max(std::time::Duration::from_millis(5));
+    let big = time(40_000);
+    assert!(big < small * 10, "10k: {small:?}, 40k: {big:?}");
+}
+
+/// Columns stay exact across checkpoints: a BOM takes no column, a
+/// multi-byte char takes one, on lines longer than a checkpoint block.
+#[test]
+fn columns_exact_with_bom_and_multibyte() {
+    let pad = "struct \u{e9} {} ".repeat(20);
+    let src = format!("\u{feff}{pad}struct b {{}}\n{pad}struct c {{}}");
+    let syms = RustExtractor.extract(&src).symbols;
+    let col = |s: &graph_core::SymbolDecl| {
+        let r = s.span.start as usize..s.span.end as usize;
+        let line = src[..r.start].rfind('\n').map_or(0, |i| i + 1);
+        let c = |o: usize| src[line..o].chars().filter(|&c| c != '\u{feff}').count() as u32 + 1;
+        (c(r.start), c(r.end))
+    };
+    for s in &syms {
+        assert_eq!((s.span.start_col, s.span.end_col), col(s), "{}", s.name);
+    }
+    let b = syms.iter().find(|s| s.name == "b").unwrap();
+    assert_eq!(b.span.start_col, 20 * 12 + 1);
+}
