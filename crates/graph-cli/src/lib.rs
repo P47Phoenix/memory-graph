@@ -206,9 +206,13 @@ pub fn check_extractor_gaps(store: &dyn Store, org: &str, repo: &str, force: boo
             eprintln!("warning: could not check stored extractors: {e} (--force: indexing anyway)");
             return Ok(());
         }
-        Err(e) => bail!(
-            "refusing to index {org}/{repo}: could not check for symbols stored by a missing extractor: {e}; retry, or pass --force to index anyway"
-        ),
+        // The typed StoreError stays in the chain (context only), so
+        // `NoLeader` and the like keep their exit codes.
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "refusing to index {org}/{repo}: could not check for symbols stored by a missing extractor; retry, or pass --force to index anyway"
+            )))
+        }
     };
     if gaps.is_empty() {
         return Ok(());
