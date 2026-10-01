@@ -420,3 +420,46 @@ fn header_failure_memo_keys_on_flags() {
         }
     }
 }
+
+/// #143: reserved words are classed `keyword`, in C and in C++ (with the
+/// C++ list); preprocessor directive names stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    use graph_core::TokenClass::{Identifier, Keyword};
+    let class = |toks: &[graph_core::TokenDecl], text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    let c = CExtractor
+        .extract(
+            "#if X
+static int f(void) { return sizeof(int); }
+#else
+int class;
+#endif
+",
+        )
+        .tokens;
+    for w in ["static", "int", "void", "return", "sizeof"] {
+        assert!(class(&c, w).iter().all(|k| *k == Keyword), "{w}");
+    }
+    for w in ["if", "else", "endif", "class", "f", "X"] {
+        assert_eq!(class(&c, w), [Identifier], "{w}");
+    }
+    let cpp = CppExtractor
+        .extract(
+            "class A { public: virtual void f() override; }; int x = not_eq;
+",
+        )
+        .tokens;
+    for w in ["class", "public", "virtual", "void", "int", "not_eq"] {
+        assert_eq!(class(&cpp, w), [Keyword], "{w}");
+    }
+    for w in ["override", "A", "f", "x"] {
+        assert_eq!(class(&cpp, w), [Identifier], "{w}");
+    }
+    assert!(CExtractor.version().starts_with("c-scan-1+kw1+tok"));
+    assert!(CppExtractor.version().starts_with("cpp-scan-1+kw1+tok"));
+}
