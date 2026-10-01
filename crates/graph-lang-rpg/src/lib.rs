@@ -87,6 +87,24 @@ fn is_assigned(t: &[TokenDecl], i: usize) -> bool {
 /// fixed C spec's operation field (columns 26-35).
 fn opcode_positions(t: &[TokenDecl]) -> Vec<bool> {
     let mut out = vec![false; t.len()];
+    // `next_semi[i]`: index of the first `;` at or after `i` (else
+    // `t.len()`); `closers[k]`: how many of `t[..k]` close a declaration
+    // in its own statement. Both linear, so a file without `;` stays O(n).
+    let mut next_semi = vec![t.len(); t.len() + 1];
+    for j in (0..t.len()).rev() {
+        next_semi[j] = if t[j].text == ";" {
+            j
+        } else {
+            next_semi[j + 1]
+        };
+    }
+    let mut closers = vec![0usize; t.len() + 1];
+    for (j, x) in t.iter().enumerate() {
+        let c = ["likeds", "likerec", "end-ds", "end-pi", "end-pr"]
+            .iter()
+            .any(|w| x.text.eq_ignore_ascii_case(w));
+        closers[j + 1] = closers[j] + usize::from(c);
+    }
     let mut prev: Option<usize> = None;
     let mut in_block = false;
     let mut line_first_col6_c = false;
@@ -106,12 +124,10 @@ fn opcode_positions(t: &[TokenDecl]) -> Vec<bool> {
         if starts {
             match lower.as_str() {
                 "dcl-ds" | "dcl-pi" | "dcl-pr" => {
-                    // A one-statement `dcl-ds x likeds(y);` opens no block.
-                    let end = (i..t.len()).find(|&j| t[j].text == ";").unwrap_or(t.len());
-                    in_block = !t[i..end].iter().any(|x| {
-                        x.text.eq_ignore_ascii_case("likeds")
-                            || x.text.eq_ignore_ascii_case("likerec")
-                    });
+                    // A one-statement `dcl-ds x likeds(y);` or
+                    // `dcl-pr p extpgm('X') end-pr;` opens no block.
+                    let end = next_semi[i];
+                    in_block = closers[end] == closers[i];
                 }
                 "end-ds" | "end-pi" | "end-pr" | "dcl-proc" | "end-proc" => in_block = false,
                 _ => out[i] = !in_block && !is_assigned(t, i),

@@ -400,3 +400,32 @@ fn rpg_keyword_escapes() {
     );
     assert!(RpgExtractor.version().starts_with("rpg-scan-2+kw1+tok"));
 }
+
+/// A declaration closed in its own statement (`... end-ds;`) opens no
+/// block, so later opcodes are still keywords.
+#[test]
+fn one_statement_declarations_open_no_block() {
+    for decl in [
+        "dcl-ds d extname('F') end-ds;",
+        "dcl-pr prog extpgm('X') end-pr;",
+        "dcl-pi *n end-pi;",
+    ] {
+        let src = format!("**FREE\n{decl}\nread f;\n");
+        let toks = RpgExtractor.extract(&src).tokens;
+        assert_eq!(classes_of(&toks, "read"), [TokenClass::Keyword], "{decl}");
+    }
+}
+
+/// Many declarations and no `;` at all: the scan stays linear.
+#[test]
+fn many_unterminated_declarations_finish_quickly() {
+    let src = format!("**FREE\n{}", "dcl-ds x\n".repeat(50_000));
+    let start = std::time::Instant::now();
+    let toks = RpgExtractor.extract(&src).tokens;
+    assert!(toks.len() >= 100_000);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}
