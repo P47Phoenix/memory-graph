@@ -300,6 +300,113 @@ fn laggard_catches_up_by_install_snapshot() {
     run_differential(&replica(&tb, laggard), &replica(&tb, leader));
 }
 
+/// #151, a cluster upgrade: the leader's current snapshot predates the
+/// upgrade (an older, upgradable store format in its file and sidecar). A
+/// lagging follower installs it and upgrades it in place; after the leader
+/// restarts it replaces the old snapshot with a fresh one.
+#[test]
+fn laggard_installs_a_pre_upgrade_snapshot_and_the_leader_rebuilds_it_on_restart() {
+    let mut tb = ClusterTestbed::with_config(3, exts(), |_, c| c.raft = Some(snappy()));
+    tb.form();
+    let leader = tb.leader();
+    let laggard = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    let c = tb.client(leader);
+    index_files(&c, "o", "r", &[small_file(0)]);
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let behind = tb
+        .node(laggard)
+        .raft()
+        .unwrap()
+        .metrics()
+        .last_log_index
+        .unwrap();
+    tb.node_mut(laggard).stop();
+    for i in 1..20 {
+        c.index_bytes("o", "r", &small_file(i).0, &small_file(i).1, None)
+            .unwrap();
+    }
+    let raft = tb.node(leader).raft().unwrap().raft.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        raft.wait(Some(CLUSTER_WAIT))
+            .metrics(
+                |m| m.purged.is_some_and(|p| p.index > behind),
+                "the leader purged past the laggard",
+            )
+            .await
+            .unwrap()
+    });
+    // Age the leader's current snapshot (nothing streams it: the laggard
+    // is down and the other follower is current).
+    let old = *graph_store::UPGRADABLE_SCHEMA_VERSIONS.last().unwrap();
+    let snaps = tb.data_dir(leader).join("snapshots");
+    let current = || {
+        let mut metas: Vec<_> = std::fs::read_dir(&snaps)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "meta")
+                    && p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("snap-")
+            })
+            .collect();
+        assert_eq!(metas.len(), 1, "{metas:?}");
+        let data = metas.pop().unwrap().with_extension("redb");
+        let side = graph_server::raft::snapshot_dir::read_sidecar(&data).unwrap();
+        (side, data)
+    };
+    let (before, data) = current();
+    graph_server::testing::age_snapshot(&data, Some(old), None).unwrap();
+    assert_eq!(graph_store::detect_format(&data).unwrap(), Some(old));
+    tb.node_mut(laggard).restart();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    assert!(
+        tb.node(laggard).raft().unwrap().snapshots_installed() >= 1,
+        "the laggard caught up through InstallSnapshot"
+    );
+    // The leader still has only the aged pair: that is what it sent.
+    let (sent, _) = current();
+    assert_eq!(
+        (sent.index, sent.store_format_version),
+        (before.index, old),
+        "the leader's snapshot was replaced before it was sent"
+    );
+    assert_eq!(tb.client(laggard).count_nodes(NodeKind::File).unwrap(), 20);
+    assert_eq!(summary(&tb.client(laggard)), summary(&tb.client(leader)));
+    // The laggard's own pair (the installed one) is in this build's format.
+    let lag_snaps = tb.data_dir(laggard).join("snapshots");
+    let lag_side = std::fs::read_dir(&lag_snaps)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.extension().is_some_and(|x| x == "redb")
+                && p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("snap-")
+        })
+        .map(|p| graph_server::raft::snapshot_dir::read_sidecar(&p).unwrap())
+        .unwrap();
+    assert_eq!(lag_side.store_format_version, graph_store::SCHEMA_VERSION);
+    // A restart of the old leader replaces its aged snapshot.
+    tb.node_mut(leader).stop();
+    tb.node_mut(leader).restart();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let (fresh, data) = current();
+    assert_eq!(fresh.store_format_version, graph_store::SCHEMA_VERSION);
+    assert!(fresh.index >= before.index);
+    assert_eq!(
+        graph_store::detect_format(&data).unwrap(),
+        Some(graph_store::SCHEMA_VERSION)
+    );
+    run_differential(&replica(&tb, laggard), &replica(&tb, leader));
+}
+
 #[test]
 fn restart_with_persisted_state() {
     let mut tb = ClusterTestbed::new(3, exts());
@@ -749,13 +856,28 @@ fn install_snapshot_refuses_other_extractors_hash() {
         .unwrap_err()
     };
     let sha_of_123 = "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81";
+    let upgradable = *graph_store::UPGRADABLE_SCHEMA_VERSIONS.last().unwrap();
+    let too_old = *graph_store::UPGRADABLE_SCHEMA_VERSIONS
+        .iter()
+        .min()
+        .unwrap()
+        - 1;
     for (hash, format) in [
         ("another-extractor-set", graph_store::SCHEMA_VERSION),
+        ("another-extractor-set", upgradable),
         (me.extractors_hash.as_str(), graph_store::SCHEMA_VERSION + 1),
+        (me.extractors_hash.as_str(), too_old),
     ] {
         let st = send(vec![header(hash, format, 3, sha_of_123), chunk.clone()]);
         assert_eq!(st.code(), tonic::Code::FailedPrecondition, "{st:?}");
     }
+    // #151: an older format this binary upgrades passes the version checks
+    // (here it then fails on its digest, so nothing is installed).
+    let st = send(vec![
+        header(&me.extractors_hash, upgradable, 3, &"0".repeat(64)),
+        chunk.clone(),
+    ]);
+    assert_eq!(st.code(), tonic::Code::DataLoss, "{st:?}");
     // QA 3: matching hash and format, but the bytes are not what the
     // header says: DATA_LOSS for a wrong digest, INVALID_ARGUMENT for a
     // stream longer than its declared size; nothing is left behind.

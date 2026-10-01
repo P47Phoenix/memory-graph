@@ -704,6 +704,97 @@ mod tests {
         assert_eq!(snaps.current().unwrap().0.index, 5);
     }
 
+    /// #151: a current snapshot made by another build (an older store
+    /// format, or another extractor version set hash) is rebuilt at start,
+    /// even at the same index (a build never reuses it); a current one is
+    /// left alone, and so is an outdated one the store is behind.
+    #[test]
+    fn an_outdated_snapshot_is_rebuilt_at_start() {
+        use crate::raft::node::repair_outdated_snapshot;
+        use crate::testing::age_snapshot;
+        let old = *graph_store::UPGRADABLE_SCHEMA_VERSIONS.last().unwrap();
+        for (format, hash) in [
+            (Some(old), None),
+            (None, Some("other")),
+            (Some(old), Some("x")),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let (slot, snaps) = with_snapshot_at_1(d.path());
+            assert!(!repair_outdated_snapshot(&slot, &snaps).unwrap());
+            let (_, path) = snaps.current().unwrap();
+            age_snapshot(&path, format, hash).unwrap();
+            let (side, _) = snaps.current().unwrap();
+            assert!(snaps.is_outdated(&side), "{format:?} {hash:?}");
+            let before = snaps.built();
+            assert!(repair_outdated_snapshot(&slot, &snaps).unwrap());
+            assert_eq!(snaps.built(), before + 1);
+            let (side, path) = snaps.current().unwrap();
+            assert_eq!(side.index, 1, "rebuilt at the store's applied index");
+            assert_eq!(side.store_format_version, graph_store::SCHEMA_VERSION);
+            assert_eq!(side.extractors_hash, "h");
+            assert_eq!(
+                graph_store::detect_format(&path).unwrap(),
+                Some(graph_store::SCHEMA_VERSION)
+            );
+            assert!(!repair_outdated_snapshot(&slot, &snaps).unwrap());
+        }
+        // A store behind its outdated snapshot (not produced by any repair)
+        // is left for the policy rather than rebuilt at a lower index.
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        StoreStateMachine::apply_all(&slot, vec![blank(3)], NO_FP, &Default::default(), None)
+            .unwrap();
+        snaps.build(&slot).unwrap();
+        let (_, path) = snaps.current().unwrap();
+        age_snapshot(&path, None, Some("other")).unwrap();
+        std::fs::create_dir_all(d.path().join("behind")).unwrap();
+        let fresh = sm_at(&d.path().join("behind")).0;
+        StoreStateMachine::apply_all(&fresh, vec![blank(2)], NO_FP, &Default::default(), None)
+            .unwrap();
+        assert!(!repair_outdated_snapshot(&fresh, &snaps).unwrap());
+        assert_eq!(snaps.current().unwrap().0.index, 3);
+    }
+
+    /// #151: a received snapshot in an older, upgradable store format is
+    /// installed; the store and the promoted pair are in this build's format.
+    #[test]
+    fn an_upgradable_older_format_snapshot_installs_and_upgrades() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let old = *graph_store::UPGRADABLE_SCHEMA_VERSIONS.last().unwrap();
+        // Build a pair at 5 elsewhere and age it: the leader's file.
+        let src = tempfile::tempdir().unwrap();
+        let (lslot, lsnaps) = with_snapshot_at_1(src.path());
+        StoreStateMachine::apply_all(&lslot, vec![blank(5)], NO_FP, &Default::default(), None)
+            .unwrap();
+        lsnaps.build(&lslot).unwrap();
+        let (_, lpath) = lsnaps.current().unwrap();
+        drop(lslot);
+        crate::testing::age_snapshot(&lpath, Some(old), None).unwrap();
+        assert_eq!(graph_store::detect_format(&lpath).unwrap(), Some(old));
+        let incoming = snaps.incoming_path();
+        std::fs::copy(&lpath, &incoming).unwrap();
+        snaps
+            .install_with(
+                slot.path(),
+                &meta_at(5),
+                &SnapshotFile { path: incoming },
+                |staged| slot.install_snapshot(staged),
+            )
+            .unwrap();
+        assert_eq!(
+            slot.with_store(|s| s.raft_marker()).unwrap().unwrap().index,
+            5
+        );
+        let (side, path) = snaps.current().unwrap();
+        assert_eq!(side.index, 5);
+        assert_eq!(side.store_format_version, graph_store::SCHEMA_VERSION);
+        assert_eq!(
+            graph_store::detect_format(&path).unwrap(),
+            Some(graph_store::SCHEMA_VERSION)
+        );
+    }
+
     #[test]
     fn a_successful_install_promotes_the_file_then_its_meta() {
         let d = tempfile::tempdir().unwrap();

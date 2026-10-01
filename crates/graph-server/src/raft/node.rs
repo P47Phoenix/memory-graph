@@ -360,9 +360,12 @@ impl RaftNode {
                 Arc::clone(&p.snapshots),
                 log_store.clone(),
             );
-            tokio::task::spawn_blocking(move || repair_stale_snapshot(&slot, &snaps, &log))
-                .await
-                .map_err(fatal)??;
+            tokio::task::spawn_blocking(move || {
+                repair_stale_snapshot(&slot, &snaps, &log)?;
+                repair_outdated_snapshot(&slot, &snaps)
+            })
+            .await
+            .map_err(fatal)??;
         }
         let sm = StoreStateMachine::new(Arc::clone(&p.slot), Arc::clone(&p.snapshots))
             .with_failpoints(p.failpoints)
@@ -937,6 +940,42 @@ pub fn repair_stale_snapshot(
         took_ms = started.elapsed().as_millis() as u64,
         "built a snapshot of the store at start-up"
     );
+    Ok(true)
+}
+
+/// Start-up replacement of a current snapshot made by another build (#151):
+/// one in an older store format (taken before this binary's upgrade) or
+/// with another extractor version set hash. Its sidecar is what a leader
+/// sends in an `InstallSnapshot` header, and a follower refuses another
+/// hash (D5), so a lagging follower would wait for the log policy's next
+/// build. A snapshot of the store (already upgraded by its open) is built
+/// now instead, at the store's applied index. A store behind its snapshot
+/// (which the interrupted-install repair above does not produce) is left
+/// alone. Returns whether it built one.
+pub fn repair_outdated_snapshot(slot: &StoreSlot, snaps: &SnapshotDir) -> Result<bool, StoreError> {
+    let Some((side, _)) = snaps.current() else {
+        return Ok(false);
+    };
+    if !snaps.is_outdated(&side) {
+        return Ok(false);
+    }
+    let marker = slot.with_store(|s| s.raft_marker())?.map_or(0, |m| m.index);
+    if marker < side.index {
+        tracing::warn!(
+            marker,
+            snapshot = side.index,
+            "the current snapshot was made by another build but the store is behind it; \
+             leaving it for the snapshot policy"
+        );
+        return Ok(false);
+    }
+    tracing::info!(
+        snapshot = side.index,
+        format = side.store_format_version,
+        extractors_hash = %side.extractors_hash,
+        "the current snapshot was made by another build; building a fresh one"
+    );
+    snaps.build(slot)?;
     Ok(true)
 }
 

@@ -211,6 +211,15 @@ impl SnapshotDir {
         self.pairs().into_iter().next()
     }
 
+    /// Whether a pair was made by another build: an older store format (a
+    /// snapshot from before an upgrade) or another extractor version set.
+    /// Such a pair is never reused by a build, and is replaced at start-up
+    /// (`node::repair_outdated_snapshot`) so no follower is sent it (#151).
+    pub fn is_outdated(&self, side: &SnapshotSidecar) -> bool {
+        side.store_format_version != graph_store::SCHEMA_VERSION
+            || side.extractors_hash != self.extractors_hash
+    }
+
     pub fn current_snapshot(&self) -> Option<Snapshot<TypeConfig>> {
         self.current().map(|(side, path)| Snapshot {
             meta: side.meta(),
@@ -295,7 +304,7 @@ impl SnapshotDir {
             super::state_machine::StoreStateMachine::read_applied(&copy)?
         };
         if let Some((side, path)) = self.current() {
-            if side.last_log_id == last && side.last_log_id.is_some() {
+            if side.last_log_id == last && side.last_log_id.is_some() && !self.is_outdated(&side) {
                 let _ = std::fs::remove_file(&tmp);
                 return Ok(Snapshot {
                     meta: side.meta(),

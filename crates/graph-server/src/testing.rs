@@ -15,6 +15,40 @@ pub mod mcp_http;
 pub use cluster::{ClusterTestbed, TestNode, CLUSTER_WAIT, TEST_RAFT};
 pub use fake_s3::{FakeS3, Faults};
 
+/// Make the snapshot pair at `data` (a `snap-*.redb` with its `.meta`)
+/// look like one an older build made (#151): stamp the store file's schema
+/// version `format` (when given, an upgradable older one) and record it,
+/// the new size and digest, and `extractors_hash` (when given) in the
+/// sidecar. The file must not be open.
+pub fn age_snapshot(
+    data: &Path,
+    format: Option<u64>,
+    extractors_hash: Option<&str>,
+) -> Result<(), StoreError> {
+    use crate::raft::snapshot_dir::{meta_path_of, read_sidecar, sha256_file};
+    let st = |e: &dyn std::fmt::Display| StoreError::Storage(e.to_string());
+    let mut side = read_sidecar(data)?;
+    if let Some(v) = format {
+        const META: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
+        let db = redb::Database::open(data).map_err(|e| st(&e))?;
+        let wt = db.begin_write().map_err(|e| st(&e))?;
+        {
+            let mut t = wt.open_table(META).map_err(|e| st(&e))?;
+            t.insert("schema_version", v).map_err(|e| st(&e))?;
+        }
+        wt.commit().map_err(|e| st(&e))?;
+        side.store_format_version = v;
+    }
+    if let Some(h) = extractors_hash {
+        side.extractors_hash = h.to_string();
+    }
+    let (sha256, size) = sha256_file(data)?;
+    side.sha256 = sha256;
+    side.size = size;
+    let json = serde_json::to_string_pretty(&side).map_err(|e| st(&e))?;
+    std::fs::write(meta_path_of(data), json).map_err(|e| st(&e))
+}
+
 pub struct TestServer {
     db: PathBuf,
     extractors: Vec<Arc<dyn Extractor>>,
