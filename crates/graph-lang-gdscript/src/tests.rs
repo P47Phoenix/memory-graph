@@ -238,3 +238,71 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword`; properties and built-in
+/// constants stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "class_name Foo extends Node\nfunc f(x) -> void:\n\tif x is int and not null:\n\t\treturn self.class\n\tvar y = PI\n";
+    let toks = GdscriptExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    for kw in [
+        "class_name",
+        "extends",
+        "func",
+        "void",
+        "if",
+        "is",
+        "and",
+        "not",
+        "null",
+        "return",
+        "self",
+        "var",
+    ] {
+        assert_eq!(class(kw), [TokenClass::Keyword], "{kw}");
+    }
+    assert_eq!(class("class"), [TokenClass::Identifier]);
+    assert_eq!(class("PI"), [TokenClass::Identifier]);
+    assert_eq!(class("int"), [TokenClass::Identifier]);
+    assert!(GdscriptExtractor
+        .version()
+        .starts_with("gdscript-scan-2+kw1+tok"));
+}
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// Every listed word, bare, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        let toks = GdscriptExtractor.extract(kw).tokens;
+        assert_eq!(classes_of(&toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+}
+
+/// Node paths (`$match`) and annotations (`@static`) are names; `preload`
+/// is a built-in function.
+#[test]
+fn gdscript_dollar_and_at_escapes() {
+    let toks = GdscriptExtractor
+        .extract("var a = $match\n@static\nvar b = preload(\"x\")\n")
+        .tokens;
+    assert_eq!(classes_of(&toks, "match"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "static"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "preload"), [TokenClass::Identifier]);
+    assert_eq!(
+        classes_of(&toks, "var"),
+        [TokenClass::Keyword, TokenClass::Keyword]
+    );
+}

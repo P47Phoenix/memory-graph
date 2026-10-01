@@ -234,3 +234,63 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword` in any case; qualified parts,
+/// variables, quoted names and common column words stay as they were.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "select t.select, [from], name from T where x is not null and @from = 1;\nCREATE TABLE Foo (id int);\n";
+    let toks = SqlExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        class("select"),
+        [TokenClass::Keyword, TokenClass::Identifier]
+    );
+    assert_eq!(class("from"), [TokenClass::Keyword, TokenClass::Identifier]);
+    for kw in ["where", "is", "not", "null", "and", "CREATE", "TABLE"] {
+        assert_eq!(class(kw), [TokenClass::Keyword], "{kw}");
+    }
+    assert_eq!(class("[from]"), [TokenClass::Identifier], "quoted name");
+    assert_eq!(class("name"), [TokenClass::Identifier]);
+    assert_eq!(class("Foo"), [TokenClass::Identifier]);
+    assert!(SqlExtractor.version().starts_with("sql-scan-2+kw1+tok"));
+}
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// Every listed word, bare, in upper and lower case, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        for w in [kw.to_string(), kw.to_lowercase()] {
+            let toks = SqlExtractor.extract(&w).tokens;
+            assert_eq!(classes_of(&toks, &w), [TokenClass::Keyword], "{w}");
+        }
+    }
+}
+
+/// Quoted names and the `:x` / `$x` escapes; dropped dialect words.
+#[test]
+fn sql_keyword_escapes() {
+    let toks = SqlExtractor
+        .extract("select \"select\", :from, $if, limit, desc")
+        .tokens;
+    assert_eq!(classes_of(&toks, "select"), [TokenClass::Keyword]);
+    assert!(classes_of(&toks, "\"select\"")
+        .iter()
+        .all(|c| *c != TokenClass::Keyword));
+    assert_eq!(classes_of(&toks, "from"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "if"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "limit"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "desc"), [TokenClass::Identifier]);
+}
