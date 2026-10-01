@@ -24,9 +24,11 @@
 //!
 //! `InstallSnapshot` writes the streamed chunks to a temp file under the
 //! snapshots directory, checks size and SHA-256 against the header, refuses
-//! another store format or extractor version set hash with
-//! `FAILED_PRECONDITION` (a replica built with other extractors would not
-//! answer queries identically, D5), and only then hands the file to
+//! another extractor version set hash, or a store format that is neither
+//! this binary's nor one it upgrades on open, with `FAILED_PRECONDITION` (a
+//! replica built with other extractors would not answer queries
+//! identically, D5; an upgradable older format is upgraded in place when
+//! the installed store opens), and only then hands the file to
 //! openraft (`Raft::install_full_snapshot`), whose state machine swaps the
 //! store under the slot's write lock.
 use crate::disk::DiskGuard;
@@ -53,6 +55,32 @@ pub struct RaftService {
     /// Where leader contact and the leader's committed index are recorded:
     /// read staleness (D8) and readiness (D10) both judge by it.
     pub obs: Arc<crate::observe::Observability>,
+}
+
+/// The version checks of an `InstallSnapshot` header against this node.
+/// The store format must be this binary's or one it upgrades on open
+/// (`graph_store::UPGRADABLE_SCHEMA_VERSIONS`, as `--restore` accepts): a
+/// leader not yet restarted on a new build, or one whose snapshot predates
+/// its upgrade, sends the older format, and the installed store is upgraded
+/// in place when it opens (#151). The extractor version set hash must match
+/// exactly (D5).
+pub fn check_snapshot_header(format: u64, hash: &str, local_hash: &str) -> Result<(), Status> {
+    if format != graph_store::SCHEMA_VERSION
+        && !graph_store::UPGRADABLE_SCHEMA_VERSIONS.contains(&format)
+    {
+        return Err(Status::failed_precondition(format!(
+            "snapshot store format {format} differs from this node's {} and is not one it \
+             upgrades",
+            graph_store::SCHEMA_VERSION
+        )));
+    }
+    if hash != local_hash {
+        return Err(Status::failed_precondition(format!(
+            "snapshot extractor version set hash {hash} differs from this node's {local_hash}: \
+             a replica must extract identically (ADR 0004 D5)"
+        )));
+    }
+    Ok(())
 }
 
 fn raft_status<E: std::fmt::Display>(e: RaftError<u64, E>) -> Status {
@@ -140,21 +168,11 @@ impl pb::raft_server::Raft for RaftService {
             Some(Err(e)) => return Err(e),
             None => return Err(bad("empty InstallSnapshot stream")),
         };
-        if header.store_format_version != graph_store::SCHEMA_VERSION {
-            return Err(Status::failed_precondition(format!(
-                "snapshot store format {} differs from this node's {}",
-                header.store_format_version,
-                graph_store::SCHEMA_VERSION
-            )));
-        }
-        if header.extractors_hash != self.snapshots.extractors_hash() {
-            return Err(Status::failed_precondition(format!(
-                "snapshot extractor version set hash {} differs from this node's {}: \
-                 a replica must extract identically (ADR 0004 D5)",
-                header.extractors_hash,
-                self.snapshots.extractors_hash()
-            )));
-        }
+        check_snapshot_header(
+            header.store_format_version,
+            &header.extractors_hash,
+            self.snapshots.extractors_hash(),
+        )?;
         // The received file plus the staged copy the swap renames into
         // place (the old store goes after the swap).
         self.disk
@@ -217,5 +235,32 @@ impl pb::raft_server::Raft for RaftService {
         Ok(Response::new(pb::InstallSnapshotResponse {
             vote: Some(wire::vote_to_pb(&resp.vote)),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_snapshot_header;
+    use graph_store::{SCHEMA_VERSION, UPGRADABLE_SCHEMA_VERSIONS};
+    use tonic::Code;
+
+    /// #151: the accept/refuse matrix of an `InstallSnapshot` header.
+    #[test]
+    fn snapshot_header_accepts_current_and_upgradable_formats_with_the_same_hash() {
+        assert!(check_snapshot_header(SCHEMA_VERSION, "h", "h").is_ok());
+        for &old in UPGRADABLE_SCHEMA_VERSIONS {
+            assert!(check_snapshot_header(old, "h", "h").is_ok(), "v{old}");
+            let e = check_snapshot_header(old, "other", "h").unwrap_err();
+            assert_eq!(e.code(), Code::FailedPrecondition, "v{old}: {e:?}");
+            assert!(e.message().contains("extractor"), "{e:?}");
+        }
+        let oldest = *UPGRADABLE_SCHEMA_VERSIONS.iter().min().unwrap();
+        for bad in [SCHEMA_VERSION + 1, oldest - 1, 0] {
+            let e = check_snapshot_header(bad, "h", "h").unwrap_err();
+            assert_eq!(e.code(), Code::FailedPrecondition, "v{bad}: {e:?}");
+            assert!(e.message().contains("store format"), "{e:?}");
+        }
+        let e = check_snapshot_header(SCHEMA_VERSION, "other", "h").unwrap_err();
+        assert_eq!(e.code(), Code::FailedPrecondition, "{e:?}");
     }
 }
