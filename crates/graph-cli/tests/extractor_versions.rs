@@ -18,10 +18,11 @@ fn bumped_extractor_versions_are_pinned() {
         ("scala", "scala-scan-1+kw1+tok"),
         ("haskell", "haskell-scan-1+kw1+tok"),
         ("fsharp", "fsharp-scan-1+kw1+tok"),
-        ("gdscript", "gdscript-scan-2+tok"),
-        ("r", "r-scan-2+tok"),
-        ("sql", "sql-scan-2+tok"),
-        ("shell", "shell-scan-2+tok"),
+        ("gdscript", "gdscript-scan-2+kw1+tok"),
+        ("r", "r-scan-2+kw1+tok"),
+        ("sql", "sql-scan-2+kw1+tok"),
+        ("shell", "shell-scan-2+kw1+tok"),
+        ("elixir", "elixir-scan-1+kw1+tok"),
         ("rpg", "rpg-scan-2+tok"),
     ] {
         let e = extractors

@@ -212,3 +212,69 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword`; atoms, keyword-list keys,
+/// fields and macros (`def`, `if`) stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    let src = "defmodule M do\n  def f(x) when x in [nil, true] do\n    if x, do: :end, else: m.end\n  end\nend\n";
+    let toks = ElixirExtractor.extract(src).tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(class("when"), [TokenClass::Keyword]);
+    assert_eq!(class("in"), [TokenClass::Keyword]);
+    assert_eq!(class("nil"), [TokenClass::Keyword]);
+    assert_eq!(class("true"), [TokenClass::Keyword]);
+    assert_eq!(
+        class("do"),
+        [
+            TokenClass::Keyword,
+            TokenClass::Keyword,
+            TokenClass::Identifier
+        ]
+    );
+    assert_eq!(class("else"), [TokenClass::Identifier]);
+    assert_eq!(
+        class("end"),
+        [
+            TokenClass::Identifier,
+            TokenClass::Identifier,
+            TokenClass::Keyword,
+            TokenClass::Keyword
+        ]
+    );
+    assert_eq!(class("def"), [TokenClass::Identifier]);
+    assert_eq!(class("if"), [TokenClass::Identifier]);
+    assert!(ElixirExtractor
+        .version()
+        .starts_with("elixir-scan-1+kw1+tok"));
+}
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// Every listed word, bare, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        let toks = ElixirExtractor.extract(kw).tokens;
+        assert_eq!(classes_of(&toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+}
+
+/// `do::` is no keyword-list key, so `do` stays a keyword; `do:` is a key.
+#[test]
+fn elixir_double_colon_is_not_a_key() {
+    let toks = ElixirExtractor.extract("x do::y").tokens;
+    assert_eq!(classes_of(&toks, "do"), [TokenClass::Keyword]);
+    let toks = ElixirExtractor.extract("x do: y").tokens;
+    assert_eq!(classes_of(&toks, "do"), [TokenClass::Identifier]);
+}

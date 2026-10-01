@@ -25,11 +25,35 @@
 //! Known limits: a body expression continued on the next line by a trailing
 //! operator is cut at the line end; `setMethod` names the generic, not the
 //! class; `assign("name", function...)` and S4 `setValidity` are not symbols.
-use graph_core::scan::{code_close_table, span_between};
+use graph_core::scan::{code_close_table, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct RExtractor;
+
+/// R's reserved words (`?Reserved`). `T`, `F` and `library` are ordinary
+/// names; a backtick name (`` `if` ``) is a literal and never matches.
+const KEYWORDS: &[&str] = &[
+    "if",
+    "else",
+    "repeat",
+    "while",
+    "function",
+    "for",
+    "in",
+    "next",
+    "break",
+    "TRUE",
+    "FALSE",
+    "NULL",
+    "Inf",
+    "NaN",
+    "NA",
+    "NA_integer_",
+    "NA_real_",
+    "NA_complex_",
+    "NA_character_",
+];
 
 /// Tokenizer dialect used for R.
 pub const R_TOKENIZER: TokenizerOptions = TokenizerOptions::R;
@@ -44,13 +68,15 @@ impl Extractor for RExtractor {
     }
 
     fn version(&self) -> String {
-        format!("r-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("r-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
         if !is_document(source) {
-            let tokens = tokenize_with(source, R_TOKENIZER);
+            let mut tokens = tokenize_with(source, R_TOKENIZER);
             let symbols = symbols(&tokens);
+            mark_keywords(&mut tokens, KEYWORDS, is_member);
             return Extraction {
                 symbols,
                 tokens,
@@ -72,6 +98,8 @@ impl Extractor for RExtractor {
             }
             if seg.code {
                 syms.extend(symbols(&part));
+                // Prose stays plain text: only code chunks have keywords.
+                mark_keywords(&mut part, KEYWORDS, is_member);
             }
             tokens.extend(part);
         }
@@ -461,6 +489,11 @@ impl Scanner<'_> {
         }
         None
     }
+}
+
+/// A word right after `$` or `@` (`x$if`) is a member name, not a keyword.
+fn is_member(t: &[TokenDecl], i: usize) -> bool {
+    i > 0 && matches!(t[i - 1].text.as_str(), "$" | "@") && t[i - 1].span.end == t[i].span.start
 }
 
 #[cfg(test)]

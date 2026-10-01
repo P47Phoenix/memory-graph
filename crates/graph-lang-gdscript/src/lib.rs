@@ -27,11 +27,53 @@
 //! Type (it has no name of its own), so its functions and variables have
 //! no class container; anonymous `enum { ... }` is not a symbol; a
 //! statement after `;` on a block header line belongs to that block.
-use graph_core::scan::{code_close_table, code_index, indent_block, span_between};
+use graph_core::scan::{code_close_table, code_index, indent_block, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct GdscriptExtractor;
+
+/// GDScript 4 keywords, including the word operators and `true`/`false`/
+/// `null`. Built-in constants (`PI`, `INF`, ...), types and built-in functions
+/// (`preload`) stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "and",
+    "as",
+    "assert",
+    "await",
+    "break",
+    "breakpoint",
+    "class",
+    "class_name",
+    "const",
+    "continue",
+    "elif",
+    "else",
+    "enum",
+    "extends",
+    "false",
+    "for",
+    "func",
+    "if",
+    "in",
+    "is",
+    "match",
+    "not",
+    "null",
+    "or",
+    "pass",
+    "return",
+    "self",
+    "signal",
+    "static",
+    "super",
+    "true",
+    "var",
+    "void",
+    "when",
+    "while",
+    "yield",
+];
 
 /// Tokenizer dialect used for GDScript.
 pub const GDSCRIPT_TOKENIZER: TokenizerOptions = TokenizerOptions::GDSCRIPT;
@@ -46,12 +88,20 @@ impl Extractor for GdscriptExtractor {
     }
 
     fn version(&self) -> String {
-        format!("gdscript-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("gdscript-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, GDSCRIPT_TOKENIZER);
+        let mut tokens = tokenize_with(source, GDSCRIPT_TOKENIZER);
         let symbols = symbols(&tokens);
+        // After the symbol scan. A property after `.` (`x.class`), a node
+        // path after `$` (`$match`) or an annotation is a plain name.
+        mark_keywords(&mut tokens, KEYWORDS, |t, i| {
+            i > 0
+                && matches!(t[i - 1].text.as_str(), "." | "$" | "@")
+                && t[i - 1].span.end == t[i].span.start
+        });
         Extraction {
             symbols,
             tokens,

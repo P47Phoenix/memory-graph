@@ -35,6 +35,95 @@ use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, Toke
 
 pub struct SqlExtractor;
 
+/// Reserved words common to ANSI SQL and the major dialects, upper case;
+/// matched case-insensitively. Words that are routinely column names
+/// (`name`, `key`, `value`, `date`, `type`, `index`, `limit`,
+/// `offset`, `desc`, ...) are left out, and quoted names (`"select"`,
+/// `[select]`) are whole tokens and never match.
+const KEYWORDS: &[&str] = &[
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "ANY",
+    "AS",
+    "ASC",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLUMN",
+    "COMMIT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "DECLARE",
+    "DEFAULT",
+    "DELETE",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "END",
+    "EXCEPT",
+    "EXEC",
+    "EXECUTE",
+    "EXISTS",
+    "FALSE",
+    "FETCH",
+    "FOR",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "FUNCTION",
+    "GRANT",
+    "GROUP",
+    "HAVING",
+    "IF",
+    "IN",
+    "INNER",
+    "INSERT",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "JOIN",
+    "LEFT",
+    "LIKE",
+    "NOT",
+    "NULL",
+    "OF",
+    "ON",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "PRIMARY",
+    "PROCEDURE",
+    "REFERENCES",
+    "RETURN",
+    "RETURNS",
+    "REVOKE",
+    "RIGHT",
+    "ROLLBACK",
+    "SELECT",
+    "SET",
+    "TABLE",
+    "THEN",
+    "TRIGGER",
+    "TRUE",
+    "TRUNCATE",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VALUES",
+    "VIEW",
+    "WHEN",
+    "WHERE",
+    "WHILE",
+    "WITH",
+];
+
 /// Tokenizer dialect used for SQL.
 pub const SQL_TOKENIZER: TokenizerOptions = TokenizerOptions::SQL;
 
@@ -48,12 +137,15 @@ impl Extractor for SqlExtractor {
     }
 
     fn version(&self) -> String {
-        format!("sql-scan-2+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("sql-scan-2+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let tokens = tokenize_with(source, SQL_TOKENIZER);
+        let mut tokens = tokenize_with(source, SQL_TOKENIZER);
         let symbols = symbols(source, &tokens);
+        // After the symbol scan, which reads identifiers as it always has.
+        mark_sql_keywords(&mut tokens);
         Extraction {
             symbols,
             tokens,
@@ -626,6 +718,25 @@ impl Scanner<'_> {
             c += 1;
         }
         hi - 1
+    }
+}
+
+/// `graph_core::scan::mark_keywords`, but case-insensitive (SQL keywords
+/// are). A qualified part (`t.select`), a variable or parameter (`@from`,
+/// `:limit`, `$if`) keeps its identifier class.
+fn mark_sql_keywords(t: &mut [TokenDecl]) {
+    for i in 0..t.len() {
+        if t[i].class != TokenClass::Identifier
+            || !KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(&t[i].text))
+        {
+            continue;
+        }
+        let escaped = i > 0
+            && matches!(t[i - 1].text.as_str(), "." | "@" | ":" | "$")
+            && t[i - 1].span.end == t[i].span.start;
+        if !escaped {
+            t[i].class = TokenClass::Keyword;
+        }
     }
 }
 
