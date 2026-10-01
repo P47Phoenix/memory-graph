@@ -128,6 +128,26 @@ pub fn mark_keywords(
     }
 }
 
+/// [`mark_keywords`], but the comparison ignores ASCII case (for languages
+/// such as SQL, COBOL and RPG whose reserved words are case-insensitive).
+/// `keywords` may be listed in any case.
+pub fn mark_keywords_ignore_case(
+    tokens: &mut [TokenDecl],
+    keywords: &[&str],
+    is_escaped: impl Fn(&[TokenDecl], usize) -> bool,
+) {
+    for i in 0..tokens.len() {
+        if tokens[i].class == TokenClass::Identifier
+            && keywords
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(&tokens[i].text))
+            && !is_escaped(tokens, i)
+        {
+            tokens[i].class = TokenClass::Keyword;
+        }
+    }
+}
+
 /// Indices of the tokens whose class is not in `skip`, in order. With
 /// `skip = &[TokenClass::Comment]` this is the code tokens an extractor walks.
 pub fn code_index(tokens: &[TokenDecl], skip: &[TokenClass]) -> Vec<usize> {
@@ -513,6 +533,19 @@ mod tests {
         assert_eq!(classes[3], TokenClass::Identifier, "escaped");
         assert_eq!(classes[4], TokenClass::Literal);
         assert_eq!(classes[5], TokenClass::Identifier, "case-sensitive");
+    }
+
+    #[test]
+    fn mark_keywords_ignore_case_matches_any_case_unless_escaped() {
+        let mut t = tokenize(r#"if x . IF "if" If iff"#);
+        mark_keywords_ignore_case(&mut t, &["If"], |t, i| i > 0 && t[i - 1].text == ".");
+        let classes: Vec<_> = t.iter().map(|t| t.class).collect();
+        assert_eq!(classes[0], TokenClass::Keyword);
+        assert_eq!(classes[1], TokenClass::Identifier);
+        assert_eq!(classes[3], TokenClass::Identifier, "escaped");
+        assert_eq!(classes[4], TokenClass::Literal);
+        assert_eq!(classes[5], TokenClass::Keyword, "case-insensitive");
+        assert_eq!(classes[6], TokenClass::Identifier, "whole word only");
     }
 
     #[test]

@@ -362,3 +362,77 @@ fn fd_ends_a_data_item_and_unnamed_01_is_skipped() {
         assert!(!names(&s).contains(&n), "{n}: {s:#?}");
     }
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// #143: every listed word, bare, in upper and lower case, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        for w in [kw.to_string(), kw.to_lowercase()] {
+            let src = format!(">>SOURCE FORMAT FREE\n{w}\n");
+            let toks = CobolExtractor.extract(&src).tokens;
+            assert_eq!(classes_of(&toks, &w), [TokenClass::Keyword], "{w}");
+        }
+    }
+}
+
+/// Keywords are classed in fixed format too; data names (even ones that
+/// contain a keyword, `END-OF-FILE`), literals and comments are not, and
+/// symbols are unchanged.
+#[test]
+fn keywords_in_a_fixed_format_program() {
+    let src = "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. HELLO.\n       PROCEDURE DIVISION.\n       MAIN-PARA.\n      * MOVE in a comment\n           MOVE 'IF' TO END-OF-FILE\n           STOP RUN.\n";
+    let ex = CobolExtractor.extract(src);
+    let toks = &ex.tokens;
+    for kw in [
+        "IDENTIFICATION",
+        "DIVISION",
+        "PROGRAM-ID",
+        "PROCEDURE",
+        "MOVE",
+        "TO",
+        "STOP",
+    ] {
+        assert!(
+            classes_of(toks, kw)
+                .iter()
+                .all(|c| *c == TokenClass::Keyword),
+            "{kw}"
+        );
+        assert!(!classes_of(toks, kw).is_empty(), "{kw}");
+    }
+    for name in ["HELLO", "MAIN-PARA", "END-OF-FILE", "RUN"] {
+        assert_eq!(classes_of(toks, name), [TokenClass::Identifier], "{name}");
+    }
+    let names: Vec<_> = ex.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"HELLO") && names.contains(&"MAIN-PARA"),
+        "{names:?}"
+    );
+    assert!(CobolExtractor.version().starts_with("cobol-scan-1+kw1+tok"));
+}
+
+/// A fixed sample of the list (so dropping a word from `KEYWORDS` fails).
+#[test]
+fn sample_keywords_are_listed_and_classed() {
+    for w in [
+        "END-IF",
+        "END-PERFORM",
+        "WORKING-STORAGE",
+        "PROGRAM-ID",
+        "PERFORM",
+        "MOVE",
+        "THRU",
+    ] {
+        let src = format!(">>SOURCE FORMAT FREE\n{w}\n");
+        let toks = CobolExtractor.extract(&src).tokens;
+        assert_eq!(classes_of(&toks, w), [TokenClass::Keyword], "{w}");
+    }
+    assert_eq!(KEYWORDS.len(), 89);
+}

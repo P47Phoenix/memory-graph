@@ -6,7 +6,9 @@
 fn bumped_extractor_versions_are_pinned() {
     let extractors = graph_cli::shipped_extractors();
     for (lang, prefix) in [
-        ("aspx", "aspx-scan-2+tok"),
+        ("aspx", "aspx-scan-2+kw1+tok"),
+        ("cobol", "cobol-scan-1+kw1+tok"),
+        ("asm", "asm-scan-1+kw1+tok"),
         ("typescript", "typescript-scan-2+kw1+tok"),
         ("python", "python-scan-2+kw1+tok"),
         ("csharp", "csharp-scan-1+kw1+tok"),
@@ -23,7 +25,7 @@ fn bumped_extractor_versions_are_pinned() {
         ("sql", "sql-scan-2+kw1+tok"),
         ("shell", "shell-scan-2+kw1+tok"),
         ("elixir", "elixir-scan-1+kw1+tok"),
-        ("rpg", "rpg-scan-2+tok"),
+        ("rpg", "rpg-scan-2+kw1+tok"),
     ] {
         let e = extractors
             .iter()

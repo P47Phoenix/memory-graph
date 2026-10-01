@@ -318,3 +318,114 @@ fn subroutine_stops_at_procedure_boundary() {
     let s = syms(src);
     assert_eq!(find(&s, "s").3, "begsr s;");
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// #143: every listed word, bare, in upper and lower case, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in DECL_KEYWORDS.iter().chain(OPCODES) {
+        for w in [kw.to_string(), kw.to_lowercase()] {
+            // First in its statement, also after another statement's `;`.
+            let src = format!("**FREE\n{w};\nx = 1; {w};\n");
+            let toks = RpgExtractor.extract(&src).tokens;
+            assert_eq!(
+                classes_of(&toks, &w),
+                [TokenClass::Keyword, TokenClass::Keyword],
+                "{w}"
+            );
+        }
+    }
+}
+
+/// Opcodes are not reserved: a variable, subfield or parameter named like
+/// one stays an identifier outside opcode position.
+#[test]
+fn opcode_named_names_stay_identifiers() {
+    let src = "**FREE\ndcl-s read ind;\nread = *on;\nif read and open;\n  x = 1;\nendif;\ndcl-ds rec;\n  open char(1);\n  update ind;\nend-ds;\ndcl-pr p;\n  write int(10);\nend-pr;\ndcl-ds r2 likeds(rec);\nread f;\n";
+    let toks = RpgExtractor.extract(src).tokens;
+    assert_eq!(
+        classes_of(&toks, "read"),
+        [
+            TokenClass::Identifier, // declared name
+            TokenClass::Identifier, // `read = *on;` is an assignment
+            TokenClass::Identifier, // `if read`
+            TokenClass::Keyword,    // `read f;` after a one-statement dcl-ds
+        ]
+    );
+    assert_eq!(
+        classes_of(&toks, "open"),
+        [TokenClass::Identifier, TokenClass::Identifier]
+    );
+    assert_eq!(classes_of(&toks, "update"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "write"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "endif"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "and"), [TokenClass::Keyword]);
+}
+
+/// A fixed C spec's operation field (columns 26-35) is opcode position;
+/// factor 1 is not.
+#[test]
+fn fixed_c_spec_opcode_column() {
+    let src = "     C     read          READ      FILE\n";
+    let toks = RpgExtractor.extract(src).tokens;
+    assert_eq!(classes_of(&toks, "READ"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "read"), [TokenClass::Identifier]);
+}
+
+/// Built-ins, special words, qualified subfields and declared names stay
+/// identifiers; symbols are unchanged.
+#[test]
+fn rpg_keyword_escapes() {
+    let src = "**FREE\ndcl-s read ind;\ndcl-proc Main;\n  if %open(f) and not *in99;\n    eval ds.update = 1;\n  endif;\nend-proc;\n";
+    let ex = RpgExtractor.extract(src);
+    let toks = &ex.tokens;
+    for kw in [
+        "dcl-s", "dcl-proc", "if", "and", "not", "eval", "endif", "end-proc",
+    ] {
+        assert_eq!(classes_of(toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+    assert_eq!(classes_of(toks, "read"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(toks, "open"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(toks, "update"), [TokenClass::Identifier]);
+    let names: Vec<_> = ex.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"read") && names.contains(&"Main"),
+        "{names:?}"
+    );
+    assert!(RpgExtractor.version().starts_with("rpg-scan-2+kw1+tok"));
+}
+
+/// A declaration closed in its own statement (`... end-ds;`) opens no
+/// block, so later opcodes are still keywords.
+#[test]
+fn one_statement_declarations_open_no_block() {
+    for decl in [
+        "dcl-ds d extname('F') end-ds;",
+        "dcl-pr prog extpgm('X') end-pr;",
+        "dcl-pi *n end-pi;",
+    ] {
+        let src = format!("**FREE\n{decl}\nread f;\n");
+        let toks = RpgExtractor.extract(&src).tokens;
+        assert_eq!(classes_of(&toks, "read"), [TokenClass::Keyword], "{decl}");
+    }
+}
+
+/// Many declarations and no `;` at all: the scan stays linear.
+#[test]
+fn many_unterminated_declarations_finish_quickly() {
+    let src = format!("**FREE\n{}", "dcl-ds x\n".repeat(50_000));
+    let start = std::time::Instant::now();
+    let toks = RpgExtractor.extract(&src).tokens;
+    assert!(toks.len() >= 100_000);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}

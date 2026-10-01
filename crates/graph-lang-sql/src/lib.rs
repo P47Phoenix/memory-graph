@@ -29,7 +29,7 @@
 //! reported as its own symbol; a dollar-quoted body is tokenized as SQL code,
 //! so an unbalanced `'` inside it can swallow what follows (a tokenizer
 //! limit); `ALTER` statements and T-SQL `#temp` names are not symbols.
-use graph_core::scan::{code_close_table, span_between};
+use graph_core::scan::{code_close_table, mark_keywords_ignore_case, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
@@ -721,23 +721,15 @@ impl Scanner<'_> {
     }
 }
 
-/// `graph_core::scan::mark_keywords`, but case-insensitive (SQL keywords
-/// are). A qualified part (`t.select`), a variable or parameter (`@from`,
-/// `:limit`, `$if`) keeps its identifier class.
+/// Case-insensitive keyword marking (SQL keywords are). A qualified part
+/// (`t.select`), a variable or parameter (`@from`, `:limit`, `$if`) keeps
+/// its identifier class.
 fn mark_sql_keywords(t: &mut [TokenDecl]) {
-    for i in 0..t.len() {
-        if t[i].class != TokenClass::Identifier
-            || !KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(&t[i].text))
-        {
-            continue;
-        }
-        let escaped = i > 0
+    mark_keywords_ignore_case(t, KEYWORDS, |t, i| {
+        i > 0
             && matches!(t[i - 1].text.as_str(), "." | "@" | ":" | "$")
-            && t[i - 1].span.end == t[i].span.start;
-        if !escaped {
-            t[i].class = TokenClass::Keyword;
-        }
-    }
+            && t[i - 1].span.end == t[i].span.start
+    });
 }
 
 #[cfg(test)]

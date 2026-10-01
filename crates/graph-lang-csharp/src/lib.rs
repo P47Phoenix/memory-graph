@@ -33,8 +33,9 @@ use std::collections::{HashMap, HashSet};
 
 /// C#'s reserved keywords. Contextual keywords (`var`, `async`, `await`,
 /// `get`, `set`, `record`, `where`, ...) are also valid identifiers and stay
-/// identifiers.
-const KEYWORDS: &[&str] = &[
+/// identifiers. Public for other extractors' tests; the list may grow (and
+/// any change needs this crate's and `graph-lang-aspx`'s versions bumped).
+pub const KEYWORDS: &[&str] = &[
     "abstract",
     "as",
     "base",
@@ -143,16 +144,27 @@ impl Extractor for CSharpExtractor {
         let mut tokens = tokenize_with(source, CSHARP_TOKENIZER);
         let symbols = symbols(&tokens);
         // After the symbol scan, which reads identifiers as it always has.
-        // `@class` is a verbatim identifier: `@` right before the word.
-        mark_keywords(&mut tokens, KEYWORDS, |t, i| {
-            i > 0 && t[i - 1].text == "@" && t[i - 1].span.end == t[i].span.start
-        });
+        mark_csharp_keywords(&mut tokens);
         Extraction {
             symbols,
             tokens,
             has_errors: false,
         }
     }
+}
+
+/// Relabels C#'s reserved words in `tokens` (as produced with
+/// [`CSHARP_TOKENIZER`]) as `keyword`. Exposed so other extractors (server
+/// code embedded in markup) class embedded C# the same way. Call it after
+/// any symbol scan, which reads identifiers.
+///
+/// `graph-lang-aspx` calls this on server script bodies: a change here
+/// changes ASPX tokens too, so it needs an aspx version bump as well.
+pub fn mark_csharp_keywords(tokens: &mut [TokenDecl]) {
+    // `@class` is a verbatim identifier: `@` right before the word.
+    mark_keywords(tokens, KEYWORDS, |t, i| {
+        i > 0 && t[i - 1].text == "@" && t[i - 1].span.end == t[i].span.start
+    });
 }
 
 /// Symbols in C# tokens (as produced with [`CSHARP_TOKENIZER`]). Exposed so
