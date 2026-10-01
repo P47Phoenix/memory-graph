@@ -417,6 +417,10 @@ pub struct V2Store {
     pub(crate) db: Database,
     registry: Registry,
     pub(crate) chunk_bytes: usize,
+    /// Test-only (#154): skip the open-batch marker writes, so a timing test
+    /// can separate the marker's cost from the raw per-chunk commit cost.
+    #[cfg(test)]
+    pub(crate) skip_open_batch_marker: bool,
     pub(crate) cache_bytes: Option<usize>,
     path: PathBuf,
     max_snapshot_age: Duration,
@@ -2535,6 +2539,8 @@ impl V2Store {
             db,
             registry: Registry::default(),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
+            #[cfg(test)]
+            skip_open_batch_marker: false,
             cache_bytes,
             path: path.to_path_buf(),
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
@@ -2945,6 +2951,8 @@ impl V2Store {
             max_snapshot_age,
             snapshot_tracker: _,
             marked_commit_hook,
+            #[cfg(test)]
+                skip_open_batch_marker: _,
         } = self;
         // Drop the old handle before renaming over its path (Windows will
         // not allow the rename while any `Database` still has it open).
@@ -3347,7 +3355,13 @@ impl V2Store {
             Self::stamp_marker(&wt, marker, membership)?;
         }
         let batch_id = Self::next_batch_id(&wt)?;
-        Self::mark_open_batch(&wt, batch_id, org, repo)?;
+        #[cfg(test)]
+        let skip_marker = self.skip_open_batch_marker;
+        #[cfg(not(test))]
+        let skip_marker = false;
+        if !skip_marker {
+            Self::mark_open_batch(&wt, batch_id, org, repo)?;
+        }
         let mut in_txn = 0usize;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -3382,14 +3396,18 @@ impl V2Store {
                 // re-stamp the marker in the new transaction; if it turns out
                 // to be the last, the clear below overwrites it in that same
                 // transaction before it ever commits.
-                Self::mark_open_batch(&wt, batch_id, org, repo)?;
+                if !skip_marker {
+                    Self::mark_open_batch(&wt, batch_id, org, repo)?;
+                }
                 in_txn = 0;
             }
         }
         // The batch completed: clear the marker in this final transaction,
         // atomically with (or, if the last data chunk just committed above,
         // immediately after) the last chunk's data.
-        Self::clear_open_batch(&wt)?;
+        if !skip_marker {
+            Self::clear_open_batch(&wt)?;
+        }
         if let Some((m, _)) = &marker {
             self.before_marked_commit(m)?;
         }

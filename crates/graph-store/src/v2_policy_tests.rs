@@ -496,11 +496,12 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
     // seconds for the whole `index_batch`.
     let d = tempfile::tempdir().unwrap();
     let mut n = 0usize;
-    let mut time_one = |chunk_bytes: usize| -> f64 {
+    let mut time_one = |chunk_bytes: usize, skip_marker: bool| -> f64 {
         n += 1;
         let mut s = V2Store::open(d.path().join(format!("v{n}.redb"))).unwrap();
         s.register(Box::new(graph_lang_rust::RustExtractor));
         s.set_chunk_bytes(chunk_bytes);
+        s.skip_open_batch_marker = skip_marker;
         let t = std::time::Instant::now();
         let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
         let secs = t.elapsed().as_secs_f64();
@@ -517,9 +518,17 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
     // this machine is right now. The best (smallest) round is kept, since
     // load only ever adds noise.
     let mut best = (f64::MAX, 0.0, 0.0);
-    for _ in 0..3 {
-        let u = time_one(usize::MAX);
-        let c = time_one(1);
+    for round in 0..3 {
+        let u = time_one(usize::MAX, false);
+        let c = time_one(1, false);
+        let c0 = time_one(1, true);
+        eprintln!(
+            "DIAG #154 round {round}: unchunked {:.1} ms, chunked+marker {:.1} ms, chunked \
+             no-marker {:.1} ms",
+            u * 1000.0,
+            c * 1000.0,
+            c0 * 1000.0
+        );
         let excess = (c - u).max(0.0) / u;
         if excess < best.0 {
             best = (excess, u, c);
