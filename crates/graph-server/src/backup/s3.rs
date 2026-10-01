@@ -53,8 +53,9 @@ pub const MAX_RESPONSE: u64 = 8 << 20;
 /// The guidance of an HTTPS refusal.
 const HTTPS_GUIDANCE: &str = "stage 1 of ADR 0006 speaks plain http:// only (no pure-Rust TLS \
      provider passes the build's gate yet, #104). Reach an HTTPS endpoint (AWS S3 itself) \
-     through a local TLS sidecar (stunnel, envoy) and point --backup-endpoint at it, e.g. \
-     http://127.0.0.1:8080, or back up to a file:// directory and `aws s3 sync` it";
+     through a local TLS sidecar (stunnel, envoy): keep the real name in --backup-endpoint, \
+     e.g. http://s3.eu-west-1.amazonaws.com, and add --backup-connect-to 127.0.0.1:8080 (the \
+     sidecar's address), or back up to a file:// directory and `aws s3 sync` it";
 
 /// A parsed `s3://bucket/prefix`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +193,35 @@ pub fn parse_endpoint(s: &str) -> Result<Endpoint, String> {
     Ok(Endpoint { host, port })
 }
 
+/// Parse `--backup-connect-to host:port` (`[v6]:port` for IPv6): the
+/// TCP address S3 traffic goes to instead of the endpoint's, while the
+/// endpoint's host still names the request (SigV4 and `Host`). A name is
+/// resolved once, here; the port is required and must not be 0.
+pub fn parse_connect_to(s: &str) -> Result<SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let bad = |why: &str| format!("--backup-connect-to `{s}`: {why}");
+    if s.contains("://") || s.contains(['/', '?', '#', '@']) {
+        return Err(bad("expected host:port (no scheme or path)"));
+    }
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| bad("expected host:port (the port is required)"))?;
+    if host.is_empty() || host == "[]" {
+        return Err(bad("no host"));
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(bad("an IPv6 address needs brackets, [addr]:port"));
+    }
+    port.parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| bad(&format!("`{port}` is not a port")))?;
+    s.to_socket_addrs()
+        .map_err(|e| bad(&format!("does not resolve: {e}")))?
+        .next()
+        .ok_or_else(|| bad("resolves to no address"))
+}
+
 /// Everything an [`S3Sink`] needs beyond the URL.
 #[derive(Clone)]
 pub struct S3Options {
@@ -214,8 +244,10 @@ pub struct S3Options {
     pub part_size: usize,
     /// [`DEFAULT_TIMEOUT`] (see there for what it bounds).
     pub timeout: Duration,
-    /// Tests: connect here whatever the host (a virtual-hosted name that
-    /// does not resolve), like curl's `--connect-to`.
+    /// `--backup-connect-to`: connect here whatever the host, like curl's
+    /// `--connect-to` (a TLS sidecar in front of AWS; tests: a
+    /// virtual-hosted name that does not resolve). The endpoint's host is
+    /// still what is signed and sent as `Host`.
     pub connect_to: Option<SocketAddr>,
 }
 
@@ -249,6 +281,7 @@ impl std::fmt::Debug for S3Options {
             .field("multipart_threshold", &self.multipart_threshold)
             .field("part_size", &self.part_size)
             .field("timeout", &self.timeout)
+            .field("connect_to", &self.connect_to)
             .finish()
     }
 }
@@ -1139,6 +1172,40 @@ impl BackupSink for S3Sink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connect_to_is_validated() {
+        assert_eq!(
+            super::parse_connect_to("127.0.0.1:9080").unwrap(),
+            "127.0.0.1:9080".parse().unwrap()
+        );
+        assert_eq!(
+            super::parse_connect_to("[::1]:9080").unwrap(),
+            "[::1]:9080".parse().unwrap()
+        );
+        assert_eq!(
+            super::parse_connect_to("localhost:9080").unwrap().port(),
+            9080
+        );
+        for (bad, why) in [
+            ("127.0.0.1", "port is required"),
+            ("127.0.0.1:0", "is not a port"),
+            ("127.0.0.1:x", "is not a port"),
+            ("127.0.0.1:70000", "is not a port"),
+            (":9080", "no host"),
+            ("[]:9080", "no host"),
+            ("::1:9080", "brackets"),
+            ("http://127.0.0.1:9080", "no scheme"),
+            ("127.0.0.1:9080/x", "no scheme"),
+            ("no-such-host.invalid:9080", "does not resolve"),
+        ] {
+            let e = super::parse_connect_to(bad).unwrap_err();
+            assert!(
+                e.contains("--backup-connect-to") && e.contains(why),
+                "{bad}: {e}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

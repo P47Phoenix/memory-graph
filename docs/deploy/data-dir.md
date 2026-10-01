@@ -91,13 +91,18 @@ the stored size is checked with a HEAD after each upload.
 
 - `--backup-endpoint http://host:port` is required: stage 1 speaks plain HTTP only, and an
   `https://` endpoint is refused. Works with MinIO, Ceph RGW, R2, B2 and Garage. For AWS S3
-  itself (HTTPS only), run a TLS sidecar (stunnel) reached under the real S3 host name, or back
+  itself (HTTPS only), run a TLS sidecar (stunnel) with `--backup-connect-to`, or back
   up to `file://` and `aws s3 sync` the directory: see
   [S3 in production](#s3-in-production-tls-lifecycle-and-iam). Native HTTPS waits on a pure-Rust TLS
   provider (#104).
 - `--backup-region` (default `us-east-1`) is the region requests are signed for.
 - Path-style addressing (`http://host/bucket/key`) is the default; `--backup-virtual-host`
   uses `http://bucket.host/key`.
+- `--backup-connect-to host:port` (like curl's `--connect-to`) opens every S3 connection to
+  that address instead of the `--backup-endpoint` host, while requests are still signed for,
+  and carry the `Host` header of, the endpoint's host. It is meant for a local TLS sidecar in
+  front of AWS (below). It takes `host:port` or `[v6]:port`, the port is required, and a host
+  name is resolved once, at startup; anything else is refused before the node starts.
 - Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`),
   which win, else from `--backup-credentials-file <file>` (the AWS INI format) with
   `--backup-profile` (default `default`). They are never taken from a flag or a TOML key (a
@@ -110,7 +115,8 @@ the stored size is checked with a HEAD after each upload.
   free disk), downloaded to `<store>.restore.tmp` and removed on any refusal; `latest` falls
   back past orphans and damaged pairs to the highest committed backup that verifies.
 - `--restore s3://` and `--backup-url s3://` share one set of S3 flags (`--backup-endpoint`,
-  `--backup-region`, `--backup-virtual-host`, `--backup-credentials-file`, `--backup-profile`);
+  `--backup-region`, `--backup-virtual-host`, `--backup-credentials-file`, `--backup-profile`,
+  `--backup-connect-to`);
   with a `file://` backup URL they serve the restore alone.
 - `memory-graph --server <any node> cluster snapshot --upload` has the leader build a snapshot
   now and upload it (whatever `--backup-on` says), and prints its URL and sha256 (if a newer
@@ -130,7 +136,7 @@ the stored size is checked with a HEAD after each upload.
 - The request timeout (60 s) bounds connecting, each chunk of a response, and the wait for a
   response, which also allows 1 s per MiB of request body.
 - TOML keys: `backup-endpoint`, `backup-region`, `backup-virtual-host`,
-  `backup-credentials-file`, `backup-profile`.
+  `backup-credentials-file`, `backup-profile`, `backup-connect-to`.
 
 ### S3 in production: TLS, lifecycle and IAM
 
@@ -143,10 +149,12 @@ to `file://` and sync that directory (the simpler of the two).
   header, so it must be the real S3 name, e.g. `s3.eu-west-1.amazonaws.com`, and no proxy may
   rewrite it (a rewrite fails with `SignatureDoesNotMatch`). So an endpoint of
   `http://127.0.0.1:9080` does **not** work against AWS. Instead, keep the real name on port 80
-  and make that name resolve to the sidecar for memory-graph only (#173 tracks a
-  `--backup-connect-to` flag that would remove the name trick):
-- **stunnel sidecar in Docker Compose** (the sidecar resolves the name normally; memory-graph's
-  container maps it to the sidecar with `extra_hosts`):
+  in `--backup-endpoint` and point `--backup-connect-to` at the sidecar: memory-graph signs
+  for, and sends the `Host` of, the real name but opens the TCP connection to the sidecar.
+  (Without the flag, the same works by making the real name resolve to the sidecar for
+  memory-graph only, with `extra_hosts` or `hostAliases`.)
+- **stunnel sidecar in Docker Compose** (the sidecar resolves the real name normally;
+  memory-graph connects to it by its service name):
 
   `stunnel.conf`:
 
@@ -167,23 +175,24 @@ to `file://` and sync that directory (the simpler of the two).
       image: debian:stable-slim       # or any image with stunnel installed
       command: sh -c "apt-get update && apt-get install -y stunnel4 ca-certificates && exec stunnel /etc/stunnel/stunnel.conf"
       volumes: ["./stunnel.conf:/etc/stunnel/stunnel.conf:ro"]
-      networks: { backup: { ipv4_address: 172.30.0.10 } }
+      networks: [backup]
     memory-graph:
       image: ghcr.io/p47phoenix/memory-graph:main
       command: >
         serve --data-dir /data --bootstrap --node-id 1 --listen 0.0.0.0:7000
         --backup-url s3://mg-backups/prod --backup-region eu-west-1
         --backup-endpoint http://s3.eu-west-1.amazonaws.com
-      extra_hosts: ["s3.eu-west-1.amazonaws.com:172.30.0.10"]
+        --backup-connect-to s3tls:80
+      depends_on: [s3tls]             # s3tls is resolved once, at startup
       env_file: aws-backup.env        # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
       networks: [backup]
   networks:
-    backup: { ipam: { config: [{ subnet: 172.30.0.0/24 }] } }
+    backup: {}
   ```
 
-  In Kubernetes, the same shape is a stunnel sidecar container plus a `hostAliases` entry, but
-  `hostAliases` applies to every container in the pod, so the sidecar must then `connect` to
-  a different name for the same region (`s3.dualstack.eu-west-1.amazonaws.com:443`). Use the
+  In Kubernetes, the same shape is a stunnel sidecar container in the pod that accepts on
+  `127.0.0.1:9080` (`accept = 127.0.0.1:9080`), with `--backup-connect-to 127.0.0.1:9080`; no
+  `hostAliases` entry is needed. Use the
   bucket's regional endpoint and path-style addressing (the default). The hop between
   memory-graph and the sidecar is plain HTTP, so keep it on a private network. (This recipe is
   not exercised in CI, which runs SeaweedFS over plain HTTP.)

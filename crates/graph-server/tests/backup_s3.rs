@@ -297,6 +297,14 @@ fn credentials_file_through_the_config() {
     let mut fb = BackupConfig::new("file:///tmp/x");
     fb.s3.endpoint = Some(f.endpoint());
     assert!(fb.open_sink().err().unwrap().contains("s3:// only"));
+    // ... including --backup-connect-to alone (#173).
+    let mut fb = BackupConfig::new("file:///tmp/x");
+    fb.s3.connect_to = Some(f.addr());
+    let e = fb.open_sink().err().unwrap();
+    assert!(
+        e.contains("s3:// only") && e.contains("--backup-connect-to"),
+        "{e}"
+    );
 }
 
 /// Called from inside an async runtime it errors instead of panicking.
