@@ -85,6 +85,51 @@
       "name": "asm-arm64",
       "description": "AArch64 GNU as examples for Apple Silicon; exercises the assembly extractor (GNU as syntax, macros).",
       "repos": ["hellosilicon"]
+    },
+    {
+      "name": "asm-masm64",
+      "description": "MASM x64 tutorial (structs, macros, WHILE, @@ labels); exercises the assembly extractor (MASM syntax).",
+      "repos": ["masm64-init"]
+    },
+    {
+      "name": "asm-masm32",
+      "description": "A snake game in 32-bit MASM (Irvine32, PROC/ENDP); exercises the assembly extractor (MASM syntax).",
+      "repos": ["masm-snake"]
+    },
+    {
+      "name": "asm-arm32",
+      "description": "A text adventure in ARM32 GNU as for the Raspberry Pi (@ comments); exercises the assembly extractor.",
+      "repos": ["arm32-game"]
+    },
+    {
+      "name": "asm-att",
+      "description": "The xv6 kernel's AT&T-syntax x86 GNU as sources (trailing # comments, cpp); exercises the assembly extractor.",
+      "repos": ["xv6-asm"]
+    },
+    {
+      "name": "rpg-fixed",
+      "description": "RPG IV service programs in fixed and mixed form (P/D specs, ... long names, /free blocks, **CTDATA); exercises the RPG extractor.",
+      "repos": ["ossile-rpg"]
+    },
+    {
+      "name": "rpg-cspecs",
+      "description": "Fixed-form RPG IV with C specs (BEGSR, CHAIN, indicators) from the vscode-rpgle test sources; exercises the RPG extractor.",
+      "repos": ["vscode-rpgle-fixed"]
+    },
+    {
+      "name": "cobol-ibm",
+      "description": "IBM-style fixed-format COBOL (sequence numbers, columns 73-80, copybooks) from the AWS CardDemo mainframe app; exercises the COBOL extractor.",
+      "repos": ["carddemo-cobol"]
+    },
+    {
+      "name": "shell-rbenv",
+      "description": "rbenv's bash commands (extensionless, detected by shebang); exercises the shell extractor.",
+      "repos": ["rbenv"]
+    },
+    {
+      "name": "r-causalimpact",
+      "description": "R sources of Google's CausalImpact package; exercises the R extractor.",
+      "repos": ["causalimpact"]
     }
   ],
   "repos": [
@@ -310,6 +355,92 @@
       "license": "MIT",
       "include": ["Chapter 04", "Chapter 06", "LICENSE"],
       "languages": ["asm"]
+    },
+    {
+      "dir": "masm64-init",
+      "kind": "MASM x64 tutorial project",
+      "upstream": "https://github.com/IbrahimHindawi/masm64-init",
+      "commit": "bb26480b8a2aa2a86db13c7a7e25c24d506c9c75",
+      "license": "MIT",
+      "include": ["source/main.asm", "source/chapters/macros.asm", "source/chapters/procs.asm", "source/chapters/flow.asm", "LICENSE"],
+      "languages": ["asm"]
+    },
+    {
+      "dir": "masm-snake",
+      "kind": "x86 MASM game",
+      "upstream": "https://github.com/meixinchoy/Snake-Game-Assembly-Language",
+      "commit": "064d78a7229f9d140b2777a3d8d7a2ea38aabeb5",
+      "license": "MIT",
+      "include": ["main.asm/main.asm/main.asm", "LICENSE"],
+      "languages": ["asm"]
+    },
+    {
+      "dir": "arm32-game",
+      "kind": "ARM32 GNU as game",
+      "upstream": "https://github.com/w84death/arm-assembly",
+      "commit": "6208bd02fa6843b698b646eaf018f13ccb13934c",
+      "license": "MIT",
+      "split": "the .asm sources of game1",
+      "include": ["game1/main.asm", "game1/globals.asm", "game1/prompt.asm", "game1/exit.asm", "game1/game_over.asm", "game1/ui_room.asm", "game1/ui_term.asm", "game1/room1.asm", "game1/room2.asm", "LICENSE"],
+      "languages": ["asm"]
+    },
+    {
+      "dir": "xv6-asm",
+      "kind": "x86 AT&T GNU as (xv6 kernel)",
+      "upstream": "https://github.com/mit-pdos/xv6-public",
+      "commit": "eeb7b415dbcb12cc362d0783e41c3d1f44066b17",
+      "license": "MIT",
+      "split": "the assembly sources only",
+      "include": ["bootasm.S", "entry.S", "swtch.S", "trapasm.S", "LICENSE"],
+      "languages": ["asm"]
+    },
+    {
+      "dir": "ossile-rpg",
+      "kind": "RPG IV utilities (fixed, mixed and free form)",
+      "note": "LICENSE_zlib is left out on purpose: it covers only main/zlib, which is not vendored.",
+      "upstream": "https://github.com/OSSILE/OSSILE",
+      "commit": "7201a67f7e704d73b7da82abd8c520826dd05741",
+      "license": "MIT",
+      "include": ["main/linkedlist/llist_h.rpgle", "main/linkedlist/llist_sort.rpgle", "main/linkedlist/parmeval.rpgle", "code_examples/rpg/COMPTIMARR.rpgle", "LICENSE"],
+      "languages": ["rpg"]
+    },
+    {
+      "dir": "vscode-rpgle-fixed",
+      "kind": "fixed-form RPG IV test sources",
+      "upstream": "https://github.com/codefori/vscode-rpgle",
+      "commit": "b357b356fbcc598de7f7e049d4f114f6b6f18408",
+      "license": "MIT",
+      "split": "two fixed-form test sources",
+      "include": ["tests/rpgle/CBKPCFGREA.rpgle", "tests/rpgle/inputspecs.rpgle", "LICENSE"],
+      "languages": ["rpg"]
+    },
+    {
+      "dir": "carddemo-cobol",
+      "kind": "IBM mainframe COBOL application",
+      "upstream": "https://github.com/aws-samples/aws-mainframe-modernization-carddemo",
+      "commit": "59cc6c2fd7ebd7ef7925cad552a01a4b8b6e4d5e",
+      "license": "Apache-2.0",
+      "split": "a few programs and copybooks",
+      "include": ["app/cbl/CBACT01C.cbl", "app/cbl/COBSWAIT.cbl", "app/app-transaction-type-db2/cbl/COBTUPDT.cbl", "app/cpy/CVCRD01Y.cpy", "app/cpy/COADM02Y.cpy", "LICENSE"],
+      "languages": ["cobol"]
+    },
+    {
+      "dir": "rbenv",
+      "kind": "bash command-line tool",
+      "upstream": "https://github.com/rbenv/rbenv",
+      "commit": "07e9b1e297a5977298c6aadc9971ae0e9eb7f0dc",
+      "license": "MIT",
+      "include": ["libexec/rbenv", "libexec/rbenv-init", "libexec/rbenv-rehash", "libexec/rbenv-sh-shell", "completions/rbenv.bash", "LICENSE"],
+      "languages": ["shell"]
+    },
+    {
+      "dir": "causalimpact",
+      "kind": "R package",
+      "upstream": "https://github.com/google/CausalImpact",
+      "commit": "0f5bf8d97cfb13321926c68b7eaeec74bb692b61",
+      "license": "Apache-2.0",
+      "include": ["R/impact_misc.R", "R/impact_plot.R", "LICENSE"],
+      "languages": ["r"]
     }
   ],
   "links": [
