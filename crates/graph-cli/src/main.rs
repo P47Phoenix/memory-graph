@@ -749,7 +749,8 @@ enum Cmd {
         kind: Option<TokenClass>,
         /// Level results are rolled up to: token, symbol (nearest enclosing symbol), method
         /// (nearest enclosing method or function), class (nearest enclosing type, or a Rust impl
-        /// block), file, repo or org. Symbol, method and class rows carry that symbol's full span
+        /// block; with none, the type a Go method's receiver names, in its file or another file
+        /// of its directory), file, repo or org. Symbol, method and class rows carry that symbol's full span
         #[arg(long, default_value = "token")]
         grain: Grain,
         /// With --grain symbol, method or class: only symbols of this symbol kind

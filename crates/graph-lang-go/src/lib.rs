@@ -17,7 +17,8 @@
 //! type (it is a sibling of the type) and is named without the receiver
 //! (`Area`, not `Rect.Area`); instead its `owner` is the receiver's type
 //! name (`Rect` for `func (r *Rect[T]) Area()`), so `--grain class` rolls it
-//! up under that type when the type is declared in the same file. A
+//! up under that type when the type is declared in the same file or in
+//! another Go file of the same directory (the package; issue #149). A
 //! declaration runs from its keyword (or, inside a `( ... )` group, from its
 //! first name) through its closing `}` or the last token before Go's
 //! automatic semicolon. Function bodies, struct fields and interface
