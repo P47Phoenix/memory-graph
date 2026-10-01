@@ -802,8 +802,8 @@ impl R {
     }
 
     /// Where an owner hint names no type in its own file (issue #149): the
-    /// type-like symbol named by dictionary id `owner` (narrowed by
-    /// `symbol_kind`) in another file of the same repo, the same directory
+    /// first type-like symbol named by dictionary id `owner` (then required
+    /// to match `symbol_kind`, if given) in another file of the same repo, the same directory
     /// and the same language as `file` -- a package, for a language whose
     /// package is its directory. Candidates come from the symbol-name index;
     /// the first by (path, source order) wins, so the answer does not depend
@@ -822,31 +822,45 @@ impl R {
         };
         let want_dir = dir(&file.name);
         let name = self.text(owner)?;
-        let mut best: Option<(String, usize, u64)> = None;
+        // Same repo, directory and language, judged on the file row alone
+        // (no org/repo rows, no stream); then (path, source order).
+        let mut cands: Vec<(String, usize, u64)> = Vec::new();
+        let mut rows: HashMap<u64, Option<String>> = HashMap::new();
         for v in self.sym_idx.get(&*name)? {
             let (tag, f2, idx) = split_id(v?.value());
             if tag != TAG_SYM || f2 == file.id {
                 continue;
             }
-            self.ctx(f2, cache)?;
-            let c = &cache[&f2];
-            if c.file.parent != file.parent
-                || c.file.language != file.language
-                || dir(&c.file.name) != want_dir
-            {
-                continue;
+            let path = match rows.get(&f2) {
+                Some(p) => p.clone(),
+                None => {
+                    let n = self.need(f2)?;
+                    let keep = n.parent == file.parent
+                        && n.language == file.language
+                        && dir(&n.name) == want_dir;
+                    let p = keep.then_some(n.name);
+                    rows.insert(f2, p.clone());
+                    p
+                }
+            };
+            if let Some(p) = path {
+                cands.push((p, idx, f2));
             }
-            if best
-                .as_ref()
-                .is_some_and(|(p, i, _)| (p.as_str(), *i) <= (c.file.name.as_str(), idx))
-            {
-                continue;
+        }
+        cands.sort();
+        // The first type-like candidate wins; the kind filter then applies
+        // to it (a filtered-out winner is no match, not a fall-through).
+        let mut decoded: Option<(u64, Vec<SymRec>)> = None;
+        let mut best: Option<(usize, u64)> = None;
+        for (_, idx, f2) in cands {
+            if decoded.as_ref().is_none_or(|(f, _)| *f != f2) {
+                let raw = self
+                    .streams
+                    .get(f2)?
+                    .ok_or_else(|| StoreError::Corrupt(format!("file {f2} without stream")))?;
+                decoded = Some((f2, codec::decode_lazy(raw.value())?.symbols()?));
             }
-            let lazy_raw = self
-                .streams
-                .get(f2)?
-                .ok_or_else(|| StoreError::Corrupt(format!("file {f2} without stream")))?;
-            let syms = codec::decode_lazy(lazy_raw.value())?.symbols()?;
+            let syms = &decoded.as_ref().expect("just decoded").1;
             let Some(r) = syms.get(idx) else {
                 return Err(StoreError::Corrupt(format!(
                     "symbol index {idx} past file {f2}"
@@ -855,19 +869,20 @@ impl R {
             if r.name != owner {
                 continue;
             }
-            let n = self.sym_node(f2, idx, &syms)?;
-            if grain_accepts(Grain::Class, &n) && symbol_kind.is_none_or(|k| kind_matches(&n, k)) {
-                best = Some((c.file.name.clone(), idx, f2));
+            let n = self.sym_node(f2, idx, syms)?;
+            if grain_accepts(Grain::Class, &n) {
+                if symbol_kind.is_some_and(|k| !kind_matches(&n, k)) {
+                    return Ok(None);
+                }
+                best = Some((idx, f2));
+                break;
             }
         }
-        let Some((_, idx, f2)) = best else {
+        let Some((idx, f2)) = best else {
             return Ok(None);
         };
-        let raw = self
-            .streams
-            .get(f2)?
-            .ok_or_else(|| StoreError::Corrupt(format!("file {f2} without stream")))?;
-        let syms = codec::decode_lazy(raw.value())?.symbols()?;
+        self.ctx(f2, cache)?;
+        let syms = decoded.expect("the winner is decoded").1;
         let mut chain = Vec::new();
         let mut cur = Some(idx as u32);
         while let Some(p) = cur {
@@ -1741,11 +1756,35 @@ impl R {
                 Grain::Repo => (c.org.id, c.repo.id, 0),
                 _ => (c.org.id, c.repo.id, fid),
             };
-            // The class grain can roll a hit up to a type in a sibling file
-            // (issue #149), keyed under that file, so a later file can still
-            // add to an earlier row: it reads every candidate file.
-            if q.grain != Grain::Class && rows.len() >= want && last_group != Some(group) {
-                break;
+            // Past the limit, a later file can still matter to the class
+            // grain: an owner hint resolved in a sibling file (issue #149)
+            // keys its row under that earlier file. A file at or before
+            // the cut-off row's path is read whole; a later one only if its
+            // directory can hold a path before the cut-off (same org and
+            // repo, `dir/` sorting before it) and it has owner hints; once
+            // past the cut-off's repo, stop.
+            let mut past_cut = false;
+            if rows.len() >= want && last_group != Some(group) {
+                if q.grain != Grain::Class || want == 0 {
+                    break;
+                }
+                let (co, cr, cp, _, _) = rows.keys().nth(want - 1).expect("want rows");
+                if (&c.org.name, &c.repo.name) != (co, cr) {
+                    break;
+                }
+                let prefix = c
+                    .file
+                    .name
+                    .rsplit_once('/')
+                    .map_or(String::new(), |(d, _)| format!("{d}/"));
+                // A sibling resolution may have keyed a row under this
+                // file itself (or a later one): read it whole.
+                if c.file.name.as_str() > cp.as_str() {
+                    if prefix.as_str() >= cp.as_str() {
+                        continue;
+                    }
+                    past_cut = true;
+                }
             }
             last_group = Some(group);
             let base_hit = |count: usize| Hit {
@@ -1803,6 +1842,9 @@ impl R {
                 .get(fid)?
                 .ok_or_else(|| StoreError::Corrupt(format!("file {fid} without stream")))?;
             let lazy = codec::decode_lazy(raw.value())?;
+            if past_cut && !lazy.symbols()?.iter().any(|s| s.owner.is_some()) {
+                continue;
+            }
             // Read only the postings' ordinals through the checkpoints.
             let mut matches: Vec<(usize, TokRec)> = Vec::new();
             lazy.tokens_at(&codec::posting_ordinals(&post)?, |ord, t| {
@@ -1904,6 +1946,14 @@ impl R {
                                         cur = syms[p as usize].parent;
                                     }
                                     break;
+                                }
+                                // A type of that name in this file that the
+                                // kind filter rejects: no match, and no
+                                // sibling search.
+                                if q.symbol_kind.is_some()
+                                    && self.resolve_owner(fid, syms, o, None)?.is_some()
+                                {
+                                    continue;
                                 }
                                 // No such type in this file: a sibling file of
                                 // the same directory (issue #149).

@@ -71,9 +71,13 @@ These `graph-core` items are the stable surface for extractors:
   may be declared in a sibling file. That row then belongs to the type's
   file: its `file`, `span` and `language` are the type's, and it counts the
   hits from every file that rolled up to it. Emit an owner hint only if that
-  same-file-then-same-directory scope is right for your language. With the
-  class grain, `--limit` reads every candidate file (a later file can add
-  to an earlier file's row).
+  same-file-then-same-directory scope is right for your language.
+  `--symbol-kind` applies to the type found: a same-file type of that name
+  that the filter rejects is no match (the other files are not searched),
+  and so is a sibling-file winner the filter rejects. With `--limit`, the
+  class grain keeps reading later files that have owner hints in a
+  directory that could hold an earlier row, since one of them can add to
+  or create a row before the cut-off.
   `symbols --json` reports it as `owner`. Setting it changes `extract`'s
   output, so bump `version()`.
 

@@ -3043,6 +3043,60 @@ fn owner_hint_sibling_files(h: &Harness) {
     drop(s);
     let s = (h.open)(vec![Box::new(PkgToy)]).expect("reopen store");
     assert_eq!(rows(&*s, &q).len(), 3);
+
+    // A limit met before the last file must not stop the walk: `m` in
+    // the last file rolls up to `P` in the first, which holds no hit.
+    batch(
+        &*s,
+        "r3",
+        &[
+            ("d/a.ptoy", "type P\n"),
+            ("d/b.ptoy", "type R foo\n"),
+            ("d/c.ptoy", "func P.m foo\n"),
+            ("e/x.ptoy", "type S foo\n"),
+        ],
+        None,
+    );
+    q.repo = Some("r3".into());
+    let full = rows(&*s, &q);
+    assert_eq!(
+        full.iter()
+            .map(|r| (r.0.clone().unwrap(), r.1.clone().unwrap(), r.2))
+            .collect::<Vec<_>>(),
+        [
+            ("d/a.ptoy".to_string(), "P".to_string(), 1),
+            ("d/b.ptoy".to_string(), "R".to_string(), 1),
+            ("e/x.ptoy".to_string(), "S".to_string(), 1),
+        ]
+    );
+    for n in 0..=4 {
+        q.limit = Some(n);
+        assert_eq!(rows(&*s, &q), full[..n.min(full.len())], "r3 limit {n}");
+        q.limit = Some(1);
+        q.offset = Some(n);
+        assert_eq!(
+            rows(&*s, &q),
+            full[n.min(full.len())..(n + 1).min(full.len())],
+            "r3 offset {n}"
+        );
+        q.offset = None;
+    }
+    q.limit = None;
+
+    // A same-file type the kind filter rejects is no match: the sibling
+    // search does not run past it.
+    let mut own = pkg_extraction("type P\nfunc P.m foo\n");
+    own.symbols[0].lang_kind = Some("interface".into());
+    s.ingest_file("o", "r4", "k/a.ptoy", "pkgtoy", &own)
+        .unwrap();
+    s.ingest_file("o", "r4", "k/b.ptoy", "pkgtoy", &pkg_extraction("type P\n"))
+        .unwrap();
+    q.repo = Some("r4".into());
+    q.symbol_kind = Some("struct".into());
+    assert_eq!(
+        rows(&*s, &q),
+        [(Some("k/a.ptoy".into()), None, 1, None, true)]
+    );
 }
 
 // --- ADR 0007: source encodings (epic story 41) ---

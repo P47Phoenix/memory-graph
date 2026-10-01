@@ -204,6 +204,56 @@ fn go_method_rolls_up_under_a_struct_in_a_sibling_file() {
     );
 }
 
+/// Issue #149: the same type declared in two sibling files resolves to the
+/// first by path, and the method's file sorts after both type files.
+#[test]
+fn go_sibling_owner_takes_the_first_file_by_path() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("b_box.go"),
+        "package shapes\n\ntype GoBox struct {\n\tw int\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("c_box.go"),
+        "package shapes\n\ntype GoBox struct {\n\th int\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("z_methods.go"),
+        "package shapes\n\nfunc (b *GoBox) Width() int {\n\treturn b.w\n}\n",
+    )
+    .unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    for limit in [None, Some("1")] {
+        let mut args = vec!["--db", &db, "search", "w", "--grain", "class", "--json"];
+        if let Some(l) = limit {
+            args.extend(["--limit", l]);
+        }
+        let (ok, out, err) = run(&args);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let rows = v["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{out}");
+        assert_eq!(rows[0]["file"], "b_box.go", "{out}");
+        assert_eq!(rows[0]["symbol"], "shapes::GoBox", "{out}");
+        assert_eq!(rows[0]["count"], 2, "{out}");
+    }
+}
+
 /// Epic story 16: a repo with `.rs`, `.py` (and `.ts`, `.java`) files is
 /// searchable by token text across languages, Python classes hold methods,
 /// and a Python syntax error is flagged, not fatal.
