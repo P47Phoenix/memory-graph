@@ -720,13 +720,13 @@ mod tests {
         ] {
             let d = tempfile::tempdir().unwrap();
             let (slot, snaps) = with_snapshot_at_1(d.path());
-            assert!(!repair_outdated_snapshot(&slot, &snaps).unwrap());
+            assert!(!repair_outdated_snapshot(&slot, &snaps, ok).unwrap());
             let (_, path) = snaps.current().unwrap();
             age_snapshot(&path, format, hash).unwrap();
             let (side, _) = snaps.current().unwrap();
             assert!(snaps.is_outdated(&side), "{format:?} {hash:?}");
             let before = snaps.built();
-            assert!(repair_outdated_snapshot(&slot, &snaps).unwrap());
+            assert!(repair_outdated_snapshot(&slot, &snaps, ok).unwrap());
             assert_eq!(snaps.built(), before + 1);
             let (side, path) = snaps.current().unwrap();
             assert_eq!(side.index, 1, "rebuilt at the store's applied index");
@@ -736,7 +736,7 @@ mod tests {
                 graph_store::detect_format(&path).unwrap(),
                 Some(graph_store::SCHEMA_VERSION)
             );
-            assert!(!repair_outdated_snapshot(&slot, &snaps).unwrap());
+            assert!(!repair_outdated_snapshot(&slot, &snaps, ok).unwrap());
         }
         // A store behind its outdated snapshot (not produced by any repair)
         // is left for the policy rather than rebuilt at a lower index.
@@ -751,8 +751,73 @@ mod tests {
         let fresh = sm_at(&d.path().join("behind")).0;
         StoreStateMachine::apply_all(&fresh, vec![blank(2)], NO_FP, &Default::default(), None)
             .unwrap();
-        assert!(!repair_outdated_snapshot(&fresh, &snaps).unwrap());
+        assert!(!repair_outdated_snapshot(&fresh, &snaps, ok).unwrap());
         assert_eq!(snaps.current().unwrap().0.index, 3);
+    }
+
+    fn ok() -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// #151 dev review: the start-up rebuild runs the disk guard first, and
+    /// a refusal leaves the outdated pair as it was.
+    #[test]
+    fn an_outdated_snapshot_rebuild_checks_the_disk_first() {
+        use crate::raft::node::repair_outdated_snapshot;
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let (_, path) = snaps.current().unwrap();
+        crate::testing::age_snapshot(&path, None, Some("other")).unwrap();
+        let before = files_in(snaps.dir());
+        let r = repair_outdated_snapshot(&slot, &snaps, || {
+            Err(StoreError::Storage("disk full".into()))
+        });
+        assert!(r.is_err());
+        assert_eq!(files_in(snaps.dir()), before);
+        assert!(snaps.is_outdated(&snaps.current().unwrap().0));
+    }
+
+    /// #151 dev review: a rebuild at the index of an outdated pair never
+    /// overwrites its file; a crash after the new file's rename and before
+    /// its meta leaves the old pair intact and current, and the next
+    /// rebuild completes and prunes it.
+    #[test]
+    fn a_rebuild_at_the_same_index_survives_a_crash_before_its_meta() {
+        use crate::raft::node::repair_outdated_snapshot;
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let (_, path) = snaps.current().unwrap();
+        crate::testing::age_snapshot(&path, None, Some("other")).unwrap();
+        let old_bytes = std::fs::read(&path).unwrap();
+        let old_meta = std::fs::read(snaps.dir().join("snap-1-1.meta")).unwrap();
+        snaps
+            .fail_before_meta
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(repair_outdated_snapshot(&slot, &snaps, ok).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            old_bytes,
+            "old file untouched"
+        );
+        assert_eq!(
+            std::fs::read(snaps.dir().join("snap-1-1.meta")).unwrap(),
+            old_meta
+        );
+        let (side, cur) = snaps.current().unwrap();
+        assert_eq!((side.index, cur), (1, path.clone()));
+        assert_eq!(side.extractors_hash, "other");
+        // The orphaned data file (no meta) is ignored; a retry completes.
+        snaps
+            .fail_before_meta
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(repair_outdated_snapshot(&slot, &snaps, ok).unwrap());
+        let (side, cur) = snaps.current().unwrap();
+        assert_eq!((side.index, side.extractors_hash.as_str()), (1, "h"));
+        assert_ne!(cur, path);
+        let (sha, size) = super::super::snapshot_dir::sha256_file(&cur).unwrap();
+        assert_eq!((side.sha256, side.size), (sha, size));
+        let files = files_in(snaps.dir());
+        assert_eq!(files.len(), 2, "one pair left: {files:?}");
     }
 
     /// #151: a received snapshot in an older, upgradable store format is

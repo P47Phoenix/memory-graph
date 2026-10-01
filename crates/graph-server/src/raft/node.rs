@@ -355,14 +355,25 @@ impl RaftNode {
         )?;
         log_store.set_observer(p.append_observer.clone());
         {
-            let (slot, snaps, log) = (
+            let (slot, snaps, log, disk) = (
                 Arc::clone(&p.slot),
                 Arc::clone(&p.snapshots),
                 log_store.clone(),
+                p.disk.clone(),
             );
             tokio::task::spawn_blocking(move || {
                 repair_stale_snapshot(&slot, &snaps, &log)?;
-                repair_outdated_snapshot(&slot, &snaps)
+                // Best effort: an outdated snapshot only delays a laggard
+                // (the policy's next build replaces it), so a failed or
+                // disk-refused rebuild is logged and serve goes on.
+                if let Err(e) = repair_outdated_snapshot(&slot, &snaps, || disk.check("snapshot")) {
+                    tracing::warn!(
+                        error = %e,
+                        "could not replace a snapshot made by another build at start-up; \
+                         the snapshot policy will replace it"
+                    );
+                }
+                Ok::<(), StoreError>(())
             })
             .await
             .map_err(fatal)??;
@@ -949,10 +960,16 @@ pub fn repair_stale_snapshot(
 /// sends in an `InstallSnapshot` header, and a follower refuses another
 /// hash (D5), so a lagging follower would wait for the log policy's next
 /// build. A snapshot of the store (already upgraded by its open) is built
-/// now instead, at the store's applied index. A store behind its snapshot
-/// (which the interrupted-install repair above does not produce) is left
-/// alone. Returns whether it built one.
-pub fn repair_outdated_snapshot(slot: &StoreSlot, snaps: &SnapshotDir) -> Result<bool, StoreError> {
+/// now instead (synchronously, a full export), at the store's applied
+/// index, after `disk_check` (the `--min-free-disk` guard). A store behind
+/// its snapshot (which the interrupted-install repair above does not
+/// produce) keeps the old pair. Returns whether it built one; the caller
+/// treats an error as a warning.
+pub fn repair_outdated_snapshot(
+    slot: &StoreSlot,
+    snaps: &SnapshotDir,
+    disk_check: impl FnOnce() -> Result<(), StoreError>,
+) -> Result<bool, StoreError> {
     let Some((side, _)) = snaps.current() else {
         return Ok(false);
     };
@@ -975,6 +992,7 @@ pub fn repair_outdated_snapshot(slot: &StoreSlot, snaps: &SnapshotDir) -> Result
         extractors_hash = %side.extractors_hash,
         "the current snapshot was made by another build; building a fresh one"
     );
+    disk_check()?;
     snaps.build(slot)?;
     Ok(true)
 }

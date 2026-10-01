@@ -11,9 +11,13 @@
 //! The current snapshot is the highest-index meta whose data file exists
 //! with the recorded size; a crash between the renames leaves a data file
 //! without a meta (ignored, and the previous pair is still there because it
-//! is only removed afterwards). Names are unique per (term, index) and a
-//! build at an index that already has a complete pair reuses it, so a meta
-//! never describes a different file of the same name.
+//! is only removed afterwards). A build at an index that already has a
+//! complete pair reuses it, unless that pair was made by another build
+//! (older store format or other extractors, #151): the rebuilt pair is then
+//! named `snap-<term>-<index>-r<nanos>` rather than overwriting the existing
+//! file, so a meta never describes a different file of the same name and a
+//! file being streamed is never replaced. The current pair is chosen by the
+//! meta's contents, not its name.
 use super::types::{LogId, SnapshotFile, SnapshotMeta, StoredMembership, TypeConfig};
 use crate::slot::StoreSlot;
 use graph_store::{StoreError, V2Store};
@@ -114,6 +118,10 @@ pub struct SnapshotDir {
     built: AtomicU64,
     /// Told about every new build (the backup uploader); must not block.
     on_built: std::sync::RwLock<Option<OnBuilt>>,
+    /// Test failpoint: fail a promotion after the data file's rename and
+    /// before its meta is written (a crash there).
+    #[cfg(test)]
+    pub(crate) fail_before_meta: std::sync::atomic::AtomicBool,
 }
 
 /// Called with each newly built snapshot pair (not a reused one).
@@ -137,6 +145,8 @@ impl SnapshotDir {
             installed: AtomicU64::new(0),
             built: AtomicU64::new(0),
             on_built: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            fail_before_meta: Default::default(),
         })
     }
 
@@ -202,7 +212,9 @@ impl SnapshotDir {
                 ),
             }
         }
-        out.sort_by_key(|a| std::cmp::Reverse(a.0.index));
+        // At one index (a rebuild that crashed before pruning), a pair made
+        // by this build comes first.
+        out.sort_by_key(|a| (std::cmp::Reverse(a.0.index), self.is_outdated(&a.0)));
         out
     }
 
@@ -257,10 +269,30 @@ impl SnapshotDir {
         let io = |e: std::io::Error| StoreError::Storage(format!("snapshot: {e}"));
         let (sha256, size) = sha256_file(data)?;
         let st = stem(last.as_ref());
-        let final_path = self.data_path(&st);
+        let mut final_path = self.data_path(&st);
+        if data != final_path && final_path.exists() {
+            // A pair at this index already exists (a rebuild of a snapshot
+            // made by another build, #151): never overwrite its file, which
+            // its meta describes and openraft may be streaming. The new pair
+            // gets its own name; the old one is pruned once it is complete.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            final_path = self.data_path(&format!("{st}-r{nanos}"));
+        }
         if data != final_path {
             replace_file(data, &final_path).map_err(io)?;
         }
+        #[cfg(test)]
+        if self.fail_before_meta.load(Ordering::SeqCst) {
+            return Err(StoreError::Storage("failpoint: before the meta".into()));
+        }
+        // What the file is, not what this binary writes: a received file in
+        // an older format is upgraded when `check_marker` opens it, and if it
+        // were not, the sidecar says so and the start-up repair replaces it.
+        let store_format_version =
+            graph_store::detect_format(&final_path)?.unwrap_or(graph_store::SCHEMA_VERSION);
         let side = SnapshotSidecar {
             term: last.map_or(0, |l| l.leader_id.term),
             index: last.map_or(0, |l| l.index),
@@ -270,7 +302,7 @@ impl SnapshotDir {
             sha256,
             size,
             extractors_hash: self.extractors_hash.clone(),
-            store_format_version: graph_store::SCHEMA_VERSION,
+            store_format_version,
         };
         let meta = meta_path_of(&final_path);
         // Durable: the data file is synced before its meta exists, and the

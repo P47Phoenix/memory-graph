@@ -306,7 +306,14 @@ fn laggard_catches_up_by_install_snapshot() {
 /// restarts it replaces the old snapshot with a fresh one.
 #[test]
 fn laggard_installs_a_pre_upgrade_snapshot_and_the_leader_rebuilds_it_on_restart() {
-    let mut tb = ClusterTestbed::with_config(3, exts(), |_, c| c.raft = Some(snappy()));
+    // No policy builds: the one snapshot is taken on demand below, so the
+    // aged pair is certainly the one the leader sends.
+    let manual = RaftSettings {
+        snapshot_log_entries: u64::MAX,
+        snapshot_log_bytes: u64::MAX,
+        ..snappy()
+    };
+    let mut tb = ClusterTestbed::with_config(3, exts(), move |_, c| c.raft = Some(manual));
     tb.form();
     let leader = tb.leader();
     let laggard = tb.ids().into_iter().find(|i| *i != leader).unwrap();
@@ -330,7 +337,9 @@ fn laggard_installs_a_pre_upgrade_snapshot_and_the_leader_rebuilds_it_on_restart
         .enable_all()
         .build()
         .unwrap();
+    let node = tb.node(leader).raft().unwrap().clone();
     rt.block_on(async {
+        node.snapshot_now(CLUSTER_WAIT).await.unwrap();
         raft.wait(Some(CLUSTER_WAIT))
             .metrics(
                 |m| m.purged.is_some_and(|p| p.index > behind),
@@ -339,6 +348,7 @@ fn laggard_installs_a_pre_upgrade_snapshot_and_the_leader_rebuilds_it_on_restart
             .await
             .unwrap()
     });
+    drop((node, raft));
     // Age the leader's current snapshot (nothing streams it: the laggard
     // is down and the other follower is current).
     let old = *graph_store::UPGRADABLE_SCHEMA_VERSIONS.last().unwrap();
@@ -392,6 +402,12 @@ fn laggard_installs_a_pre_upgrade_snapshot_and_the_leader_rebuilds_it_on_restart
         })
         .map(|p| graph_server::raft::snapshot_dir::read_sidecar(&p).unwrap())
         .unwrap();
+    // No policy builds anywhere: the laggard's only pair is the one it
+    // installed (the aged one's log id), upgraded to this build's format.
+    assert_eq!(
+        (lag_side.index, lag_side.term, &lag_side.snapshot_id),
+        (before.index, before.term, &before.snapshot_id)
+    );
     assert_eq!(lag_side.store_format_version, graph_store::SCHEMA_VERSION);
     // A restart of the old leader replaces its aged snapshot.
     tb.node_mut(leader).stop();
@@ -407,6 +423,57 @@ fn laggard_installs_a_pre_upgrade_snapshot_and_the_leader_rebuilds_it_on_restart
     run_differential(&replica(&tb, laggard), &replica(&tb, leader));
 }
 
+/// #151 QA: a restarted node replaces a snapshot made by another build
+/// (older format, other extractors) before it serves; with no policy
+/// builds, only the start-up repair can have done it.
+#[test]
+fn a_restart_replaces_a_snapshot_made_by_another_build() {
+    let manual = RaftSettings {
+        snapshot_log_entries: u64::MAX,
+        snapshot_log_bytes: u64::MAX,
+        ..snappy()
+    };
+    let old = *graph_store::UPGRADABLE_SCHEMA_VERSIONS.last().unwrap();
+    for (format, hash) in [(Some(old), None), (None, Some("another-build"))] {
+        let mut tb = ClusterTestbed::with_config(1, exts(), move |_, c| c.raft = Some(manual));
+        tb.form();
+        index_files(&tb.client(1), "o", "r", &[small_file(0), small_file(1)]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let node = tb.node(1).raft().unwrap().clone();
+        let (index, _) = rt.block_on(node.snapshot_now(CLUSTER_WAIT)).unwrap();
+        drop(node);
+        tb.node_mut(1).stop();
+        let snaps = tb.data_dir(1).join("snapshots");
+        let pair = || {
+            let metas: Vec<_> = std::fs::read_dir(&snaps)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == "meta"))
+                .collect();
+            assert_eq!(metas.len(), 1, "{metas:?}");
+            let data = metas[0].with_extension("redb");
+            (
+                graph_server::raft::snapshot_dir::read_sidecar(&data).unwrap(),
+                data,
+            )
+        };
+        let (_, data) = pair();
+        graph_server::testing::age_snapshot(&data, format, hash).unwrap();
+        tb.node_mut(1).restart();
+        let (side, data) = pair();
+        assert_eq!(side.index, index, "{format:?} {hash:?}");
+        assert_eq!(side.store_format_version, graph_store::SCHEMA_VERSION);
+        assert_ne!(side.extractors_hash, "another-build");
+        assert_eq!(
+            graph_store::detect_format(&data).unwrap(),
+            Some(graph_store::SCHEMA_VERSION)
+        );
+        assert_eq!(tb.client(1).count_nodes(NodeKind::File).unwrap(), 2);
+    }
+}
 #[test]
 fn restart_with_persisted_state() {
     let mut tb = ClusterTestbed::new(3, exts());
