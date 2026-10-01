@@ -2423,6 +2423,25 @@ fn prepare_with_snapshot(h: &Harness) {
     for (q, n) in [("alpha", 1), ("NEW", 0), ("CHANGED", 1), ("gamma", 1)] {
         assert_eq!(s.search(&Query::new(q)).unwrap().len(), n, "{q}");
     }
+    // Paths in subdirectories key the snapshot by their stored
+    // (normalized, `/`-separated) path, whatever separator the caller sent.
+    s.index_batch("o", "r", &[bf("a/b/c.txt", b"deep")], d)
+        .unwrap();
+    let snap = s.fingerprint_snapshot("o", "r").unwrap();
+    for path in ["a/b/c.txt", "a\\b\\c.txt"] {
+        let p = s
+            .prepare_with("o", "r", &bf(path, b"deep"), d, &snap)
+            .unwrap();
+        if local {
+            assert!(p.is_unchanged(), "{path}");
+        }
+        let out = s.index_prepared("o", "r", vec![p], d).unwrap();
+        assert!(out[0].as_ref().unwrap().unchanged, "{path}");
+    }
+    let p = s
+        .prepare_with("o", "r", &bf("a/b/c.txt", b"deeper"), d, &snap)
+        .unwrap();
+    assert!(!p.is_unchanged());
     // Another repo's snapshot: the same outcome as a plain `prepare`.
     let other = s.fingerprint_snapshot("o", "elsewhere").unwrap();
     let p = s

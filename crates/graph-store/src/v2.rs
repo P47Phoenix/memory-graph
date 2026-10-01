@@ -278,6 +278,18 @@ fn dict_rev_lookup<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>
     Ok(entries.into_iter().find(|(i, _)| *i == id).map(|(_, t)| t))
 }
 
+/// Read transactions opened by `prepare`'s one-file pre-check, process-wide
+/// (#172). Tests use it to prove that `prepare_with` with a matching
+/// snapshot, and so the CLI's parse threads, never open one.
+static PRECHECK_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many pre-check read transactions `prepare` has opened in this
+/// process. For tests only; not a stable API.
+#[doc(hidden)]
+pub fn precheck_reads() -> u64 {
+    PRECHECK_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The encoded size at which [`dict_rev_append`] stops extending the last
 /// reverse-dictionary block and starts a new one (#162).
 pub(crate) const DICT_BLOCK_MAX_BYTES: usize = 64 << 10;
@@ -295,7 +307,11 @@ pub(crate) const DICT_BLOCK_MAX_BYTES: usize = 64 << 10;
 /// a 100-small-file batch after such a file took 0.8-2.7 s instead of 8 ms.
 /// Readers never assumed `DICT_BLOCK` entries per block (vacuum already
 /// leaves uneven boundaries), so this is a write policy, not a format change.
-fn dict_rev_append(rev: &mut redb::Table<u64, &'static [u8]>, id: u64, text: &str) -> Result<()> {
+pub(crate) fn dict_rev_append(
+    rev: &mut redb::Table<u64, &'static [u8]>,
+    id: u64,
+    text: &str,
+) -> Result<()> {
     let n = rev.len()?;
     if n > 0 {
         let last = n - 1;
@@ -3196,7 +3212,10 @@ impl V2Store {
     /// committed state. Its read transaction is not ordered against commits,
     /// so a caller that needs the file bytes independent of thread timing
     /// (the CLI's `index`, #158) takes one snapshot per batch before any
-    /// commit and calls `prepare_with` instead (#172).
+    /// commit and calls `prepare_with` instead (#172). Any other caller
+    /// that prepares concurrently with commits still gets correct results,
+    /// but the database bytes then depend on thread timing, so it should
+    /// prefer `prepare_with` too.
     fn prepare(
         &self,
         org: &str,
@@ -3205,6 +3224,7 @@ impl V2Store {
         opts: IndexOptions,
     ) -> Result<PreparedFile> {
         let mut p = prepare_file(&self.registry, org, repo, f, opts, |path, _, fp| {
+            PRECHECK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             stored_fingerprint_matches(&self.db.begin_read()?, org, repo, path, fp)
         })?;
         Self::build_v2_prep(&mut p);

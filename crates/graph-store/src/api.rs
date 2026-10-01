@@ -46,6 +46,10 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// hint, as of when it was taken: the commit re-checks every file
 /// authoritatively, so a stale snapshot costs an extraction, never a wrong
 /// result.
+///
+/// Memory: one path and one fingerprint string per fingerprinted file of
+/// the repo, so O(files in the repo), held for the whole batch. It is not
+/// counted against the CLI pipeline's byte budget (`--memory`).
 #[derive(Debug, Clone, Default)]
 pub struct FingerprintSnapshot {
     pub(crate) org: String,

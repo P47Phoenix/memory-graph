@@ -2334,6 +2334,41 @@ fn a_long_term_closes_its_dict_rev_block() {
     }
 }
 
+/// Issue #162, the boundary: a last block of exactly `DICT_BLOCK_MAX_BYTES`
+/// encoded bytes is full (the next term starts a new block); one byte less
+/// is extended.
+#[test]
+fn a_dict_rev_block_of_exactly_the_cap_is_full() {
+    use crate::codec::encode_dict_block;
+    use crate::v2::{dict_rev_append, DICT_BLOCK_MAX_BYTES, DICT_REV};
+    // A one-entry block whose encoding is exactly `want` bytes (the
+    // header is a few bytes of varints).
+    let sized = |want: usize| {
+        (want - 32..=want)
+            .map(|len| "z".repeat(len))
+            .find(|t| encode_dict_block(&[(0, t.as_str())]).len() == want)
+            .expect("a term length that encodes to exactly `want` bytes")
+    };
+    for (size, blocks) in [(DICT_BLOCK_MAX_BYTES, 2), (DICT_BLOCK_MAX_BYTES - 1, 1)] {
+        let d = tempfile::tempdir().unwrap();
+        let s = V2Store::open(d.path().join("v.redb")).unwrap();
+        let wt = s.db.begin_write().unwrap();
+        {
+            let mut rev = wt.open_table(DICT_REV).unwrap();
+            for k in 0..rev.len().unwrap() {
+                rev.remove(k).unwrap();
+            }
+            let t = sized(size);
+            rev.insert(0, encode_dict_block(&[(0, t.as_str())]).as_slice())
+                .unwrap();
+            assert_eq!(rev.get(0).unwrap().unwrap().value().len(), size);
+            dict_rev_append(&mut rev, 1, "x").unwrap();
+            assert_eq!(rev.len().unwrap(), blocks, "block of {size} bytes");
+        }
+        wt.abort().unwrap();
+    }
+}
+
 /// `vacuum` repacks `dict_rev` densely (ADR 0003 story 5): after removing
 /// terms scattered across several blocks, block boundaries no longer line up
 /// with `id / DICT_BLOCK` (dead ids leave gaps), and lookups must still find

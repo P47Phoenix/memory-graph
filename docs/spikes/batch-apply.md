@@ -43,7 +43,8 @@ was last when it was interned. `dict_rev_append` extended the last block
 whenever it held fewer than `DICT_BLOCK` entries: decode the whole block,
 push one entry, encode it again and insert it. After a long term, every
 new term (each new number or name in the small files) therefore decoded,
-re-encoded and rewrote the 20 MiB block, until 128 more terms had filled it.
+re-encoded and rewrote the 20 MiB block, until the block reached
+`DICT_BLOCK` (128) entries.
 The first batch after the large files paid that for the most terms, which is
 the 2.7 s; later batches still added a few new terms each. A debug build
 does the same work, only slower, hence the 3.5-14 s seen in the test.

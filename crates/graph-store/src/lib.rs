@@ -41,6 +41,8 @@ pub(crate) use common::{
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
 /// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
+#[doc(hidden)]
+pub use v2::precheck_reads;
 pub use v2::UPGRADABLE_SCHEMA_VERSIONS;
 pub use v2::V2_SCHEMA_VERSION as SCHEMA_VERSION;
 pub use v2::{CompactStats, MarkedCommitHook, RaftMarker, V2Snapshot, V2Store, VacuumStats};
