@@ -218,6 +218,46 @@ fn reindex_hints_at_compact_and_compact_restores_the_size() {
     );
 }
 
+/// #90: `index --reindex --compact` compacts the file after a run that
+/// replaced files, so it ends within 1.2x of a fresh index (no separate
+/// `vacuum --compact`), and prints no hint (there is nothing left to do).
+#[test]
+fn reindex_with_compact_ends_within_bounds_of_a_fresh_index() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let db = db.to_str().unwrap();
+    let corpus = corpus_dir();
+    let corpus_s = corpus.to_str().unwrap();
+    let index = |extra: &[&str]| {
+        let mut args = vec![
+            "--db",
+            db,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            "--no-progress",
+        ];
+        args.extend_from_slice(extra);
+        args.push(corpus_s);
+        let (ok, out, err) = run(&args);
+        assert!(ok, "{out}{err}");
+        (out, err)
+    };
+    index(&[]);
+    let fresh = std::fs::metadata(db).unwrap().len();
+    let (out, err) = index(&["--reindex", "--compact"]);
+    let compacted = std::fs::metadata(db).unwrap().len();
+    println!("reindex --compact: fresh={fresh} B, after={compacted} B");
+    assert!(out.contains("compact: "), "no compact line: {out}{err}");
+    assert!(!err.contains("hint:"), "hint despite --compact: {err}");
+    assert!(
+        compacted as f64 <= 1.2 * fresh as f64,
+        "--reindex --compact left {compacted} B, fresh index was {fresh} B (limit 1.2x)"
+    );
+}
+
 /// The Raft log (ADR 0004 D7): every write is a log entry that carries the
 /// source bytes, so before a snapshot `raft.redb` holds the source again
 /// (and more: redb rounds large values up). After `cluster snapshot`

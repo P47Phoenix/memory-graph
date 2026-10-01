@@ -57,12 +57,13 @@ fn run_with(
             remote: None,
             encoding: None,
             strict_encoding: false,
+            compact: false,
         },
         open,
         &mut out,
     );
     let v = serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
-    (r, v)
+    (r.map(|_| ()), v)
 }
 
 fn describe(db: &Path) -> serde_json::Value {

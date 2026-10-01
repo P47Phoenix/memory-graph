@@ -596,6 +596,11 @@ enum Cmd {
         /// same content, language and extractor version are skipped). Does not affect --prune's safety checks
         #[arg(long)]
         reindex: bool,
+        /// With --reindex: after a run that replaced at least one stored file, compact the database file
+        /// (as `vacuum --compact`) to reclaim the old copies' pages, which redb otherwise keeps (the file
+        /// stays about twice its size). Embedded --db only; on a server run `vacuum --compact --server`
+        #[arg(long, requires = "reindex")]
+        compact: bool,
         /// Parse threads (default, or 0: one per CPU but one, left for the database writer). Files are still
         /// committed in walk order by one writer, so the stored content is the same for any value
         #[arg(long, short = 'j', default_value_t = 0, hide_default_value = true)]
@@ -1901,6 +1906,7 @@ fn run() -> Result<i32> {
             prune,
             force,
             reindex,
+            compact,
             jobs,
             memory,
             deterministic,
@@ -1924,6 +1930,11 @@ fn run() -> Result<i32> {
             let (db, remote_store, remote_board) = match &target {
                 Target::Embedded(db) => (db.clone(), None, None),
                 Target::Remote { addr, read } => {
+                    if compact {
+                        bail!(
+                            "--compact is embedded-only (--db); with --server, run `memory-graph vacuum --compact` against the server after the re-index"
+                        );
+                    }
                     let s = remote(addr, *read, overrides)?;
                     if jobs != 0 {
                         eprintln!(
@@ -1940,7 +1951,7 @@ fn run() -> Result<i32> {
                 }
             };
             let mut remote_store = remote_store;
-            index_dir(
+            let replaced = index_dir(
                 DirOpts {
                     db: &db,
                     org: &org,
@@ -1968,13 +1979,34 @@ fn run() -> Result<i32> {
                     remote: remote_board,
                     encoding: encoding.and_then(|e| e.0),
                     strict_encoding,
+                    compact,
                 },
                 |_| match remote_store.take() {
                     Some(s) => Ok(Box::new(s) as Box<dyn Store>),
                     None => open_for_indexing(&target, overrides),
                 },
                 &mut std::io::stdout().lock(),
-            )?
+            )?;
+            // #90: a re-index leaves the replaced files' old pages in the
+            // file; reclaim them as `vacuum --compact` does (the store above
+            // is closed by now). Nothing replaced, nothing to reclaim.
+            if compact && replaced > 0 {
+                let s = graph_cli::target::open_embedded(&db, || open_v2(&db, overrides))
+                    .with_context(|| format!("opening database `{}`", db.display()))?;
+                // The same two steps as `vacuum --compact`.
+                s.vacuum()?;
+                let (_, cst) = s.compact().context("compacting after --reindex")?;
+                let line = format!(
+                    "compact: {} bytes -> {} bytes",
+                    cst.before_bytes, cst.after_bytes
+                );
+                // Keep stdout a single JSON document under --json.
+                if json {
+                    eprintln!("{line}");
+                } else {
+                    out!("{line}");
+                }
+            }
         }
         Cmd::Sysinfo {
             json,
