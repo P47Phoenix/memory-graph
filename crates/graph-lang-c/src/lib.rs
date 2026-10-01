@@ -39,7 +39,7 @@
 //! A `.h` file is C unless it uses C++-only syntax (`class X {`,
 //! `namespace X {`, `template <`, `public:`); then it is scanned with the
 //! C++ rules but keeps the language `c`.
-use graph_core::scan::{span_between, NestedEnds, Step};
+use graph_core::scan::{mark_keywords, span_between, NestedEnds, Step};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::cell::RefCell;
@@ -63,7 +63,8 @@ impl Extractor for CExtractor {
     }
 
     fn version(&self) -> String {
-        format!("c-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("c-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -81,7 +82,8 @@ impl Extractor for CppExtractor {
     }
 
     fn version(&self) -> String {
-        format!("cpp-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("cpp-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -89,12 +91,172 @@ impl Extractor for CppExtractor {
     }
 }
 
+/// C keywords (C11 and C23).
+const C_KEYWORDS: &[&str] = &[
+    "auto",
+    "break",
+    "case",
+    "char",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extern",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "register",
+    "restrict",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "struct",
+    "switch",
+    "typedef",
+    "union",
+    "unsigned",
+    "void",
+    "volatile",
+    "while",
+    "_Alignas",
+    "_Alignof",
+    "_Atomic",
+    "_BitInt",
+    "_Bool",
+    "_Complex",
+    "_Decimal128",
+    "_Decimal32",
+    "_Decimal64",
+    "_Generic",
+    "_Imaginary",
+    "_Noreturn",
+    "_Static_assert",
+    "_Thread_local",
+    "alignas",
+    "alignof",
+    "bool",
+    "constexpr",
+    "false",
+    "nullptr",
+    "static_assert",
+    "thread_local",
+    "true",
+    "typeof",
+    "typeof_unqual",
+];
+
+/// C++20 keywords and alternative operator tokens. Contextual words
+/// (`override`, `final`, `import`, `module`) stay identifiers.
+const CPP_KEYWORDS: &[&str] = &[
+    "alignas",
+    "alignof",
+    "and",
+    "and_eq",
+    "asm",
+    "auto",
+    "bitand",
+    "bitor",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "char8_t",
+    "char16_t",
+    "char32_t",
+    "class",
+    "compl",
+    "concept",
+    "const",
+    "consteval",
+    "constexpr",
+    "constinit",
+    "const_cast",
+    "continue",
+    "co_await",
+    "co_return",
+    "co_yield",
+    "decltype",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "dynamic_cast",
+    "else",
+    "enum",
+    "explicit",
+    "export",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "not",
+    "not_eq",
+    "nullptr",
+    "operator",
+    "or",
+    "or_eq",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "reinterpret_cast",
+    "requires",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "static_assert",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "thread_local",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "wchar_t",
+    "while",
+    "xor",
+    "xor_eq",
+];
+
 /// Nesting depth past which bodies are not scanned (deeper symbols are
 /// dropped), so that pathological input cannot overflow the stack.
 const MAX_DEPTH: usize = 64;
 
 fn extract(source: &str, dialect: TokenizerOptions, cpp: bool, sniff: bool) -> Extraction {
-    let tokens = tokenize_with(source, dialect);
+    let mut tokens = tokenize_with(source, dialect);
     let (code, macros) = preprocess(&tokens);
     // A C header (`.h`) that uses C++-only constructs is scanned as C++; its
     // language stays `c`.
@@ -112,6 +274,16 @@ fn extract(source: &str, dialect: TokenizerOptions, cpp: bool, sniff: bool) -> E
     s.body(0, code.len(), &Level::File);
     let mut symbols = s.out;
     symbols.sort_by_key(|s| (s.span.start, std::cmp::Reverse(s.span.end)));
+    // After the symbol scan. A header sniffed as C++ gets the C++ list.
+    // Directive names (`#if`, `#else`) stay identifiers, like `#define`.
+    let words = if cpp { CPP_KEYWORDS } else { C_KEYWORDS };
+    mark_keywords(&mut tokens, words, |t, i| {
+        t[..i]
+            .iter()
+            .rev()
+            .find(|t| t.class != TokenClass::Comment)
+            .is_some_and(|p| p.text == "#")
+    });
     Extraction {
         symbols,
         tokens,

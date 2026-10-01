@@ -286,3 +286,41 @@ proptest! {
         assert_exact_tokens(&src, &ex);
     }
 }
+
+/// #143: reserved words are classed `keyword`; special identifiers stay
+/// identifiers, as do names with a prime.
+#[test]
+fn keywords_are_classed_keyword() {
+    use graph_core::TokenClass::{Identifier, Keyword};
+    let toks = HaskellExtractor
+        .extract("module M where\nimport qualified D as E\nf x = let y' = x in case y' of _ -> foreign\n")
+        .tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    for w in [
+        "module", "where", "import", "let", "in", "case", "of", "foreign",
+    ] {
+        assert_eq!(class(w), [Keyword], "{w}");
+    }
+    for w in ["qualified", "as", "M", "f"] {
+        assert_eq!(class(w), [Identifier], "{w}");
+    }
+    assert!(class("y'").iter().all(|k| *k == Identifier));
+    assert!(HaskellExtractor
+        .version()
+        .starts_with("haskell-scan-1+kw1+tok"));
+}
+
+/// #143: every listed word, written bare, is classed `keyword`.
+#[test]
+fn every_keyword_is_classed_keyword() {
+    for w in KEYWORDS {
+        let toks = HaskellExtractor.extract(w).tokens;
+        assert_eq!(toks.len(), 1, "{w}");
+        assert_eq!(toks[0].class, graph_core::TokenClass::Keyword, "{w}");
+    }
+}

@@ -34,11 +34,19 @@
 //! Known limits: explicit-brace layout (`where { ... }`) is not followed;
 //! pattern bindings (`(a, b) = ...`) and Template Haskell splices are not
 //! symbols; a `.hs` file with a bird-track-looking line is read as literate.
-use graph_core::scan::{code_index, indent_block, span_between};
+use graph_core::scan::{code_index, indent_block, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 
 pub struct HaskellExtractor;
+
+/// Haskell 2010 reserved words plus `foreign`. Special identifiers
+/// (`as`, `qualified`, `hiding`, `forall`, ...) stay identifiers.
+const KEYWORDS: &[&str] = &[
+    "case", "class", "data", "default", "deriving", "do", "else", "foreign", "if", "import", "in",
+    "infix", "infixl", "infixr", "instance", "let", "module", "newtype", "of", "then", "type",
+    "where",
+];
 
 /// Tokenizer dialect used for Haskell.
 pub const HASKELL_TOKENIZER: TokenizerOptions = TokenizerOptions::HASKELL;
@@ -53,11 +61,12 @@ impl Extractor for HaskellExtractor {
     }
 
     fn version(&self) -> String {
-        format!("haskell-scan-1+tok{TOKENIZER_VERSION}")
+        // `kw1`: reserved words are classed `keyword` (#143).
+        format!("haskell-scan-1+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let (tokens, symbols) = match literate_mask(source) {
+        let (mut tokens, symbols) = match literate_mask(source) {
             Some(masked) => {
                 let (tokens, code) = literate_tokens(source, &masked);
                 (tokens, symbols(&code))
@@ -68,6 +77,8 @@ impl Extractor for HaskellExtractor {
                 (tokens, symbols)
             }
         };
+        // After the symbol scan. Haskell has no escaped identifiers.
+        mark_keywords(&mut tokens, KEYWORDS, |_, _| false);
         Extraction {
             symbols,
             tokens,

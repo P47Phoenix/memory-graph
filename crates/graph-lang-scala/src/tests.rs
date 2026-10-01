@@ -238,3 +238,38 @@ proptest! {
         assert_nested(&ex);
     }
 }
+
+/// #143: reserved words are classed `keyword`; soft keywords and
+/// backticked names stay identifiers.
+#[test]
+fn keywords_are_classed_keyword() {
+    use graph_core::TokenClass::{Identifier, Keyword};
+    let toks = ScalaExtractor
+        .extract("object O { def f(using x: Int) = `type` + forSome; val y = this }\n")
+        .tokens;
+    let class = |text: &str| {
+        toks.iter()
+            .filter(|t| t.text == text)
+            .map(|t| t.class)
+            .collect::<Vec<_>>()
+    };
+    for w in ["object", "def", "forSome", "val", "this"] {
+        assert_eq!(class(w), [Keyword], "{w}");
+    }
+    // The Scala dialect lexes a backticked name as one literal token.
+    assert_eq!(class("`type`"), [graph_core::TokenClass::Literal]);
+    for w in ["using", "O", "f", "x", "y"] {
+        assert_eq!(class(w), [Identifier], "{w}");
+    }
+    assert!(ScalaExtractor.version().starts_with("scala-scan-1+kw1+tok"));
+}
+
+/// #143: every listed word, written bare, is classed `keyword`.
+#[test]
+fn every_keyword_is_classed_keyword() {
+    for w in KEYWORDS {
+        let toks = ScalaExtractor.extract(w).tokens;
+        assert_eq!(toks.len(), 1, "{w}");
+        assert_eq!(toks[0].class, graph_core::TokenClass::Keyword, "{w}");
+    }
+}
