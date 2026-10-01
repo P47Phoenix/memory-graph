@@ -452,14 +452,10 @@ fn open_batch_marker_is_cleared_after_a_completed_batch() {
 
 /// Ingest-cost sanity check for the open-batch marker (ADR 0003 story 3,
 /// slice 3n): the marker adds one small `meta`/`open_batch` write per chunk
-/// commit, so unlike slice 3h/3l's byte-growth gates there is no separate
-/// "before" binary to diff against in this same test process -- instead this
-/// asserts a generous wall-clock ceiling on indexing this repo's own
-/// `crates/` tree chunked finely enough that nearly every file is its own
-/// chunk (worst case for marker-write overhead), so a real regression in the
-/// marker bookkeeping would blow well past it. The ceiling scales with total
-/// source bytes plus a per-chunk allowance, because the tree grows and cost
-/// tracks bytes, not files (issues #125, #136).
+/// commit. This indexes this repo's own `crates/` tree one file per chunk
+/// (worst case for marker-write overhead) with the marker and, as a baseline
+/// that pays exactly the same per-chunk durable commits, without it (a
+/// test-only switch), and gates on the ratio (issues #125, #136, #154).
 #[test]
 fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_own_corpus() {
     let files = this_repos_rust_corpus();
@@ -509,63 +505,49 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
         secs
     };
 
-    // Relative, not absolute (issue #136). Each round indexes the same batch
-    // unchunked (one transaction, the marker written once) and then chunked
-    // one file per chunk (every file its own fsync'd commit plus a marker
-    // re-stamp), back to back. Extraction and byte-proportional work are the
-    // same in both, so the excess of chunked over unchunked, as a fraction of
-    // unchunked, is the per-chunk commit + marker cost normalised by how fast
-    // this machine is right now. The best (smallest) round is kept, since
-    // load only ever adds noise.
-    let mut best = (f64::MAX, 0.0, 0.0);
+    // Relative, not absolute (issues #136, #154). Each round indexes the same
+    // batch one file per chunk twice, with the open-batch marker and without
+    // it, in alternating order. Both pay the same per-chunk durable commits, so
+    // their ratio isolates what the marker adds. The earlier baseline, an
+    // unchunked ingest, did not: on the windows-latest runner a durable commit
+    // costs ~220 ms (181 commits: unchunked 4.7 s, one chunk per file 44 s,
+    // with or without the marker), which no ratio against unchunked can absorb.
+    // The best (smallest) time of each kind is kept, since load only ever adds
+    // noise.
+    let (mut with_marker, mut without) = (f64::MAX, f64::MAX);
     for round in 0..3 {
-        let u = time_one(usize::MAX, false);
-        let c = time_one(1, false);
-        let c0 = time_one(1, true);
-        eprintln!(
-            "DIAG #154 round {round}: unchunked {:.1} ms, chunked+marker {:.1} ms, chunked \
-             no-marker {:.1} ms",
-            u * 1000.0,
-            c * 1000.0,
-            c0 * 1000.0
-        );
-        let excess = (c - u).max(0.0) / u;
-        if excess < best.0 {
-            best = (excess, u, c);
-        }
+        let (m, b) = if round % 2 == 0 {
+            let m = time_one(1, false);
+            (m, time_one(1, true))
+        } else {
+            let b = time_one(1, true);
+            (time_one(1, false), b)
+        };
+        with_marker = with_marker.min(m);
+        without = without.min(b);
     }
-    let (excess, unchunked, chunked) = best;
-    let per_chunk_ms = (chunked - unchunked).max(0.0) * 1000.0 / chunks as f64;
+    let excess = (with_marker - without) / without;
+    let per_chunk_ms = (with_marker - without) * 1000.0 / chunks as f64;
     eprintln!(
-        "chunked ingest with open-batch marker, {chunks} files ({total_bytes} bytes): unchunked \
-         {:.1} ms, one chunk per file {:.1} ms, excess {:.2}x of unchunked ({per_chunk_ms:.2} ms \
-         per chunk)",
-        unchunked * 1000.0,
-        chunked * 1000.0,
+        "one-chunk-per-file ingest, {chunks} files ({total_bytes} bytes): with open-batch marker \
+         {:.1} ms, without {:.1} ms, marker excess {:+.3}x ({per_chunk_ms:+.2} ms per chunk)",
+        with_marker * 1000.0,
+        without * 1000.0,
         excess
     );
-    // Gate on the excess ratio. Measured (Windows debug, 145 files, 3.08 MB;
-    // see PR #141): idle 0.40-0.47, with 32 CPU burners on 32 cores 0.26-0.57
-    // (absolute per-chunk ms rises 3-10x under load, so a fixed ms gate
-    // cannot separate load from a regression; the ratio can). An injected
-    // 30 ms per chunk commit, or per-chunk bookkeeping that grows with the
-    // number of chunks, both land well above the gate: +30 ms per commit
-    // gave 2.84-2.95x, a sleep of 0.2 ms x chunk index 1.59-1.64x. Re-measured
-    // after #187 (Windows debug, 181 files, 4.12 MB, 10 runs): 0.37-0.42x, so
-    // the Windows CI leg runs it too (#154).
-    const EXCESS_GATE: f64 = 1.0;
+    // Measured, marker excess: Windows debug local (181 files, 4.12 MB) within
+    // +-0.01; windows-latest runner -0.10 to +0.03 (per-round noise there is
+    // ~10%). The marker is two small table writes inside a transaction that
+    // commits anyway, so a real regression (extra commits or fsyncs, or
+    // bookkeeping that grows with the chunk count) lands far above the gate.
+    const EXCESS_GATE: f64 = 0.5;
     assert!(
         excess < EXCESS_GATE,
-        "one-chunk-per-file ingest was {excess:.2}x slower than unchunked ({per_chunk_ms:.2} ms \
-         per chunk; unchunked {:.1} ms, chunked {:.1} ms, {chunks} chunks); expected under \
-         {EXCESS_GATE}x",
-        unchunked * 1000.0,
-        chunked * 1000.0
-    );
-    // Very generous absolute sanity bound only (~20x the idle debug time).
-    assert!(
-        chunked < 60.0,
-        "chunked ingest took {chunked:.1} s, expected well under 60 s"
+        "one-chunk-per-file ingest with the open-batch marker was {excess:.2}x slower than \
+         without it ({per_chunk_ms:.2} ms per chunk; with {:.1} ms, without {:.1} ms, {chunks} \
+         chunks); expected under {EXCESS_GATE}x",
+        with_marker * 1000.0,
+        without * 1000.0
     );
 }
 
