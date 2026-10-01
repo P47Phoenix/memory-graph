@@ -646,6 +646,47 @@ fn every_parsed_token_is_stored() {
     spot("PUSH2", "asm", "macro", "Chapter 06/codesnippets.s");
     spot("VAR1", "asm", "equ", "Chapter 06/codesnippets.s");
     spot("hexstr", "asm", "data", "Chapter 04/printdword.s");
+    // MASM (PROC/ENDP, STRUCT, MACRO), ARM32 GNU as and AT&T x86 GNU as.
+    spot("DrawWall", "asm", "proc", "main.asm/main.asm/main.asm");
+    spot("Arena", "asm", "struct", "source/main.asm");
+    spot("macrowhile", "asm", "macro", "source/chapters/macros.asm");
+    spot("_prompt", "asm", "label", "game1/prompt.asm");
+    spot("swtch", "asm", "label", "swtch.S");
+    // Fixed-form and mixed RPG IV: a P spec with a `...` long name, a D-spec
+    // data structure inside it, and a C-spec subroutine.
+    spot(
+        "list_sort_insertionSort",
+        "rpg",
+        "procedure",
+        "main/linkedlist/llist_sort.rpgle",
+    );
+    spot("header", "rpg", "ds", "main/linkedlist/llist_sort.rpgle");
+    spot(
+        "httpCodes",
+        "rpg",
+        "standalone",
+        "code_examples/rpg/COMPTIMARR.rpgle",
+    );
+    spot(
+        "GetConfig",
+        "rpg",
+        "subroutine",
+        "tests/rpgle/CBKPCFGREA.rpgle",
+    );
+    // IBM-style COBOL: sequence numbers in columns 1-6, an identification
+    // area in 73-80, and copybooks.
+    spot("CBACT01C", "cobol", "program", "app/cbl/CBACT01C.cbl");
+    spot(
+        "WORKING-STORAGE",
+        "cobol",
+        "section",
+        "app/app-transaction-type-db2/cbl/COBTUPDT.cbl",
+    );
+    spot("CC-WORK-AREAS", "cobol", "level-01", "app/cpy/CVCRD01Y.cpy");
+    // Shell (an extensionless script found by its shebang) and R.
+    spot("canonicalize", "shell", "function", "libexec/rbenv");
+    spot("_rbenv", "shell", "function", "completions/rbenv.bash");
+    spot("Standardize", "r", "function", "R/impact_misc.R");
     // Cross-repo, cross-language search works on real code.
     let hits = store.search(&Query::new("ITransport")).unwrap();
     let repos: BTreeSet<_> = hits.iter().filter_map(|h| h.repo.clone()).collect();
@@ -698,6 +739,16 @@ fn token_classes_are_sensible_on_real_code() {
     assert!(cs
         .iter()
         .any(|t| t.text == "AbstractRebusTransport" && t.class == TokenClass::Identifier));
+    let sh = classes("rbenv", "libexec/rbenv");
+    assert!(sh.iter().any(|t| t.class == TokenClass::Comment));
+    assert!(sh
+        .iter()
+        .any(|t| t.text == "canonicalize" && t.class == TokenClass::Identifier));
+    let r = classes("causalimpact", "R/impact_misc.R");
+    assert!(r.iter().any(|t| t.class == TokenClass::Comment));
+    assert!(r
+        .iter()
+        .any(|t| t.text == "Standardize" && t.class == TokenClass::Identifier));
 }
 
 /// A second `index` of the same corpus skips every file, changes nothing and
@@ -763,8 +814,8 @@ fn second_index_of_the_corpus_reports_everything_unchanged() {
 /// changed (bump `TOKENIZER_VERSION`, re-pin) or the corpus did.
 #[test]
 fn non_rust_corpus_token_streams_are_unchanged() {
-    const EXPECTED_FILES: usize = 704;
-    const EXPECTED_HASH: u64 = 2636213689751639222;
+    const EXPECTED_FILES: usize = 758;
+    const EXPECTED_HASH: u64 = 12922119727943935660;
     let (mut n, mut h) = (0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
         let dir = corpus_dir().join(r["dir"].as_str().unwrap());
