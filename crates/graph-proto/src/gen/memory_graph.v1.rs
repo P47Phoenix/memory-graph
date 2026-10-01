@@ -1385,9 +1385,10 @@ pub mod store_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Store", "DescribeByScan"));
             self.inner.unary(req, path, codec).await
         }
-        /// Languages whose stored symbols came from an extractor this server lacks
-        /// (`Store::extractor_gaps`, #165): the server parses `Write.Index`, so its
-        /// registry is the one that matters. Always this node's store, now.
+        /// Languages whose stored symbols came from an extractor the leader lacks
+        /// (`Store::extractor_gaps`, #165): `Write.Index` is forwarded to and parsed
+        /// by the leader, so its registry is the one that matters. A follower
+        /// forwards this call to the leader, as it does a write.
         pub async fn extractor_gaps(
             &mut self,
             request: impl tonic::IntoRequest<super::ExtractorGapsRequest>,
@@ -1638,9 +1639,10 @@ pub mod store_server {
             tonic::Response<super::DescribeResponse>,
             tonic::Status,
         >;
-        /// Languages whose stored symbols came from an extractor this server lacks
-        /// (`Store::extractor_gaps`, #165): the server parses `Write.Index`, so its
-        /// registry is the one that matters. Always this node's store, now.
+        /// Languages whose stored symbols came from an extractor the leader lacks
+        /// (`Store::extractor_gaps`, #165): `Write.Index` is forwarded to and parsed
+        /// by the leader, so its registry is the one that matters. A follower
+        /// forwards this call to the leader, as it does a write.
         async fn extractor_gaps(
             &self,
             request: tonic::Request<super::ExtractorGapsRequest>,
