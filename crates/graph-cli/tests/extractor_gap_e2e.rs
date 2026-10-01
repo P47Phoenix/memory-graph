@@ -138,6 +138,18 @@ fn alpha_symbols(target: &[&str]) -> usize {
     v["results"].as_array().map_or(0, Vec::len)
 }
 
+/// Files of `o/r` holding the token `delta` (only `b.txt` has it).
+fn delta_files(target: &[&str]) -> usize {
+    let mut a = target.to_vec();
+    a.extend([
+        "search", "delta", "--repo", "r", "--grain", "file", "--json",
+    ]);
+    let o = run(&a);
+    assert!(o.status.success(), "{}", text(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    v["results"].as_array().map_or(0, Vec::len)
+}
+
 /// Drop what legitimately differs between an embedded and a served run.
 fn refusal_lines(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr)
@@ -150,7 +162,8 @@ fn refusal_lines(o: &Output) -> String {
 /// Every refusal, then `--force`, on one target; returns the refusal text.
 fn refuse_then_force(target: &[&str], src: &Path) -> String {
     let dir = src.to_str().unwrap();
-    let file = src.join("a.toy");
+    // A plain-text file: the refusal is repo-wide, not per language.
+    let file = src.join("b.txt");
     let file = file.to_str().unwrap();
     let idx = |extra: &[&str]| {
         let mut a = target.to_vec();
@@ -174,8 +187,9 @@ fn refuse_then_force(target: &[&str], src: &Path) -> String {
         if first.is_empty() {
             first = refusal_lines(&o);
         }
-        // Nothing was written: the symbol is still there.
+        // Nothing was written: the symbol is still there, b.txt is not.
         assert_eq!(alpha_symbols(target), 1, "{extra:?}");
+        assert_eq!(delta_files(target), 0, "{extra:?}");
     }
     let mut a = target.to_vec();
     a.extend(["index-file", "--org", "o", "--repo", "r", file]);
@@ -183,6 +197,19 @@ fn refuse_then_force(target: &[&str], src: &Path) -> String {
     assert!(!o.status.success(), "index-file was not refused");
     assert!(text(&o).contains("refusing to index o/r"), "{}", text(&o));
     assert_eq!(alpha_symbols(target), 1);
+    assert_eq!(delta_files(target), 0);
+
+    // index-file --force stores the file, warning; the toy file (and its
+    // gap) is untouched, so the next run is still refused.
+    let mut a = target.to_vec();
+    a.extend(["index-file", "--org", "o", "--repo", "r", "--force", file]);
+    let o = run(&a);
+    let t = text(&o);
+    assert!(o.status.success(), "{t}");
+    assert!(t.contains("warning:") && t.contains("--force"), "{t}");
+    assert_eq!(delta_files(target), 1);
+    assert_eq!(alpha_symbols(target), 1);
+    assert!(!idx(&[]).status.success());
 
     // Another repo has no gap: not refused.
     let mut a = target.to_vec();
@@ -190,9 +217,9 @@ fn refuse_then_force(target: &[&str], src: &Path) -> String {
     let o = run(&a);
     assert!(o.status.success(), "{}", text(&o));
 
-    // --force indexes anyway, warning; the symbols are gone, and so is the
-    // gap, so a later run is not refused.
-    let o = idx(&["--force", "--reindex"]);
+    // --force alone (no --prune, no --reindex) indexes anyway, warning; the
+    // symbols are gone, and so is the gap, so a later run is not refused.
+    let o = idx(&["--force"]);
     let t = text(&o);
     assert!(o.status.success(), "{t}");
     assert!(
@@ -200,6 +227,7 @@ fn refuse_then_force(target: &[&str], src: &Path) -> String {
         "{t}"
     );
     assert_eq!(alpha_symbols(target), 0);
+    assert!(delta_files(target) >= 1);
     let o = idx(&[]);
     assert!(o.status.success(), "{}", text(&o));
     first
@@ -209,6 +237,7 @@ fn source(root: &Path) -> std::path::PathBuf {
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("a.toy"), b"alpha beta\n").unwrap();
+    std::fs::write(src.join("b.txt"), b"delta\n").unwrap();
     src
 }
 

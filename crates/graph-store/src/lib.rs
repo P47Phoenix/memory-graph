@@ -62,11 +62,20 @@ pub const ORIGIN_DIRECTORY: &str = "directory";
 /// this holds for an error that came back over the wire too, whatever a
 /// proxy did to its message.
 pub fn is_strict_encoding_refusal(e: &StoreError) -> bool {
-    matches!(
-        e,
-        StoreError::NotUtf8(_) | StoreError::StrictEncoding { .. }
-    )
+    match e {
+        StoreError::NotUtf8(_) | StoreError::StrictEncoding { .. } => true,
+        // Version skew (#180): a server from before the typed variant sends
+        // a `Rejected` ending in this text. Kept for one release; removed
+        // in the next (ADR 0007).
+        StoreError::Rejected(m) => m.ends_with(LEGACY_STRICT_ENCODING_SUFFIX),
+        _ => false,
+    }
 }
+
+/// The end of the `Rejected` message older servers sent for a non-UTF-8
+/// strict refusal, before `StoreError::StrictEncoding` (#180). Recognised
+/// for one release only.
+const LEGACY_STRICT_ENCODING_SUFFIX: &str = "(strict encoding)";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

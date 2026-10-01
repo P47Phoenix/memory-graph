@@ -546,8 +546,9 @@ enum Cmd {
         #[arg(long)]
         strict_encoding: bool,
         /// Index even when the repo has symbols stored by an extractor that the store parsing the file
-        /// (this build, or the server with --server) lacks; refused by default, since re-indexed files
-        /// of that language are stored tokens-only
+        /// (this build, or the cluster leader with --server) lacks; refused by default, since re-indexed
+        /// files of that language are stored tokens-only. The check is repo-wide: it refuses even when this
+        /// file is in another language
         #[arg(long)]
         force: bool,
         /// The file to index; stored under the repo by this path as given
@@ -577,9 +578,10 @@ enum Cmd {
         #[arg(long)]
         prune: bool,
         /// Index even when the repo has symbols stored by an extractor that the store parsing this run
-        /// (this build, or the server with --server) lacks: those files are stored tokens-only and lose
-        /// their symbols, which is refused by default. With --prune, also allow removing files even when
-        /// this run indexed nothing
+        /// (this build, or the cluster leader with --server) lacks: those files are stored tokens-only and
+        /// lose their symbols, so such a run is refused by default. The check is repo-wide: any such file
+        /// in the repo refuses the run, whichever files it indexes. With --prune, --force also overrides
+        /// the empty-run guard (allows removing files even when this run indexed nothing)
         #[arg(long)]
         force: bool,
         /// Re-index every file even when unchanged since it was last indexed (by default files with the

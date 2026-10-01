@@ -190,15 +190,25 @@ fn human_size(bytes: u64) -> String {
 /// languages whose stored symbols came from an extractor the store that
 /// parses lacks (this build when embedded, the server with `--server`):
 /// re-indexing those files would store them tokens-only and drop their
-/// symbols. Refuses, naming each gap, unless `force`, which only warns. A
-/// failed check (e.g. a server without the RPC) is only a warning.
+/// symbols. The check is repo-wide: any gap in the repo refuses the run,
+/// whichever files it indexes. Refuses, naming each gap, unless `force`,
+/// which only warns. A failed check refuses too (unless `force`), except
+/// `Protocol` from a server too old to have the RPC, which only warns.
 pub fn check_extractor_gaps(store: &dyn Store, org: &str, repo: &str, force: bool) -> Result<()> {
     let gaps = match store.extractor_gaps(Some(org), Some(repo)) {
         Ok(gaps) => gaps,
-        Err(e) => {
-            eprintln!("warning: could not check stored extractors: {e}");
+        // A server too old to have the RPC (UNIMPLEMENTED): fail open.
+        Err(e @ graph_store::StoreError::Protocol(_)) => {
+            eprintln!("warning: could not check stored extractors (the server is too old): {e}");
             return Ok(());
         }
+        Err(e) if force => {
+            eprintln!("warning: could not check stored extractors: {e} (--force: indexing anyway)");
+            return Ok(());
+        }
+        Err(e) => bail!(
+            "refusing to index {org}/{repo}: could not check for symbols stored by a missing extractor: {e}; retry, or pass --force to index anyway"
+        ),
     };
     if gaps.is_empty() {
         return Ok(());
@@ -367,7 +377,8 @@ fn flush_batch(
                 t.skipped.entry("binary".into()).or_default().push(rel)
             }
             // ADR 0007 C3: only --strict-encoding refuses a file for its
-            // encoding, as NotUtf8 (decoded as UTF-8) or Rejected naming it.
+            // encoding, as NotUtf8 (decoded as UTF-8) or StrictEncoding
+            // naming it (or, from an older server, its legacy Rejected).
             Err(e) if graph_store::is_strict_encoding_refusal(&e) => t
                 .skipped
                 .entry(STRICT_ENCODING_REFUSED.into())

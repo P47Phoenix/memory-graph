@@ -1336,3 +1336,55 @@ fn a_transfer_waits_for_a_write_in_flight() {
         "the write is on the target"
     );
 }
+
+/// #165: `Store.ExtractorGaps` asked of a follower is forwarded to the
+/// leader, whose registry parses every write: a follower rebuilt without
+/// the Rust extractor answers the leader's (empty) gaps, while the same
+/// request marked as already forwarded is answered from the follower's own
+/// store and names the gap.
+#[test]
+fn extractor_gaps_via_follower_are_the_leaders() {
+    let _w = watchdog("extractor_gaps_via_follower_are_the_leaders", TEST_LIMIT);
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let index = tb.write_via_leader(|c| {
+        let (path, bytes) = small_file(0);
+        c.index_bytes("o", "r", &path, &bytes, None).unwrap();
+        c.applied_index().load(Ordering::SeqCst)
+    });
+    tb.wait_applied(index, CLUSTER_WAIT);
+    let leader = tb.leader();
+    let f = node_ids_other_than(&tb, &[leader])[0];
+    tb.node_mut(f).stop();
+    tb.node_mut(f).set_extractors(vec![]);
+    tb.node_mut(f).restart();
+    let leader = tb.wait_leader(CLUSTER_WAIT);
+    assert_ne!(leader, f, "the rebuilt node must stay a follower");
+    wait_until("the rebuilt follower caught up", || {
+        tb.node(f).applied_index() >= index
+    });
+    assert_eq!(
+        tb.client(f).extractor_gaps(Some("o"), Some("r")).unwrap(),
+        vec![]
+    );
+    let local = rt().block_on(async {
+        let ch =
+            tonic::transport::Endpoint::from_shared(format!("http://{}", tb.node(f).endpoint()))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+        let mut s = pb::store_client::StoreClient::with_interceptor(ch, graph_proto::SendVersion);
+        let mut req = tonic::Request::new(pb::ExtractorGapsRequest {
+            org: Some("o".into()),
+            repo: Some("r".into()),
+        });
+        req.metadata_mut().insert(
+            graph_server::forward::FORWARDED_BY_HEADER,
+            "9".parse().unwrap(),
+        );
+        s.extractor_gaps(req).await.unwrap().into_inner().gaps
+    });
+    assert_eq!(local.len(), 1, "{local:?}");
+    assert_eq!(local[0].language, "rust");
+}

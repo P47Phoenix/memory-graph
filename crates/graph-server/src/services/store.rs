@@ -249,13 +249,26 @@ impl pb::store_server::Store for StoreService {
         ))
     }
 
-    /// #165: this node's gaps, from its own registry (the one that parses
-    /// what a client sends). Not a `View` read: the registry is the node's,
-    /// so a snapshot or the leader would not answer for it.
+    /// #165: the leader's gaps, from its registry: writes (`Index`) are
+    /// forwarded to the leader, so its extractors are the ones a client's
+    /// run meets. A follower forwards this call there like a write
+    /// (`mg-forwarded-by` stops loops); the leader answers from its store.
     async fn extractor_gaps(
         &self,
         req: Request<pb::ExtractorGapsRequest>,
     ) -> Result<Response<pb::ExtractorGapsResponse>, Status> {
+        use crate::forward::{forward_error, within, Forwarder, Route, FORWARD_UNARY_TIMEOUT};
+        if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+            let deadline = self.ctx.fwd.deadline(req.metadata(), FORWARD_UNARY_TIMEOUT);
+            let mut client = self.ctx.fwd.store_client(&addr)?;
+            let resp = within(
+                deadline,
+                client.extractor_gaps(Forwarder::request(req.into_inner(), deadline)),
+            )
+            .await
+            .map_err(forward_error)?;
+            return Ok(Response::new(resp.into_inner()));
+        }
         let r = req.into_inner();
         let slot = Arc::clone(&self.ctx.slot);
         let gaps = tokio::task::spawn_blocking(move || {

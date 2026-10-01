@@ -30,9 +30,10 @@ service Store {
   rpc Describe(DescribeRequest) returns (DescribeResponse);
   // The reference scan behind `describe` (conformance oracle).
   rpc DescribeByScan(DescribeRequest) returns (DescribeResponse);
-  // Languages whose stored symbols came from an extractor this server lacks
-  // (`Store::extractor_gaps`, #165): the server parses `Write.Index`, so its
-  // registry is the one that matters. Always this node's store, now.
+  // Languages whose stored symbols came from an extractor the leader lacks
+  // (`Store::extractor_gaps`, #165): `Write.Index` is forwarded to and parsed
+  // by the leader, so its registry is the one that matters. A follower
+  // forwards this call to the leader, as it does a write.
   rpc ExtractorGaps(ExtractorGapsRequest) returns (ExtractorGapsResponse);
   // A request without `limit` gets the server's default limit (1000); when that
   // fills the page, `applied_default_limit` is set and the client pages to completion.

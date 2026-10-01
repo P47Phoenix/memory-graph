@@ -1202,7 +1202,10 @@ fn strict_encoding_survives_a_rewritten_message() {
         e.to_string(),
         "rejected: `a.txt` has byte sequences that are invalid in Shift_JIS (strict encoding)"
     );
-    // A bare `Rejected` ending in the old text is no longer a strict refusal.
-    let plain = StoreError::Rejected("x (strict encoding)".into());
+    // Version skew, for one release: an older server's `Rejected` ending
+    // in the legacy text still counts; other `Rejected`s do not.
+    let legacy = StoreError::Rejected("`x` has ... invalid in Shift_JIS (strict encoding)".into());
+    assert!(graph_store::is_strict_encoding_refusal(&legacy));
+    let plain = StoreError::Rejected("strict encoding, but not the suffix".into());
     assert!(!graph_store::is_strict_encoding_refusal(&plain));
 }

@@ -736,9 +736,10 @@ impl Store for RemoteStore {
         Ok(r.into_inner().removed)
     }
 
-    /// #165: the server's gaps (`Store.ExtractorGaps`): it parses what this
-    /// client sends, so its registry is the one that decides. A server
-    /// without the RPC answers `Protocol` (UNIMPLEMENTED).
+    /// #165: the cluster leader's gaps (`Store.ExtractorGaps`; a follower
+    /// forwards the call): writes go to the leader, so its registry is the
+    /// one that decides. A server without the RPC answers `Protocol`
+    /// (UNIMPLEMENTED).
     fn extractor_gaps(
         &self,
         org: Option<&str>,
