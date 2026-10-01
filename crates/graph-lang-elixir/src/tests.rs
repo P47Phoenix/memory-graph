@@ -253,3 +253,28 @@ fn keywords_are_classed_keyword() {
         .version()
         .starts_with("elixir-scan-1+kw1+tok"));
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// Every listed word, bare, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        let toks = ElixirExtractor.extract(kw).tokens;
+        assert_eq!(classes_of(&toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+}
+
+/// `do::` is no keyword-list key, so `do` stays a keyword; `do:` is a key.
+#[test]
+fn elixir_double_colon_is_not_a_key() {
+    let toks = ElixirExtractor.extract("x do::y").tokens;
+    assert_eq!(classes_of(&toks, "do"), [TokenClass::Keyword]);
+    let toks = ElixirExtractor.extract("x do: y").tokens;
+    assert_eq!(classes_of(&toks, "do"), [TokenClass::Identifier]);
+}

@@ -231,3 +231,28 @@ fn keywords_are_classed_keyword() {
     assert_eq!(class("next"), [TokenClass::Keyword]);
     assert!(RExtractor.version().starts_with("r-scan-2+kw1+tok"));
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// Every listed word, bare, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        let toks = RExtractor.extract(kw).tokens;
+        assert_eq!(classes_of(&toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+}
+
+/// A slot after `@` is a name; a spaced `@ if` is not glued.
+#[test]
+fn r_at_escape() {
+    let toks = RExtractor.extract("x@if\n").tokens;
+    assert_eq!(classes_of(&toks, "if"), [TokenClass::Identifier]);
+    let toks = RExtractor.extract("x @ if\n").tokens;
+    assert_eq!(classes_of(&toks, "if"), [TokenClass::Keyword]);
+}

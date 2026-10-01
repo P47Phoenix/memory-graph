@@ -370,6 +370,9 @@ fn is_plain_word(t: &[TokenDecl], i: usize) -> bool {
     let Some(p) = (0..i).rev().find(code) else {
         return false;
     };
+    if in_array_literal(t, i) {
+        return true;
+    }
     if t[i].text == "in" {
         let pp = (0..p).rev().find(code);
         return !pp.is_some_and(|q| matches!(t[q].text.as_str(), "for" | "case" | "select"));
@@ -384,6 +387,26 @@ fn is_plain_word(t: &[TokenDecl], i: usize) -> bool {
         "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "time"
     );
     !(new_line || op || after_kw)
+}
+
+/// Whether `i` sits inside an array literal `name=( ... )` (or `+=(`): the
+/// nearest unclosed `(` before it directly follows a glued `=`. The walk back
+/// is bounded, so a huge file stays linear.
+fn in_array_literal(t: &[TokenDecl], i: usize) -> bool {
+    let mut depth = 0usize;
+    for j in (i.saturating_sub(512)..i).rev() {
+        match t[j].text.as_str() {
+            ")" => depth += 1,
+            "(" if depth > 0 => depth -= 1,
+            "(" => {
+                return j > 0
+                    && t[j - 1].text.ends_with('=')
+                    && t[j - 1].span.end == t[j].span.start;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 #[cfg(test)]

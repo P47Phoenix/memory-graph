@@ -218,3 +218,61 @@ fn keywords_are_classed_keyword() {
     assert_eq!(class("echo"), [TokenClass::Identifier]);
     assert!(ShellExtractor.version().starts_with("shell-scan-2+kw1+tok"));
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// Every listed word, bare in command position, is a keyword (`in` after
+/// `for x`).
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        let src = if *kw == "in" {
+            "for x in a".to_string()
+        } else {
+            kw.to_string()
+        };
+        let toks = ShellExtractor.extract(&src).tokens;
+        assert_eq!(classes_of(&toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+}
+
+/// Array literals, `for in in`, `\`-continued lines and each command-start
+/// operator.
+#[test]
+fn keyword_positions_in_shell() {
+    let toks = ShellExtractor
+        .extract("arr=(if then fi)\nx+=(do done)\n")
+        .tokens;
+    assert!(
+        toks.iter().all(|t| t.class != TokenClass::Keyword),
+        "{toks:?}"
+    );
+    // The loop variable may be named `in`; the second `in` is the keyword.
+    let toks = ShellExtractor.extract("for in in a; do :; done\n").tokens;
+    assert_eq!(
+        classes_of(&toks, "in"),
+        [TokenClass::Identifier, TokenClass::Keyword]
+    );
+    // A `\`-continued line keeps the argument an argument.
+    let toks = ShellExtractor.extract("echo \\\n  done\n").tokens;
+    assert_eq!(classes_of(&toks, "done"), [TokenClass::Identifier]);
+    for src in [
+        "! if x",
+        "{ if x",
+        "( if x",
+        "a && if x",
+        "a | if x",
+        "a; if x",
+    ] {
+        let toks = ShellExtractor.extract(src).tokens;
+        assert_eq!(classes_of(&toks, "if"), [TokenClass::Keyword], "{src}");
+    }
+    // A subshell after an assignment-free `(` is still command position.
+    let toks = ShellExtractor.extract("(if x; then :; fi)").tokens;
+    assert_eq!(classes_of(&toks, "then"), [TokenClass::Keyword]);
+}

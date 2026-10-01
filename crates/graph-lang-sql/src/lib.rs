@@ -37,8 +37,9 @@ pub struct SqlExtractor;
 
 /// Reserved words common to ANSI SQL and the major dialects, upper case;
 /// matched case-insensitively. Words that are routinely column names
-/// (`name`, `key`, `value`, `date`, `type`, ...) are left out, and quoted
-/// names (`"select"`, `[select]`) are whole tokens and never match.
+/// (`name`, `key`, `value`, `date`, `type`, `index`, `limit`,
+/// `offset`, `desc`, ...) are left out, and quoted names (`"select"`,
+/// `[select]`) are whole tokens and never match.
 const KEYWORDS: &[&str] = &[
     "ADD",
     "ALL",
@@ -61,7 +62,6 @@ const KEYWORDS: &[&str] = &[
     "DECLARE",
     "DEFAULT",
     "DELETE",
-    "DESC",
     "DISTINCT",
     "DROP",
     "ELSE",
@@ -82,7 +82,6 @@ const KEYWORDS: &[&str] = &[
     "HAVING",
     "IF",
     "IN",
-    "INDEX",
     "INNER",
     "INSERT",
     "INTERSECT",
@@ -91,11 +90,9 @@ const KEYWORDS: &[&str] = &[
     "JOIN",
     "LEFT",
     "LIKE",
-    "LIMIT",
     "NOT",
     "NULL",
     "OF",
-    "OFFSET",
     "ON",
     "OR",
     "ORDER",

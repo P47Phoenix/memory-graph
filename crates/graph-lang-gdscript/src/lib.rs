@@ -34,7 +34,8 @@ use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, Toke
 pub struct GdscriptExtractor;
 
 /// GDScript 4 keywords, including the word operators and `true`/`false`/
-/// `null`. Built-in constants (`PI`, `INF`, ...) and types stay identifiers.
+/// `null`. Built-in constants (`PI`, `INF`, ...), types and built-in functions
+/// (`preload`) stay identifiers.
 const KEYWORDS: &[&str] = &[
     "and",
     "as",
@@ -61,7 +62,6 @@ const KEYWORDS: &[&str] = &[
     "null",
     "or",
     "pass",
-    "preload",
     "return",
     "self",
     "signal",

@@ -274,3 +274,35 @@ fn keywords_are_classed_keyword() {
         .version()
         .starts_with("gdscript-scan-2+kw1+tok"));
 }
+
+fn classes_of(toks: &[TokenDecl], text: &str) -> Vec<TokenClass> {
+    toks.iter()
+        .filter(|t| t.text == text)
+        .map(|t| t.class)
+        .collect()
+}
+
+/// Every listed word, bare, is a keyword.
+#[test]
+fn every_listed_keyword_is_classed_keyword() {
+    for kw in KEYWORDS {
+        let toks = GdscriptExtractor.extract(kw).tokens;
+        assert_eq!(classes_of(&toks, kw), [TokenClass::Keyword], "{kw}");
+    }
+}
+
+/// Node paths (`$match`) and annotations (`@static`) are names; `preload`
+/// is a built-in function.
+#[test]
+fn gdscript_dollar_and_at_escapes() {
+    let toks = GdscriptExtractor
+        .extract("var a = $match\n@static\nvar b = preload(\"x\")\n")
+        .tokens;
+    assert_eq!(classes_of(&toks, "match"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "static"), [TokenClass::Identifier]);
+    assert_eq!(classes_of(&toks, "preload"), [TokenClass::Identifier]);
+    assert_eq!(
+        classes_of(&toks, "var"),
+        [TokenClass::Keyword, TokenClass::Keyword]
+    );
+}
