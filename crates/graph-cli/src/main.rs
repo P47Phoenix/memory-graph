@@ -482,13 +482,13 @@ enum Cmd {
         /// log rather than by a snapshot (default 1000)
         #[arg(long, value_name = "N")]
         log_keep_entries: Option<u64>,
-        /// Election timeout lower bound, ms (--data-dir default 1000)
+        /// Election timeout lower bound, ms (default: --data-dir 1000, --db 2000)
         #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
         election_timeout_min: Option<u64>,
-        /// Election timeout upper bound, ms (--data-dir default 2000)
+        /// Election timeout upper bound, ms (default: --data-dir 2000, --db 4000)
         #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
         election_timeout_max: Option<u64>,
-        /// Leader heartbeat interval, ms (--data-dir default 250)
+        /// Leader heartbeat interval, ms (default: --data-dir 250, --db 500)
         #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
         heartbeat_interval: Option<u64>,
         /// A leader that has heard from no quorum for this long answers its pending writes

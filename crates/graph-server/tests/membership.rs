@@ -1388,3 +1388,56 @@ fn extractor_gaps_via_follower_are_the_leaders() {
     assert_eq!(local.len(), 1, "{local:?}");
     assert_eq!(local[0].language, "rust");
 }
+
+/// Issue #205: a node that leads alone suspends openraft's ticks, so an
+/// idle sole voter publishes no metrics (nothing wakes the readiness and
+/// snapshot-policy loops); a join resumes them, so the learner keeps
+/// hearing heartbeats while idle; removing it suspends them again, and the
+/// node still serves writes throughout.
+#[test]
+fn sole_voter_suspends_ticks_until_the_membership_grows() {
+    let _w = watchdog(
+        "sole_voter_suspends_ticks_until_the_membership_grows",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::new(1, exts());
+    let suspended = |tb: &ClusterTestbed| tb.node(1).raft().unwrap().ticks.suspended();
+    // Idle with ticks off: the metrics stay still for many tick periods.
+    let idle_metrics_still = |tb: &ClusterTestbed| {
+        let mut rx = tb.node(1).raft().unwrap().raft.metrics();
+        // Past any trailing update of the last write or change.
+        std::thread::sleep(Duration::from_millis(300));
+        rx.borrow_and_update();
+        std::thread::sleep(Duration::from_millis(1500));
+        !rx.has_changed().unwrap()
+    };
+    wait_until("node 1, leading alone, suspends its ticks", || {
+        suspended(&tb)
+    });
+    assert!(idle_metrics_still(&tb), "an idle sole voter still ticks");
+
+    let cfg = join_cfg(&tb, 2, false);
+    tb.add_node(2, cfg, exts()).unwrap();
+    assert!(!suspended(&tb), "ticks stay suspended with a learner");
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    // Idle, the learner still hears from the leader every heartbeat.
+    let learner = tb.node(2).raft().unwrap();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        let heard = learner.obs.since_heard_from_leader().unwrap();
+        assert!(
+            heard < Duration::from_millis(1000),
+            "the idle learner has not heard from the leader for {heard:?}"
+        );
+    }
+
+    tb.client(1).admin_remove(2, true).unwrap();
+    wait_until("node 1, alone again, suspends its ticks", || suspended(&tb));
+    let files: Vec<_> = (0..3).map(small_file).collect();
+    index_files(&tb.client(1), "o", "r", &files);
+    assert_eq!(tb.client(1).count_nodes(NodeKind::File).unwrap(), 3);
+    assert!(
+        idle_metrics_still(&tb),
+        "an idle sole voter still ticks after a write"
+    );
+}
