@@ -316,15 +316,13 @@ pub(crate) fn dict_rev_append(
     if n > 0 {
         let last = n - 1;
         let block = rev.get(last)?.unwrap();
-        let room = block.value().len() < DICT_BLOCK_MAX_BYTES;
-        let mut entries = if room {
-            codec::decode_dict_block(block.value())?
-        } else {
-            Vec::new()
-        };
         let encoded_len = block.value().len();
-        drop(block);
-        if !dict_block_is_full(encoded_len, entries.len()) {
+        let count = codec::dict_block_entry_count(block.value())?;
+        if !dict_block_is_full(encoded_len, count) {
+            // Decode only a block that will be extended: a full one may hold
+            // a multi-MiB term (#162).
+            let mut entries = codec::decode_dict_block(block.value())?;
+            drop(block);
             entries.push((id, text.to_string()));
             let refs: Vec<(u64, &str)> = entries.iter().map(|(i, t)| (*i, t.as_str())).collect();
             rev.insert(last, codec::encode_dict_block(&refs).as_slice())?;
@@ -347,16 +345,20 @@ fn dict_block_is_full(encoded_len: usize, entries: usize) -> bool {
 /// filling each block until [`dict_block_is_full`], exactly as a sequence of
 /// [`dict_rev_append`] calls would (#188: vacuum's repack used to split by
 /// entry count only, so a long term could share a block with small ones).
-fn pack_dict_blocks(entries: &[(u64, String)]) -> Vec<Vec<u8>> {
+pub(crate) fn pack_dict_blocks(entries: &[(u64, String)]) -> Vec<Vec<u8>> {
     let mut blocks = Vec::new();
     let mut current: Vec<(u64, &str)> = Vec::new();
+    // Running size of `current`'s entries; the count header (which grows a
+    // byte at 128 entries) is added when checking.
+    let mut body_len = 0usize;
     for (id, text) in entries {
-        if !current.is_empty()
-            && dict_block_is_full(codec::dict_block_encoded_len(&current), current.len())
-        {
+        let encoded_len = codec::dict_block_count_len(current.len()) + body_len;
+        if !current.is_empty() && dict_block_is_full(encoded_len, current.len()) {
             blocks.push(codec::encode_dict_block(&current));
             current.clear();
+            body_len = 0;
         }
+        body_len += codec::dict_entry_encoded_len(*id, text);
         current.push((*id, text.as_str()));
     }
     if !current.is_empty() {

@@ -2576,6 +2576,155 @@ fn vacuum_repack_closes_the_block_of_a_long_term() {
     assert!(repo.languages.contains_key("text"));
 }
 
+/// A one-entry block's term whose encoding is exactly `want` bytes.
+fn term_encoding_to(want: usize) -> String {
+    (want - 32..=want)
+        .map(|len| "z".repeat(len))
+        .find(|t| crate::codec::encode_dict_block(&[(0, t.as_str())]).len() == want)
+        .expect("a term length that encodes to exactly `want` bytes")
+}
+
+/// Issue #188, the boundary: `pack_dict_blocks` closes a block of exactly
+/// `DICT_BLOCK_MAX_BYTES` encoded bytes and extends one of a byte less, as
+/// `dict_rev_append` does.
+#[test]
+fn pack_dict_blocks_closes_a_block_at_exactly_the_cap() {
+    use crate::v2::{pack_dict_blocks, DICT_BLOCK_MAX_BYTES};
+    for (size, blocks) in [(DICT_BLOCK_MAX_BYTES, 2), (DICT_BLOCK_MAX_BYTES - 1, 1)] {
+        let entries = vec![(0, term_encoding_to(size)), (1, "x".to_string())];
+        let packed = pack_dict_blocks(&entries);
+        assert_eq!(packed.len(), blocks, "block of {size} bytes");
+        assert!(packed[0].len() >= size);
+    }
+}
+
+/// Appends `entries` one at a time with `dict_rev_append` to an empty
+/// reverse dictionary and returns the encoded blocks.
+fn blocks_by_append(entries: &[(u64, String)]) -> Vec<Vec<u8>> {
+    use crate::v2::{dict_rev_append, DICT_REV};
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    let wt = s.db.begin_write().unwrap();
+    let blocks = {
+        let mut rev = wt.open_table(DICT_REV).unwrap();
+        for k in 0..rev.len().unwrap() {
+            rev.remove(k).unwrap();
+        }
+        for (id, text) in entries {
+            dict_rev_append(&mut rev, *id, text).unwrap();
+        }
+        (0..rev.len().unwrap())
+            .map(|k| rev.get(k).unwrap().unwrap().value().to_vec())
+            .collect()
+    };
+    wt.abort().unwrap();
+    blocks
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+    /// Issue #188: vacuum's packer and the append path share one boundary
+    /// rule, so packing a sorted term list gives the same blocks as
+    /// appending it term by term (including across the 64 KiB cap and the
+    /// 128-entry count).
+    #[test]
+    fn pack_dict_blocks_equals_repeated_append(
+        lens in proptest::collection::vec(
+            proptest::prop_oneof![
+                8 => 0usize..40,
+                1 => 20_000usize..70_000,
+            ],
+            0..300,
+        ),
+        gap in 1u64..300,
+    ) {
+        let entries: Vec<(u64, String)> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| (i as u64 * gap, "q".repeat(len)))
+            .collect();
+        proptest::prop_assert_eq!(
+            crate::v2::pack_dict_blocks(&entries),
+            blocks_by_append(&entries)
+        );
+    }
+}
+
+/// Issue #188: a store holding several long terms answers every query the
+/// same after a vacuum as a fresh index of the same content, and keeps doing
+/// so after more terms are appended to the repacked blocks and it is
+/// vacuumed again.
+#[test]
+fn vacuum_with_long_terms_matches_a_fresh_index() {
+    use crate::v2::DICT_BLOCK_MAX_BYTES;
+    let longs: Vec<String> = (0..4u8)
+        .map(|i| {
+            char::from(b'a' + i)
+                .to_string()
+                .repeat(DICT_BLOCK_MAX_BYTES + i as usize)
+        })
+        .collect();
+    let file = |terms: &[String]| {
+        let mut at = 0u32;
+        let toks: Vec<(String, u32, u32)> = terms
+            .iter()
+            .map(|t| {
+                let start = at;
+                at += t.len() as u32 + 1;
+                (t.clone(), start, start + t.len() as u32)
+            })
+            .collect();
+        toks
+    };
+    let ingest = |s: &V2Store, path: &str, terms: &[String]| {
+        let owned = file(terms);
+        let toks: Vec<(&str, u32, u32)> =
+            owned.iter().map(|(t, a, b)| (t.as_str(), *a, *b)).collect();
+        s.ingest_file("o", "r", path, "text", &span_ext(&[], &toks))
+            .unwrap();
+    };
+    let mut live: Vec<String> = Vec::new();
+    for (i, long) in longs.iter().enumerate() {
+        live.extend((0..10).map(|k| format!("w{i}_{k}")));
+        live.push(long.clone());
+    }
+    let mut with_dead = live.clone();
+    with_dead.extend((0..10).map(|k| format!("dead{k}")));
+
+    let dv = tempfile::tempdir().unwrap();
+    let df = tempfile::tempdir().unwrap();
+    let vacuumed = V2Store::open(dv.path().join("v.redb")).unwrap();
+    let fresh = V2Store::open(df.path().join("f.redb")).unwrap();
+    ingest(&vacuumed, "x.txt", &with_dead);
+    ingest(&vacuumed, "x.txt", &live);
+    assert_eq!(vacuumed.vacuum().unwrap().terms_removed, 10);
+    vacuumed.check_consistency(true);
+    ingest(&fresh, "x.txt", &live);
+    crate::conformance::run_differential(&vacuumed, &fresh);
+
+    let more: Vec<String> = (0..150)
+        .map(|k| format!("more{k}"))
+        .chain(["m".repeat(DICT_BLOCK_MAX_BYTES * 2)])
+        .collect();
+    for s in [&vacuumed, &fresh] {
+        ingest(s, "y.txt", &more);
+        ingest(s, "z.txt", &["gone".to_string()]);
+        ingest(s, "z.txt", &["kept_z".to_string()]);
+    }
+    vacuumed.vacuum().unwrap();
+    vacuumed.check_consistency(true);
+    fresh.check_consistency(false);
+    crate::conformance::run_differential(&vacuumed, &fresh);
+    for t in live.iter().chain(&more) {
+        assert_eq!(
+            vacuumed.search(&Query::new(t.as_str())).unwrap().len(),
+            1,
+            "{t:.20}"
+        );
+    }
+}
+
 /// Size gate (ADR 0003 story 5, decision D1: "Dictionary <= 15% of pages at
 /// 9.9 M; lookups unchanged"): on a term set derived from this repo's own
 /// source (`v2.rs`/`codec.rs`, tokenized crudely by splitting on

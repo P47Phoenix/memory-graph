@@ -753,12 +753,32 @@ pub fn encode_dict_block(entries: &[(u64, &str)]) -> Vec<u8> {
 }
 
 /// The length of [`encode_dict_block`]`(entries)` without encoding it.
+/// Test-only: production sizes blocks incrementally from the two helpers
+/// below, and this pins their sum to the real encoding.
+#[cfg(test)]
 pub fn dict_block_encoded_len(entries: &[(u64, &str)]) -> usize {
-    entries
+    let body: usize = entries
         .iter()
-        .fold(varint_len(entries.len() as u64), |len, (id, text)| {
-            len + varint_len(*id) + varint_len(text.len() as u64) + text.len()
-        })
+        .map(|(id, text)| dict_entry_encoded_len(*id, text))
+        .sum();
+    dict_block_count_len(entries.len()) + body
+}
+
+/// The bytes one `(id, text)` entry adds to an [`encode_dict_block`] body.
+pub fn dict_entry_encoded_len(id: u64, text: &str) -> usize {
+    varint_len(id) + varint_len(text.len() as u64) + text.len()
+}
+
+/// The bytes of an [`encode_dict_block`] entry-count header for `n` entries.
+pub fn dict_block_count_len(n: usize) -> usize {
+    varint_len(n as u64)
+}
+
+/// The entry count of an [`encode_dict_block`] block, read from its header
+/// without decoding the entries.
+pub fn dict_block_entry_count(b: &[u8]) -> Result<usize, StoreError> {
+    let mut r = Reader { b, at: 0 };
+    usize::try_from(r.varint()?).map_err(|_| bad("dict block count out of range"))
 }
 
 /// Decode a block written by [`encode_dict_block`] into its `(id, text)`
@@ -1730,9 +1750,6 @@ mod tests {
         assert_eq!(dict_block_first_id(&b).unwrap(), Some(0));
     }
 
-    /// An empty block (never written by `encode_dict_block` itself, but
-    /// accepted defensively by the decoder/peek) round-trips to no entries
-    /// and no first id.
     /// `dict_block_encoded_len` agrees with `encode_dict_block` across every
     /// varint width boundary for ids, lengths and the entry count.
     #[test]
@@ -1752,6 +1769,9 @@ mod tests {
         }
     }
 
+    /// An empty block (never written by `encode_dict_block` itself, but
+    /// accepted defensively by the decoder/peek) round-trips to no entries
+    /// and no first id.
     #[test]
     fn dict_block_empty_round_trips() {
         let b = encode_dict_block(&[]);
