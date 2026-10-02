@@ -4,11 +4,13 @@
 //! `serve --bootstrap --restore s3://.../latest` that answers like the
 //! source, and a restore of a name that is no backup refused with nothing
 //! left behind.
+mod common;
+
+use common::readiness::{start_serve, ServeProcess, StartOptions};
 use graph_server::testing::fake_s3::FAKE_REGION;
 use graph_server::testing::FakeS3;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_memory-graph");
@@ -64,36 +66,11 @@ impl Drop for Server {
 }
 
 fn serve(args: &[String]) -> Server {
-    let mut child = cmd()
-        .arg("serve")
+    let mut c = cmd();
+    c.arg("serve")
         .args(["--listen", "127.0.0.1:0", "--min-free-disk", "1"])
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let out = child.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(out).lines() {
-            let Ok(l) = line else { return };
-            let _ = tx.send(l);
-        }
-    });
-    let line = match rx.recv_timeout(WAIT) {
-        Ok(l) => l,
-        Err(e) => {
-            let st = child.try_wait();
-            let _ = child.kill();
-            panic!("serve {args:?} printed no listening line ({e}); exit: {st:?}");
-        }
-    };
-    let addr = line
-        .split("listening on ")
-        .nth(1)
-        .and_then(|r| r.split_whitespace().next())
-        .unwrap_or_else(|| panic!("no address in {line:?}"))
-        .to_string();
+        .args(args);
+    let ServeProcess { child, addr, .. } = start_serve(c, StartOptions::default());
     let s = Server { child, addr };
     // A --bootstrap node leads itself once its election ran.
     let deadline = Instant::now() + WAIT;
