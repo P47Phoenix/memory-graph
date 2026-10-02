@@ -148,6 +148,12 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
+/// The number of bytes [`put_varint`] writes for `v`.
+fn varint_len(v: u64) -> usize {
+    let bits = 64 - v.leading_zeros() as usize;
+    bits.max(1).div_ceil(7)
+}
+
 fn zigzag(d: i64) -> u64 {
     ((d << 1) ^ (d >> 63)) as u64
 }
@@ -744,6 +750,35 @@ pub fn encode_dict_block(entries: &[(u64, &str)]) -> Vec<u8> {
         out.extend_from_slice(bytes);
     }
     out
+}
+
+/// The length of [`encode_dict_block`]`(entries)` without encoding it.
+/// Test-only: production sizes blocks incrementally from the two helpers
+/// below, and this pins their sum to the real encoding.
+#[cfg(test)]
+pub fn dict_block_encoded_len(entries: &[(u64, &str)]) -> usize {
+    let body: usize = entries
+        .iter()
+        .map(|(id, text)| dict_entry_encoded_len(*id, text))
+        .sum();
+    dict_block_count_len(entries.len()) + body
+}
+
+/// The bytes one `(id, text)` entry adds to an [`encode_dict_block`] body.
+pub fn dict_entry_encoded_len(id: u64, text: &str) -> usize {
+    varint_len(id) + varint_len(text.len() as u64) + text.len()
+}
+
+/// The bytes of an [`encode_dict_block`] entry-count header for `n` entries.
+pub fn dict_block_count_len(n: usize) -> usize {
+    varint_len(n as u64)
+}
+
+/// The entry count of an [`encode_dict_block`] block, read from its header
+/// without decoding the entries.
+pub fn dict_block_entry_count(b: &[u8]) -> Result<usize, StoreError> {
+    let mut r = Reader { b, at: 0 };
+    usize::try_from(r.varint()?).map_err(|_| bad("dict block count out of range"))
 }
 
 /// Decode a block written by [`encode_dict_block`] into its `(id, text)`
@@ -1713,6 +1748,25 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(dict_block_first_id(&b).unwrap(), Some(0));
+    }
+
+    /// `dict_block_encoded_len` agrees with `encode_dict_block` across every
+    /// varint width boundary for ids, lengths and the entry count.
+    #[test]
+    fn dict_block_encoded_len_matches_encoding() {
+        let long = "y".repeat(1 << 14);
+        let ids = [0, 127, 128, 16_383, 16_384, u64::MAX];
+        let texts = ["", "a", &long[..127], &long[..128], &long];
+        for n in [0usize, 1, 5, 127, 128] {
+            let entries: Vec<(u64, &str)> = (0..n)
+                .map(|i| (ids[i % ids.len()], texts[i % texts.len()]))
+                .collect();
+            assert_eq!(
+                dict_block_encoded_len(&entries),
+                encode_dict_block(&entries).len(),
+                "{n} entries"
+            );
+        }
     }
 
     /// An empty block (never written by `encode_dict_block` itself, but

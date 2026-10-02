@@ -316,14 +316,13 @@ pub(crate) fn dict_rev_append(
     if n > 0 {
         let last = n - 1;
         let block = rev.get(last)?.unwrap();
-        let room = block.value().len() < DICT_BLOCK_MAX_BYTES;
-        let mut entries = if room {
-            codec::decode_dict_block(block.value())?
-        } else {
-            Vec::new()
-        };
-        drop(block);
-        if room && entries.len() < codec::DICT_BLOCK {
+        let encoded_len = block.value().len();
+        let count = codec::dict_block_entry_count(block.value())?;
+        if !dict_block_is_full(encoded_len, count) {
+            // Decode only a block that will be extended: a full one may hold
+            // a multi-MiB term (#162).
+            let mut entries = codec::decode_dict_block(block.value())?;
+            drop(block);
             entries.push((id, text.to_string()));
             let refs: Vec<(u64, &str)> = entries.iter().map(|(i, t)| (*i, t.as_str())).collect();
             rev.insert(last, codec::encode_dict_block(&refs).as_slice())?;
@@ -332,6 +331,40 @@ pub(crate) fn dict_rev_append(
     }
     rev.insert(n, codec::encode_dict_block(&[(id, text)]).as_slice())?;
     Ok(())
+}
+
+/// The one block-boundary rule for the reverse dictionary, shared by
+/// [`dict_rev_append`] and [`pack_dict_blocks`]: a block is full once it
+/// holds [`codec::DICT_BLOCK`] entries or encodes to
+/// [`DICT_BLOCK_MAX_BYTES`] or more.
+fn dict_block_is_full(encoded_len: usize, entries: usize) -> bool {
+    encoded_len >= DICT_BLOCK_MAX_BYTES || entries >= codec::DICT_BLOCK
+}
+
+/// Pack `entries` (ascending ids) into encoded reverse-dictionary blocks,
+/// filling each block until [`dict_block_is_full`], exactly as a sequence of
+/// [`dict_rev_append`] calls would (#188: vacuum's repack used to split by
+/// entry count only, so a long term could share a block with small ones).
+pub(crate) fn pack_dict_blocks(entries: &[(u64, String)]) -> Vec<Vec<u8>> {
+    let mut blocks = Vec::new();
+    let mut current: Vec<(u64, &str)> = Vec::new();
+    // Running size of `current`'s entries; the count header (which grows a
+    // byte at 128 entries) is added when checking.
+    let mut body_len = 0usize;
+    for (id, text) in entries {
+        let encoded_len = codec::dict_block_count_len(current.len()) + body_len;
+        if !current.is_empty() && dict_block_is_full(encoded_len, current.len()) {
+            blocks.push(codec::encode_dict_block(&current));
+            current.clear();
+            body_len = 0;
+        }
+        body_len += codec::dict_entry_encoded_len(*id, text);
+        current.push((*id, text.as_str()));
+    }
+    if !current.is_empty() {
+        blocks.push(codec::encode_dict_block(&current));
+    }
+    blocks
 }
 
 const TAG_SYM: u64 = 1;
@@ -2843,11 +2876,8 @@ impl V2Store {
                 for i in 0..old_blocks {
                     w.rev.remove(i)?;
                 }
-                for (i, chunk) in kept.chunks(codec::DICT_BLOCK).enumerate() {
-                    let refs: Vec<(u64, &str)> =
-                        chunk.iter().map(|(id, t)| (*id, t.as_str())).collect();
-                    w.rev
-                        .insert(i as u64, codec::encode_dict_block(&refs).as_slice())?;
+                for (i, block) in pack_dict_blocks(&kept).iter().enumerate() {
+                    w.rev.insert(i as u64, block.as_slice())?;
                 }
             }
             let stats = VacuumStats {
