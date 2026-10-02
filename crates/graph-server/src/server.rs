@@ -1314,6 +1314,14 @@ mod tests {
         assert_eq!(rt.metrics().num_workers(), 1);
         let rt = build_runtime(None).unwrap();
         assert!(rt.metrics().num_workers() >= 1);
+        // The default is unchanged: one per CPU the process may use (when
+        // tokio's own TOKIO_WORKER_THREADS does not say otherwise).
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+            assert_eq!(
+                rt.metrics().num_workers(),
+                std::thread::available_parallelism().unwrap().get()
+            );
+        }
         assert_eq!(
             ServeConfig::new("g.redb", ([127, 0, 0, 1], 0).into()).worker_threads,
             None

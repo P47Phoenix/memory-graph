@@ -632,38 +632,101 @@ fn worker_threads_caps_the_pool_and_refuses_zero() {
         server.shutdown();
     }
 
-    for (env, args, names) in [
+    // Refused with exit 2 before anything opens: 0, over the 1024 cap
+    // (99999999 once reached a 42 GB working set), and a bad
+    // TOKIO_WORKER_THREADS (tokio itself would panic). Each run has a
+    // deadline, so a regression that lets one through fails, not hangs.
+    for (env, args, names, why) in [
         (
             None,
-            vec!["serve", "--worker-threads", "0"],
+            vec!["--worker-threads", "0"],
             "--worker-threads",
+            "at least 1",
+        ),
+        (
+            None,
+            vec!["--worker-threads", "99999999"],
+            "--worker-threads",
+            "at most 1024",
         ),
         (
             Some(("MEMORY_GRAPH_WORKER_THREADS", "0")),
-            vec!["serve"],
+            vec![],
             "--worker-threads",
+            "at least 1",
         ),
         (
             Some(("TOKIO_WORKER_THREADS", "0")),
-            vec!["serve"],
+            vec![],
             "TOKIO_WORKER_THREADS",
+            "at least 1",
+        ),
+        (
+            Some(("TOKIO_WORKER_THREADS", "100000")),
+            vec![],
+            "TOKIO_WORKER_THREADS",
+            "at most 1024",
+        ),
+        (
+            Some(("TOKIO_WORKER_THREADS", "many")),
+            vec![],
+            "TOKIO_WORKER_THREADS",
+            "not a thread count",
         ),
     ] {
         let mut c = cmd();
         if let Some((k, v)) = env {
             c.env(k, v);
         }
-        let o = c
+        c.arg("serve")
             .args(args)
             .args(["--db"])
             .arg(d.path().join("never.redb"))
-            .args(["--listen", "127.0.0.1:0"])
-            .output()
-            .unwrap();
-        assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+            .args(["--listen", "127.0.0.1:0"]);
+        let o = output_within(c, Duration::from_secs(60));
         let e = stderr(&o);
-        assert!(e.contains(names) && e.contains("at least 1"), "{e}");
+        assert_eq!(o.status.code(), Some(2), "{env:?}: {e}");
+        assert!(e.contains(names) && e.contains(why), "{env:?}: {e}");
         assert!(!d.path().join("never.redb").exists());
+    }
+}
+
+/// Run `c` to completion, but kill it and fail if it is still running
+/// after `limit` (a server that should have refused to start).
+fn output_within(mut c: Command, limit: Duration) -> Output {
+    let mut child = c
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let drain = |r: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|r| Box::new(r) as _));
+    let err = drain(child.stderr.take().map(|r| Box::new(r) as _));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("still running after {limit:?}; killed");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
     }
 }
 
