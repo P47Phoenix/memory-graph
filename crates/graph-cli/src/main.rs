@@ -508,6 +508,11 @@ enum Cmd {
         /// an s/m/h suffix (default 15m)
         #[arg(long, value_parser = parse_duration, default_value = "15m")]
         snapshot_max_age: std::time::Duration,
+        /// The server's async worker threads, 1 to 1024 (default: TOKIO_WORKER_THREADS if set,
+        /// else one per CPU). A small number (2-4) means fewer threads and less memory on a
+        /// many-core host or a Docker Desktop VM. Env: MEMORY_GRAPH_WORKER_THREADS
+        #[arg(long, env = "MEMORY_GRAPH_WORKER_THREADS", value_name = "N", value_parser = parse_worker_threads)]
+        worker_threads: Option<std::num::NonZeroUsize>,
     },
     /// Check a server's health (grpc.health.v1): exit 0 when serving, 1 when not (or unreachable).
     /// With --ready: the memory-graph.ready service, SERVING while a leader is known and this node
@@ -935,6 +940,46 @@ fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
 }
 
+/// The most `serve --worker-threads` takes: more is a typo, not a tuning.
+const MAX_WORKER_THREADS: usize = 1024;
+
+/// `serve --worker-threads N` (and `TOKIO_WORKER_THREADS`): a thread count
+/// from 1 to [`MAX_WORKER_THREADS`]. 0 is refused rather than read as
+/// "the default" (leave it unset for that).
+fn parse_worker_threads(s: &str) -> std::result::Result<std::num::NonZeroUsize, String> {
+    let n: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{s}` is not a thread count (a whole number, at least 1)"))?;
+    match std::num::NonZeroUsize::new(n) {
+        None => Err("must be at least 1 (leave it unset for the default: one per CPU)".into()),
+        Some(n) if n.get() > MAX_WORKER_THREADS => {
+            Err(format!("must be at most {MAX_WORKER_THREADS}"))
+        }
+        Some(n) => Ok(n),
+    }
+}
+
+/// The worker count `serve` asks for: --worker-threads (or
+/// MEMORY_GRAPH_WORKER_THREADS), else a valid TOKIO_WORKER_THREADS, else
+/// `None` (one per CPU). An invalid TOKIO_WORKER_THREADS is an error here,
+/// where tokio itself would panic.
+fn resolve_worker_threads(
+    flag: Option<std::num::NonZeroUsize>,
+    tokio_env: Option<&std::ffi::OsStr>,
+) -> std::result::Result<Option<std::num::NonZeroUsize>, String> {
+    match (flag, tokio_env) {
+        (Some(n), _) => Ok(Some(n)),
+        (None, None) => Ok(None),
+        (None, Some(v)) => {
+            let v = v.to_string_lossy();
+            parse_worker_threads(&v)
+                .map(Some)
+                .map_err(|e| format!("invalid TOKIO_WORKER_THREADS `{v}`: {e}"))
+        }
+    }
+}
+
 /// Set once `serve --log-format json` installed its subscriber: a failure
 /// is then logged as JSON rather than printed as text.
 static JSON_LOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1106,11 +1151,23 @@ fn run() -> Result<i32> {
         quorum_loss_timeout,
         min_free_disk,
         snapshot_max_age,
+        worker_threads,
     } = &cli.cmd
     {
         if let Some(s) = &cli.server {
             bail!("serve takes --db <file> or --data-dir <dir> to serve, not --server {s}");
         }
+        // Like a bad flag value (clap's exit 2), before anything opens.
+        let worker_threads = match resolve_worker_threads(
+            *worker_threads,
+            std::env::var_os("TOKIO_WORKER_THREADS").as_deref(),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return Ok(2);
+            }
+        };
         graph_cli::logging::init(*log_format, log_level)?;
         let _ = JSON_LOGS.set(*log_format == graph_cli::logging::LogFormat::Json);
         if *auto_promote && join.is_none() && bootstrap_or_join.is_none() {
@@ -1318,6 +1375,7 @@ fn run() -> Result<i32> {
             cfg.mcp = Some(mc);
         }
         cfg.snapshot_max_age = *snapshot_max_age;
+        cfg.worker_threads = worker_threads;
         cfg.restore_allow_extractor_mismatch = *restore_allow_extractor_mismatch;
         let s3 = graph_server::backup::S3Options {
             endpoint: backup_endpoint.clone(),
@@ -1389,7 +1447,11 @@ fn run() -> Result<i32> {
                 let msg = format!("mcp on {}", mcp_url(&m.to_string()));
                 println!("{}", start_line(log_format, "mcp", &msg, &m.to_string()));
             }
-            let msg = format!("listening on {} ({shown})", r.addr);
+            let msg = format!(
+                "listening on {} ({shown}, {} worker threads)",
+                r.addr,
+                r.worker_threads()
+            );
             println!(
                 "{}",
                 start_line(log_format, "listening", &msg, &r.addr.to_string())
@@ -1898,6 +1960,9 @@ fn run() -> Result<i32> {
                 if st.unchanged { " [unchanged]" } else { "" },
                 if st.has_errors { " [has_errors]" } else { "" }
             );
+            if let Some(w) = &st.span_warning {
+                eprintln!("warning: {}: {w}", path.display());
+            }
         }
         Cmd::Index {
             org,
@@ -2619,6 +2684,8 @@ mod serve_config_tests {
                 "5%",
                 "--snapshot-max-age",
                 "10m",
+                "--worker-threads",
+                "3",
                 "--cache-bytes",
                 "1000000",
                 "--backup-url",
@@ -2675,6 +2742,7 @@ heartbeat-interval = 100
 quorum-loss-timeout = 1500
 min-free-disk = "5%"
 snapshot-max-age = "10m"
+worker-threads = 3
 cache-bytes = 1000000
 "#,
         );
@@ -2826,6 +2894,92 @@ listen = "0.0.0.0:7000"
             typed.extend(os(&base));
             typed.extend(os(extra));
             assert_eq!(parsed(a), parsed(typed), "{extra:?}");
+        }
+    }
+}
+
+/// `serve --worker-threads` (issue #205): a positive count, 0 refused with
+/// a clear message, from the flag or MEMORY_GRAPH_WORKER_THREADS.
+#[cfg(test)]
+mod worker_threads_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn worker_threads_parses_and_refuses_zero() {
+        assert_eq!(parse_worker_threads("2").unwrap().get(), 2);
+        assert_eq!(parse_worker_threads(" 16 ").unwrap().get(), 16);
+        let e = parse_worker_threads("0").unwrap_err();
+        assert!(e.contains("at least 1"), "{e}");
+        for bad in ["", "-1", "two", "1.5"] {
+            assert!(parse_worker_threads(bad).is_err(), "{bad:?}");
+        }
+        let threads = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.cmd) {
+            Ok(Cmd::Serve { worker_threads, .. }) => Ok(worker_threads.map(|n| n.get())),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e.to_string()),
+        };
+        if std::env::var_os("MEMORY_GRAPH_WORKER_THREADS").is_none() {
+            assert_eq!(threads(&["memory-graph", "serve"]), Ok(None));
+        }
+        assert_eq!(
+            threads(&["memory-graph", "serve", "--worker-threads", "4"]),
+            Ok(Some(4))
+        );
+        let e = threads(&["memory-graph", "serve", "--worker-threads", "0"]).unwrap_err();
+        assert!(
+            e.contains("--worker-threads") && e.contains("at least 1"),
+            "{e}"
+        );
+        assert_eq!(parse_worker_threads("1024").unwrap().get(), 1024);
+        let e = parse_worker_threads("1025").unwrap_err();
+        assert!(e.contains("at most 1024"), "{e}");
+    }
+
+    /// The flag (or MEMORY_GRAPH_WORKER_THREADS) wins over
+    /// TOKIO_WORKER_THREADS, which is validated instead of left to panic.
+    #[test]
+    fn tokio_worker_threads_is_validated_and_loses_to_the_flag() {
+        use std::ffi::OsStr;
+        let two = std::num::NonZeroUsize::new(2);
+        assert_eq!(resolve_worker_threads(None, None), Ok(None));
+        assert_eq!(resolve_worker_threads(two, Some(OsStr::new("0"))), Ok(two));
+        assert_eq!(
+            resolve_worker_threads(None, Some(OsStr::new("3"))),
+            Ok(std::num::NonZeroUsize::new(3))
+        );
+        for bad in ["0", "x", "", "5000"] {
+            let e = resolve_worker_threads(None, Some(OsStr::new(bad))).unwrap_err();
+            assert!(e.contains("TOKIO_WORKER_THREADS"), "{bad:?}: {e}");
+        }
+    }
+
+    /// A config-file `worker-threads` loses to the flag (the environment
+    /// variable over the file is checked end to end in serve_e2e, without
+    /// touching this process's environment).
+    #[test]
+    fn the_flag_overrides_the_config_file() {
+        use clap::CommandFactory;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("serve.toml");
+        std::fs::write(&f, "worker-threads = 3\n").unwrap();
+        let run = |extra: &[&str]| {
+            let mut a: Vec<std::ffi::OsString> = ["memory-graph", "serve"]
+                .iter()
+                .chain(extra)
+                .map(Into::into)
+                .collect();
+            a.push("--config".into());
+            a.push(f.clone().into_os_string());
+            let a = graph_cli::serve_config::apply(&Cli::command(), a).unwrap();
+            match Cli::try_parse_from(a).unwrap().cmd {
+                Cmd::Serve { worker_threads, .. } => worker_threads.map(|n| n.get()),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(run(&["--worker-threads", "5"]), Some(5));
+        if std::env::var_os("MEMORY_GRAPH_WORKER_THREADS").is_none() {
+            assert_eq!(run(&[]), Some(3));
         }
     }
 }

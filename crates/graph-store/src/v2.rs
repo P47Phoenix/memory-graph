@@ -3317,7 +3317,7 @@ impl V2Store {
             crate::api::Prepared::Extracted(ex) => ex,
             crate::api::Prepared::Remote(_) => unreachable!("prepare_file never keeps raw bytes"),
         };
-        let stats = Self::ingest_prepped(
+        let mut stats = Self::ingest_prepped(
             &wt,
             org,
             repo,
@@ -3328,6 +3328,7 @@ impl V2Store {
             None,
         )?;
         wt.commit()?;
+        stats.span_warning = p.span_warning.take();
         Ok(stats)
     }
 
@@ -3899,6 +3900,7 @@ impl V2Store {
             language: language.to_string(),
             encoding: meta.encoding.map(Into::into),
             lossy: meta.lossy,
+            span_warning: None,
         })
     }
 }

@@ -43,6 +43,8 @@ fn cmd() -> Command {
         .env_remove("MEMORY_GRAPH_READ_DEADLINE")
         .env_remove("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER")
         .env_remove("MEMORY_GRAPH_TESTING_WITHHOLD_LEADER")
+        .env_remove("MEMORY_GRAPH_WORKER_THREADS")
+        .env_remove("TOKIO_WORKER_THREADS")
         .env("MEMORY_GRAPH_LOCK_WAIT_MS", "300");
     c
 }
@@ -99,6 +101,8 @@ struct Server {
     child: Child,
     addr: String,
     db: PathBuf,
+    /// The `listening on ...` start line.
+    start_line: String,
     /// Every later stdout line of the server (the reader thread keeps
     /// draining the pipe so the server never blocks on, or fails, a print).
     lines: std::sync::mpsc::Receiver<String>,
@@ -110,8 +114,15 @@ impl Server {
     }
 
     fn start_env(db: &Path, env: &[(&str, &str)]) -> Server {
+        Self::start_with(db, env, &[])
+    }
+
+    fn start_with(db: &Path, env: &[(&str, &str)], extra: &[&str]) -> Server {
         let mut c = cmd();
-        c.envs(env.iter().copied()).args(["serve", "--db"]).arg(db);
+        c.envs(env.iter().copied())
+            .args(["serve", "--db"])
+            .arg(db)
+            .args(extra);
         Self::spawn(c, db)
     }
 
@@ -153,6 +164,7 @@ impl Server {
             child,
             addr,
             db: db.to_path_buf(),
+            start_line: line,
             lines: rx,
         }
     }
@@ -533,6 +545,196 @@ fn health_cluster_and_sysinfo() {
     server.shutdown();
     let o = run(&["--server", &addr, "health"]);
     assert_eq!(o.status.code(), Some(1), "after shutdown: {}", stdout(&o));
+}
+
+/// `serve --worker-threads 2` (issue #205) starts and serves writes and
+/// reads; the env var works too; 0 is refused before anything opens.
+#[test]
+fn worker_threads_caps_the_pool_and_refuses_zero() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let src = d.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.rs"),
+        "fn alpha() {}
+",
+    )
+    .unwrap();
+    let server = Server::start_with(&db, &[], &["--worker-threads", "2"]);
+    assert!(
+        server.start_line.contains(", 2 worker threads)"),
+        "{}",
+        server.start_line
+    );
+    let addr = server.addr.clone();
+    assert_eq!(ok(&["--server", &addr, "health"]).trim(), "SERVING");
+    ok(&[
+        "--server",
+        &addr,
+        "index",
+        src.to_str().unwrap(),
+        "--org",
+        "o",
+        "--repo",
+        "r",
+    ]);
+    let hits = ok(&["--server", &addr, "search", "alpha"]);
+    assert!(hits.contains("alpha"), "{hits}");
+    server.shutdown();
+
+    // The environment variable sets it as well.
+    let server = Server::start_with(&db, &[("MEMORY_GRAPH_WORKER_THREADS", "1")], &[]);
+    assert!(
+        server.start_line.contains(", 1 worker threads)"),
+        "{}",
+        server.start_line
+    );
+    let hits = ok(&["--server", &server.addr, "search", "alpha"]);
+    assert!(hits.contains("alpha"), "{hits}");
+    server.shutdown();
+
+    // Precedence: flag > MEMORY_GRAPH_WORKER_THREADS > config file >
+    // TOKIO_WORKER_THREADS > one per CPU.
+    let toml = d.path().join("serve.toml");
+    std::fs::write(
+        &toml,
+        "worker-threads = 3
+",
+    )
+    .unwrap();
+    let toml = toml.to_str().unwrap();
+    for (env, extra, want) in [
+        (vec![], vec!["--config", toml], 3),
+        (
+            vec![("MEMORY_GRAPH_WORKER_THREADS", "1")],
+            vec!["--config", toml],
+            1,
+        ),
+        (
+            vec![("MEMORY_GRAPH_WORKER_THREADS", "1")],
+            vec!["--config", toml, "--worker-threads", "2"],
+            2,
+        ),
+        (vec![("TOKIO_WORKER_THREADS", "3")], vec![], 3),
+        (
+            vec![("TOKIO_WORKER_THREADS", "0")],
+            vec!["--worker-threads", "2"],
+            2,
+        ),
+        (
+            vec![("TOKIO_WORKER_THREADS", "1")],
+            vec!["--config", toml],
+            3,
+        ),
+    ] {
+        let server = Server::start_with(&db, &env, &extra);
+        assert!(
+            server
+                .start_line
+                .contains(&format!(", {want} worker threads)")),
+            "{env:?} {extra:?}: {}",
+            server.start_line
+        );
+        server.shutdown();
+    }
+
+    // Refused with exit 2 before anything opens: 0, over the 1024 cap
+    // (99999999 once reached a 42 GB working set), and a bad
+    // TOKIO_WORKER_THREADS (tokio itself would panic). Each run has a
+    // deadline, so a regression that lets one through fails, not hangs.
+    for (env, args, names, why) in [
+        (
+            None,
+            vec!["--worker-threads", "0"],
+            "--worker-threads",
+            "at least 1",
+        ),
+        (
+            None,
+            vec!["--worker-threads", "99999999"],
+            "--worker-threads",
+            "at most 1024",
+        ),
+        (
+            Some(("MEMORY_GRAPH_WORKER_THREADS", "0")),
+            vec![],
+            "--worker-threads",
+            "at least 1",
+        ),
+        (
+            Some(("TOKIO_WORKER_THREADS", "0")),
+            vec![],
+            "TOKIO_WORKER_THREADS",
+            "at least 1",
+        ),
+        (
+            Some(("TOKIO_WORKER_THREADS", "100000")),
+            vec![],
+            "TOKIO_WORKER_THREADS",
+            "at most 1024",
+        ),
+        (
+            Some(("TOKIO_WORKER_THREADS", "many")),
+            vec![],
+            "TOKIO_WORKER_THREADS",
+            "not a thread count",
+        ),
+    ] {
+        let mut c = cmd();
+        if let Some((k, v)) = env {
+            c.env(k, v);
+        }
+        c.arg("serve")
+            .args(args)
+            .args(["--db"])
+            .arg(d.path().join("never.redb"))
+            .args(["--listen", "127.0.0.1:0"]);
+        let o = output_within(c, Duration::from_secs(60));
+        let e = stderr(&o);
+        assert_eq!(o.status.code(), Some(2), "{env:?}: {e}");
+        assert!(e.contains(names) && e.contains(why), "{env:?}: {e}");
+        assert!(!d.path().join("never.redb").exists());
+    }
+}
+
+/// Run `c` to completion, but kill it and fail if it is still running
+/// after `limit` (a server that should have refused to start).
+fn output_within(mut c: Command, limit: Duration) -> Output {
+    let mut child = c
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let drain = |r: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|r| Box::new(r) as _));
+    let err = drain(child.stderr.take().map(|r| Box::new(r) as _));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("still running after {limit:?}; killed");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
+    }
 }
 
 /// An embedded open of a served file waits a little, then names the

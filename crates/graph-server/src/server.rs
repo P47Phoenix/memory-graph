@@ -136,6 +136,12 @@ pub struct ServeConfig {
     /// `--backup-credentials-file`, `--backup-profile`,
     /// `--backup-connect-to`).
     pub restore_s3: crate::backup::S3Options,
+    /// `--worker-threads`: the tokio runtime's worker threads in
+    /// [`run_blocking`]; `None` keeps tokio's default (one per CPU, or
+    /// `TOKIO_WORKER_THREADS`). Fewer idle workers mean fewer idle wakeups
+    /// on a many-core host. [`start`] runs on the caller's runtime and
+    /// ignores it.
+    pub worker_threads: Option<std::num::NonZeroUsize>,
 }
 
 /// How long a restart whose `node.json` address differs from the one its
@@ -231,6 +237,7 @@ impl ServeConfig {
             backup: None,
             restore_allow_extractor_mismatch: false,
             restore_s3: crate::backup::S3Options::default(),
+            worker_threads: None,
         }
     }
 
@@ -275,6 +282,7 @@ impl std::fmt::Debug for ServeConfig {
                 &self.restore_allow_extractor_mismatch,
             )
             .field("restore_s3", &self.restore_s3)
+            .field("worker_threads", &self.worker_threads)
             .finish()
     }
 }
@@ -338,6 +346,15 @@ pub struct Running {
 impl Running {
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         self.shutdown.clone()
+    }
+
+    /// The worker threads of the runtime the caller is on (what
+    /// `--worker-threads`, `TOKIO_WORKER_THREADS` or the CPU count gave to
+    /// [`run_blocking`]'s runtime, where `on_ready` runs); 0 outside one.
+    pub fn worker_threads(&self) -> usize {
+        tokio::runtime::Handle::try_current()
+            .map(|h| h.metrics().num_workers())
+            .unwrap_or(0)
     }
 
     /// Ask it to stop (returns at once; [`wait`](Self::wait) for the end).
@@ -1213,10 +1230,7 @@ pub fn run_blocking_with(
     extractors: Vec<Box<dyn Extractor>>,
     on_ready: impl FnOnce(&Running) + Send + 'static,
 ) -> Result<(), StoreError> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| io_err("tokio runtime", e))?;
+    let rt = build_runtime(cfg.worker_threads).map_err(|e| io_err("tokio runtime", e))?;
     rt.block_on(async move {
         let running = start(cfg, share(extractors)).await?;
         on_ready(&running);
@@ -1228,6 +1242,18 @@ pub fn run_blocking_with(
         });
         running.wait().await
     })
+}
+
+/// The multi-thread runtime [`run_blocking`] serves on: `worker_threads`
+/// workers, or tokio's default (one per CPU, or `TOKIO_WORKER_THREADS`).
+fn build_runtime(
+    worker_threads: Option<std::num::NonZeroUsize>,
+) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = worker_threads {
+        b.worker_threads(n.get());
+    }
+    b.enable_all().build()
 }
 
 async fn wait_for_signal() {
@@ -1288,6 +1314,30 @@ mod tests {
         .unwrap()
         .into_inner()
         .status
+    }
+
+    /// `--worker-threads N` builds a runtime with exactly N workers; none
+    /// keeps tokio's default (at least one).
+    #[test]
+    fn worker_threads_sets_the_runtime_pool() {
+        let rt = build_runtime(std::num::NonZeroUsize::new(2)).unwrap();
+        assert_eq!(rt.metrics().num_workers(), 2);
+        let rt = build_runtime(std::num::NonZeroUsize::new(1)).unwrap();
+        assert_eq!(rt.metrics().num_workers(), 1);
+        let rt = build_runtime(None).unwrap();
+        assert!(rt.metrics().num_workers() >= 1);
+        // The default is unchanged: one per CPU the process may use (when
+        // tokio's own TOKIO_WORKER_THREADS does not say otherwise).
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+            assert_eq!(
+                rt.metrics().num_workers(),
+                std::thread::available_parallelism().unwrap().get()
+            );
+        }
+        assert_eq!(
+            ServeConfig::new("g.redb", ([127, 0, 0, 1], 0).into()).worker_threads,
+            None
+        );
     }
 
     /// Shutdown step 1 reports both health names NOT_SERVING.

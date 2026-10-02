@@ -90,6 +90,21 @@ fn configurations_are_query_equivalent() {
     conformance::run_differential(&*a, &*b);
 }
 
+/// #203: files stored without their invalid symbols answer alike whatever
+/// the chunk and cache sizes.
+#[test]
+fn degraded_files_are_query_equivalent_across_configurations() {
+    let d = tempfile::tempdir().unwrap();
+    let ex = conformance::invalid_symbol_span_extractors;
+    let a = open_store(&d.path().join("a.redb"), ex()).unwrap();
+    let mut b = V2Store::open_with_cache_bytes(d.path().join("b.redb"), Some(1 << 20)).unwrap();
+    b.set_chunk_bytes(1);
+    for e in ex() {
+        b.register(e);
+    }
+    conformance::run_invalid_symbol_span_differential(&*a, &b);
+}
+
 /// A batch that crashes mid-way (storage error in one chunk) and is re-run
 /// ends up identical to a fresh index, whatever the chunking.
 #[test]

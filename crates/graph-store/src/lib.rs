@@ -506,6 +506,11 @@ pub struct IngestStats {
     /// when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lossy: bool,
+    /// Set when the extractor produced an invalid span (#203): its symbols
+    /// were dropped and only the tokens stored. Names the extractor and the
+    /// span. Omitted from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_warning: Option<String>,
 }
 
 /// What the test modules below reach through `use super::*`.

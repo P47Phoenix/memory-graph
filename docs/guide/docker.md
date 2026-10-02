@@ -121,6 +121,8 @@ docker stop mg-server                                     # SIGTERM: a graceful 
 docker start mg-server                                    # same command again: --bootstrap on an initialized /data is a plain restart
 ```
 
+A server runs one worker thread per CPU it can see, and on Docker Desktop that is every core of the VM. For fewer threads, less memory and somewhat less idle CPU, give the container fewer CPUs (`docker run --cpus=2`, which also lowers the default) or set the count: `serve --worker-threads 2`, `-e MEMORY_GRAPH_WORKER_THREADS=2`, or tokio's own `-e TOKIO_WORKER_THREADS=2` ([server guide](server.md#serve-options-and-the-lock-file)). Idle workers park, so the idle wakeup rate hardly moves (measured 8.3 to 8.2 per second at `--cpus=2`); it comes from the Raft tick, which a server leading alone (`--db`, or a one-node `--data-dir`) suspends.
+
 See the [server](server.md) and [cluster](cluster.md) guides for what these flags do.
 
 ## Idle CPU on macOS (Docker Desktop)
@@ -134,7 +136,7 @@ On a Mac, containers run in a Linux VM. Each time a thread in the VM wakes (a ti
   ```
 
 - **Use a named volume for `/data`, not a bind mount.** A bind mount goes through Docker Desktop's file sharing to macOS; a named volume stays inside the VM.
-- **Limit the CPUs.** The server sizes its thread pool from the CPUs it sees. With `--cpus=2` (Compose: `cpus: 2`) the pool is 2 threads instead of one per host CPU. You can also set `-e TOKIO_WORKER_THREADS=2` to size only the pool.
+- **Limit the CPUs.** The server sizes its thread pool from the CPUs it sees. With `--cpus=2` (Compose: `cpus: 2`) the pool is 2 threads instead of one per VM CPU. To size only the pool, use `serve --worker-threads 2` or `-e MEMORY_GRAPH_WORKER_THREADS=2` (see above). A smaller pool means fewer threads and less memory, but hardly fewer wakeups.
 - **Run the health check less often.** The image's `HEALTHCHECK` starts a new `memory-graph health` process every 30 s. If nothing watches the status closely, use `docker run --health-interval=5m` (Compose: `healthcheck: interval: 5m`).
 - **Keep `MEMORY_GRAPH_LOG` at `info`** (the default). `debug` and `trace` add log lines (openraft's among them), and each line is a write the VM has to wake for.
 - **Measure the VM, not only the container.** Look at `com.docker.virtualization` in Activity Monitor (or `top -o cpu`) with the server idle, and compare it with the container stopped. `docker stats` shows only what the container's processes used inside the VM.

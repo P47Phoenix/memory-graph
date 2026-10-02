@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f1ff0b618bd152536b098f99a6e2c122cd3dac3c2651893b86896dfb076a2295 # shrinks to parts = ["type A = B |", "declare function g(): void;"]
+cc af2af422f7232523fc1217c7d65269745eb8ef9feb534ce4d496493e15e89de5 # shrinks to parts = ["const f = (): T =>", "export", "type A = B |"]

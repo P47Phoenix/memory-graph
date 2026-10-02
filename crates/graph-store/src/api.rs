@@ -112,6 +112,9 @@ pub struct PreparedFile {
     /// Remote-prepared files only: the hint and strict flag to send.
     pub(crate) hint: Option<&'static graph_core::encoding::Encoding>,
     pub(crate) strict_encoding: bool,
+    /// Set when the extractor's symbols failed span validation and were
+    /// dropped (#203); reported as [`IngestStats::span_warning`].
+    pub(crate) span_warning: Option<String>,
 }
 
 pub(crate) enum Prepared {
@@ -179,6 +182,7 @@ impl PreparedFile {
             lossy: false,
             hint: None,
             strict_encoding: false,
+            span_warning: None,
         }
     }
 
