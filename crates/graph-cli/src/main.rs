@@ -508,6 +508,11 @@ enum Cmd {
         /// an s/m/h suffix (default 15m)
         #[arg(long, value_parser = parse_duration, default_value = "15m")]
         snapshot_max_age: std::time::Duration,
+        /// The server's tokio worker threads, at least 1 (default: one per CPU, or
+        /// TOKIO_WORKER_THREADS). A small number (2-4) cuts idle wakeups on a many-core host or
+        /// a Docker Desktop VM. Env: MEMORY_GRAPH_WORKER_THREADS
+        #[arg(long, env = "MEMORY_GRAPH_WORKER_THREADS", value_name = "N", value_parser = parse_worker_threads)]
+        worker_threads: Option<std::num::NonZeroUsize>,
     },
     /// Check a server's health (grpc.health.v1): exit 0 when serving, 1 when not (or unreachable).
     /// With --ready: the memory-graph.ready service, SERVING while a leader is known and this node
@@ -935,6 +940,18 @@ fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
 }
 
+/// `serve --worker-threads N`: a positive thread count. 0 is refused
+/// rather than read as "tokio's default" (omit the flag for that).
+fn parse_worker_threads(s: &str) -> std::result::Result<std::num::NonZeroUsize, String> {
+    let n: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{s}` is not a thread count (a whole number, at least 1)"))?;
+    std::num::NonZeroUsize::new(n).ok_or_else(|| {
+        "must be at least 1 (omit --worker-threads for the default: one per CPU)".to_string()
+    })
+}
+
 /// Set once `serve --log-format json` installed its subscriber: a failure
 /// is then logged as JSON rather than printed as text.
 static JSON_LOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1106,6 +1123,7 @@ fn run() -> Result<i32> {
         quorum_loss_timeout,
         min_free_disk,
         snapshot_max_age,
+        worker_threads,
     } = &cli.cmd
     {
         if let Some(s) = &cli.server {
@@ -1318,6 +1336,7 @@ fn run() -> Result<i32> {
             cfg.mcp = Some(mc);
         }
         cfg.snapshot_max_age = *snapshot_max_age;
+        cfg.worker_threads = *worker_threads;
         cfg.restore_allow_extractor_mismatch = *restore_allow_extractor_mismatch;
         let s3 = graph_server::backup::S3Options {
             endpoint: backup_endpoint.clone(),
@@ -2619,6 +2638,8 @@ mod serve_config_tests {
                 "5%",
                 "--snapshot-max-age",
                 "10m",
+                "--worker-threads",
+                "3",
                 "--cache-bytes",
                 "1000000",
                 "--backup-url",
@@ -2675,6 +2696,7 @@ heartbeat-interval = 100
 quorum-loss-timeout = 1500
 min-free-disk = "5%"
 snapshot-max-age = "10m"
+worker-threads = 3
 cache-bytes = 1000000
 "#,
         );
@@ -2827,6 +2849,42 @@ listen = "0.0.0.0:7000"
             typed.extend(os(extra));
             assert_eq!(parsed(a), parsed(typed), "{extra:?}");
         }
+    }
+}
+
+/// `serve --worker-threads` (issue #205): a positive count, 0 refused with
+/// a clear message, from the flag or MEMORY_GRAPH_WORKER_THREADS.
+#[cfg(test)]
+mod worker_threads_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn worker_threads_parses_and_refuses_zero() {
+        assert_eq!(parse_worker_threads("2").unwrap().get(), 2);
+        assert_eq!(parse_worker_threads(" 16 ").unwrap().get(), 16);
+        let e = parse_worker_threads("0").unwrap_err();
+        assert!(e.contains("at least 1"), "{e}");
+        for bad in ["", "-1", "two", "1.5"] {
+            assert!(parse_worker_threads(bad).is_err(), "{bad:?}");
+        }
+        let threads = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.cmd) {
+            Ok(Cmd::Serve { worker_threads, .. }) => Ok(worker_threads.map(|n| n.get())),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e.to_string()),
+        };
+        if std::env::var_os("MEMORY_GRAPH_WORKER_THREADS").is_none() {
+            assert_eq!(threads(&["memory-graph", "serve"]), Ok(None));
+        }
+        assert_eq!(
+            threads(&["memory-graph", "serve", "--worker-threads", "4"]),
+            Ok(Some(4))
+        );
+        let e = threads(&["memory-graph", "serve", "--worker-threads", "0"]).unwrap_err();
+        assert!(
+            e.contains("--worker-threads") && e.contains("at least 1"),
+            "{e}"
+        );
     }
 }
 

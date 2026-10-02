@@ -43,6 +43,7 @@ fn cmd() -> Command {
         .env_remove("MEMORY_GRAPH_READ_DEADLINE")
         .env_remove("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER")
         .env_remove("MEMORY_GRAPH_TESTING_WITHHOLD_LEADER")
+        .env_remove("MEMORY_GRAPH_WORKER_THREADS")
         .env("MEMORY_GRAPH_LOCK_WAIT_MS", "300");
     c
 }
@@ -110,12 +111,17 @@ impl Server {
     }
 
     fn start_env(db: &Path, env: &[(&str, &str)]) -> Server {
+        Self::start_with(db, env, &[])
+    }
+
+    fn start_with(db: &Path, env: &[(&str, &str)], extra: &[&str]) -> Server {
         let mut c = cmd();
         c.envs(env.iter().copied());
         let mut child = c
             .args(["serve", "--db"])
             .arg(db)
             .args(["--listen", "127.0.0.1:0"])
+            .args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -528,6 +534,68 @@ fn health_cluster_and_sysinfo() {
     server.shutdown();
     let o = run(&["--server", &addr, "health"]);
     assert_eq!(o.status.code(), Some(1), "after shutdown: {}", stdout(&o));
+}
+
+/// `serve --worker-threads 2` (issue #205) starts and serves writes and
+/// reads; the env var works too; 0 is refused before anything opens.
+#[test]
+fn worker_threads_caps_the_pool_and_refuses_zero() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let src = d.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.rs"),
+        "fn alpha() {}
+",
+    )
+    .unwrap();
+    let server = Server::start_with(&db, &[], &["--worker-threads", "2"]);
+    let addr = server.addr.clone();
+    assert_eq!(ok(&["--server", &addr, "health"]).trim(), "SERVING");
+    ok(&[
+        "--server",
+        &addr,
+        "index",
+        src.to_str().unwrap(),
+        "--org",
+        "o",
+        "--repo",
+        "r",
+    ]);
+    let hits = ok(&["--server", &addr, "search", "alpha"]);
+    assert!(hits.contains("alpha"), "{hits}");
+    server.shutdown();
+
+    // The environment variable sets it as well.
+    let server = Server::start_with(&db, &[("MEMORY_GRAPH_WORKER_THREADS", "1")], &[]);
+    let hits = ok(&["--server", &server.addr, "search", "alpha"]);
+    assert!(hits.contains("alpha"), "{hits}");
+    server.shutdown();
+
+    for (env, args) in [
+        (None, vec!["serve", "--worker-threads", "0"]),
+        (Some("0"), vec!["serve"]),
+    ] {
+        let mut c = cmd();
+        if let Some(v) = env {
+            c.env("MEMORY_GRAPH_WORKER_THREADS", v);
+        }
+        let o = c
+            .args(args)
+            .args(["--db"])
+            .arg(d.path().join("never.redb"))
+            .args(["--listen", "127.0.0.1:0"])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+        let e = stderr(&o);
+        assert!(
+            e.contains("--worker-threads") && e.contains("at least 1"),
+            "{e}"
+        );
+        assert!(!d.path().join("never.redb").exists());
+    }
 }
 
 /// An embedded open of a served file waits a little, then names the
