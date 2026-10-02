@@ -322,8 +322,9 @@ pub(crate) fn dict_rev_append(
         } else {
             Vec::new()
         };
+        let encoded_len = block.value().len();
         drop(block);
-        if room && entries.len() < codec::DICT_BLOCK {
+        if !dict_block_is_full(encoded_len, entries.len()) {
             entries.push((id, text.to_string()));
             let refs: Vec<(u64, &str)> = entries.iter().map(|(i, t)| (*i, t.as_str())).collect();
             rev.insert(last, codec::encode_dict_block(&refs).as_slice())?;
@@ -332,6 +333,36 @@ pub(crate) fn dict_rev_append(
     }
     rev.insert(n, codec::encode_dict_block(&[(id, text)]).as_slice())?;
     Ok(())
+}
+
+/// The one block-boundary rule for the reverse dictionary, shared by
+/// [`dict_rev_append`] and [`pack_dict_blocks`]: a block is full once it
+/// holds [`codec::DICT_BLOCK`] entries or encodes to
+/// [`DICT_BLOCK_MAX_BYTES`] or more.
+fn dict_block_is_full(encoded_len: usize, entries: usize) -> bool {
+    encoded_len >= DICT_BLOCK_MAX_BYTES || entries >= codec::DICT_BLOCK
+}
+
+/// Pack `entries` (ascending ids) into encoded reverse-dictionary blocks,
+/// filling each block until [`dict_block_is_full`], exactly as a sequence of
+/// [`dict_rev_append`] calls would (#188: vacuum's repack used to split by
+/// entry count only, so a long term could share a block with small ones).
+fn pack_dict_blocks(entries: &[(u64, String)]) -> Vec<Vec<u8>> {
+    let mut blocks = Vec::new();
+    let mut current: Vec<(u64, &str)> = Vec::new();
+    for (id, text) in entries {
+        if !current.is_empty()
+            && dict_block_is_full(codec::dict_block_encoded_len(&current), current.len())
+        {
+            blocks.push(codec::encode_dict_block(&current));
+            current.clear();
+        }
+        current.push((*id, text.as_str()));
+    }
+    if !current.is_empty() {
+        blocks.push(codec::encode_dict_block(&current));
+    }
+    blocks
 }
 
 const TAG_SYM: u64 = 1;
@@ -2843,11 +2874,8 @@ impl V2Store {
                 for i in 0..old_blocks {
                     w.rev.remove(i)?;
                 }
-                for (i, chunk) in kept.chunks(codec::DICT_BLOCK).enumerate() {
-                    let refs: Vec<(u64, &str)> =
-                        chunk.iter().map(|(id, t)| (*id, t.as_str())).collect();
-                    w.rev
-                        .insert(i as u64, codec::encode_dict_block(&refs).as_slice())?;
+                for (i, block) in pack_dict_blocks(&kept).iter().enumerate() {
+                    w.rev.insert(i as u64, block.as_slice())?;
                 }
             }
             let stats = VacuumStats {

@@ -2483,6 +2483,99 @@ fn vacuum_repacks_dict_rev_blocks_and_lookups_stay_correct() {
     }
 }
 
+/// Issue #188: vacuum's repack applies the same byte cap as
+/// `dict_rev_append` (#162). Before the fix it split by entry count only, so
+/// after a vacuum the small terms interned after a 64 KiB term shared its
+/// block and every lookup of them decoded the long term again.
+#[test]
+fn vacuum_repack_closes_the_block_of_a_long_term() {
+    use crate::v2::{DICT_BLOCK_MAX_BYTES, DICT_REV};
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    let long = "z".repeat(DICT_BLOCK_MAX_BYTES);
+    let before: Vec<String> = (0..5).map(|i| format!("before{i}")).collect();
+    let after: Vec<String> = (0..20).map(|i| format!("after{i}")).collect();
+    let dead: Vec<String> = (0..3).map(|i| format!("dead{i}")).collect();
+    let tokens_of = |terms: &[&str]| -> Vec<(String, u32, u32)> {
+        let mut at = 0u32;
+        terms
+            .iter()
+            .map(|t| {
+                let start = at;
+                at += t.len() as u32 + 1;
+                (t.to_string(), start, start + t.len() as u32)
+            })
+            .collect()
+    };
+    let ingest = |terms: &[&str]| {
+        let owned = tokens_of(terms);
+        let toks: Vec<(&str, u32, u32)> =
+            owned.iter().map(|(t, s, e)| (t.as_str(), *s, *e)).collect();
+        let end = toks.last().map_or(0, |t| t.2);
+        let syms = [("Holder", SymbolKind::Function, 0, end)];
+        s.ingest_file("o", "r", "x.txt", "text", &span_ext(&syms, &toks))
+            .unwrap();
+    };
+    let live: Vec<&str> = before
+        .iter()
+        .map(String::as_str)
+        .chain([long.as_str()])
+        .chain(after.iter().map(String::as_str))
+        .collect();
+    let with_dead: Vec<&str> = live
+        .iter()
+        .copied()
+        .chain(dead.iter().map(String::as_str))
+        .collect();
+    ingest(&with_dead);
+    ingest(&live);
+
+    let stats = s.vacuum().unwrap();
+    assert_eq!(stats.terms_removed, dead.len());
+    s.check_consistency(true);
+
+    let rt = s.db.begin_read().unwrap();
+    let table = rt.open_table(DICT_REV).unwrap();
+    let blocks: Vec<Vec<(u64, String)>> = table
+        .iter()
+        .unwrap()
+        .map(|r| crate::codec::decode_dict_block(r.unwrap().1.value()).unwrap())
+        .collect();
+    let at = blocks
+        .iter()
+        .position(|b| b.iter().any(|(_, t)| *t == long))
+        .expect("the long term survives the vacuum");
+    assert_eq!(
+        blocks[at].last().unwrap().1,
+        long,
+        "no term follows the long term in its block"
+    );
+    let rest: Vec<&str> = blocks[at + 1..]
+        .iter()
+        .flatten()
+        .map(|(_, t)| t.as_str())
+        .collect();
+    for t in &after {
+        assert!(
+            rest.contains(&t.as_str()),
+            "{t} is packed after the long block"
+        );
+    }
+
+    for t in &live {
+        assert_eq!(s.search(&Query::new(*t)).unwrap().len(), 1, "term {t:.20}");
+    }
+    for t in &dead {
+        assert!(s.search(&Query::new(t)).unwrap().is_empty(), "dead {t}");
+    }
+    let infos = s.describe(None, None).unwrap();
+    let repo = infos
+        .iter()
+        .find(|i| i.org == "o" && i.repo == "r")
+        .expect("describe still reports the repo");
+    assert!(repo.languages.contains_key("text"));
+}
+
 /// Size gate (ADR 0003 story 5, decision D1: "Dictionary <= 15% of pages at
 /// 9.9 M; lookups unchanged"): on a term set derived from this repo's own
 /// source (`v2.rs`/`codec.rs`, tokenized crudely by splitting on

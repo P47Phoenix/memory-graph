@@ -148,6 +148,12 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
+/// The number of bytes [`put_varint`] writes for `v`.
+fn varint_len(v: u64) -> usize {
+    let bits = 64 - v.leading_zeros() as usize;
+    bits.max(1).div_ceil(7)
+}
+
 fn zigzag(d: i64) -> u64 {
     ((d << 1) ^ (d >> 63)) as u64
 }
@@ -744,6 +750,15 @@ pub fn encode_dict_block(entries: &[(u64, &str)]) -> Vec<u8> {
         out.extend_from_slice(bytes);
     }
     out
+}
+
+/// The length of [`encode_dict_block`]`(entries)` without encoding it.
+pub fn dict_block_encoded_len(entries: &[(u64, &str)]) -> usize {
+    entries
+        .iter()
+        .fold(varint_len(entries.len() as u64), |len, (id, text)| {
+            len + varint_len(*id) + varint_len(text.len() as u64) + text.len()
+        })
 }
 
 /// Decode a block written by [`encode_dict_block`] into its `(id, text)`
@@ -1718,6 +1733,25 @@ mod tests {
     /// An empty block (never written by `encode_dict_block` itself, but
     /// accepted defensively by the decoder/peek) round-trips to no entries
     /// and no first id.
+    /// `dict_block_encoded_len` agrees with `encode_dict_block` across every
+    /// varint width boundary for ids, lengths and the entry count.
+    #[test]
+    fn dict_block_encoded_len_matches_encoding() {
+        let long = "y".repeat(1 << 14);
+        let ids = [0, 127, 128, 16_383, 16_384, u64::MAX];
+        let texts = ["", "a", &long[..127], &long[..128], &long];
+        for n in [0usize, 1, 5, 127, 128] {
+            let entries: Vec<(u64, &str)> = (0..n)
+                .map(|i| (ids[i % ids.len()], texts[i % texts.len()]))
+                .collect();
+            assert_eq!(
+                dict_block_encoded_len(&entries),
+                encode_dict_block(&entries).len(),
+                "{n} entries"
+            );
+        }
+    }
+
     #[test]
     fn dict_block_empty_round_trips() {
         let b = encode_dict_block(&[]);
