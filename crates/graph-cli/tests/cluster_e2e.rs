@@ -19,9 +19,11 @@
 //!
 //! Every wait polls a condition with a hard deadline and says what it was
 //! waiting for; nothing sleeps and hopes.
+mod common;
+
+use common::readiness::{ready_timeout, start_serve, try_start_serve, StartOptions};
 use graph_server::testing::mcp_http::{http, McpHttpClient};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -152,45 +154,10 @@ impl Node {
             .args(RAFT_TIMING)
             // The test machine's free space is not what is being tested.
             .args(["--min-free-disk", "1"])
-            .args(extra)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let mut child = c.spawn().unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            // Keep draining so the server never blocks on a print.
-            for line in BufReader::new(out).lines() {
-                let Ok(l) = line else { return };
-                let _ = tx.send(l);
-            }
-        });
-        // `metrics on ...` and `mcp on ...` (when enabled) come before the
-        // listening line, which is the start signal.
-        let (mut mcp, mut metrics) = (None, None);
-        let line = loop {
-            let l = match rx.recv_timeout(WAIT) {
-                Ok(l) => l,
-                Err(e) => {
-                    let st = child.try_wait();
-                    let _ = child.kill();
-                    panic!("node {id} printed no listening line ({e}); exit: {st:?}");
-                }
-            };
-            if let Some((_, rest)) = l.split_once("mcp on http://") {
-                mcp = Some(rest.trim_end_matches("/mcp").parse().unwrap());
-            } else if let Some((_, rest)) = l.split_once("metrics on http://") {
-                metrics = Some(rest.trim_end_matches("/metrics").parse().unwrap());
-            } else {
-                break l;
-            }
-        };
-        let addr = line
-            .split("listening on ")
-            .nth(1)
-            .and_then(|r| r.split_whitespace().next())
-            .unwrap_or_else(|| panic!("no address in {line:?}"))
-            .to_string();
+            .args(extra);
+        let started = start_serve(c, StartOptions::default());
+        let (child, addr, mcp, metrics) =
+            (started.child, started.addr, started.mcp, started.metrics);
         Node {
             id,
             dir: dir.to_path_buf(),
@@ -215,42 +182,32 @@ impl Node {
         assert!(self.child.is_none(), "node {} is still running", self.id);
         // The port was just released; a platform may hold it briefly.
         let listen = self.addr.clone();
-        let deadline = Instant::now() + WAIT;
+        // One deadline for every attempt together: each gets what is left.
+        let deadline = Instant::now() + ready_timeout();
         loop {
             let mut c = cmd();
-            let mut child = c
-                .arg("serve")
+            c.arg("serve")
                 .arg("--data-dir")
                 .arg(&self.dir)
                 .args(["--listen", &listen])
                 .args(RAFT_TIMING)
                 .args(["--min-free-disk", "1"])
-                .args(extra)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let out = child.stdout.take().unwrap();
-            let mut lines = BufReader::new(out).lines();
-            match lines.next() {
-                Some(Ok(l)) if l.contains("listening on") => {
-                    std::thread::spawn(move || lines.for_each(drop));
-                    let err = child.stderr.take().unwrap();
-                    std::thread::spawn(move || {
-                        for l in BufReader::new(err).lines().map_while(Result::ok) {
-                            eprintln!("{l}");
-                        }
-                    });
-                    self.child = Some(child);
+                .args(extra);
+            let options = StartOptions {
+                timeout: deadline.saturating_duration_since(Instant::now()),
+                ..StartOptions::default()
+            };
+            match try_start_serve(c, options) {
+                Ok(started) => {
+                    self.child = Some(started.child);
                     return;
                 }
-                _ => {
-                    let o = child.wait_with_output().unwrap();
-                    let err = text(&o.stderr);
+                Err(failure) => {
+                    let err = failure.stderr_text();
                     assert!(
                         Instant::now() < deadline
                             && (err.contains("in use") || err.contains("10048")),
-                        "node {} did not restart on {listen}: {err}",
+                        "node {} did not restart on {listen}: {failure}",
                         self.id
                     );
                     std::thread::sleep(Duration::from_millis(200));
