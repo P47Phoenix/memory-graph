@@ -6,7 +6,9 @@
 //! membership, sha256, size, extractors hash, store format). One pair is
 //! kept: older pairs are removed only after a new one is complete.
 //!
-//! Crash safety: a build exports to `snap-build.redb.tmp`, renames it to
+//! Crash safety: a build exports to its own `snap-build-<nanos>-<n>.redb.tmp`
+//! (unique per build, so concurrent builds never touch each other's file and
+//! every error path removes it), renames it to
 //! its final name, then writes the meta through a temp file and a rename.
 //! The current snapshot is the highest-index meta whose data file exists
 //! with the recorded size; a crash between the renames leaves a data file
@@ -14,7 +16,15 @@
 //! is only removed afterwards). Pruning older pairs never touches a
 //! `*.tmp` file, which may be a concurrent build's export in progress
 //! (#185); temp files orphaned by a crash are swept when the directory is
-//! opened. A build at an index that already has a
+//! opened.
+//!
+//! Concurrency: builds (blocking tasks) and installs can run at the same
+//! time. Each promotion (rename, fsync, meta, prune) holds one lock, so a
+//! prune never removes another promotion's renamed file before its meta
+//! exists. A promotion older than the current pair (a build that exported
+//! before an install of a later snapshot finished) is discarded and the
+//! newer pair kept: openraft's snapshot only ever moves forward, and a
+//! newer committed snapshot is always a valid answer. A build at an index that already has a
 //! complete pair reuses it, unless that pair was made by another build
 //! (older store format or other extractors, #151): the rebuilt pair is then
 //! named `snap-<term>-<index>-r<nanos>` rather than overwriting the existing
@@ -125,6 +135,29 @@ pub struct SnapshotDir {
     /// before its meta is written (a crash there).
     #[cfg(test)]
     pub(crate) fail_before_meta: std::sync::atomic::AtomicBool,
+    /// Held across a whole promotion (rename, meta, prune).
+    promote_lock: std::sync::Mutex<()>,
+    /// Makes temp names unique within this process.
+    temp_seq: AtomicU64,
+}
+
+/// A temp file removed when dropped (every error path); a no-op once the
+/// file has been renamed into place.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// What a promotion did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Promoted {
+    /// The file became the current pair.
+    New,
+    /// A newer pair already existed; the file was discarded.
+    Stale,
 }
 
 /// Called with each newly built snapshot pair (not a reused one).
@@ -150,6 +183,8 @@ impl SnapshotDir {
             on_built: std::sync::RwLock::new(None),
             #[cfg(test)]
             fail_before_meta: Default::default(),
+            promote_lock: std::sync::Mutex::new(()),
+            temp_seq: AtomicU64::new(0),
         })
     }
 
@@ -185,6 +220,16 @@ impl SnapshotDir {
             .unwrap_or_default();
         let n: u32 = rand::random();
         self.dir.join(format!("incoming-{nanos}-{n:08x}.redb.tmp"))
+    }
+
+    /// A fresh `<prefix>-<nanos>-<n>.redb.tmp` path in this directory.
+    fn temp_path(&self, prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let n = self.temp_seq.fetch_add(1, Ordering::SeqCst);
+        self.dir.join(format!("{prefix}-{nanos}-{n:08x}.redb.tmp"))
     }
 
     fn data_path(&self, stem: &str) -> PathBuf {
@@ -267,14 +312,33 @@ impl SnapshotDir {
 
     /// Put `data` (a complete store file in this directory) in place as
     /// the snapshot `last`/`membership`: rename to its final name, then
-    /// write its meta, then remove older pairs.
+    /// write its meta, then remove older pairs, all under `promote_lock`.
+    ///
+    /// If the current pair is newer than `last`, `data` is removed and the
+    /// current pair returned with `Promoted::Stale`: a newer pair is never
+    /// pruned for an older one.
     pub(super) fn promote(
         &self,
         data: &Path,
         last: Option<LogId>,
         membership: StoredMembership,
         snapshot_id: String,
-    ) -> Result<(SnapshotSidecar, PathBuf), StoreError> {
+    ) -> Result<(SnapshotSidecar, PathBuf, Promoted), StoreError> {
+        let _guard = self
+            .promote_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((side, path)) = self.current() {
+            if side.last_log_id > last {
+                tracing::info!(
+                    current = ?side.last_log_id,
+                    incoming = ?last,
+                    "snapshot older than the current one; discarded"
+                );
+                let _ = std::fs::remove_file(data);
+                return Ok((side, path, Promoted::Stale));
+            }
+        }
         let io = |e: std::io::Error| StoreError::Storage(format!("snapshot: {e}"));
         let (sha256, size) = sha256_file(data)?;
         let st = stem(last.as_ref());
@@ -330,23 +394,21 @@ impl SnapshotDir {
         )
         .map_err(io)?;
         self.prune_except(&final_path);
-        Ok((side, final_path))
+        Ok((side, final_path, Promoted::New))
     }
 
     /// Build a snapshot of the store in `slot` (blocking): export in one
     /// read transaction, read the copy's own marker, and promote. A build at
     /// an index that already has a complete pair reuses it.
     pub fn build(&self, slot: &StoreSlot) -> Result<Snapshot<TypeConfig>, StoreError> {
-        let tmp = self.dir.join("snap-build.redb.tmp");
-        let _ = std::fs::remove_file(&tmp);
-        slot.with_store(|s| s.export_snapshot(&tmp))?;
+        let tmp = TempFile(self.temp_path("snap-build"));
+        slot.with_store(|s| s.export_snapshot(&tmp.0))?;
         let (last, membership) = {
-            let copy = V2Store::open(&tmp)?;
+            let copy = V2Store::open(&tmp.0)?;
             super::state_machine::StoreStateMachine::read_applied(&copy)?
         };
         if let Some((side, path)) = self.current() {
             if side.last_log_id == last && side.last_log_id.is_some() && !self.is_outdated(&side) {
-                let _ = std::fs::remove_file(&tmp);
                 return Ok(Snapshot {
                     meta: side.meta(),
                     snapshot: Box::new(SnapshotFile { path }),
@@ -358,17 +420,18 @@ impl SnapshotDir {
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let snapshot_id = format!("{}-{nanos}", stem(last.as_ref()));
-        let r = self.promote(&tmp, last, membership, snapshot_id);
-        let _ = std::fs::remove_file(&tmp);
-        let (side, path) = r?;
-        self.built.fetch_add(1, Ordering::SeqCst);
-        let hook = self
-            .on_built
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(f) = hook {
-            f(&side, &path);
+        let (side, path, promoted) = self.promote(&tmp.0, last, membership, snapshot_id)?;
+        drop(tmp);
+        if promoted == Promoted::New {
+            self.built.fetch_add(1, Ordering::SeqCst);
+            let hook = self
+                .on_built
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(f) = hook {
+                f(&side, &path);
+            }
         }
         Ok(Snapshot {
             meta: side.meta(),
@@ -458,12 +521,12 @@ impl SnapshotDir {
             )
         } else {
             // Not ours to move (a test's file): copy it in.
-            let tmp = self.dir.join("snap-copy.redb.tmp");
-            std::fs::copy(&data.path, &tmp)
+            let tmp = TempFile(self.temp_path("snap-copy"));
+            std::fs::copy(&data.path, &tmp.0)
                 .map_err(|e| StoreError::Storage(format!("snapshot copy: {e}")))
                 .and_then(|_| {
                     self.promote(
-                        &tmp,
+                        &tmp.0,
                         meta.last_log_id,
                         meta.last_membership.clone(),
                         meta.snapshot_id.clone(),
