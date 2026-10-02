@@ -579,9 +579,11 @@ impl RaftNode {
         if node.sole_voter() {
             let me = node.node_id;
             // `initialize` campaigns at once (and its vote may not show in
-            // the metrics yet: no second campaign). A restarted voter
-            // starts as a follower and campaigns at its first tick, 1.5
-            // heartbeats away; alone, it has nobody to wait for.
+            // the metrics yet: no second campaign). A restart whose
+            // committed vote is its own resumes as leader at once; one
+            // that is not (a crash mid-campaign) starts as a follower and
+            // would campaign only at its first tick, 1.5 heartbeats away.
+            // Alone, it has nobody to wait for.
             if !initialized_now && node.metrics().state != ServerState::Leader {
                 node.raft.trigger().elect().await.map_err(fatal)?;
             }
