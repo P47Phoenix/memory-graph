@@ -784,20 +784,24 @@ fn token_classes_are_sensible_on_real_code() {
         let src = std::fs::read_to_string(corpus_dir().join(repo).join(file)).unwrap();
         shipped_registry().extract("asm", &src).tokens
     };
-    // Known limits (#134), pinned on real code so a fix shows up here: an
-    // AT&T trailing `# comment` after code and an ARM32 `@ comment` are not
-    // comments today. Flip these to `TokenClass::Comment` when they are.
+    // #197: an AT&T trailing `# comment` after code and an ARM32
+    // `@ comment` are comments (pinned on real code).
     let att = asm("xv6-asm", "bootasm.S");
     let line16: Vec<_> = att.iter().filter(|t| t.span.start_line == 16).collect();
     assert_eq!(line16[0].text, "xorw");
-    let hash = line16.iter().find(|t| t.text == "#").expect("# on line 16");
-    assert_ne!(hash.class, TokenClass::Comment);
+    let hash = line16
+        .iter()
+        .find(|t| t.text.starts_with('#'))
+        .expect("# on line 16");
+    assert_eq!(hash.class, TokenClass::Comment);
+    assert_eq!(hash.text.trim_end_matches('\r'), "# Set %ax to zero");
     let arm = asm("arm32-game", "game1/prompt.asm");
     let at = arm
         .iter()
-        .find(|t| t.span.start_line == 15 && t.text == "@")
+        .find(|t| t.span.start_line == 15 && t.text.starts_with('@'))
         .expect("@ on line 15");
-    assert_ne!(at.class, TokenClass::Comment);
+    assert_eq!(at.class, TokenClass::Comment);
+    assert_eq!(at.text.trim_end_matches('\r'), "@ #0x0\t1");
     let sh = classes("rbenv", "libexec/rbenv");
     assert!(sh.iter().any(|t| t.class == TokenClass::Comment));
     assert!(sh
