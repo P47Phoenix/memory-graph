@@ -699,6 +699,26 @@ fn every_parsed_token_is_stored() {
     // program symbol still starts at column 8 of its PROGRAM-ID line.
     let s = span_of("COBTUPDT", "cobol", "program");
     assert_eq!((s.start_line, s.start_col), (22, 8), "{s:?}");
+    // A paragraph name may start with a digit (#196).
+    spot(
+        "1000-ACCTFILE-GET-NEXT",
+        "cobol",
+        "paragraph",
+        "app/cbl/CBACT01C.cbl",
+    );
+    let mut q = graph_store::SymbolQuery::new("1000-ACCTFILE-GET-NEXT");
+    q.language = Some("cobol".into());
+    let s = store
+        .search_symbols(&q)
+        .unwrap()
+        .into_iter()
+        .find(|h| h.file == "app/cbl/CBACT01C.cbl")
+        .and_then(|h| h.span)
+        .expect("1000-ACCTFILE-GET-NEXT has a span in CBACT01C.cbl");
+    assert_eq!((s.start_line, s.start_col), (165, 8), "{s:?}");
+    let cbl =
+        std::fs::read_to_string(corpus_dir().join("carddemo-cobol/app/cbl/CBACT01C.cbl")).unwrap();
+    assert!(cbl[s.start as usize..].starts_with("1000-ACCTFILE-GET-NEXT."));
     // A fixed-form P spec runs from its `B` (with the `...` long name on the
     // line before) to its `E` spec.
     let s = span_of("list_sort_insertionSort", "rpg", "procedure");
@@ -887,7 +907,7 @@ fn non_rust_corpus_token_streams_are_unchanged() {
 /// (bump its version, re-pin) or the corpus did.
 #[test]
 fn non_aspx_corpus_symbols_are_unchanged() {
-    const EXPECTED: (usize, usize, u64) = (787, 6927, 3942956324713085798);
+    const EXPECTED: (usize, usize, u64) = (787, 6952, 5569861369318968961);
     let registry = shipped_registry();
     let (mut n, mut syms, mut h) = (0usize, 0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
