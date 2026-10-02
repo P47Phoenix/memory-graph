@@ -820,6 +820,57 @@ mod tests {
         assert_eq!(files.len(), 2, "one pair left: {files:?}");
     }
 
+    /// #185: a promote (here an install's) while a build is still writing
+    /// its temp file prunes older pairs but leaves the temp file alone; the
+    /// build then finishes and promotes, and a crash's leftover temp file is
+    /// swept when the directory is reopened.
+    #[test]
+    fn a_promote_never_prunes_a_build_in_progress() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let (side, current) = snaps.current().unwrap();
+        // A build mid-export: its temp file exists, not yet promoted.
+        let building = snaps.dir().join("snap-build.redb.tmp");
+        slot.with_store(|s| s.export_snapshot(&building)).unwrap();
+        let building_bytes = std::fs::read(&building).unwrap();
+        // A concurrent install promotes (and prunes).
+        let received = d.path().join("received.redb");
+        std::fs::copy(&current, &received).unwrap();
+        snaps
+            .install_with(
+                &d.path().join("store-not-swapped.redb"),
+                &side.meta(),
+                &SnapshotFile { path: received },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(snaps.installed(), 1);
+        assert_eq!(
+            std::fs::read(&building).unwrap(),
+            building_bytes,
+            "the build's temp file survives the prune"
+        );
+        // The build finishes and promotes its file.
+        let (built, path) = snaps
+            .promote(
+                &building,
+                side.last_log_id,
+                side.membership.clone(),
+                "finished".into(),
+            )
+            .unwrap();
+        assert_eq!(built.snapshot_id, "finished");
+        assert!(!building.exists());
+        let (cur, cur_path) = snaps.current().unwrap();
+        assert_eq!((cur.snapshot_id.as_str(), cur_path), ("finished", path));
+        assert_eq!(files_in(snaps.dir()).len(), 2, "one pair left");
+        // A temp file orphaned by a crash is swept at the next open.
+        std::fs::write(&building, b"partial").unwrap();
+        let reopened = SnapshotDir::open(snaps.dir(), "h").unwrap();
+        assert!(!building.exists());
+        assert_eq!(reopened.current().unwrap().0.snapshot_id, "finished");
+    }
+
     /// #151: a received snapshot in an older, upgradable store format is
     /// installed; the store and the promoted pair are in this build's format.
     #[test]

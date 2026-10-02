@@ -11,7 +11,10 @@
 //! The current snapshot is the highest-index meta whose data file exists
 //! with the recorded size; a crash between the renames leaves a data file
 //! without a meta (ignored, and the previous pair is still there because it
-//! is only removed afterwards). A build at an index that already has a
+//! is only removed afterwards). Pruning older pairs never touches a
+//! `*.tmp` file, which may be a concurrent build's export in progress
+//! (#185); temp files orphaned by a crash are swept when the directory is
+//! opened. A build at an index that already has a
 //! complete pair reuses it, unless that pair was made by another build
 //! (older store format or other extractors, #151): the rebuilt pair is then
 //! named `snap-<term>-<index>-r<nanos>` rather than overwriting the existing
@@ -242,6 +245,11 @@ impl SnapshotDir {
     /// Remove every snapshot file but `keep` (and its meta). Errors are
     /// ignored: a file still being streamed to a follower on Windows may
     /// refuse, and a leftover is harmless (the next build retries).
+    ///
+    /// Temp files (`*.tmp`) are never removed here: one may belong to a
+    /// concurrent build or install still writing it (#185). Each owner
+    /// removes its own temp file, and [`SnapshotDir::open`] sweeps any
+    /// left by a crash.
     fn prune_except(&self, keep: &Path) {
         let Ok(rd) = std::fs::read_dir(&self.dir) else {
             return;
@@ -250,7 +258,8 @@ impl SnapshotDir {
         for e in rd.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("snap-") && p != keep && p != keep_meta {
+            let prunable = name.starts_with("snap-") && !name.ends_with(".tmp");
+            if prunable && p != keep && p != keep_meta {
                 let _ = std::fs::remove_file(&p);
             }
         }
@@ -259,7 +268,7 @@ impl SnapshotDir {
     /// Put `data` (a complete store file in this directory) in place as
     /// the snapshot `last`/`membership`: rename to its final name, then
     /// write its meta, then remove older pairs.
-    fn promote(
+    pub(super) fn promote(
         &self,
         data: &Path,
         last: Option<LogId>,
