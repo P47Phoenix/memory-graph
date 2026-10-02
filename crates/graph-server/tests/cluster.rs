@@ -1668,6 +1668,91 @@ fn a_postponed_snapshot_is_built_on_an_idle_node() {
     });
 }
 
+/// A Rust file of about `bytes` bytes (one log entry a little larger).
+fn rust_file_of(i: usize, bytes: usize) -> (String, Vec<u8>) {
+    let mut s = String::new();
+    let mut n = 0;
+    while s.len() < bytes {
+        s.push_str(&format!("fn g{i}_{n}() -> u32 {{ {n} }}\n"));
+        n += 1;
+    }
+    (format!("src/big{i}.rs"), s.into_bytes())
+}
+
+/// Issue #211: the `--snapshot-log-bytes` trigger, end to end, twice in a
+/// row (the entry trigger is off). The first build is held after it took
+/// its snapshot while a second write lands above it; once it finishes, the
+/// bytes of that write still count toward the next snapshot, so a second
+/// one follows. (The policy used to restart the count at the first
+/// snapshot's arrival, dropping what was appended during its build.)
+#[test]
+fn the_log_bytes_trigger_builds_snapshots_back_to_back() {
+    let _w = watchdog(
+        "the_log_bytes_trigger_builds_snapshots_back_to_back",
+        TEST_LIMIT,
+    );
+    const LIMIT: u64 = 16 << 10;
+    let tb = ClusterTestbed::with_config(1, exts(), |_, c| {
+        c.raft = Some(RaftSettings {
+            snapshot_log_entries: u64::MAX,
+            snapshot_log_bytes: LIMIT,
+            ..TEST_RAFT
+        });
+    });
+    let node = tb.node(1).raft().unwrap().clone();
+    assert!(node.metrics().snapshot.is_none());
+    // The first new build reports itself and waits for the release (on
+    // the node's blocking pool, after the pair was promoted and before
+    // openraft hears of it); later ones pass.
+    let (built_tx, built_rx) = std::sync::mpsc::channel::<u64>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let built_tx = Mutex::new(built_tx);
+    let release_rx = Mutex::new(Some(release_rx));
+    node.snapshots.set_on_built(Some(Arc::new(move |side, _| {
+        let _ = built_tx.lock().unwrap().send(side.index);
+        if let Some(rx) = release_rx.lock().unwrap().take() {
+            let _ = rx.recv_timeout(CLUSTER_WAIT * 3);
+        }
+    })));
+    let c = tb.client(1);
+    let (path, bytes) = rust_file_of(1, 2 * LIMIT as usize);
+    c.index_bytes("o", "r", &path, &bytes, None).unwrap();
+    let first = built_rx
+        .recv_timeout(CLUSTER_WAIT)
+        .expect("a snapshot built by the byte trigger");
+    let (path, bytes) = rust_file_of(2, 2 * LIMIT as usize);
+    c.index_bytes("o", "r", &path, &bytes, None).unwrap();
+    let applied = node.metrics().last_applied.map_or(0, |l| l.index);
+    assert!(
+        first < applied,
+        "the held build ({first}) is below the second write ({applied})"
+    );
+    release_tx.send(()).unwrap();
+    let second = built_rx
+        .recv_timeout(CLUSTER_WAIT)
+        .expect("a second snapshot for the bytes written during the first build");
+    assert!(
+        second >= applied,
+        "second snapshot at {second}, want {applied}"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        node.raft
+            .wait(Some(CLUSTER_WAIT))
+            .metrics(
+                |m| m.snapshot.is_some_and(|s| s.index >= applied),
+                "the second snapshot",
+            )
+            .await
+            .unwrap();
+    });
+    node.snapshots.set_on_built(None);
+    assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 2);
+}
+
 /// QA 11: `Admin.Compact` (`vacuum --compact`) is node-local: it writes
 /// no log entry and leaves the applied state as it was.
 #[test]

@@ -338,10 +338,23 @@ impl RedbLogStore {
 
     /// Encoded bytes of the entries above `index` in the log right now.
     pub fn bytes_after(&self, index: u64) -> Result<u64, StoreError> {
+        self.bytes_in(index, Bound::Unbounded)
+    }
+
+    /// Encoded bytes of the entries above `after`, up to and including
+    /// `upto`, in the log right now.
+    pub fn bytes_between(&self, after: u64, upto: u64) -> Result<u64, StoreError> {
+        if upto <= after {
+            return Ok(0);
+        }
+        self.bytes_in(after, Bound::Included(upto))
+    }
+
+    fn bytes_in(&self, after: u64, upto: Bound<u64>) -> Result<u64, StoreError> {
         let rt = self.read_txn()?;
         let t = rt.open_table(LOG)?;
         let mut n = 0u64;
-        for row in t.range::<u64>((Bound::Excluded(index), Bound::Unbounded))? {
+        for row in t.range::<u64>((Bound::Excluded(after), upto))? {
             let (_, v) = row?;
             n += v.value().len() as u64;
         }
@@ -1094,9 +1107,14 @@ mod tests {
         };
         log.insert_for_test(&e(1));
         log.insert_for_test(&e(2));
+        log.insert_for_test(&e(3));
         drop(log);
         let log = RedbLogStore::open(&path).unwrap();
-        assert_eq!(log.appended_bytes(), 2 * 125);
-        assert_eq!(log.bytes_after(1).unwrap(), 125);
+        assert_eq!(log.appended_bytes(), 3 * 125);
+        assert_eq!(log.bytes_after(1).unwrap(), 2 * 125);
+        assert_eq!(log.bytes_between(1, 2).unwrap(), 125);
+        assert_eq!(log.bytes_between(0, 3).unwrap(), 3 * 125);
+        assert_eq!(log.bytes_between(3, 9).unwrap(), 0);
+        assert_eq!(log.bytes_between(2, 1).unwrap(), 0);
     }
 }

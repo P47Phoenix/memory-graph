@@ -994,22 +994,20 @@ impl RaftNode {
 /// frees up even on an idle cluster, and a triggered build that never
 /// produced a snapshot (openraft logs a failed build and carries on) is
 /// retried after [`SNAPSHOT_RETRY`]. With neither, an idle node does not
-/// wake it (issue #205). The byte trigger counts from what the log held
-/// above the snapshot at start, so a restart does not reset it.
+/// wake it (issue #205). The byte trigger counts the applied entries above
+/// the last snapshot whenever they were appended ([`bytes_base`]), so
+/// neither a restart nor a build resets it.
 async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
     let mut rx = node.raft.metrics();
     let entries = s.snapshot_log_entries.max(1);
-    let mut last_snap = rx.borrow().snapshot.map(|l| l.index);
-    let mut base_bytes = {
-        let log = node.log_store.clone();
-        let snap = last_snap.unwrap_or(0);
-        let above = tokio::task::spawn_blocking(move || log.bytes_after(snap))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(0);
-        node.log_store.appended_bytes().saturating_sub(above)
+    let (mut last_snap, applied) = {
+        let m = rx.borrow();
+        (
+            m.snapshot.map(|l| l.index),
+            m.last_applied.map_or(0, |l| l.index),
+        )
     };
+    let mut base_bytes = bytes_base(&node.log_store, last_snap.unwrap_or(0), applied).await;
     let mut pending: Option<(u64, std::time::Instant)> = None;
     let mut disk_refused = false;
     loop {
@@ -1026,7 +1024,10 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
         }
         if snap != last_snap {
             last_snap = snap;
-            base_bytes = node.log_store.appended_bytes();
+            // Not `appended_bytes()`: the entries applied above the new
+            // snapshot (appended while it was built) count toward the next
+            // one, as at start-up (issue #211).
+            base_bytes = bytes_base(&node.log_store, snap.unwrap_or(0), applied).await;
             if pending.is_some_and(|(p, _)| snap.unwrap_or(0) >= p) {
                 pending = None;
             }
@@ -1037,7 +1038,11 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
         }
         let since = applied.saturating_sub(snap.unwrap_or(0));
         let bytes = node.log_store.appended_bytes().saturating_sub(base_bytes);
-        let due = applied > 0 && (since >= entries || bytes >= s.snapshot_log_bytes);
+        // A build covers the applied index only: with nothing applied
+        // above the snapshot (a lagging apply, the bytes all above it), it
+        // would rebuild the same snapshot and wait for SNAPSHOT_RETRY.
+        let due =
+            applied > snap.unwrap_or(0) && (since >= entries || bytes >= s.snapshot_log_bytes);
         if !due {
             // Nothing to retry (a snapshot arrived some other way).
             disk_refused = false;
@@ -1066,6 +1071,29 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
             _ = tokio::time::sleep(POLICY_TICK), if waiting => {}
         }
     }
+}
+
+/// The byte trigger's baseline once the snapshot is at `snap` and the node
+/// has applied `applied`: the log's
+/// [`appended_bytes`](RedbLogStore::appended_bytes) counter less the bytes
+/// of the entries in `(snap, applied]`, so those count toward the next
+/// snapshot whenever they were appended (before a restart, or while the
+/// snapshot was being built). Entries not applied yet are left out: a
+/// build covers only the applied index, so on a node whose apply lags a
+/// backlog over the limit would otherwise make every new snapshot due
+/// again at once, each covering only what was applied during the last
+/// build. The counter is read first (an append after it lands above
+/// `applied`, outside the range). A failed read counts nothing above `snap`
+/// (the next snapshot comes later).
+async fn bytes_base(log: &RedbLogStore, snap: u64, applied: u64) -> u64 {
+    let appended = log.appended_bytes();
+    let log = log.clone();
+    let above = tokio::task::spawn_blocking(move || log.bytes_between(snap, applied))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(0);
+    appended.saturating_sub(above)
 }
 
 /// The snapshot policy re-evaluates at least this often while a build is
