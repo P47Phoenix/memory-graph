@@ -129,15 +129,19 @@ jobs:
 
       - name: Idle wakeups of serve --db (issue #205, docs/spikes/idle-cpu.md)
         shell: bash
+        timeout-minutes: 5
         run: |
           set -euxo pipefail
+          trap 'docker logs mg-idle || true; docker rm -f mg-idle >/dev/null 2>&1 || true; docker volume rm -f mg-idle >/dev/null 2>&1 || true' EXIT
           docker volume rm -f mg-idle >/dev/null 2>&1 || true
           docker run -d --name mg-idle -v mg-idle:/data memory-graph:smoke \
             serve --db /data/g.redb --listen 0.0.0.0:7000
-          trap 'docker logs mg-idle || true; docker rm -f mg-idle >/dev/null 2>&1 || true; docker volume rm -f mg-idle >/dev/null 2>&1 || true' EXIT
           ok=0
           for i in $(seq 1 60); do
-            if docker logs mg-idle 2>&1 | grep -q 'listening on'; then ok=1; break; fi
+            # Captured first: `grep -q` quitting early could SIGPIPE
+            # `docker logs` and fail the pipeline under pipefail.
+            logs="$(docker logs mg-idle 2>&1 || true)"
+            if grep -q 'listening on' <<<"$logs"; then ok=1; break; fi
             sleep 1
           done
           [ "$ok" = 1 ]

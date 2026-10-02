@@ -17,8 +17,9 @@
 # counts in full.
 #
 # With a max, exits 1 when the total wakeups/s exceed it (the docker
-# workflow runs it against an idle `serve --db`). Exits 2 on bad usage or
-# when the container is not running. Needs docker and the alpine image
+# workflow runs it against an idle `serve --db`). Exits 2 on bad usage,
+# when the container is not running, or when the measurement itself fails
+# (the sidecar could not run, no total). Needs docker and the alpine image
 # (pulled if missing). See docs/spikes/idle-cpu.md.
 set -eu
 
@@ -69,11 +70,14 @@ awk -v S="$1" '
 grep -v '^TOTAL' /tmp/r | sort -t= -k3 -rn
 grep '^TOTAL' /tmp/r
 EOF
-)
-echo "$out"
+) || {
+    echo "$0: the measurement sidecar failed" >&2
+    exit 2
+}
+printf '%s\n' "$out"
 
 [ -n "$max" ] || exit 0
-total=$(echo "$out" | sed -n 's/^TOTAL .*wakeups\/s=//p')
+total=$(printf '%s\n' "$out" | sed -n 's/^TOTAL .*wakeups\/s=//p')
 if [ -z "$total" ]; then
     echo "$0: no TOTAL line in the measurement" >&2
     exit 2
