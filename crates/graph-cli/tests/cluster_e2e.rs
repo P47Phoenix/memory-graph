@@ -633,6 +633,22 @@ fn voters(n: &Node) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// Run a `cluster remove`, retrying while the leader refuses it only
+/// because a voter does not look reachable yet: right after a leadership
+/// change (or one slow heartbeat on a loaded machine) the leader has no
+/// matched index, or a fresh RPC error, for a peer that is up. The guard
+/// says so ("retry shortly"); any other answer is returned as is.
+fn remove_when_reachable(args: &[&str]) -> Output {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let o = run(args);
+        if !text(&o.stderr).contains("would drop below quorum") || Instant::now() >= deadline {
+            return o;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Run the CLI and wait at most [`WAIT`] for it to exit (a `serve` that
 /// should have been refused must not hang the test); kills only the
 /// process it spawned.
@@ -683,6 +699,15 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
     wait_for("nodes 2 and 3 to be auto-promoted", || {
         (voters(&n1) == [1, 2, 3]).then_some(())
     });
+    // The joint change that adds node 3 commits with nodes 1 and 2 alone,
+    // so node 3 may not hold the membership yet (its first appends can
+    // still be in back-off): its `cluster members` would be empty. Wait
+    // until every node lists the three voters (seen on CI, main 585bf4b).
+    for n in [&n2, &n3] {
+        wait_for(&format!("node {} to list three voters", n.id), || {
+            (voters(n) == [1, 2, 3]).then_some(())
+        });
+    }
     let members = ok(&["--server", &n3.addr, "cluster", "members"]);
     for want in ["1 voter", "2 voter", "3 voter", "(leader)"] {
         assert!(members.contains(want), "{want}: {members}");
@@ -754,7 +779,9 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
         "{}",
         text(&o.stderr)
     );
-    let o = run(&["--server", &n3.addr, "cluster", "remove", "3"]);
+    // The quorum guard runs before the 3 -> 2 one (--force cannot help an
+    // unreachable quorum), so a transient "not reachable" is waited out.
+    let o = remove_when_reachable(&["--server", &n3.addr, "cluster", "remove", "3"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
     assert!(text(&o.stderr).contains("--force"), "{}", text(&o.stderr));
     assert_eq!(voters(&n1), [1, 2, 3]);
@@ -773,7 +800,18 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
     wait_for("node 1 to follow node 2", || {
         (n1.leader() == Some(2)).then_some(())
     });
-    let removed = ok(&["--server", &n1.addr, "cluster", "remove", "3", "--force"]);
+    // Node 2 has just become the leader: until its first append to a peer
+    // is matched (a 100 ms RPC timeout can expire on a loaded runner), the
+    // remove guard counts that peer as unreachable (seen on CI, PR #206).
+    let o = remove_when_reachable(&["--server", &n1.addr, "cluster", "remove", "3", "--force"]);
+    assert!(
+        o.status.success(),
+        "remove 3 --force failed ({:?}):\n{}{}",
+        o.status.code(),
+        text(&o.stdout),
+        text(&o.stderr)
+    );
+    let removed = text(&o.stdout);
     assert!(removed.contains("was removed"), "{removed}");
     wait_for("two voters", || (voters(&n2) == [1, 2]).then_some(()));
     eprintln!("guards, transfer and remove done at {:?}", t0.elapsed());
