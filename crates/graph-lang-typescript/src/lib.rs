@@ -42,7 +42,9 @@ impl Extractor for TypeScriptExtractor {
 
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
-        format!("typescript-scan-2+kw1+tok{TOKENIZER_VERSION}")
+        // `scan-3`: a type stops before the next statement and the merged
+        // spans always nest (#203).
+        format!("typescript-scan-3+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -80,7 +82,25 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
             .cmp(&b.span.start)
             .then(b.span.end.cmp(&a.span.end))
     });
+    drop_partial_overlaps(&mut out);
     out
+}
+
+/// Drops every symbol that partially overlaps one kept before it, so the
+/// merged output of two independent scans always nests (#203). `syms` must
+/// be sorted by start, then by end descending.
+fn drop_partial_overlaps(syms: &mut Vec<SymbolDecl>) {
+    let mut open: Vec<u32> = Vec::new();
+    syms.retain(|s| {
+        while open.last().is_some_and(|&end| end <= s.span.start) {
+            open.pop();
+        }
+        let nests = open.last().is_none_or(|&end| s.span.end <= end);
+        if nests {
+            open.push(s.span.end);
+        }
+        nests
+    });
 }
 
 /// Words that may precede a declaration and belong to its span.

@@ -59,6 +59,10 @@ pub const CASES: &[(&str, Case)] = &[
     ("prune", prune),
     ("describe_matches_scan", describe_matches_scan),
     ("invalid_span_slots", invalid_span_slots),
+    (
+        "invalid_symbol_spans_keep_tokens",
+        invalid_symbol_spans_keep_tokens,
+    ),
     ("reopen_persists", reopen_persists),
     ("snapshot_is_frozen", snapshot_is_frozen),
     ("locking", locking),
@@ -594,8 +598,9 @@ fn describe_matches_scan(h: &Harness) {
     );
 }
 
-/// Fails span validation on demand: language `conf-bad` yields a symbol whose
-/// start is after its end; `conf-ok` yields one token.
+/// Fails span validation on demand: language `conf-bad` yields a symbol and
+/// a token whose start is after their end. The token is invalid too, so
+/// dropping the symbols (#203) cannot save the file: it is rejected.
 struct BadSpans;
 impl Extractor for BadSpans {
     fn language(&self) -> &str {
@@ -607,10 +612,215 @@ impl Extractor for BadSpans {
         bad.start = s.end + 1;
         Extraction {
             symbols: vec![sym("x", SymbolKind::Function, bad)],
-            tokens: vec![],
+            tokens: vec![graph_core::TokenDecl {
+                text: src.into(),
+                class: graph_core::TokenClass::Other,
+                span: bad,
+            }],
             has_errors: false,
         }
     }
+}
+
+/// Language `conf-overlap`: exact tokens plus two symbols that partially
+/// overlap (the first and second halves of the source, sharing its middle
+/// word), the shape of #203. Language `conf-tokens`: the same tokens and no
+/// symbols, what a degraded `conf-overlap` file must store.
+struct OverlapSpans;
+impl Extractor for OverlapSpans {
+    fn language(&self) -> &str {
+        "conf-overlap"
+    }
+    fn version(&self) -> String {
+        "conf-overlap-1".into()
+    }
+    fn extract(&self, src: &str) -> Extraction {
+        let words: Vec<&str> = src.split_whitespace().collect();
+        let mut symbols = Vec::new();
+        if let (Some(first), Some(last)) = (words.first(), words.last()) {
+            let mid = words.len() / 2;
+            let head = span_of(src, first);
+            let tail = span_of(src, last);
+            let middle = src.find(words[mid]).unwrap_or(0);
+            let middle_end = middle + words[mid].len();
+            let left = span_of(src, &src[head.start as usize..middle_end]);
+            let right = span_of(src, &src[middle..tail.end as usize]);
+            symbols.push(sym("left", SymbolKind::Function, left));
+            symbols.push(sym("right", SymbolKind::Function, right));
+        }
+        Extraction {
+            symbols,
+            tokens: tokenize(src),
+            has_errors: false,
+        }
+    }
+}
+
+struct TokensOnly;
+impl Extractor for TokensOnly {
+    fn language(&self) -> &str {
+        "conf-tokens"
+    }
+    fn extract(&self, src: &str) -> Extraction {
+        plain(src)
+    }
+}
+
+/// The extractors [`run_invalid_symbol_span_differential`] needs: open both
+/// of its stores with these registered.
+pub fn invalid_symbol_span_extractors() -> Vec<Box<dyn Extractor>> {
+    vec![Box::new(OverlapSpans), Box::new(TokensOnly)]
+}
+
+/// Source whose `conf-overlap` symbols partially overlap: `left` covers
+/// `alpha beta gamma`, `right` covers `gamma delta epsilon`.
+const OVERLAP_SRC: &[u8] = b"alpha beta gamma delta epsilon\n";
+
+/// #203: a file whose symbols fail span validation is stored with its
+/// tokens and no symbols, on every write path, with a warning naming the
+/// extractor and the span; it answers every query like the same tokens
+/// stored with no symbols at all.
+fn invalid_symbol_spans_keep_tokens(h: &Harness) {
+    let s = (h.open)(invalid_symbol_span_extractors()).expect("open store");
+    let warned = |st: &crate::IngestStats| {
+        let w = st.span_warning.as_deref().expect("a span warning");
+        assert!(w.contains("conf-overlap-1"), "names the extractor: {w}");
+        assert!(w.contains("partially overlap"), "names the span: {w}");
+        assert!(!st.unchanged);
+        assert_eq!((st.symbols, st.tokens), (0, 5), "{st:?}");
+    };
+    let f = |p, l| BatchFile {
+        path: p,
+        bytes: OVERLAP_SRC,
+        language: Some(l),
+        origin: None,
+        ..Default::default()
+    };
+    let d = IndexOptions::default();
+    // index_batch, next to a clean file, and the clean reference repo.
+    let out = s
+        .index_batch(
+            "o",
+            "r",
+            &[f("ok.txt", "text"), f("bad.ov", "conf-overlap")],
+            d,
+        )
+        .unwrap();
+    assert!(out[0].as_ref().unwrap().span_warning.is_none());
+    warned(out[1].as_ref().expect("degraded, not rejected"));
+    let refs = s
+        .index_batch("o", "ref", &[f("bad.ov", "conf-tokens")], d)
+        .unwrap();
+    assert!(refs[0].as_ref().unwrap().span_warning.is_none());
+    // prepare + index_prepared, and the single-file path.
+    let p = s
+        .prepare("o", "p", &f("bad.ov", "conf-overlap"), d)
+        .unwrap();
+    warned(
+        s.index_prepared("o", "p", vec![p], d).unwrap()[0]
+            .as_ref()
+            .unwrap(),
+    );
+    warned(
+        &s.index_bytes("o", "solo", "bad.ov", OVERLAP_SRC, Some("conf-overlap"))
+            .unwrap(),
+    );
+    // Unchanged on re-index: no warning (nothing was extracted).
+    let again = s
+        .index_batch("o", "r", &[f("bad.ov", "conf-overlap")], d)
+        .unwrap();
+    let again = again[0].as_ref().unwrap();
+    assert!(again.unchanged && again.span_warning.is_none(), "{again:?}");
+    // A reindex extracts again and warns again.
+    let re = IndexOptions {
+        reindex: true,
+        ..Default::default()
+    };
+    warned(
+        s.index_batch("o", "r", &[f("bad.ov", "conf-overlap")], re)
+            .unwrap()[0]
+            .as_ref()
+            .unwrap(),
+    );
+    // Stored like the tokens-only reference, and no symbol at all.
+    let toks = |repo| s.file_tokens("o", repo, "bad.ov").unwrap().unwrap();
+    let texts = |v: Vec<Node>| v.into_iter().map(|n| (n.name, n.span)).collect::<Vec<_>>();
+    for repo in ["r", "p", "solo"] {
+        assert_eq!(texts(toks(repo)), texts(toks("ref")), "{repo}");
+    }
+    assert!(s.search_symbols(&SymbolQuery::new("*")).unwrap().is_empty());
+    for grain in [Grain::Token, Grain::Symbol, Grain::File] {
+        let hits = |repo: &str| {
+            let mut q = Query::new("gamma");
+            q.grain = grain;
+            q.repo = Some(repo.into());
+            s.search(&q)
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.file.as_deref() != Some("ok.txt"))
+                .map(|mut h| {
+                    h.repo = None;
+                    h.language = None;
+                    h
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hits("r"), hits("ref"), "{grain:?}");
+        assert_eq!(hits("r").len(), 1, "{grain:?}");
+    }
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap()
+    );
+}
+
+/// [`run_differential`] over two stores that also hold #203's degraded
+/// files (written through `index_batch`, `prepare` and `index_bytes`), so
+/// the fallback is shown not to depend on configuration or backend. Open
+/// both stores with [`invalid_symbol_span_extractors`] registered.
+pub fn run_invalid_symbol_span_differential(a: &dyn Store, b: &dyn Store) {
+    let d = IndexOptions::default();
+    for s in [a, b] {
+        let f = |p| BatchFile {
+            path: p,
+            bytes: OVERLAP_SRC,
+            language: Some("conf-overlap"),
+            origin: Some(ORIGIN_DIRECTORY),
+            ..Default::default()
+        };
+        let out = s
+            .index_batch("o1", "r1", &[f("a.ov"), f("b.ov")], d)
+            .unwrap();
+        assert!(out
+            .iter()
+            .all(|r| r.as_ref().unwrap().span_warning.is_some()));
+        let p = s.prepare("o1", "r1", &f("c.ov"), d).unwrap();
+        assert!(s.index_prepared("o1", "r1", vec![p], d).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .span_warning
+            .is_some());
+        s.index_bytes("o1", "r2", "d.ov", OVERLAP_SRC, Some("conf-overlap"))
+            .unwrap();
+    }
+    for text in ["alpha", "gamma", "epsilon"] {
+        for grain in [
+            Grain::Token,
+            Grain::Symbol,
+            Grain::Method,
+            Grain::File,
+            Grain::Repo,
+        ] {
+            let mut q = Query::new(text);
+            q.grain = grain;
+            assert_eq!(
+                a.search(&q).unwrap(),
+                b.search(&q).unwrap(),
+                "{text}/{grain:?}"
+            );
+        }
+    }
+    run_differential(a, b);
 }
 
 fn invalid_span_slots(h: &Harness) {

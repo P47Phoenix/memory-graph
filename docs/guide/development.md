@@ -33,7 +33,7 @@ CI runs all of the above on every push and pull request, plus a real disk-full r
 
 The CLI depends on the object-safe `graph_store::Store` / `StoreRead` traits, not on redb. `open_store(path, extractors)` returns a `Box<dyn Store>` over `V2Store`, the one storage format (`V2Store::open(path)` gives the concrete type); bring the traits into scope (`use graph_store::{Store, StoreRead}`) to call methods on it.
 
-- Indexing is split into `Store::prepare` (pure, callable from many threads) and `Store::index_prepared` (the commit); `Store::index_batch` reports a file's `InvalidSpan` in that file's result slot and returns `Err` only for storage errors.
+- Indexing is split into `Store::prepare` (pure, callable from many threads) and `Store::index_prepared` (the commit); `Store::index_batch` reports a file's `InvalidSpan` in that file's result slot and returns `Err` only for storage errors. When only the symbols are invalid, `prepare` keeps the tokens, drops the symbols, and sets `IngestStats::span_warning` (#203). `ingest` with a caller-supplied extraction still rejects.
 - `Extractor` requires `Send + Sync`.
 - `graph_store::conformance::run_all` is a reusable test suite for any `Store` implementation.
 

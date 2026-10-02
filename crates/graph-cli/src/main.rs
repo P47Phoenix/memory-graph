@@ -1898,6 +1898,9 @@ fn run() -> Result<i32> {
                 if st.unchanged { " [unchanged]" } else { "" },
                 if st.has_errors { " [has_errors]" } else { "" }
             );
+            if let Some(w) = &st.span_warning {
+                eprintln!("warning: {}: {w}", path.display());
+            }
         }
         Cmd::Index {
             org,

@@ -528,6 +528,7 @@ impl From<IngestStats> for pb::IngestStats {
             language: s.language,
             encoding: s.encoding,
             lossy: s.lossy,
+            span_warning: s.span_warning,
         }
     }
 }
@@ -546,6 +547,7 @@ impl TryFrom<pb::IngestStats> for IngestStats {
             language: s.language,
             encoding: s.encoding,
             lossy: s.lossy,
+            span_warning: s.span_warning,
         })
     }
 }

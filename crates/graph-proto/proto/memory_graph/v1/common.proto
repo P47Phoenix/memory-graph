@@ -247,6 +247,10 @@ message IngestStats {
   optional string encoding = 9;
   // The file was decoded lossily.
   bool lossy = 10;
+  // The extractor produced an invalid span, so the file was stored with its
+  // tokens and no symbols (#203); names the extractor and the span. Absent
+  // otherwise, and from servers that predate it.
+  optional string span_warning = 11;
 }
 
 // One source file as raw bytes (`graph_store::BatchFile`), for `Write.Index`

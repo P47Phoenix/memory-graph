@@ -1,9 +1,10 @@
-//! CLI failure path: a file whose extraction has an invalid span fails alone.
+//! CLI failure path: a file whose extraction has an invalid token span fails
+//! alone; one whose symbols alone are invalid keeps its tokens (#203).
 //! A fake extractor is injected through `graph_cli::index_dir`'s opener, so
 //! production code needs no test hook.
 use graph_cli::{index_dir, DirOpts};
 use graph_core::NodeKind;
-use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind};
+use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use graph_store::{open_store, Store, StoreRead, V2Store};
 use std::path::Path;
 
@@ -12,26 +13,51 @@ impl Extractor for Fake {
     fn language(&self) -> &str {
         "zig"
     }
+    /// `bad...`: an inverted symbol and token (rejected). `overlap...`: two
+    /// partially overlapping symbols over valid tokens (stored tokens-only).
     fn extract(&self, source: &str) -> Extraction {
         assert!(!source.starts_with("panic"), "extractor panics");
         let bad = source.starts_with("bad");
-        let span = Span {
-            start: if bad { 3 } else { 0 },
-            end: if bad { 1 } else { source.len() as u32 },
+        let at = |start: usize, end: usize| Span {
+            start: start as u32,
+            end: end as u32,
             start_line: 1,
-            start_col: 1,
+            start_col: start as u32 + 1,
             end_line: 1,
-            end_col: 1,
+            end_col: end as u32 + 1,
+        };
+        let symbol = |name: &str, span| SymbolDecl {
+            owner: None,
+            name: name.into(),
+            kind: SymbolKind::Function,
+            lang_kind: None,
+            span,
+        };
+        if source.starts_with("overlap") {
+            let n = source.len();
+            return Extraction {
+                symbols: vec![symbol("a", at(0, n - 1)), symbol("b", at(1, n))],
+                tokens: vec![TokenDecl {
+                    text: source.into(),
+                    class: TokenClass::Identifier,
+                    span: at(0, n),
+                }],
+                has_errors: false,
+            };
+        }
+        let span = if bad { at(3, 1) } else { at(0, source.len()) };
+        let tokens = if bad {
+            vec![TokenDecl {
+                text: "x".into(),
+                class: TokenClass::Other,
+                span,
+            }]
+        } else {
+            vec![]
         };
         Extraction {
-            symbols: vec![SymbolDecl {
-                owner: None,
-                name: "s".into(),
-                kind: SymbolKind::Function,
-                lang_kind: None,
-                span,
-            }],
-            tokens: vec![],
+            symbols: vec![symbol("s", span)],
+            tokens,
             has_errors: false,
         }
     }
@@ -126,6 +152,45 @@ fn invalid_span_fails_one_file_and_exits_nonzero() {
         .unwrap()
         .starts_with("invalid span"));
     assert_eq!(v["files"], 1);
+}
+
+/// #203: a file whose symbols fail span validation is stored with its tokens
+/// and no symbols, the run succeeds (and prunes), and the file is reported
+/// as a warning naming the extractor and the span, in text and JSON.
+#[test]
+fn invalid_symbol_span_keeps_tokens_and_warns() {
+    let d = tempfile::tempdir().unwrap();
+    let (db, dir) = (d.path().join("g.redb"), d.path().join("src"));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("gone.zig"), "fine gone").unwrap();
+    run(&db, &dir, false, false).0.unwrap();
+    std::fs::remove_file(dir.join("gone.zig")).unwrap();
+    std::fs::write(dir.join("ov.zig"), "overlapping").unwrap();
+    std::fs::write(dir.join("ok.zig"), "fine").unwrap();
+
+    let (r, text) = run(&db, &dir, false, true);
+    r.unwrap();
+    assert!(text.contains("failed=0 pruned=1"), "{text}");
+    assert!(
+        text.contains("  warning: ov.zig: extractor `") && text.contains("partially overlap"),
+        "{text}"
+    );
+    let s = V2Store::open(&db).unwrap();
+    assert_eq!(s.file_tokens("o", "r", "ov.zig").unwrap().unwrap().len(), 1);
+    assert_eq!(s.count_nodes(NodeKind::Symbol).unwrap(), 1, "only ok.zig's");
+    drop(s);
+
+    std::fs::write(dir.join("ov.zig"), "overlap again").unwrap();
+    let (r, json) = run(&db, &dir, true, false);
+    r.unwrap();
+    let v: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+    assert_eq!(v["failed"], 0, "{v}");
+    assert_eq!(v["degraded"], 1, "{v}");
+    assert_eq!(v["degraded_files"][0]["path"], "ov.zig", "{v}");
+    assert!(v["degraded_files"][0]["warning"]
+        .as_str()
+        .unwrap()
+        .contains("partially overlap"));
 }
 
 /// A panicking extractor mid-run fails that one file (#82), without hanging,

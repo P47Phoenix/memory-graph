@@ -76,6 +76,18 @@ fn remote_matches_embedded_differential() {
     conformance::run_differential(&*embedded, &remote);
 }
 
+/// #203: a file whose symbols fail span validation is stored tokens-only by
+/// the server exactly as by an embedded store, warning included.
+#[test]
+fn remote_matches_embedded_for_degraded_files() {
+    let d = tempfile::tempdir().unwrap();
+    let ex = conformance::invalid_symbol_span_extractors;
+    let embedded = open_store(&d.path().join("e.redb"), ex()).unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), ex());
+    let remote = connect(&server);
+    conformance::run_invalid_symbol_span_differential(&*embedded, &remote);
+}
+
 /// #120: a Windows client sends `\` paths to a server; the server's answers
 /// equal an embedded index of the same tree with `/` paths (no
 /// `dir\.gitignore` read as language `gitignore` on a Linux host).
