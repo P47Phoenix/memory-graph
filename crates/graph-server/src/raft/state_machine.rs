@@ -820,6 +820,152 @@ mod tests {
         assert_eq!(files.len(), 2, "one pair left: {files:?}");
     }
 
+    /// #185: a promote (here an install's) while a build is still writing
+    /// its temp file prunes older pairs but leaves the temp file alone; the
+    /// build then finishes and promotes, and a crash's leftover temp file is
+    /// swept when the directory is reopened.
+    #[test]
+    fn a_promote_never_prunes_a_build_in_progress() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let (side, current) = snaps.current().unwrap();
+        // A build mid-export: its temp file exists, not yet promoted.
+        let building = snaps.dir().join("snap-build.redb.tmp");
+        slot.with_store(|s| s.export_snapshot(&building)).unwrap();
+        let building_bytes = std::fs::read(&building).unwrap();
+        // A concurrent install promotes (and prunes).
+        let received = d.path().join("received.redb");
+        std::fs::copy(&current, &received).unwrap();
+        snaps
+            .install_with(
+                &d.path().join("store-not-swapped.redb"),
+                &side.meta(),
+                &SnapshotFile { path: received },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(snaps.installed(), 1);
+        assert_eq!(
+            std::fs::read(&building).unwrap(),
+            building_bytes,
+            "the build's temp file survives the prune"
+        );
+        // The build finishes and promotes its file.
+        let (built, path, promoted) = snaps
+            .promote(
+                &building,
+                side.last_log_id,
+                side.membership.clone(),
+                "finished".into(),
+            )
+            .unwrap();
+        assert_eq!(built.snapshot_id, "finished");
+        assert_eq!(promoted, super::super::snapshot_dir::Promoted::New);
+        assert!(!building.exists());
+        let (cur, cur_path) = snaps.current().unwrap();
+        assert_eq!((cur.snapshot_id.as_str(), cur_path), ("finished", path));
+        assert_eq!(files_in(snaps.dir()).len(), 2, "one pair left");
+        // A temp file orphaned by a crash is swept at the next open.
+        std::fs::write(&building, b"partial").unwrap();
+        let reopened = SnapshotDir::open(snaps.dir(), "h").unwrap();
+        assert!(!building.exists());
+        assert_eq!(reopened.current().unwrap().0.snapshot_id, "finished");
+    }
+
+    /// #185 review: a build (index 2) racing an install of an older
+    /// snapshot (index 1) on two threads always ends with the newest pair
+    /// current, a meta that matches its file, and no other files.
+    #[test]
+    fn a_build_racing_an_older_install_keeps_the_newest_pair() {
+        for _ in 0..8 {
+            let d = tempfile::tempdir().unwrap();
+            let (slot, snaps) = with_snapshot_at_1(d.path());
+            let (side1, path1) = snaps.current().unwrap();
+            let received = d.path().join("received.redb");
+            std::fs::copy(&path1, &received).unwrap();
+            StoreStateMachine::apply_all(&slot, vec![blank(2)], NO_FP, &Default::default(), None)
+                .unwrap();
+            let store_path = d.path().join("store-not-swapped.redb");
+            std::thread::scope(|sc| {
+                let build = sc.spawn(|| snaps.build(&slot).map(|s| s.meta.last_log_id));
+                let install = sc.spawn(|| {
+                    snaps.install_with(
+                        &store_path,
+                        &side1.meta(),
+                        &SnapshotFile {
+                            path: received.clone(),
+                        },
+                        |_| Ok(()),
+                    )
+                });
+                let built = build.join().unwrap().unwrap();
+                assert!(built >= Some(log_id(2)));
+                install.join().unwrap().unwrap();
+            });
+            let (side, cur) = snaps.current().unwrap();
+            assert_eq!(side.last_log_id, Some(log_id(2)));
+            let (sha, size) = super::super::snapshot_dir::sha256_file(&cur).unwrap();
+            assert_eq!((side.sha256, side.size), (sha, size));
+            let files = files_in(snaps.dir());
+            assert_eq!(files.len(), 2, "one pair, no orphans: {files:?}");
+            assert!(files.iter().all(|f| !f.ends_with(".tmp")));
+        }
+    }
+
+    /// #185 review: promoting an older file than the current pair discards
+    /// the file and leaves the pair unchanged.
+    #[test]
+    fn promoting_an_older_snapshot_is_stale_and_keeps_the_pair() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let (side1, path1) = snaps.current().unwrap();
+        let older = snaps.dir().join("older.redb.tmp");
+        std::fs::copy(&path1, &older).unwrap();
+        StoreStateMachine::apply_all(&slot, vec![blank(2)], NO_FP, &Default::default(), None)
+            .unwrap();
+        snaps.build(&slot).unwrap();
+        let before = files_in(snaps.dir());
+        let (side2, path2) = snaps.current().unwrap();
+        assert_eq!(side2.last_log_id, Some(log_id(2)));
+        let (side, path, promoted) = snaps
+            .promote(
+                &older,
+                side1.last_log_id,
+                side1.membership.clone(),
+                "older".into(),
+            )
+            .unwrap();
+        assert_eq!(promoted, super::super::snapshot_dir::Promoted::Stale);
+        assert_eq!((side, path), (side2.clone(), path2.clone()));
+        assert!(!older.exists(), "the stale file is removed");
+        assert_eq!(snaps.current().unwrap(), (side2, path2));
+        let mut expected = before;
+        expected.retain(|f| f != "older.redb.tmp");
+        assert_eq!(files_in(snaps.dir()), expected);
+    }
+
+    /// #185 review: temp files of every kind left by a crash are swept when
+    /// the directory is opened; the complete pair is kept.
+    #[test]
+    fn open_sweeps_every_kind_of_orphaned_temp_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (_slot, snaps) = with_snapshot_at_1(d.path());
+        let dir = snaps.dir().to_path_buf();
+        let before = files_in(&dir);
+        for name in [
+            "snap-1-1.meta.tmp",
+            "incoming-123-0000abcd.redb.tmp",
+            "snap-build-123-00000000.redb.tmp",
+            "snap-copy-123-00000001.redb.tmp",
+        ] {
+            std::fs::write(dir.join(name), b"orphan").unwrap();
+        }
+        drop(snaps);
+        let reopened = SnapshotDir::open(&dir, "h").unwrap();
+        assert_eq!(files_in(&dir), before);
+        assert_eq!(reopened.current().unwrap().0.index, 1);
+    }
+
     /// #151: a received snapshot in an older, upgradable store format is
     /// installed; the store and the promoted pair are in this build's format.
     #[test]
