@@ -758,7 +758,24 @@ impl Scanner<'_> {
             )
     }
 
-    /// See [`type_end`].
+    /// Whether the word at `c` opens a statement rather than continuing a
+    /// type: a statement word (not `import(...)`, an import type), or a
+    /// contextual declaration word followed by a name. Never after `.`
+    /// (`React.default`, `x.const` are property names).
+    fn starts_statement(&self, c: usize, hi: usize) -> bool {
+        let t = self.text(c);
+        if c > 0 && matches!(self.text(c - 1), "." | "?.") {
+            return false;
+        }
+        if STATEMENT_WORDS.contains(&t) {
+            return !(t == "import" && c + 1 < hi && self.text(c + 1) == "(");
+        }
+        DECLARATION_WORDS.contains(&t) && self.word_follows(c, hi)
+    }
+
+    /// See [`type_end`]. Only TypeScript mode calls it (every caller checks
+    /// `self.ts`), so changes here leave the JavaScript extractor's output
+    /// and version unchanged.
     fn type_end(&self, mut c: usize, hi: usize) -> usize {
         // Whether an operand is expected next, and whether the last operand
         // was a parenthesized group (so `=>` makes it a function type).
@@ -802,14 +819,16 @@ impl Scanner<'_> {
                 // declaration (`type A = class B {}` must not give a type
                 // span that partially overlaps the class, #145).
                 "class" | "function" | "enum" | "interface" => return c,
-                // Likewise the reserved words that open a statement, which
-                // the TypeScript pass folds into the next declaration's span
+                // Likewise a word that opens the next statement, which the
+                // TypeScript pass folds into the next declaration's span
                 // (`type A = B |\nexport class C {}`, #203).
-                _ if STATEMENT_WORDS.contains(&t) => return c,
-                // Contextual declaration words stop a type when a name
-                // follows: in a type, such a word is never followed by
-                // another word (`type A = B |\ndeclare module "m" {}`, #203).
-                _ if DECLARATION_WORDS.contains(&t) && self.word_follows(c, hi) => return c,
+                _ if self.starts_statement(c, hi) => return c,
+                // An import type, `import("./m")`: the call's group is the
+                // operand.
+                "import" if operand && c + 1 < hi && self.text(c + 1) == "(" => {
+                    c += 1;
+                    continue;
+                }
                 "|" | "&" | "?" | ":" | "." | "-" | "+" => {
                     c += 1;
                     operand = true;

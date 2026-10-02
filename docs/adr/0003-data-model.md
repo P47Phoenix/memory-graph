@@ -178,7 +178,7 @@ Lines break on `\n`, `\r\n` and bare `\r` as the extractors do today (the extrac
 
 The store does not check `text == source[start_byte..end_byte]` because it has no source, but it does check the other three. Everything else is `irregular = 1` and stores end line, end column and byte length explicitly (multi-line tokens, tabs or combining marks if an extractor reports them with drift).
 
-**Validation before any write.** `ingest` validates the whole extraction (tokens and symbols) and rejects it with `InvalidSpan` **before** the first write of the transaction, or stores it round-trip exact (it comes back byte for byte).
+**Validation before any write.** `ingest` validates the whole extraction (tokens and symbols) and rejects it with `InvalidSpan` **before** the first write of the transaction, or stores it round-trip exact (it comes back byte for byte). The index write paths (`index_batch`, `prepare`/`index_prepared`, `index_bytes`, and the server's `Write.Index`) extract the file themselves, and they add one fallback before `ingest` (#203). If only the extraction's symbols fail validation, they drop all of its symbols and pass the tokens to `ingest`, reporting `IngestStats::span_warning` (which names the extractor and the span). If the tokens fail too, the file is rejected with the token error. `ingest` with a caller-supplied extraction still rejects with no fallback.
 
 The stream must be able to represent: tokens sorted by `(start_byte, ordinal)` non-decreasing; **overlapping, out-of-order and zero-length tokens** are representable through signed `gap` (zigzag) and explicit length when `irregular`; `text` need not equal a source slice (the store has none).
 
@@ -197,7 +197,7 @@ This is the epic story 13 rule "exactly as given", and it means the v1 behaviour
 
 **What this means:** a token belongs to the innermost symbol that covers its first byte. If no symbol covers it, the file owns it. When a symbol and a token start at the same byte, the token goes inside the symbol.
 
-**What this means (span validation):** the store checks every span before writing anything. Broken input is refused whole; the store never trims it to fit.
+**What this means (span validation):** the store checks every span before writing anything. Broken input is refused whole; the store never trims it to fit. The one exception is on the index paths (#203): an extraction whose symbols alone are broken is stored with its tokens and no symbols, and the caller gets a warning.
 
 **Rejections main enforces (`InvalidSpan`), which the differential oracle depends on and v2 keeps unchanged:** (a) `start > end` for any symbol or token; (b) a symbol **or token** that starts inside an enclosing symbol but ends **after** it (partial overlap of an enclosing symbol).
 

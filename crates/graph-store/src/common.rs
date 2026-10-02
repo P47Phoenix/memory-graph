@@ -393,8 +393,10 @@ pub(crate) fn extract_checked(
         symbols: Vec::new(),
         ..ex
     };
-    if validate_spans(&tokens_only).is_err() {
-        let e = StoreError::InvalidSpan(format!("`{path}`: {why}"));
+    // Invalid tokens cannot be saved by dropping symbols: report the token
+    // error, the one the file is rejected for.
+    if let Err(StoreError::InvalidSpan(token_why)) = validate_spans(&tokens_only) {
+        let e = StoreError::InvalidSpan(format!("`{path}`: {token_why}"));
         return (Prepared::Rejected(e), None);
     }
     let warning = format!(

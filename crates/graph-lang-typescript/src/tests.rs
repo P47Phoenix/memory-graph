@@ -456,4 +456,15 @@ fn type_alias_stops_before_the_next_statement() {
     let s = syms("type A = B | declare;\ntype M = module | type;\n");
     assert_eq!(find(&s, "A").3, "type A = B | declare;");
     assert_eq!(find(&s, "M").3, "type M = module | type;");
+    // Property names and import types are not statements.
+    for alias in [
+        "type P = React.default;",
+        "type Q = x.const | y.export;",
+        "type I = import(\"./m\").T;",
+        "type J = typeof import(\"./m\");",
+        "type K = A | import(\"./m\").T;",
+    ] {
+        let name = &alias[5..6];
+        assert_eq!(find(&syms(alias), name).3, alias);
+    }
 }
