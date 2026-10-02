@@ -1,5 +1,7 @@
-//! One readiness wait for every e2e test that spawns `memory-graph serve`
-//! (issue #202).
+//! A shared readiness wait for e2e tests that spawn `memory-graph serve`
+//! (issue #202). `cluster_e2e`, `backup_e2e`, `s3_e2e` and
+//! `observability_e2e` use it; other test binaries still parse the
+//! listening line themselves.
 //!
 //! [`start_serve`] spawns the command with both pipes drained by threads,
 //! reads stdout until the `listening on <addr>` start line, then confirms
@@ -8,15 +10,17 @@
 //! [`ready_timeout`], 180 s unless `MG_E2E_READY_TIMEOUT_SECS` says
 //! otherwise, which is longer than `serve --join`'s default 2 m join
 //! timeout (a joiner prints its listening line only after it joined). A
-//! failure carries everything the process printed so far, so a flaky CI
-//! run can be diagnosed from its log.
+//! failure carries everything the process printed, so a flaky CI run can
+//! be diagnosed from its log.
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_memory-graph");
@@ -30,14 +34,20 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The readiness deadline: [`READY_TIMEOUT_ENV`] when set to a number of
-/// seconds, else [`DEFAULT_READY_TIMEOUT`].
+/// The most one `memory-graph health` probe may take before it is killed.
+const PROBE_LIMIT: Duration = Duration::from_secs(10);
+
+/// The readiness deadline: [`READY_TIMEOUT_ENV`] when set, else
+/// [`DEFAULT_READY_TIMEOUT`]. Panics on a value that is not a positive
+/// whole number of seconds.
 pub fn ready_timeout() -> Duration {
-    std::env::var(READY_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_READY_TIMEOUT)
+    let Ok(raw) = std::env::var(READY_TIMEOUT_ENV) else {
+        return DEFAULT_READY_TIMEOUT;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => panic!("{READY_TIMEOUT_ENV}={raw:?} is not a positive number of seconds"),
+    }
 }
 
 /// A `serve` that printed its listening line and answered a health check.
@@ -53,8 +63,8 @@ pub struct ServeProcess {
     /// Every stdout line up to and including the listening line.
     pub start_lines: Vec<String>,
     /// Every stderr line, as it arrives (also echoed when
-    /// [`StartOptions::echo_stderr`] is set). Lines printed before
-    /// readiness are in here too.
+    /// [`StartOptions::echo_stderr`] is set), including those printed
+    /// before readiness.
     pub stderr: Receiver<String>,
 }
 
@@ -111,8 +121,8 @@ pub fn start_serve(cmd: Command, options: StartOptions) -> ServeProcess {
 }
 
 /// Spawn `cmd` (a `memory-graph serve ...`; its stdio is replaced by
-/// pipes) and wait for it to be ready. On failure the process is killed
-/// and its output returned.
+/// pipes) and wait for it to be ready. On failure the process is killed,
+/// both pipes are read to the end, and its whole output returned.
 pub fn try_start_serve(
     mut cmd: Command,
     options: StartOptions,
@@ -123,27 +133,29 @@ pub fn try_start_serve(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn memory-graph serve");
-    let stdout = drain(child.stdout.take().expect("piped stdout"), false);
-    let stderr_log = Arc::new(Mutex::new(Vec::new()));
-    let stderr = drain_stderr(
+    let (stdout, stdout_reader) = drain_stdout(child.stdout.take().expect("piped stdout"));
+    let capture = StderrCapture::default();
+    let (stderr, stderr_reader) = drain_stderr(
         child.stderr.take().expect("piped stderr"),
         options.echo_stderr,
-        Arc::clone(&stderr_log),
+        capture.clone(),
     );
-    let mut start_lines = Vec::new();
-    let fail = |child: &mut Child, start_lines: &[String], reason: String| {
+    let fail = |mut child: Child, start_lines: Vec<String>, reason: String| {
         let _ = child.kill();
         let status = child.wait().ok();
-        // The pipe is closed now; give the drain thread a moment to finish.
-        std::thread::sleep(Duration::from_millis(50));
+        // The pipes are closed now: joining the readers guarantees the last
+        // lines (a port in use, a join error) are captured.
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
         StartFailure {
             reason,
             status,
-            stdout: start_lines.to_vec(),
-            stderr: stderr_log.lock().map(|l| l.clone()).unwrap_or_default(),
+            stdout: start_lines,
+            stderr: capture.take(),
         }
     };
 
+    let mut start_lines = Vec::new();
     let addr = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match stdout.recv_timeout(left) {
@@ -156,11 +168,11 @@ pub fn try_start_serve(
             }
             Err(RecvTimeoutError::Timeout) => {
                 let reason = format!("no listening line within {:?}", options.timeout);
-                return Err(fail(&mut child, &start_lines, reason));
+                return Err(fail(child, start_lines, reason));
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let reason = "stdout closed before the listening line".to_string();
-                return Err(fail(&mut child, &start_lines, reason));
+                return Err(fail(child, start_lines, reason));
             }
         }
     };
@@ -168,8 +180,9 @@ pub fn try_start_serve(
     std::thread::spawn(move || stdout.iter().for_each(drop));
 
     if let Err(reason) = await_health(&mut child, &addr, deadline) {
-        return Err(fail(&mut child, &start_lines, reason));
+        return Err(fail(child, start_lines, reason));
     }
+    capture.stop();
     Ok(ServeProcess {
         child,
         mcp: endpoint(&start_lines, "mcp on http://", "/mcp"),
@@ -200,7 +213,7 @@ fn endpoint(lines: &[String], prefix: &str, suffix: &str) -> Option<SocketAddr> 
 /// passes, the process exits, or the deadline.
 fn await_health(child: &mut Child, addr: &str, deadline: Instant) -> Result<(), String> {
     loop {
-        if health_ok(addr) {
+        if health_ok(addr, deadline) {
             return Ok(());
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -215,8 +228,11 @@ fn await_health(child: &mut Child, addr: &str, deadline: Instant) -> Result<(), 
     }
 }
 
-fn health_ok(addr: &str) -> bool {
-    Command::new(BIN)
+/// One health probe, killed after [`PROBE_LIMIT`] or at `deadline`,
+/// whichever comes first.
+fn health_ok(addr: &str, deadline: Instant) -> bool {
+    let probe_deadline = deadline.min(Instant::now() + PROBE_LIMIT);
+    let spawned = Command::new(BIN)
         .env_remove("MEMORY_GRAPH_SERVER")
         .env_remove("MEMORY_GRAPH_READ")
         .env_remove("MEMORY_GRAPH_CONFIG")
@@ -224,38 +240,78 @@ fn health_ok(addr: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .spawn();
+    let Ok(mut probe) = spawned else {
+        return false;
+    };
+    loop {
+        match probe.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < probe_deadline => std::thread::sleep(PROBE_INTERVAL),
+            _ => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                return false;
+            }
+        }
+    }
 }
 
-fn drain(reader: impl Read + Send + 'static, echo: bool) -> Receiver<String> {
+/// Stderr lines kept for a [`StartFailure`] until readiness, then no more.
+#[derive(Clone, Default)]
+struct StderrCapture {
+    lines: Arc<Mutex<Vec<String>>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl StderrCapture {
+    fn push(&self, line: &str) {
+        if self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.push(line.to_string());
+        }
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.take();
+    }
+
+    fn take(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .map(|mut lines| std::mem::take(&mut *lines))
+            .unwrap_or_default()
+    }
+}
+
+fn drain_stdout(reader: impl Read + Send + 'static) -> (Receiver<String>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            if echo {
-                eprintln!("{line}");
-            }
             // The receiver may be gone; keep draining regardless.
             let _ = tx.send(line);
         }
     });
-    rx
+    (rx, handle)
 }
 
 fn drain_stderr(
     reader: impl Read + Send + 'static,
     echo: bool,
-    log: Arc<Mutex<Vec<String>>>,
-) -> Receiver<String> {
+    capture: StderrCapture,
+) -> (Receiver<String>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
-    let lines = drain(reader, echo);
-    std::thread::spawn(move || {
-        for line in lines {
-            if let Ok(mut l) = log.lock() {
-                l.push(line.clone());
+    let handle = std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if echo {
+                eprintln!("{line}");
             }
+            capture.push(&line);
             let _ = tx.send(line);
         }
     });
-    rx
+    (rx, handle)
 }

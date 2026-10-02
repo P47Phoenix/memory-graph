@@ -21,7 +21,7 @@
 //! waiting for; nothing sleeps and hopes.
 mod common;
 
-use common::readiness::{start_serve, try_start_serve, StartOptions};
+use common::readiness::{ready_timeout, start_serve, try_start_serve, StartOptions};
 use graph_server::testing::mcp_http::{http, McpHttpClient};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -182,7 +182,8 @@ impl Node {
         assert!(self.child.is_none(), "node {} is still running", self.id);
         // The port was just released; a platform may hold it briefly.
         let listen = self.addr.clone();
-        let deadline = Instant::now() + WAIT;
+        // One deadline for every attempt together: each gets what is left.
+        let deadline = Instant::now() + ready_timeout();
         loop {
             let mut c = cmd();
             c.arg("serve")
@@ -192,7 +193,11 @@ impl Node {
                 .args(RAFT_TIMING)
                 .args(["--min-free-disk", "1"])
                 .args(extra);
-            match try_start_serve(c, StartOptions::default()) {
+            let options = StartOptions {
+                timeout: deadline.saturating_duration_since(Instant::now()),
+                ..StartOptions::default()
+            };
+            match try_start_serve(c, options) {
                 Ok(started) => {
                     self.child = Some(started.child);
                     return;
