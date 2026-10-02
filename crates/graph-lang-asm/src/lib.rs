@@ -35,14 +35,19 @@
 //! macro-local `%%x`, Mach-O compiler locals `Ltmp0`/`LBB0_1`), labels inside a MASM `PROC` (proc-scoped there),
 //! and anything inside a macro body (a template, not code).
 //!
-//! Known limits (the `ASM` dialect's): `;` always starts a comment (GNU as
-//! uses it as a statement separator on some targets); `#` is a comment only
-//! at line start, so an AT&T trailing `# comment` is read as code; ARM32 `@`
-//! comments are not recognised. Macro invocations are not expanded. An
+//! Comments: `;` always starts one (GNU as uses it as a statement separator
+//! on some targets, a known limit), and so does `#` at line start. A
+//! trailing `# comment` is one in AT&T x86 files (a `%eax`-style register
+//! appears), and `@ comment` in ARM32 files (`.arm`, `.thumb`, `.thumb_func`
+//! or `.syntax` appears); elsewhere `#` is an immediate and `@` a symbol
+//! suffix (`@PLT`). Symbols are scanned before trailing comments are
+//! classed, so they read those words as before.
+//!
+//! Known limits: macro invocations are not expanded. An
 //! unclosed block (`PROC` without `ENDP`) spans its header line only.
 use graph_core::scan::{mark_keywords_ignore_case, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
-use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
+use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use std::collections::HashMap;
 
 pub struct AsmExtractor;
@@ -60,23 +65,30 @@ impl Extractor for AsmExtractor {
     }
 
     fn version(&self) -> String {
-        // `kw1`: assembler directives are classed `keyword` (#143).
-        format!("asm-scan-1+kw1+tok{TOKENIZER_VERSION}")
+        // `kw1`: assembler directives are classed `keyword` (#143); `kw2`:
+        // not the operand of a mnemonic (`call proc`) nor a name before a
+        // named directive (`section db 1`) (#200). `cmt1`: AT&T trailing `#`
+        // and ARM32 `@` comments (#197).
+        format!("asm-scan-1+kw2+cmt1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
-        let mut tokens = tokenize_with(source, ASM_TOKENIZER);
+        let tokens = tokenize_with(source, ASM_TOKENIZER);
         let symbols = symbols(&tokens);
-        // After the symbol scan, which reads identifiers as it always has.
+        // After the symbol scan, which reads tokens as it always has.
+        let mut tokens = match trailing_comment_marker(&tokens) {
+            Some(marker) => merge_trailing_comments(source, tokens, marker),
+            None => tokens,
+        };
         mark_keywords_ignore_case(&mut tokens, DOT_DIRECTIVES, |t, i| {
             directive_at(t, i) != Some(DirectiveForm::Dotted)
         });
         mark_keywords_ignore_case(&mut tokens, BARE_DIRECTIVES, |t, i| {
             match directive_at(t, i) {
-                Some(DirectiveForm::Bare) => false,
-                Some(DirectiveForm::Named) => !NAMED_DIRECTIVES
-                    .iter()
-                    .any(|d| d.eq_ignore_ascii_case(&t[i].text)),
+                Some(DirectiveForm::Bare) => {
+                    is_named_directive_at(t, i + 1) && !takes_operand(&t[i].text)
+                }
+                Some(DirectiveForm::Named) => !is_named_directive_at(t, i),
                 _ => true,
             }
         });
@@ -187,8 +199,9 @@ const BARE_DIRECTIVES: &[&str] = &[
 ];
 
 /// The [`BARE_DIRECTIVES`] that may also follow a name (`x db 1`,
-/// `main PROC`, `_TEXT SEGMENT`, `n equ 3`). The name is any one word, so a
-/// mnemonic counts too: `call proc` labels `proc` a keyword. Only the first
+/// `main PROC`, `_TEXT SEGMENT`, `n equ 3`). The name is any one word except
+/// an operand-taking mnemonic or directive (`call proc`, `jmp times`), and a
+/// bare directive followed by one is a name (`section db 1`). Only the first
 /// directive in a statement is found: NASM `times 10 db 0` labels `times`
 /// and leaves `db` an identifier.
 const NAMED_DIRECTIVES: &[&str] = &[
@@ -235,9 +248,146 @@ fn directive_at(t: &[TokenDecl], i: usize) -> Option<DirectiveForm> {
         [dot] if dot.text == "." && glued(dot, &t[i]) => Some(DirectiveForm::Dotted),
         // Two identifier tokens are never adjacent (they would be one), so
         // `name` is always separated from the directive here.
-        [name] if word(name) => Some(DirectiveForm::Named),
+        [name] if word(name) && !takes_operand(&name.text) => Some(DirectiveForm::Named),
         _ => None,
     }
+}
+
+/// Whether `t[i]` is one of the [`NAMED_DIRECTIVES`], on the same line as
+/// the token before it (`section db 1`: `section` is then a name).
+fn is_named_directive_at(t: &[TokenDecl], i: usize) -> bool {
+    i > 0
+        && t.get(i).is_some_and(|d| {
+            d.span.start_line == t[i - 1].span.end_line
+                && NAMED_DIRECTIVES
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&d.text))
+        })
+}
+
+/// Words whose next word is an operand, never a named directive: common
+/// x86 and ARM mnemonics that take a label or value (`call proc`,
+/// `jmp times`, `push dword`) and the operand-taking [`DIRECTIVES`].
+fn takes_operand(word: &str) -> bool {
+    const MNEMONICS: &[&str] = &[
+        "call", "jmp", "ja", "jae", "jb", "jbe", "jc", "jcxz", "jecxz", "jrcxz", "je", "jg", "jge",
+        "jl", "jle", "jna", "jnae", "jnb", "jnbe", "jnc", "jne", "jng", "jnge", "jnl", "jnle",
+        "jno", "jnp", "jns", "jnz", "jo", "jp", "jpe", "jpo", "js", "jz", "loop", "loope",
+        "loopne", "loopnz", "loopz", "push", "pop", "mov", "lea", "cmp", "test", "inc", "dec",
+        "not", "neg", "int", "ret", "b", "bl", "blx", "bx", "beq", "bne", "ldr", "str", "adr",
+    ];
+    let lower = word.to_ascii_lowercase();
+    MNEMONICS.contains(&lower.as_str()) || DIRECTIVES.contains(&lower.as_str())
+}
+
+/// The trailing-comment marker the file's syntax makes unambiguous (#197):
+/// `#` in AT&T x86 (a `%`-prefixed x86 register appears; `#` is an
+/// immediate in ARM and never a comment in NASM/MASM), `@` in ARM32 (a
+/// `.arm`, `.thumb`, `.thumb_func` or `.syntax` directive appears; in
+/// AT&T `@` is a symbol suffix such as `@PLT`). AT&T wins if both appear.
+fn trailing_comment_marker(t: &[TokenDecl]) -> Option<&'static str> {
+    let glued_pairs = || {
+        t.windows(2)
+            .filter(|w| w[0].span.end == w[1].span.start)
+            .map(|w| (&w[0], &w[1]))
+    };
+    if glued_pairs().any(|(p, r)| {
+        p.text == "%" && r.class == TokenClass::Identifier && is_x86_register(&r.text)
+    }) {
+        return Some("#");
+    }
+    const ARM32_DIRECTIVES: &[&str] = &["arm", "thumb", "thumb_func", "syntax"];
+    glued_pairs()
+        .any(|(dot, d)| {
+            dot.text == "."
+                && ARM32_DIRECTIVES
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(&d.text))
+        })
+        .then_some("@")
+}
+
+/// An x86 register name, any case (`ax`, `eax`, `rax`, `al`, `r8d`, `ds`,
+/// `xmm0`, `cr0`, ...).
+fn is_x86_register(name: &str) -> bool {
+    const WORD: &[&str] = &["ax", "bx", "cx", "dx", "si", "di", "sp", "bp", "ip"];
+    const OTHER: &[&str] = &[
+        "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh", "sil", "dil", "spl", "bpl", "cs", "ds",
+        "es", "fs", "gs", "ss", "st",
+    ];
+    const NUMBERED: &[&str] = &["xmm", "ymm", "zmm", "mm", "cr", "dr", "st"];
+    let n = name.to_ascii_lowercase();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let stem = n.strip_prefix(['e', 'r']).unwrap_or(&n);
+    let numbered_gpr = n.strip_prefix('r').is_some_and(|r| {
+        let num = r.trim_end_matches(['d', 'w', 'b']);
+        digits(num) && num.parse::<u8>().is_ok_and(|v| (8..=15).contains(&v))
+    });
+    OTHER.contains(&n.as_str())
+        || WORD.contains(&stem)
+        || numbered_gpr
+        || NUMBERED
+            .iter()
+            .any(|p| n.strip_prefix(p).is_some_and(digits))
+}
+
+/// Replace each trailing comment, from a `marker` token to the end of its
+/// line, with one Comment token over the same bytes (as the tokenizer
+/// writes a `;` comment, so trailing blanks and a `\r` are included). A
+/// marker inside a literal or comment is not a token of its own. A line
+/// where a later token crosses the line end (a block comment or an
+/// unterminated string) is left as tokenized.
+fn merge_trailing_comments(source: &str, tokens: Vec<TokenDecl>, marker: &str) -> Vec<TokenDecl> {
+    // (first token index, one past the last, end byte) of each comment.
+    let mut comments: Vec<(usize, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t.text != marker || matches!(t.class, TokenClass::Comment | TokenClass::Literal) {
+            i += 1;
+            continue;
+        }
+        let start = t.span.start as usize;
+        let end = source[start..]
+            .find('\n')
+            .map_or(source.len(), |n| start + n);
+        let next = i + tokens[i..].partition_point(|x| (x.span.start as usize) < end);
+        if tokens[next - 1].span.end as usize <= end {
+            comments.push((i, next, end));
+            i = next;
+        } else {
+            i += 1;
+        }
+    }
+    if comments.is_empty() {
+        return tokens;
+    }
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut pending = comments.into_iter().peekable();
+    let mut skip_until = 0;
+    for (i, t) in tokens.into_iter().enumerate() {
+        if i < skip_until {
+            continue;
+        }
+        let Some(&(_, next, end)) = pending.next_if(|c| c.0 == i).as_ref() else {
+            out.push(t);
+            continue;
+        };
+        skip_until = next;
+        let text = &source[t.span.start as usize..end];
+        let width = text.chars().filter(|&c| c != '\u{feff}').count() as u32;
+        out.push(TokenDecl {
+            text: text.to_string(),
+            class: TokenClass::Comment,
+            span: Span {
+                end: end as u32,
+                end_line: t.span.start_line,
+                end_col: t.span.start_col + width,
+                ..t.span
+            },
+        });
+    }
+    out
 }
 
 /// Data-defining directives: a label before one of these is data.

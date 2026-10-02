@@ -427,7 +427,9 @@ fn asm_directive_positions() {
         names.contains(&"main") && names.contains(&"end"),
         "{names:?}"
     );
-    assert!(AsmExtractor.version().starts_with("asm-scan-1+kw1+tok"));
+    assert!(AsmExtractor
+        .version()
+        .starts_with("asm-scan-1+kw2+cmt1+tok"));
 }
 
 /// Labels and assignments named like bare directives stay identifiers;
@@ -450,7 +452,7 @@ fn asm_directive_edge_positions() {
         "{toks:?}"
     );
     let toks = AsmExtractor
-        .extract("l: x db 1\ncall proc\ntimes 10 db 0\n")
+        .extract("l: x db 1\nmain proc\ntimes 10 db 0\n")
         .tokens;
     assert_eq!(
         classes_of(&toks, "db"),
@@ -458,4 +460,101 @@ fn asm_directive_edge_positions() {
     );
     assert_eq!(classes_of(&toks, "proc"), [TokenClass::Keyword]);
     assert_eq!(classes_of(&toks, "times"), [TokenClass::Keyword]);
+}
+
+/// #200: a named directive after an operand-taking mnemonic or directive is
+/// an operand, and a bare directive followed by a named one is a name.
+#[test]
+fn named_directive_not_after_mnemonic() {
+    let src = "call proc\njmp times\nJNZ DB\npush dword\nextern segment\nsection db 1\n";
+    let toks = AsmExtractor.extract(src).tokens;
+    for w in ["proc", "times", "DB", "segment", "section"] {
+        assert_eq!(classes_of(&toks, w), [TokenClass::Identifier], "{w}");
+    }
+    assert_eq!(classes_of(&toks, "db"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "extern"), [TokenClass::Keyword]);
+    // Still keywords: a name, a label, and a bare directive whose next
+    // word is not a named directive.
+    let toks = AsmExtractor
+        .extract("msg db 1\nl: x dw 2\nsection .data\nsection\ndb 3\n")
+        .tokens;
+    assert_eq!(classes_of(&toks, "db"), [TokenClass::Keyword; 2]);
+    assert_eq!(classes_of(&toks, "dw"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "section"), [TokenClass::Keyword; 2]);
+}
+
+fn comments(src: &str) -> Vec<String> {
+    let ex = AsmExtractor.extract(src);
+    assert_exact_spans(src, &ex.tokens);
+    ex.tokens
+        .into_iter()
+        .filter(|t| t.class == TokenClass::Comment)
+        .map(|t| t.text)
+        .collect()
+}
+
+/// Every token's text, byte range, line and column match the source.
+fn assert_exact_spans(src: &str, toks: &[TokenDecl]) {
+    let pos = |b: usize| {
+        let before = &src[..b];
+        let line = 1 + before.matches('\n').count() as u32;
+        let col = 1 + before.rsplit('\n').next().unwrap().chars().count() as u32;
+        (line, col)
+    };
+    let mut prev = 0;
+    for t in toks {
+        let (s, e) = (t.span.start as usize, t.span.end as usize);
+        assert!(s >= prev, "{t:?}");
+        assert_eq!(&src[s..e], t.text);
+        assert_eq!((t.span.start_line, t.span.start_col), pos(s), "{t:?}");
+        assert_eq!((t.span.end_line, t.span.end_col), pos(e), "{t:?}");
+        prev = e;
+    }
+}
+
+/// #197: AT&T trailing `#` comments, in files with `%`-registers.
+#[test]
+fn att_trailing_hash_comments() {
+    let src =
+        "# head\n  xorw %ax,%ax   # Set %ax to zero  \r\n  call f@PLT # é 'x\n  movl $1, %eax\n";
+    assert_eq!(comments(src), ["# head", "# Set %ax to zero  \r", "# é 'x"]);
+    let toks = AsmExtractor.extract(src).tokens;
+    assert_eq!(classes_of(&toks, "PLT"), [TokenClass::Identifier]);
+    assert_ne!(classes_of(&toks, "@"), [TokenClass::Comment]);
+    // A `#` inside a string, or followed on its line by a block comment
+    // crossing the line end, is left as tokenized.
+    let src = "  movl %eax, %ebx\n  .ascii \"a # b\"\n  ret # x /* y\n z */\n";
+    assert_eq!(comments(src), ["/* y\n z */"]);
+}
+
+/// #197: ARM32 `@` comments, in files with `.arm`/`.thumb`/`.syntax`.
+#[test]
+fn arm32_at_comments() {
+    let src = "@ banner #1\n.arm\ncommands:  @ mem. #0x0\n  mov r0, #1 @ one\n";
+    assert_eq!(comments(src), ["@ banner #1", "@ mem. #0x0", "@ one"]);
+    let toks = AsmExtractor.extract(src).tokens;
+    assert_eq!(classes_of(&toks, "#"), [TokenClass::Punctuation]);
+    assert_eq!(comments(".syntax unified\n  bx lr @ ret\n"), ["@ ret"]);
+}
+
+/// #197 negatives: no marker without the syntax evidence, and symbols do
+/// not change either way.
+#[test]
+fn trailing_comment_markers_need_syntax_evidence() {
+    // ARM/AArch64 immediates, Mach-O `@PAGE`, NASM, and AT&T `@` suffixes.
+    for src in [
+        "  mov r0, #1\n  add x0, x1, #2\n",
+        "  adrp x0, msg@PAGE @ x\n",
+        "section .text\n  mov eax, 1 # x\n%define n 1\n",
+        "  call f@PLT\n  movq foo@GOTPCREL(%rip), %rax\n",
+    ] {
+        let toks = AsmExtractor.extract(src).tokens;
+        assert!(
+            toks.iter().all(|t| t.class != TokenClass::Comment),
+            "{src:?}: {toks:?}"
+        );
+    }
+    let src = "f:\n  movl %eax, %ebx # done\n  ret # x\n";
+    let tokenized = tokenize_with(src, ASM_TOKENIZER);
+    assert_eq!(AsmExtractor.extract(src).symbols, symbols(&tokenized));
 }
