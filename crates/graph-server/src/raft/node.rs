@@ -82,13 +82,17 @@ impl RaftSettings {
         }
     }
 
-    /// `--db` (stage A) defaults: one member elects itself at the first
-    /// short timeout, so a (test) server starts quickly.
+    /// `--db` (stage A) defaults. The sole voter campaigns at once on
+    /// start (no election timeout to wait out) and suspends its ticks while
+    /// it leads alone ([`TickControl`]), so the timings do not shape
+    /// start-up; they only pace openraft's tick timer, which still wakes
+    /// every 1.5 heartbeats while suspended: a long heartbeat keeps an idle
+    /// server quiet (issue #205; it was 50 ms, a tick every 75 ms).
     pub const fn standalone() -> Self {
         Self {
-            heartbeat_ms: 50,
-            election_min_ms: 100,
-            election_max_ms: 200,
+            heartbeat_ms: 500,
+            election_min_ms: 2000,
+            election_max_ms: 4000,
             ..Self::cluster()
         }
     }
@@ -230,6 +234,119 @@ pub struct RaftNode {
     /// Linearizable reads on this node waiting to apply the leader's read
     /// index right now (a test observes a read parked there).
     pub read_index_waits: Arc<AtomicUsize>,
+    /// Whether openraft's tick is suspended because this node leads alone
+    /// ([`TickControl`], issue #205), and what holds it on.
+    pub ticks: Arc<TickControl>,
+}
+
+/// openraft's tick (elections, heartbeats) suspended while this node is the
+/// leader and the only member, voter or learner (issue #205): it has nobody
+/// to heartbeat and nobody to lose an election to, and every tick publishes
+/// the Raft metrics, which wakes the readiness and snapshot-policy loops.
+/// An idle sole voter then wakes only for openraft's tick timer itself,
+/// which checks the flag and goes back to sleep. Ticks resume the moment
+/// the membership grows (the metrics show it) and are held on for the
+/// whole of any membership change ([`TickHold`]), so a new learner is
+/// heartbeated from its first entry and a leader that removed itself still
+/// steps down.
+#[derive(Default)]
+pub struct TickControl {
+    state: std::sync::Mutex<TickState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct TickState {
+    /// Membership changes in flight ([`TickHold`]).
+    holds: usize,
+    suspended: bool,
+}
+
+impl TickControl {
+    /// Whether ticks are suspended right now.
+    pub fn suspended(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .suspended
+    }
+
+    /// Suspend or resume per `alone` (this node leads alone), unless a
+    /// hold keeps them on.
+    fn apply(&self, raft: &Raft<TypeConfig>, alone: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let suspend = alone && st.holds == 0;
+        if suspend != st.suspended {
+            raft.runtime_config().tick(!suspend);
+            st.suspended = suspend;
+            tracing::debug!(suspended = suspend, "raft ticks");
+        }
+    }
+}
+
+/// Ticks held on while it lives ([`TickControl`]); dropping it lets
+/// [`idle_ticks`] decide again.
+pub struct TickHold {
+    ticks: Arc<TickControl>,
+}
+
+impl TickHold {
+    fn new(ticks: &Arc<TickControl>, raft: &Raft<TypeConfig>) -> Self {
+        let mut st = ticks.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.holds += 1;
+        if st.suspended {
+            raft.runtime_config().tick(true);
+            st.suspended = false;
+            tracing::debug!(suspended = false, "raft ticks (membership change)");
+        }
+        Self {
+            ticks: Arc::clone(ticks),
+        }
+    }
+}
+
+impl Drop for TickHold {
+    fn drop(&mut self) {
+        let mut st = self.ticks.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.holds -= 1;
+        drop(st);
+        // One waiter (`idle_ticks`); `notify_one` keeps the permit if it
+        // is not waiting right now.
+        self.ticks.changed.notify_one();
+    }
+}
+
+/// Whether this node leads and is the only member (no other voter, no
+/// learner): nobody needs its heartbeats ([`TickControl`]).
+pub fn leads_alone(m: &RaftMetrics<NodeId, BasicNode>, node: NodeId) -> bool {
+    m.state == ServerState::Leader
+        && m.current_leader == Some(node)
+        && m.membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .eq([node])
+}
+
+/// Suspends openraft's tick while this node leads alone and resumes it
+/// otherwise ([`TickControl`]), re-deciding on every metrics change and
+/// whenever a [`TickHold`] ends. Ends when the Raft node shuts down.
+async fn idle_ticks(node: RaftNode) {
+    let mut rx = node.raft.metrics();
+    loop {
+        let alone = {
+            let m = rx.borrow_and_update();
+            if m.running_state.is_err() {
+                return;
+            }
+            leads_alone(&m, node.node_id)
+        };
+        node.ticks.apply(&node.raft, alone);
+        tokio::select! {
+            r = rx.changed() => if r.is_err() { return },
+            _ = node.ticks.changed.notified() => {}
+        }
+    }
 }
 
 /// One proposal in flight ([`RaftNode::in_flight`]); leaves on drop.
@@ -423,6 +540,7 @@ impl RaftNode {
             hold_proposal: None,
             read_index_waits: Arc::default(),
             obs: p.obs,
+            ticks: Arc::default(),
         };
         // The metrics are published by the Raft task, so right after
         // `Raft::new`/`initialize` they may not show the membership yet:
@@ -446,6 +564,12 @@ impl RaftNode {
         }
         if node.sole_voter() {
             let me = node.node_id;
+            // `initialize` campaigns at once, but a restarted voter starts
+            // as a follower and would wait out a whole election timeout:
+            // alone, it has nobody to wait for.
+            if node.metrics().state != ServerState::Leader {
+                node.raft.trigger().elect().await.map_err(fatal)?;
+            }
             node.raft
                 .wait(Some(Duration::from_secs(30)))
                 .metrics(
@@ -456,6 +580,7 @@ impl RaftNode {
                 .map_err(|e| fatal(format!("waiting to become leader: {e}")))?;
         }
         tokio::spawn(snapshot_policy(node.clone(), s));
+        tokio::spawn(idle_ticks(node.clone()));
         Ok(node)
     }
 
@@ -529,6 +654,11 @@ impl RaftNode {
         let guard = InFlight(Arc::clone(&self.in_flight));
         self.no_leader_while_transferring()?;
         Ok(guard)
+    }
+
+    /// Ticks on for a membership change ([`TickControl`]).
+    fn tick_hold(&self) -> TickHold {
+        TickHold::new(&self.ticks, &self.raft)
     }
 
     /// Snapshots this node installed from a leader since it started.
@@ -645,6 +775,7 @@ impl RaftNode {
         blocking: bool,
     ) -> Result<u64, StoreError> {
         let in_flight = self.proposal()?;
+        let _ticks = self.tick_hold();
         // openraft's own `blocking` waits only its default half second and
         // then answers success whatever the learner's state, so the wait
         // for catch-up is ours, with a real timeout and a real error.
@@ -681,6 +812,7 @@ impl RaftNode {
     /// Returns the final membership entry's index.
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<u64, StoreError> {
         let _in_flight = self.proposal()?;
+        let _ticks = self.tick_hold();
         let r = committed(self.raft.change_membership(voters, true)).await?;
         Ok(r.log_id().index)
     }
@@ -691,6 +823,7 @@ impl RaftNode {
     /// both take effect. Returns the final membership entry's index.
     pub async fn promote(&self, id: NodeId) -> Result<u64, StoreError> {
         let _in_flight = self.proposal()?;
+        let _ticks = self.tick_hold();
         let r = committed(self.raft.change_membership(
             openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
             true,
@@ -704,6 +837,7 @@ impl RaftNode {
     /// (`Admin.Remove`). Returns the final membership entry's index.
     pub async fn remove(&self, id: NodeId, voter: bool) -> Result<u64, StoreError> {
         let _in_flight = self.proposal()?;
+        let _ticks = self.tick_hold();
         let ids = BTreeSet::from([id]);
         let change = if voter {
             openraft::ChangeMembers::RemoveVoters(ids)
@@ -721,6 +855,7 @@ impl RaftNode {
     /// (`Admin.UpdateAdvertise`). Returns the entry's index.
     pub async fn set_node_addr(&self, id: NodeId, addr: &str) -> Result<u64, StoreError> {
         let _in_flight = self.proposal()?;
+        let _ticks = self.tick_hold();
         let r = committed(self.raft.change_membership(
             openraft::ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
                 id,
@@ -834,11 +969,13 @@ impl RaftNode {
 /// then purges the log below it, keeping `log_keep_entries`. Ends when the
 /// Raft node shuts down.
 ///
-/// It re-evaluates on every metrics change and at least every
-/// [`POLICY_TICK`], so a build the disk guard refused is retried once space
-/// frees up even on an idle cluster; a triggered build that never produced
-/// a snapshot (openraft logs a failed build and carries on) is retried
-/// after [`SNAPSHOT_RETRY`]. The byte trigger counts from what the log held
+/// It re-evaluates on every metrics change (an append, an apply, a new
+/// snapshot), and every [`POLICY_TICK`] only while it waits on something
+/// time can change: a build the disk guard refused is retried once space
+/// frees up even on an idle cluster, and a triggered build that never
+/// produced a snapshot (openraft logs a failed build and carries on) is
+/// retried after [`SNAPSHOT_RETRY`]. With neither, an idle node does not
+/// wake it (issue #205). The byte trigger counts from what the log held
 /// above the snapshot at start, so a restart does not reset it.
 async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
     let mut rx = node.raft.metrics();
@@ -882,6 +1019,10 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
         let since = applied.saturating_sub(snap.unwrap_or(0));
         let bytes = node.log_store.appended_bytes().saturating_sub(base_bytes);
         let due = applied > 0 && (since >= entries || bytes >= s.snapshot_log_bytes);
+        if !due {
+            // Nothing to retry (a snapshot arrived some other way).
+            disk_refused = false;
+        }
         if due && pending.is_none() {
             match node.disk.check("snapshot") {
                 Ok(()) => {
@@ -900,14 +1041,16 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                 }
             }
         }
+        let waiting = disk_refused || pending.is_some();
         tokio::select! {
             r = rx.changed() => if r.is_err() { return },
-            _ = tokio::time::sleep(POLICY_TICK) => {}
+            _ = tokio::time::sleep(POLICY_TICK), if waiting => {}
         }
     }
 }
 
-/// The snapshot policy re-evaluates at least this often.
+/// The snapshot policy re-evaluates at least this often while a build is
+/// refused or pending.
 pub const POLICY_TICK: Duration = Duration::from_secs(1);
 
 /// A triggered build that produced no snapshot is retried after this.
@@ -1042,6 +1185,26 @@ pub fn follower_stale(known: bool, recent: bool, applied: u64, leader_commit: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leads_alone_only_as_the_leader_and_only_member() {
+        assert!(leads_alone(&leader_metrics(&[1], None), 1));
+        // Another voter, or another node's view.
+        assert!(!leads_alone(&leader_metrics(&[1, 2], None), 1));
+        assert!(!leads_alone(&leader_metrics(&[1], None), 2));
+        // A learner needs heartbeats too.
+        let mut m = leader_metrics(&[1], None);
+        let nodes = BTreeMap::from([(1, BasicNode::new("h:1")), (2, BasicNode::new("h:2"))]);
+        m.membership_config = Arc::new(openraft::StoredMembership::new(
+            None,
+            openraft::Membership::new(vec![BTreeSet::from([1])], nodes),
+        ));
+        assert!(!leads_alone(&m, 1));
+        // Not (yet) leading: a candidate or follower keeps its timers.
+        let mut m = leader_metrics(&[1], None);
+        m.state = ServerState::Candidate;
+        assert!(!leads_alone(&m, 1));
+    }
 
     fn leader_metrics(voters: &[NodeId], ack_ms: Option<u64>) -> RaftMetrics<NodeId, BasicNode> {
         let mut m = RaftMetrics::new_initial(1);
