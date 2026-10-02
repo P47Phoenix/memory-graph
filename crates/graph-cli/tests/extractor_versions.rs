@@ -8,7 +8,7 @@ fn bumped_extractor_versions_are_pinned() {
     for (lang, prefix) in [
         ("aspx", "aspx-scan-2+kw1+cb1+tok"),
         ("cobol", "cobol-scan-1+kw1+dw1+tok"),
-        ("asm", "asm-scan-1+kw1+tok"),
+        ("asm", "asm-scan-1+kw2+cmt1+tok"),
         ("typescript", "typescript-scan-3+kw1+tok"),
         ("python", "python-scan-2+kw1+tok"),
         ("csharp", "csharp-scan-1+kw1+tok"),
