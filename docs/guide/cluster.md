@@ -33,7 +33,7 @@ A real network partition is bounded this way; a peer whose process answers healt
 
 ## Configuration file
 
-`serve --config serve.toml` (or `MEMORY_GRAPH_CONFIG`) reads the same settings from TOML: every `serve` flag is a key of the same name, kebab-case or snake_case, plus `db` and `cache-bytes`; a switch is `true`/`false`, a list an array. A flag on the command line, or its environment variable (`MEMORY_GRAPH_LOG`), overrides the file, and the file overrides the defaults. An unknown key is an error, and the file's values go through the flags' own checks. For example:
+`serve --config serve.toml` (or `MEMORY_GRAPH_CONFIG`) reads the same settings from TOML: every `serve` flag is a key of the same name, kebab-case or snake_case, plus `db` and `cache-bytes`; a switch is `true`/`false`, a list an array. A flag on the command line, or its environment variable (`MEMORY_GRAPH_LOG`, `MEMORY_GRAPH_WORKER_THREADS`), overrides the file, and the file overrides the defaults. An unknown key is an error, and the file's values go through the flags' own checks. For example:
 
 ```toml
 data-dir = "/var/lib/memory-graph"
