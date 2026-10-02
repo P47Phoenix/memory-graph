@@ -912,6 +912,38 @@ mod tests {
         }
     }
 
+    /// #185 review: promoting an older file than the current pair discards
+    /// the file and leaves the pair unchanged.
+    #[test]
+    fn promoting_an_older_snapshot_is_stale_and_keeps_the_pair() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let (side1, path1) = snaps.current().unwrap();
+        let older = snaps.dir().join("older.redb.tmp");
+        std::fs::copy(&path1, &older).unwrap();
+        StoreStateMachine::apply_all(&slot, vec![blank(2)], NO_FP, &Default::default(), None)
+            .unwrap();
+        snaps.build(&slot).unwrap();
+        let before = files_in(snaps.dir());
+        let (side2, path2) = snaps.current().unwrap();
+        assert_eq!(side2.last_log_id, Some(log_id(2)));
+        let (side, path, promoted) = snaps
+            .promote(
+                &older,
+                side1.last_log_id,
+                side1.membership.clone(),
+                "older".into(),
+            )
+            .unwrap();
+        assert_eq!(promoted, super::super::snapshot_dir::Promoted::Stale);
+        assert_eq!((side, path), (side2.clone(), path2.clone()));
+        assert!(!older.exists(), "the stale file is removed");
+        assert_eq!(snaps.current().unwrap(), (side2, path2));
+        let mut expected = before;
+        expected.retain(|f| f != "older.redb.tmp");
+        assert_eq!(files_in(snaps.dir()), expected);
+    }
+
     /// #185 review: temp files of every kind left by a crash are swept when
     /// the directory is opened; the complete pair is kept.
     #[test]

@@ -8,8 +8,8 @@
 //!
 //! Crash safety: a build exports to its own `snap-build-<nanos>-<n>.redb.tmp`
 //! (unique per build, so concurrent builds never touch each other's file and
-//! every error path removes it), renames it to
-//! its final name, then writes the meta through a temp file and a rename.
+//! every error path removes it), renames it to its final name, then writes
+//! the meta through a temp file and a rename.
 //! The current snapshot is the highest-index meta whose data file exists
 //! with the recorded size; a crash between the renames leaves a data file
 //! without a meta (ignored, and the previous pair is still there because it
@@ -24,8 +24,9 @@
 //! exists. A promotion older than the current pair (a build that exported
 //! before an install of a later snapshot finished) is discarded and the
 //! newer pair kept: openraft's snapshot only ever moves forward, and a
-//! newer committed snapshot is always a valid answer. A build at an index that already has a
-//! complete pair reuses it, unless that pair was made by another build
+//! newer committed snapshot is always a valid answer.
+//!
+//! A build at an index that already has a complete pair reuses it, unless that pair was made by another build
 //! (older store format or other extractors, #151): the rebuilt pair is then
 //! named `snap-<term>-<index>-r<nanos>` rather than overwriting the existing
 //! file, so a meta never describes a different file of the same name and a
@@ -534,7 +535,19 @@ impl SnapshotDir {
                 })
         };
         cleanup();
-        promoted?;
+        let (side, _, promoted) = promoted?;
+        if promoted == Promoted::Stale {
+            // Unreachable under openraft: it drops a full snapshot at or
+            // below `committed`, and a build covers at most `applied`, so no
+            // pair can be newer than an install. Only a direct caller (the
+            // race test) gets here; no `debug_assert!` for that reason.
+            tracing::warn!(
+                store_at = ?meta.last_log_id,
+                pair_at = ?side.last_log_id,
+                "installed a snapshot older than the current pair; pair kept"
+            );
+            return Ok(());
+        }
         self.installed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
