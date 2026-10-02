@@ -8,7 +8,7 @@ Status: evidence for issue #205 (stories S1-S3 fixed it, S5 guards it). Date 202
 - **Before: an idle `serve --db` woke 39.6 times a second** (0.17 % of one core, 34 threads on a 32-vCPU VM). With longer Raft timings by hand it was 8.3/s. [M]
 - **The cause was Raft's timers, not the database.** A 50 ms heartbeat made openraft tick every 75 ms; every tick published new Raft metrics, which woke the readiness loop (it re-sent the gRPC health status every pass) and the snapshot-policy loop. A one-node "cluster" ticked although it has nobody to heartbeat. [M]
 - **After the fix (PR #208): `serve --db` wakes 3.0 times a second (13x fewer), a one-node `--data-dir` 5.7.** All of it is one thread: openraft 0.9's tick timer, which still wakes every 1.5 heartbeats to see that ticks are off. That is the floor without changing openraft. [M]
-- **A regression guard keeps it there:** a Linux test in `serve_e2e` (`--db` under 8/s, `--data-dir` under 12/s) and a step in the Docker workflow (`scripts/idle-cpu.sh`, under 8/s). [M]
+- **A regression guard keeps it there:** a Linux test in `serve_e2e` (`--db` under 5/s, `--data-dir` under 8/s) and a step in the Docker workflow (`scripts/idle-cpu.sh`, under 5/s). [M]
 
 **Labels.** [M] measured, [E] estimated or inferred (reason stated). Machine: AMD Ryzen 9 7950X (16 cores, 32 threads), 63 GB RAM, Windows 11 Pro (10.0.26200), Docker Desktop 29.6 with the WSL2 backend (a Linux VM with 32 vCPUs). Not measured on a Mac: the macOS cost model is Docker's documented VM design and the user report, not a measurement here. Other programs were running.
 
@@ -71,7 +71,7 @@ All of these are in the server's own tasks; the store itself is quiet.
 | `--db`, `docker run --cpus=2` | 3.0 | 0.017 % | 4 |
 | `--data-dir --bootstrap --node-id 1` | **5.7** | 0.033 % | 34 |
 
-The whole remaining rate is on one tokio worker. The `serve_e2e` guard (debug build, 10 s window, run in a `rust:1.98-bookworm` container on the same machine) measured the same: 3.0/s for `--db` and 5.7/s for `--data-dir`. The same test on the code before the fix (f04084d) measured 50.5/s for `--db`, failing its limit of 8, and 10.6/s for `--data-dir`, under its limit of 12 (see [Regression guard](#regression-guard-s5) for why). [M]
+The whole remaining rate is on one tokio worker. The `serve_e2e` guard (debug build, 10 s window, run in a `rust:1.98-bookworm` container on the same machine) measured the same: 3.0/s for `--db` and 5.7/s for `--data-dir`. The same test on the code before the fix (f04084d) measured 50.5/s for `--db` and 10.6/s for `--data-dir`, failing both limits (5 and 8). [M]
 
 ## The remaining floor
 
@@ -85,5 +85,13 @@ The [Docker guide](../guide/docker.md#idle-cpu-on-macos-docker-desktop) has the 
 
 ## Regression guard (S5)
 
-- `crates/graph-cli/tests/serve_e2e.rs`, module `idle` (Linux only): starts the real binary as `serve --db` and as a one-node `serve --data-dir --bootstrap`, lets it settle for 2 s, then sums the context switches of all its threads over 10 s (sampled every 200 ms so a thread that exits mid-window still counts). Limits: `--db` under 8/s (the code before the fix measured 50.5/s here and fails it; the fix measured 3.0/s, under half of it), `--data-dir` under 12/s (catches a return to per-tick fan-out or a short heartbeat, not the step from 10.6/s to 5.7/s measured here, which would be flaky to pin on a shared runner).
-- `.github/workflows/docker.yml`, build job: runs the freshly built image as `serve --db /data/g.redb` on a named volume, waits for it to listen and for the health check's start period to pass, then `scripts/idle-cpu.sh <container> 20 8`.
+- `crates/graph-cli/tests/serve_e2e.rs`, module `idle` (Linux only): starts the real binary as `serve --db` and as a one-node `serve --data-dir --bootstrap`, lets it settle for 2 s, then sums the context switches of all its threads over 10 s (sampled every 200 ms so a thread that exits mid-window still counts). Limits: `--db` under 5/s, `--data-dir` under 8/s. The rate is driven by timers, so it barely moves: across repeated runs, a CPU-starved `--cpus=2` with CPU hogs, and the whole test binary in parallel, `--db` stayed at 2.9-3.0/s and `--data-dir` at 5.2-5.8/s. Partial reverts measured in review all fail at least the `--db` limit:
+
+  | revert | `--db` | `--data-dir` |
+  |---|---|---|
+  | ticks never suspended (S1) | 5.6/s | 11.0/s |
+  | readiness and policy loops on timers again (S2) | 6.9/s | 8.8/s |
+  | S1 and S2 | 6.7/s | 11.4/s |
+  | 50 ms `--db` heartbeat (S3) | 26.3/s | (unchanged) |
+  | before the fix (f04084d) | 50.5/s | 10.6/s |
+- `.github/workflows/docker.yml`, build job: runs the freshly built image as `serve --db /data/g.redb` on a named volume, waits for it to listen and for the health check's start period to pass, then `scripts/idle-cpu.sh <container> 20 5` (3.1/s measured; 5.6/s with S1 and S2 reverted, 39.8/s for the image before the fix).

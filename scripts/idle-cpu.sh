@@ -48,7 +48,9 @@ out=$(docker run -i --rm --pid="container:$container" alpine:3 sh -s "$seconds" 
 snap() {
     for t in /proc/1/task/*; do
         id=${t##*/}
-        name=$(tr ' ' '_' < "$t/comm" 2>/dev/null) || continue
+        # A thread can exit between the listing and the read: skip it
+        # quietly (the redirect's own error goes to the subshell's stderr).
+        name=$( (tr ' ' '_' < "$t/comm") 2>/dev/null) || continue
         ticks=$(sed 's/.*) //' "$t/stat" 2>/dev/null | awk '{print $12 + $13}') || continue
         sw=$(awk '/^(non)?voluntary_ctxt_switches:/ {s += $2} END {print s + 0}' "$t/status" 2>/dev/null) || continue
         [ -n "$ticks" ] && echo "$id $name $ticks $sw"

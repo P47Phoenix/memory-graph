@@ -149,7 +149,7 @@ jobs:
           # start period) so the window sees only the 30 s probe, then
           # measure 20 s: about 3 wakeups/s after #205, about 40 before.
           sleep 12
-          sh scripts/idle-cpu.sh mg-idle 20 8
+          sh scripts/idle-cpu.sh mg-idle 20 5
 
   publish:
     # Both architectures, pushed to ghcr.io. Only this job may write packages,

@@ -141,7 +141,7 @@ On a Mac, containers run in a Linux VM. Each time a thread in the VM wakes (a ti
 - **Keep `MEMORY_GRAPH_LOG` at `info`** (the default). `debug` and `trace` add log lines (openraft's among them), and each line is a write the VM has to wake for.
 - **Measure the VM, not only the container.** Look at `com.docker.virtualization` in Activity Monitor (or `top -o cpu`) with the server idle, and compare it with the container stopped. `docker stats` shows only what the container's processes used inside the VM.
 
-To count the wakeups of a running container, `scripts/idle-cpu.sh <container> [seconds] [max]` (in this repository) runs a small alpine container in the server's pid namespace and prints the wakeups/s and CPU per thread and in total. The Docker workflow runs it in CI against an idle `serve --db` and fails above 8 wakeups/s.
+To count the wakeups of a running container, `scripts/idle-cpu.sh <container> [seconds] [max]` (in this repository) runs a small alpine container in the server's pid namespace and prints the wakeups/s and CPU per thread and in total. The Docker workflow runs it in CI against an idle `serve --db` and fails above 5 wakeups/s.
 
 ```sh
 docker run -d --name mg-server --cpus=2 -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main serve --db /data/graph.redb --listen 0.0.0.0:7000
