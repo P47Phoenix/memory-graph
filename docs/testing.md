@@ -118,7 +118,11 @@ Four layers, from the wire up:
    `cluster leader`/`status`, `sysinfo --server`, `vacuum --compact
    --server`; the `Locked` message naming the server's pid and address (for
    an embedded open, with `MEMORY_GRAPH_LOCK_WAIT_MS=300`, and for a second
-   `serve`); on unix, SIGTERM stopping the server gracefully. Exit code 5
+   `serve`); on unix, SIGTERM stopping the server gracefully; on Linux, an
+   idle `serve --db` waking under 8 times/s and a one-node `serve --data-dir`
+   under 12 (context switches of all its threads from `/proc` over 10 s,
+   issue #205; the Docker workflow checks the image the same way with
+   `scripts/idle-cpu.sh`, see [the idle CPU spike](spikes/idle-cpu.md)). Exit code 5
    (protocol mismatch) needs a server speaking another protocol version, so
    its mapping is unit-tested in `crates/graph-cli/src/target.rs` instead.
 4. **RPC overhead** (`crates/graph-client/examples/rpc_bench.rs`, run by hand

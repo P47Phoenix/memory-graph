@@ -111,11 +111,16 @@ impl Server {
 
     fn start_env(db: &Path, env: &[(&str, &str)]) -> Server {
         let mut c = cmd();
-        c.envs(env.iter().copied());
+        c.envs(env.iter().copied()).args(["serve", "--db"]).arg(db);
+        Self::spawn(c, db)
+    }
+
+    /// `c` (a `serve` command with its target flags: `--db <db>`, or
+    /// `--data-dir ...` whose store is `db`), listening on a free port.
+    fn spawn(mut c: Command, db: &Path) -> Server {
         let mut child = c
-            .args(["serve", "--db"])
-            .arg(db)
-            .args(["--listen", "127.0.0.1:0"])
+            .arg("--listen")
+            .arg("127.0.0.1:0")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -824,4 +829,131 @@ fn leaderless_linearizable_read_is_a_bounded_read_failure() {
     assert_eq!(j["repos"][0]["repo"], "r");
     assert_eq!(j["stale_possible"], true, "no leader known: {j}");
     server.shutdown();
+}
+
+/// Idle wakeups of a served node (issue #205): an idle `serve` must not
+/// wake on its own more than a few times a second. On Docker Desktop for
+/// macOS every wakeup costs a VM exit, billed to the VM rather than the
+/// container, so the wakeup rate is the number to guard, not CPU time.
+///
+/// A wakeup is a context switch, voluntary or not, of any of the server's
+/// threads (`/proc/<pid>/task/*/status`), the same count
+/// `scripts/idle-cpu.sh` reports for a container. See
+/// `docs/spikes/idle-cpu.md` for the measurements behind the limits.
+#[cfg(target_os = "linux")]
+mod idle {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// How long a fresh server is left to settle (election, readiness,
+    /// first metrics) before the window starts.
+    const SETTLE: Duration = Duration::from_secs(2);
+    /// The measured window.
+    const WINDOW: Duration = Duration::from_secs(10);
+    /// How often `/proc` is sampled within the window. Reading `/proc`
+    /// does not wake the server; sampling often only keeps the switches of
+    /// a thread that exits mid-window (a tokio blocking-pool thread, say)
+    /// from being lost.
+    const SAMPLE: Duration = Duration::from_millis(200);
+
+    /// Voluntary plus nonvoluntary context switches of each live thread of
+    /// `pid`, by thread id.
+    fn switches(pid: u32) -> HashMap<u64, u64> {
+        let mut m = HashMap::new();
+        let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return m;
+        };
+        for e in dir.flatten() {
+            let Ok(tid) = e.file_name().to_string_lossy().parse::<u64>() else {
+                continue;
+            };
+            // The thread may have exited since the listing.
+            let Ok(status) = std::fs::read_to_string(e.path().join("status")) else {
+                continue;
+            };
+            let n = status
+                .lines()
+                .filter_map(|l| {
+                    l.strip_prefix("voluntary_ctxt_switches:")
+                        .or_else(|| l.strip_prefix("nonvoluntary_ctxt_switches:"))
+                })
+                .filter_map(|v| v.trim().parse::<u64>().ok())
+                .sum();
+            m.insert(tid, n);
+        }
+        m
+    }
+
+    /// Wakeups per second of `pid` over [`WINDOW`], and the most threads
+    /// seen. A thread already there at the start counts from its first
+    /// sample, one born in the window counts in full, and one that exits
+    /// counts up to its last sample.
+    fn wakeups_per_s(pid: u32) -> (f64, usize) {
+        let first = switches(pid);
+        let mut last = first.clone();
+        let mut threads = first.len();
+        let start = Instant::now();
+        while start.elapsed() < WINDOW {
+            std::thread::sleep(SAMPLE);
+            let now = switches(pid);
+            threads = threads.max(now.len());
+            last.extend(now);
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let total: u64 = last
+            .iter()
+            .map(|(tid, n)| n.saturating_sub(first.get(tid).copied().unwrap_or(0)))
+            .sum();
+        (total as f64 / secs, threads)
+    }
+
+    fn check(what: &str, server: Server, max_per_s: f64) {
+        std::thread::sleep(SETTLE);
+        let (rate, threads) = wakeups_per_s(server.pid());
+        println!(
+            "idle {what}: {rate:.1} wakeups/s over {}s, {threads} threads (limit {max_per_s})",
+            WINDOW.as_secs()
+        );
+        assert!(
+            rate < max_per_s,
+            "idle {what} woke {rate:.1} times/s ({threads} threads), limit {max_per_s} (issue #205)"
+        );
+        server.shutdown();
+    }
+
+    /// `serve --db`. Measured in Docker on 32 vCPUs (60 s windows): about
+    /// 40 wakeups/s before issue #205 (a 75 ms Raft tick fanned out to the
+    /// readiness and snapshot-policy loops on every tick), 2.9/s after,
+    /// all of it openraft's tick timer (every 750 ms with the 500 ms
+    /// heartbeat). This test measured 3.0/s, and 50.5/s on the code before
+    /// the fix (Linux container, same machine). 8/s is well over twice the
+    /// floor, room for a busy CI runner, and far under the old rate.
+    #[test]
+    fn idle_serve_db_barely_wakes() {
+        let d = tempfile::tempdir().unwrap();
+        let server = Server::start(&d.path().join("g.redb"));
+        check("serve --db", server, 8.0);
+    }
+
+    /// `serve --data-dir --bootstrap`, one node. Measured as above: 8.3/s
+    /// before issue #205, 5.5/s after (the cluster's 250 ms heartbeat makes
+    /// the tick timer wake every 375 ms); this test measured 5.7/s, and
+    /// 10.6/s before the fix. That difference is too small to pin on a
+    /// shared runner without flakes, so 12/s guards against the gross
+    /// regressions (a sole voter ticking again with a per-tick fan-out, or
+    /// a short heartbeat: tens of wakeups per second), not the last 3/s.
+    #[test]
+    fn idle_serve_data_dir_barely_wakes() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("node");
+        let mut c = cmd();
+        c.arg("serve")
+            .arg("--data-dir")
+            .arg(&dir)
+            .args(["--bootstrap", "--node-id", "1"])
+            // The test machine's free space is not what is being tested.
+            .args(["--min-free-disk", "1"]);
+        let server = Server::spawn(c, &dir.join("graph.redb"));
+        check("serve --data-dir", server, 12.0);
+    }
 }
