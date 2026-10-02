@@ -355,7 +355,7 @@ fn ingest_stats() -> impl Strategy<Value = IngestStats> {
         any::<bool>(),
         text(),
         text(),
-        (option::of(text()), any::<bool>()),
+        (option::of(text()), any::<bool>(), option::of(text())),
     )
         .prop_map(
             |(
@@ -367,7 +367,7 @@ fn ingest_stats() -> impl Strategy<Value = IngestStats> {
                 has_errors,
                 path,
                 language,
-                (encoding, lossy),
+                (encoding, lossy, span_warning),
             )| {
                 IngestStats {
                     file_id,
@@ -380,6 +380,7 @@ fn ingest_stats() -> impl Strategy<Value = IngestStats> {
                     language,
                     encoding,
                     lossy,
+                    span_warning,
                 }
             },
         )

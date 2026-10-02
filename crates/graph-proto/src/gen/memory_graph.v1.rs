@@ -298,6 +298,11 @@ pub struct IngestStats {
     /// The file was decoded lossily.
     #[prost(bool, tag = "10")]
     pub lossy: bool,
+    /// The extractor produced an invalid span, so the file was stored with its
+    /// tokens and no symbols (#203); names the extractor and the span. Absent
+    /// otherwise, and from servers that predate it.
+    #[prost(string, optional, tag = "11")]
+    pub span_warning: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// One source file as raw bytes (`graph_store::BatchFile`), for `Write.Index`
 /// and the replicated `LogCommand.IndexChunk`.

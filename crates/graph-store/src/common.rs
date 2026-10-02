@@ -316,6 +316,7 @@ pub(crate) fn prepare_file(
         lossy: false,
         hint: None,
         strict_encoding: false,
+        span_warning: None,
     };
     if f.bytes.len() > MAX_SOURCE_BYTES {
         p.work = Prepared::Rejected(StoreError::TooLarge(format!("`{}`", f.path)));
@@ -351,7 +352,9 @@ pub(crate) fn prepare_file(
         // extracts it after all (as `index_batch` would have).
         Prepared::Unchanged(src.to_owned())
     } else {
-        extract_checked(registry, &p.path, &p.language, src)
+        let (work, warning) = extract_checked(registry, &p.path, &p.language, src);
+        p.span_warning = warning;
+        work
     };
     Ok(p)
 }
@@ -372,15 +375,33 @@ fn strict_refusal(path: &str, encoding: &'static Encoding) -> StoreError {
     }
 }
 
-/// Extract and validate spans, so a bad file only fails itself.
-pub(crate) fn extract_checked(registry: &Registry, path: &str, lang: &str, src: &str) -> Prepared {
+/// Extract and validate spans, so a bad file only fails itself. When only
+/// the symbols are at fault (#203), the file keeps its tokens with no
+/// symbols and the second value is a warning naming the extractor and the
+/// span; when the tokens are invalid too, the file is rejected.
+pub(crate) fn extract_checked(
+    registry: &Registry,
+    path: &str,
+    lang: &str,
+    src: &str,
+) -> (Prepared, Option<String>) {
     let ex = registry.extract(lang, src);
-    match validate_spans(&ex) {
-        Err(StoreError::InvalidSpan(why)) => {
-            Prepared::Rejected(StoreError::InvalidSpan(format!("`{path}`: {why}")))
-        }
-        _ => Prepared::Extracted(ex),
+    let Err(StoreError::InvalidSpan(why)) = validate_spans(&ex) else {
+        return (Prepared::Extracted(ex), None);
+    };
+    let tokens_only = Extraction {
+        symbols: Vec::new(),
+        ..ex
+    };
+    if validate_spans(&tokens_only).is_err() {
+        let e = StoreError::InvalidSpan(format!("`{path}`: {why}"));
+        return (Prepared::Rejected(e), None);
     }
+    let warning = format!(
+        "extractor `{}` produced an invalid span ({why}); stored tokens only, no symbols",
+        registry.version(lang)
+    );
+    (Prepared::Extracted(tokens_only), Some(warning))
 }
 
 /// The committing half, inside the caller's write transaction: re-run the
@@ -431,11 +452,19 @@ pub(crate) fn commit_prepared(
         }
     }
     let work = match work {
-        Prepared::Unchanged(src) => extract_checked(registry, &p.path, &p.language, &src),
+        Prepared::Unchanged(src) => {
+            let (work, warning) = extract_checked(registry, &p.path, &p.language, &src);
+            p.span_warning = warning;
+            work
+        }
         w => w,
     };
     match work {
-        Prepared::Extracted(ex) => Ok(Ok(ingest(&mut p, &ex)?)),
+        Prepared::Extracted(ex) => {
+            let mut stats = ingest(&mut p, &ex)?;
+            stats.span_warning = p.span_warning.take();
+            Ok(Ok(stats))
+        }
         Prepared::Rejected(e) => Ok(Err(e)),
         Prepared::Unchanged(_) => unreachable!("extracted above"),
         Prepared::Remote(_) => unreachable!("rejected above"),

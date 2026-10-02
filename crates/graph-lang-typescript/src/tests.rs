@@ -259,6 +259,8 @@ proptest! {
                 Just("B"), Just("{"), Just("}"), Just("("), Just(")"), Just("["), Just("]"),
                 Just(";"), Just("="), Just(">"), Just("<"), Just(":"), Just("|"), Just("=>"),
                 Just("@"), Just("?"), Just(","), Just("\"s\""), Just("//c\n"), Just("\n"),
+                Just("export"), Just("declare"), Just("default"), Just("let"), Just("x"),
+                Just("."), Just("async"),
             ],
             0..40,
         )
@@ -273,6 +275,31 @@ proptest! {
             prop_assert!(!s.name.is_empty());
         }
         assert_nested(&ex);
+    }
+}
+
+proptest! {
+    /// #203: whole declaration fragments in any order, some left open (a
+    /// trailing `|`, `&`, `=`), joined by newlines, never produce spans the
+    /// store would reject.
+    #[test]
+    fn declaration_fragments_keep_spans_valid(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                Just("type A = B |"), Just("type A = B &"), Just("type A ="), Just("type A = B;"),
+                Just("type A<T> = (x: T) =>"), Just("export"), Just("declare"), Just("default"),
+                Just("export const enum E { X }"), Just("const enum E { X }"),
+                Just("declare module \"m\" { }"), Just("namespace N.M { }"),
+                Just("declare namespace N { }"), Just("export interface I { a: T }"),
+                Just("abstract class K { m(): void; f: T | }"), Just("class C { x: A |"),
+                Just("export function f(): T |"), Just("}"), Just("{"), Just("const f = (): T =>"),
+                Just("declare function g(): void;"), Just("export default class D { }"),
+            ],
+            0..12,
+        )
+    ) {
+        let src = parts.join("\n");
+        assert_nested(&TypeScriptExtractor.extract(&src));
     }
 }
 
@@ -373,7 +400,7 @@ fn keywords_are_classed_keyword() {
     assert_eq!(class("import"), [TokenClass::Identifier]);
     assert!(TypeScriptExtractor
         .version()
-        .starts_with("typescript-scan-2+kw1+tok"));
+        .starts_with("typescript-scan-3+kw1+tok"));
 }
 
 /// Review of #164: interface and type-literal members with reserved names
@@ -404,4 +431,29 @@ fn keyword_classing_members() {
         [K]
     );
     assert_eq!(classes("switch (x) { default: break; }", "default"), [K]);
+}
+
+/// #203: a type alias left open by a trailing operator read the next
+/// statement's `export` / `declare` as a type operand, so its span ended
+/// inside the declaration whose span starts at that word.
+#[test]
+fn type_alias_stops_before_the_next_statement() {
+    for (src, alias) in [
+        ("type A = B |\nexport class K { }\n", "type A = B |"),
+        ("type A = B |\ndeclare module \"m\" { }\n", "type A = B |"),
+        ("type A = B &\ndeclare namespace N { }\n", "type A = B &"),
+        ("type A = B |\nexport const enum E { }\n", "type A = B |"),
+        ("type A = B |\nabstract class K { }\n", "type A = B |"),
+        ("type A = B |\nnamespace N { }\n", "type A = B |"),
+        ("type A = B |\nimport x from \"y\";\n", "type A = B |"),
+        ("type A = B |\nasync function f() { }\n", "type A = B |"),
+        ("type A = B |\ntype C = D;\n", "type A = B |"),
+    ] {
+        let s = syms(src);
+        assert_eq!(find(&s, "A").3, alias, "{src}");
+    }
+    // Contextual words are still types where no name follows them.
+    let s = syms("type A = B | declare;\ntype M = module | type;\n");
+    assert_eq!(find(&s, "A").3, "type A = B | declare;");
+    assert_eq!(find(&s, "M").3, "type M = module | type;");
 }

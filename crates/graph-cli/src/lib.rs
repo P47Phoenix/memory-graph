@@ -322,6 +322,9 @@ struct Tally {
     skipped: std::collections::BTreeMap<String, Vec<String>>,
     /// Files whose extraction failed span validation: (path, reason). Not stored.
     failed: Vec<(String, String)>,
+    /// Files stored with their tokens and no symbols because the extractor's
+    /// symbols failed span validation (#203): (path, warning).
+    degraded: Vec<(String, String)>,
     /// Files in the run decoded from a non-UTF-8 encoding, and files in the
     /// run decoded lossily (ADR 0007; `--stats`). Unchanged files count too,
     /// with their stored encoding; refused files do not.
@@ -386,6 +389,9 @@ fn flush_batch(
                 *t.by_lang.entry(st.language).or_default() += 1;
                 t.transcoded += usize::from(st.encoding.is_some());
                 t.lossy += usize::from(st.lossy);
+                if let Some(w) = st.span_warning {
+                    t.degraded.push((rel, w));
+                }
                 t.seen.insert(st.path);
             }
             // ADR 0007 C5: the store's binary check, tallied with the walk's.
@@ -1284,6 +1290,7 @@ pub fn index_dir_with(
         seen,
         skipped: batch_skipped,
         mut failed,
+        mut degraded,
         transcoded,
         lossy,
     } = tally;
@@ -1294,6 +1301,7 @@ pub fn index_dir_with(
     // arrive; sort so the report does not depend on batching (paths are
     // unique within a run).
     failed.sort();
+    degraded.sort();
     for (r, v) in batch_skipped {
         skipped.entry(r).or_default().extend(v);
     }
@@ -1328,6 +1336,8 @@ pub fn index_dir_with(
             "pruned": pruned, "elapsed_ms": ms,
             "failed": failed.len(),
             "failed_files": failed.iter().map(|(p, r)| serde_json::json!({"path": p, "reason": r})).collect::<Vec<_>>(),
+            "degraded": degraded.len(),
+            "degraded_files": degraded.iter().map(|(p, w)| serde_json::json!({"path": p, "warning": w})).collect::<Vec<_>>(),
         });
         let mut summary = summary;
         if let Some(r) = &view.remote {
@@ -1374,6 +1384,9 @@ pub fn index_dir_with(
                     v.len() - 20
                 );
             }
+        }
+        for (p, w) in &degraded {
+            out!(out, "  warning: {p}: {w}");
         }
         for (p, r) in &failed {
             out!(out, "  failed: {p}: {r}");

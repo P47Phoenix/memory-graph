@@ -380,6 +380,20 @@ const TYPE_WORDS: &[&str] = &[
     "keyof", "typeof", "infer", "is", "extends", "readonly", "unique", "asserts", "new", "in", "as",
 ];
 
+/// Reserved words that start a statement and are never part of a type.
+const STATEMENT_WORDS: &[&str] = &["export", "import", "default", "const", "let", "var"];
+
+/// TypeScript's contextual words that start a declaration when a name (or a
+/// module string) follows them: `declare module "m"`, `namespace N`.
+const DECLARATION_WORDS: &[&str] = &[
+    "declare",
+    "abstract",
+    "namespace",
+    "module",
+    "type",
+    "async",
+];
+
 struct Scanner<'a> {
     tokens: &'a [TokenDecl],
     code: &'a [usize],
@@ -735,6 +749,15 @@ impl Scanner<'_> {
         })
     }
 
+    /// Whether the code token after `c` (before `hi`) is a word or a literal.
+    fn word_follows(&self, c: usize, hi: usize) -> bool {
+        c + 1 < hi
+            && matches!(
+                self.tok(c + 1).class,
+                TokenClass::Identifier | TokenClass::Keyword | TokenClass::Literal
+            )
+    }
+
     /// See [`type_end`].
     fn type_end(&self, mut c: usize, hi: usize) -> usize {
         // Whether an operand is expected next, and whether the last operand
@@ -779,6 +802,14 @@ impl Scanner<'_> {
                 // declaration (`type A = class B {}` must not give a type
                 // span that partially overlaps the class, #145).
                 "class" | "function" | "enum" | "interface" => return c,
+                // Likewise the reserved words that open a statement, which
+                // the TypeScript pass folds into the next declaration's span
+                // (`type A = B |\nexport class C {}`, #203).
+                _ if STATEMENT_WORDS.contains(&t) => return c,
+                // Contextual declaration words stop a type when a name
+                // follows: in a type, such a word is never followed by
+                // another word (`type A = B |\ndeclare module "m" {}`, #203).
+                _ if DECLARATION_WORDS.contains(&t) && self.word_follows(c, hi) => return c,
                 "|" | "&" | "?" | ":" | "." | "-" | "+" => {
                     c += 1;
                     operand = true;
