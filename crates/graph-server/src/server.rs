@@ -834,8 +834,8 @@ pub async fn start(
         let raft_for_health = raft.clone();
         let max_lag = cfg.ready_max_lag;
         let silence = crate::observe::leader_silence_limit(settings.election_max_ms);
-        // Re-checked at least this often: the time since a leader last
-        // reached this node grows without any event.
+        // A follower re-checks at least this often: the time since a
+        // leader last reached it grows without any event.
         let recheck = (silence / 4).min(Duration::from_secs(1));
         tokio::spawn(async move {
             let mut last = None;
@@ -843,21 +843,29 @@ pub async fn start(
                 if shutdown.is_triggered() {
                     return;
                 }
-                let ready = raft_ready(&raft_for_health, &rx.borrow_and_update(), max_lag, silence);
+                let (ready, leads) = {
+                    let m = rx.borrow_and_update();
+                    let leads = m.state == openraft::ServerState::Leader
+                        && m.current_leader == Some(raft_for_health.node_id);
+                    (raft_ready(&raft_for_health, &m, max_lag, silence), leads)
+                };
+                // Only a change is reported: tonic-health notifies every
+                // watcher on each update, even an unchanged one (issue
+                // #205: an idle server must not wake for nothing).
                 if last != Some(ready) {
                     tracing::info!(ready, max_lag, "readiness changed");
                     last = Some(ready);
+                    reporter
+                        .set_service_status(
+                            READY_SERVICE,
+                            if ready {
+                                ServingStatus::Serving
+                            } else {
+                                ServingStatus::NotServing
+                            },
+                        )
+                        .await;
                 }
-                reporter
-                    .set_service_status(
-                        READY_SERVICE,
-                        if ready {
-                            ServingStatus::Serving
-                        } else {
-                            ServingStatus::NotServing
-                        },
-                    )
-                    .await;
                 if shutdown.is_triggered() {
                     // Raced the shutdown watcher: never leave SERVING behind.
                     mark_not_serving(&reporter).await;
@@ -865,14 +873,18 @@ pub async fn start(
                 }
                 // Applied index and leadership come with the Raft
                 // metrics; the leader's committed index with its
-                // heartbeats (noted by the Raft service).
+                // heartbeats (noted by the Raft service). A leader is
+                // ready for as long as it leads, so only a follower needs
+                // the timer (the `withhold_leader` test hook's leader is
+                // not ready for as long as it leads: no timer either).
                 tokio::select! {
                     r = rx.changed() => if r.is_err() { return },
                     _ = raft_for_health.obs.leader_commit_changed() => {}
+                    _ = shutdown.wait() => {}
                     // The leader's silence, and a backstop for a change
                     // noted between the check and the wait
                     // (`Notify::notify_waiters` keeps no permit).
-                    _ = tokio::time::sleep(recheck) => {}
+                    _ = tokio::time::sleep(recheck), if !leads => {}
                 }
             }
         });
