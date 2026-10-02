@@ -22,6 +22,7 @@
 mod common;
 
 use common::readiness::{ready_timeout, start_serve, try_start_serve, StartOptions};
+use graph_server::services::admin::QUORUM_REFUSAL;
 use graph_server::testing::mcp_http::{http, McpHttpClient};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -642,7 +643,7 @@ fn remove_when_reachable(args: &[&str]) -> Output {
     let deadline = Instant::now() + WAIT;
     loop {
         let o = run(args);
-        if !text(&o.stderr).contains("would drop below quorum") || Instant::now() >= deadline {
+        if !text(&o.stderr).contains(QUORUM_REFUSAL) || Instant::now() >= deadline {
             return o;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -783,7 +784,14 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
     // unreachable quorum), so a transient "not reachable" is waited out.
     let o = remove_when_reachable(&["--server", &n3.addr, "cluster", "remove", "3"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
-    assert!(text(&o.stderr).contains("--force"), "{}", text(&o.stderr));
+    // Only the 3 -> 2 guard's words: the quorum refusal mentions --force
+    // too ("--force does not override this").
+    let err = text(&o.stderr);
+    assert!(!err.contains(QUORUM_REFUSAL), "{err}");
+    assert!(
+        err.contains("3 voters to 2") && err.contains("pass --force"),
+        "{err}"
+    );
     assert_eq!(voters(&n1), [1, 2, 3]);
     // #122: a mistyped id is no error (exit 0) but says nothing was removed.
     let typo = ok(&["--server", &n2.addr, "cluster", "remove", "42"]);
