@@ -794,12 +794,14 @@ fn token_classes_are_sensible_on_real_code() {
         .find(|t| t.text.starts_with('#'))
         .expect("# on line 16");
     assert_eq!(hash.class, TokenClass::Comment);
+    assert_eq!(hash.text.trim_end_matches('\r'), "# Set %ax to zero");
     let arm = asm("arm32-game", "game1/prompt.asm");
     let at = arm
         .iter()
         .find(|t| t.span.start_line == 15 && t.text.starts_with('@'))
         .expect("@ on line 15");
     assert_eq!(at.class, TokenClass::Comment);
+    assert_eq!(at.text.trim_end_matches('\r'), "@ #0x0\t1");
     let sh = classes("rbenv", "libexec/rbenv");
     assert!(sh.iter().any(|t| t.class == TokenClass::Comment));
     assert!(sh

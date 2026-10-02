@@ -481,6 +481,21 @@ fn named_directive_not_after_mnemonic() {
     assert_eq!(classes_of(&toks, "db"), [TokenClass::Keyword; 2]);
     assert_eq!(classes_of(&toks, "dw"), [TokenClass::Keyword]);
     assert_eq!(classes_of(&toks, "section"), [TokenClass::Keyword; 2]);
+    // Label names that are also mnemonics or directives keep their data.
+    let toks = AsmExtractor
+        .extract("str db 'x',0\nb db 1\ntest dd 0\npage dw 0\n")
+        .tokens;
+    assert_eq!(classes_of(&toks, "db"), [TokenClass::Keyword; 2]);
+    assert_eq!(classes_of(&toks, "dd"), [TokenClass::Keyword]);
+    assert_eq!(classes_of(&toks, "dw"), [TokenClass::Keyword]);
+    // AT&T size suffixes and ARM branch variants take a label operand.
+    let src =
+        "callq proc\njmpq times\npushq db\npushl dw\ncbz proc\ncbnz times\nbne proc\nbleq times\n";
+    let toks = AsmExtractor.extract(src).tokens;
+    assert!(
+        toks.iter().all(|t| t.class != TokenClass::Keyword),
+        "{toks:?}"
+    );
 }
 
 fn comments(src: &str) -> Vec<String> {
@@ -535,6 +550,15 @@ fn arm32_at_comments() {
     let toks = AsmExtractor.extract(src).tokens;
     assert_eq!(classes_of(&toks, "#"), [TokenClass::Punctuation]);
     assert_eq!(comments(".syntax unified\n  bx lr @ ret\n"), ["@ ret"]);
+    assert_eq!(comments(".arm\r\n  bx lr @ ret\r\n"), ["@ ret\r"]);
+}
+
+/// A marker at end of file with no newline.
+#[test]
+fn trailing_comment_at_eof() {
+    assert_eq!(comments(".arm\n  bx lr @ end"), ["@ end"]);
+    assert_eq!(comments("  ret %eax # end"), ["# end"]);
+    assert_eq!(comments(".thumb\n  bx lr @"), ["@"]);
 }
 
 /// #197 negatives: no marker without the syntax evidence, and symbols do
