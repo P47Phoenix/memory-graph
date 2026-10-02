@@ -14,10 +14,13 @@
 //!
 //! Every wait has a hard deadline; only processes this test spawned are
 //! stopped (Admin.Shutdown, or kill on drop).
+mod common;
+
+use common::readiness::{start_serve, StartOptions};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -66,64 +69,19 @@ struct Serve {
 
 impl Serve {
     fn start(args: &[&str], env: &[(&str, &str)]) -> Serve {
-        let mut child = cmd()
-            .arg("serve")
-            .args(args)
-            .envs(env.iter().copied())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let drain = |r: Box<dyn Read + Send>| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                for l in BufReader::new(r).lines() {
-                    match l {
-                        Ok(l) => {
-                            let _ = tx.send(l);
-                        }
-                        Err(_) => return,
-                    }
-                }
-            });
-            rx
+        let mut c = cmd();
+        c.arg("serve").args(args).envs(env.iter().copied());
+        let options = StartOptions {
+            echo_stderr: false,
+            ..StartOptions::default()
         };
-        let out = drain(Box::new(child.stdout.take().unwrap()));
-        let err = drain(Box::new(child.stderr.take().unwrap()));
-        let mut stdout = Vec::new();
-        let deadline = Instant::now() + WAIT;
-        let (addr, metrics) = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = match out.recv_timeout(left) {
-                Ok(l) => l,
-                Err(_) => {
-                    let _ = child.kill();
-                    let errs: Vec<String> = err.try_iter().collect();
-                    panic!(
-                        "serve {args:?} printed no listening line within {WAIT:?}:\n{}",
-                        errs.join("\n")
-                    );
-                }
-            };
-            stdout.push(line.clone());
-            if let Some(rest) = line.split("listening on ").nth(1) {
-                let addr = rest.split_whitespace().next().unwrap().to_string();
-                let metrics = stdout.iter().find_map(|l| {
-                    l.split("metrics on http://")
-                        .nth(1)
-                        .and_then(|r| r.split("/metrics").next())
-                        .map(str::to_string)
-                });
-                break (addr, metrics);
-            }
-        };
-        std::thread::spawn(move || for _ in out.iter() {});
+        let started = start_serve(c, options);
         Serve {
-            child,
-            addr,
-            metrics,
-            stdout,
-            stderr: err,
+            child: started.child,
+            addr: started.addr,
+            metrics: started.metrics.map(|m| m.to_string()),
+            stdout: started.start_lines,
+            stderr: started.stderr,
         }
     }
 
