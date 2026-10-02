@@ -278,6 +278,7 @@ pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
 /// `9A-X`) into one `Identifier`. The shared tokenizer lexes it as a number,
 /// `-` and an identifier; COBOL makes it one word as long as it has a letter
 /// and the pieces touch (arithmetic operators need spaces around them).
+/// A word split across a continuation line is not joined.
 fn join_digit_led_words(src: &str, tokens: Vec<TokenDecl>) -> Vec<TokenDecl> {
     let mut out: Vec<TokenDecl> = Vec::with_capacity(tokens.len());
     let mut i = 0;

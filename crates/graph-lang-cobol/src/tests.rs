@@ -68,12 +68,71 @@ fn digit_led_hyphenated_name_is_one_identifier() {
 
 #[test]
 fn numbers_without_letters_or_with_gaps_are_not_joined() {
-    let t = token_texts("       COMPUTE X = 100-200 - 1 - A.\n       MOVE 1.5 TO Y.\n");
-    let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
-    assert!(texts.contains(&"100"), "{texts:?}");
-    assert!(texts.contains(&"200"), "{texts:?}");
-    assert!(texts.contains(&"A"), "{texts:?}");
-    assert!(texts.contains(&"1.5"), "{texts:?}");
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "       100-200 - 1 - A.\n",
+            &["100", "-", "200", "-", "1", "-", "A", "."],
+        ),
+        ("       MOVE 1.5 TO Y.\n", &["MOVE", "1.5", "TO", "Y", "."]),
+        ("       1.5-A\n", &["1.5", "-", "A"]),
+        ("       1E5 - B\n", &["1E5", "-", "B"]),
+    ];
+    for (src, expected) in cases {
+        let t = token_texts(src);
+        let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(texts, expected, "{src:?}");
+    }
+}
+
+#[test]
+fn exponent_like_and_multi_number_pieces_are_joined() {
+    for (src, word) in [
+        ("       1E5-X.\n", "1E5-X"),
+        ("       12-34-AB.\n", "12-34-AB"),
+    ] {
+        let t = token_texts(src);
+        let expected = [
+            (word.to_string(), TokenClass::Identifier),
+            (".".to_string(), TokenClass::Punctuation),
+        ];
+        assert_eq!(t, expected, "{src:?}");
+    }
+}
+
+#[test]
+fn digit_led_section_is_extracted() {
+    let src = "       PROCEDURE DIVISION.\n       1000-MAIN SECTION.\n       1100-STEP.\n           GOBACK.\n";
+    let s = syms(src);
+    let section = find(&s, "1000-MAIN");
+    assert_eq!(section.2, "section");
+    assert!(section.3.starts_with("1000-MAIN SECTION."), "{section:?}");
+    assert!(contains(&s, "1000-MAIN", "1100-STEP"));
+}
+
+#[test]
+fn digit_led_paragraph_after_sequence_area_and_indicators() {
+    let src = "\
+000100 PROCEDURE DIVISION.
+000200D    DISPLAY 'DEBUG'.
+000300 1000-READ-NEXT.
+000400     DISPLAY 'LONG
+000500-    'TEXT'.
+000600 2000-DONE.
+000700     GOBACK.
+";
+    let s = syms(src);
+    assert!(find(&s, "1000-READ-NEXT").3.starts_with("1000-READ-NEXT."));
+    assert!(find(&s, "2000-DONE").3.starts_with("2000-DONE."));
+    assert!(!names(&s).contains(&"000300"), "{s:#?}");
+}
+
+#[test]
+fn digit_led_paragraph_in_free_format() {
+    let src =
+        ">>SOURCE FREE\nPROCEDURE DIVISION.\n1000-main.\n  DISPLAY 1.\n2000-next.\n  GOBACK.\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "1000-main").2, "paragraph");
+    assert_eq!(find(&s, "2000-next").2, "paragraph");
 }
 
 #[test]
@@ -314,6 +373,26 @@ proptest! {
             prop_assert!(s.span.start <= s.span.end && s.span.end as usize <= src.len());
             prop_assert!(src.is_char_boundary(s.span.start as usize));
             prop_assert!(src.is_char_boundary(s.span.end as usize));
+        }
+    }
+
+    /// Joined or not, every token is its exact source text and tokens never
+    /// overlap, in fixed and free format.
+    #[test]
+    fn digit_led_tokens_are_exact_and_disjoint(
+        parts in proptest::collection::vec(prop_oneof![
+            Just("1000"), Just("-"), Just("A"), Just("READ-NEXT"), Just("9"), Just("1E5"),
+            Just("1.5"), Just("."), Just(" "), Just("\n"), Just("       "), Just("000100 "),
+            Just("'x'"), Just("*> c"), Just("é"),
+        ], 0..40),
+        free in any::<bool>(),
+    ) {
+        let src: String = parts.concat();
+        let mut prev_end = 0;
+        for t in tokenize(&src, free) {
+            prop_assert_eq!(&src[t.span.start as usize..t.span.end as usize], t.text.as_str());
+            prop_assert!(t.span.start >= prev_end, "overlap at {:?}", t.span);
+            prev_end = t.span.end;
         }
     }
 }
