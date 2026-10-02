@@ -3,7 +3,7 @@
 A database file is opened by one process at a time. To share one between processes, machines or containers, serve it and point the other commands at the server:
 
 ```sh
-memory-graph serve --db ./g --listen 127.0.0.1:7000     # prints: memory-graph serve: listening on 127.0.0.1:7000 (db ./g, node 1)
+memory-graph serve --db ./g --listen 127.0.0.1:7000     # prints: memory-graph serve: listening on 127.0.0.1:7000 (db ./g, node 1, 16 worker threads)
 memory-graph --server 127.0.0.1:7000 index --org acme --repo api ./api
 memory-graph --server 127.0.0.1:7000 search foo --language rust
 export MEMORY_GRAPH_SERVER=127.0.0.1:7000                 # every command in this shell now uses the server
@@ -31,7 +31,7 @@ Also over `--server`: `sysinfo` prints the server machine's report under `server
 
 - `--listen` defaults to `127.0.0.1:7000` (`0.0.0.0:7000` to accept other machines; port `0` picks a free port and the printed line names it).
 - `--node-id` (default 1 with `--db`), `--cache-bytes`, `--snapshot-max-age` (how long a paging client's frozen view may live, default `15m`).
-- `--worker-threads N` (env `MEMORY_GRAPH_WORKER_THREADS`, config key `worker-threads`; at least 1) caps the server's async worker threads. The default is one per CPU the process may use (tokio's default, which also reads `TOKIO_WORKER_THREADS`). On a many-core host or a Docker Desktop VM, an idle server with dozens of workers still wakes up often; 2-4 workers serve a typical team and cut those wakeups.
+- `--worker-threads N` (env `MEMORY_GRAPH_WORKER_THREADS`, config key `worker-threads`; 1 to 1024) sets the server's async worker threads; the `listening on` line reports the count. Precedence: the flag, then `MEMORY_GRAPH_WORKER_THREADS`, then the config file, then tokio's own `TOKIO_WORKER_THREADS` (checked the same way: 0 or a non-number is an error, exit 2), then one per CPU the process may use. On a many-core host or a Docker Desktop VM, 2-4 workers serve a typical team with fewer threads, less memory and somewhat less idle CPU. Idle workers park, so this barely changes the idle wakeup rate: that is set by the Raft tick (with `--db`, `--heartbeat-interval 250 --election-timeout-min 1000 --election-timeout-max 2000` slows it).
 - With `--db` it writes `<db>.LOCK` (`{"pid", "listen", "started"}`) next to the file and removes it on a graceful stop: Ctrl-C, SIGTERM, `docker stop`; on Windows Ctrl-C or Ctrl-Break, which is what a supervisor sends a console process started in its own process group (e.g. Python's `send_signal(signal.CTRL_BREAK_EVENT)`). `taskkill /F` is a kill, not a graceful stop. The Raft log lives in `<db>.raft.redb`. `--data-dir` ([cluster guide](cluster.md)) keeps everything in one directory instead.
 
 A served file opened directly waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_WAIT_MS` changes that), then says who holds it: `database ./g is locked by pid 4242 (memory-graph serve on 127.0.0.1:7000); use --server 127.0.0.1:7000 or stop it`. Once the server stops, the file opens directly again and answers exactly as the server did.

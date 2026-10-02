@@ -44,6 +44,7 @@ fn cmd() -> Command {
         .env_remove("MEMORY_GRAPH_TESTING_STALL_WRITES_AFTER")
         .env_remove("MEMORY_GRAPH_TESTING_WITHHOLD_LEADER")
         .env_remove("MEMORY_GRAPH_WORKER_THREADS")
+        .env_remove("TOKIO_WORKER_THREADS")
         .env("MEMORY_GRAPH_LOCK_WAIT_MS", "300");
     c
 }
@@ -100,6 +101,8 @@ struct Server {
     child: Child,
     addr: String,
     db: PathBuf,
+    /// The `listening on ...` start line.
+    start_line: String,
     /// Every later stdout line of the server (the reader thread keeps
     /// draining the pipe so the server never blocks on, or fails, a print).
     lines: std::sync::mpsc::Receiver<String>,
@@ -154,6 +157,7 @@ impl Server {
             child,
             addr,
             db: db.to_path_buf(),
+            start_line: line,
             lines: rx,
         }
     }
@@ -551,6 +555,11 @@ fn worker_threads_caps_the_pool_and_refuses_zero() {
     )
     .unwrap();
     let server = Server::start_with(&db, &[], &["--worker-threads", "2"]);
+    assert!(
+        server.start_line.contains(", 2 worker threads)"),
+        "{}",
+        server.start_line
+    );
     let addr = server.addr.clone();
     assert_eq!(ok(&["--server", &addr, "health"]).trim(), "SERVING");
     ok(&[
@@ -569,17 +578,80 @@ fn worker_threads_caps_the_pool_and_refuses_zero() {
 
     // The environment variable sets it as well.
     let server = Server::start_with(&db, &[("MEMORY_GRAPH_WORKER_THREADS", "1")], &[]);
+    assert!(
+        server.start_line.contains(", 1 worker threads)"),
+        "{}",
+        server.start_line
+    );
     let hits = ok(&["--server", &server.addr, "search", "alpha"]);
     assert!(hits.contains("alpha"), "{hits}");
     server.shutdown();
 
-    for (env, args) in [
-        (None, vec!["serve", "--worker-threads", "0"]),
-        (Some("0"), vec!["serve"]),
+    // Precedence: flag > MEMORY_GRAPH_WORKER_THREADS > config file >
+    // TOKIO_WORKER_THREADS > one per CPU.
+    let toml = d.path().join("serve.toml");
+    std::fs::write(
+        &toml,
+        "worker-threads = 3
+",
+    )
+    .unwrap();
+    let toml = toml.to_str().unwrap();
+    for (env, extra, want) in [
+        (vec![], vec!["--config", toml], 3),
+        (
+            vec![("MEMORY_GRAPH_WORKER_THREADS", "1")],
+            vec!["--config", toml],
+            1,
+        ),
+        (
+            vec![("MEMORY_GRAPH_WORKER_THREADS", "1")],
+            vec!["--config", toml, "--worker-threads", "2"],
+            2,
+        ),
+        (vec![("TOKIO_WORKER_THREADS", "3")], vec![], 3),
+        (
+            vec![("TOKIO_WORKER_THREADS", "0")],
+            vec!["--worker-threads", "2"],
+            2,
+        ),
+        (
+            vec![("TOKIO_WORKER_THREADS", "1")],
+            vec!["--config", toml],
+            3,
+        ),
+    ] {
+        let server = Server::start_with(&db, &env, &extra);
+        assert!(
+            server
+                .start_line
+                .contains(&format!(", {want} worker threads)")),
+            "{env:?} {extra:?}: {}",
+            server.start_line
+        );
+        server.shutdown();
+    }
+
+    for (env, args, names) in [
+        (
+            None,
+            vec!["serve", "--worker-threads", "0"],
+            "--worker-threads",
+        ),
+        (
+            Some(("MEMORY_GRAPH_WORKER_THREADS", "0")),
+            vec!["serve"],
+            "--worker-threads",
+        ),
+        (
+            Some(("TOKIO_WORKER_THREADS", "0")),
+            vec!["serve"],
+            "TOKIO_WORKER_THREADS",
+        ),
     ] {
         let mut c = cmd();
-        if let Some(v) = env {
-            c.env("MEMORY_GRAPH_WORKER_THREADS", v);
+        if let Some((k, v)) = env {
+            c.env(k, v);
         }
         let o = c
             .args(args)
@@ -590,10 +662,7 @@ fn worker_threads_caps_the_pool_and_refuses_zero() {
             .unwrap();
         assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
         let e = stderr(&o);
-        assert!(
-            e.contains("--worker-threads") && e.contains("at least 1"),
-            "{e}"
-        );
+        assert!(e.contains(names) && e.contains("at least 1"), "{e}");
         assert!(!d.path().join("never.redb").exists());
     }
 }

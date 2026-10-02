@@ -121,7 +121,7 @@ docker stop mg-server                                     # SIGTERM: a graceful 
 docker start mg-server                                    # same command again: --bootstrap on an initialized /data is a plain restart
 ```
 
-An idle server runs one worker thread per CPU it can see, and on Docker Desktop that is every core of the VM; each one wakes up now and then, which keeps the VM busy. To cut that, give the container fewer CPUs (`docker run --cpus=2`, which also caps the default), or set the worker count directly: `serve --worker-threads 2`, `-e MEMORY_GRAPH_WORKER_THREADS=2`, or tokio's own `-e TOKIO_WORKER_THREADS=2`.
+A server runs one worker thread per CPU it can see, and on Docker Desktop that is every core of the VM. For fewer threads, less memory and somewhat less idle CPU, give the container fewer CPUs (`docker run --cpus=2`, which also lowers the default) or set the count: `serve --worker-threads 2`, `-e MEMORY_GRAPH_WORKER_THREADS=2`, or tokio's own `-e TOKIO_WORKER_THREADS=2` ([server guide](server.md#serve-options-and-the-lock-file)). Idle workers park, so the idle wakeup rate hardly moves (measured 8.3 to 8.2 per second at `--cpus=2`); it comes from the Raft tick, which `--heartbeat-interval 250 --election-timeout-min 1000 --election-timeout-max 2000` slows on a `--db` server.
 
 See the [server](server.md) and [cluster](cluster.md) guides for what these flags do.
 

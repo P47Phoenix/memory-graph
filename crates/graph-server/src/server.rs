@@ -348,6 +348,15 @@ impl Running {
         self.shutdown.clone()
     }
 
+    /// The worker threads of the runtime the caller is on (what
+    /// `--worker-threads`, `TOKIO_WORKER_THREADS` or the CPU count gave to
+    /// [`run_blocking`]'s runtime, where `on_ready` runs); 0 outside one.
+    pub fn worker_threads(&self) -> usize {
+        tokio::runtime::Handle::try_current()
+            .map(|h| h.metrics().num_workers())
+            .unwrap_or(0)
+    }
+
     /// Ask it to stop (returns at once; [`wait`](Self::wait) for the end).
     pub fn shutdown(&self) {
         self.shutdown.trigger();
