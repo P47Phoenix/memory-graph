@@ -125,6 +125,29 @@ A server runs one worker thread per CPU it can see, and on Docker Desktop that i
 
 See the [server](server.md) and [cluster](cluster.md) guides for what these flags do.
 
+## Idle CPU on macOS (Docker Desktop)
+
+On a Mac, containers run in a Linux VM. Each time a thread in the VM wakes (a timer, a futex), the hypervisor exits to macOS, and that time is billed to the `com.docker.virtualization` process, not to the container. So an idle `serve` can show next to nothing in `docker stats` and still keep the Mac's CPU busy. An idle server now wakes about 3 times a second (`serve --db`) or 5-6 times a second (a one-node `--data-dir`); before issue #205 it was about 40. The [idle CPU spike](../spikes/idle-cpu.md) has the numbers and causes. To keep the cost down:
+
+- **Run the image for your Mac's architecture.** The image is multi-arch (`linux/amd64` and `linux/arm64`), so on Apple silicon Docker pulls the arm64 one. If you forced `--platform linux/amd64`, it runs under Rosetta or QEMU, which costs much more for every wakeup. Check:
+
+  ```sh
+  docker image inspect -f '{{.Architecture}}' ghcr.io/p47phoenix/memory-graph:main   # arm64 on Apple silicon
+  ```
+
+- **Use a named volume for `/data`, not a bind mount.** A bind mount goes through Docker Desktop's file sharing to macOS; a named volume stays inside the VM.
+- **Limit the CPUs.** The server sizes its thread pool from the CPUs it sees. With `--cpus=2` (Compose: `cpus: 2`) the pool is 2 threads instead of one per VM CPU. To size only the pool, use `serve --worker-threads 2` or `-e MEMORY_GRAPH_WORKER_THREADS=2` (see above). A smaller pool means fewer threads and less memory, but hardly fewer wakeups.
+- **Run the health check less often.** The image's `HEALTHCHECK` starts a new `memory-graph health` process every 30 s. If nothing watches the status closely, use `docker run --health-interval=5m` (Compose: `healthcheck: interval: 5m`).
+- **Keep `MEMORY_GRAPH_LOG` at `info`** (the default). `debug` and `trace` add log lines (openraft's among them), and each line is a write the VM has to wake for.
+- **Measure the VM, not only the container.** Look at `com.docker.virtualization` in Activity Monitor (or `top -o cpu`) with the server idle, and compare it with the container stopped. `docker stats` shows only what the container's processes used inside the VM.
+
+To count the wakeups of a running container, `scripts/idle-cpu.sh <container> [seconds] [max]` (in this repository) runs a small alpine container in the server's pid namespace and prints the wakeups/s and CPU per thread and in total. The Docker workflow runs it in CI against an idle `serve --db` and fails above 5 wakeups/s.
+
+```sh
+docker run -d --name mg-server --cpus=2 -v mg-data:/data ghcr.io/p47phoenix/memory-graph:main serve --db /data/graph.redb --listen 0.0.0.0:7000
+scripts/idle-cpu.sh mg-server 60      # TOTAL cpu=...% of one core, wakeups/s=...
+```
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
