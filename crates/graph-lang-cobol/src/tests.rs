@@ -45,6 +45,57 @@ fn contains(s: &[Sym], outer: &str, inner: &str) -> bool {
     o.3.contains(&i.3) && o.3.len() > i.3.len()
 }
 
+fn token_texts(src: &str) -> Vec<(String, TokenClass)> {
+    tokenize(src, false)
+        .into_iter()
+        .map(|t| {
+            assert_eq!(src[t.span.start as usize..t.span.end as usize], t.text);
+            (t.text, t.class)
+        })
+        .collect()
+}
+
+#[test]
+fn digit_led_hyphenated_name_is_one_identifier() {
+    let t = token_texts("       1000-ACCTFILE-GET-NEXT.\n       9A-X 0001-OPEN-FILES.\n");
+    let ids: Vec<&str> = t
+        .iter()
+        .filter(|(_, c)| *c == TokenClass::Identifier)
+        .map(|(s, _)| s.as_str())
+        .collect();
+    assert_eq!(ids, ["1000-ACCTFILE-GET-NEXT", "9A-X", "0001-OPEN-FILES"]);
+}
+
+#[test]
+fn numbers_without_letters_or_with_gaps_are_not_joined() {
+    let t = token_texts("       COMPUTE X = 100-200 - 1 - A.\n       MOVE 1.5 TO Y.\n");
+    let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
+    assert!(texts.contains(&"100"), "{texts:?}");
+    assert!(texts.contains(&"200"), "{texts:?}");
+    assert!(texts.contains(&"A"), "{texts:?}");
+    assert!(texts.contains(&"1.5"), "{texts:?}");
+}
+
+#[test]
+fn digit_led_paragraphs_are_extracted() {
+    let src = "\
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. P.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-ACCTFILE-GET-NEXT.
+           GOBACK.
+       1000-ACCTFILE-GET-NEXT.
+           DISPLAY 'X'.
+";
+    let s = syms(src);
+    let p = find(&s, "1000-ACCTFILE-GET-NEXT");
+    assert_eq!(p.2, "paragraph");
+    assert!(p.3.starts_with("1000-ACCTFILE-GET-NEXT."), "{p:?}");
+    assert_eq!(find(&s, "0000-MAIN").2, "paragraph");
+    assert!(contains(&s, "PROCEDURE", "1000-ACCTFILE-GET-NEXT"));
+}
+
 const FIXED: &str = "\
 000100 IDENTIFICATION DIVISION.                                         HELLO001
 000200 PROGRAM-ID. HELLO.
@@ -415,7 +466,9 @@ fn keywords_in_a_fixed_format_program() {
         names.contains(&"HELLO") && names.contains(&"MAIN-PARA"),
         "{names:?}"
     );
-    assert!(CobolExtractor.version().starts_with("cobol-scan-1+kw1+tok"));
+    assert!(CobolExtractor
+        .version()
+        .starts_with("cobol-scan-1+kw1+dw1+tok"));
 }
 
 /// A fixed sample of the list (so dropping a word from `KEYWORDS` fails).

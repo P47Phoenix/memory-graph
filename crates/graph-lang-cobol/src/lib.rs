@@ -160,7 +160,8 @@ impl Extractor for CobolExtractor {
 
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
-        format!("cobol-scan-1+kw1+tok{TOKENIZER_VERSION}")
+        // `dw1`: digit-led words (`1000-READ-NEXT`) are one identifier (#196).
+        format!("cobol-scan-1+kw1+dw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -270,7 +271,65 @@ pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
             i += 1;
         }
     }
+    join_digit_led_words(src, out)
+}
+
+/// Joins a user-defined word that starts with a digit (`1000-READ-NEXT`,
+/// `9A-X`) into one `Identifier`. The shared tokenizer lexes it as a number,
+/// `-` and an identifier; COBOL makes it one word as long as it has a letter
+/// and the pieces touch (arithmetic operators need spaces around them).
+fn join_digit_led_words(src: &str, tokens: Vec<TokenDecl>) -> Vec<TokenDecl> {
+    let mut out: Vec<TokenDecl> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let end = digit_led_word_end(&tokens, i);
+        if end == i {
+            out.push(tokens[i].clone());
+        } else {
+            let span = span_between(&tokens[i].span, &tokens[end].span);
+            out.push(TokenDecl {
+                text: src[span.start as usize..span.end as usize].to_string(),
+                class: TokenClass::Identifier,
+                span,
+            });
+        }
+        i = end + 1;
+    }
     out
+}
+
+/// Index of the last token of a digit-led word starting at `start`, or
+/// `start` itself when there is none to join.
+fn digit_led_word_end(tokens: &[TokenDecl], start: usize) -> usize {
+    let is_word_piece = |t: &TokenDecl| {
+        matches!(t.class, TokenClass::Literal | TokenClass::Identifier)
+            && t.text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let first = &tokens[start];
+    let digit_led = first.class == TokenClass::Literal
+        && first.text.starts_with(|c: char| c.is_ascii_digit())
+        && is_word_piece(first);
+    if !digit_led {
+        return start;
+    }
+    let mut end = start;
+    let mut has_letter = first.text.bytes().any(|b| b.is_ascii_alphabetic());
+    // Each step consumes a touching `-` and the touching piece after it.
+    while let (Some(dash), Some(piece)) = (tokens.get(end + 1), tokens.get(end + 2)) {
+        let touching = dash.span.start == tokens[end].span.end && piece.span.start == dash.span.end;
+        if !(touching && dash.text == "-" && is_word_piece(piece)) {
+            break;
+        }
+        has_letter |= piece.text.bytes().any(|b| b.is_ascii_alphabetic());
+        end += 2;
+    }
+    if has_letter {
+        end
+    } else {
+        start
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
