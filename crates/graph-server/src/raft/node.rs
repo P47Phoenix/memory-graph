@@ -83,7 +83,7 @@ impl RaftSettings {
     }
 
     /// `--db` (stage A) defaults. The sole voter campaigns at once on
-    /// start (no election timeout to wait out) and suspends its ticks while
+    /// start (not at its first tick) and suspends its ticks while
     /// it leads alone ([`TickControl`]), so the timings do not shape
     /// start-up; they only pace openraft's tick timer, which still wakes
     /// every 1.5 heartbeats while suspended: a long heartbeat keeps an idle
@@ -413,6 +413,18 @@ fn write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Store
             leader_id: f.leader_id,
             leader_addr: f.leader_node.map(|n| n.addr),
         },
+        // Another change is still committing (a joiner's auto-promote, say):
+        // a moment later this one goes through, so callers retry it like a
+        // missing leader rather than give up (a `--join` racing another
+        // node's promotion was refused outright).
+        RaftError::APIError(ClientWriteError::ChangeMembershipError(
+            openraft::error::ChangeMembershipError::InProgress(e),
+        )) => {
+            tracing::debug!(error = %e, "membership change: another one in progress; retry");
+            StoreError::NoLeader {
+                retry_after_ms: NO_LEADER_RETRY_MS,
+            }
+        }
         RaftError::APIError(ClientWriteError::ChangeMembershipError(e)) => {
             StoreError::Rejected(format!("membership change: {e}"))
         }
@@ -518,10 +530,12 @@ impl RaftNode {
             None => Raft::new(p.node_id, config, net, log_store.clone(), sm).await,
         }
         .map_err(fatal)?;
+        let mut initialized_now = false;
         if p.initialize && !raft.is_initialized().await.map_err(fatal)? {
             let mut members = BTreeMap::new();
             members.insert(p.node_id, BasicNode::new(&p.advertise));
             raft.initialize(members).await.map_err(fatal)?;
+            initialized_now = true;
         }
         let node = Self {
             raft,
@@ -564,10 +578,13 @@ impl RaftNode {
         }
         if node.sole_voter() {
             let me = node.node_id;
-            // `initialize` campaigns at once, but a restarted voter starts
-            // as a follower and would wait out a whole election timeout:
-            // alone, it has nobody to wait for.
-            if node.metrics().state != ServerState::Leader {
+            // `initialize` campaigns at once (and its vote may not show in
+            // the metrics yet: no second campaign). A restart whose
+            // committed vote is its own resumes as leader at once; one
+            // that is not (a crash mid-campaign) starts as a follower and
+            // would campaign only at its first tick, 1.5 heartbeats away.
+            // Alone, it has nobody to wait for.
+            if !initialized_now && node.metrics().state != ServerState::Leader {
                 node.raft.trigger().elect().await.map_err(fatal)?;
             }
             node.raft
@@ -761,7 +778,9 @@ impl RaftNode {
                 };
             }
             // Metrics change at least every 1.5 heartbeats (openraft's
-            // tick); the sleep also bounds the wait when they do not.
+            // tick) once a peer exists (a sole voter never gets here: its
+            // ticks may be suspended); the sleep also bounds the wait when
+            // they do not.
             let _ = tokio::time::timeout(tick, rx.changed()).await;
         }
     }

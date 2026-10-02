@@ -858,7 +858,8 @@ pub async fn start(
                 // metrics; the leader's committed index with its
                 // heartbeats (noted by the Raft service). A leader is
                 // ready for as long as it leads, so only a follower needs
-                // the timer.
+                // the timer (the `withhold_leader` test hook's leader is
+                // not ready for as long as it leads: no timer either).
                 tokio::select! {
                     r = rx.changed() => if r.is_err() { return },
                     _ = raft_for_health.obs.leader_commit_changed() => {}
