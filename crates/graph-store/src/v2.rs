@@ -1899,6 +1899,9 @@ impl R {
             // Owner id -> the type-like symbol it resolves to in this file
             // (issue #137), cached across this file's matches.
             let mut owners: HashMap<u64, Option<usize>> = HashMap::new();
+            // The same, unfiltered: consulted only under a kind filter, to
+            // tell a rejected same-file type from no such type (issue #201).
+            let mut owners_any: HashMap<u64, bool> = HashMap::new();
             for (ord, t) in matches {
                 // Enclosing symbols, innermost first (with their indexes).
                 let mut chain: Vec<Node> = Vec::new();
@@ -1983,10 +1986,19 @@ impl R {
                                 // A type of that name in this file that the
                                 // kind filter rejects: no match, and no
                                 // sibling search.
-                                if q.symbol_kind.is_some()
-                                    && self.resolve_owner(fid, syms, o, None)?.is_some()
-                                {
-                                    continue;
+                                if q.symbol_kind.is_some() {
+                                    let any = match owners_any.get(&o) {
+                                        Some(&any) => any,
+                                        None => {
+                                            let any =
+                                                self.resolve_owner(fid, syms, o, None)?.is_some();
+                                            owners_any.insert(o, any);
+                                            any
+                                        }
+                                    };
+                                    if any {
+                                        continue;
+                                    }
                                 }
                                 // No such type in this file: a sibling file of
                                 // the same directory (issue #149).

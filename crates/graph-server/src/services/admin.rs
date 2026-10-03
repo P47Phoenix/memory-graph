@@ -281,6 +281,12 @@ fn reachable_voters(ctx: &Ctx, voters: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
         .collect()
 }
 
+/// The words of `Remove`'s quorum refusal. A refusal containing them is
+/// transient when a voter has just come back or a leader was just elected,
+/// so callers retry it: the auto-promote re-join's remove (`join.rs`) and
+/// the CLI end-to-end tests match on this constant, not a copy of it.
+pub const QUORUM_REFUSAL: &str = "would drop below quorum";
+
 /// `Remove` on the leader, with its guards. Returns the log index and
 /// whether `id` was not a member (nothing changed; see issue #122).
 async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<(u64, bool), Status> {
@@ -319,7 +325,7 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<(u64, bool
         if up.len() < quorum {
             let down: Vec<NodeId> = set.difference(&up).copied().collect();
             return Err(rejected(format!(
-                "removing node {id} would drop below quorum: {} voters would {which} \
+                "removing node {id} {QUORUM_REFUSAL}: {} voters would {which} \
                  ({set:?}), a quorum is {quorum}, and only {} of them are reachable now \
                  ({down:?} are not); bring them back first. --force does not override this. \
                  (A node that just came back may still show its last error for a moment; \

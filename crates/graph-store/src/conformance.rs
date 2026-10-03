@@ -3307,6 +3307,144 @@ fn owner_hint_sibling_files(h: &Harness) {
         rows(&*s, &q),
         [(Some("k/a.ptoy".into()), None, 1, None, true)]
     );
+    q.symbol_kind = None;
+
+    // Issue #201: a cut-off path holding a byte below '/' ('-' and '.').
+    // `d-a.ptoy` sorts before every `d/...` path, so with the cut there
+    // the `d/` files are skipped, while the root file `z.ptoy` (its
+    // directory "" sorts before the cut) is read and keys its row under
+    // `a.ptoy`. Run unfiltered and with a kind filter that accepts every
+    // type (the filtered walk also checks the unfiltered owner, issue #201).
+    batch(
+        &*s,
+        "r5",
+        &[
+            (
+                "a.ptoy", "type P
+",
+            ),
+            (
+                "d-a.ptoy",
+                "type R foo
+",
+            ),
+            (
+                "d.ptoy",
+                "type S foo
+",
+            ),
+            (
+                "d/a.ptoy",
+                "type Q foo
+",
+            ),
+            (
+                "d/b.ptoy",
+                "func Q.n foo
+func Q.k foo
+",
+            ),
+            (
+                "z.ptoy",
+                "func P.m foo
+func P.j foo
+",
+            ),
+        ],
+        None,
+    );
+    q.repo = Some("r5".into());
+    for kind in [None, Some("struct")] {
+        q.symbol_kind = kind.map(Into::into);
+        let full = rows(&*s, &q);
+        assert_eq!(
+            full.iter()
+                .map(|r| (r.0.clone().unwrap(), r.1.clone().unwrap(), r.2))
+                .collect::<Vec<_>>(),
+            [
+                ("a.ptoy".to_string(), "P".to_string(), 2),
+                ("d-a.ptoy".to_string(), "R".to_string(), 1),
+                ("d.ptoy".to_string(), "S".to_string(), 1),
+                ("d/a.ptoy".to_string(), "Q".to_string(), 3),
+            ],
+            "r5 kind {kind:?}"
+        );
+        for n in 0..=5 {
+            q.limit = Some(n);
+            assert_eq!(rows(&*s, &q), full[..n.min(full.len())], "r5 limit {n}");
+            q.limit = Some(1);
+            q.offset = Some(n);
+            assert_eq!(
+                rows(&*s, &q),
+                full[n.min(full.len())..(n + 1).min(full.len())],
+                "r5 offset {n}"
+            );
+            q.offset = None;
+        }
+        q.limit = None;
+    }
+    q.symbol_kind = None;
+
+    // Issue #201: the unfiltered-owner cache is per file. `x/a.ptoy` holds
+    // a `P` the kind filter rejects (no match, no sibling search), while
+    // `y/c.ptoy` has no `P` of its own and resolves to `y/b.ptoy`'s.
+    let iface = |src: &str| {
+        let mut e = pkg_extraction(src);
+        e.symbols[0].lang_kind = Some("interface".into());
+        e
+    };
+    s.ingest_file(
+        "o",
+        "r6",
+        "x/a.ptoy",
+        "pkgtoy",
+        &iface("type P\nfunc P.m foo\n"),
+    )
+    .unwrap();
+    s.ingest_file("o", "r6", "y/b.ptoy", "pkgtoy", &pkg_extraction("type P\n"))
+        .unwrap();
+    s.ingest_file(
+        "o",
+        "r6",
+        "y/c.ptoy",
+        "pkgtoy",
+        &pkg_extraction("func P.n foo\n"),
+    )
+    .unwrap();
+    q.repo = Some("r6".into());
+    q.symbol_kind = Some("struct".into());
+    assert_eq!(
+        rows(&*s, &q),
+        [
+            (Some("x/a.ptoy".into()), None, 1, None, true),
+            (
+                Some("y/b.ptoy".into()),
+                Some("P".into()),
+                1,
+                Some(span_of("type P\n", "type P")),
+                false
+            ),
+        ]
+    );
+
+    // Issue #201: a second method on the same rejected owner hits the
+    // cache and must still be no match (not a sibling resolution).
+    s.ingest_file(
+        "o",
+        "r7",
+        "k/a.ptoy",
+        "pkgtoy",
+        &iface("type P\nfunc P.m foo\nfunc P.j foo\n"),
+    )
+    .unwrap();
+    s.ingest_file("o", "r7", "k/b.ptoy", "pkgtoy", &pkg_extraction("type P\n"))
+        .unwrap();
+    q.repo = Some("r7".into());
+    assert_eq!(
+        rows(&*s, &q),
+        [(Some("k/a.ptoy".into()), None, 2, None, true)]
+    );
+    q.symbol_kind = None;
 }
 
 // --- ADR 0007: source encodings (epic story 41) ---
