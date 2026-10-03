@@ -26,8 +26,9 @@ Kubernetes), owned by the image's user 65532.
 
 ## Disk
 
-Plan for the store, plus one snapshot copy (the same size), plus the log (up to
-`--snapshot-log-bytes`, default 1G, before a snapshot purges it), plus a transient second copy while
+Plan for the store, plus one snapshot copy (the same size), plus the log (roughly
+`--snapshot-log-bytes`, default 1G, of applied entries before a snapshot purges it, plus the kept
+entries and any backlog a lagging node has not applied yet), plus a transient second copy while
 a snapshot is received. The disk guard (`--min-free-disk`, default 5% of the volume between 2G and
 32G) refuses writes with `RESOURCE_EXHAUSTED` before the volume fills; `mg_store_bytes` and
 `mg_log_bytes` on `/metrics` show the two files.
