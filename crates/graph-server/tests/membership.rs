@@ -8,10 +8,14 @@ use support::*;
 use graph_client::{ClientConfig, ReadMode, RemoteStore};
 use graph_core::{Extractor, NodeKind};
 use graph_proto::pb;
-use graph_server::testing::{ClusterTestbed, TestServer, CLUSTER_WAIT};
-use graph_server::{InitMode, JoinSpec, NodeJson, ServeConfig};
+use graph_server::raft::log_store::RedbLogStore;
+use graph_server::testing::{ClusterTestbed, TestServer, CLUSTER_WAIT, TEST_RAFT};
+use graph_server::{InitMode, JoinSpec, NodeJson, RaftSettings, ServeConfig};
 use graph_store::conformance::run_differential;
 use graph_store::{BatchFile, IndexOptions, Store, StoreError, StoreRead, ORIGIN_DIRECTORY};
+use openraft::raft::VoteRequest;
+use openraft::storage::RaftLogStorage;
+use openraft::{CommittedLeaderId, LogId, ServerState, Vote};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1440,4 +1444,116 @@ fn sole_voter_suspends_ticks_until_the_membership_grows() {
         idle_metrics_still(&tb),
         "an idle sole voter still ticks after a write"
     );
+}
+
+/// Issue #211: a sole leader with its ticks suspended that loses
+/// leadership with no membership change (another node's vote request at a
+/// higher term, with a longer log) resumes its ticks, campaigns at its next
+/// tick and leads again. Kept suspended, it would stay a follower with no
+/// election timer, forever.
+#[test]
+fn a_suspended_sole_leader_deposed_by_a_vote_resumes_ticks_and_leads_again() {
+    let _w = watchdog(
+        "a_suspended_sole_leader_deposed_by_a_vote_resumes_ticks_and_leads_again",
+        TEST_LIMIT,
+    );
+    let tb = ClusterTestbed::new(1, exts());
+    let node = tb.node(1).raft().unwrap().clone();
+    wait_until("node 1, leading alone, suspends its ticks", || {
+        node.ticks.suspended()
+    });
+    let m = node.metrics();
+    let term = m.current_term;
+    let last = m.last_log_index.unwrap_or(0);
+    // Node 2 (not a member: openraft does not ask) campaigns at the next
+    // term with a longer log. The leader refuses it while its own vote's
+    // lease (election_timeout_max) lasts, then grants it.
+    let req = VoteRequest::new(
+        Vote::new(term + 1, 2),
+        Some(LogId::new(CommittedLeaderId::new(term + 1, 2), last + 1)),
+    );
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    rt().block_on(async {
+        loop {
+            let r = node.raft.vote(req.clone()).await.expect("vote request");
+            if r.vote_granted {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node 1 never granted the vote: {r:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    wait_until("node 1 campaigns and leads again at a later term", || {
+        let m = node.metrics();
+        m.state == ServerState::Leader && m.current_leader == Some(1) && m.current_term > term + 1
+    });
+    wait_until("node 1, leading alone again, suspends its ticks", || {
+        node.ticks.suspended()
+    });
+    let files: Vec<_> = (0..2).map(small_file).collect();
+    index_files(&tb.client(1), "o", "r", &files);
+    assert_eq!(tb.client(1).count_nodes(NodeKind::File).unwrap(), 2);
+}
+
+/// Issue #211: a sole voter restarted after a crash mid-campaign (its own
+/// vote for a newer term on disk, not committed) starts as a follower and
+/// campaigns at once, not at its first tick: the restart returns leading.
+/// The timings put that first tick 7.5 s away.
+#[test]
+fn a_sole_voter_restarted_mid_campaign_leads_at_once() {
+    let _w = watchdog(
+        "a_sole_voter_restarted_mid_campaign_leads_at_once",
+        TEST_LIMIT,
+    );
+    let slow = RaftSettings {
+        heartbeat_ms: 5000,
+        election_min_ms: 20_000,
+        election_max_ms: 40_000,
+        ..TEST_RAFT
+    };
+    slow.validate(true).unwrap();
+    let mut tb = ClusterTestbed::with_config(1, exts(), move |_, c| c.raft = Some(slow));
+    let term = tb.node(1).raft().unwrap().metrics().current_term;
+    tb.node_mut(1).stop();
+    {
+        // The stopped node's file can be held for a moment yet (Windows:
+        // `DatabaseAlreadyOpen`).
+        let path = tb.data_dir(1).join("raft.redb");
+        let deadline = Instant::now() + CLUSTER_WAIT;
+        let mut log = loop {
+            match RedbLogStore::open(&path) {
+                Ok(log) => break log,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "opening the stopped node's log: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        let campaign = Vote::new(term + 1, 1);
+        assert!(!campaign.is_committed());
+        rt().block_on(log.save_vote(&campaign)).unwrap();
+    }
+    let started = Instant::now();
+    tb.node_mut(1).try_restart().unwrap();
+    let took = started.elapsed();
+    let m = tb.node(1).raft().unwrap().metrics();
+    assert_eq!(m.state, ServerState::Leader);
+    assert_eq!(m.current_leader, Some(1));
+    assert!(
+        m.current_term > term + 1,
+        "term {} after a campaign at {}",
+        m.current_term,
+        term + 1
+    );
+    assert!(
+        took < Duration::from_secs(3),
+        "the restart took {took:?} to lead (its first tick is 7.5 s away)"
+    );
+    index_files(&tb.client(1), "o", "r", &[small_file(0)]);
 }

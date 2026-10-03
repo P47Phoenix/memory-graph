@@ -21,7 +21,7 @@ memory-graph serve --data-dir ./n1 --listen 127.0.0.1:7001   # later: a restart 
 
 ## Tuning: log, snapshots, timing, disk
 
-- **Log and snapshots.** A snapshot is built after `--snapshot-log-entries` (default 10000) applied entries or `--snapshot-log-bytes` (default 1G) of log. The log below it is then purged, keeping `--log-keep-entries` (default 1000) so a briefly lagging follower catches up from the log, and `raft.redb` is compacted.
+- **Log and snapshots.** A snapshot is built after `--snapshot-log-entries` (default 10000) applied entries or once the applied entries above the last snapshot hold `--snapshot-log-bytes` (default 1G) of log. The log below it is then purged, keeping `--log-keep-entries` (default 1000) so a briefly lagging follower catches up from the log, and `raft.redb` is compacted.
 - **Timing.** `--heartbeat-interval` (ms, default 250), `--election-timeout-min` / `--election-timeout-max` (ms, default 1000 / 2000).
 - **Disk guard.** `--min-free-disk` (a size, or a percentage of the volume; the default for a data directory is 5% of it, between 2G and 32G, and off for `--db`). Writes and snapshot builds are refused with `RESOURCE_EXHAUSTED` while less than that plus one snapshot copy is free.
 

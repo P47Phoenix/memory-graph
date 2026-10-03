@@ -8,7 +8,7 @@
 //! them.
 mod support;
 
-use graph_server::testing::{ClusterTestbed, CLUSTER_WAIT};
+use graph_server::testing::{ClusterTestbed, TestServer, CLUSTER_WAIT};
 use graph_server::{InitMode, JoinSpec, READY_SERVICE};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -284,6 +284,72 @@ fn a_survivor_without_quorum_is_live_but_not_ready() {
         assert!(!c.health(READY_SERVICE).unwrap(), "and not ready");
         std::thread::sleep(Duration::from_millis(30));
     }
+}
+
+/// Issue #211: `memory-graph.ready` is reported on a change only. A
+/// `grpc.health.v1` Watch on an idle `--db` server gets SERVING and then
+/// nothing more, even after a write moves the Raft metrics the readiness
+/// loop wakes on (tonic-health tells every watcher about each update,
+/// changed or not, so a re-report would reach it).
+#[test]
+fn a_ready_watch_on_an_idle_server_hears_serving_once() {
+    use tonic_health::pb::health_check_response::ServingStatus;
+    use tonic_health::pb::health_client::HealthClient;
+    use tonic_health::pb::HealthCheckRequest;
+    let _w = watchdog(
+        "a_ready_watch_on_an_idle_server_hears_serving_once",
+        TEST_LIMIT,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&dir.path().join("g.redb"), exts());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = server.endpoint();
+    let mut stream = rt.block_on(async {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut h = HealthClient::new(ch);
+        let deadline = Instant::now() + CLUSTER_WAIT;
+        // The name is registered by the readiness loop's first report.
+        let mut s = loop {
+            match h
+                .watch(HealthCheckRequest {
+                    service: READY_SERVICE.into(),
+                })
+                .await
+            {
+                Ok(r) => break r.into_inner(),
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "no readiness to watch: {e}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        loop {
+            let m = tokio::time::timeout(CLUSTER_WAIT, s.message())
+                .await
+                .expect("a readiness status")
+                .expect("the watch stream")
+                .expect("an open stream");
+            if m.status == ServingStatus::Serving as i32 {
+                break s;
+            }
+        }
+    });
+    // The readiness loop wakes on the write's metrics; readiness stays.
+    let c = graph_client::RemoteStore::connect(graph_client::ClientConfig::new(endpoint)).unwrap();
+    index_files(&c, "o", "r", &[small_file(0)]);
+    let more =
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(3), stream.message()).await });
+    assert!(
+        more.is_err(),
+        "a readiness update with nothing changed: {more:?}"
+    );
 }
 
 fn scrape(addr: std::net::SocketAddr) -> std::io::Result<String> {

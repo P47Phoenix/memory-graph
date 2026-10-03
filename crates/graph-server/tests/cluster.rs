@@ -1668,6 +1668,207 @@ fn a_postponed_snapshot_is_built_on_an_idle_node() {
     });
 }
 
+/// A Rust file of about `bytes` bytes (one log entry a little larger).
+fn rust_file_of(i: usize, bytes: usize) -> (String, Vec<u8>) {
+    let mut s = String::new();
+    let mut n = 0;
+    while s.len() < bytes {
+        s.push_str(&format!("fn g{i}_{n}() -> u32 {{ {n} }}\n"));
+        n += 1;
+    }
+    (format!("src/big{i}.rs"), s.into_bytes())
+}
+
+/// Issue #211: the `--snapshot-log-bytes` trigger, end to end, twice in a
+/// row (the entry trigger is off). The first build is held after it took
+/// its snapshot while a second write lands above it; once it finishes, the
+/// bytes of that write still count toward the next snapshot, so a second
+/// one follows. (The policy used to restart the count at the first
+/// snapshot's arrival, dropping what was appended during its build.)
+#[test]
+fn the_log_bytes_trigger_builds_snapshots_back_to_back() {
+    let _w = watchdog(
+        "the_log_bytes_trigger_builds_snapshots_back_to_back",
+        TEST_LIMIT,
+    );
+    const LIMIT: u64 = 16 << 10;
+    let tb = ClusterTestbed::with_config(1, exts(), |_, c| {
+        c.raft = Some(RaftSettings {
+            snapshot_log_entries: u64::MAX,
+            snapshot_log_bytes: LIMIT,
+            ..TEST_RAFT
+        });
+    });
+    let node = tb.node(1).raft().unwrap().clone();
+    assert!(node.metrics().snapshot.is_none());
+    // The first new build reports itself and waits for the release (on
+    // the node's blocking pool, after the pair was promoted and before
+    // openraft hears of it); later ones pass.
+    let (built_tx, built_rx) = std::sync::mpsc::channel::<u64>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let built_tx = Mutex::new(built_tx);
+    let release_rx = Mutex::new(Some(release_rx));
+    node.snapshots.set_on_built(Some(Arc::new(move |side, _| {
+        let _ = built_tx.lock().unwrap().send(side.index);
+        if let Some(rx) = release_rx.lock().unwrap().take() {
+            let _ = rx.recv_timeout(CLUSTER_WAIT * 3);
+        }
+    })));
+    let c = tb.client(1);
+    let (path, bytes) = rust_file_of(1, 2 * LIMIT as usize);
+    c.index_bytes("o", "r", &path, &bytes, None).unwrap();
+    let first = built_rx
+        .recv_timeout(CLUSTER_WAIT)
+        .expect("a snapshot built by the byte trigger");
+    let (path, bytes) = rust_file_of(2, 2 * LIMIT as usize);
+    c.index_bytes("o", "r", &path, &bytes, None).unwrap();
+    let applied = node.metrics().last_applied.map_or(0, |l| l.index);
+    assert!(
+        first < applied,
+        "the held build ({first}) is below the second write ({applied})"
+    );
+    release_tx.send(()).unwrap();
+    let second = built_rx
+        .recv_timeout(CLUSTER_WAIT)
+        .expect("a second snapshot for the bytes written during the first build");
+    assert!(
+        second >= applied,
+        "second snapshot at {second}, want {applied}"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        node.raft
+            .wait(Some(CLUSTER_WAIT))
+            .metrics(
+                |m| m.snapshot.is_some_and(|s| s.index >= applied),
+                "the second snapshot",
+            )
+            .await
+            .unwrap();
+    });
+    node.snapshots.set_on_built(None);
+    assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 2);
+}
+
+/// Poll `probe` until it holds; fail with `what` after [`CLUSTER_WAIT`].
+fn poll_until(what: &str, mut probe: impl FnMut() -> bool) {
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    while !probe() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Issue #211: a backlog appended while apply lags counts toward the byte
+/// trigger once applied, and not before. Apply is held above a
+/// byte-triggered snapshot while four ~6 KiB entries (more than the 16 KiB
+/// limit in all) are appended one by one, then released one entry at a
+/// time. Nothing is built while the backlog waits, nor as the first two
+/// entries apply (under the limit). The third makes a snapshot due; the
+/// build waits behind the fourth entry's held apply (openraft's state
+/// machine runs its commands in order), so exactly one snapshot, at the
+/// fourth, follows its release, and none after. Counting the unapplied
+/// backlog would build as soon as the first entry applied, and again after.
+#[test]
+fn a_lagging_apply_counts_its_backlog_toward_the_byte_trigger_once_applied() {
+    let _w = watchdog(
+        "a_lagging_apply_counts_its_backlog_toward_the_byte_trigger_once_applied",
+        TEST_LIMIT,
+    );
+    const LIMIT: u64 = 16 << 10;
+    // Apply holds every entry above the index it is set to (`None`: all
+    // pass); a held apply gives up after a minute, never hanging a run.
+    let held: Arc<(Mutex<Option<u64>>, std::sync::Condvar)> = Arc::default();
+    let gate = Arc::clone(&held);
+    let tb = ClusterTestbed::with_config(1, exts(), move |_, c| {
+        c.raft = Some(RaftSettings {
+            snapshot_log_entries: u64::MAX,
+            snapshot_log_bytes: LIMIT,
+            ..TEST_RAFT
+        });
+        let gate = Arc::clone(&gate);
+        c.testing_apply_gate = Some(Arc::new(move |index| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut h = gate.0.lock().unwrap();
+            while h.is_some_and(|x| index > x) && Instant::now() < deadline {
+                h = gate
+                    .1
+                    .wait_timeout(h, Duration::from_millis(100))
+                    .unwrap()
+                    .0;
+            }
+        }));
+    });
+    let hold_above = |i: Option<u64>| {
+        *held.0.lock().unwrap() = i;
+        held.1.notify_all();
+    };
+    let node = tb.node(1).raft().unwrap().clone();
+    let (built_tx, built_rx) = std::sync::mpsc::channel::<u64>();
+    let built_tx = Mutex::new(built_tx);
+    node.snapshots.set_on_built(Some(Arc::new(move |side, _| {
+        let _ = built_tx.lock().unwrap().send(side.index);
+    })));
+    // A first snapshot, by bytes.
+    let (path, bytes) = rust_file_of(1, 2 * LIMIT as usize);
+    tb.client(1)
+        .index_bytes("o", "r", &path, &bytes, None)
+        .unwrap();
+    let base = node.metrics().last_applied.unwrap().index;
+    assert_eq!(built_rx.recv_timeout(CLUSTER_WAIT).unwrap(), base);
+    poll_until("the first snapshot", || {
+        node.metrics().snapshot.is_some_and(|s| s.index >= base)
+    });
+    // Four entries appended above it one by one (each committed on its
+    // own, so each is its own apply command), none applied.
+    hold_above(Some(base));
+    let endpoint = tb.node(1).endpoint();
+    let mut writers = Vec::new();
+    for i in 1..=4u64 {
+        let endpoint = endpoint.clone();
+        writers.push(std::thread::spawn(move || {
+            let mut cfg = graph_client::ClientConfig::new(endpoint);
+            cfg.write_deadline = CLUSTER_WAIT * 2;
+            let c = RemoteStore::connect(cfg).unwrap();
+            let (path, bytes) = rust_file_of(10 + i as usize, 6 << 10);
+            c.index_bytes("o", "r", &path, &bytes, None).unwrap();
+        }));
+        poll_until("the backlog entry appended", || {
+            node.metrics().last_log_index >= Some(base + i)
+        });
+        // Past its flush and commit before the next one is proposed.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let quiet = |what: &str| {
+        if let Ok(i) = built_rx.recv_timeout(Duration::from_millis(1000)) {
+            panic!("a snapshot at {i} {what}");
+        }
+    };
+    quiet("while the backlog waits");
+    for step in 1..=3u64 {
+        hold_above(Some(base + step));
+        poll_until("the next backlog entry applied", || {
+            tb.node(1).applied_index() >= base + step
+        });
+        quiet(&format!("with {step} of 4 backlog entries applied"));
+    }
+    hold_above(None);
+    assert_eq!(
+        built_rx.recv_timeout(CLUSTER_WAIT).unwrap(),
+        base + 4,
+        "the byte-triggered snapshot of the applied backlog"
+    );
+    quiet("after the backlog's snapshot");
+    for w in writers {
+        w.join().unwrap();
+    }
+    node.snapshots.set_on_built(None);
+    assert_eq!(tb.client(1).count_nodes(NodeKind::File).unwrap(), 5);
+}
+
 /// QA 11: `Admin.Compact` (`vacuum --compact`) is node-local: it writes
 /// no log entry and leaves the applied state as it was.
 #[test]

@@ -37,8 +37,9 @@ pub struct RaftSettings {
     /// Build a snapshot once this many entries were applied since the last
     /// one (`--snapshot-log-entries`, default 10 000).
     pub snapshot_log_entries: u64,
-    /// ... or once this many log bytes were appended since the last one
-    /// (`--snapshot-log-bytes`, default 1 GiB).
+    /// ... or once the applied log entries above the last one hold this
+    /// many encoded bytes (`--snapshot-log-bytes`, default 1 GiB; entries
+    /// appended but not applied yet count once applied).
     pub snapshot_log_bytes: u64,
     /// Entries kept in the log below the snapshot (`--log-keep-entries`,
     /// default 1000), so a briefly lagging follower catches up from the
@@ -983,8 +984,9 @@ impl RaftNode {
 }
 
 /// The snapshot policy (ADR 0004 D7): build a snapshot once
-/// `snapshot_log_entries` entries were applied or `snapshot_log_bytes` log
-/// bytes appended since the last one, if the disk guard allows; openraft
+/// `snapshot_log_entries` entries were applied above the last one, or the
+/// applied entries above it hold `snapshot_log_bytes` log bytes
+/// ([`AppliedBytes`]), if the disk guard allows; openraft
 /// then purges the log below it, keeping `log_keep_entries`. Ends when the
 /// Raft node shuts down.
 ///
@@ -994,22 +996,14 @@ impl RaftNode {
 /// frees up even on an idle cluster, and a triggered build that never
 /// produced a snapshot (openraft logs a failed build and carries on) is
 /// retried after [`SNAPSHOT_RETRY`]. With neither, an idle node does not
-/// wake it (issue #205). The byte trigger counts from what the log held
-/// above the snapshot at start, so a restart does not reset it.
+/// wake it (issue #205). The byte count covers the applied entries above
+/// the last snapshot whenever they were appended, so neither a restart, a
+/// build nor a lagging apply loses any of them.
 async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
     let mut rx = node.raft.metrics();
     let entries = s.snapshot_log_entries.max(1);
     let mut last_snap = rx.borrow().snapshot.map(|l| l.index);
-    let mut base_bytes = {
-        let log = node.log_store.clone();
-        let snap = last_snap.unwrap_or(0);
-        let above = tokio::task::spawn_blocking(move || log.bytes_after(snap))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(0);
-        node.log_store.appended_bytes().saturating_sub(above)
-    };
+    let mut counted = AppliedBytes::new(last_snap.unwrap_or(0));
     let mut pending: Option<(u64, std::time::Instant)> = None;
     let mut disk_refused = false;
     loop {
@@ -1024,9 +1018,27 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
         if !running {
             return;
         }
+        if counted.stale(snap.unwrap_or(0), applied) {
+            // Not a reset to "now" on a new snapshot: the entries applied
+            // above it (appended while it was built) still count
+            // (issue #211).
+            let log = node.log_store.clone();
+            let mut next = counted;
+            counted = tokio::task::spawn_blocking(move || {
+                next.update(snap.unwrap_or(0), applied, |a, b| {
+                    log.bytes_between(a, b).unwrap_or(0)
+                });
+                next
+            })
+            .await
+            .unwrap_or(AppliedBytes {
+                snap: snap.unwrap_or(0),
+                upto: applied.max(snap.unwrap_or(0)),
+                bytes: 0,
+            });
+        }
         if snap != last_snap {
             last_snap = snap;
-            base_bytes = node.log_store.appended_bytes();
             if pending.is_some_and(|(p, _)| snap.unwrap_or(0) >= p) {
                 pending = None;
             }
@@ -1036,8 +1048,13 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
             pending = None;
         }
         let since = applied.saturating_sub(snap.unwrap_or(0));
-        let bytes = node.log_store.appended_bytes().saturating_sub(base_bytes);
-        let due = applied > 0 && (since >= entries || bytes >= s.snapshot_log_bytes);
+        let bytes = counted.bytes;
+        // Something must be applied above the snapshot for a build to cover
+        // it: a lagging apply (or a byte limit of 0 from a library caller)
+        // never makes the same snapshot due again, which would rebuild it
+        // after every SNAPSHOT_RETRY.
+        let due =
+            applied > snap.unwrap_or(0) && (since >= entries || bytes >= s.snapshot_log_bytes);
         if !due {
             // Nothing to retry (a snapshot arrived some other way).
             disk_refused = false;
@@ -1064,6 +1081,63 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
         tokio::select! {
             r = rx.changed() => if r.is_err() { return },
             _ = tokio::time::sleep(POLICY_TICK), if waiting => {}
+        }
+    }
+}
+
+/// The byte trigger's count: the encoded bytes of the applied log entries
+/// above the last snapshot (issue #211), kept incrementally as the applied
+/// index moves (only the newly applied entries are read) and restarted
+/// from the entries still above a new snapshot when one lands. Applied
+/// entries count whenever they were appended: before a restart, while a
+/// snapshot was being built, or as a backlog a lagging node applies later.
+/// Unapplied entries do not count yet: a build covers only the applied
+/// index, so on a node whose apply lags, counting them would make every
+/// new snapshot due again at once, each covering only what was applied
+/// during the last build. A failed read counts those entries as 0 (the
+/// next snapshot comes later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppliedBytes {
+    /// The snapshot index the count is above.
+    snap: u64,
+    /// The applied index the count reaches.
+    upto: u64,
+    /// Encoded bytes of the log entries in `(snap, upto]`.
+    bytes: u64,
+}
+
+impl AppliedBytes {
+    fn new(snap: u64) -> Self {
+        Self {
+            snap,
+            upto: snap,
+            bytes: 0,
+        }
+    }
+
+    /// Whether [`update`](Self::update) has anything to read for this
+    /// snapshot and applied index.
+    fn stale(&self, snap: u64, applied: u64) -> bool {
+        snap != self.snap || applied > self.upto
+    }
+
+    /// Follow the snapshot to `snap` and the count to `applied`;
+    /// `range(a, b)` answers the bytes of the entries in `(a, b]`. Each
+    /// applied entry is read once, when it is applied, except those still
+    /// above a new snapshot, which are read again to restart the count.
+    fn update(&mut self, snap: u64, applied: u64, range: impl Fn(u64, u64) -> u64) {
+        if snap != self.snap {
+            self.bytes = if snap < self.upto {
+                range(snap, self.upto)
+            } else {
+                0
+            };
+            self.upto = self.upto.max(snap);
+            self.snap = snap;
+        }
+        if applied > self.upto {
+            self.bytes = self.bytes.saturating_add(range(self.upto, applied));
+            self.upto = applied;
         }
     }
 }
@@ -1204,6 +1278,56 @@ pub fn follower_stale(known: bool, recent: bool, applied: u64, leader_commit: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #211: the byte trigger counts every applied entry above the
+    /// snapshot exactly once, whenever it was appended: a backlog applied
+    /// after a snapshot landed, and entries applied while it was built.
+    #[test]
+    fn applied_bytes_count_each_applied_entry_above_the_snapshot() {
+        // Entry i is 10 * i bytes; `reads` records every range asked.
+        let reads = std::cell::RefCell::new(Vec::new());
+        let range = |a: u64, b: u64| {
+            reads.borrow_mut().push((a, b));
+            (a + 1..=b).map(|i| 10 * i).sum::<u64>()
+        };
+        let mut c = AppliedBytes::new(0);
+        assert!(!c.stale(0, 0));
+        assert!(c.stale(0, 1), "a newly applied entry needs a read");
+        assert!(c.stale(1, 0), "so does a new snapshot");
+        // Start-up: what is applied above the snapshot counts.
+        c.update(0, 3, range);
+        assert_eq!(c.bytes, 10 + 20 + 30);
+        // Only the newly applied entries are read.
+        c.update(0, 5, range);
+        assert_eq!(c.bytes, 150);
+        assert_eq!(*reads.borrow(), [(0, 3), (3, 5)]);
+        // A snapshot at 3 lands while 4 and 5 (applied during its build)
+        // are above it: they still count.
+        assert!(c.stale(3, 5));
+        c.update(3, 5, range);
+        assert_eq!(c.bytes, 40 + 50);
+        assert!(!c.stale(3, 5));
+        // A snapshot lands at the applied index with a backlog appended
+        // above it, not applied yet: nothing counts until it is applied,
+        // then all of it does.
+        c.update(5, 5, range);
+        assert_eq!(c.bytes, 0);
+        c.update(5, 8, range);
+        assert_eq!(c.bytes, 60 + 70 + 80);
+        // A snapshot installed above the count (from a leader) restarts
+        // it there.
+        c.update(20, 20, range);
+        assert_eq!(
+            c,
+            AppliedBytes {
+                snap: 20,
+                upto: 20,
+                bytes: 0
+            }
+        );
+        c.update(20, 21, range);
+        assert_eq!(c.bytes, 210);
+    }
 
     #[test]
     fn leads_alone_only_as_the_leader_and_only_member() {
