@@ -1049,11 +1049,10 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
         }
         let since = applied.saturating_sub(snap.unwrap_or(0));
         let bytes = counted.bytes;
-        // A build covers the applied index only: with nothing applied
-        // above the snapshot (a lagging apply, the bytes all above it), it
-        // would rebuild the same snapshot and wait for SNAPSHOT_RETRY.
-        let due =
-            applied > snap.unwrap_or(0) && (since >= entries || bytes >= s.snapshot_log_bytes);
+        // Both triggers count applied entries above the snapshot only, so a
+        // due snapshot always has something new to cover (a lagging apply
+        // never makes the same snapshot due again).
+        let due = applied > 0 && (since >= entries || bytes >= s.snapshot_log_bytes);
         if !due {
             // Nothing to retry (a snapshot arrived some other way).
             disk_refused = false;
