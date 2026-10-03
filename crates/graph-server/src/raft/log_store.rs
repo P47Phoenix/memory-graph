@@ -183,9 +183,6 @@ pub struct RedbLogStore {
     /// moves pages.
     db: Arc<RwLock<Database>>,
     path: PathBuf,
-    /// Encoded bytes the log held when opened plus every append since (the
-    /// snapshot policy's byte trigger, `--snapshot-log-bytes`).
-    appended_bytes: Arc<AtomicU64>,
     /// The file size right after the last compaction (0: none yet).
     compacted_bytes: Arc<AtomicU64>,
     /// A background compaction is running.
@@ -315,7 +312,6 @@ impl RedbLogStore {
         let s = Self {
             db: Arc::new(RwLock::new(db)),
             path: path.to_path_buf(),
-            appended_bytes: Arc::new(AtomicU64::new(0)),
             compacted_bytes: Arc::new(AtomicU64::new(0)),
             owner: Some(Arc::new(Owner {
                 busy: Arc::clone(&compacting),
@@ -328,33 +324,23 @@ impl RedbLogStore {
             #[cfg(test)]
             compact_gate: Arc::default(),
         };
-        // The byte trigger survives a restart: start from what the log
-        // holds (the snapshot policy subtracts what lies at or below the
-        // last snapshot, see `bytes_after`).
-        let held = s.bytes_after(0)?;
-        s.appended_bytes.store(held, Ordering::Relaxed);
         Ok(s)
     }
 
-    /// Encoded bytes of the entries above `index` in the log right now.
-    pub fn bytes_after(&self, index: u64) -> Result<u64, StoreError> {
-        self.bytes_in(index, Bound::Unbounded)
-    }
-
     /// Encoded bytes of the entries above `after`, up to and including
-    /// `upto`, in the log right now.
+    /// `upto`, in the log right now (the snapshot policy's byte trigger,
+    /// `--snapshot-log-bytes`). It reads every value in the range under
+    /// the log's read lock (a compaction waits meanwhile), so the policy
+    /// asks only for the entries applied since its last call, and for
+    /// those above a new snapshot when one lands.
     pub fn bytes_between(&self, after: u64, upto: u64) -> Result<u64, StoreError> {
         if upto <= after {
             return Ok(0);
         }
-        self.bytes_in(after, Bound::Included(upto))
-    }
-
-    fn bytes_in(&self, after: u64, upto: Bound<u64>) -> Result<u64, StoreError> {
         let rt = self.read_txn()?;
         let t = rt.open_table(LOG)?;
         let mut n = 0u64;
-        for row in t.range::<u64>((Bound::Excluded(after), upto))? {
+        for row in t.range::<u64>((Bound::Excluded(after), Bound::Included(upto)))? {
             let (_, v) = row?;
             n += v.value().len() as u64;
         }
@@ -552,11 +538,6 @@ impl RedbLogStore {
         self.observer = observer;
     }
 
-    /// Encoded entry bytes appended since the log was opened.
-    pub fn appended_bytes(&self) -> u64 {
-        self.appended_bytes.load(Ordering::Relaxed)
-    }
-
     /// The last committed index this node persisted (`save_committed`).
     pub fn committed_index(&self) -> Option<u64> {
         self.meta::<Option<LogId>>(K_COMMITTED)
@@ -729,13 +710,11 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         let written = self
             .blocking(move |s| {
                 let wt = s.write_txn().map_err(write_err)?;
-                let mut bytes = 0u64;
                 let mut last = 0u64;
                 {
                     let mut t = wt.open_table(LOG).map_err(write_err)?;
                     for e in &entries {
                         let enc = encode_entry(e);
-                        bytes += enc.len() as u64;
                         last = e.log_id.index;
                         t.insert(e.log_id.index, enc.as_slice())
                             .map_err(write_err)?;
@@ -748,7 +727,6 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
                 if let Some(o) = &s.observer {
                     o(AppendEvent::Committed { last_index: last });
                 }
-                s.appended_bytes.fetch_add(bytes, Ordering::Relaxed);
                 Ok(last)
             })
             .await;
@@ -1091,14 +1069,14 @@ mod tests {
         }
     }
 
-    /// The snapshot policy's byte trigger survives a restart: a reopened
-    /// log starts from the bytes it holds.
+    /// The snapshot policy's byte trigger reads what the log holds, so it
+    /// survives a restart: a reopened log answers the same ranges.
     #[test]
-    fn appended_bytes_start_from_what_the_log_holds() {
+    fn bytes_between_counts_the_entries_in_the_range() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("raft.redb");
         let log = RedbLogStore::open(&path).unwrap();
-        assert_eq!(log.appended_bytes(), 0);
+        assert_eq!(log.bytes_between(0, u64::MAX).unwrap(), 0);
         let e = |i| Entry {
             log_id: LogId::new(CommittedLeaderId::new(1, 1), i),
             payload: EntryPayload::Normal(LogRequest {
@@ -1110,8 +1088,7 @@ mod tests {
         log.insert_for_test(&e(3));
         drop(log);
         let log = RedbLogStore::open(&path).unwrap();
-        assert_eq!(log.appended_bytes(), 3 * 125);
-        assert_eq!(log.bytes_after(1).unwrap(), 2 * 125);
+        assert_eq!(log.bytes_between(1, u64::MAX).unwrap(), 2 * 125);
         assert_eq!(log.bytes_between(1, 2).unwrap(), 125);
         assert_eq!(log.bytes_between(0, 3).unwrap(), 3 * 125);
         assert_eq!(log.bytes_between(3, 9).unwrap(), 0);

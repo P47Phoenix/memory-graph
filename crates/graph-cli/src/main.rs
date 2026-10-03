@@ -475,7 +475,8 @@ enum Cmd {
         /// (default 10000)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         snapshot_log_entries: Option<u64>,
-        /// ... or after this many log bytes: a size with a K/M/G suffix (default 1G)
+        /// ... or once the applied log entries above the last snapshot hold this many bytes: a
+        /// size with a K/M/G suffix (default 1G)
         #[arg(long, value_name = "SIZE", value_parser = graph_cli::sysinfo::parse_size)]
         snapshot_log_bytes: Option<u64>,
         /// Log entries kept below a snapshot, so a briefly lagging follower catches up from the

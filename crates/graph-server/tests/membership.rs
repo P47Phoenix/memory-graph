@@ -1519,7 +1519,22 @@ fn a_sole_voter_restarted_mid_campaign_leads_at_once() {
     let term = tb.node(1).raft().unwrap().metrics().current_term;
     tb.node_mut(1).stop();
     {
-        let mut log = RedbLogStore::open(&tb.data_dir(1).join("raft.redb")).unwrap();
+        // The stopped node's file can be held for a moment yet (Windows:
+        // `DatabaseAlreadyOpen`).
+        let path = tb.data_dir(1).join("raft.redb");
+        let deadline = Instant::now() + CLUSTER_WAIT;
+        let mut log = loop {
+            match RedbLogStore::open(&path) {
+                Ok(log) => break log,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "opening the stopped node's log: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
         let campaign = Vote::new(term + 1, 1);
         assert!(!campaign.is_committed());
         rt().block_on(log.save_vote(&campaign)).unwrap();
