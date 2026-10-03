@@ -650,7 +650,10 @@ async fn remove_lost_self(peer: &str, id: NodeId, timeout: Duration) -> Result<(
                     Next::Fail(e) => {
                         // The quorum check answers a rejection while the
                         // other members still settle; retry it too.
-                        if !st.message().contains("would drop below quorum") {
+                        if !st
+                            .message()
+                            .contains(crate::services::admin::QUORUM_REFUSAL)
+                        {
                             return Err(e.to_string());
                         }
                         st.message().to_string()
