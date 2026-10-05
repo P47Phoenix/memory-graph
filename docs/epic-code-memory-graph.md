@@ -60,8 +60,13 @@
 | 42 | `--encoding`, `--strict-encoding` and `.memory-graph.toml` per-glob overrides | Medium | 3 | P2 | 41 |
 | 43 | Encodings on the wire, in `describe`/`--stats` and in MCP | Medium | 5 | P3 | 41, 20, 31 |
 | 44 | Encoding fixtures, cross-encoding search tests and docs | Medium | 3 | P3 | 42, 43 |
+| 45 | Read-path measurement and benchmark (ADR 0008 phase 0, **Proposed**) | Risk reduction | 3 | P3 | 24 |
+| 46 | Dict lookup without full decode; page-cache sizing (ADR 0008 phase 1, **Proposed**) | Medium | 3 | P3 | 45 |
+| 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, **Proposed**) | High | 8 | P3 | 45 (gate), 46 |
+| 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, **Proposed**) | High | 5 | P3 | 47 |
+| 49 | Optional query-result cache (ADR 0008 phase 3, **Proposed**) | Low | 3 | P4 | 45, 48 |
 
-Total: 44 stories, 227 pts (average about 5.2); 219 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30.
+Total: 44 stories, 227 pts (average about 5.2); 219 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) are **proposed** by [ADR 0008](adr/0008-read-cache.md) (read cache pool, Proposed 2026-10-05) and are not counted in the totals above until the owner accepts it; 47-48 are gated on story 45's measurement and 49 is optional.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -553,6 +558,64 @@ Design: [ADR 0007](adr/0007-source-encodings.md) test plan.
 - Given one fixture per encoding (UTF-16LE/BE with and without a BOM, windows-1252, Shift_JIS, GBK, EUC-KR, Big5) and one invalid-bytes file, When indexed, Then each must record the expected encoding, exact spans against the decoded text, and its symbols (e.g. a C# class in a UTF-16 file).
 - Given the same identifiers (e.g. `CustomerId`, `café`, `日本`) in UTF-8, UTF-16LE, UTF-16BE, windows-1252 and Shift_JIS files, When searched, Then one search must return hits from every file and the dictionary must hold one term per identifier.
 - Given the docs, When read, Then `docs/guide/indexing.md` must have an Encodings section (detection order, overrides, limits of cross-encoding matching), the glossary must define decoded source and lossy, ADR 0003 must point to ADR 0007, and the CLAUDE.md exact-spans invariant must read as in ADR 0007 C1.
+
+**45. Read-path measurement and benchmark (3 pts)**
+Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; not started).
+As a maintainer deciding whether to build a read cache
+I want decode costs and cold/warm/concurrent read numbers
+So that the cache is built only if it pays.
+Design: [ADR 0008](adr/0008-read-cache.md) phase 0.
+- Given a running `serve`, When queries run, Then the metrics endpoint must export decode counts and timers for dictionary blocks, symbol sections and file/repo/org node decodes.
+- Given the vendored corpus and an agent-like mix (`search`, `symbols`, grain roll-ups, `describe`), When the read benchmark runs, Then it must report p50/p95 latency and decode share for cold, warm, and 8, 16 and 32 concurrent readers.
+- Given the results, When recorded in a spike doc, Then it must state whether decode is at least about 25% of warm query time, which is the gate for stories 47-48.
+- Given the counters, When `run_differential` runs, Then query answers must be unchanged.
+
+**46. Dict lookup without full decode; page-cache sizing (3 pts)**
+Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; not started).
+As a user querying a large store
+I want a term lookup to decode only the string it needs, and a page cache sized for my machine
+So that queries do less work and the documented cache size is true.
+Design: [ADR 0008](adr/0008-read-cache.md) phase 1.
+- Given an id in a reverse dictionary block, When `dict_rev_lookup` reads it, Then it must scan varint lengths and allocate only the hit string, and return the same string as a full decode (property-tested over random blocks, including the last and a full block).
+- Given no `--cache-bytes`, When a store opens, Then the redb page cache must be sized from available memory (clamped), and ADR 0003 and the code must state the same default.
+- Given `--cache-bytes`, When set, Then it must override the derived size.
+- Given story 45's benchmark, When re-run, Then dictionary decode time must drop and no query answer may change (`run_differential`).
+
+**47. Decoded-object cache core and MVCC-safe invalidation (8 pts)**
+Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; gated on story 45).
+As an agent sending many queries to `serve`
+I want decoded dictionary blocks, symbol sections and file context reused across queries
+So that warm queries skip repeated decoding without ever seeing stale data.
+Design: [ADR 0008](adr/0008-read-cache.md) phase 2.
+- Given a `V2Store`, When opened, Then it must own one sharded, byte-weighted, scan-resistant cache of `Arc` immutable values (dictionary blocks, symbol sections with stream headers and checkpoints, file context), in pure Rust passing `check-no-c-deps.py`.
+- Given a committed write, When it commits, Then the generation must be bumped and the touched keys recorded (files in `commit_prepared`, the extended block in `dict_rev_append`); given vacuum, Then the whole cache must be cleared.
+- Given a reader that began at generation G, When it looks up a key changed after G or after the entry was created, Then it must bypass the cache and read redb, returning exactly what its snapshot holds.
+- Given a Raft follower, When it applies entries, Then it must invalidate through the same write path as the leader.
+- Given a snapshot install or a compact, When the store slot is swapped, Then the old cache must be dropped with the old store.
+- Given the implementation, When reviewed, Then no `ReadTransaction` may be held by the cache.
+
+**48. Read-cache tests, metrics and flags (5 pts)**
+Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; gated on story 45).
+As an operator and a maintainer
+I want the read cache sized, observable, switchable and proven equivalent
+So that it can be tuned or turned off and never changes an answer.
+Design: [ADR 0008](adr/0008-read-cache.md) phase 2 (sizing, tests).
+- Given `--read-cache-bytes N`, When `serve` or the CLI opens a store, Then the cache must hold at most about N bytes; given `0`, Then it must be off; given neither, Then it must take its share of one hardware-derived budget shared with the page cache.
+- Given the metrics endpoint, When queries run, Then it must export read-cache hits, misses, evictions and resident bytes.
+- Given `run_differential`, When run with the read cache off, at one entry and large, Then every answer must be identical.
+- Given concurrent writers and older readers and snapshot handles, When the new consistency differential runs, Then each answer must equal an uncached store's at the same generation.
+- Given a snapshot install or a compact, When queries run afterwards, Then answers must equal an uncached store's.
+- Given story 45's benchmark, When re-run, Then the warm and concurrent results must be recorded in the spike doc.
+
+**49. Optional query-result cache (3 pts)**
+Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; optional, only if story 45 shows repeated identical queries).
+As an agent that repeats the same query
+I want the server to return a cached result when nothing has changed
+So that repeated queries cost almost nothing.
+Design: [ADR 0008](adr/0008-read-cache.md) phase 3.
+- Given story 45's results, When reviewed, Then this story must start only if repeated identical queries are a measurable share of the workload.
+- Given a query at generation G, When the same query arrives at G, Then `serve` must return the cached result; given any write, Then the result cache must be cleared.
+- Given the result cache on and off, When `run_differential` and the consistency differential run, Then answers must be identical.
 
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
