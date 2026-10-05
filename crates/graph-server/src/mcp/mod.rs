@@ -17,8 +17,11 @@
 //!   on the Origin allowlist (a browser always sends `Origin` on these
 //!   requests) plus the operator's proxy;
 //! - a body over [`MAX_BODY_BYTES`] gets 413 (with `Connection: close`,
-//!   the rest being unread); every other answer comes after the whole body
-//!   was read, so it reaches a client still sending;
+//!   the rest being unread); 429 and the session and JSON answers come
+//!   after the whole body was read. Every connection is closed in stages
+//!   ([`linger`], RFC 9112 section 9.6), so an answer given before the body
+//!   was read (413, and the 403/404/405 guards) still reaches a client that
+//!   is sending it, rather than a TCP reset;
 //! - past `--mcp-max-inflight` requests at once, 429 (with `Retry-After`),
 //!   decided after the session checks;
 //! - a call past [`CALL_DEADLINE`] answers a JSON-RPC error
@@ -26,7 +29,8 @@
 //! - results are cut at 4 MiB with `next_offset` and tools are read-only
 //!   (both in `graph-mcp`).
 //!
-//! Transport: `POST /mcp` carries one JSON-RPC message. `initialize`
+//! Transport: HTTP/1.1 (hyper, with axum's router), one task per
+//! connection. `POST /mcp` carries one JSON-RPC message. `initialize`
 //! (without a session) opens a session, whose id comes back in
 //! `Mcp-Session-Id`; every later message must carry it (400 without, 404
 //! for an unknown or ended one). The session holds only the negotiated
@@ -118,6 +122,10 @@ pub struct McpConfig {
     pub testing_call_delay: Option<Duration>,
     /// A session unused this long ends ([`SESSION_IDLE`]; tests shorten it).
     pub session_idle: Duration,
+    /// Testing only: the staged close's bounds ([`Linger::DEFAULT`]), so a
+    /// test can check them without waiting the real ones out.
+    #[doc(hidden)]
+    pub testing_linger: Linger,
 }
 
 impl McpConfig {
@@ -131,8 +139,29 @@ impl McpConfig {
             call_timeout: CALL_DEADLINE,
             testing_call_delay: None,
             session_idle: SESSION_IDLE,
+            testing_linger: Linger::DEFAULT,
         }
     }
+}
+
+/// The bounds of the staged close ([`linger`]): it stops reading after
+/// `idle` without a byte, after `time` in all, or after `bytes` read.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Linger {
+    pub idle: Duration,
+    pub time: Duration,
+    pub bytes: u64,
+}
+
+impl Linger {
+    /// 5 s idle, 30 s in all, 64 MiB (nginx's `lingering_timeout` and
+    /// `lingering_time` defaults, plus a byte cap).
+    pub const DEFAULT: Linger = Linger {
+        idle: LINGER_IDLE,
+        time: LINGER_TIME,
+        bytes: LINGER_BYTES,
+    };
 }
 
 /// Refuse a non-loopback bind without `--mcp-allow-remote` (ADR 0005 D4),
@@ -228,13 +257,135 @@ pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdow
     });
     let app = axum::Router::new()
         .route("/mcp", axum::routing::any(handle))
-        .fallback(|| async { StatusCode::NOT_FOUND })
+        .fallback(|req: Request| async move {
+            close_if_body_unread(req.headers(), StatusCode::NOT_FOUND.into_response())
+        })
         .with_state(state);
-    let r = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.wait().await })
-        .await;
-    if let Err(e) = r {
-        tracing::warn!(error = %e, "MCP endpoint stopped");
+    let mut conns = tokio::task::JoinSet::new();
+    loop {
+        let stream = tokio::select! {
+            r = listener.accept() => match r {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    // A connection that failed before it was accepted is
+                    // the client's; anything else (out of file handles)
+                    // gets a pause, as axum::serve does.
+                    if !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionRefused
+                    ) {
+                        tracing::warn!(error = %e, "MCP endpoint: accept failed");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            },
+            _ = shutdown.wait() => break,
+        };
+        // Reap the finished connections as we go.
+        while conns.try_join_next().is_some() {}
+        conns.spawn(serve_connection(
+            stream,
+            app.clone(),
+            shutdown.clone(),
+            cfg.testing_linger,
+        ));
+    }
+    drop(listener);
+    // The connections are asked to finish the request they are on. This
+    // task is spawned detached (`server::start`), so that holds only while
+    // the runtime lives: a `serve` process that exits ends them with it.
+    while conns.join_next().await.is_some() {}
+}
+
+/// How long a connection the server is done with keeps reading (and
+/// discarding) what the client still sends, at most, before it is closed
+/// ([`linger`]).
+pub(crate) const LINGER_TIME: Duration = Duration::from_secs(30);
+/// How long [`linger`] waits for the client's next bytes before it closes.
+pub(crate) const LINGER_IDLE: Duration = Duration::from_secs(5);
+/// The most [`linger`] reads and discards from one connection.
+pub(crate) const LINGER_BYTES: u64 = 64 << 20;
+/// [`linger`]'s read buffer: small, since thousands of connections may
+/// linger at once and each holds one.
+const LINGER_BUF: usize = 8 << 10;
+
+/// One HTTP/1.1 connection: hyper serves it, and the TCP connection is then
+/// closed in stages ([`linger`]) rather than at once.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    app: axum::Router,
+    shutdown: ShutdownHandle,
+    bounds: Linger,
+) {
+    use hyper_util::rt::TokioIo;
+    use tower_service::Service;
+    let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+        let mut app = app.clone();
+        // Boxed: `poll_without_shutdown` wants an `Unpin` future.
+        Box::pin(async move { app.call(req.map(Body::new)).await })
+    });
+    let mut conn =
+        hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc);
+    let mut stopping = false;
+    let served = loop {
+        let done = tokio::select! {
+            r = std::future::poll_fn(|cx| conn.poll_without_shutdown(cx)) => Some(r),
+            _ = shutdown.wait(), if !stopping => None,
+        };
+        match done {
+            Some(r) => break r,
+            None => {
+                // Finish the request in progress, then close.
+                stopping = true;
+                std::pin::Pin::new(&mut conn).graceful_shutdown();
+            }
+        }
+    };
+    if let Err(e) = served {
+        tracing::debug!(error = %e, "MCP connection ended with an error");
+    }
+    // The IO back from hyper, which neither shut it down nor closed it:
+    // the response it wrote is flushed.
+    let stream = conn.into_parts().io.into_inner();
+    if !shutdown.is_triggered() {
+        tokio::select! {
+            () = linger(stream, bounds) => {}
+            _ = shutdown.wait() => {}
+        }
+    }
+}
+
+/// Close `stream` in stages (RFC 9112 section 9.6, "Tear-down"): send FIN
+/// (half-close), then read and discard whatever the client still sends
+/// until it closes too, `bounds.idle` passes without a byte, `bounds.time`
+/// passes, or `bounds.bytes` were read ([`Linger::DEFAULT`]: 5 s, 30 s,
+/// 64 MiB); only then close.
+///
+/// A server that closes a socket with unread bytes in its receive buffer,
+/// or that receives more after the close, sends a TCP reset, and the reset
+/// can destroy its own last response in the client's buffers before the
+/// client reads it (#224): a 413 for a body the server refused before
+/// reading it, a 403/404/405 answered before the body was read, all arrived
+/// as `ECONNRESET`/`WSAECONNABORTED` instead. Reading the rest first leaves
+/// nothing unread at the close.
+async fn linger(mut stream: tokio::net::TcpStream, bounds: Linger) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + bounds.time;
+    let mut buf = vec![0u8; LINGER_BUF];
+    let mut read = 0u64;
+    while read < bounds.bytes {
+        let idle = tokio::time::Instant::now() + bounds.idle;
+        match tokio::time::timeout_at(idle.min(deadline), stream.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => read += n as u64,
+            // EOF (the client closed), an error, or out of time.
+            _ => return,
+        }
     }
 }
 
@@ -256,6 +407,22 @@ fn closing(mut r: Response) -> Response {
     r.headers_mut()
         .insert(header::CONNECTION, HeaderValue::from_static("close"));
     r
+}
+
+/// `r` with `Connection: close` when the request declares a body (a
+/// non-zero `Content-Length`, or any `Transfer-Encoding`) that this answer
+/// leaves unread, so a pooling client does not send its next request on a
+/// connection the server will not read again.
+fn close_if_body_unread(headers: &HeaderMap, r: Response) -> Response {
+    let declared = headers.contains_key(header::TRANSFER_ENCODING)
+        || headers
+            .get(header::CONTENT_LENGTH)
+            .is_some_and(|v| v.to_str().map_or(true, |v| v.trim() != "0"));
+    if declared {
+        closing(r)
+    } else {
+        r
+    }
 }
 
 /// Whether a body read failed on the size limit (not on the transport).
@@ -379,7 +546,7 @@ fn server_name() -> (&'static str, &'static str) {
 
 async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     if let Some(refused) = st.guard(req.headers()) {
-        return refused;
+        return close_if_body_unread(req.headers(), refused);
     }
     let session = req
         .headers()
@@ -389,11 +556,12 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     match *req.method() {
         Method::POST => {}
         Method::DELETE => {
-            return match session {
+            let r = match session {
                 None => plain(StatusCode::BAD_REQUEST, "DELETE needs an Mcp-Session-Id"),
                 Some(id) if st.end_session(&id) => StatusCode::OK.into_response(),
                 Some(_) => plain(StatusCode::NOT_FOUND, "no such session"),
-            }
+            };
+            return close_if_body_unread(req.headers(), r);
         }
         _ => {
             // GET (a server-initiated SSE stream) is not offered in v1.
@@ -403,7 +571,7 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             );
             r.headers_mut()
                 .insert(header::ALLOW, HeaderValue::from_static("POST, DELETE"));
-            return r;
+            return close_if_body_unread(req.headers(), r);
         }
     }
     let too_long = req
