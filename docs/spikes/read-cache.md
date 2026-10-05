@@ -124,11 +124,54 @@ brackets where it differs by more than a point).
   removes most of what made it pass here; a general decoded-object cache
   (phase 2) is justified only if the share is still >= 25% after that.
 
+## Phase 1 re-run (story 46, 2026-10-05)
+
+Phase 1 replaced the whole-block decode in `dict_rev_lookup` with an
+in-place scan (`codec::dict_block_find`): every entry is still walked and
+validated (so a corrupt block is refused exactly as before), but only the
+matching string is allocated. A new counter, `dict_strings_decoded`, rises by
+exactly one per uncached lookup; `dict_block_decodes` now counts block scans.
+The encoding is unchanged (no schema bump).
+
+Same machine, same command, both builds run back to back in one session
+(before = `read-cache-phase0-measure` at 18b81a8, after = this branch). The
+benchmark opens the store with an explicit size (`None` = redb's 1 GiB for
+the warm rows, 1 MiB for the cold row), so the new derived page-cache
+default does not affect these numbers.
+
+| phase | p50 ms before | p50 ms after | qps before | qps after | decode share before | decode share after | dict share before | dict share after |
+|---|---|---|---|---|---|---|---|---|
+| cold redb cache, 1 MiB | 0.076 | 0.047 | 2756 | 3432 | 25.3% | 14.3% | 23.7% | 12.0% |
+| warm x20, timing on | 0.049 | 0.029 | 4243 | 6282 | 37.4% | 23.5% | 35.2% | 20.3% |
+| 1 thread x20 | 0.050 | 0.028 | 4212 | 6237 | 37.4% | 23.3% | 35.2% | 20.0% |
+| 8 threads x20 | 0.068 | 0.036 | 23318 | 36521 | 37.3% | 18.7% | 35.1% | 15.7% |
+| 16 threads x20 | 0.149 | 0.076 | 25111 | 39006 | 36.2% | 12.1% | 34.0% | 9.6% |
+| 32 threads x20 | 0.235 | 0.111 | 31784 | 52878 | 37.9% | 11.4% | 36.0% | 9.2% |
+
+- Warm single-reader throughput rose about 48% (4243 to 6282 qps) and p95
+  fell from 1.14 to 0.80 ms; 32 readers went from 31.8k to 52.9k qps.
+- Counts per query are unchanged (22.6 dictionary lookups, 3.4 lazy and
+  symbol decodes, 1 read transaction), as they must be: answers did not
+  change, only the cost of each lookup.
+- Timing overhead after: +0.2% to +3.0% (median +1.2%) over 5 trials.
+
+**Gate after phase 1: not met on this corpus.** Warm single-reader decode
+share is 23.3-23.5%, and 18.7%, 12.1% and 11.4% at 8, 16 and 32 readers, all
+below the 25% gate. The remaining decode time is still mostly the dictionary
+scan (one block walk per memo miss, validating every entry's UTF-8); lazy
+and symbol decodes are 2-3%. On this evidence phase 2 (the decoded-object
+cache, story 47) is a no-go unless the large-index re-run (#233) shows a
+higher share; a cheaper next step, if one is wanted, is a per-block offset
+index or skipping UTF-8 validation of non-matching entries, which stays
+within phase 1's no-invalidation scope.
 ## Go / no-go
 
 - **Phase 0 gate:** GO on the vendored corpus (warm single-reader 37%,
   8/16/32 readers 36-38%, gate 25%), subject to the large-index re-run in
   #233.
+- **Re-evaluated after phase 1 (2026-10-05):** NOT MET (warm single-reader
+  23.4%, 8/16/32 readers 18.7%/12.1%/11.4%, gate 25%); see the phase 1
+  re-run above.
 - **Owner sign-off:** _pending_ (name, date).
 
 ## Caveats

@@ -31,6 +31,9 @@ pub const OS_RESERVE: f64 = 0.20;
 /// growth per source byte (see [`MemoryPolicy`]), so it is in RSS terms.
 /// The footprint leaves out allocator rounding and the store's caches
 /// (measured 6-25% under the real growth), which the 30% slack covers.
+/// That slack was measured with redb's old 1 GiB cache; the derived page
+/// cache (ADR 0008 phase 1) can reach 4 GiB on a large machine and is not
+/// in the budget either, so the slack is due a re-measure (#236).
 pub const DEFAULT_FRACTION: f64 = 0.70;
 /// Heap per source byte in flight assumed until measured. Measured on the
 /// test corpus: about 25x (the extraction's tokens, symbols and their
@@ -82,6 +85,19 @@ pub fn sample_memory() -> Result<MemSample, String> {
 /// Bytes of memory available to new allocations, if the platform says.
 pub fn available_memory() -> Option<u64> {
     sample_memory().ok().map(|m| m.available)
+}
+
+/// The page-cache size for a store opened without `--cache-bytes` (ADR
+/// 0008 phase 1): [`graph_store::derive_cache_bytes`] of this machine's
+/// available memory, or [`graph_store::FALLBACK_CACHE_BYTES`] when the
+/// platform cannot say. An explicit `--cache-bytes` wins over it.
+pub fn cache_bytes_or_derived(explicit: Option<u64>) -> u64 {
+    explicit.unwrap_or_else(|| {
+        available_memory().map_or(
+            graph_store::FALLBACK_CACHE_BYTES,
+            graph_store::derive_cache_bytes,
+        )
+    })
 }
 
 /// `MemTotal` and `MemAvailable` (bytes) from `/proc/meminfo` text.
@@ -833,6 +849,21 @@ impl Sizing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_cache_size_wins_over_the_derived_one() {
+        assert_eq!(cache_bytes_or_derived(Some(12_345)), 12_345);
+    }
+
+    #[test]
+    fn the_derived_cache_size_is_within_the_clamp() {
+        let derived = cache_bytes_or_derived(None);
+        assert!(
+            (graph_store::MIN_DERIVED_CACHE_BYTES..=graph_store::MAX_DERIVED_CACHE_BYTES)
+                .contains(&derived),
+            "{derived}"
+        );
+    }
 
     fn mem_mb(total_mb: u64, avail_mb: u64) -> MemSample {
         MemSample {

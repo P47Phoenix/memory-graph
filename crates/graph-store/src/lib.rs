@@ -29,6 +29,10 @@ pub mod conformance;
 pub mod export;
 pub mod read_stats;
 pub use read_stats::ReadStats;
+mod cache_size;
+pub use cache_size::{
+    derive_cache_bytes, FALLBACK_CACHE_BYTES, MAX_DERIVED_CACHE_BYTES, MIN_DERIVED_CACHE_BYTES,
+};
 mod v2;
 pub use api::{
     detect_format, open_store, FingerprintSnapshot, Page, PreparedFile, RemoteParts, SnapshotStats,

@@ -85,6 +85,7 @@ fn a_repeated_query_counts_the_same_one_txn_and_one_miss_per_distinct_term() {
     assert!(distinct.contains("alpha") && distinct.contains("beta"));
     assert_eq!(first.dict_text_memo_misses, distinct.len() as u64);
     assert_eq!(first.dict_block_decodes, first.dict_text_memo_misses);
+    assert_eq!(first.dict_strings_decoded, first.dict_text_memo_misses);
     assert_eq!(
         first.dict_text_memo_hits,
         (tokens.len() - distinct.len()) as u64
@@ -103,7 +104,7 @@ fn a_token_search_reads_one_txn_the_same_way_each_time() {
 }
 
 #[test]
-fn an_uncached_text_lookup_decodes_one_block_and_a_memo_hit_none() {
+fn an_uncached_text_lookup_scans_one_block_and_decodes_one_string() {
     let (_d, s) = tiny_store();
     let (alpha, beta) = (term_id(&s, "alpha"), term_id(&s, "beta"));
     let rt = s.db.begin_read().expect("begin_read");
@@ -112,15 +113,18 @@ fn an_uncached_text_lookup_decodes_one_block_and_a_memo_hit_none() {
     let (text, miss) = measure(|| r.text(alpha).expect("text"));
     assert_eq!(&*text, "alpha");
     assert_eq!(miss.dict_block_decodes, 1);
+    assert_eq!(miss.dict_strings_decoded, 1, "only the looked-up string");
     assert_eq!(miss.dict_text_memo_misses, 1);
     assert_eq!(miss.dict_text_memo_hits, 0);
 
     let (_, hit) = measure(|| r.text(alpha).expect("text"));
     assert_eq!(hit.dict_block_decodes, 0);
+    assert_eq!(hit.dict_strings_decoded, 0);
     assert_eq!(hit.dict_text_memo_hits, 1);
 
     let (_, other) = measure(|| r.text(beta).expect("text"));
     assert_eq!(other.dict_block_decodes, 1);
+    assert_eq!(other.dict_strings_decoded, 1);
 }
 
 #[test]
@@ -174,6 +178,7 @@ fn writes_do_not_count_as_reads() {
         s.vacuum().expect("vacuum")
     });
     assert_eq!(w.dict_block_decodes, 0, "{w:?}");
+    assert_eq!(w.dict_strings_decoded, 0, "{w:?}");
     assert_eq!(w.lazy_stream_decodes + w.symbol_section_decodes, 0, "{w:?}");
     assert_eq!(w.full_stream_decodes, 0, "{w:?}");
 }

@@ -827,6 +827,41 @@ pub fn decode_dict_block(b: &[u8]) -> Result<Vec<(u64, String)>, StoreError> {
     Ok(out)
 }
 
+/// `id`'s text in a block written by [`encode_dict_block`], allocating only
+/// that one string (read cache phase 1, ADR 0008): every entry is walked in
+/// place (varint id, varint length, bytes) and validated exactly as
+/// [`decode_dict_block`] validates it, so for any input this returns
+/// `Ok(decode_dict_block(b)?.find(id))` -- the same answer and the same
+/// `Corrupt` refusals, without a `String` per entry. Not counted here,
+/// like [`decode_dict_block`]: the query-side caller counts it.
+pub fn dict_block_find(b: &[u8], id: u64) -> Result<Option<String>, StoreError> {
+    let mut r = Reader { b, at: 0 };
+    let n = usize::try_from(r.varint()?).map_err(|_| bad("dict block count out of range"))?;
+    if n > b.len() {
+        return Err(bad("dict block count exceeds input"));
+    }
+    let mut found = None;
+    for _ in 0..n {
+        let entry_id = r.varint()?;
+        let len =
+            usize::try_from(r.varint()?).map_err(|_| bad("dict entry length out of range"))?;
+        let end =
+            r.at.checked_add(len)
+                .filter(|&e| e <= b.len())
+                .ok_or_else(|| bad("dict entry exceeds input"))?;
+        let text =
+            std::str::from_utf8(&b[r.at..end]).map_err(|_| bad("dict entry is not valid UTF-8"))?;
+        if found.is_none() && entry_id == id {
+            found = Some(text);
+        }
+        r.at = end;
+    }
+    if r.at != b.len() {
+        return Err(bad("trailing bytes in dict block"));
+    }
+    Ok(found.map(str::to_owned))
+}
+
 /// The id of a block's first entry, without decoding the rest of the block
 /// (used to binary-search across blocks by id). `None` for an empty block
 /// (never written by [`encode_dict_block`], but accepted defensively).
@@ -2176,6 +2211,106 @@ mod props {
                     prop_assert!(w[1] > w[0]);
                 }
             }
+        }
+    }
+}
+
+/// Read cache phase 1 (ADR 0008, story 46): the in-place dictionary scan
+/// answers exactly what a full block decode answers, on any input.
+#[cfg(test)]
+mod dict_find_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A full decode's answer, as the oracle: `Some(found)` or `None` for
+    /// `Corrupt`.
+    fn oracle(b: &[u8], id: u64) -> Option<Option<String>> {
+        decode_dict_block(b)
+            .ok()
+            .map(|e| e.into_iter().find(|(i, _)| *i == id).map(|(_, t)| t))
+    }
+
+    fn assert_same(b: &[u8], id: u64) {
+        match dict_block_find(b, id) {
+            Ok(found) => assert_eq!(Some(found), oracle(b, id), "id {id}"),
+            Err(e) => {
+                assert!(matches!(e, StoreError::Corrupt(_)), "{e:?}");
+                assert_eq!(oracle(b, id), None, "scan refused, decode accepted");
+            }
+        }
+    }
+
+    fn encode(entries: &[(u64, String)]) -> Vec<u8> {
+        let refs: Vec<(u64, &str)> = entries.iter().map(|(i, t)| (*i, t.as_str())).collect();
+        encode_dict_block(&refs)
+    }
+
+    /// Ascending, unique ids with arbitrary (including multi-byte) text.
+    fn entries(max: usize) -> impl Strategy<Value = Vec<(u64, String)>> {
+        prop::collection::vec((1u64..1 << 40, ".{0,24}"), 0..max).prop_map(|v| {
+            let mut id = 0;
+            v.into_iter()
+                .map(|(step, text)| {
+                    id += step;
+                    (id, text)
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn edge_inputs_match_full_decode() {
+        for b in [&[][..], &[0], &[1], &[0x80], &[1, 5], &[1, 5, 3, b'a']] {
+            for id in [0, 5, 6] {
+                assert_same(b, id);
+            }
+        }
+        assert_eq!(dict_block_find(&[0], 1).expect("empty block"), None);
+    }
+
+    #[test]
+    fn full_and_byte_cap_blocks_match_full_decode() {
+        let full: Vec<(u64, String)> = (1..=DICT_BLOCK as u64)
+            .map(|i| (i * 3, format!("t{i}")))
+            .collect();
+        let b = encode(&full);
+        for id in [3, (DICT_BLOCK as u64) * 3, 4, 0] {
+            assert_same(&b, id);
+        }
+        // One entry that alone reaches the 64 KiB block byte cap.
+        let big = vec![(9, "x".repeat(64 << 10))];
+        let b = encode(&big);
+        assert_eq!(
+            dict_block_find(&b, 9).expect("big").map(|t| t.len()),
+            Some(64 << 10)
+        );
+        assert_same(&b, 9);
+        assert_same(&b[..b.len() - 1], 9);
+    }
+
+    proptest! {
+        #[test]
+        fn scan_equals_full_decode(entries in entries(80), pick in any::<prop::sample::Index>(), cut in any::<prop::sample::Index>(), flip in any::<(prop::sample::Index, u8)>()) {
+            let b = encode(&entries);
+            let probe = if entries.is_empty() { 7 } else { entries[pick.index(entries.len())].0 };
+            let last = entries.last().map_or(1, |e| e.0);
+            for id in [probe, last, last + 1, 0] {
+                assert_same(&b, id);
+                // Truncated input (every cut point is reachable).
+                assert_same(&b[..cut.index(b.len() + 1)], id);
+                // One corrupted byte.
+                if !b.is_empty() {
+                    let mut c = b.clone();
+                    let at = flip.0.index(c.len());
+                    c[at] ^= flip.1;
+                    assert_same(&c, id);
+                }
+            }
+        }
+
+        #[test]
+        fn arbitrary_bytes_never_panic(b in prop::collection::vec(any::<u8>(), 0..64), id in 0u64..8) {
+            assert_same(&b, id);
         }
     }
 }

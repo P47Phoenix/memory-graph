@@ -38,8 +38,10 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReadStats {
-    /// Reverse-dictionary blocks decoded by queries to resolve one term id
-    /// (one per uncached term-text lookup; writes are not counted).
+    /// Reverse-dictionary blocks scanned by queries to resolve one term id
+    /// (one per uncached term-text lookup; writes are not counted). Since
+    /// read cache phase 1 a scan walks the encoded entries without decoding
+    /// them, so this is a block visit, not a full decode.
     pub dict_block_decodes: u64,
     /// Term-text lookups answered from the per-query memo.
     pub dict_text_memo_hits: u64,
@@ -61,6 +63,9 @@ pub struct ReadStats {
     pub lazy_decode_nanos: u64,
     /// Nanoseconds inside full stream decodes (timing on only).
     pub full_decode_nanos: u64,
+    /// Dictionary strings allocated by query-side lookups: exactly one per
+    /// uncached term-text lookup that finds its id (read cache phase 1).
+    pub dict_strings_decoded: u64,
 }
 
 impl ReadStats {
@@ -88,6 +93,7 @@ impl ReadStats {
             self.dict_decode_nanos,
             self.lazy_decode_nanos,
             self.full_decode_nanos,
+            self.dict_strings_decoded,
         ]
     }
 
@@ -103,6 +109,7 @@ impl ReadStats {
             dict_decode_nanos: v[Counter::DictNanos as usize],
             lazy_decode_nanos: v[Counter::LazyNanos as usize],
             full_decode_nanos: v[Counter::FullNanos as usize],
+            dict_strings_decoded: v[Counter::DictStrings as usize],
         }
     }
 }
@@ -121,9 +128,10 @@ pub(crate) enum Counter {
     DictNanos,
     LazyNanos,
     FullNanos,
+    DictStrings,
 }
 
-const COUNTERS: usize = 10;
+const COUNTERS: usize = 11;
 
 static GLOBAL: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 static TIMING: AtomicBool = AtomicBool::new(false);
