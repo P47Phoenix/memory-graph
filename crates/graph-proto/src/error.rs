@@ -21,6 +21,10 @@
 //! them as its own variants so a server can build one without a `StoreError`
 //! in hand, and `WireError <-> StoreError` maps them one to one in both
 //! directions (a `WireError::Store` never wraps one of the three).
+//!
+//! A refusal may also be marked *transient* on the wire
+//! ([`transient_rejection`], issue #225): still `Rejected` on both sides,
+//! but a client retries it until its write deadline.
 use crate::pb::{self, store_error_detail as d};
 use graph_core::{NodeKind, SchemaError};
 use graph_store::StoreError;
@@ -207,12 +211,16 @@ impl WireError {
                     path: path.clone(),
                     reason: reason.clone(),
                 }),
-                StoreError::Rejected(msg) => K::Rejected(d::Rejected { msg: msg.clone() }),
+                StoreError::Rejected(msg) => K::Rejected(d::Rejected {
+                    msg: msg.clone(),
+                    transient: false,
+                }),
                 // Server-internal (the state machine consumes it); should one
                 // ever leak it travels as the refusal it is, in its class.
-                StoreError::AlreadyApplied { .. } => {
-                    K::Rejected(d::Rejected { msg: e.to_string() })
-                }
+                StoreError::AlreadyApplied { .. } => K::Rejected(d::Rejected {
+                    msg: e.to_string(),
+                    transient: false,
+                }),
                 StoreError::NotUtf8(path) => K::NotUtf8(d::NotUtf8 { path: path.clone() }),
                 StoreError::StrictEncoding { path, encoding } => {
                     K::StrictEncoding(d::StrictEncoding {
@@ -413,6 +421,42 @@ pub fn status_to_store_error(s: &Status) -> StoreError {
     WireError::from(s).into()
 }
 
+/// A *transient* refusal (`StoreErrorDetail.Rejected.transient`, issue
+/// #225): the same code (`INVALID_ARGUMENT`), message and `StoreError`
+/// (`Rejected(msg)`) as any refusal, but marked as expected to clear on its
+/// own shortly, so a client retries the request until its write deadline
+/// ([`is_transient_rejection`]) and then reports the refusal unchanged. An
+/// older client ignores the flag and fails at once, as before.
+pub fn transient_rejection(msg: String) -> Status {
+    let detail = pb::StoreErrorDetail {
+        kind: Some(d::Kind::Rejected(d::Rejected {
+            msg: msg.clone(),
+            transient: true,
+        })),
+    };
+    let display = StoreError::Rejected(msg).to_string();
+    Status::with_details(
+        Code::InvalidArgument,
+        display,
+        detail.encode_to_vec().into(),
+    )
+}
+
+/// Whether `s` is a [`transient_rejection`] (its typed detail says so).
+pub fn is_transient_rejection(s: &Status) -> bool {
+    let details = s.details();
+    !details.is_empty()
+        && matches!(
+            pb::StoreErrorDetail::decode(details),
+            Ok(pb::StoreErrorDetail {
+                kind: Some(d::Kind::Rejected(d::Rejected {
+                    transient: true,
+                    ..
+                })),
+            })
+        )
+}
+
 /// A `WireError` over a borrowed `StoreError` (which is not `Clone`):
 /// re-creates the variant field by field; the three cluster-level variants
 /// become their `WireError` counterparts.
@@ -497,6 +541,31 @@ mod tests {
             assert!(is_transport_loss(c, ""));
         }
         assert!(!is_transport_loss(Code::Internal, "connection reset"));
+    }
+
+    /// Issue #225: a transient refusal is an ordinary refusal on the wire
+    /// (code, message, `StoreError`), plus the flag; nothing else carries it.
+    #[test]
+    fn a_transient_rejection_is_a_flagged_refusal() {
+        let st = transient_rejection("would drop below quorum".into());
+        let plain = store_error_to_status(&StoreError::Rejected("would drop below quorum".into()));
+        assert_eq!(st.code(), plain.code());
+        assert_eq!(st.message(), plain.message());
+        assert!(is_transient_rejection(&st));
+        assert!(!is_transient_rejection(&plain));
+        assert!(matches!(
+            status_to_store_error(&st),
+            StoreError::Rejected(ref m) if m == "would drop below quorum"
+        ));
+        // Other kinds, and statuses without a (decodable) detail, are not.
+        for other in [
+            store_error_to_status(&StoreError::NoLeader { retry_after_ms: 1 }),
+            store_error_to_status(&StoreError::Storage("x".into())),
+            Status::invalid_argument("would drop below quorum"),
+            Status::with_details(Code::InvalidArgument, "x", vec![0xff, 0xff].into()),
+        ] {
+            assert!(!is_transient_rejection(&other), "{other:?}");
+        }
     }
 
     #[test]
