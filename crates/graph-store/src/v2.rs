@@ -487,6 +487,13 @@ pub struct V2Store {
     /// always written.
     #[cfg(test)]
     pub(crate) skip_open_batch_marker: bool,
+    /// Test-only (#224): `index_batch`'s chunk commits skip the fsync
+    /// (`Durability::None`), so a timing test of what the marker adds to a
+    /// chunk is not swamped by the disk's commit latency, which on a shared
+    /// CI runner varies by more than the gate. Exists only under
+    /// `cfg(test)`; every other build commits durably.
+    #[cfg(test)]
+    pub(crate) non_durable_commits: bool,
     pub(crate) cache_bytes: Option<usize>,
     path: PathBuf,
     max_snapshot_age: Duration,
@@ -2793,6 +2800,8 @@ impl V2Store {
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             #[cfg(test)]
             skip_open_batch_marker: false,
+            #[cfg(test)]
+            non_durable_commits: false,
             cache_bytes,
             path: path.to_path_buf(),
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
@@ -3204,6 +3213,8 @@ impl V2Store {
             marked_commit_hook,
             #[cfg(test)]
                 skip_open_batch_marker: _,
+            #[cfg(test)]
+                non_durable_commits: _,
         } = self;
         // Drop the old handle before renaming over its path (Windows will
         // not allow the rename while any `Database` still has it open).
@@ -3602,7 +3613,17 @@ impl V2Store {
         } else {
             chunk_bytes
         };
-        let mut wt = self.db.begin_write()?;
+        #[cfg(test)]
+        let begin = || -> Result<redb::WriteTransaction> {
+            let mut wt = self.db.begin_write()?;
+            if self.non_durable_commits {
+                wt.set_durability(redb::Durability::None);
+            }
+            Ok(wt)
+        };
+        #[cfg(not(test))]
+        let begin = || -> Result<redb::WriteTransaction> { Ok(self.db.begin_write()?) };
+        let mut wt = begin()?;
         if let Some((marker, membership)) = marker {
             Self::stamp_marker(&wt, marker, membership)?;
         }
@@ -3643,7 +3664,7 @@ impl V2Store {
             if in_txn >= chunk_bytes {
                 wt.commit()?;
                 commits += 1;
-                wt = self.db.begin_write()?;
+                wt = begin()?;
                 // This chunk is not (yet) known to be the batch's last, so
                 // re-stamp the marker in the new transaction; if it turns out
                 // to be the last, the clear below overwrites it in that same

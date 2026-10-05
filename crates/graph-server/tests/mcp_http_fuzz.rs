@@ -62,7 +62,10 @@ fn exchange(addr: SocketAddr, raw: &[u8], half_close: bool) -> Result<Vec<u8>, S
         {
             Err(format!("no answer within 20 s: {e}"))
         }
-        // A reset after an early answer (413 with the body unread).
+        // A connection error after what was read: the answer, if any, is
+        // judged by the caller (a complete request must have one; the
+        // server reads the rest of a body it refused before it closes, so
+        // a reset cannot destroy that answer: #224).
         Err(_) => Ok(out),
     }
 }
