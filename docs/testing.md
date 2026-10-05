@@ -271,6 +271,13 @@ well under 30 s (the slowest, the partition, about 5 s):
   right after `TransferLeader` a raw `Remove` is refused with a transient
   quorum refusal; the same remove through `RemoteStore` (forwarded by the
   old leader) is retried and succeeds once the peer is matched.
+- `remove_lost_self_retries_only_the_transient_refusal`: the same race
+  for `serve --bootstrap-or-join`'s removal of a lost incarnation
+  (`join::remove_lost_self`): retried until it succeeds, while a final
+  refusal (removing the leader) ends it at once. `remove_guards` also
+  checks that final refusals come back at once through a client with a
+  15 s write deadline, and that only the quorum refusal carries the
+  transient flag on the wire.
 - `transfer_leader_moves_leadership` (3 nodes) and `..._five_nodes`: sent
   to a follower, forwarded; exactly the target leads (never a third node),
   the old leader follows it, writes work through both; the 3-node case runs

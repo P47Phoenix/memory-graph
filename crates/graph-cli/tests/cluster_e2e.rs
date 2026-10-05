@@ -877,7 +877,8 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
             .then_some(())
     });
     let t = Instant::now();
-    let o = run(&[
+    // Bounded: a deadline regression must fail the test, not hang it.
+    let o = run_bounded(&[
         "--server",
         &n2.addr,
         "--write-deadline",

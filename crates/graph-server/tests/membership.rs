@@ -480,8 +480,11 @@ fn remove_guards() {
     let leader = tb.leader();
     let others = node_ids_other_than(&tb, &[leader]);
     let (a, b) = (others[0], others[1]);
-    // Through a follower: forwarded to the leader, which refuses.
+    // Through a follower: forwarded to the leader, which refuses. These
+    // refusals are final: answered at once, not retried until the client's
+    // 15 s write deadline (issue #225 retries only the transient one).
     let via = tb.client(a);
+    let t0 = Instant::now();
     let e = via.admin_remove(leader, true).unwrap_err();
     assert!(
         matches!(e, StoreError::Rejected(ref m) if m.contains("transfer leadership first")),
@@ -489,6 +492,26 @@ fn remove_guards() {
     );
     let e = via.admin_remove(a, false).unwrap_err();
     assert!(e.to_string().contains("--force"), "{e}");
+    let took = t0.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "final refusals must not be retried: took {took:?}"
+    );
+    // On the wire, only the quorum refusal is marked transient.
+    for (id, force) in [(leader, true), (a, false)] {
+        let st = rt()
+            .block_on(async {
+                admin_client(&tb.node(leader).endpoint())
+                    .await
+                    .remove(pb::RemoveRequest { node_id: id, force })
+                    .await
+            })
+            .unwrap_err();
+        assert!(
+            !graph_proto::error::is_transient_rejection(&st),
+            "a final refusal marked transient: {st:?}"
+        );
+    }
     // A non-member: nothing to remove, an idempotent OK (a retried remove).
     // #122: reported, so an operator notices a mistyped id.
     let r = via.admin_remove(42, true).unwrap();
@@ -503,6 +526,21 @@ fn remove_guards() {
     // The refusal is transient (issue #225), so the client retries it until
     // its write deadline and then reports it as is: `Rejected`, not
     // `NoLeader` (exit code 1 in the CLI, not 4), bounded by the deadline.
+    let st = rt()
+        .block_on(async {
+            admin_client(&tb.node(leader).endpoint())
+                .await
+                .remove(pb::RemoveRequest {
+                    node_id: a,
+                    force: true,
+                })
+                .await
+        })
+        .unwrap_err();
+    assert!(
+        graph_proto::error::is_transient_rejection(&st) && st.message().contains(QUORUM_REFUSAL),
+        "{st:?}"
+    );
     let t0 = Instant::now();
     let e = short_client(&tb, leader, Duration::from_secs(2))
         .admin_remove(a, true)
@@ -531,28 +569,18 @@ fn remove_guards() {
         .unwrap();
 }
 
-/// Issue #225: right after `TransferLeader` the new leader has no matched
-/// index for a peer whose first append is still under way (held 3 s here by
-/// the fault plan, as a slow first RPC on a loaded machine would be), so
-/// `Remove`'s quorum guard refuses: correctly, and transiently. A single raw
-/// `Remove` shows the race; `RemoteStore` (the CLI) retries the refusal and
-/// the remove, sent right after the transfer through the old leader (so
-/// forwarded), succeeds once the new leader reaches the peer.
-#[test]
-fn remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_peers() {
-    let _w = watchdog(
-        "remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_peers",
-        TEST_LIMIT,
-    );
-    const HOLD: Duration = Duration::from_secs(3);
-    let mut tb = ClusterTestbed::new(3, exts());
-    tb.form();
+/// Issue #225 setup: a formed 3-node cluster whose leader (`old`) hands
+/// leadership to `target` while the fault plan holds the new leader's
+/// appends to `slow` for `hold` (as a slow first RPC on a loaded machine
+/// would), with `slow`'s own elections off meanwhile (it hears nothing from
+/// the new leader for longer than an election timeout, and its higher term
+/// would depose the new leader: a different race). Checks that a single raw
+/// `Remove` of `old` right after the transfer is refused, transiently: the
+/// race, reproduced. Returns `(old, target, slow)`.
+fn transfer_with_a_held_peer(tb: &ClusterTestbed, hold: Duration) -> (u64, u64, u64) {
     let old = tb.leader();
-    let others = node_ids_other_than(&tb, &[old]);
+    let others = node_ids_other_than(tb, &[old]);
     let (target, slow) = (others[0], others[1]);
-    // `slow` hears nothing from the new leader for HOLD, longer than an
-    // election timeout: keep it from campaigning meanwhile (its higher term
-    // would depose the new leader, a different race).
     tb.node(slow)
         .raft()
         .unwrap()
@@ -560,13 +588,12 @@ fn remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_pee
         .runtime_config()
         .elect(false);
     let term = tb.node(old).raft().unwrap().metrics().current_term;
-    tb.faults().hold_new_term_appends_to(slow, term, HOLD);
+    tb.faults().hold_new_term_appends_to(slow, term, hold);
     let t0 = Instant::now();
     assert_eq!(
         tb.client(old).admin_transfer_leader(target).unwrap(),
         target
     );
-    // The race, reproduced: one Remove now is refused, transiently.
     let st = rt()
         .block_on(async {
             admin_client(&tb.node(target).endpoint())
@@ -579,7 +606,7 @@ fn remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_pee
         })
         .unwrap_err();
     assert!(
-        t0.elapsed() < HOLD,
+        t0.elapsed() < hold,
         "the raw Remove came too late to see the race"
     );
     assert!(
@@ -588,10 +615,12 @@ fn remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_pee
     );
     assert!(st.message().contains(QUORUM_REFUSAL), "{st:?}");
     assert_eq!(tb.membership(target).0.len(), 3, "nothing changed");
-    // Through RemoteStore: retried, and done once `slow` is matched.
-    let r = tb.client(old).admin_remove(old, true).unwrap();
-    assert!(!r.not_a_member, "{r:?}");
-    eprintln!("remove after the transfer done at {:?}", t0.elapsed());
+    (old, target, slow)
+}
+
+/// After the remove: `target` and `slow` are the voters, `slow` may
+/// campaign again, and writes work.
+fn check_two_voters_left(tb: &ClusterTestbed, target: u64, slow: u64) {
     tb.wait_voters(&[target, slow], CLUSTER_WAIT);
     tb.node(slow)
         .raft()
@@ -603,6 +632,64 @@ fn remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_pee
     tb.client(target)
         .index_bytes("o", "r", &p, &bytes, None)
         .unwrap();
+}
+
+/// Issue #225: right after `TransferLeader` the new leader has no matched
+/// index for a peer whose first append is still under way, so `Remove`'s
+/// quorum guard refuses: correctly, and transiently. `RemoteStore` (the
+/// CLI) retries the refusal, and the remove, sent right after the transfer
+/// through the old leader (so forwarded), succeeds once the new leader
+/// reaches the peer.
+#[test]
+fn remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_peers() {
+    let _w = watchdog(
+        "remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_peers",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let t0 = Instant::now();
+    let (old, target, slow) = transfer_with_a_held_peer(&tb, Duration::from_secs(3));
+    let r = tb.client(old).admin_remove(old, true).unwrap();
+    assert!(!r.not_a_member, "{r:?}");
+    eprintln!("remove after the transfer done at {:?}", t0.elapsed());
+    check_two_voters_left(&tb, target, slow);
+}
+
+/// Issue #225, the lost-incarnation removal of `serve --bootstrap-or-join`
+/// (`join::remove_lost_self`): a final refusal (removing the leader) ends
+/// it at once, well before its timeout, and the transient quorum refusal
+/// right after a transfer is retried until the remove succeeds.
+#[test]
+fn remove_lost_self_retries_only_the_transient_refusal() {
+    let _w = watchdog(
+        "remove_lost_self_retries_only_the_transient_refusal",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let leader = tb.leader();
+    let via = tb.node(node_ids_other_than(&tb, &[leader])[0]).endpoint();
+    let timeout = Duration::from_secs(20);
+    let t0 = Instant::now();
+    let e = rt()
+        .block_on(graph_server::join::remove_lost_self(&via, leader, timeout))
+        .unwrap_err();
+    assert!(e.contains("transfer leadership first"), "{e}");
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "a final refusal must not be retried: took {:?}",
+        t0.elapsed()
+    );
+    let (old, target, slow) = transfer_with_a_held_peer(&tb, Duration::from_secs(3));
+    let old_ep = tb.node(old).endpoint();
+    rt().block_on(graph_server::join::remove_lost_self(&old_ep, old, timeout))
+        .unwrap_or_else(|e| panic!("remove_lost_self after the transfer: {e}"));
+    eprintln!(
+        "remove_lost_self after the transfer done at {:?}",
+        t0.elapsed()
+    );
+    check_two_voters_left(&tb, target, slow);
 }
 
 /// A raw `Admin` client of `endpoint` (no retries, no leader following).

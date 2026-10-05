@@ -41,7 +41,7 @@ Logs go to stderr. Stdout carries only the `listening on` start line, and `metri
 | `mg_backup_failures_total`, `mg_backup_bytes_total` | counter | Backups that failed after every retry; bytes written by successful ones |
 | `mg_mcp_tool_calls_total{tool,outcome}` | counter | MCP tool calls served by `serve --mcp-listen` ([docs/mcp.md](../mcp.md)) |
 
-`cluster status --json` reports the same Raft and store numbers, `writes_forwarded_total`, `rpcs_total` and `entries_applied_total`; on the leader, `replication` lists each peer's `matched_index`, `lag` and `last_error` (the last failed Raft RPC to it, empty once it answers again).
+`cluster status --json` reports the same Raft and store numbers, `writes_forwarded_total`, `rpcs_total` and `entries_applied_total`; on the leader, `replication` lists each peer's `matched_index`, `lag` and `last_error` (the last failed Raft RPC to it, kept while RPCs to it keep failing or while it lags behind the leader; empty once it answers and has caught up).
 
 Contract note on `outcome`: it is read from the response headers, so an error a streaming call (`Descendants`, `FileTokens`, snapshot download) reports in its trailers after its first message counts as `ok`; alert on stream failures from the client side.
 

@@ -623,8 +623,10 @@ pub async fn resolve_bootstrap_or_join(
 
 /// `Admin.Remove` of `id` through `peer` (forwarded to the leader), with
 /// `force` (3 voters to 2: the node is back as a voter once it caught up),
-/// retrying while no leader answers until `timeout`.
-async fn remove_lost_self(peer: &str, id: NodeId, timeout: Duration) -> Result<(), String> {
+/// retrying while no leader answers, or the leader refuses transiently,
+/// until `timeout`. Public only for the membership tests.
+#[doc(hidden)]
+pub async fn remove_lost_self(peer: &str, id: NodeId, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut target = peer.to_string();
     let mut delay = Duration::from_millis(100);
@@ -650,8 +652,14 @@ async fn remove_lost_self(peer: &str, id: NodeId, timeout: Duration) -> Result<(
                     Next::Fail(e) => {
                         // The quorum check refuses transiently while the
                         // other members still settle (a typed flag, issue
-                        // #225); retry that too.
-                        if !graph_proto::error::is_transient_rejection(&st) {
+                        // #225); retry that too. The text match covers a
+                        // leader one release older (no flag yet) in a
+                        // mixed-version cluster: drop it after one release.
+                        if !graph_proto::error::is_transient_rejection(&st)
+                            && !st
+                                .message()
+                                .contains(crate::services::admin::QUORUM_REFUSAL)
+                        {
                             return Err(e.to_string());
                         }
                         st.message().to_string()

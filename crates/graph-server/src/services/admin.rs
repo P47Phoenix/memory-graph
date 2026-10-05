@@ -336,8 +336,9 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<(u64, bool
                 "removing node {id} {QUORUM_REFUSAL}: {} voters would {which} \
                  ({set:?}), a quorum is {quorum}, and only {} of them are reachable now \
                  ({down:?} are not); bring them back first. --force does not override this. \
-                 (A node that just came back may still show its last error for a moment; \
-                 retry shortly.)",
+                 (A node that just came back, or a leader elected a moment ago, can make this \
+                 refusal momentary, so clients retry it until their write deadline; refused \
+                 after that, check those nodes, then retry.)",
                 set.len(),
                 up.len()
             )));
