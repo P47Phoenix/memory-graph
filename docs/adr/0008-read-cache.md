@@ -6,7 +6,7 @@
 
 1. Today the only thing a query reuses from the last query is redb's page cache. Everything decoded from those pages (dictionary blocks, symbol sections, org/repo/file nodes) is thrown away at the end of each call and decoded again by the next.
 2. This ADR first measures how much time that re-decoding costs (phase 0), then takes two cheap wins (phase 1), and only if decode passes an exact threshold adds an in-process cache of decoded objects (phase 2).
-3. The cache must never return something a reader's MVCC snapshot would not see. Every committed write bumps a generation and records, per key, the generation that last changed it. An entry is tagged with the snapshot generation of the reader that built it, and a reader may use it only if the key has not changed since either snapshot. Anything uncertain bypasses to redb.
+3. The cache must never return something a reader's MVCC snapshot would not see, and readers must never wait for a writer. Every committed write bumps a seqlock generation and records, per key, the generation that last changed it. An entry is tagged with the snapshot generation of the reader that built it, and a reader may use it only if the key has not changed since either snapshot and both are above a floor. Anything uncertain bypasses to redb.
 4. It is pure Rust, in process, memory only, sized from the hardware, and `--read-cache-bytes 0` turns it off. There is no on-disk format change.
 5. An external cache such as Redis is rejected: it is slower than a local decode, cannot follow MVCC snapshots or Raft applied indexes, and adds an ops dependency to an embedded single-file database.
 
@@ -57,47 +57,61 @@ Four phases. Each later phase is gated on the one before.
 
 State, beside the cache:
 
-- `gen`: the generation, bumped once per successful commit.
-- `last_mod: Map<Key, u64>`: the generation that last changed each key.
-- `F`: the floor generation. Nothing below it is trusted.
+- `gen: AtomicU64`, a seqlock word. It is even when no commit is in progress and odd while one is; each successful commit moves it on by 2.
+- `last_mod: Map<Key, u64>`: the generation that last changed each non-dictionary key. An absent record means "unchanged since before F".
+- `F: AtomicU64`: the floor generation. Nothing below it is trusted.
 
-**Writer protocol.** Every write goes through a `RecordingWriteTxn` wrapper. Its only commit method takes the touched-key set (`commit(self, touched: TouchedKeys)`), so a write cannot commit without declaring what it touched; this is type-enforced, not a convention. Commit then does, under the cache's `gen_lock` (a mutex):
+**Safety property and optimisation.** The use-time check below is the safety property; everything else (the insert-time check, pruning) is an optimisation or a memory bound. A reader that is unsure of anything reads redb, so uncertainty only ever costs an uncached read.
 
-1. commit the redb transaction;
-2. if it succeeded, set `last_mod[k] = gen + 1` for each touched key, then publish `gen = gen + 1`.
+**Writer protocol (seqlock).** Writes are already serialised by redb's single write transaction. Every write goes through a `RecordingWriteTxn` wrapper whose only commit method takes the touched-key set (`commit(self, touched: TouchedKeys)`), so a write cannot commit without declaring what it touched; this is type-enforced. Commit does:
 
-The bump happens only after a successful commit. An aborted transaction bumps nothing. A failure between commit and bump (a failpoint covers this) is handled by invalidating everything (`F = gen + 1`, then the bump), which can only over-invalidate.
+1. `gen` += 1 (now odd: commit in progress);
+2. commit the redb transaction (including the fsync);
+3. on success, set `last_mod[k] = gen + 1` for each touched key, then `gen` += 1 (even, the new generation); on failure, raise `F` to `gen + 1` and `gen` += 1, which can only over-invalidate.
 
-**Reader protocol.** A reader takes `gen_lock`, calls `begin_read`, reads `G = gen`, and releases the lock. Holding the lock across both makes `G` exactly the generation of the snapshot the reader sees. (A seqlock was considered; the mutex is simpler and is held only for `begin_read`, which is cheap.) If `G < F`, the reader bypasses the cache entirely.
+An aborted transaction that never reaches commit touches nothing. A failure between the redb commit and step 3 (a failpoint covers this) leaves `gen` odd only until the error path runs, which raises `F`.
+
+**Reader protocol (wait-free).** A reader reads `g1 = gen`, calls `begin_read`, reads `g2 = gen`, registers in the reader table (below), and re-reads `g3 = gen`. If `g1` is odd or `g1 != g2` or `g2 != g3`, the reader bypasses the cache for its whole lifetime (it still reads redb normally). Otherwise `G = g1`.
+
+- **Why a seqlock, not a mutex or try-lock:** redb readers never wait for a writer today, and a lock held across a commit (with its fsync, and every chunk of `commit_each_counted`) would queue readers behind indexing. A try-lock-else-bypass would also be wait-free but would bypass for the whole commit too while adding a lock word to the hot path; the seqlock costs three atomic loads and bypasses only readers that actually overlap a commit. Correctness: if `gen` was even and unchanged across `begin_read`, no commit finished or started during it, so the snapshot is exactly generation `G`.
+- **Acceptance (manual benchmark, not CI):** reader p99 under a concurrent indexer with the cache on is no worse than with the cache off.
+- **With `--read-cache-bytes 0`** readers never touch `gen`, `F`, the reader table or the cache. Writers still maintain `gen` and `last_mod` (a map insert per touched key), so the protocol does not depend on configuration.
 
 **Entry tag.** An entry is tagged with `Ge`, the snapshot generation of the reader that decoded it, not the time it was inserted.
 
-- **Insert:** rejected if `last_mod(K) > Ge` (a newer write already changed the key) or `Ge < F`. This covers a slow old reader inserting after a newer write.
-- **Use:** a reader at `G` may use an entry iff `Ge >= F` and `last_mod(K) <= min(G, Ge)`. Otherwise it reads redb and may try to insert its own decode.
+- **Use (safety):** a reader at `G` may use an entry for key `K` iff, reading `F_now` at lookup time, `G >= F_now && Ge >= F_now && last_mod(K) <= min(G, Ge)`, where an absent record counts as below `F_now`. Otherwise it reads redb. `F` is re-read on every lookup, so a floor raised mid-reader (vacuum, a cap prune) makes that reader bypass from then on.
+- **Insert (optimisation):** skipped if `last_mod(K) > Ge` or `Ge < F_now`, which saves inserting an entry the use check would always reject (for example a slow old reader inserting after a newer write).
 - This is correct in both directions: a newer reader never sees an entry built before a change it can see, and an older reader never sees an entry built from a change it cannot see.
 
-**Dictionary blocks.** Blocks are append-only, so a cached block also records its string count. A reader at `G` uses a cached block only for ids below its own high-water mark (the count it would see in its snapshot, held in the reader's meta); a longer cached block is still valid for older ids. `dict_rev_append` records its block as touched as usual.
+**Dictionary blocks are exempt from `last_mod`.** Reverse blocks are append-only (`dict_rev_append` only extends the last block, and strings never change). A cached `DictBlock` records its string count, and a reader at `G` uses it only for ids below its own high-water mark (the dictionary length in its snapshot's meta). A longer cached block is valid for every older id, so no generation check is needed; a shorter one is replaced on a miss. Dictionary entries still obey `F` (vacuum renumbers nothing today, but clear-all drops them for simplicity).
 
-**Clear-all.** Vacuum, `vacuum_marked`, snapshot import and any phase 3 result-cache clear set `F = gen + 1` (before the bump of their own commit). Entries tagged below `F` are rejected and readers with `G < F` bypass.
+**Clear-all.** `vacuum` and `vacuum_marked` raise `F` to the generation their commit will publish. A snapshot install is not a write: it is a `StoreSlot` slot swap (`state_machine.rs` ~374-385), which drops the old store with its cache and starts an empty one. A phase 3 result-cache clear raises that cache's own floor.
 
-**Touched-key coverage.** The recorder must be fed by every write path:
+**Touched-key coverage.** Every write path feeds the recorder:
 
 | Write path | Keys touched |
 |---|---|
-| `commit_prepared` (index, re-index) | `FileCtx`, `Symbols` for each file; `Repo`, `Org` if created or changed; each extended `DictBlock` |
-| `dict_rev_append` | the extended `DictBlock` |
-| `ingest_file_with_origin` (origin refresh, v2.rs ~3377) | `FileCtx` |
-| `remove_content` (v2.rs ~2192), remove-repo, `prune_files` / `prune_files_marked` | `FileCtx`, `Symbols` per file; `Repo`, `Org` |
-| marked writes (Raft `raft_sm` path) | as for the unmarked write they wrap |
-| `vacuum`, `vacuum_marked`, snapshot import | clear-all (raise `F`) |
+| `commit_prepared` (index, re-index), via `index_prepared_marked` on Raft | `FileCtx`, `Symbols` per file; `Repo`, `Org` if created or changed (dictionary appends need no key) |
+| `index_bytes_opts` (commits at v2.rs ~3355, ~3372) | as `commit_prepared`, for its file |
+| `commit_each_counted` (v2.rs ~3540) | one touched set per chunk commit; each chunk is its own generation, and readers may land between chunks and see a consistent prefix |
+| `ingest_file_with_origin` (origin refresh, v2.rs ~3377), via `ingest_file_marked` | `FileCtx` |
+| `remove_content` (v2.rs ~2192), remove-repo, `prune_files`, `prune_files_marked` | `FileCtx`, `Symbols` per file; `Repo`, `Org` |
+| `rebuild_refs` / `rebuild_refs_in` (v2.rs ~2322, ~3083) | `All` (raise `F`) unless it can name its files |
+| `vacuum`, `vacuum_marked` | `All` (raise `F`) |
+| marker-only openraft blank and membership entries (v2.rs ~3057-3062) | no keys, but still a commit, so they bump `gen` |
+| test hooks (v2.rs ~2560-2593) | `TouchedKeys::All` |
+| open-time writes: `rebuild_encoding_catalog_in`, the `from_db` schema upgrades (~2640-2731), `clear_raft_state` (~2796) | none: they run before the cache exists |
 
-A path that cannot name its keys precisely must declare `TouchedKeys::All`, which raises `F`.
+Raft applies use exactly these marked calls (`state_machine.rs` ~292, ~308, ~322, ~326: `index_prepared_marked`, `ingest_file_marked`, `prune_files_marked`, `vacuum_marked`), so followers invalidate as the leader does. A path that cannot name its keys precisely must declare `TouchedKeys::All`.
 
-**Bounding `last_mod`.** The cache tracks the oldest active reader generation `Gmin` (each reader, and each snapshot handle, registers its `G` and deregisters on drop). Records with generation `<= Gmin` are pruned and the floor is raised to the largest pruned generation (`F = max(F, pruned)`). No active reader is below the new floor, so none loses correctness; a later reader simply finds those entries rejected and repopulates. A snapshot handle held for a long time pins `Gmin`, so `last_mod` grows until it is released; the map is also capped (`max_mod_records`), and exceeding the cap raises `F` to `gen + 1`, which makes old readers bypass rather than grow memory.
+**Reader table and bounding `last_mod`.** Each reader that passes the seqlock check registers its `G` in a reader table between the second and third `gen` reads (so a reader is registered before it is trusted), and deregisters in `Drop`, which also runs on panic. The oldest registered generation is `Gmin`.
 
-**Raft followers.** Applies go through the same `RecordingWriteTxn` path (`state_machine.rs` calls the store's marked writes), so followers invalidate exactly as the leader does. Installing a snapshot is a slot swap and drops the cache. Linearizable reads (`Admin.ReadIndex`) wait for the applied index and then read like any other reader.
+- Records with generation `<= Gmin` may be dropped only by raising `F` past them (`F = max(F, dropped + 2)`); an absent record then means "older than F", which the use rule treats as unusable for any entry or reader below `F`. No registered reader is below the new floor, so none loses an answer, only cache hits.
+- Snapshot handles and long readers pin `Gmin`. gRPC snapshot handles are tied to the existing snapshot-handle TTL and idle expiry, so an orphaned handle deregisters when it expires; a leaked embedded reader pins until dropped.
+- `last_mod` is also capped (`max_mod_records`). Exceeding the cap raises `F` to the current `gen`, so every reader then active bypasses from its next lookup rather than memory growing.
+- Metric: `read_cache_floor_raises`, counted by cause (vacuum, cap, prune, commit failure).
 
-**`--read-cache-bytes 0`.** No cache is allocated and the read path does no cache work (no lookups, no counters move). Writes still bump `gen` and record keys, so the protocol does not depend on configuration; the cost is a map insert per touched key.
+**Raft followers and crashes.** Followers apply through the same marked calls and recorder. Installing a snapshot is a slot swap and drops the cache. Linearizable reads (`Admin.ReadIndex`) wait for the applied index and then read like any reader. The cache, `gen`, `F` and `last_mod` are memory only: a restart starts empty at a fresh generation, so crash and re-run cannot see stale entries.
 
 #### Engine and sizing
 
@@ -110,7 +124,7 @@ A path that cannot name its keys precisely must declare `TouchedKeys::All`, whic
 
 - `run_differential` gains read-cache configurations: off, one entry, a mid-size eviction-heavy budget, a budget smaller than the smallest entry, and large.
 - A consistency differential: concurrent writers against older readers and snapshot handles; each answer equals an uncached store's at the same generation.
-- Deterministic interleavings: (a) reader begins, writer commits, reader looks up (must not see the new value); (b) the mirror: a newer reader populates an entry, an older reader must not be served it; (c) a slow old reader inserts after a newer write (rejected); (d) a failpoint between commit and bump.
+- Deterministic interleavings: (a) reader begins, writer commits, reader looks up (must not see the new value); (b) the mirror: a newer reader populates an entry, an older reader must not be served it; (c) a slow old reader inserts after a newer write (rejected); (d) a failpoint between commit and bump; (e) a reader that begins during a commit (odd `gen`) bypasses; (f) a reader active while the `max_mod_records` cap fires, which then looks up a key re-populated at or above the new `F`, bypasses; (g) a reader between two `commit_each_counted` chunks sees a consistent prefix.
 - A concurrent eviction stress test: no stale answers, resident bytes within the bound.
 - Snapshot handles held across install, compact and vacuum; `last_mod` pruning with a pinned handle.
 - `run_crash_rerun_differential` with the cache on.
@@ -121,7 +135,7 @@ A path that cannot name its keys precisely must declare `TouchedKeys::All`, whic
 
 ### Phase 3 (optional): a query-result cache
 
-A server-side cache of whole query results keyed by (query, generation), cleared on every write (raising its own floor as a clear-all). Built only if the phase 0 benchmark's request log shows at least 20% of queries are exact repeats within 60 seconds at an unchanged generation.
+A server-side cache of whole query results keyed by (query, generation), cleared on every write (raising its own floor). Built only if the phase 0 benchmark's request log shows at least 20% of queries are exact repeats within 60 seconds at an unchanged generation.
 
 ## Alternatives considered
 
