@@ -1232,12 +1232,14 @@ pub fn run_blocking_with(
 ) -> Result<(), StoreError> {
     let rt = build_runtime(cfg.worker_threads).map_err(|e| io_err("tokio runtime", e))?;
     rt.block_on(async move {
-        let running = start(cfg, share(extractors)).await?;
-        // The handlers go in before `on_ready` announces the server (#224):
-        // a supervisor may send SIGTERM as soon as it reads the start line,
-        // and a signal that arrives before its handler kills the process
-        // with the default action (no graceful stop, LOCK sidecar left).
+        // The handlers go in before anything starts (#224): a supervisor
+        // may send SIGTERM as soon as it reads the start line, or while a
+        // long store open or log replay runs, and a signal that arrives
+        // before its handler kills the process with the default action (no
+        // graceful stop, LOCK sidecar left). One received during `start` is
+        // kept, and stops the server gracefully right after it started.
         let signals = Signals::install().map_err(|e| io_err("signal handlers", e))?;
+        let running = start(cfg, share(extractors)).await?;
         on_ready(&running);
         let handle = running.shutdown_handle();
         tokio::spawn(async move {

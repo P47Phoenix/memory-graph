@@ -193,10 +193,10 @@ fn an_early_answer_survives_a_client_that_reads_after_sending() {
         let head = head.replace("{addr}", &addr.to_string());
         let mut s = std::net::TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-        let req = format!(
-            "{head}Content-Type: application/json\r\nContent-Length: {body_len}\r\n\
-             Connection: close\r\n\r\n"
-        );
+        // No `Connection: close`: a pooling client's request. The answer
+        // must say the connection ends, since the body stays unread.
+        let req =
+            format!("{head}Content-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n");
         s.write_all(req.as_bytes()).unwrap();
         // The whole body, which the server answers without reading: it
         // must read it after answering, or this write cannot finish.
@@ -212,7 +212,126 @@ fn an_early_answer_survives_a_client_that_reads_after_sending() {
             text.starts_with(&format!("HTTP/1.1 {want} ")),
             "{want}: {text}"
         );
+        let head = text.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+        assert!(head.contains("\r\nconnection: close"), "{want}: {text}");
     }
+}
+
+/// An early answer (a 413 for a declared length over the limit, no body
+/// sent yet), then the connection is left open; `None` if the answer did
+/// not come.
+fn early_413(addr: SocketAddr) -> Option<std::net::TcpStream> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n",
+        64u64 << 20
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    // The server answers and half-closes at once: EOF after the answer.
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).ok()?;
+    String::from_utf8_lossy(&out)
+        .starts_with("HTTP/1.1 413 ")
+        .then_some(s)
+}
+
+/// Send `chunk` every `gap` until a write fails (the server has closed:
+/// its reset comes back); `(elapsed, bytes sent)` then, or `None` if every
+/// write still went through after `limit`.
+fn closed_within(
+    s: &mut std::net::TcpStream,
+    chunk: &[u8],
+    gap: Duration,
+    limit: Duration,
+) -> Option<(Duration, usize)> {
+    use std::io::Write;
+    let t0 = std::time::Instant::now();
+    let mut sent = 0;
+    while t0.elapsed() < limit {
+        if s.write_all(chunk).is_err() {
+            return Some((t0.elapsed(), sent));
+        }
+        sent += chunk.len();
+        std::thread::sleep(gap);
+    }
+    None
+}
+
+/// #224 review: the staged close is bounded. After an early answer the
+/// server keeps reading what the client sends, but closes once the client
+/// has been silent for `idle`, once `time` has passed however it trickles,
+/// and once `bytes` were read however fast it sends; each bound is checked
+/// alone, shortened through `testing_linger`.
+#[test]
+fn the_staged_close_is_bounded() {
+    use graph_server::mcp::Linger;
+    let long = Duration::from_secs(600);
+    let run = |bounds: Linger| {
+        let d = tempfile::tempdir().unwrap();
+        let mut m = loopback();
+        m.testing_linger = bounds;
+        let (srv, addr) = server(&d, m);
+        (d, srv, early_413(addr).expect("the early 413"))
+    };
+
+    // Idle: a byte now is still read; then silence past `idle`, and the
+    // connection is gone.
+    let (_d, _srv, mut s) = run(Linger {
+        idle: Duration::from_millis(300),
+        time: long,
+        bytes: u64::MAX,
+    });
+    assert!(
+        closed_within(
+            &mut s,
+            b" ",
+            Duration::from_millis(50),
+            Duration::from_millis(200)
+        )
+        .is_none(),
+        "the server still reads within the idle time"
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    let r = closed_within(
+        &mut s,
+        b" ",
+        Duration::from_millis(100),
+        Duration::from_secs(10),
+    );
+    assert!(r.is_some(), "still open 1.5 s after a 300 ms idle bound");
+
+    // Time: a byte every 50 ms is never idle, but `time` ends it.
+    let (_d, _srv, mut s) = run(Linger {
+        idle: long,
+        time: Duration::from_secs(1),
+        bytes: u64::MAX,
+    });
+    let r = closed_within(
+        &mut s,
+        b" ",
+        Duration::from_millis(50),
+        Duration::from_secs(20),
+    );
+    let (took, _) = r.expect("still open 20 s past a 1 s time bound");
+    assert!(took >= Duration::from_millis(800), "closed after {took:?}");
+
+    // Bytes: sending as fast as it can, closed after about `bytes`
+    // (plus what the socket buffers hold).
+    let (_d, _srv, mut s) = run(Linger {
+        idle: long,
+        time: long,
+        bytes: 256 << 10,
+    });
+    let r = closed_within(
+        &mut s,
+        &[b' '; 64 << 10],
+        Duration::ZERO,
+        Duration::from_secs(20),
+    );
+    let (_, sent) = r.expect("still open 20 s past a 256 KiB byte bound");
+    assert!(sent < 64 << 20, "{sent} bytes read past a 256 KiB bound");
 }
 
 #[test]

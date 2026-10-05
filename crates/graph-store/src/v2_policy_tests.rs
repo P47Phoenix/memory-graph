@@ -560,8 +560,12 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
         s
     };
 
-    // Deterministic half (#224): the marker adds no commit (so no fsync)
-    // to a batch; each chunk still commits once, with or without it.
+    // Deterministic half (#224): the batch loop commits once per chunk, with
+    // or without the marker. This counts the commits `commit_each_counted`
+    // itself counts; the marker writes take the chunk's `&WriteTransaction`
+    // and cannot commit on their own. A commit added that bypasses that
+    // counter (a second transaction opened and committed elsewhere) is not
+    // seen here, and, with the fsync off below, not by the timing either.
     let commits = |s: &V2Store| -> u64 {
         let prepared = bf
             .iter()
@@ -585,8 +589,9 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
     // Timed half: the commits skip the fsync (`non_durable_commits`). A
     // durable commit costs ~220 ms on the windows-latest runner and varies
     // there by more than the gate under the parallel test load (#224: +0.51x
-    // with no change to the marker), and the marker adds no commit (checked
-    // above), so the fsync is not what this measures.
+    // with no change to the marker), and the batch loop commits as often with
+    // the marker as without it (checked above), so the fsync is not what this
+    // measures.
     let mut time_one = |chunk_bytes: usize, skip_marker: bool| -> f64 {
         let mut s = fresh(chunk_bytes, skip_marker);
         s.non_durable_commits = true;
@@ -636,8 +641,8 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
     // sleep per marker write: +1.02x. The marker is
     // two small table writes inside a transaction that commits anyway, so a
     // real regression (bookkeeping that grows with the chunk count, a sleep or
-    // a sync per marker write) lands far above the gate; an extra commit fails
-    // the count check above.
+    // a sync per marker write) lands far above the gate; an extra chunk commit
+    // counted by the batch loop fails the count check above.
     const EXCESS_GATE: f64 = 0.5;
     assert!(
         excess < EXCESS_GATE,
