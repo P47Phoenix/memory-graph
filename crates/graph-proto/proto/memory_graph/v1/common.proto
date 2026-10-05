@@ -330,7 +330,12 @@ message StoreErrorDetail {
   message SchemaMismatch { uint64 found = 1; }
   message LegacyFormat { string path = 1; uint64 version = 2; }
   message OpenFailed { string path = 1; string reason = 2; }
-  message Rejected { string msg = 1; }
+  // A refusal. `transient`: the refusal is expected to clear on its own
+  // shortly (`Admin.Remove`'s quorum guard while a new leader has not yet
+  // matched a peer that is up, issue #225), so a client retries the same
+  // request until its write deadline, then reports this refusal as is.
+  // False (an older server) keeps the old meaning: final.
+  message Rejected { string msg = 1; bool transient = 2; }
   message NotUtf8 { string path = 1; }
   message TooLarge { string path = 1; }
   message InvalidSpan { string msg = 1; }

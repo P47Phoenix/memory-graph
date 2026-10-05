@@ -1,8 +1,8 @@
 //! The connection: endpoint selection, the `Hello` handshake, and the retry
 //! policy every RPC goes through.
 use crate::{ClientConfig, ReadMode, RetryConfig};
-use graph_proto::error::is_transport_loss;
 use graph_proto::error::WireError;
+use graph_proto::error::{is_transient_rejection, is_transport_loss};
 use graph_proto::pb::admin_client::AdminClient;
 use graph_proto::pb::store_client::StoreClient;
 use graph_proto::pb::write_client::WriteClient;
@@ -202,6 +202,20 @@ fn read_moves_on(kind: Kind, endpoints: usize, s: &Status) -> bool {
         && s.details().is_empty()
         && is_transport_loss(s.code(), s.message())
 }
+
+/// Whether a write was refused only for now (a typed transient refusal,
+/// issue #225: `Admin.Remove`'s quorum guard while a new leader has not yet
+/// matched a peer that is up). Retried until the write deadline, which then
+/// reports the refusal itself, not `NoLeader`: a leader answered, and the
+/// voter it cannot reach is the reason.
+fn transient_refusal(kind: Kind, s: &Status) -> bool {
+    kind == Kind::Write && is_transient_rejection(s)
+}
+
+/// The longest pause between two attempts of a transiently refused write:
+/// what clears it (a new leader's first append to a peer, a heartbeat to a
+/// voter that came back) takes a heartbeat or two, not the full back-off.
+const TRANSIENT_RETRY_MAX: Duration = Duration::from_millis(250);
 
 /// Consecutive `NotLeader` switches after which the client backs off
 /// before the next one (two nodes naming each other as leader during an
@@ -493,11 +507,14 @@ impl Conn {
     /// with jittered back-off within the budget (`Kind::Read`: the retry
     /// budget; `Kind::Write`: the write deadline), switching endpoint on a
     /// `NotLeader` that names the leader (with back-off from the second
-    /// switch in a row), and waiting `retry_after_ms` on `NoLeader`.
+    /// switch in a row), waiting `retry_after_ms` on `NoLeader`, and
+    /// resending a write refused transiently (issue #225) to the same
+    /// endpoint.
     ///
     /// A write that exhausts its deadline on a retryable error answers
     /// `NoLeader` (exit code 4 in the CLI): no leader accepted it in time,
-    /// whether the server was unreachable, lost mid-call or electing.
+    /// whether the server was unreachable, lost mid-call or electing. One
+    /// that exhausts it on a transient refusal answers that refusal.
     pub async fn call<T, F, Fut>(&self, kind: Kind, f: F) -> Result<T, StoreError>
     where
         F: Fn(Channel) -> Fut,
@@ -581,6 +598,13 @@ impl Conn {
                     self.rotate();
                     jitter(&self.cfg.retry, attempt)
                 }
+                // The leader (asked directly or through a forward) refused
+                // for now only (issue #225): the same request, to the same
+                // endpoint, shortly.
+                _ if transient_refusal(kind, &st) => {
+                    switches = 0;
+                    jitter(&self.cfg.retry, attempt).min(TRANSIENT_RETRY_MAX)
+                }
                 _ => return Err(map_status(&endpoint, &st)),
             };
             if Instant::now() + delay > deadline {
@@ -595,11 +619,13 @@ impl Conn {
 
 /// The error for a call whose budget ran out on a retryable status: for a
 /// write, `NoLeader` (unless the server itself named a leader: then the
-/// `NotLeader` it sent); for a read, the mapped status.
+/// `NotLeader` it sent; or refused transiently: then that refusal); for a
+/// read, the mapped status.
 fn deadline_error(kind: Kind, endpoint: &str, st: &Status, retry: &RetryConfig) -> StoreError {
     let mapped = map_status(endpoint, st);
     match (kind, mapped) {
         (Kind::Write, e @ StoreError::NotLeader { .. }) => e,
+        (Kind::Write, e) if transient_refusal(kind, st) => e,
         (Kind::Write, e) => {
             tracing::warn!(endpoint, error = %e, "write deadline exhausted");
             StoreError::NoLeader {
@@ -674,6 +700,23 @@ mod tests {
         assert!(matches!(
             deadline_error(Kind::Read, "h:1", &st, &r),
             StoreError::Storage(ref m) if m.contains("server h:1 unavailable")
+        ));
+    }
+
+    /// Issue #225: a transient refusal is retried for writes only, and a
+    /// write deadline that runs out on one reports the refusal itself.
+    #[test]
+    fn a_transient_refusal_is_retried_and_then_reported_as_is() {
+        let r = RetryConfig::default();
+        let st = graph_proto::error::transient_rejection("would drop below quorum".into());
+        assert!(transient_refusal(Kind::Write, &st));
+        assert!(!transient_refusal(Kind::Read, &st));
+        assert!(!retryable(Kind::Write, &st), "not by the UNAVAILABLE rule");
+        let plain: Status = graph_proto::WireError::Store(StoreError::Rejected("x".into())).into();
+        assert!(!transient_refusal(Kind::Write, &plain), "a final refusal");
+        assert!(matches!(
+            deadline_error(Kind::Write, "h:1", &st, &r),
+            StoreError::Rejected(ref m) if m == "would drop below quorum"
         ));
     }
 

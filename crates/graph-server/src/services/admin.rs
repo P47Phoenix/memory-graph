@@ -24,7 +24,8 @@
 //!   down to 2 without `force`, and any removal for which the voters that
 //!   are reachable now are fewer than a quorum of the new voter set or of
 //!   the old one (joint consensus needs both), or no voter would be left,
-//!   are refused.
+//!   are refused. The quorum refusal is a transient one (see
+//!   [`QUORUM_REFUSAL`]): clients retry it until their write deadline.
 //!
 //! `TransferLeader` (openraft 0.9 has no transfer of its own): the leader
 //! checks the target is a voter with a replication lag of zero, takes the
@@ -281,10 +282,17 @@ fn reachable_voters(ctx: &Ctx, voters: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
         .collect()
 }
 
-/// The words of `Remove`'s quorum refusal. A refusal containing them is
-/// transient when a voter has just come back or a leader was just elected,
-/// so callers retry it: the auto-promote re-join's remove (`join.rs`) and
-/// the CLI end-to-end tests match on this constant, not a copy of it.
+/// The words of `Remove`'s quorum refusal (tests match on this constant,
+/// not a copy of it). The refusal is often transient: a leader elected a
+/// moment ago (`cluster transfer-leader`, say) counts a peer as unreachable
+/// until its first append to it is matched, and a voter that has just come
+/// back may still show its last error. So it travels as a *transient*
+/// refusal ([`graph_proto::error::transient_rejection`], issue #225), which
+/// `RemoteStore` (the CLI) and the lost-self remove of `join.rs` retry until
+/// their deadline; a voter that stays down is still refused, with this
+/// message, once the deadline passes. The guard itself must stay strict:
+/// proposing a joint-consensus change that cannot commit would block every
+/// later membership change.
 pub const QUORUM_REFUSAL: &str = "would drop below quorum";
 
 /// `Remove` on the leader, with its guards. Returns the log index and
@@ -324,12 +332,13 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<(u64, bool
         let up = reachable_voters(ctx, set);
         if up.len() < quorum {
             let down: Vec<NodeId> = set.difference(&up).copied().collect();
-            return Err(rejected(format!(
+            return Err(graph_proto::error::transient_rejection(format!(
                 "removing node {id} {QUORUM_REFUSAL}: {} voters would {which} \
                  ({set:?}), a quorum is {quorum}, and only {} of them are reachable now \
                  ({down:?} are not); bring them back first. --force does not override this. \
-                 (A node that just came back may still show its last error for a moment; \
-                 retry shortly.)",
+                 (A node that just came back, or a leader elected a moment ago, can make this \
+                 refusal momentary, so clients retry it until their write deadline; refused \
+                 after that, check those nodes, then retry.)",
                 set.len(),
                 up.len()
             )));
