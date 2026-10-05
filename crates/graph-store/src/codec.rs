@@ -79,7 +79,7 @@
 //! independently justify codec-embedding vs. a separate table on its own
 //! access pattern, not cite this decision. See the story 3 row for the full
 //! scoping decision and its five conditions.
-use crate::read_stats;
+use crate::read_stats::{self, Counter};
 use crate::StoreError;
 use graph_core::{Span, SymbolKind, TokenClass};
 
@@ -398,7 +398,7 @@ pub struct Lazy<'a> {
 
 /// Decode a stream's header (counted in [`crate::read_stats`]).
 pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
-    read_stats::timed(&read_stats::LAZY_DECODES, &read_stats::LAZY_NANOS, || {
+    read_stats::timed(Counter::LazyDecodes, Counter::LazyNanos, || {
         decode_lazy_uncounted(b)
     })
 }
@@ -489,7 +489,7 @@ impl Lazy<'_> {
 
     /// The symbol section, decoded (counted in [`crate::read_stats`]).
     pub fn symbols(&self) -> Result<Vec<SymRec>, StoreError> {
-        read_stats::timed(&read_stats::SYMBOL_DECODES, &read_stats::LAZY_NANOS, || {
+        read_stats::timed(Counter::SymbolDecodes, Counter::LazyNanos, || {
             self.symbols_uncounted()
         })
     }
@@ -797,15 +797,10 @@ pub fn dict_block_entry_count(b: &[u8]) -> Result<usize, StoreError> {
 
 /// Decode a block written by [`encode_dict_block`] into its `(id, text)`
 /// entries, in the stored (ascending id) order.
+///
+/// Not counted here: the query-side call site counts it, so the write side
+/// (extending a block, `vacuum`) stays out of [`crate::read_stats`].
 pub fn decode_dict_block(b: &[u8]) -> Result<Vec<(u64, String)>, StoreError> {
-    read_stats::timed(
-        &read_stats::DICT_BLOCK_DECODES,
-        &read_stats::DICT_NANOS,
-        || decode_dict_block_uncounted(b),
-    )
-}
-
-fn decode_dict_block_uncounted(b: &[u8]) -> Result<Vec<(u64, String)>, StoreError> {
     let mut r = Reader { b, at: 0 };
     let n = usize::try_from(r.varint()?).map_err(|_| bad("dict block count out of range"))?;
     if n > b.len() {
@@ -847,7 +842,7 @@ pub fn dict_block_first_id(b: &[u8]) -> Result<Option<u64>, StoreError> {
 /// Decode a whole stream (counted in [`crate::read_stats`] as one full
 /// decode, not also as a lazy and a symbol-section decode).
 pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
-    read_stats::timed(&read_stats::FULL_DECODES, &read_stats::FULL_NANOS, || {
+    read_stats::timed(Counter::FullDecodes, Counter::FullNanos, || {
         decode_uncounted(b)
     })
 }
