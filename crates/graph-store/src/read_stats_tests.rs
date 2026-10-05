@@ -27,6 +27,17 @@ fn tiny_store() -> (tempfile::TempDir, V2Store) {
     (d, s)
 }
 
+/// s with the nanosecond fields zeroed: they depend on the process-global
+/// timing toggle, which a parallel test may flip.
+fn counts(s: ReadStats) -> ReadStats {
+    ReadStats {
+        dict_decode_nanos: 0,
+        lazy_decode_nanos: 0,
+        full_decode_nanos: 0,
+        ..s
+    }
+}
+
 /// The counters for the work `f` does on this thread.
 fn measure<T>(f: impl FnOnce() -> T) -> (T, ReadStats) {
     let before = thread_snapshot();
@@ -62,7 +73,8 @@ fn a_repeated_query_counts_the_same_one_txn_and_one_miss_per_distinct_term() {
     let (tokens2, second) = measure(read);
     assert_eq!(tokens1, tokens2);
     assert_eq!(
-        first, second,
+        counts(first),
+        counts(second),
         "a fixed query counts the same work each time"
     );
     assert_eq!(first.read_txns, 1);
@@ -86,7 +98,7 @@ fn a_token_search_reads_one_txn_the_same_way_each_time() {
     let (hits2, second) = measure(|| s.search(&alpha_query()).expect("search"));
     assert_eq!(hits1, hits2);
     assert_eq!(hits1.len(), 3);
-    assert_eq!(first, second);
+    assert_eq!(counts(first), counts(second));
     assert_eq!(first.read_txns, 1);
 }
 
@@ -167,7 +179,8 @@ fn writes_do_not_count_as_reads() {
 }
 
 /// One test for both timing states, because the toggle is process-global:
-/// no other test asserts on the nanosecond fields.
+/// while it is on, other tests' nanosecond fields may be non-zero, so they
+/// compare counts only ([`counts`]) or copy the measured nanos.
 #[test]
 fn timing_fills_the_nanos_only_when_on_and_never_changes_answers() {
     let (_d, s) = tiny_store();

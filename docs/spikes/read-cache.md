@@ -62,6 +62,9 @@ rate (meaningless until a cache exists) are tracked in #233.
     sum of its per-query latencies) and reported as the median across
     readers, as the ADR defines it. The category columns are over all
     readers.
+  - The share is measured **with timing on**, so the `Instant::now` calls
+    around each decode are inside the decode nanoseconds and may raise the
+    share slightly (the overhead range below bounds the effect).
   - **Timing overhead** is measured over 5 alternating off/on warm runs and
     reported as a range.
 

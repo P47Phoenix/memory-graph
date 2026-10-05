@@ -13,7 +13,9 @@
 //!   ([`ReadStats::since`]) around a workload that runs alone.
 //! - [`thread_snapshot`]: the calling thread's own totals. A query runs on
 //!   the thread that called it, so a test can measure exactly its own
-//!   queries even while other tests run in parallel.
+//!   queries even while other tests run in parallel. If a single read is
+//!   ever parallelised across threads, this view under-counts it: work done
+//!   on helper threads lands in their counters, not the caller's.
 //!
 //! Only read-side work is counted: decodes done by writes (`dict_rev_append`
 //! extending a dictionary block, removing a file's content, `vacuum`) are
