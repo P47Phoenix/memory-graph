@@ -244,8 +244,8 @@ fn is_hashed(text: &str) -> bool {
 /// story 5): binary-search the block whose first id is the largest one
 /// `<= id` (a "floor" search over `dict_block_first_id`, which is a
 /// one-varint peek and does not decode a candidate block's other entries),
-/// then linearly scan that one block (at most `codec::DICT_BLOCK` entries)
-/// for the exact id. `Ok(None)` for an id that was never assigned, or was
+/// then scan that one block in place (at most `codec::DICT_BLOCK` entries,
+/// `codec::dict_block_find`) for the exact id, allocating only its text. `Ok(None)` for an id that was never assigned, or was
 /// removed by `vacuum`. Generic over `redb::Table`/`redb::ReadOnlyTable`
 /// (both implement `ReadableTable`) so the read (`R`) and write (`W`) sides
 /// share one implementation.
@@ -256,12 +256,12 @@ fn dict_rev_lookup<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>
     let Some(block) = dict_rev_block(t, id)? else {
         return Ok(None);
     };
-    let entries = codec::decode_dict_block(block.value())?;
-    Ok(find_dict_entry(entries, id))
+    codec::dict_block_find(block.value(), id)
 }
 
-/// [`dict_rev_lookup`] for queries: the block decode is counted (and, with
-/// timing on, timed) in [`crate::read_stats`]. Writes use the uncounted one.
+/// [`dict_rev_lookup`] for queries: the block scan is counted (and, with
+/// timing on, timed) in [`crate::read_stats`], plus one
+/// `dict_strings_decoded` when the id is found. Writes use the uncounted one.
 fn dict_rev_lookup_counted<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
     t: &T,
     id: u64,
@@ -269,14 +269,13 @@ fn dict_rev_lookup_counted<T: ReadableTable<u64, &'static [u8]> + ReadableTableM
     let Some(block) = dict_rev_block(t, id)? else {
         return Ok(None);
     };
-    let entries = read_stats::timed(Counter::DictBlockDecodes, Counter::DictNanos, || {
-        codec::decode_dict_block(block.value())
+    let text = read_stats::timed(Counter::DictBlockDecodes, Counter::DictNanos, || {
+        codec::dict_block_find(block.value(), id)
     })?;
-    Ok(find_dict_entry(entries, id))
-}
-
-fn find_dict_entry(entries: Vec<(u64, String)>, id: u64) -> Option<String> {
-    entries.into_iter().find(|(i, _)| *i == id).map(|(_, t)| t)
+    if text.is_some() {
+        read_stats::bump(Counter::DictStrings);
+    }
+    Ok(text)
 }
 
 /// The reverse-dictionary block that would hold `id`, if any.

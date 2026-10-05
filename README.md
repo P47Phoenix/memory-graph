@@ -78,7 +78,7 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 
 `search`, `symbols` and `describe` take `--json` (an object on stdout); `search` and `symbols` also take `--limit`/`--offset` for paging, with results ordered by org, repo, file, position.
 
-Global options: `--db <file>` (default `./graph.redb`), `--server <host:port>[,<host:port>...]` and `--read local|linearizable` ([server guide](docs/guide/server.md)), `--chunk-bytes` (commit a transaction every this many source bytes, default 64 MiB) and `--cache-bytes` (redb's cache, default 1 GiB). Run `memory-graph <command> --help` for the full list.
+Global options: `--db <file>` (default `./graph.redb`), `--server <host:port>[,<host:port>...]` and `--read local|linearizable` ([server guide](docs/guide/server.md)), `--chunk-bytes` (commit a transaction every this many source bytes, default 64 MiB) and `--cache-bytes` (redb's page cache; default a quarter of available memory, clamped to 64 MiB..4 GiB). Run `memory-graph <command> --help` for the full list.
 
 ## Source encodings
 

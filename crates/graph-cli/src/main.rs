@@ -6,9 +6,7 @@ use graph_cli::target::{Target, TargetArgs};
 use graph_cli::{index_dir, DirOpts};
 use graph_client::{ReadMode, RemoteStore};
 use graph_core::{Extractor, TokenClass};
-use graph_store::{
-    open_store, Grain, IndexOptions, Query, Store, StoreError, SymbolQuery, V2Store,
-};
+use graph_store::{Grain, IndexOptions, Query, Store, StoreError, SymbolQuery, V2Store};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -56,8 +54,8 @@ struct Cli {
     /// (default 64 MiB). A soft cap: one file larger than it is still a chunk of its own
     #[arg(long, global = true, alias = "v2-chunk-bytes", value_parser = clap::value_parser!(u64).range(1..))]
     chunk_bytes: Option<u64>,
-    /// Cache size in bytes for the database (redb's default is 1 GiB, split 9:1 between its read and write
-    /// caches)
+    /// Page-cache size in bytes for the database, split 9:1 between redb's read and write caches. Default:
+    /// a quarter of available memory, clamped to 64 MiB..4 GiB (256 MiB if the platform cannot say)
     #[arg(long, global = true, alias = "v2-cache-bytes", value_parser = clap::value_parser!(u64).range(1..))]
     cache_bytes: Option<u64>,
     #[command(subcommand)]
@@ -790,8 +788,9 @@ enum Cmd {
     Mcp,
 }
 
-/// Store settings taken from CLI flags. Both default to redb/`V2Store`
-/// defaults (`None`).
+/// Store settings taken from CLI flags (`None` when the flag is unset):
+/// `chunk_bytes` then takes `V2Store`'s default, `cache_bytes` the size
+/// derived from available memory (`sysinfo::cache_bytes_or_derived`).
 #[derive(Clone, Copy, Default)]
 struct Overrides {
     chunk_bytes: Option<u64>,
@@ -799,11 +798,11 @@ struct Overrides {
 }
 
 /// Open the store at `db` with `extractors` registered, applying
-/// `overrides`. Goes through `open_store` whenever no override applies, so it
-/// only diverges from `open_store`'s construction path (`V2Store::open` +
-/// register) when an override needs a `V2Store` method
-/// (`open_with_cache_bytes`, `set_chunk_bytes`) that isn't on the `Store`
-/// trait; mirror any future change to `open_store` here too. A file in the
+/// `overrides`. Always through [`open_v2`], because the page cache is sized
+/// even without `--cache-bytes` (ADR 0008 phase 1) and that needs a
+/// `V2Store` method (`open_with_cache_bytes`) that isn't on the `Store`
+/// trait; it mirrors `open_store`'s construction (`V2Store::open` +
+/// register), so mirror any future change to `open_store` here too. A file in the
 /// retired v1 format is refused (`StoreError::LegacyFormat`) before anything
 /// is written, with the migration hint in the error.
 fn open_with_overrides(
@@ -811,20 +810,18 @@ fn open_with_overrides(
     extractors: Vec<Box<dyn Extractor>>,
     overrides: Overrides,
 ) -> std::result::Result<Box<dyn Store>, StoreError> {
-    if overrides.chunk_bytes.is_some() || overrides.cache_bytes.is_some() {
-        let mut s = open_v2(db, overrides)?;
-        for e in extractors {
-            s.register(e);
-        }
-        return Ok(Box::new(s));
+    let mut s = open_v2(db, overrides)?;
+    for e in extractors {
+        s.register(e);
     }
-    open_store(db, extractors)
+    Ok(Box::new(s))
 }
 
 /// A concrete `V2Store` with `overrides` applied (for `vacuum --compact`,
 /// which needs an owned store).
 fn open_v2(db: &std::path::Path, overrides: Overrides) -> std::result::Result<V2Store, StoreError> {
-    let mut s = V2Store::open_with_cache_bytes(db, overrides.cache_bytes.map(|b| b as usize))?;
+    let cache_bytes = graph_cli::sysinfo::cache_bytes_or_derived(overrides.cache_bytes);
+    let mut s = V2Store::open_with_cache_bytes(db, Some(cache_bytes as usize))?;
     if let Some(bytes) = overrides.chunk_bytes {
         s.set_chunk_bytes(bytes as usize);
     }
@@ -1343,7 +1340,8 @@ fn run() -> Result<i32> {
                  server's own log only; clusters use --data-dir"
             );
         }
-        cfg.cache_bytes = cli.cache_bytes.map(|b| b as usize);
+        cfg.cache_bytes =
+            Some(graph_cli::sysinfo::cache_bytes_or_derived(cli.cache_bytes) as usize);
         cfg.ready_max_lag = *ready_max_lag;
         if let Some(m) = metrics_listen {
             use std::net::ToSocketAddrs;

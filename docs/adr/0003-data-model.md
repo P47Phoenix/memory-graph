@@ -239,6 +239,7 @@ Children of a file are returned in ordinal order interleaved with symbols by `(s
   - a crash leaves a whole number of committed files;
   - the repo/file rows commit last, so a half-indexed repo is detected by an `indexing` marker and resumed.
   - **What this means (chunked ingest):** a big load is saved in pieces. If the power fails, finished files are safe and the next run picks up where it stopped.
+- **Update (ADR 0008 phase 1, 2026-10-05):** the 256 MiB default below was never wired: without `--cache-bytes` the store kept redb's 1 GiB default. The default is now derived from the machine: a quarter of available memory, clamped to 64 MiB..4 GiB (256 MiB when the platform cannot report memory); `--cache-bytes` / serve `cache-bytes` still wins. See [ADR 0008](0008-read-cache.md) and epic story 46.
 - **redb cache size** is set explicitly (`Builder::set_cache_size`, default 256 MiB, configurable) instead of the 1 GiB default; RSS is a tuning knob (spike observed 1.2 GB at 9.9 M with defaults).
 - **Reader MVCC file growth:** an open read transaction pins pages; long snapshots make the file grow and defeat compaction. See Snapshots.
 - **Churn / soak benchmark:** a required benchmark re-indexes and deletes a fraction of files repeatedly (e.g. 20 rounds of 10% churn on the 1x and 4x sets) and asserts file size stays within 1.5x of the fresh-ingest size after `vacuum`, and that `vacuum` restores it.
