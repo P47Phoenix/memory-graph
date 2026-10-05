@@ -31,6 +31,9 @@ pub const OS_RESERVE: f64 = 0.20;
 /// growth per source byte (see [`MemoryPolicy`]), so it is in RSS terms.
 /// The footprint leaves out allocator rounding and the store's caches
 /// (measured 6-25% under the real growth), which the 30% slack covers.
+/// That slack was measured with redb's old 1 GiB cache; the derived page
+/// cache (ADR 0008 phase 1) can reach 4 GiB on a large machine and is not
+/// in the budget either, so the slack is due a re-measure (#236).
 pub const DEFAULT_FRACTION: f64 = 0.70;
 /// Heap per source byte in flight assumed until measured. Measured on the
 /// test corpus: about 25x (the extraction's tokens, symbols and their

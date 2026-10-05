@@ -242,6 +242,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 fn add(a: ReadStats, b: &ReadStats) -> ReadStats {
     let mut out = a;
     out.dict_block_decodes += b.dict_block_decodes;
+    out.dict_strings_decoded += b.dict_strings_decoded;
     out.dict_text_memo_hits += b.dict_text_memo_hits;
     out.dict_text_memo_misses += b.dict_text_memo_misses;
     out.full_stream_decodes += b.full_stream_decodes;
@@ -267,7 +268,7 @@ fn report(label: &str, readers: &[Reader], wall: Duration) {
     let n = lat.len() as f64;
     let share = median(readers.iter().map(Reader::decode_share).collect());
     println!(
-        "| {label} | {} | {:.3} | {:.3} | {:.0} | {share:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1} | {:.1} | {:.1} | {:.2} |",
+        "| {label} | {} | {:.3} | {:.3} | {:.0} | {share:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} |",
         lat.len(),
         percentile(&lat, 0.5),
         percentile(&lat, 0.95),
@@ -276,6 +277,7 @@ fn report(label: &str, readers: &[Reader], wall: Duration) {
         pct(stats.lazy_decode_nanos),
         pct(stats.full_decode_nanos),
         stats.dict_block_decodes as f64 / n,
+        stats.dict_strings_decoded as f64 / n,
         stats.lazy_stream_decodes as f64 / n,
         stats.symbol_section_decodes as f64 / n,
         stats.read_txns as f64 / n,
@@ -283,8 +285,8 @@ fn report(label: &str, readers: &[Reader], wall: Duration) {
 }
 
 fn header() {
-    println!("\n| phase | queries | p50 ms | p95 ms | qps | decode share (median of readers) | dict | lazy+sym | full | dict blocks/q | lazy/q | sym/q | txns/q |");
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("\n| phase | queries | p50 ms | p95 ms | qps | decode share (median of readers) | dict | lazy+sym | full | dict blocks/q | dict strings/q | lazy/q | sym/q | txns/q |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 }
 
 fn cold(db: &Path, ops: &[Op], cache_bytes: usize) {

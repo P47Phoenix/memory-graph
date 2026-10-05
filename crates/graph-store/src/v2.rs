@@ -2635,7 +2635,8 @@ impl V2Store {
 
     /// `open`, with an explicit cache size in bytes (redb's default is 1
     /// GiB, split 9:1 between its read and write caches). `None` keeps
-    /// redb's default.
+    /// redb's default; [`crate::derive_cache_bytes`] gives the size the CLI
+    /// and `serve` use when none is configured (ADR 0008 phase 1).
     pub fn open_with_cache_bytes(
         path: impl AsRef<Path>,
         cache_bytes: Option<usize>,

@@ -32,7 +32,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
-    fn no_memory_reported_clamps_to_the_floor() {
+    fn zero_available_clamps_to_the_floor() {
         assert_eq!(derive_cache_bytes(0), 64 * MIB);
     }
 
