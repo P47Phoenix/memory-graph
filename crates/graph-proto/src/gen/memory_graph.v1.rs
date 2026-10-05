@@ -435,10 +435,17 @@ pub mod store_error_detail {
         #[prost(string, tag = "2")]
         pub reason: ::prost::alloc::string::String,
     }
+    /// A refusal. `transient`: the refusal is expected to clear on its own
+    /// shortly (`Admin.Remove`'s quorum guard while a new leader has not yet
+    /// matched a peer that is up, issue #225), so a client retries the same
+    /// request until its write deadline, then reports this refusal as is.
+    /// False (an older server) keeps the old meaning: final.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Rejected {
         #[prost(string, tag = "1")]
         pub msg: ::prost::alloc::string::String,
+        #[prost(bool, tag = "2")]
+        pub transient: bool,
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct NotUtf8 {

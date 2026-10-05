@@ -37,7 +37,8 @@ struct Cli {
     read: Option<ReadMode>,
     /// With --server: how long a write keeps retrying (no leader, a lost connection) before it
     /// fails with exit code 4, e.g. `500ms`, `10s`, `2m`. Also read from MEMORY_GRAPH_WRITE_DEADLINE.
-    /// Default 10s
+    /// A momentary refusal (`cluster remove` right after a leader change) is retried as long, then
+    /// reported (exit code 1). Default 10s
     #[arg(long, global = true, env = "MEMORY_GRAPH_WRITE_DEADLINE", value_name = "DURATION",
           value_parser = graph_cli::target::parse_deadline)]
     write_deadline: Option<std::time::Duration>,
@@ -1595,6 +1596,7 @@ fn run() -> Result<i32> {
                                     "node_id": p.node_id,
                                     "matched_index": p.matched_index,
                                     "lag": p.lag,
+                                    "last_error": p.last_error,
                                 })).collect::<Vec<_>>(),
                                 "backup": st.backup.as_ref().map(|b| serde_json::json!({
                                     "url": b.url,

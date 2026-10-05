@@ -648,12 +648,10 @@ async fn remove_lost_self(peer: &str, id: NodeId, timeout: Duration) -> Result<(
                 }
                 match classify(&target, &st) {
                     Next::Fail(e) => {
-                        // The quorum check answers a rejection while the
-                        // other members still settle; retry it too.
-                        if !st
-                            .message()
-                            .contains(crate::services::admin::QUORUM_REFUSAL)
-                        {
+                        // The quorum check refuses transiently while the
+                        // other members still settle (a typed flag, issue
+                        // #225); retry that too.
+                        if !graph_proto::error::is_transient_rejection(&st) {
                             return Err(e.to_string());
                         }
                         st.message().to_string()

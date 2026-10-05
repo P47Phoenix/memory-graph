@@ -256,7 +256,10 @@ impl RemoteStore {
     /// forwards it to the leader, which enforces the guards: not the
     /// leader, not below quorum, 3 voters to 2 only with `force`). A node
     /// that is not a member is no error (a retry of a committed remove must
-    /// succeed) but is reported in [`RemoveOutcome::not_a_member`].
+    /// succeed) but is reported in [`RemoveOutcome::not_a_member`]. The
+    /// quorum refusal is transient (a leader elected a moment ago has not
+    /// matched its peers yet, issue #225): it is retried until the write
+    /// deadline, then returned as the `Rejected` it is.
     pub fn admin_remove(&self, node_id: u64, force: bool) -> Result<RemoveOutcome> {
         let d = self.config().admin_deadline;
         // Set when an attempt ended with its outcome unknown: a detail-less

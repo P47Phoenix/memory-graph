@@ -210,10 +210,13 @@ started with any `TestingHooks` set logs a warning at start:
    it, the output equals an embedded run) and reads it from node 3; checks
    that `cluster remove` of the leader and 3 -> 2 without `--force` exit 1
    with the reason on stderr; moves leadership with `cluster
-   transfer-leader 2` (sent to node 3); removes node 3 with `--force`; and
-   restarts a data directory of another cluster with `--join`, which must
-   exit with code 6 (`WrongCluster`; run with a hard timeout, and only the
-   process the test spawned is ever killed). The ignored
+   transfer-leader 2` (sent to node 3); removes node 3 with `--force` right
+   after it, once (the CLI retries the new leader's transient quorum
+   refusal, issue #225); restarts a data directory of another cluster with
+   `--join`, which must exit with code 6 (`WrongCluster`; run with a hard
+   timeout, and only the process the test spawned is ever killed); and,
+   with node 1 killed, checks that `cluster remove 1 --write-deadline 3s`
+   is retried for the deadline and then exits 1 with the quorum refusal. The ignored
    `measure_replication` in the same file produces
    [spikes/raft-replication.md](spikes/raft-replication.md) (run it with
    `--release --ignored --nocapture`); the ignored
@@ -258,8 +261,16 @@ well under 30 s (the slowest, the partition, about 5 s):
   into `replaced-<secs>/` with it.
 - `remove_guards`: the leader, 3 -> 2 without `--force`, an unknown id, and
   below quorum (a voter killed, the leader's `Status` showing its
-  `last_error`) even with `--force` are refused; with every voter back and
+  `last_error`) even with `--force` are refused (that refusal is
+  transient: the client retries it until its 2 s write deadline, then
+  reports it as `Rejected`, not `NoLeader`); with every voter back and
   caught up, `--force` works.
+- `remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_peers`
+  (issue #225): the fault plan holds the new leader's appends to one peer
+  for 3 s (`hold_new_term_appends_to`, that peer's own elections off), so
+  right after `TransferLeader` a raw `Remove` is refused with a transient
+  quorum refusal; the same remove through `RemoteStore` (forwarded by the
+  old leader) is retried and succeeds once the peer is matched.
 - `transfer_leader_moves_leadership` (3 nodes) and `..._five_nodes`: sent
   to a follower, forwarded; exactly the target leads (never a third node),
   the old leader follows it, writes work through both; the 3-node case runs

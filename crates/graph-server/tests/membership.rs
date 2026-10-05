@@ -9,6 +9,7 @@ use graph_client::{ClientConfig, ReadMode, RemoteStore};
 use graph_core::{Extractor, NodeKind};
 use graph_proto::pb;
 use graph_server::raft::log_store::RedbLogStore;
+use graph_server::services::admin::QUORUM_REFUSAL;
 use graph_server::testing::{ClusterTestbed, TestServer, CLUSTER_WAIT, TEST_RAFT};
 use graph_server::{InitMode, JoinSpec, NodeJson, RaftSettings, ServeConfig};
 use graph_store::conformance::run_differential;
@@ -499,8 +500,22 @@ fn remove_guards() {
     wait_peer(&tb, b, "the leader to see node b failing", |p| {
         !p.last_error.is_empty()
     });
-    let e = tb.client(leader).admin_remove(a, true).unwrap_err();
-    assert!(e.to_string().contains("below quorum"), "{e}");
+    // The refusal is transient (issue #225), so the client retries it until
+    // its write deadline and then reports it as is: `Rejected`, not
+    // `NoLeader` (exit code 1 in the CLI, not 4), bounded by the deadline.
+    let t0 = Instant::now();
+    let e = short_client(&tb, leader, Duration::from_secs(2))
+        .admin_remove(a, true)
+        .unwrap_err();
+    let took = t0.elapsed();
+    assert!(
+        matches!(e, StoreError::Rejected(ref m) if m.contains(QUORUM_REFUSAL)),
+        "{e:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(1500) && took < Duration::from_secs(10),
+        "retried until the 2 s deadline, then refused: took {took:?}"
+    );
     assert_eq!(tb.membership(leader).0.len(), 3);
     // Back up and caught up: --force takes 3 voters to 2.
     tb.node_mut(b).restart();
@@ -512,6 +527,80 @@ fn remove_guards() {
     tb.wait_voters(&[leader, b], CLUSTER_WAIT);
     let (p, bytes) = small_file(1);
     tb.client(leader)
+        .index_bytes("o", "r", &p, &bytes, None)
+        .unwrap();
+}
+
+/// Issue #225: right after `TransferLeader` the new leader has no matched
+/// index for a peer whose first append is still under way (held 3 s here by
+/// the fault plan, as a slow first RPC on a loaded machine would be), so
+/// `Remove`'s quorum guard refuses: correctly, and transiently. A single raw
+/// `Remove` shows the race; `RemoteStore` (the CLI) retries the refusal and
+/// the remove, sent right after the transfer through the old leader (so
+/// forwarded), succeeds once the new leader reaches the peer.
+#[test]
+fn remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_peers() {
+    let _w = watchdog(
+        "remove_right_after_a_transfer_is_retried_until_the_new_leader_reaches_its_peers",
+        TEST_LIMIT,
+    );
+    const HOLD: Duration = Duration::from_secs(3);
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let old = tb.leader();
+    let others = node_ids_other_than(&tb, &[old]);
+    let (target, slow) = (others[0], others[1]);
+    // `slow` hears nothing from the new leader for HOLD, longer than an
+    // election timeout: keep it from campaigning meanwhile (its higher term
+    // would depose the new leader, a different race).
+    tb.node(slow)
+        .raft()
+        .unwrap()
+        .raft
+        .runtime_config()
+        .elect(false);
+    let term = tb.node(old).raft().unwrap().metrics().current_term;
+    tb.faults().hold_new_term_appends_to(slow, term, HOLD);
+    let t0 = Instant::now();
+    assert_eq!(
+        tb.client(old).admin_transfer_leader(target).unwrap(),
+        target
+    );
+    // The race, reproduced: one Remove now is refused, transiently.
+    let st = rt()
+        .block_on(async {
+            admin_client(&tb.node(target).endpoint())
+                .await
+                .remove(pb::RemoveRequest {
+                    node_id: old,
+                    force: true,
+                })
+                .await
+        })
+        .unwrap_err();
+    assert!(
+        t0.elapsed() < HOLD,
+        "the raw Remove came too late to see the race"
+    );
+    assert!(
+        graph_proto::error::is_transient_rejection(&st),
+        "a transient refusal: {st:?}"
+    );
+    assert!(st.message().contains(QUORUM_REFUSAL), "{st:?}");
+    assert_eq!(tb.membership(target).0.len(), 3, "nothing changed");
+    // Through RemoteStore: retried, and done once `slow` is matched.
+    let r = tb.client(old).admin_remove(old, true).unwrap();
+    assert!(!r.not_a_member, "{r:?}");
+    eprintln!("remove after the transfer done at {:?}", t0.elapsed());
+    tb.wait_voters(&[target, slow], CLUSTER_WAIT);
+    tb.node(slow)
+        .raft()
+        .unwrap()
+        .raft
+        .runtime_config()
+        .elect(true);
+    let (p, bytes) = small_file(1);
+    tb.client(target)
         .index_bytes("o", "r", &p, &bytes, None)
         .unwrap();
 }
@@ -859,7 +948,9 @@ fn remove_needs_a_quorum_of_the_old_voter_set_too() {
             !p.last_error.is_empty()
         });
     }
-    let e = tb.client(leader).admin_remove(d, true).unwrap_err();
+    let e = short_client(&tb, leader, Duration::from_secs(1))
+        .admin_remove(d, true)
+        .unwrap_err();
     let m = e.to_string();
     assert!(
         m.contains("below quorum") && m.contains("vote on the change"),

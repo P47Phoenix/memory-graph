@@ -39,7 +39,8 @@
 //! * Channels are cached per target node id and rebuilt when the member's
 //!   address changes or a transport call failed.
 //! * [`FaultPlan`] / [`FaultyNetwork`]: test fault injection (partitions,
-//!   dropped `AppendEntries`), a wrapper that stage C/D tests reuse.
+//!   dropped `AppendEntries`, a new leader's appends held back), a wrapper
+//!   that stage C/D tests reuse.
 use super::snapshot_dir::read_sidecar;
 use super::types::{LogId, NodeId, TypeConfig};
 use super::wire;
@@ -820,6 +821,17 @@ struct Faults {
     /// group reach everyone.
     groups: Vec<BTreeSet<NodeId>>,
     drop_append_to: BTreeSet<NodeId>,
+    hold: Option<AppendHold>,
+}
+
+/// [`FaultPlan::hold_new_term_appends_to`].
+#[derive(Debug)]
+struct AppendHold {
+    to: NodeId,
+    above_term: u64,
+    hold: Duration,
+    /// When the first `AppendEntries` of each held term was attempted.
+    first: HashMap<u64, std::time::Instant>,
 }
 
 /// Test fault injection shared by every node of a testbed: each node's
@@ -859,6 +871,35 @@ impl FaultPlan {
         self.with(|f| {
             f.drop_append_to.insert(id);
         });
+    }
+
+    /// Hold every `AppendEntries` (heartbeats included) to `to` of a term
+    /// above `above_term` until `hold` after the first one of that term
+    /// was attempted: a leader elected later reaches `to` that much late,
+    /// so it has no matched index for it meanwhile (issue #225). openraft
+    /// times a held call out after `heartbeat_interval` and retries, and
+    /// the retries are held until the same instant.
+    pub fn hold_new_term_appends_to(&self, to: NodeId, above_term: u64, hold: Duration) {
+        self.with(|f| {
+            f.hold = Some(AppendHold {
+                to,
+                above_term,
+                hold,
+                first: HashMap::new(),
+            });
+        });
+    }
+
+    /// Until when an `AppendEntries` to `to` in `term` is held, if it is.
+    fn append_held_until(&self, to: NodeId, term: u64) -> Option<std::time::Instant> {
+        self.with(|f| {
+            let h = f.hold.as_mut()?;
+            if h.to != to || term <= h.above_term {
+                return None;
+            }
+            let first = *h.first.entry(term).or_insert_with(std::time::Instant::now);
+            Some(first + h.hold)
+        })
     }
 
     /// Whether a partition leaves `from` and `to` connected (the
@@ -943,6 +984,12 @@ impl<C: RaftNetwork<TypeConfig>> RaftNetwork<TypeConfig> for FaultyConnection<C>
         option: RPCOption,
     ) -> RpcResult<AppendEntriesResponse<NodeId>> {
         self.check(RpcKind::AppendEntries)?;
+        if let Some(until) = self
+            .plan
+            .append_held_until(self.target, rpc.vote.leader_id.term)
+        {
+            tokio::time::sleep_until(until.into()).await;
+        }
         self.inner.append_entries(rpc, option).await
     }
 

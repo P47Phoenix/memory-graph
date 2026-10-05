@@ -634,20 +634,23 @@ fn voters(n: &Node) -> Vec<u64> {
         .unwrap_or_default()
 }
 
-/// Run a `cluster remove`, retrying while the leader refuses it only
-/// because a voter does not look reachable yet: right after a leadership
-/// change (or one slow heartbeat on a loaded machine) the leader has no
-/// matched index, or a fresh RPC error, for a peer that is up. The guard
-/// says so ("retry shortly"); any other answer is returned as is.
-fn remove_when_reachable(args: &[&str]) -> Output {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let o = run(args);
-        if !text(&o.stderr).contains(QUORUM_REFUSAL) || Instant::now() >= deadline {
-            return o;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+/// Run `cluster remove <args>` through `server` once, as a script would,
+/// with a generous write deadline (a loaded runner). Right after a
+/// leadership change (or one slow heartbeat) the leader has no matched
+/// index, or a fresh RPC error, for a peer that is up, and its quorum guard
+/// refuses; that refusal is transient (issue #225) and the CLI itself
+/// retries it until the write deadline, so no retry loop is needed here.
+fn remove(server: &str, args: &[&str]) -> Output {
+    let mut a = vec![
+        "--server",
+        server,
+        "--write-deadline",
+        "60s",
+        "cluster",
+        "remove",
+    ];
+    a.extend(args);
+    run(&a)
 }
 
 /// Run the CLI and wait at most [`WAIT`] for it to exit (a `serve` that
@@ -690,11 +693,12 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
     let t0 = Instant::now();
     let d = tempfile::tempdir().unwrap();
     let dir = |i: u64| d.path().join(format!("n{i}"));
-    let n1 = Node::start(1, &dir(1), "127.0.0.1:0", &["--bootstrap"]);
+    let mut n1 = Node::start(1, &dir(1), "127.0.0.1:0", &["--bootstrap"]);
     wait_for("node 1 to elect itself", || {
         (n1.leader() == Some(1)).then_some(())
     });
-    let join = ["--join", n1.addr.as_str(), "--auto-promote"];
+    let n1_addr = n1.addr.clone();
+    let join = ["--join", n1_addr.as_str(), "--auto-promote"];
     let n2 = Node::start(2, &dir(2), "127.0.0.1:0", &join);
     let n3 = Node::start(3, &dir(3), "127.0.0.1:0", &join);
     wait_for("nodes 2 and 3 to be auto-promoted", || {
@@ -781,8 +785,9 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
         text(&o.stderr)
     );
     // The quorum guard runs before the 3 -> 2 one (--force cannot help an
-    // unreachable quorum), so a transient "not reachable" is waited out.
-    let o = remove_when_reachable(&["--server", &n3.addr, "cluster", "remove", "3"]);
+    // unreachable quorum); a transient "not reachable" is retried by the
+    // CLI, and the final answer is the 3 -> 2 refusal.
+    let o = remove(&n3.addr, &["3"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
     // Only the 3 -> 2 guard's words: the quorum refusal mentions --force
     // too ("--force does not override this").
@@ -811,7 +816,9 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
     // Node 2 has just become the leader: until its first append to a peer
     // is matched (a 100 ms RPC timeout can expire on a loaded runner), the
     // remove guard counts that peer as unreachable (seen on CI, PR #206).
-    let o = remove_when_reachable(&["--server", &n1.addr, "cluster", "remove", "3", "--force"]);
+    // Issue #225: the CLI retries that transient refusal itself, so the
+    // remove right after the transfer, run once, succeeds.
+    let o = remove(&n1.addr, &["3", "--force"]);
     assert!(
         o.status.success(),
         "remove 3 --force failed ({:?}):\n{}{}",
@@ -851,6 +858,43 @@ fn join_forward_remove_transfer_and_wrong_cluster() {
         "{}",
         text(&o.stderr)
     );
+
+    // Issue #225, the other side: a voter that is really down. Two voters
+    // (1, 2; node 2 leads): removing node 1 while it is dead would leave
+    // one reachable voter of the two that vote on the change. The CLI
+    // retries the transient refusal until its write deadline, then fails
+    // with the refusal itself (exit 1, not the deadline's exit 4).
+    n1.kill();
+    // Wait until the leader counts node 1 unreachable (`last_error` in
+    // `cluster status --json`): before that its guard would let the change
+    // through, and a joint change with node 1 dead could never commit.
+    wait_for("node 2 to see node 1 failing", || {
+        let st = n2.status()?;
+        st["replication"]
+            .as_array()?
+            .iter()
+            .any(|p| p["node_id"] == 1 && !p["last_error"].as_str().unwrap_or_default().is_empty())
+            .then_some(())
+    });
+    let t = Instant::now();
+    let o = run(&[
+        "--server",
+        &n2.addr,
+        "--write-deadline",
+        "3s",
+        "cluster",
+        "remove",
+        "1",
+    ]);
+    let took = t.elapsed();
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains(QUORUM_REFUSAL), "{err}");
+    assert!(
+        took >= Duration::from_secs(2) && took < WAIT,
+        "retried until the 3 s deadline, then refused: took {took:?}"
+    );
+    assert_eq!(voters(&n2), [1, 2]);
     drop((n2, n3));
     eprintln!("cluster stage C e2e done in {:?}", t0.elapsed());
 }

@@ -33,7 +33,10 @@
 //!   leader that lost its quorum answers a pending write `NoLeader` too,
 //!   after its `--quorum-loss-timeout`, so the deadline also bounds a
 //!   write sent to a minority leader). `NoLeader` does not mean the write
-//!   was not applied; retries are idempotent. A read
+//!   was not applied; retries are idempotent. A write refused
+//!   *transiently* (a typed flag on the refusal, issue #225: `Admin.Remove`'s
+//!   quorum guard right after a leader change) is resent until the write
+//!   deadline, which then reports that refusal, not `NoLeader`. A read
 //!   whose connection was lost fails with a `Storage` error naming the
 //!   server. Every call carries the `mg-protocol-version` header.
 //!
