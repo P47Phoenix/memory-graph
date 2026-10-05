@@ -497,8 +497,10 @@ fn open_batch_marker_is_cleared_after_a_completed_batch() {
 /// slice 3n): the marker adds one small `meta`/`open_batch` write per chunk
 /// commit. This indexes this repo's own `crates/` tree one file per chunk
 /// (worst case for marker-write overhead) with the marker and, as a baseline
-/// that pays exactly the same per-chunk durable commits, without it (a
-/// test-only switch), and gates on the ratio (issues #125, #136, #154).
+/// that pays exactly the same per-chunk commits, without it (a test-only
+/// switch): the commit counts must be equal, and the time ratio, measured
+/// with the fsync off, must stay under a gate (issues #125, #136, #154,
+/// #224).
 ///
 /// Only a fixed subset of the tree is used: `SUBSET` files evenly spaced
 /// through the path-sorted list (every `len / SUBSET`-th file, starting at the
@@ -549,12 +551,50 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
     // seconds for the whole `index_batch`.
     let d = tempfile::tempdir().unwrap();
     let mut n = 0usize;
-    let mut time_one = |chunk_bytes: usize, skip_marker: bool| -> f64 {
+    let mut fresh = |chunk_bytes: usize, skip_marker: bool| -> V2Store {
         n += 1;
         let mut s = V2Store::open(d.path().join(format!("v{n}.redb"))).unwrap();
         s.register(Box::new(graph_lang_rust::RustExtractor));
         s.set_chunk_bytes(chunk_bytes);
         s.skip_open_batch_marker = skip_marker;
+        s
+    };
+
+    // Deterministic half (#224): the batch loop commits once per chunk, with
+    // or without the marker. This counts the commits `commit_each_counted`
+    // itself counts; the marker writes take the chunk's `&WriteTransaction`
+    // and cannot commit on their own. A commit added that bypasses that
+    // counter (a second transaction opened and committed elsewhere) is not
+    // seen here, and, with the fsync off below, not by the timing either.
+    let commits = |s: &V2Store| -> u64 {
+        let prepared = bf
+            .iter()
+            .map(|f| s.prepare("o", "r", f, IndexOptions::default()).unwrap())
+            .collect();
+        let (results, commits) = s
+            .index_prepared_counted("o", "r", prepared, IndexOptions::default())
+            .unwrap();
+        assert!(results.iter().all(|r| r.is_ok()));
+        commits
+    };
+    let with_commits = commits(&fresh(1, false));
+    let without_commits = commits(&fresh(1, true));
+    assert_eq!(
+        with_commits, without_commits,
+        "the open-batch marker changed the number of commits"
+    );
+    // One per one-file chunk, plus the final (marker-clearing) one.
+    assert_eq!(with_commits, chunks as u64 + 1);
+
+    // Timed half: the commits skip the fsync (`non_durable_commits`). A
+    // durable commit costs ~220 ms on the windows-latest runner and varies
+    // there by more than the gate under the parallel test load (#224: +0.51x
+    // with no change to the marker), and the batch loop commits as often with
+    // the marker as without it (checked above), so the fsync is not what this
+    // measures.
+    let mut time_one = |chunk_bytes: usize, skip_marker: bool| -> f64 {
+        let mut s = fresh(chunk_bytes, skip_marker);
+        s.non_durable_commits = true;
         let t = std::time::Instant::now();
         let results = V2Store::index_batch(&s, "o", "r", &bf, IndexOptions::default()).unwrap();
         let secs = t.elapsed().as_secs_f64();
@@ -564,15 +604,15 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
 
     // Relative, not absolute (issues #136, #154). Each round indexes the same
     // batch one file per chunk twice, with the open-batch marker and without
-    // it, in alternating order. Both pay the same per-chunk durable commits, so
-    // their ratio isolates what the marker adds. The earlier baseline, an
-    // unchunked ingest, did not: on the windows-latest runner a durable commit
-    // costs ~220 ms (181 commits: unchunked 4.7 s, one chunk per file 44 s,
-    // with or without the marker), which no ratio against unchunked can absorb.
-    // The best (smallest) time of each kind is kept, since load only ever adds
-    // noise.
+    // it, in alternating order. Both pay the same per-chunk commits, so their
+    // ratio isolates what the marker adds. The earlier baseline, an unchunked
+    // ingest, did not: on the windows-latest runner a durable commit costs
+    // ~220 ms (181 commits: unchunked 4.7 s, one chunk per file 44 s, with or
+    // without the marker), which no ratio against unchunked can absorb. The
+    // best (smallest) time of each kind is kept, since load only ever adds
+    // noise; without the fsync a round is short, so there are five.
     let (mut with_marker, mut without) = (f64::MAX, f64::MAX);
-    for round in 0..3 {
+    for round in 0..5 {
         let (m, b) = if round % 2 == 0 {
             let m = time_one(1, false);
             (m, time_one(1, true))
@@ -592,12 +632,17 @@ fn chunked_ingest_with_the_open_batch_marker_completes_promptly_on_this_repos_ow
         without * 1000.0,
         excess
     );
-    // Measured, marker excess: Windows debug local, 181 files within +-0.01 and
-    // the 40-file subset -0.007 to +0.007; windows-latest runner, 181 files,
-    // -0.10 to +0.03 (per-round noise there is ~10%). A 15 ms sleep per marker
-    // write gives +1.23x on the subset locally. The marker is two small table writes inside a transaction that
-    // commits anyway, so a real regression (extra commits or fsyncs, or
-    // bookkeeping that grows with the chunk count) lands far above the gate.
+    // Measured, marker excess, durable commits (before #224): Windows debug
+    // local, 181 files within +-0.01 and the 40-file subset -0.007 to +0.007;
+    // windows-latest runner, 181 files, -0.10 to +0.03, but once +0.51 under
+    // the parallel test load (#224). Without the fsync (#224), Windows debug
+    // local beside six copies of this crate's whole suite, 40-file subset, 20
+    // runs: -0.03 to +0.16 (durable, three rounds: -0.19 to +0.29); a 15 ms
+    // sleep per marker write: +1.02x. The marker is
+    // two small table writes inside a transaction that commits anyway, so a
+    // real regression (bookkeeping that grows with the chunk count, a sleep or
+    // a sync per marker write) lands far above the gate; an extra chunk commit
+    // counted by the batch loop fails the count check above.
     const EXCESS_GATE: f64 = 0.5;
     assert!(
         excess < EXCESS_GATE,
