@@ -561,7 +561,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) test plan.
 
 <a id="story-45"></a>
 **45. Read-path measurement and benchmark (3 pts)**
-Status: Partly delivered in PR #230 (counters, read benchmark, spike doc). Not yet done, tracked in #233: export on the metrics endpoint, query wall time, the bypass rate, a fresh-process cold run, the `#[ignore]` benchmark form, and the large-index re-run.
+Status: Partly delivered in PR #230 (counters, read benchmark, spike doc). Not yet done, tracked in #233: export on the metrics endpoint, decode byte counters, query wall time, the bypass rate, a fresh-process cold run, the `#[ignore]` benchmark form, and the large-index re-run.
 As a maintainer deciding whether to build a read cache
 I want decode costs and cold, warm and concurrent read numbers
 So that the cache is built only if it pays.
@@ -618,7 +618,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 2 (sizing, tests).
 
 <a id="story-49"></a>
 **49. Optional query-result cache (3 pts)**
-Status: Not started; optional. Start only if the story 49 threshold is met (exact repeat queries).
+Status: Not started; optional. Start only if a request log shows at least 20% of queries are exact repeats within 60 seconds at an unchanged generation. That log is tracked in #233.
 As an agent that repeats the same query
 I want the server to return a cached result when nothing has changed
 So that repeated queries cost almost nothing.
