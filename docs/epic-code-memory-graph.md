@@ -60,13 +60,13 @@
 | 42 | `--encoding`, `--strict-encoding` and `.memory-graph.toml` per-glob overrides | Medium | 3 | P2 | 41 |
 | 43 | Encodings on the wire, in `describe`/`--stats` and in MCP | Medium | 5 | P3 | 41, 20, 31 |
 | 44 | Encoding fixtures, cross-encoding search tests and docs | Medium | 3 | P3 | 42, 43 |
-| 45 | Read-path measurement and benchmark (ADR 0008 phase 0, **Proposed**) | Risk reduction | 3 | P3 | 24 |
-| 46 | Dict lookup without full decode; page-cache sizing (ADR 0008 phase 1, **Proposed**) | Medium | 3 | P3 | 45 |
-| 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, **Proposed**) | High | 8 | P3 | 45 (gate), 46 |
-| 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, **Proposed**) | High | 5 | P3 | 47 |
-| 49 | Optional query-result cache (ADR 0008 phase 3, **Proposed**) | Low | 3 | P4 | 45, 48 |
+| 45 | Read-path measurement and benchmark (ADR 0008 phase 0, partly delivered; #233) | Risk reduction | 3 | P3 | 24 |
+| 46 | Dict lookup without full decode; page-cache sizing (ADR 0008 phase 1, delivered) | Medium | 3 | P3 | 45 |
+| 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, gated) | High | 8 | P3 | 45 (gate), 46 |
+| 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, gated) | High | 5 | P3 | 47 |
+| 49 | Optional query-result cache (ADR 0008 phase 3, optional) | Low | 3 | P4 | 45, 48 |
 
-Total: 44 stories, 227 pts (average about 5.2); 219 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) are **proposed** by [ADR 0008](adr/0008-read-cache.md) (read cache pool, Proposed 2026-10-05) and are not counted in the totals above until the owner accepts it; 47-48 are gated on story 45's measurement and 49 is optional.
+Total: 49 stories, 249 pts (average about 5.1); 241 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -561,7 +561,7 @@ Design: [ADR 0007](adr/0007-source-encodings.md) test plan.
 
 <a id="story-45"></a>
 **45. Read-path measurement and benchmark (3 pts)**
-Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; not started).
+Status: Partly delivered in PR #230 (counters, read benchmark, spike doc). Not yet done, tracked in #233: export on the metrics endpoint, decode byte counters, query wall time, the bypass rate, a fresh-process cold run, the `#[ignore]` benchmark form, and the large-index re-run.
 As a maintainer deciding whether to build a read cache
 I want decode costs and cold, warm and concurrent read numbers
 So that the cache is built only if it pays.
@@ -573,7 +573,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 0.
 
 <a id="story-46"></a>
 **46. Dict lookup without full decode; page-cache sizing (3 pts)**
-Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; not started).
+Status: Delivered in PR #235. The dictionary scan allocates only the hit, and the CLI and `serve` derive the page cache size. After phase 1 the gate is not met on the vendored corpus (decode share 11-24%). Follow-up #236: the ingest memory budget versus the larger page cache.
 As a user querying a large store
 I want a term lookup to decode only the string it needs, and a page cache sized for my machine
 So that queries do less work and the documented cache size is true.
@@ -586,7 +586,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 1.
 
 <a id="story-47"></a>
 **47. Decoded-object cache core and MVCC-safe invalidation (8 pts)**
-Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; gated on story 45's go).
+Status: Not started; gated. The gate was not met after phase 1 (story 46). Start only if the large-index re-run (#233) shows a decode share of 25% or more.
 As an agent sending many queries to `serve`
 I want decoded dictionary blocks, symbol sections and file context reused across queries
 So that warm queries skip repeated decoding without ever seeing stale data.
@@ -603,7 +603,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 2 (generations).
 
 <a id="story-48"></a>
 **48. Read-cache tests, metrics and flags (5 pts)**
-Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; gated on story 45's go).
+Status: Not started; gated with story 47.
 As an operator and a maintainer
 I want the read cache sized, observable, switchable and proven equivalent
 So that it can be tuned or turned off and never changes an answer.
@@ -618,7 +618,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 2 (sizing, tests).
 
 <a id="story-49"></a>
 **49. Optional query-result cache (3 pts)**
-Status: Proposed ([ADR 0008](adr/0008-read-cache.md), Proposed 2026-10-05; optional).
+Status: Not started; optional. Start only if a request log shows at least 20% of queries are exact repeats within 60 seconds at an unchanged generation. That log is tracked in #233.
 As an agent that repeats the same query
 I want the server to return a cached result when nothing has changed
 So that repeated queries cost almost nothing.
