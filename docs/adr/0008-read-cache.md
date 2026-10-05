@@ -1,6 +1,6 @@
 # ADR 0008: Read cache pool
 
-**Status:** Proposed (2026-10-05; revised the same day after dev and QA review). Not accepted; the owner decides. Builds on [ADR 0003](0003-data-model.md) (the v2 store) and [ADR 0004](0004-client-server-and-replication.md) (`serve`, Raft). Epic amendment: stories 45-49 in the [epic](../epic-code-memory-graph.md), added as Proposed with the owner's approval.
+**Status:** Accepted by the owner on 2026-10-05 (proposed and revised after dev and QA review the same day). Phases 0 and 1 are delivered (#230, #235). After phase 1 the decode share is below the 25% gate on the vendored corpus, so phase 2 (stories 47-48) is not started; it stays gated on the large-index re-run tracked in #233. Builds on [ADR 0003](0003-data-model.md) (the v2 store) and [ADR 0004](0004-client-server-and-replication.md) (`serve`, Raft). Epic amendment: stories 45-49 in the [epic](../epic-code-memory-graph.md), added with the owner's approval.
 
 ## In plain words
 
