@@ -20,6 +20,7 @@
 //! is refused before anything is written (a retired v1 file with
 //! [`StoreError::LegacyFormat`], anything else with `SchemaMismatch`).
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
+use crate::read_stats::{self, Counter};
 use crate::{check_unchanged, dec, describe_in, enc, SnapshotStats, Store, StoreRead};
 use crate::{
     commit_prepared, prepare_file, stored_fingerprint_matches, stored_fingerprints, PreparedFile,
@@ -252,6 +253,37 @@ fn dict_rev_lookup<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>
     t: &T,
     id: u64,
 ) -> Result<Option<String>> {
+    let Some(block) = dict_rev_block(t, id)? else {
+        return Ok(None);
+    };
+    let entries = codec::decode_dict_block(block.value())?;
+    Ok(find_dict_entry(entries, id))
+}
+
+/// [`dict_rev_lookup`] for queries: the block decode is counted (and, with
+/// timing on, timed) in [`crate::read_stats`]. Writes use the uncounted one.
+fn dict_rev_lookup_counted<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
+    t: &T,
+    id: u64,
+) -> Result<Option<String>> {
+    let Some(block) = dict_rev_block(t, id)? else {
+        return Ok(None);
+    };
+    let entries = read_stats::timed(Counter::DictBlockDecodes, Counter::DictNanos, || {
+        codec::decode_dict_block(block.value())
+    })?;
+    Ok(find_dict_entry(entries, id))
+}
+
+fn find_dict_entry(entries: Vec<(u64, String)>, id: u64) -> Option<String> {
+    entries.into_iter().find(|(i, _)| *i == id).map(|(_, t)| t)
+}
+
+/// The reverse-dictionary block that would hold `id`, if any.
+fn dict_rev_block<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
+    t: &T,
+    id: u64,
+) -> Result<Option<redb::AccessGuard<'_, &'static [u8]>>> {
     let n = t.len()?;
     if n == 0 {
         return Ok(None);
@@ -273,9 +305,7 @@ fn dict_rev_lookup<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>
     if lo == 0 {
         return Ok(None);
     }
-    let block = t.get(lo - 1)?.unwrap();
-    let entries = codec::decode_dict_block(block.value())?;
-    Ok(entries.into_iter().find(|(i, _)| *i == id).map(|(_, t)| t))
+    Ok(t.get(lo - 1)?)
 }
 
 /// Read transactions opened by `prepare`'s one-file pre-check, process-wide
@@ -770,7 +800,7 @@ impl R {
             else {
                 return Ok(None);
             };
-            if dict_rev_lookup(&self.rev, id)?.is_some_and(|t| t == text) {
+            if dict_rev_lookup_counted(&self.rev, id)?.is_some_and(|t| t == text) {
                 return Ok(Some(id));
             }
         }
@@ -778,11 +808,13 @@ impl R {
     }
 
     /// A dictionary text, cached for the life of this query.
-    fn text(&self, term: u64) -> Result<Rc<str>> {
+    pub(crate) fn text(&self, term: u64) -> Result<Rc<str>> {
         if let Some(t) = self.texts.borrow().get(&term) {
+            read_stats::bump(Counter::DictMemoHits);
             return Ok(Rc::clone(t));
         }
-        let t: Rc<str> = dict_rev_lookup(&self.rev, term)?
+        read_stats::bump(Counter::DictMemoMisses);
+        let t: Rc<str> = dict_rev_lookup_counted(&self.rev, term)?
             .ok_or_else(|| StoreError::Corrupt(format!("dangling term {term}")))?
             .into();
         self.texts.borrow_mut().insert(term, Rc::clone(&t));
@@ -2200,7 +2232,7 @@ impl<'t> W<'t> {
         let Some(raw) = self.streams.get(file)? else {
             return Ok(());
         };
-        let s = codec::decode(raw.value())?;
+        let s = read_stats::uncounted(|| codec::decode(raw.value()))?;
         drop(raw);
 
         let cid = content_id(file);
@@ -2856,7 +2888,9 @@ impl V2Store {
                 live.insert(r?.0.value().0);
             }
             for r in w.streams.iter()? {
-                for s in codec::decode_lazy(r?.1.value())?.symbols()? {
+                let raw = r?.1;
+                let syms = read_stats::uncounted(|| codec::decode_lazy(raw.value())?.symbols())?;
+                for s in syms {
                     live.insert(s.name);
                     live.extend(s.lang_kind);
                     live.extend(s.owner);
@@ -4051,7 +4085,10 @@ macro_rules! store_read {
     };
 }
 
-store_read!(V2Store, |s| s.db.begin_read()?);
+store_read!(V2Store, |s| {
+    read_stats::bump(Counter::ReadTxns);
+    s.db.begin_read()?
+});
 store_read!(V2Snapshot, |s| &s.rt);
 
 impl V2Store {
