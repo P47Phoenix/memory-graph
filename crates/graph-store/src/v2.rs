@@ -773,8 +773,10 @@ impl R {
     /// A dictionary text, cached for the life of this query.
     fn text(&self, term: u64) -> Result<Rc<str>> {
         if let Some(t) = self.texts.borrow().get(&term) {
+            crate::read_stats::bump(&crate::read_stats::DICT_MEMO_HITS);
             return Ok(Rc::clone(t));
         }
+        crate::read_stats::bump(&crate::read_stats::DICT_MEMO_MISSES);
         let t: Rc<str> = dict_rev_lookup(&self.rev, term)?
             .ok_or_else(|| StoreError::Corrupt(format!("dangling term {term}")))?
             .into();
@@ -4030,7 +4032,10 @@ macro_rules! store_read {
     };
 }
 
-store_read!(V2Store, |s| s.db.begin_read()?);
+store_read!(V2Store, |s| {
+    crate::read_stats::bump(&crate::read_stats::READ_TXNS);
+    s.db.begin_read()?
+});
 store_read!(V2Snapshot, |s| &s.rt);
 
 impl V2Store {

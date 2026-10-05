@@ -79,6 +79,7 @@
 //! independently justify codec-embedding vs. a separate table on its own
 //! access pattern, not cite this decision. See the story 3 row for the full
 //! scoping decision and its five conditions.
+use crate::read_stats;
 use crate::StoreError;
 use graph_core::{Span, SymbolKind, TokenClass};
 
@@ -395,7 +396,14 @@ pub struct Lazy<'a> {
     toks: &'a [u8],
 }
 
+/// Decode a stream's header (counted in [`crate::read_stats`]).
 pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
+    read_stats::timed(&read_stats::LAZY_DECODES, &read_stats::LAZY_NANOS, || {
+        decode_lazy_uncounted(b)
+    })
+}
+
+fn decode_lazy_uncounted(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
     let mut r = Reader { b, at: 0 };
     let fmt = r.byte()?;
     if fmt != STREAM_FORMAT {
@@ -479,8 +487,14 @@ impl Lazy<'_> {
         self.ranges_dense
     }
 
-    /// The symbol section, decoded.
+    /// The symbol section, decoded (counted in [`crate::read_stats`]).
     pub fn symbols(&self) -> Result<Vec<SymRec>, StoreError> {
+        read_stats::timed(&read_stats::SYMBOL_DECODES, &read_stats::LAZY_NANOS, || {
+            self.symbols_uncounted()
+        })
+    }
+
+    fn symbols_uncounted(&self) -> Result<Vec<SymRec>, StoreError> {
         let mut r = Reader {
             b: self.sym_bytes,
             at: 0,
@@ -784,6 +798,14 @@ pub fn dict_block_entry_count(b: &[u8]) -> Result<usize, StoreError> {
 /// Decode a block written by [`encode_dict_block`] into its `(id, text)`
 /// entries, in the stored (ascending id) order.
 pub fn decode_dict_block(b: &[u8]) -> Result<Vec<(u64, String)>, StoreError> {
+    read_stats::timed(
+        &read_stats::DICT_BLOCK_DECODES,
+        &read_stats::DICT_NANOS,
+        || decode_dict_block_uncounted(b),
+    )
+}
+
+fn decode_dict_block_uncounted(b: &[u8]) -> Result<Vec<(u64, String)>, StoreError> {
     let mut r = Reader { b, at: 0 };
     let n = usize::try_from(r.varint()?).map_err(|_| bad("dict block count out of range"))?;
     if n > b.len() {
@@ -822,9 +844,17 @@ pub fn dict_block_first_id(b: &[u8]) -> Result<Option<u64>, StoreError> {
     Ok(Some(r.varint()?))
 }
 
+/// Decode a whole stream (counted in [`crate::read_stats`] as one full
+/// decode, not also as a lazy and a symbol-section decode).
 pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
-    let lazy = decode_lazy(b)?;
-    let symbols = lazy.symbols()?;
+    read_stats::timed(&read_stats::FULL_DECODES, &read_stats::FULL_NANOS, || {
+        decode_uncounted(b)
+    })
+}
+
+fn decode_uncounted(b: &[u8]) -> Result<Stream, StoreError> {
+    let lazy = decode_lazy_uncounted(b)?;
+    let symbols = lazy.symbols_uncounted()?;
     let mut tokens = Vec::with_capacity(lazy.ntok);
     lazy.tokens(|_, t| {
         tokens.push(t.clone());

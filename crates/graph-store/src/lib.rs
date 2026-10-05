@@ -27,6 +27,8 @@ pub(crate) mod codec;
 mod common;
 pub mod conformance;
 pub mod export;
+mod read_stats;
+pub use read_stats::{read_stats, reset_read_stats, set_read_timing, ReadStats};
 mod v2;
 pub use api::{
     detect_format, open_store, FingerprintSnapshot, Page, PreparedFile, RemoteParts, SnapshotStats,
