@@ -166,6 +166,55 @@ fn a_body_over_1_mib_gets_413() {
     assert_eq!(r.json()["error"]["code"], graph_mcp::PARSE_ERROR);
 }
 
+/// #224: an answer given before the body was read (a declared length over
+/// the limit, a foreign Host, another path, another method) reaches a
+/// client that sends its whole body first and reads only afterwards, as a
+/// simple client does. The server closes in stages (RFC 9112 section 9.6):
+/// it reads and discards the rest before it closes. Closing with the body
+/// unread sends a TCP reset, which on Windows destroyed the answer in the
+/// client's buffer (`WSAECONNABORTED`, 10053) every time here, and on a
+/// loaded host often enough to fail `a_body_over_1_mib_gets_413`.
+#[test]
+fn an_early_answer_survives_a_client_that_reads_after_sending() {
+    use std::io::{Read, Write};
+    let d = tempfile::tempdir().unwrap();
+    let (_srv, addr) = server(&d, loopback());
+    let big = MAX_BODY_BYTES + (1 << 20);
+    for (head, body_len, want) in [
+        ("POST /mcp HTTP/1.1\r\nHost: {addr}\r\n", big, 413),
+        (
+            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\n",
+            512 << 10,
+            403,
+        ),
+        ("POST /other HTTP/1.1\r\nHost: {addr}\r\n", 512 << 10, 404),
+        ("PUT /mcp HTTP/1.1\r\nHost: {addr}\r\n", 512 << 10, 405),
+    ] {
+        let head = head.replace("{addr}", &addr.to_string());
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let req = format!(
+            "{head}Content-Type: application/json\r\nContent-Length: {body_len}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        // The whole body, which the server answers without reading: it
+        // must read it after answering, or this write cannot finish.
+        s.write_all(&vec![b' '; body_len])
+            .unwrap_or_else(|e| panic!("{want}: sending the body: {e}"));
+        // Give the server every chance to close before this reads.
+        std::thread::sleep(Duration::from_millis(300));
+        let mut out = Vec::new();
+        s.read_to_end(&mut out)
+            .unwrap_or_else(|e| panic!("{want}: reading the answer: {e}"));
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.starts_with(&format!("HTTP/1.1 {want} ")),
+            "{want}: {text}"
+        );
+    }
+}
+
 #[test]
 fn sessions_are_issued_and_checked() {
     let d = tempfile::tempdir().unwrap();

@@ -1334,11 +1334,31 @@ fn a_transfer_waits_for_a_write_in_flight() {
     );
     assert_eq!(tb.leader(), target, "the TARGET must lead");
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let c = tb.client(target);
     assert_eq!(
-        tb.client(target).count_nodes(NodeKind::File).unwrap(),
+        c.count_nodes(NodeKind::File).unwrap(),
         1,
-        "the write is on the target"
+        "the write is on the target; its files: {:?}",
+        file_paths(&c)
     );
+}
+
+/// `org/repo/path` of every file in `c`'s store (a failure's diagnostic).
+fn file_paths(c: &RemoteStore) -> Vec<String> {
+    let mut out = Vec::new();
+    for org in c.roots().unwrap() {
+        for repo in c.children(org.id).unwrap() {
+            for f in c.children(repo.id).unwrap() {
+                if f.kind == NodeKind::File {
+                    out.push(format!(
+                        "{}/{}/{} (id {:?})",
+                        org.name, repo.name, f.name, f.id
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// #165: `Store.ExtractorGaps` asked of a follower is forwarded to the

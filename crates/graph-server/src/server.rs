@@ -1233,10 +1233,15 @@ pub fn run_blocking_with(
     let rt = build_runtime(cfg.worker_threads).map_err(|e| io_err("tokio runtime", e))?;
     rt.block_on(async move {
         let running = start(cfg, share(extractors)).await?;
+        // The handlers go in before `on_ready` announces the server (#224):
+        // a supervisor may send SIGTERM as soon as it reads the start line,
+        // and a signal that arrives before its handler kills the process
+        // with the default action (no graceful stop, LOCK sidecar left).
+        let signals = Signals::install().map_err(|e| io_err("signal handlers", e))?;
         on_ready(&running);
         let handle = running.shutdown_handle();
         tokio::spawn(async move {
-            wait_for_signal().await;
+            signals.wait().await;
             tracing::info!("signal received; shutting down");
             handle.trigger();
         });
@@ -1256,36 +1261,75 @@ fn build_runtime(
     b.enable_all().build()
 }
 
-async fn wait_for_signal() {
+/// The stop signals `serve` handles, registered when built (not when first
+/// awaited): Ctrl-C and SIGTERM on Unix; on Windows Ctrl-C, and Ctrl-Break
+/// (what a supervisor sends a console process it started in its own process
+/// group, e.g. Python's `send_signal(CTRL_BREAK_EVENT)` in
+/// `scripts/cluster_soak.py`).
+struct Signals {
     #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+    int: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+}
+
+impl Signals {
+    /// Register the handlers now; from here on these signals are delivered
+    /// to [`wait`](Self::wait), never to the default action.
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                int: signal(SignalKind::interrupt())?,
+                term: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+                ctrl_break: tokio::signal::windows::ctrl_break().ok(),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(Self {})
         }
     }
-    // Windows: Ctrl-C, and Ctrl-Break (what a supervisor sends a console
-    // process it started in its own process group, e.g. Python's
-    // `send_signal(CTRL_BREAK_EVENT)` in `scripts/cluster_soak.py`).
-    #[cfg(windows)]
-    {
-        match tokio::signal::windows::ctrl_break() {
-            Ok(mut brk) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = brk.recv() => {}
+
+    /// Resolve on the first of the signals.
+    async fn wait(mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.int.recv() => {}
+                _ = self.term.recv() => {}
+            }
+        }
+        #[cfg(windows)]
+        {
+            match &mut self.ctrl_break {
+                Some(brk) => {
+                    tokio::select! {
+                        _ = self.ctrl_c.recv() => {}
+                        _ = brk.recv() => {}
+                    }
+                }
+                None => {
+                    self.ctrl_c.recv().await;
                 }
             }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
         }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = &mut self;
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
