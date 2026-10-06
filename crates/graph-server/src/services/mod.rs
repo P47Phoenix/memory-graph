@@ -213,6 +213,15 @@ impl Ctx {
         }
     }
 
+    /// Count one answered read in the request log (ADR 0008 phase 3 gate):
+    /// `key` at the applied index its answer reflects.
+    pub fn note_query(&self, key: crate::repeats::QueryKey, meta: &ReadMeta) {
+        self.raft
+            .obs
+            .repeats
+            .note(key, meta.applied_index, std::time::Instant::now());
+    }
+
     /// Run a node-local write (a dry-run prune, compact) on the blocking
     /// pool.
     pub async fn blocking<T, F>(&self, f: F) -> Result<T, Status>

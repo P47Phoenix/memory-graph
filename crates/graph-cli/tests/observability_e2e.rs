@@ -735,3 +735,104 @@ fn read_counters_rise_across_a_search() {
     }
     s.stop();
 }
+
+/// The sample of `name` whose `rpc` label is `rpc`.
+fn by_rpc(samples: &[Sample], name: &str, rpc: &str) -> f64 {
+    let v: Vec<&Sample> = samples
+        .iter()
+        .filter(|s| s.name == name && s.labels.get("rpc").map(String::as_str) == Some(rpc))
+        .collect();
+    assert_eq!(v.len(), 1, "{name}{{rpc={rpc}}}: {v:?}");
+    v[0].value
+}
+
+/// ADR 0008 phase 3 gate (epic story 49): the same search twice at an
+/// unchanged applied index counts one exact repeat; a write in between
+/// (the applied index advances) makes the next one a fresh query.
+#[test]
+fn an_identical_search_counts_one_repeat_until_a_write() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let s = Serve::start(
+        &[
+            "--db",
+            db.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--metrics-listen",
+            "127.0.0.1:0",
+        ],
+        &[],
+    );
+    let metrics = s.metrics.clone().expect("a metrics line on stdout");
+    let index = |file: &str| {
+        ok(&[
+            "--server",
+            &s.addr,
+            "index-file",
+            "--org",
+            "o",
+            "--repo",
+            "r",
+            file,
+        ])
+    };
+    index(&src_file(d.path()));
+    let scrape = || {
+        let (code, body) = http_get(&metrics, "/metrics");
+        assert_eq!(code, 200, "{body}");
+        parse_prometheus(&body).1
+    };
+    let search = || assert!(ok(&["--server", &s.addr, "search", "observed"]).contains("observed"));
+    let queries = |x: &[Sample]| by_rpc(x, "mg_queries_total", "Search");
+    let repeats = |x: &[Sample]| by_rpc(x, "mg_query_exact_repeats_total", "Search");
+
+    let before = scrape();
+    search();
+    let first = scrape();
+    assert!(queries(&first) > queries(&before));
+    assert_eq!(
+        repeats(&first),
+        repeats(&before),
+        "a first query is no repeat"
+    );
+    search();
+    let second = scrape();
+    assert!(queries(&second) > queries(&first));
+    assert_eq!(
+        repeats(&second) - repeats(&first),
+        1.0,
+        "the same search again"
+    );
+    // The read view is not part of the key: a linearizable read of the
+    // same query at the same applied index is a repeat of the local one.
+    let lin = ok(&[
+        "--server",
+        &s.addr,
+        "--read",
+        "linearizable",
+        "search",
+        "observed",
+    ]);
+    assert!(lin.contains("observed"), "{lin}");
+    let after_lin = scrape();
+    assert_eq!(
+        repeats(&after_lin) - repeats(&second),
+        1.0,
+        "linearizable after local"
+    );
+    let second = after_lin;
+
+    let g = d.path().join("other.rs");
+    std::fs::write(&g, "pub fn observed_too() -> u32 { 2 }\n").unwrap();
+    index(g.to_str().unwrap());
+    search();
+    let third = scrape();
+    assert!(queries(&third) > queries(&second));
+    assert_eq!(
+        repeats(&third),
+        repeats(&second),
+        "a write advanced the applied index"
+    );
+    s.stop();
+}

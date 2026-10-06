@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 30] = [
+pub const METRIC_NAMES: [&str; 32] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -66,6 +66,8 @@ pub const METRIC_NAMES: [&str; 30] = [
     "mg_read_query_seconds_total",
     "mg_read_txns_total",
     "mg_read_dict_strings_total",
+    "mg_queries_total",
+    "mg_query_exact_repeats_total",
 ];
 
 /// The Prometheus text exposition format this module writes.
@@ -145,6 +147,8 @@ pub struct Observability {
     last_contact: Mutex<Option<(Instant, Option<u64>)>>,
     /// `(tool, outcome)` -> MCP `tools/call`s on `--mcp-listen`.
     mcp_calls: Mutex<BTreeMap<(String, String), u64>>,
+    /// Read RPCs answered and their exact repeats (ADR 0008 phase 3 gate).
+    pub repeats: crate::repeats::RepeatLog,
 }
 
 impl Observability {
@@ -523,7 +527,42 @@ pub fn render(ctx: &Ctx) -> String {
     );
     let _ = writeln!(out, "mg_backup_bytes_total {}", b.bytes_total);
     render_read_stats(&mut out, &graph_store::read_stats::snapshot());
+    render_repeats(&mut out, &obs.repeats);
     out
+}
+
+/// `mg_queries_total{rpc}` and `mg_query_exact_repeats_total{rpc}`: one
+/// sample per read RPC (a fixed set), zeros included.
+fn render_repeats(out: &mut String, log: &crate::repeats::RepeatLog) {
+    let counts = log.counts();
+    head(
+        out,
+        "mg_queries_total",
+        "counter",
+        "Read RPCs answered by this node, by method.",
+    );
+    for (rpc, c) in counts {
+        let _ = writeln!(
+            out,
+            "mg_queries_total{{rpc=\"{}\"}} {}",
+            rpc.as_str(),
+            c.queries
+        );
+    }
+    head(
+        out,
+        "mg_query_exact_repeats_total",
+        "counter",
+        "Read RPCs that repeated an identical request (any read view) answered within 60 s at the same Raft applied index, by method; an approximate lower bound (see docs/guide/observability.md).",
+    );
+    for (rpc, c) in counts {
+        let _ = writeln!(
+            out,
+            "mg_query_exact_repeats_total{{rpc=\"{}\"}} {}",
+            rpc.as_str(),
+            c.repeats
+        );
+    }
 }
 
 fn counter(out: &mut String, name: &str, help: &str, v: impl std::fmt::Display) {
