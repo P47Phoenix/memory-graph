@@ -65,8 +65,13 @@
 | 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, gated) | High | 8 | P3 | 45 (gate), 46 |
 | 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, gated) | High | 5 | P3 | 47 |
 | 49 | Optional query-result cache (ADR 0008 phase 3, optional) | Low | 3 | P4 | 45, 48 |
+| 50 | OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot` (ADR 0009, **Proposed**) | Medium | 5 | P3 | 24 |
+| 51 | Traces and W3C propagation across client, forward and Raft (ADR 0009, **Proposed**) | High | 8 | P3 | 50 |
+| 52 | Metrics over OTLP with the 1:1 name mapping (ADR 0009, **Proposed**) | Medium | 5 | P3 | 50, 51 |
+| 53 | Logs over OTLP; trace ids in JSON logs (ADR 0009, **Proposed**) | Medium | 3 | P3 | 51 |
+| 54 | OpenTelemetry compose demo, CI and docs (ADR 0009, **Proposed**) | Low | 3 | P3 | 52, 53 |
 
-Total: 49 stories, 249 pts (average about 5.1); 241 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional.
+Total: 49 stories, 249 pts (average about 5.1); 241 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (24 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), which is **Proposed**; they are not counted in the totals above until the owner accepts it.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -626,6 +631,69 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 3.
 - Given story 45's request log, When reviewed, Then this story must start only if at least 20% of queries are exact repeats within 60 seconds at an unchanged generation.
 - Given a query at generation G, When the same query arrives at G, Then `serve` must return the cached result (a hit counter rises); given any write, Then the result cache must be cleared by raising its floor.
 - Given the result cache on and off, When `run_differential` and the consistency differential run, Then answers must be identical.
+
+<a id="story-50"></a>
+**50. OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot` (5 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. The new dependencies need the owner's approval in this story's PR.
+As a maintainer adding OpenTelemetry
+I want the pinned crates, a telemetry module and one metrics snapshot in place with no change in behaviour
+So that traces, metrics and logs can be added without touching the Prometheus contract.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D2, D3, D4, D6 and D9.
+- Given the crates in ADR 0009 D2, When added to `[workspace.dependencies]` with exact pins and the listed features only, Then `cargo tree -i ring` and `cargo tree -i aws-lc-sys` must print nothing, `check-no-c-deps.py` and `test_gate.py` must pass, `cargo tree -d` must show no second tonic or prost, and the PR must record that `tracing-opentelemetry` targets `opentelemetry 0.33`.
+- Given `--otlp-endpoint`, `--otlp-signals`, `--otel-service-name` and `--otlp-metrics-interval`, When set by flag, config key or `OTEL_*` environment variable, Then `TelemetryConfig` must follow the precedence flag, then key, then environment (unit-tested for each pair), headers must come only from `OTEL_EXPORTER_OTLP_HEADERS`, and a non-`http://` endpoint must be refused at startup.
+- Given no endpoint from any source, When `serve` starts, Then no OpenTelemetry provider, layer or exporter task may exist.
+- Given the `MetricsSnapshot` refactor, When `/metrics` is scraped, Then the output must be byte-identical to before (a golden test taken before the refactor, plus the existing observability tests).
+- Given the resource, When built, Then it must carry `service.name`, `service.version`, `service.instance.id`, `memory_graph.cluster` and `host.name`, and `OTEL_RESOURCE_ATTRIBUTES` must not override them.
+
+<a id="story-51"></a>
+**51. Traces and W3C propagation across client, forward and Raft (8 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted.
+As an operator debugging a slow or failed request
+I want one trace from the client through the follower, the leader and Raft
+So that I can see where the time went across nodes.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D5 and D8.
+- Given a 3-node cluster with OTLP pointed at a fake collector (an in-process tonic server built on `opentelemetry-proto` `gen-tonic`, on 127.0.0.1:0), When a client sends a write to a follower that forwards it to the leader, Then the collector must receive one trace whose spans link the client call, the follower's rpc and forward hop, the leader's rpc, and the Raft append and apply.
+- Given an rpc span, When exported, Then it must carry `rpc.system=grpc`, `rpc.service`, `rpc.method`, `rpc.grpc.status_code` and `server.address`; and a forward hop must carry `mg.forwarded_by`.
+- Given an incoming `traceparent`, When `RpcService::call` handles the request, Then the server span must be its child; and `SendVersion`, `ForwardHeaders` and `RaftHeaders` must inject `traceparent` and `tracestate`.
+- Given MCP `tools/call`, an index batch, a snapshot install and a `RemoteStore` call, When each runs with traces on, Then each must produce a span.
+- Given no endpoint, When the same workload runs, Then the fake collector must receive nothing and no OpenTelemetry layer may be installed.
+- Given the collector down, When RPCs run, Then they must all succeed with latency within a fixed bound of the OTLP-off run, and `mg_otel_export_failures_total{signal="traces"}` must rise.
+- Given a clean shutdown, When `serve` stops, Then spans still in the queue must be flushed within the timeout.
+
+<a id="story-52"></a>
+**52. Metrics over OTLP with the 1:1 name mapping (5 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted.
+As an operator whose metrics pipeline is OpenTelemetry
+I want every `/metrics` family exported over OTLP under an OTel-style name
+So that I get the same numbers without scraping.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D6 and D8.
+- Given `METRIC_NAMES` and the ADR's mapping table, When the contract test runs, Then every Prometheus family must have exactly one OTLP twin and every OTLP metric must map back.
+- Given the fake collector and `--otlp-metrics-interval`, When an interval passes, Then every mapped metric must arrive with the instrument kind, unit and attributes in the table, histograms with the `DURATION_BUCKETS` bounds, and values equal to a `/metrics` scrape taken at the same moment (within a tolerance for counters that keep moving).
+- Given the two new families, When scraped, Then `mg_otel_export_failures_total{signal}` and `mg_otel_dropped_total{signal}` must be in `METRIC_NAMES` and stay 0 with OpenTelemetry off.
+- Given the collector down, When intervals pass, Then serving must be unaffected and the metrics failure counter must rise.
+
+<a id="story-53"></a>
+**53. Logs over OTLP; trace ids in JSON logs (3 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted.
+As an operator reading logs next to traces
+I want `serve`'s log events exported over OTLP and tagged with trace ids
+So that a log line leads to its trace and back.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D7 and D8.
+- Given `--otlp-signals logs` and the fake collector, When an event is logged inside an rpc span, Then the collector must receive a record with the mapped severity, the body, the attributes, and the trace and span ids of that span.
+- Given `--log-level` or `MEMORY_GRAPH_LOG`, When set, Then OTLP must receive the same events as stdout.
+- Given `--log-format json` with OTLP off, When an event is logged inside a span, Then the line must gain `trace_id` and `span_id` and be otherwise unchanged; text logs must be unchanged.
+- Given the collector down, When events are logged, Then logging and serving must not block, the exporter must not export its own errors, and `mg_otel_dropped_total{signal="logs"}` or the failure counter must rise.
+
+<a id="story-54"></a>
+**54. OpenTelemetry compose demo, CI and docs (3 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted.
+As an operator trying OpenTelemetry for the first time
+I want a working compose recipe and a guide
+So that I can see traces, metrics and logs in minutes and know how to run a collector with TLS.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D3, D4, D6 and D10.
+- Given `deploy/compose/` with an `otel` profile, When `docker compose --profile otel up` runs, Then the collector's debug output must show traces, metrics and logs from all three nodes started with `--otlp-endpoint http://otel-collector:4317`.
+- Given the existing compose CI job and `check.sh`, When run, Then they must pass unchanged.
+- Given `docs/guide/observability.md`, When read, Then it must have an OpenTelemetry section covering enabling, the flags, keys and environment variables with their precedence, the resource attributes, the signals, the metric name mapping, the failure behaviour, and a collector recipe that handles TLS at the collector; and `docs/deploy/compose.md`, the README, the CLAUDE.md crate notes and the release notes must point to it, including the environment-variable configuration of the Docker image.
 
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
