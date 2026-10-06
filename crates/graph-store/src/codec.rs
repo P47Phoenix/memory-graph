@@ -398,6 +398,7 @@ pub struct Lazy<'a> {
 
 /// Decode a stream's header (counted in [`crate::read_stats`]).
 pub fn decode_lazy(b: &[u8]) -> Result<Lazy<'_>, StoreError> {
+    read_stats::add_bytes(Counter::LazyBytes, b.len());
     read_stats::timed(Counter::LazyDecodes, Counter::LazyNanos, || {
         decode_lazy_uncounted(b)
     })
@@ -489,6 +490,7 @@ impl Lazy<'_> {
 
     /// The symbol section, decoded (counted in [`crate::read_stats`]).
     pub fn symbols(&self) -> Result<Vec<SymRec>, StoreError> {
+        read_stats::add_bytes(Counter::SymbolBytes, self.sym_bytes.len());
         read_stats::timed(Counter::SymbolDecodes, Counter::LazyNanos, || {
             self.symbols_uncounted()
         })
@@ -877,6 +879,7 @@ pub fn dict_block_first_id(b: &[u8]) -> Result<Option<u64>, StoreError> {
 /// Decode a whole stream (counted in [`crate::read_stats`] as one full
 /// decode, not also as a lazy and a symbol-section decode).
 pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
+    read_stats::add_bytes(Counter::FullBytes, b.len());
     read_stats::timed(Counter::FullDecodes, Counter::FullNanos, || {
         decode_uncounted(b)
     })

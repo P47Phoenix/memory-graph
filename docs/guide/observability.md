@@ -40,6 +40,12 @@ Logs go to stderr. Stdout carries only the `listening on` start line, and `metri
 | `mg_backup_last_success_timestamp`, `mg_backup_last_index` | gauge | Unix time and log index of the last snapshot backup committed (`--backup-url`; 0: none) |
 | `mg_backup_failures_total`, `mg_backup_bytes_total` | counter | Backups that failed after every retry; bytes written by successful ones |
 | `mg_mcp_tool_calls_total{tool,outcome}` | counter | MCP tool calls served by `serve --mcp-listen` ([docs/mcp.md](../mcp.md)) |
+| `mg_read_decodes_total{kind}`, `mg_read_decode_bytes_total{kind}` | counter | Decodes done by queries and the encoded bytes they read; `kind` `dict` (reverse-dictionary block scans), `symbol` (symbol sections), `lazy` (stream headers) or `full` (whole streams) |
+| `mg_read_decode_nanoseconds_total{kind}` | counter | Time inside those decodes (`--read-timing` only, else 0; symbol-section time is counted under `lazy`, so `symbol` stays 0) |
+| `mg_read_queries_total`, `mg_read_query_nanoseconds_total` | counter | Store read calls served, and their wall time (`--read-timing` only) |
+| `mg_read_txns_total`, `mg_read_dict_strings_total` | counter | Read transactions opened by store reads (snapshot reads reuse one); dictionary strings allocated by term lookups |
+
+The `mg_read_*` families (read cache phase 0, [ADR 0008](../adr/0008-read-cache.md)) are process-wide counters of the store's read path: the share of query time spent decoding is `mg_read_decode_nanoseconds_total / mg_read_query_nanoseconds_total`. Counts are always on; the nanosecond families need `serve --read-timing` (config key `read-timing = true`, default off), because reading the clock around every decode is not free on every platform.
 
 `cluster status --json` reports the same Raft and store numbers, `writes_forwarded_total`, `rpcs_total` and `entries_applied_total`; on the leader, `replication` lists each peer's `matched_index`, `lag` and `last_error` (the last failed Raft RPC to it, kept while RPCs to it keep failing or while it lags behind the leader; empty once it answers and has caught up).
 

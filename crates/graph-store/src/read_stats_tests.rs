@@ -34,6 +34,7 @@ fn counts(s: ReadStats) -> ReadStats {
         dict_decode_nanos: 0,
         lazy_decode_nanos: 0,
         full_decode_nanos: 0,
+        query_nanos: 0,
         ..s
     }
 }
@@ -78,6 +79,7 @@ fn a_repeated_query_counts_the_same_one_txn_and_one_miss_per_distinct_term() {
         "a fixed query counts the same work each time"
     );
     assert_eq!(first.read_txns, 1);
+    assert_eq!(first.queries, 1, "one StoreRead call is one query");
     // Each distinct token text is resolved from the dictionary once, then
     // answered from the per-query memo.
     let tokens = tokens1.expect("a.txt is indexed");
@@ -86,6 +88,7 @@ fn a_repeated_query_counts_the_same_one_txn_and_one_miss_per_distinct_term() {
     assert_eq!(first.dict_text_memo_misses, distinct.len() as u64);
     assert_eq!(first.dict_block_decodes, first.dict_text_memo_misses);
     assert_eq!(first.dict_strings_decoded, first.dict_text_memo_misses);
+    assert!(first.dict_bytes > 0, "{first:?}");
     assert_eq!(
         first.dict_text_memo_hits,
         (tokens.len() - distinct.len()) as u64
@@ -101,6 +104,35 @@ fn a_token_search_reads_one_txn_the_same_way_each_time() {
     assert_eq!(hits1.len(), 3);
     assert_eq!(counts(first), counts(second));
     assert_eq!(first.read_txns, 1);
+    assert_eq!(first.queries, 1);
+}
+
+#[test]
+fn snapshot_reads_count_one_query_each_and_no_txn() {
+    let (_d, s) = tiny_store();
+    let snap = s.snapshot_owned().expect("snapshot");
+    let (_, d) = measure(|| {
+        snap.search(&alpha_query()).expect("search");
+        snap.describe(None, None).expect("describe")
+    });
+    assert_eq!(d.queries, 2, "{d:?}");
+    assert_eq!(d.read_txns, 0, "{d:?}");
+}
+
+#[test]
+fn a_dictionary_scan_counts_the_encoded_block_bytes() {
+    let (_d, s) = tiny_store();
+    let alpha = term_id(&s, "alpha");
+    let rt = s.db.begin_read().expect("begin_read");
+    let block_len = {
+        let t = rt.open_table(crate::v2::DICT_REV).expect("dict_rev table");
+        let row = t.iter().expect("iter").next().expect("one block");
+        let len = row.expect("row").1.value().len() as u64;
+        len
+    };
+    let r = crate::v2::R::new(&rt).expect("reader");
+    let (_, d) = measure(|| r.text(alpha).expect("text"));
+    assert_eq!(d.dict_bytes, block_len, "{d:?}");
 }
 
 #[test]
@@ -134,6 +166,7 @@ fn a_full_decode_counts_only_as_a_full_decode() {
     let (_, d) = measure(|| crate::codec::decode(&bytes).expect("decode"));
     let want = ReadStats {
         full_stream_decodes: 1,
+        full_bytes: bytes.len() as u64,
         full_decode_nanos: d.full_decode_nanos,
         ..Default::default()
     };
@@ -153,6 +186,8 @@ fn a_lazy_decode_then_symbols_counts_one_of_each() {
     let want = ReadStats {
         lazy_stream_decodes: 1,
         symbol_section_decodes: 1,
+        lazy_bytes: bytes.len() as u64,
+        symbol_bytes: d.symbol_bytes,
         lazy_decode_nanos: d.lazy_decode_nanos,
         ..Default::default()
     };
@@ -181,6 +216,9 @@ fn writes_do_not_count_as_reads() {
     assert_eq!(w.dict_strings_decoded, 0, "{w:?}");
     assert_eq!(w.lazy_stream_decodes + w.symbol_section_decodes, 0, "{w:?}");
     assert_eq!(w.full_stream_decodes, 0, "{w:?}");
+    let bytes = w.dict_bytes + w.symbol_bytes + w.lazy_bytes + w.full_bytes;
+    assert_eq!(bytes, 0, "{w:?}");
+    assert_eq!(w.queries, 0, "{w:?}");
 }
 
 /// One test for both timing states, because the toggle is process-global:
@@ -202,6 +240,7 @@ fn timing_fills_the_nanos_only_when_on_and_never_changes_answers() {
     assert_eq!(off.dict_decode_nanos, 0);
     assert_eq!(off.lazy_decode_nanos, 0);
     assert_eq!(off.full_decode_nanos, 0);
+    assert_eq!(off.query_nanos, 0);
 
     read_stats::set_timing(true);
     let (on_answers, on) = measure(workload);
@@ -209,5 +248,6 @@ fn timing_fills_the_nanos_only_when_on_and_never_changes_answers() {
     assert!(on.dict_decode_nanos > 0, "{on:?}");
     assert!(on.lazy_decode_nanos > 0, "{on:?}");
     assert!(on.full_decode_nanos > 0, "{on:?}");
+    assert!(on.query_nanos > 0, "{on:?}");
     assert_eq!(on_answers, off_answers);
 }

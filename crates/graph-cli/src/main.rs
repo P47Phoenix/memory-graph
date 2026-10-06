@@ -436,6 +436,11 @@ enum Cmd {
         /// Serve Prometheus metrics (text format 0.0.4) at http://<HOST:PORT>/metrics
         #[arg(long, value_name = "HOST:PORT")]
         metrics_listen: Option<String>,
+        /// Time store reads (ADR 0008 phase 0): fill the mg_read_*_nanoseconds_total
+        /// metrics. Off by default, because reading the clock is not free on every
+        /// platform; the read counts are always on.
+        #[arg(long)]
+        read_timing: bool,
         /// Serve MCP (Model Context Protocol, streamable HTTP; read-only tools) at
         /// http://<HOST:PORT>/mcp, on a port of its own. Off unless given. Loopback only
         /// (127.0.0.1, ::1) unless --mcp-allow-remote. See docs/mcp.md.
@@ -1135,6 +1140,7 @@ fn run() -> Result<i32> {
         log_format,
         log_level,
         metrics_listen,
+        read_timing,
         mcp_listen,
         mcp_allow_remote,
         mcp_allow_origin,
@@ -1354,6 +1360,9 @@ fn run() -> Result<i32> {
                         anyhow::anyhow!("--metrics-listen {m}: resolves to no address")
                     })?,
             );
+        }
+        if *read_timing {
+            graph_store::read_stats::set_timing(true);
         }
         if let Some(m) = mcp_listen {
             use std::net::ToSocketAddrs;
@@ -2654,6 +2663,7 @@ mod serve_config_tests {
                 "debug",
                 "--metrics-listen",
                 "0.0.0.0:9100",
+                "--read-timing",
                 "--mcp-listen",
                 "0.0.0.0:7071",
                 "--mcp-allow-remote",
@@ -2728,6 +2738,7 @@ node-id = 3
 log-format = "json"
 log_level = "debug"
 metrics-listen = "0.0.0.0:9100"
+read-timing = true
 mcp-listen = "0.0.0.0:7071"
 mcp_allow_remote = true
 mcp-allow-origin = ["http://localhost:6274", "https://a.example"]
