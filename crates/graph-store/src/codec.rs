@@ -488,10 +488,16 @@ impl Lazy<'_> {
         self.ranges_dense
     }
 
+    /// The encoded length of the symbol section.
+    #[cfg(test)]
+    pub(crate) fn symbol_section_len(&self) -> usize {
+        self.sym_bytes.len()
+    }
+
     /// The symbol section, decoded (counted in [`crate::read_stats`]).
     pub fn symbols(&self) -> Result<Vec<SymRec>, StoreError> {
         read_stats::add_bytes(Counter::SymbolBytes, self.sym_bytes.len());
-        read_stats::timed(Counter::SymbolDecodes, Counter::LazyNanos, || {
+        read_stats::timed(Counter::SymbolDecodes, Counter::SymbolNanos, || {
             self.symbols_uncounted()
         })
     }

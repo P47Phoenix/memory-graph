@@ -59,7 +59,7 @@ pub struct ReadStats {
     pub read_txns: u64,
     /// Nanoseconds inside dictionary block decodes (timing on only).
     pub dict_decode_nanos: u64,
-    /// Nanoseconds inside lazy header and symbol-section decodes (timing on only).
+    /// Nanoseconds inside lazy header decodes (timing on only).
     pub lazy_decode_nanos: u64,
     /// Nanoseconds inside full stream decodes (timing on only).
     pub full_decode_nanos: u64,
@@ -74,10 +74,14 @@ pub struct ReadStats {
     pub dict_bytes: u64,
     /// Encoded bytes of the symbol sections decoded by reads.
     pub symbol_bytes: u64,
-    /// Encoded bytes of the streams whose header was decoded lazily.
+    /// Encoded size of the streams whose header was decoded lazily (the whole
+    /// stream, not just the header). Symbol bytes lie within it, so do not
+    /// sum byte counters across kinds.
     pub lazy_bytes: u64,
     /// Encoded bytes of the streams decoded whole.
     pub full_bytes: u64,
+    /// Nanoseconds inside symbol-section decodes (timing on only).
+    pub symbol_decode_nanos: u64,
 }
 
 impl ReadStats {
@@ -90,7 +94,10 @@ impl ReadStats {
 
     /// Total nanoseconds measured inside decodes (zero unless timing is on).
     pub fn decode_nanos(&self) -> u64 {
-        self.dict_decode_nanos + self.lazy_decode_nanos + self.full_decode_nanos
+        self.dict_decode_nanos
+            + self.lazy_decode_nanos
+            + self.symbol_decode_nanos
+            + self.full_decode_nanos
     }
 
     fn to_array(self) -> [u64; COUNTERS] {
@@ -112,6 +119,7 @@ impl ReadStats {
             self.symbol_bytes,
             self.lazy_bytes,
             self.full_bytes,
+            self.symbol_decode_nanos,
         ]
     }
 
@@ -134,6 +142,7 @@ impl ReadStats {
             symbol_bytes: v[Counter::SymbolBytes as usize],
             lazy_bytes: v[Counter::LazyBytes as usize],
             full_bytes: v[Counter::FullBytes as usize],
+            symbol_decode_nanos: v[Counter::SymbolNanos as usize],
         }
     }
 }
@@ -159,9 +168,10 @@ pub(crate) enum Counter {
     SymbolBytes,
     LazyBytes,
     FullBytes,
+    SymbolNanos,
 }
 
-const COUNTERS: usize = 17;
+const COUNTERS: usize = 18;
 
 static GLOBAL: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 static TIMING: AtomicBool = AtomicBool::new(false);

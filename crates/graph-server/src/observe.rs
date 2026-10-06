@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 29] = [
+pub const METRIC_NAMES: [&str; 30] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -58,11 +58,12 @@ pub const METRIC_NAMES: [&str; 29] = [
     "mg_backup_last_index",
     "mg_backup_failures_total",
     "mg_backup_bytes_total",
+    "mg_mcp_tool_calls_total",
     "mg_read_decodes_total",
     "mg_read_decode_bytes_total",
-    "mg_read_decode_nanoseconds_total",
+    "mg_read_decode_seconds_total",
     "mg_read_queries_total",
-    "mg_read_query_nanoseconds_total",
+    "mg_read_query_seconds_total",
     "mg_read_txns_total",
     "mg_read_dict_strings_total",
 ];
@@ -525,22 +526,33 @@ pub fn render(ctx: &Ctx) -> String {
     out
 }
 
-fn counter(out: &mut String, name: &str, help: &str, v: u64) {
+fn counter(out: &mut String, name: &str, help: &str, v: impl std::fmt::Display) {
     head(out, name, "counter", help);
     let _ = writeln!(out, "{name} {v}");
 }
 
 /// A counter family with one sample per decode kind.
-fn per_kind(out: &mut String, name: &str, help: &str, by_kind: [(&str, u64); 4]) {
+fn per_kind<V: std::fmt::Display>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    by_kind: [(&str, V); 4],
+) {
     head(out, name, "counter", help);
     for (kind, v) in by_kind {
         let _ = writeln!(out, "{name}{{kind=\"{kind}\"}} {v}");
     }
 }
 
+/// Nanoseconds as float seconds (the Prometheus base unit).
+fn secs(nanos: u64) -> f64 {
+    nanos as f64 / 1e9
+}
+
 /// The read-path counters (ADR 0008 phase 0). They are process-wide: every
-/// store in this process adds to them. Nanosecond families stay at zero
-/// unless `--read-timing` is on.
+/// store in this process adds to them, so several servers sharing one
+/// process report the same totals. The seconds families stay at zero unless
+/// read timing is on (`--read-timing`).
 fn render_read_stats(out: &mut String, r: &graph_store::read_stats::ReadStats) {
     per_kind(
         out,
@@ -556,7 +568,7 @@ fn render_read_stats(out: &mut String, r: &graph_store::read_stats::ReadStats) {
     per_kind(
         out,
         "mg_read_decode_bytes_total",
-        "Encoded bytes read by query decodes, by kind.",
+        "Encoded bytes behind query decodes, by kind: dict blocks scanned, symbol sections, the whole encoded size of streams whose header was decoded lazily (symbol bytes lie within it), whole streams decoded. Do not sum across kinds.",
         [
             ("dict", r.dict_bytes),
             ("symbol", r.symbol_bytes),
@@ -564,29 +576,28 @@ fn render_read_stats(out: &mut String, r: &graph_store::read_stats::ReadStats) {
             ("full", r.full_bytes),
         ],
     );
-    // Symbol-section and lazy-header decodes share one timer in the store.
     per_kind(
         out,
-        "mg_read_decode_nanoseconds_total",
-        "Nanoseconds inside query decodes, by kind (--read-timing only; symbol-section time is reported under lazy).",
+        "mg_read_decode_seconds_total",
+        "Seconds inside query decodes, by kind (--read-timing only).",
         [
-            ("dict", r.dict_decode_nanos),
-            ("symbol", 0),
-            ("lazy", r.lazy_decode_nanos),
-            ("full", r.full_decode_nanos),
+            ("dict", secs(r.dict_decode_nanos)),
+            ("symbol", secs(r.symbol_decode_nanos)),
+            ("lazy", secs(r.lazy_decode_nanos)),
+            ("full", secs(r.full_decode_nanos)),
         ],
     );
     counter(
         out,
         "mg_read_queries_total",
-        "Store read calls (queries) served by this process.",
+        "Store read calls (queries) in this process, including rejected or expired ones.",
         r.queries,
     );
     counter(
         out,
-        "mg_read_query_nanoseconds_total",
-        "Wall nanoseconds inside store read calls (--read-timing only).",
-        r.query_nanos,
+        "mg_read_query_seconds_total",
+        "Wall seconds inside store read calls, including opening the read transaction (--read-timing only).",
+        secs(r.query_nanos),
     );
     counter(
         out,
@@ -885,6 +896,48 @@ async fn answer(mut stream: TcpStream, ctx: &Ctx) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_stats_render_as_counters_in_seconds() {
+        // `ReadStats` is non-exhaustive: no struct literal outside its crate.
+        let mut r = graph_store::read_stats::ReadStats::default();
+        r.symbol_decode_nanos = 1_500_000_000;
+        r.query_nanos = 2_000_000_000;
+        r.queries = 7;
+        let mut out = String::new();
+        render_read_stats(&mut out, &r);
+        let families: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .collect();
+        assert_eq!(families.len(), 7, "{out}");
+        for f in families {
+            let (name, kind) = f.split_once(' ').expect("TYPE name kind");
+            assert_eq!(kind, "counter", "{name}");
+            assert!(METRIC_NAMES.contains(&name), "{name} not in METRIC_NAMES");
+        }
+        assert!(
+            out.contains(
+                "mg_read_decode_seconds_total{kind=\"symbol\"} 1.5
+"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "mg_read_query_seconds_total 2
+"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "mg_read_queries_total 7
+"
+            ),
+            "{out}"
+        );
+    }
 
     #[test]
     fn rpc_names_drop_the_package() {

@@ -318,37 +318,7 @@ fn check_histograms(types: &BTreeMap<String, String>, samples: &[Sample]) {
     }
 }
 
-const METRIC_NAMES: [&str; 29] = [
-    "mg_raft_term",
-    "mg_raft_leader_id",
-    "mg_raft_role",
-    "mg_raft_last_log_index",
-    "mg_raft_committed_index",
-    "mg_raft_applied_index",
-    "mg_raft_snapshot_index",
-    "mg_raft_purged_index",
-    "mg_raft_replication_lag",
-    "mg_store_bytes",
-    "mg_log_bytes",
-    "mg_snapshot_handles_open",
-    "mg_rpc_duration_seconds",
-    "mg_rpc_total",
-    "mg_writes_forwarded_total",
-    "mg_quorum_probes_total",
-    "mg_apply_duration_seconds",
-    "mg_build_info",
-    "mg_backup_last_success_timestamp",
-    "mg_backup_last_index",
-    "mg_backup_failures_total",
-    "mg_backup_bytes_total",
-    "mg_read_decodes_total",
-    "mg_read_decode_bytes_total",
-    "mg_read_decode_nanoseconds_total",
-    "mg_read_queries_total",
-    "mg_read_query_nanoseconds_total",
-    "mg_read_txns_total",
-    "mg_read_dict_strings_total",
-];
+use graph_server::observe::METRIC_NAMES;
 
 /// The sample of `name` whose `kind` label is `kind`.
 fn by_kind(samples: &[Sample], name: &str, kind: &str) -> f64 {
@@ -413,6 +383,12 @@ fn json_logs_metrics_and_health_exit_codes() {
     let (types, samples) = parse_prometheus(&body);
     for name in METRIC_NAMES {
         assert!(types.contains_key(name), "TYPE of {name} missing:\n{body}");
+    }
+    for name in types.keys().filter(|n| n.starts_with("mg_")) {
+        assert!(
+            METRIC_NAMES.contains(&name.as_str()),
+            "{name} is exported but not in METRIC_NAMES"
+        );
     }
     assert_eq!(types["mg_rpc_total"], "counter");
     assert_eq!(types["mg_rpc_duration_seconds"], "histogram");
@@ -685,7 +661,7 @@ fn statefulset_identity_from_the_hostname() {
 
 /// ADR 0008 phase 0 (epic story 45): the read-path counters rise across a
 /// fixed search served over the client, and `--read-timing` fills the
-/// query nanoseconds.
+/// query seconds.
 #[test]
 fn read_counters_rise_across_a_search() {
     let d = tempfile::tempdir().unwrap();
@@ -722,8 +698,12 @@ fn read_counters_rise_across_a_search() {
     let (types, before) = scrape();
     for name in [
         "mg_read_decodes_total",
+        "mg_read_decode_bytes_total",
+        "mg_read_decode_seconds_total",
         "mg_read_queries_total",
+        "mg_read_query_seconds_total",
         "mg_read_txns_total",
+        "mg_read_dict_strings_total",
     ] {
         assert_eq!(types[name], "counter", "{name}");
     }
@@ -733,10 +713,7 @@ fn read_counters_rise_across_a_search() {
     let rose = |name: &str| one(&after, name) - one(&before, name);
     assert!(rose("mg_read_queries_total") >= 1.0);
     assert!(rose("mg_read_txns_total") >= 1.0);
-    assert!(
-        rose("mg_read_query_nanoseconds_total") > 0.0,
-        "--read-timing"
-    );
+    assert!(rose("mg_read_query_seconds_total") > 0.0, "--read-timing");
     assert!(rose("mg_read_dict_strings_total") > 0.0);
     let dict = |samples: &[Sample], name: &str| by_kind(samples, name, "dict");
     assert!(dict(&after, "mg_read_decodes_total") > 0.0);
@@ -751,7 +728,7 @@ fn read_counters_rise_across_a_search() {
         for name in [
             "mg_read_decodes_total",
             "mg_read_decode_bytes_total",
-            "mg_read_decode_nanoseconds_total",
+            "mg_read_decode_seconds_total",
         ] {
             assert!(by_kind(&after, name, kind) >= by_kind(&before, name, kind));
         }

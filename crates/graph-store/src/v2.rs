@@ -280,7 +280,7 @@ fn dict_rev_lookup_counted<T: ReadableTable<u64, &'static [u8]> + ReadableTableM
 }
 
 /// The reverse-dictionary block that would hold `id`, if any.
-fn dict_rev_block<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
+pub(crate) fn dict_rev_block<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
     t: &T,
     id: u64,
 ) -> Result<Option<redb::AccessGuard<'_, &'static [u8]>>> {

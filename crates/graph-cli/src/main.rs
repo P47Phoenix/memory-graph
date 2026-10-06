@@ -436,9 +436,9 @@ enum Cmd {
         /// Serve Prometheus metrics (text format 0.0.4) at http://<HOST:PORT>/metrics
         #[arg(long, value_name = "HOST:PORT")]
         metrics_listen: Option<String>,
-        /// Time store reads (ADR 0008 phase 0): fill the mg_read_*_nanoseconds_total
+        /// Time store reads (ADR 0008 phase 0): fill the mg_read_*_seconds_total
         /// metrics. Off by default, because reading the clock is not free on every
-        /// platform; the read counts are always on.
+        /// platform; the read counts are always on. Process-global, never turned off.
         #[arg(long)]
         read_timing: bool,
         /// Serve MCP (Model Context Protocol, streamable HTTP; read-only tools) at
