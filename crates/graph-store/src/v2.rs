@@ -269,6 +269,7 @@ fn dict_rev_lookup_counted<T: ReadableTable<u64, &'static [u8]> + ReadableTableM
     let Some(block) = dict_rev_block(t, id)? else {
         return Ok(None);
     };
+    read_stats::add_bytes(Counter::DictBytes, block.value().len());
     let text = read_stats::timed(Counter::DictBlockDecodes, Counter::DictNanos, || {
         codec::dict_block_find(block.value(), id)
     })?;
@@ -279,7 +280,7 @@ fn dict_rev_lookup_counted<T: ReadableTable<u64, &'static [u8]> + ReadableTableM
 }
 
 /// The reverse-dictionary block that would hold `id`, if any.
-fn dict_rev_block<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
+pub(crate) fn dict_rev_block<T: ReadableTable<u64, &'static [u8]> + ReadableTableMetadata>(
     t: &T,
     id: u64,
 ) -> Result<Option<redb::AccessGuard<'_, &'static [u8]>>> {
@@ -4006,80 +4007,104 @@ macro_rules! store_read {
     ($ty:ty, |$s:ident| $rt:expr) => {
         impl StoreRead for $ty {
             fn get(&self, id: NodeId) -> Result<Option<Node>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.get(id)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.get(id)
+                })
             }
             fn parent(&self, id: NodeId) -> Result<Option<Node>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.parent(id)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.parent(id)
+                })
             }
             fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.count_nodes(kind)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.count_nodes(kind)
+                })
             }
             fn roots(&self) -> Result<Vec<Node>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.roots()
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.roots()
+                })
             }
             fn children(&self, id: NodeId) -> Result<Vec<Node>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.children(id)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.children(id)
+                })
             }
             fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.descendants(id)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.descendants(id)
+                })
             }
             fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.ancestors(id)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.ancestors(id)
+                })
             }
             fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.file_tokens(org, repo, path)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.file_tokens(org, repo, path)
+                })
             }
             fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                describe_in(&g, org, repo)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    describe_in(&g, org, repo)
+                })
             }
             fn describe_by_scan(
                 &self,
                 org: Option<&str>,
                 repo: Option<&str>,
             ) -> Result<Vec<RepoInfo>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.describe_by_scan(org, repo)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.describe_by_scan(org, repo)
+                })
             }
             fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.search_symbols(q)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.search_symbols(q)
+                })
             }
             fn search(&self, q: &Query) -> Result<Vec<Hit>> {
-                let $s = self;
-                $s.check_not_expired()?;
-                let g = $rt;
-                R::new(&g)?.search(q)
+                read_stats::timed_query(|| {
+                    let $s = self;
+                    $s.check_not_expired()?;
+                    let g = $rt;
+                    R::new(&g)?.search(q)
+                })
             }
         }
     };
