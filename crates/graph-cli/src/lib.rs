@@ -303,8 +303,26 @@ pub fn size_skip_reason(len: u64, max_file_size: Option<u64>) -> Option<&'static
     }
 }
 
+/// The directory walk `index_dir` uses, in path order, skipping `.git`.
+/// Only the directory's own .gitignore files (and parents') apply: global
+/// git config, .git/info/exclude and .ignore files would make results
+/// differ between machines. A caller's own `filter_entry` replaces the
+/// `.git` skip, so it must skip `.git` itself.
+pub fn dir_walker(dir: &std::path::Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(dir);
+    builder
+        .hidden(false)
+        .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|e| e.file_name() != ".git");
+    builder
+}
+
 /// Bytes a file read may take before it is known to be over a limit.
-fn read_cap(max_file_size: Option<u64>) -> u64 {
+pub fn read_cap(max_file_size: Option<u64>) -> u64 {
     let span_cap = graph_store::MAX_SOURCE_BYTES as u64;
     max_file_size.map_or(span_cap, |m| m.min(span_cap))
 }
@@ -597,18 +615,7 @@ fn walk(
     let db_meta = std::fs::metadata(o.db).ok();
     let db_canon = o.db.canonicalize().ok();
     let db_name = o.db.file_name();
-    // Only the directory's own .gitignore files (and parents') apply: global
-    // git config, .git/info/exclude and .ignore files would make results
-    // differ between machines.
-    let walker = ignore::WalkBuilder::new(o.dir)
-        .hidden(false)
-        .require_git(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .filter_entry(|e| e.file_name() != ".git")
-        .build();
+    let walker = dir_walker(o.dir).build();
     let dir = o.dir.display().to_string();
     board.walk.busy(0, "walking", &dir, || {
         let mut seq = 0u64;
