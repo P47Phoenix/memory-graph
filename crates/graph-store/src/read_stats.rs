@@ -59,13 +59,29 @@ pub struct ReadStats {
     pub read_txns: u64,
     /// Nanoseconds inside dictionary block decodes (timing on only).
     pub dict_decode_nanos: u64,
-    /// Nanoseconds inside lazy header and symbol-section decodes (timing on only).
+    /// Nanoseconds inside lazy header decodes (timing on only).
     pub lazy_decode_nanos: u64,
     /// Nanoseconds inside full stream decodes (timing on only).
     pub full_decode_nanos: u64,
     /// Dictionary strings allocated by query-side lookups: exactly one per
     /// uncached term-text lookup that finds its id (read cache phase 1).
     pub dict_strings_decoded: u64,
+    /// `StoreRead` calls (queries) on a `V2Store` or a `V2Snapshot`.
+    pub queries: u64,
+    /// Wall nanoseconds inside `StoreRead` calls (timing on only).
+    pub query_nanos: u64,
+    /// Encoded bytes of the reverse-dictionary blocks scanned by queries.
+    pub dict_bytes: u64,
+    /// Encoded bytes of the symbol sections decoded by reads.
+    pub symbol_bytes: u64,
+    /// Encoded size of the streams whose header was decoded lazily (the whole
+    /// stream, not just the header). Symbol bytes lie within it, so do not
+    /// sum byte counters across kinds.
+    pub lazy_bytes: u64,
+    /// Encoded bytes of the streams decoded whole.
+    pub full_bytes: u64,
+    /// Nanoseconds inside symbol-section decodes (timing on only).
+    pub symbol_decode_nanos: u64,
 }
 
 impl ReadStats {
@@ -78,7 +94,10 @@ impl ReadStats {
 
     /// Total nanoseconds measured inside decodes (zero unless timing is on).
     pub fn decode_nanos(&self) -> u64 {
-        self.dict_decode_nanos + self.lazy_decode_nanos + self.full_decode_nanos
+        self.dict_decode_nanos
+            + self.lazy_decode_nanos
+            + self.symbol_decode_nanos
+            + self.full_decode_nanos
     }
 
     fn to_array(self) -> [u64; COUNTERS] {
@@ -94,6 +113,13 @@ impl ReadStats {
             self.lazy_decode_nanos,
             self.full_decode_nanos,
             self.dict_strings_decoded,
+            self.queries,
+            self.query_nanos,
+            self.dict_bytes,
+            self.symbol_bytes,
+            self.lazy_bytes,
+            self.full_bytes,
+            self.symbol_decode_nanos,
         ]
     }
 
@@ -110,6 +136,13 @@ impl ReadStats {
             lazy_decode_nanos: v[Counter::LazyNanos as usize],
             full_decode_nanos: v[Counter::FullNanos as usize],
             dict_strings_decoded: v[Counter::DictStrings as usize],
+            queries: v[Counter::QueryCount as usize],
+            query_nanos: v[Counter::QueryNanos as usize],
+            dict_bytes: v[Counter::DictBytes as usize],
+            symbol_bytes: v[Counter::SymbolBytes as usize],
+            lazy_bytes: v[Counter::LazyBytes as usize],
+            full_bytes: v[Counter::FullBytes as usize],
+            symbol_decode_nanos: v[Counter::SymbolNanos as usize],
         }
     }
 }
@@ -129,9 +162,16 @@ pub(crate) enum Counter {
     LazyNanos,
     FullNanos,
     DictStrings,
+    QueryCount,
+    QueryNanos,
+    DictBytes,
+    SymbolBytes,
+    LazyBytes,
+    FullBytes,
+    SymbolNanos,
 }
 
-const COUNTERS: usize = 11;
+const COUNTERS: usize = 18;
 
 static GLOBAL: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 static TIMING: AtomicBool = AtomicBool::new(false);
@@ -206,6 +246,19 @@ pub(crate) fn timed<T>(counter: Counter, nanos: Counter, f: impl FnOnce() -> T) 
     out
 }
 
+/// Add `bytes` (the length of an encoded input) to a byte counter.
+#[inline]
+pub(crate) fn add_bytes(counter: Counter, bytes: usize) {
+    add(counter, u64::try_from(bytes).unwrap_or(u64::MAX));
+}
+
+/// Count one query and, with timing on, its wall time; wraps each
+/// `StoreRead` call.
+#[inline]
+pub(crate) fn timed_query<T>(f: impl FnOnce() -> T) -> T {
+    timed(Counter::QueryCount, Counter::QueryNanos, f)
+}
+
 /// Run `f` without counting anything it does on this thread; for write and
 /// maintenance paths that reuse the read-side decoders.
 pub(crate) fn uncounted<T>(f: impl FnOnce() -> T) -> T {
@@ -258,5 +311,23 @@ mod tests {
         uncounted(|| uncounted(|| bump(Counter::ReadTxns)));
         bump(Counter::ReadTxns);
         assert_eq!(thread_snapshot().since(&before).read_txns, 1);
+    }
+
+    #[test]
+    fn bytes_and_queries_count_exactly_per_thread() {
+        let before = thread_snapshot();
+        add_bytes(Counter::DictBytes, 7);
+        add_bytes(Counter::SymbolBytes, 3);
+        add_bytes(Counter::LazyBytes, 11);
+        add_bytes(Counter::FullBytes, 13);
+        uncounted(|| add_bytes(Counter::FullBytes, 100));
+        assert_eq!(timed_query(|| 42), 42);
+        timed_query(|| ());
+        let d = thread_snapshot().since(&before);
+        assert_eq!(
+            (d.dict_bytes, d.symbol_bytes, d.lazy_bytes, d.full_bytes),
+            (7, 3, 11, 13)
+        );
+        assert_eq!(d.queries, 2);
     }
 }
