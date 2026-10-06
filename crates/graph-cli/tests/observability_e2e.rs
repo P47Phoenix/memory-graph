@@ -804,6 +804,24 @@ fn an_identical_search_counts_one_repeat_until_a_write() {
         1.0,
         "the same search again"
     );
+    // The read view is not part of the key: a linearizable read of the
+    // same query at the same applied index is a repeat of the local one.
+    let lin = ok(&[
+        "--server",
+        &s.addr,
+        "--read",
+        "linearizable",
+        "search",
+        "observed",
+    ]);
+    assert!(lin.contains("observed"), "{lin}");
+    let after_lin = scrape();
+    assert_eq!(
+        repeats(&after_lin) - repeats(&second),
+        1.0,
+        "linearizable after local"
+    );
+    let second = after_lin;
 
     let g = d.path().join("other.rs");
     std::fs::write(&g, "pub fn observed_too() -> u32 { 2 }\n").unwrap();

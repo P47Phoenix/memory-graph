@@ -18,6 +18,20 @@ pub struct StoreService {
     pub ctx: Arc<Ctx>,
 }
 
+/// The request's [`QueryKey`] with its read view cleared: a `Local` and a
+/// `Linearizable` read of the same query at the same applied index give the
+/// same answer, and a snapshot read's generation is the handle's frozen
+/// applied index (its `ReadMeta`), so the view never changes the answer at a
+/// given generation.
+macro_rules! view_free_key {
+    ($rpc:expr, $r:ident) => {{
+        let view = $r.view.take();
+        let key = QueryKey::of($rpc, &$r);
+        $r.view = view;
+        key
+    }};
+}
+
 type NodeStream = Pin<Box<dyn Stream<Item = Result<pb::NodeBatch, Status>> + Send>>;
 
 fn batches(nodes: Vec<Node>) -> NodeStream {
@@ -71,8 +85,8 @@ impl pb::store_server::Store for StoreService {
     }
 
     async fn get(&self, req: Request<pb::GetRequest>) -> Result<Response<pb::GetResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::Get, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::Get, r);
         let (node, meta) = self.ctx.read(r.view, move |s| s.get(r.id)).await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
@@ -87,8 +101,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::ParentRequest>,
     ) -> Result<Response<pb::ParentResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::Parent, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::Parent, r);
         let (node, meta) = self.ctx.read(r.view, move |s| s.parent(r.id)).await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
@@ -103,8 +117,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::CountNodesRequest>,
     ) -> Result<Response<pb::CountNodesResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::CountNodes, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::CountNodes, r);
         let kind = Wire::<NodeKind>::try_from(r.kind)?.0;
         let (count, meta) = self.ctx.read(r.view, move |s| s.count_nodes(kind)).await?;
         self.ctx.note_query(key, &meta);
@@ -120,8 +134,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::RootsRequest>,
     ) -> Result<Response<pb::RootsResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::Roots, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::Roots, r);
         let (nodes, meta) = self.ctx.read(r.view, |s| s.roots()).await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
@@ -136,8 +150,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::ChildrenRequest>,
     ) -> Result<Response<pb::ChildrenResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::Children, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::Children, r);
         let (nodes, meta) = self.ctx.read(r.view, move |s| s.children(r.id)).await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
@@ -152,8 +166,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::ChildrenPageRequest>,
     ) -> Result<Response<pb::NodePage>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::ChildrenPage, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::ChildrenPage, r);
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
         let (page, meta) = self
             .ctx
@@ -169,8 +183,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::DescendantsRequest>,
     ) -> Result<Response<Self::DescendantsStream>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::Descendants, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::Descendants, r);
         let (nodes, meta) = self.ctx.read(r.view, move |s| s.descendants(r.id)).await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(batches(nodes), meta))
@@ -180,8 +194,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::DescendantsPageRequest>,
     ) -> Result<Response<pb::NodePage>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::DescendantsPage, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::DescendantsPage, r);
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
         let (page, meta) = self
             .ctx
@@ -195,8 +209,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::AncestorsRequest>,
     ) -> Result<Response<pb::AncestorsResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::Ancestors, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::Ancestors, r);
         let (nodes, meta) = self.ctx.read(r.view, move |s| s.ancestors(r.id)).await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
@@ -213,8 +227,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::FileTokensRequest>,
     ) -> Result<Response<Self::FileTokensStream>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::FileTokens, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::FileTokens, r);
         let (toks, meta) = self
             .ctx
             .read(r.view, move |s| s.file_tokens(&r.org, &r.repo, &r.path))
@@ -236,8 +250,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::DescribeRequest>,
     ) -> Result<Response<pb::DescribeResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::Describe, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::Describe, r);
         let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
@@ -257,8 +271,8 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::DescribeRequest>,
     ) -> Result<Response<pb::DescribeResponse>, Status> {
-        let r = req.into_inner();
-        let key = QueryKey::of(ReadRpc::DescribeByScan, &r);
+        let mut r = req.into_inner();
+        let key = view_free_key!(ReadRpc::DescribeByScan, r);
         let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
@@ -320,7 +334,7 @@ impl pb::store_server::Store for StoreService {
         if let Some(q) = r.query.as_mut() {
             q.limit.get_or_insert(DEFAULT_SEARCH_LIMIT as u64);
         }
-        let key = QueryKey::of(ReadRpc::SearchSymbols, &r);
+        let key = view_free_key!(ReadRpc::SearchSymbols, r);
         let q: SymbolQuery = r
             .query
             .ok_or_else(|| {
@@ -352,7 +366,7 @@ impl pb::store_server::Store for StoreService {
         if let Some(q) = r.query.as_mut() {
             q.limit.get_or_insert(DEFAULT_SEARCH_LIMIT as u64);
         }
-        let key = QueryKey::of(ReadRpc::Search, &r);
+        let key = view_free_key!(ReadRpc::Search, r);
         let q: Query = r
             .query
             .ok_or_else(|| ConvertError("required field `SearchRequest.query` is missing".into()))?

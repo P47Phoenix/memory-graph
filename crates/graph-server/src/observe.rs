@@ -553,7 +553,7 @@ fn render_repeats(out: &mut String, log: &crate::repeats::RepeatLog) {
         out,
         "mg_query_exact_repeats_total",
         "counter",
-        "Read RPCs that repeated an identical request answered within 60 s at the same Raft applied index, by method.",
+        "Read RPCs that repeated an identical request (any read view) answered within 60 s at the same Raft applied index, by method; an approximate lower bound (see docs/guide/observability.md).",
     );
     for (rpc, c) in counts {
         let _ = writeln!(

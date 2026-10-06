@@ -4,13 +4,30 @@
 //! generation counter; the applied index advances with every write, so an
 //! unchanged index means an unchanged store). A result cache keyed on the
 //! request and the generation could only ever serve those repeats, so
-//! `mg_query_exact_repeats_total / mg_queries_total` bounds its hit rate.
+//! `mg_query_exact_repeats_total / mg_queries_total` approximates its hit
+//! rate (a lower bound).
+//!
+//! The key leaves out the read view: a `Local` and a `Linearizable` read of
+//! the same query at the same applied index give the same answer, and a
+//! snapshot read's generation is the handle's frozen applied index.
+//!
+//! Why only approximate, and mostly low:
+//! - the key hashes the encoded request, so the same query with its
+//!   repeated fields in another order counts as a different one;
+//! - past [`MAX_ENTRIES`] distinct queries per window the oldest are
+//!   evicted and their repeats go uncounted;
+//! - counts are per node (a client spreading reads over nodes repeats less
+//!   on each);
+//! - the applied index is read before the read runs, so a write applied
+//!   while it runs can, rarely, make two different answers count as a
+//!   repeat (a slight over-count).
 //!
 //! Cost on the hot path: one prost encode of the (small) request into a
 //! `Vec`, one SipHash over it, and one short critical section (a hash map
 //! lookup and insert plus a deque push, amortised O(1) eviction). The map
 //! and the deque are hard-capped at [`MAX_ENTRIES`] entries, so memory stays
-//! bounded (~40 B per entry) whatever the request rate.
+//! bounded (about 90-100 B per entry with hash map overhead, about 6 MB at
+//! the cap) whatever the request rate.
 //!
 //! The hash is std's `DefaultHasher`: not stable across processes or
 //! releases, which is fine for an in-memory window.
@@ -310,21 +327,51 @@ mod tests {
     }
 
     #[test]
-    fn different_views_or_rpcs_do_not_collide() {
+    fn views_collide_once_cleared_but_rpcs_do_not() {
         let log = RepeatLog::default();
         let t = Instant::now();
-        let local = search("a", None);
-        let snap = search(
-            "a",
-            Some(pb::View {
-                v: Some(pb::view::V::SnapshotId(7)),
-            }),
-        );
-        log.note(QueryKey::of(ReadRpc::Search, &local), 1, t);
-        assert!(!log.note(QueryKey::of(ReadRpc::Search, &snap), 1, t));
+        let mode = |m: pb::ReadMode| {
+            search(
+                "a",
+                Some(pb::View {
+                    v: Some(pb::view::V::Mode(m as i32)),
+                }),
+            )
+        };
+        // The service clears the view before keying (`view_free_key!`).
+        let cleared = |mut r: pb::SearchRequest| {
+            r.view = None;
+            QueryKey::of(ReadRpc::Search, &r)
+        };
+        let local = mode(pb::ReadMode::Local);
+        log.note(cleared(local.clone()), 1, t);
+        assert!(log.note(cleared(mode(pb::ReadMode::Linearizable)), 1, t));
         assert!(!log.note(QueryKey::of(ReadRpc::DescribeByScan, &local), 1, t));
         assert_eq!(counts(&log, ReadRpc::Search).queries, 2);
         assert_eq!(counts(&log, ReadRpc::DescribeByScan).queries, 1);
+    }
+
+    #[test]
+    fn concurrent_notes_of_one_key_count_consistently() {
+        let log = std::sync::Arc::new(RepeatLog::default());
+        let t = Instant::now();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let log = std::sync::Arc::clone(&log);
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        log.note(key("a"), 1, t);
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().expect("noting thread");
+        }
+        let c = counts(&log, ReadRpc::Search);
+        assert_eq!(c.queries, 4000);
+        assert_eq!(c.repeats, 3999, "all but the first are repeats");
+        assert_eq!(log.len(), 1);
     }
 
     #[test]
