@@ -39,8 +39,38 @@ rate (meaningless until a cache exists) are tracked in #233.
   `read_stats::set_timing(true)`, a process-global toggle. Timing is off by
   default, so the production cost is one relaxed atomic add, one
   thread-local add and two thread-local loads per event.
-- **Benchmark.** `cargo run --release -p graph-cli --example readbench --
-  <workdir> testdata/corpus 20 1048576`
+- **Benchmark.** An `#[ignore]` test, `crates/graph-cli/tests/readbench.rs`.
+  It replaced the `readbench` example
+  (`cargo run --release -p graph-cli --example readbench -- <workdir>
+  testdata/corpus 20 1048576`), which took the numbers below with its cold
+  phase in the same process. How to run:
+
+  ```sh
+  # the vendored corpus (testdata/corpus)
+  cargo test --release -p graph-cli --test readbench measure_reads -- --ignored --nocapture
+  # the fetched big corpus (scripts/fetch-bench-corpus.py): index once ...
+  MG_READBENCH_CORPUS=/data/bench-corpus MG_READBENCH_WORKDIR=/data/readbench \
+    cargo test --release -p graph-cli --test readbench measure_reads -- --ignored --nocapture
+  # ... then re-measure without re-indexing
+  MG_READBENCH_REUSE=1 MG_READBENCH_WORKDIR=/data/readbench \
+    cargo test --release -p graph-cli --test readbench measure_reads -- --ignored --nocapture
+  ```
+
+  - Other inputs: `MG_READBENCH_REPS` (default 20), `MG_READBENCH_COLD_CACHE`
+    (bytes, default 1 MiB), and `MG_READBENCH_MAX_FILES` /
+    `MG_READBENCH_MAX_BYTES` to stop indexing early.
+  - The walk skips `.git`, `target`, `node_modules` and binary files (a NUL
+    in the first 8 KiB) and streams the corpus in batches of 256 files /
+    32 MiB.
+  - The workload's words and `file_tokens` paths come from the first 8 MiB
+    of each repo, so on a big tree a "cold" term is rare in the sample, not
+    necessarily in the corpus. The workload is saved next to the database,
+    so a reuse run and the cold child measure the same queries.
+  - The cold phase runs in a **fresh process** (the test binary re-run with
+    `--exact readbench_cold_phase`), so the redb cache starts empty. The OS
+    page cache stays warm unless it is dropped by hand (Linux:
+    `sync; echo 3 > /proc/sys/vm/drop_caches`); the test does not do it.
+  - The `bypass` column stays 0 until phase 2 adds a cache.
   - Indexes the vendored corpus with **every shipped extractor**
     (`graph_cli::shipped_extractors()`): 795 files, 335k tokens, a 16.6 MiB
     db.
