@@ -15,7 +15,7 @@
 
 References are to `origin/main` on 2026-10-06.
 
-- **Logs.** `crates/graph-cli/src/logging.rs::init` (~36-50, called from `main.rs` ~1176) installs a plain `tracing_subscriber::fmt().try_init()`. It is not a layered `Registry`, so another layer cannot be added.
+- **Logs.** `crates/graph-cli/src/logging.rs::init` (~35, called from `main.rs` ~1176) installs a plain `tracing_subscriber::fmt().try_init()`. It is not a layered `Registry`, so another layer cannot be added.
 - **Metrics:**
   - `render()` (`crates/graph-server/src/observe.rs` ~310) writes Prometheus text straight from about ten sources: openraft metrics, the log store, forward counts, quorum probes, MCP, backup, repeats and read stats. There is no snapshot type in between.
   - `METRIC_NAMES` lists the 32 families (the contract), and `DURATION_BUCKETS` holds the histogram bounds (0.5 ms to 10 s).
@@ -123,7 +123,12 @@ Exact pins in `[workspace.dependencies]`, as the workspace does for tonic and pr
   | `index_batch` | the `Index` rpc span (`serve`), or root (embedded) |
   | `install_snapshot` (one span on each side, wrapping the whole stream) | root, or the sending node's span through `RaftHeaders` |
 
-- **Raft traffic is not exported.** Spans from the Raft service (AppendEntries, Vote, heartbeats) use their own `tracing` target. That target is filtered out of the OpenTelemetry layer, so an idle cluster does not flood the collector. They still appear in local logs at the usual levels. `InstallSnapshot` gets exactly one span on each side (above) and no per-chunk spans.
+- **Raft traffic is not exported.** A `tracing` span's target is fixed where the macro is called, and today `RpcLayer` opens one `rpc` span for every service (`observe.rs` ~777).
+  - **Separate target.** `RpcService::call` chooses the macro call by request path. For `/memory_graph.v1.Raft/*` it opens the span with a separate `info_span!(target: "memory_graph::raft_rpc", "rpc", ...)` call, and for everything else it uses the existing call.
+  - **Per-layer filter.** The OpenTelemetry layer has its own filter (`Layer::with_filter`) that rejects the `memory_graph::raft_rpc` target. The fmt layer does not have that filter, so these spans still appear in local logs at the usual levels. An idle cluster does not flood the collector.
+  - **Context is extracted anyway.** The receiving side of `InstallSnapshot` still extracts the propagated `traceparent` in `RpcService::call`, even though its `rpc` span is filtered out of export. Its `install_snapshot` span (default target, so exported) takes the extracted context as its parent.
+  - **Children of a filtered Raft rpc.** For the OpenTelemetry layer a filtered span does not exist, so a child span opened under it (for example a follower's `apply` under AppendEntries) becomes a **root** in its own trace. It is not dropped. Follower `apply` spans are therefore exported as roots, and this matches the D5 trace scope ("follower applies are their own roots"). The Raft rpc that carried them is not exported.
+  - `InstallSnapshot` gets exactly one span on each side (above) and no per-chunk spans.
 - **Propagation:** W3C `traceparent` and `tracestate` in gRPC metadata, with the `TraceContextPropagator`.
   - **Extract** in `RpcService::call` (`observe.rs` ~765).
   - **Inject** in `SendVersion` (client), `ForwardHeaders` (forward to the leader) and `RaftHeaders` (only for `install_snapshot`).
@@ -239,7 +244,8 @@ Span attributes and OTLP log fields come from an allow-list: rpc and method name
   - source snippets or token text;
   - header or metadata values (including `OTEL_EXPORTER_OTLP_HEADERS`).
 - **File paths:** repo and file paths are not exported in this ADR. Paths can name customers or projects, and nothing here needs them.
-- **Log records:** the appender exports the event's message and only the allow-listed fields. Other fields are dropped from the OTLP record. They stay in local logs, as today.
+- **Log records:** `opentelemetry-appender-tracing` has no field allow-list of its own. A small custom `LogProcessor` sits in front of the batch processor. In `emit` it strips every attribute that is not on the allow-list before the record is queued for export. The record keeps its message. Stripped fields stay in local logs, as today.
+- **Messages must not interpolate values that are not allow-listed.** Neither log messages nor span names may do it: no `info!("search {q}")`. Put the value in a field instead, where it is either allow-listed or stripped. The processor cannot inspect a formatted message, so the sentinel test is what enforces this rule.
 - **The test:** stories 51 and 53 send a sentinel query string and check that it appears in no exported attribute, field or body.
 
 ### D10. Telemetry module
