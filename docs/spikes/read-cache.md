@@ -183,12 +183,18 @@ within phase 1's no-invalidation scope.
 
 ## Large-index re-run (A4, issue #233)
 
-The vendored `testdata/corpus` is too small to settle the decode share at scale, so the ADR 0008 re-run uses a large public corpus fetched by `scripts/fetch-bench-corpus.py`. Nothing is vendored: the script shallow-fetches 29 permissively licensed public repos (MIT, Apache-2.0, BSD, MPL, PostgreSQL), each pinned to an exact commit, into a directory outside the repo. Together they cover Rust, C, C++, Go, Java, Scala, C#, F#, JavaScript, TypeScript, Python, SQL, shell, R, Haskell, Elixir, GDScript, COBOL, assembly, HTML and Razor, about 7 GB checked out (an estimate; the script prints the measured bytes and files per language at the end).
+The vendored `testdata/corpus` is too small to settle the decode share at scale, so the ADR 0008 re-run uses a large public corpus fetched by `scripts/fetch-bench-corpus.py`. Nothing is vendored: the script shallow-fetches 31 permissively licensed public repos (MIT, Apache-2.0, BSD, PostgreSQL, Apache-2.0 with the LLVM exception), each pinned to an exact commit, into a directory outside the repo. Together they cover Rust, C, C++, Go, Java, Scala, C#, F#, JavaScript, TypeScript, Python, SQL, shell, R, Haskell, Elixir, GDScript, COBOL, RPG, assembly, HTML and Razor. RPG is covered only thinly (OSSILE and noxDB, a few MB of RPG); there is no large permissively licensed RPG codebase on GitHub that we found.
+
+- **Disk:** about 7.2 GB of working tree (an estimate from the manifest) plus the shallow `.git` packs, which are roughly the same size again; budget 15 GB.
+- **Submodules are not populated** (rust and dotnet-runtime have some), so those parts are absent.
+- **Extractors:** Python, Java, Kotlin, TypeScript and Perl have no extractor, so they are indexed as tokens only (no symbols).
+- The closing summary is on-disk bytes by file extension, not what gets indexed; the share under "other" is printed explicitly.
+- Visibility and licence are checked with `gh api` before anything is fetched (fails closed, like `vendor-corpus.py`; `--skip-verify` opts out). A repo is skipped only when HEAD is at its pinned sha and `.git/mg-bench-ok` says so; anything else is wiped and re-fetched. A failed fetch is retried, reported, and makes the exit status non-zero, while the others continue.
 
 ```sh
 python3 scripts/fetch-bench-corpus.py --list                         # the manifest: name, sha, licence, size, languages
-python3 scripts/fetch-bench-corpus.py --dest /data/mg-bench           # fetch everything (resumable; repos already at their sha are skipped)
-python3 scripts/fetch-bench-corpus.py --dest /data/mg-bench --only go,tokio --verify-licenses
+python3 scripts/fetch-bench-corpus.py --dest /data/mg-bench           # fetch everything (resumable)
+python3 scripts/fetch-bench-corpus.py --dest /data/mg-bench --only go,tokio
 ```
 
 To run the read benchmark against it, index the directory and point the benchmark at it with `MG_READBENCH_CORPUS=/data/mg-bench`. That env var is planned: it lands with the reworked benchmark (A3), and until then the benchmark reads only `testdata/corpus`.

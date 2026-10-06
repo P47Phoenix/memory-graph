@@ -31,7 +31,7 @@ cargo run --release -p graph-client --example rpc_bench -- <db>   # RPC overhead
 python3 scripts/test_gate.py                               # CI's own extra gate
 python3 scripts/check-no-c-deps.py                          # pure-Rust gate: fails on any -sys crate or C build script (see below)
 python3 scripts/vendor-corpus.py                            # re-vendor testdata/corpus/ (pinned commits, license-checked)
-python3 scripts/fetch-bench-corpus.py --dest <dir>           # fetch the ~7 GB pinned public corpus for the large-index read benchmark (outside the repo)
+python3 scripts/fetch-bench-corpus.py --dest <dir>           # fetch the ~7 GB (plus .git) pinned public corpus for the large-index read benchmark (outside the repo)
 docker build -t memory-graph .                              # the container image (static musl binary on scratch; .github/workflows/docker.yml publishes it to ghcr.io)
 ```
 
