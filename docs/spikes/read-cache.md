@@ -56,12 +56,22 @@ rate (meaningless until a cache exists) are tracked in #233.
     cargo test --release -p graph-cli --test readbench measure_reads -- --ignored --nocapture
   ```
 
-  - Other inputs: `MG_READBENCH_REPS` (default 20), `MG_READBENCH_COLD_CACHE`
-    (bytes, default 1 MiB), and `MG_READBENCH_MAX_FILES` /
-    `MG_READBENCH_MAX_BYTES` to stop indexing early.
-  - The walk skips `.git`, `target`, `node_modules` and binary files (a NUL
-    in the first 8 KiB) and streams the corpus in batches of 256 files /
-    32 MiB.
+  - Other inputs: `MG_READBENCH_WORKDIR` (default a temp dir, removed
+    afterwards), `MG_READBENCH_REPS` (default 20, at least 1),
+    `MG_READBENCH_COLD_CACHE` (bytes, default 1 MiB), and
+    `MG_READBENCH_MAX_FILES` / `MG_READBENCH_MAX_BYTES` to stop indexing
+    early. `MG_READBENCH_REUSE=1` needs a fixed `MG_READBENCH_WORKDIR` and
+    ignores the caps; if the database or workload is missing it warns and
+    indexes afresh.
+  - The walk matches `index_dir`'s (`graph_cli::dir_walker`: the repo's
+    `.gitignore` rules, `.git` skipped, non-UTF-8 paths skipped, the same
+    binary check and size cap). The only difference: it also skips
+    `target` and `node_modules` directories. It streams the corpus in
+    batches of 256 files / 32 MiB.
+  - Columns added since the numbers below: separate `lazy` and `sym`
+    decode shares, `store ms/q` (wall time inside `StoreRead` calls),
+    `KiB/q` (encoded bytes decoded per query) and `bypass`. Timing columns
+    read `n/a` in the timing-off row.
   - The workload's words and `file_tokens` paths come from the first 8 MiB
     of each repo, so on a big tree a "cold" term is rare in the sample, not
     necessarily in the corpus. The workload is saved next to the database,

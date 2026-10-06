@@ -16,8 +16,14 @@
 //!   (default 1 MiB).
 //! - `MG_READBENCH_REUSE=1`: reuse the database and workload already in the
 //!   workdir instead of indexing again (index once, measure many times).
+//!   It needs a fixed `MG_READBENCH_WORKDIR` and ignores the caps; when the
+//!   files are missing it warns and indexes afresh.
 //! - `MG_READBENCH_MAX_FILES` / `MG_READBENCH_MAX_BYTES`: stop indexing
 //!   after this many files / source bytes.
+//!
+//! The walk is `index_dir`'s (`graph_cli::dir_walker`: the repo's
+//! `.gitignore` rules, `.git` skipped, the same binary check and size cap),
+//! plus two extra skipped directories, `target` and `node_modules`.
 //!
 //! The workload is agent-like: searches at token, symbol, method, class and
 //! file grain over hot and cold terms, `search_symbols`, `file_tokens` and
@@ -54,9 +60,14 @@ const BATCH_BYTES: u64 = 32 << 20;
 /// Source bytes per repo whose words feed the workload, so a big tree
 /// does not hold every distinct identifier in memory.
 const SAMPLE_BYTES_PER_REPO: u64 = 8 << 20;
-/// A NUL in this prefix marks a file as binary.
-const BINARY_SNIFF_BYTES: usize = 8 << 10;
+/// Directories never walked. `.git` is `index_dir`'s own skip; `target`
+/// and `node_modules` are extra, for clones whose `.gitignore` does not
+/// cover their build output or dependencies.
 const SKIPPED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+
+fn is_skipped_dir(name: &std::ffi::OsStr) -> bool {
+    SKIPPED_DIRS.iter().any(|d| name == *d)
+}
 
 /// Benchmark inputs, from the `MG_READBENCH_*` environment.
 struct Config {
@@ -77,6 +88,26 @@ fn env_num<T: std::str::FromStr>(name: &str) -> Option<T> {
     )
 }
 
+fn reps_from_env() -> usize {
+    let reps = env_num("MG_READBENCH_REPS").unwrap_or(20);
+    assert!(
+        reps >= 1,
+        "MG_READBENCH_REPS must be at least 1, got {reps}"
+    );
+    reps
+}
+
+fn reuse_from_env() -> bool {
+    match std::env::var("MG_READBENCH_REUSE").as_deref() {
+        Ok("1") => true,
+        Ok("0") | Ok("") | Err(_) => false,
+        Ok(other) => {
+            eprintln!("warning: MG_READBENCH_REUSE={other} is not 1; indexing afresh");
+            false
+        }
+    }
+}
+
 impl Config {
     fn from_env(default_workdir: &Path) -> Self {
         let corpus = std::env::var_os("MG_READBENCH_CORPUS").map_or_else(
@@ -87,9 +118,9 @@ impl Config {
             corpus,
             workdir: std::env::var_os("MG_READBENCH_WORKDIR")
                 .map_or_else(|| default_workdir.to_path_buf(), PathBuf::from),
-            reps: env_num("MG_READBENCH_REPS").unwrap_or(20),
+            reps: reps_from_env(),
             cold_cache: env_num("MG_READBENCH_COLD_CACHE").unwrap_or(1 << 20),
-            reuse: std::env::var("MG_READBENCH_REUSE").is_ok_and(|v| v == "1"),
+            reuse: reuse_from_env(),
             max_files: env_num("MG_READBENCH_MAX_FILES"),
             max_bytes: env_num("MG_READBENCH_MAX_BYTES"),
         }
@@ -193,41 +224,63 @@ fn open(path: &Path, cache_bytes: Option<usize>) -> V2Store {
     s
 }
 
-fn is_binary(bytes: &[u8]) -> bool {
-    bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
-}
-
-/// Source files under `repo_dir` in path order, skipping VCS, build and
-/// dependency directories.
+/// Source files under `repo_dir` in path order, walked as `index_dir`
+/// walks (its `.gitignore` rules), plus the extra `SKIPPED_DIRS`.
 fn repo_files(repo_dir: &Path) -> impl Iterator<Item = PathBuf> {
-    ignore::WalkBuilder::new(repo_dir)
-        .standard_filters(false)
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .filter_entry(|e| !SKIPPED_DIRS.iter().any(|d| e.file_name() == *d))
+    graph_cli::dir_walker(repo_dir)
+        .filter_entry(|e| !is_skipped_dir(e.file_name()))
         .build()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
         .map(ignore::DirEntry::into_path)
 }
 
+/// The corpus's repos: its direct subdirectories, less `SKIPPED_DIRS`.
 fn corpus_repos(corpus: &Path) -> Vec<PathBuf> {
     let mut repos: Vec<_> = std::fs::read_dir(corpus)
         .unwrap_or_else(|e| panic!("corpus dir {}: {e}", corpus.display()))
         .map(|e| e.expect("dir entry").path())
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() && !p.file_name().is_some_and(is_skipped_dir))
         .collect();
+    assert!(
+        !repos.is_empty(),
+        "corpus {} has no repo subdirectories (each subdirectory is one repo)",
+        corpus.display()
+    );
     repos.sort();
     repos
+}
+
+/// A file's bytes as `index_dir` reads them: `None` when it is over the
+/// span limit, unreadable or binary (`is_binary_with_hint`, so UTF-16 and
+/// BOM files are kept).
+fn read_source(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let len = std::fs::metadata(path).ok()?.len();
+    if graph_cli::size_skip_reason(len, None).is_some() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| {
+            f.take(graph_cli::read_cap(None).saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
+        .ok()?;
+    let fits = graph_cli::size_skip_reason(bytes.len() as u64, None).is_none();
+    (fits && !graph_core::encoding::is_binary_with_hint(&bytes, None)).then_some(bytes)
 }
 
 /// A file read from disk, waiting in the current batch.
 struct Pending {
     path: String,
     bytes: Vec<u8>,
+    /// Feeds the workload sample once it indexes.
+    is_sampled: bool,
 }
 
 /// Streams the corpus into the store batch by batch, sampling words and
-/// paths for the workload as it goes.
+/// paths of files that indexed for the workload.
 #[derive(Default)]
 struct Indexer {
     files: u64,
@@ -243,8 +296,8 @@ impl Indexer {
         cfg.max_files.is_none_or(|m| self.files < m) && cfg.max_bytes.is_none_or(|m| self.bytes < m)
     }
 
-    fn sample(&mut self, repo: &str, path: &str, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes);
+    fn sample(&mut self, repo: &str, file: &Pending) {
+        let text = String::from_utf8_lossy(&file.bytes);
         for w in text
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|w| w.len() >= 4 && w.starts_with(|c: char| c.is_ascii_alphabetic()))
@@ -252,7 +305,7 @@ impl Indexer {
             *self.word_freq.entry(w.to_string()).or_default() += 1;
         }
         self.sampled_paths
-            .push((repo.to_string(), path.to_string()));
+            .push((repo.to_string(), file.path.clone()));
     }
 
     fn flush(&mut self, store: &V2Store, repo: &str, batch: &mut Vec<Pending>) {
@@ -271,9 +324,14 @@ impl Indexer {
         let results = store
             .index_batch(ORG, repo, &files, IndexOptions::default())
             .expect("index_batch");
-        for r in results {
+        for (file, r) in batch.iter().zip(results) {
             match r {
-                Ok(stats) => self.tokens += stats.tokens,
+                Ok(stats) => {
+                    self.tokens += stats.tokens;
+                    if file.is_sampled {
+                        self.sample(repo, file);
+                    }
+                }
                 Err(_) => self.skipped += 1,
             }
         }
@@ -293,28 +351,29 @@ impl Indexer {
             if !self.under_caps(cfg) {
                 break;
             }
-            let Ok(bytes) = std::fs::read(&p) else {
+            // Like index_dir: a path that is not UTF-8 is skipped.
+            let Some(rel) = p.strip_prefix(repo_dir).expect("under repo").to_str() else {
                 self.skipped += 1;
                 continue;
             };
-            if is_binary(&bytes) {
+            let path = graph_core::normalize_path(rel);
+            let Some(bytes) = read_source(&p) else {
                 self.skipped += 1;
                 continue;
-            }
-            let path = p
-                .strip_prefix(repo_dir)
-                .expect("under repo")
-                .to_string_lossy()
-                .replace('\\', "/");
+            };
             let len = bytes.len() as u64;
-            if sampled_bytes < SAMPLE_BYTES_PER_REPO {
+            let is_sampled = sampled_bytes < SAMPLE_BYTES_PER_REPO;
+            if is_sampled {
                 sampled_bytes += len;
-                self.sample(&repo, &path, &bytes);
             }
             self.files += 1;
             self.bytes += len;
             batch_bytes += len;
-            batch.push(Pending { path, bytes });
+            batch.push(Pending {
+                path,
+                bytes,
+                is_sampled,
+            });
             if batch.len() >= BATCH_FILES || batch_bytes >= BATCH_BYTES {
                 self.flush(store, &repo, &mut batch);
                 batch_bytes = 0;
@@ -353,22 +412,30 @@ impl Indexer {
     }
 }
 
-/// Index the corpus into a fresh database (or reuse one) and return the
-/// database path and the workload.
+/// Index the corpus into a fresh database (or reuse one; `REUSE` ignores
+/// the caps) and return the database path and the workload.
 fn prepare(cfg: &Config) -> (PathBuf, Workload) {
-    std::fs::create_dir_all(&cfg.workdir).expect("create workdir");
     let db = cfg.workdir.join(DB_NAME);
     let workload_path = cfg.workdir.join(WORKLOAD_NAME);
-    if cfg.reuse && db.is_file() && workload_path.is_file() {
-        println!("reusing {}", db.display());
-        return (db, Workload::load(&workload_path));
+    if cfg.reuse {
+        if db.is_file() && workload_path.is_file() {
+            println!("reusing {} (the caps do not apply)", db.display());
+            return (db, Workload::load(&workload_path));
+        }
+        eprintln!(
+            "warning: MG_READBENCH_REUSE=1 but {} or {} is missing; indexing afresh",
+            db.display(),
+            workload_path.display()
+        );
     }
+    let repos = corpus_repos(&cfg.corpus);
+    std::fs::create_dir_all(&cfg.workdir).expect("create workdir");
     let _ = std::fs::remove_file(&db);
     let t = Instant::now();
     let mut indexer = Indexer::default();
     {
         let store = open(&db, None);
-        for repo_dir in corpus_repos(&cfg.corpus) {
+        for repo_dir in repos {
             if !indexer.under_caps(cfg) {
                 break;
             }
@@ -452,6 +519,13 @@ fn add(a: ReadStats, b: &ReadStats) -> ReadStats {
     out.dict_decode_nanos += b.dict_decode_nanos;
     out.lazy_decode_nanos += b.lazy_decode_nanos;
     out.full_decode_nanos += b.full_decode_nanos;
+    out.queries += b.queries;
+    out.query_nanos += b.query_nanos;
+    out.dict_bytes += b.dict_bytes;
+    out.symbol_bytes += b.symbol_bytes;
+    out.lazy_bytes += b.lazy_bytes;
+    out.full_bytes += b.full_bytes;
+    out.symbol_decode_nanos += b.symbol_decode_nanos;
     out
 }
 
@@ -465,8 +539,10 @@ fn bypass_rate(_stats: &ReadStats) -> f64 {
 
 /// One table row. The decode share is the median of the readers' own
 /// shares; the category split and per-query counts are over all readers.
-// TODO(#240): once its counters land, add bytes decoded per query and the
-// summed per-query wall time (and symbol nanos) as columns.
+/// Timing columns read `n/a` when timing is off. `KiB/q` is the encoded
+/// bytes decoded per query: dictionary blocks plus streams decoded lazily
+/// or whole (symbol sections lie inside the lazy streams, so they are not
+/// added again). `store ms/q` is the wall time inside `StoreRead` calls.
 fn report(label: &str, readers: &[Reader], wall: Duration) {
     let mut lat: Vec<Duration> = readers.iter().flat_map(|r| r.lat.clone()).collect();
     lat.sort();
@@ -476,16 +552,33 @@ fn report(label: &str, readers: &[Reader], wall: Duration) {
     let busy: f64 = readers.iter().map(Reader::busy_secs).sum();
     let pct = |nanos: u64| nanos as f64 / 1e9 / busy * 100.0;
     let n = lat.len() as f64;
-    let share = median(readers.iter().map(Reader::decode_share).collect());
+    let timed = |text: String| {
+        if read_stats::timing() {
+            text
+        } else {
+            "n/a".into()
+        }
+    };
+    let share = timed(format!(
+        "{:.1}%",
+        median(readers.iter().map(Reader::decode_share).collect())
+    ));
+    let category = |nanos: u64| timed(format!("{:.1}%", pct(nanos)));
+    let store_ms = timed(format!(
+        "{:.3}",
+        stats.query_nanos as f64 / 1e6 / stats.queries.max(1) as f64
+    ));
+    let kib = (stats.dict_bytes + stats.lazy_bytes + stats.full_bytes) as f64 / 1024.0 / n;
     println!(
-        "| {label} | {} | {:.3} | {:.3} | {:.0} | {share:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} | {:.1}% |",
+        "| {label} | {} | {:.3} | {:.3} | {:.0} | {share} | {} | {} | {} | {} | {store_ms} | {kib:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} | {:.1}% |",
         lat.len(),
         percentile(&lat, 0.5),
         percentile(&lat, 0.95),
         n / wall.as_secs_f64(),
-        pct(stats.dict_decode_nanos),
-        pct(stats.lazy_decode_nanos),
-        pct(stats.full_decode_nanos),
+        category(stats.dict_decode_nanos),
+        category(stats.lazy_decode_nanos),
+        category(stats.symbol_decode_nanos),
+        category(stats.full_decode_nanos),
         stats.dict_block_decodes as f64 / n,
         stats.dict_strings_decoded as f64 / n,
         stats.lazy_stream_decodes as f64 / n,
@@ -496,8 +589,8 @@ fn report(label: &str, readers: &[Reader], wall: Duration) {
 }
 
 fn header() {
-    println!("\n| phase | queries | p50 ms | p95 ms | qps | decode share (median of readers) | dict | lazy+sym | full | dict blocks/q | dict strings/q | lazy/q | sym/q | txns/q | bypass |");
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("\n| phase | queries | p50 ms | p95 ms | qps | decode share (median of readers) | dict | lazy | sym | full | store ms/q | KiB/q | dict blocks/q | dict strings/q | lazy/q | sym/q | txns/q | bypass |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 }
 
 /// Run the cold phase in a fresh process (this test binary, running only
