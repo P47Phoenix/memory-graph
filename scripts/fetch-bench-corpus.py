@@ -159,6 +159,8 @@ def fetch(repo, dest):
 def summarize(paths):
     by_lang = defaultdict(lambda: [0, 0])
     for p in paths:
+        if os.name == "nt":  # paths past MAX_PATH (aspnetcore has some) need the \\?\ prefix
+            p = "\\\\?\\" + os.path.abspath(p)
         for base, dirs, files in os.walk(p):
             dirs[:] = [d for d in dirs if d != ".git"]
             for name in files:
