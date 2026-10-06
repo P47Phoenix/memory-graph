@@ -14,7 +14,7 @@ reported, the others continue, and the exit status is non-zero at the end.
 
 Usage:
   python3 scripts/fetch-bench-corpus.py --list
-  python3 scripts/fetch-bench-corpus.py --dest D:/mg-bench [--only tokio,go] [--skip-verify]
+  python3 scripts/fetch-bench-corpus.py --dest D:/tmp/bench-corpus [--only tokio,go] [--skip-verify]
 
 The manifest below was checked with `gh api repos/<owner>/<repo>` (license,
 size) and pinned with `gh api repos/<o>/<r>/commits/<branch> -q .sha` on
