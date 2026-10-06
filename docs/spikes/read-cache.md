@@ -213,7 +213,7 @@ within phase 1's no-invalidation scope.
   23.4%, 8/16/32 readers 18.7%/12.1%/11.4%, gate 25%); see the phase 1
   re-run above.
 - **Large-index re-run (A5, 2026-10-06):** phase 2 NO-GO (decode share
-  0.2%), phase 3 GO (repeats 40.5-75.2%, synthetic session); see
+  0.2%), phase 3 GO, conditional on real-usage confirmation (repeats 40.5-75.2%, synthetic session); see
   "A5 gate decision" below, which carries the sign-off line.
 
 ## Caveats
@@ -254,14 +254,14 @@ To run the read benchmark against it, index the directory and point the benchmar
 - **Commands:**
 
   ```sh
-  RUST_MIN_STACK=268435456 CARGO_TARGET_DIR=D:/mg-target-a5 MG_READBENCH_CORPUS=D:/mg-bench-corpus \
+  RUST_MIN_STACK=268435456 CARGO_TARGET_DIR=D:/tmp/a5-target MG_READBENCH_CORPUS=D:/tmp/bench-corpus \
     MG_READBENCH_WORKDIR=D:/tmp/a5-readbench2 MG_READBENCH_REUSE=1 \
     cargo test --release -p graph-cli --test readbench measure_reads -- --ignored --nocapture
   ```
 
-  For a new run, use `D:/tmp/bench-corpus` and `D:/tmp/a5-readbench` instead, per the D:\tmp rule.
-- **Stack overflow:** the first indexing attempt died after 48 minutes with `STATUS_STACK_OVERFLOW` on the benchmark's indexing thread, which is the test harness's default 2 MiB thread. Setting `RUST_MIN_STACK` (256 MiB) got past it.
-  - We did not find which file triggers it, and we did not check whether `memory-graph index` (8 MiB main thread) hits the same overflow. Follow-up issue to be filed.
+  The runs used `D:\mg-bench-corpus` and `D:\mg-target-a5`. Since then the corpus has moved to `D:\tmp\bench-corpus` and the build dir has been deleted, per the D:\tmp rule; the command above uses the current paths.
+- **Stack overflow:** the first indexing attempt died after 48 minutes with `STATUS_STACK_OVERFLOW` on the benchmark's indexing thread, which is the test harness's default 2 MiB thread. Setting `RUST_MIN_STACK` (256 MiB) got past it. Tracked in #245.
+  - We did not find which file triggers it, and we did not check whether `memory-graph index` (8 MiB main thread) hits the same overflow. See #245.
 - **Index:**
   - 572,360 files indexed (4,790.8 MiB; 10,399 skipped), 877.1M tokens.
   - Took 2,741 s (45.7 min).
@@ -274,7 +274,7 @@ Run 2 (reuse). Run 1 agreed within 2% on every timing column and exactly on ever
 
 | phase | p50 ms | p95 ms | qps | decode share (median) | dict | lazy | sym | full | store ms/q | KiB/q | dict blocks/q | dict strings/q | lazy/q | sym/q | txns/q |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| cold redb cache, fresh process (OS cache warm), 1 MiB | 0.450 | 519.2 | 14 | 0.1% | 0.1% | 0.0% | 0.0% | 0.0% | 72.9 | 1028.1 | 18.9 | 18.9 | 9.1 | 9.1 | 1.00 |
+| cold redb cache, fresh process (OS cache warm), 1 MiB (informational; not a gate row) | 0.450 | 519.2 | 14 | 0.1% | 0.1% | 0.0% | 0.0% | 0.0% | 72.9 | 1028.1 | 18.9 | 18.9 | 9.1 | 9.1 | 1.00 |
 | warm x20, timing off | 0.068 | 206.0 | 33 | n/a | n/a | n/a | n/a | n/a | n/a | 1028.1 | 18.9 | 18.9 | 9.1 | 9.1 | 1.00 |
 | warm x20, timing on | 0.069 | 206.3 | 33 | 0.2% | 0.1% | 0.1% | 0.0% | 0.0% | 30.2 | 1028.1 | 18.9 | 18.9 | 9.1 | 9.1 | 1.00 |
 | 1 thread x20 | 0.070 | 207.5 | 33 | 0.2% | 0.1% | 0.1% | 0.0% | 0.0% | 30.3 | 1028.1 | 18.9 | 18.9 | 9.1 | 9.1 | 1.00 |
@@ -287,6 +287,7 @@ Run 2 (reuse). Run 1 agreed within 2% on every timing column and exactly on ever
   - The decode counts per query are close to the small corpus's: 18.9 dictionary lookups, 9.1 lazy and 9.1 symbol decodes.
   - But the store spends 30 ms per query, so their time is a rounding error.
   - Most of the time sits in what is not decode-timed: token-stream walks (`Lazy::tokens`, untimed by design, see above), posting reads and redb page access.
+- **The decode share is uninformative at this scale.** Untimed posting and token-stream walks for the hot terms dominate the wall time (p95 about 206 ms), so any timed decode is a rounding error beside them. The real hot spot is those walks, tracked as #246 (hot-term posting/token walks).
 - **What a cache would buy:** the gate's share is wall-time weighted, so the heavy queries set it. A decoded-object cache would not shorten them. It saves only the timed decodes, which are 0.2% of the time.
 
 ### Caveats
@@ -301,17 +302,19 @@ Run 2 (reuse). Run 1 agreed within 2% on every timing column and exactly on ever
 
 `scripts/agent-session-sim.py` drives `memory-graph --server <addr> mcp` over stdio like a coding agent and scrapes `mg_queries_total` and `mg_query_exact_repeats_total` before and after the session. Its seeding calls (listing repos, collecting symbol names) are excluded. The MCP tools on a `--server` target issue Store RPCs, so the server's counters see everything an agent's calls cost.
 
+- **Run it on an idle server.** Seeding calls and any other traffic count as prior requests in the server's 60 s repeat window. Run the simulator against an otherwise idle server, at least 60 s after any earlier session. The script now waits `--settle` seconds (default 61) after seeding, before its first scrape. The measured runs below predate that wait, so in their first minute seeding calls could count as earlier requests. The effect is small against 7,811 RPCs, and it errs upward.
+- **Wall-clock window.** The 60 s window is wall-clock, so the share also depends on latency: slower queries or longer think time push earlier calls out of the window.
 - **Setup:** `memory-graph --db D:/tmp/a5-readbench2/readbench.redb serve --listen 127.0.0.1:7321 --metrics-listen 127.0.0.1:9321`, on the A5 index above.
 - **Session:**
   - 3,000 MCP calls with seed 7.
   - Think time between calls is exponential, mean 0.3 s. The session took about 60 minutes, because hot searches on this index are slow, so the 60 s repeat window was exercised.
   - Calls are grouped into tasks of 6 to 25 calls on one repo and one seed symbol.
 - **Mix of actions:**
-  - 22% re-ask: a verbatim repeat of an earlier call, 80% from the task's last 8 calls, 20% from the last 300 calls overall;
+  - 22% re-ask: a verbatim repeat of an earlier call, 80% from the task's last 8 calls, 20% from the session's last 300 calls (a re-ask drawn on a task's first step goes to the other actions in their mix);
   - 15% `find_symbols` (an exact name, or a `prefix*` 20% of the time; repo-scoped half the time);
   - 15% `file_outline`, which sometimes navigates on to a symbol in the outline;
   - 15% `file_tokens` on a 40/80/150-line window;
-  - 25% `search` (token grain mostly, else symbol, method or file; refined with a repo filter 40% of the time);
+  - 25% `search` (token grain mostly, else symbol, method or file; refined with an org/repo filter 40% of the time);
   - 4% `list_files`;
   - 4% `describe`;
   - 10% of steps move to another file of the same repo.
@@ -338,23 +341,23 @@ Run 2 (reuse). Run 1 agreed within 2% on every timing column and exactly on ever
 
 | Phase | Gate | Measured (A5) | Verdict |
 |---|---|---|---|
-| Phase 2: decoded-object cache (stories 47-48) | decode share >= 25% at warm single reader, or at any of 8/16/32 readers | 0.2% warm single reader; 0.2% at 8, 16 and 32 readers; 0.1% cold | **NO-GO** |
-| Phase 3: result cache (story 49) | exact repeats >= 20% on a representative agent workload | 75.2% of all read RPCs; 40.5% of query RPCs (35.3% with no explicit re-asks); synthetic scripted session | **GO** |
+| Phase 2: decoded-object cache (stories 47-48) | decode share >= 25% at warm single reader, or at any of 8/16/32 readers | 0.2% warm single reader; 0.2% at 8, 16 and 32 readers (0.1% cold, informational) | **NO-GO** |
+| Phase 3: result cache (story 49) | exact repeats >= 20% on a representative agent workload | 75.2% of all read RPCs; 40.5% of query RPCs (35.3% with no explicit re-asks); synthetic scripted session | **GO (conditional)** |
 
 - Phase 2 fails at both scales. The vendored corpus after phase 1 measured 23.4% warm, and this 877M-token index measures 0.2%.
-- Phase 3 passes with margin even on the conservative figure. It rests on a synthetic session, so the owner may want to confirm it against a real agent's server (the same metrics, `serve --metrics-listen`) before building story 49.
+- Phase 2's decode share is uninformative at this scale: untimed posting and token walks dominate (p95 about 206 ms). The cost worth attacking is those walks (#246), which a decoded-object cache would not remove.
+- Phase 3 passes with margin even on the conservative figure, but on a synthetic session. **Condition:** before story 49 is built, confirm at least 20% query-RPC repeats on a real agent's server (`serve --metrics-listen`), or the owner explicitly waives the check. The 60 s window is wall-clock, so the share also depends on latency.
 
 **Owner sign-off:** ____ (name, date)
 
 ### Directories used (A5)
 
-These are kept so the runs can be repeated; relocate or clean them before the next run.
+Kept for the phase 3 real-usage confirmation and #246 profiling; delete them when no longer needed.
 
 | Path | What | Size |
 |---|---|---|
-| `D:\mg-bench-corpus` | the fetched corpus (predates the D:\tmp rule) | 6.4 GB |
-| `D:\mg-target-a5` | the release build | several GB |
+| `D:\tmp\bench-corpus` | the fetched corpus (fetched as `D:\mg-bench-corpus`, then renamed) | 6.4 GB |
 | `D:\tmp\a5-readbench2` | the benchmark db (`readbench.redb`) and workload, plus the `serve --db` sidecars (`.raft.redb`, `.snapshots`, `.LOCK`) | 22.0 GiB |
-| `D:\tmp\a5-readbench` | partial db from the attempt that overflowed its stack; can be deleted | 18.0 GiB |
-| `D:\tmp\a5-simtest` | a small db for smoke-testing the session script | under 50 MB |
 | `D:\tmp\a5-logs` | fetch, benchmark, serve and session logs, and the session JSON | small |
+
+Already deleted: `D:\mg-target-a5` (the release build), `D:\tmp\a5-readbench` (the partial db from the stack overflow) and `D:\tmp\a5-simtest` (a smoke-test db).
