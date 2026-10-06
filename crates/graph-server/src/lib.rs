@@ -56,6 +56,7 @@ pub mod observe;
 pub mod paths;
 pub mod powercut;
 pub mod raft;
+pub mod repeats;
 pub mod server;
 pub mod services;
 pub mod slot;

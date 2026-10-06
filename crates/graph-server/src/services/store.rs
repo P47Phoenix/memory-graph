@@ -2,6 +2,7 @@
 //! `View`, and the snapshot handles (ADR 0004 D1/D8).
 use super::{reply, Ctx};
 use crate::conn::conn_id;
+use crate::repeats::{QueryKey, ReadRpc};
 use crate::{DEFAULT_SEARCH_LIMIT, SERVER_VERSION};
 use graph_core::{Node, NodeKind};
 use graph_proto::convert::Wire;
@@ -71,7 +72,9 @@ impl pb::store_server::Store for StoreService {
 
     async fn get(&self, req: Request<pb::GetRequest>) -> Result<Response<pb::GetResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::Get, &r);
         let (node, meta) = self.ctx.read(r.view, move |s| s.get(r.id)).await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::GetResponse {
                 node: node.map(Into::into),
@@ -85,7 +88,9 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::ParentRequest>,
     ) -> Result<Response<pb::ParentResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::Parent, &r);
         let (node, meta) = self.ctx.read(r.view, move |s| s.parent(r.id)).await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::ParentResponse {
                 node: node.map(Into::into),
@@ -99,8 +104,10 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::CountNodesRequest>,
     ) -> Result<Response<pb::CountNodesResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::CountNodes, &r);
         let kind = Wire::<NodeKind>::try_from(r.kind)?.0;
         let (count, meta) = self.ctx.read(r.view, move |s| s.count_nodes(kind)).await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::CountNodesResponse {
                 count: count as u64,
@@ -114,7 +121,9 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::RootsRequest>,
     ) -> Result<Response<pb::RootsResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::Roots, &r);
         let (nodes, meta) = self.ctx.read(r.view, |s| s.roots()).await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::RootsResponse {
                 nodes: nodes_into(nodes),
@@ -128,7 +137,9 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::ChildrenRequest>,
     ) -> Result<Response<pb::ChildrenResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::Children, &r);
         let (nodes, meta) = self.ctx.read(r.view, move |s| s.children(r.id)).await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::ChildrenResponse {
                 nodes: nodes_into(nodes),
@@ -142,11 +153,13 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::ChildrenPageRequest>,
     ) -> Result<Response<pb::NodePage>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::ChildrenPage, &r);
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
         let (page, meta) = self
             .ctx
             .read(r.view, move |s| s.children_page(r.id, offset, limit))
             .await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(page.into(), meta))
     }
 
@@ -157,7 +170,9 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::DescendantsRequest>,
     ) -> Result<Response<Self::DescendantsStream>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::Descendants, &r);
         let (nodes, meta) = self.ctx.read(r.view, move |s| s.descendants(r.id)).await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(batches(nodes), meta))
     }
 
@@ -166,11 +181,13 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::DescendantsPageRequest>,
     ) -> Result<Response<pb::NodePage>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::DescendantsPage, &r);
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
         let (page, meta) = self
             .ctx
             .read(r.view, move |s| s.descendants_page(r.id, offset, limit))
             .await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(page.into(), meta))
     }
 
@@ -179,7 +196,9 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::AncestorsRequest>,
     ) -> Result<Response<pb::AncestorsResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::Ancestors, &r);
         let (nodes, meta) = self.ctx.read(r.view, move |s| s.ancestors(r.id)).await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::AncestorsResponse {
                 nodes: nodes_into(nodes),
@@ -195,10 +214,12 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::FileTokensRequest>,
     ) -> Result<Response<Self::FileTokensStream>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::FileTokens, &r);
         let (toks, meta) = self
             .ctx
             .read(r.view, move |s| s.file_tokens(&r.org, &r.repo, &r.path))
             .await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             match toks {
                 Some(nodes) => batches(nodes),
@@ -216,12 +237,14 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::DescribeRequest>,
     ) -> Result<Response<pb::DescribeResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::Describe, &r);
         let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
                 s.describe(r.org.as_deref(), r.repo.as_deref())
             })
             .await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::DescribeResponse {
                 repos: repos.into_iter().map(Into::into).collect(),
@@ -235,12 +258,14 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::DescribeRequest>,
     ) -> Result<Response<pb::DescribeResponse>, Status> {
         let r = req.into_inner();
+        let key = QueryKey::of(ReadRpc::DescribeByScan, &r);
         let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
                 s.describe_by_scan(r.org.as_deref(), r.repo.as_deref())
             })
             .await?;
+        self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::DescribeResponse {
                 repos: repos.into_iter().map(Into::into).collect(),
@@ -288,20 +313,24 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::SearchSymbolsRequest>,
     ) -> Result<Response<pb::SearchSymbolsResponse>, Status> {
-        let r = req.into_inner();
-        let mut q: SymbolQuery = r
+        let mut r = req.into_inner();
+        // The key sees the default limit applied, so an omitted limit and
+        // the default one are the same query.
+        let defaulted = r.query.as_ref().is_some_and(|q| q.limit.is_none());
+        if let Some(q) = r.query.as_mut() {
+            q.limit.get_or_insert(DEFAULT_SEARCH_LIMIT as u64);
+        }
+        let key = QueryKey::of(ReadRpc::SearchSymbols, &r);
+        let q: SymbolQuery = r
             .query
             .ok_or_else(|| {
                 ConvertError("required field `SearchSymbolsRequest.query` is missing".into())
             })?
             .try_into()?;
-        // Only a page the default limit filled is reported, so a small answer
-        // needs no paging round trips (a full one may have more behind it).
-        let defaulted = q.limit.is_none();
-        if defaulted {
-            q.limit = Some(DEFAULT_SEARCH_LIMIT);
-        }
+        // Only a page the default limit filled is reported as defaulted, so a
+        // small answer needs no paging round trips.
         let (hits, meta) = self.ctx.read(r.view, move |s| s.search_symbols(&q)).await?;
+        self.ctx.note_query(key, &meta);
         let hits_len = hits.len();
         Ok(reply(
             pb::SearchSymbolsResponse {
@@ -316,18 +345,22 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::SearchRequest>,
     ) -> Result<Response<pb::SearchResponse>, Status> {
-        let r = req.into_inner();
-        let mut q: Query = r
+        let mut r = req.into_inner();
+        // The key sees the default limit applied, so an omitted limit and
+        // the default one are the same query.
+        let defaulted = r.query.as_ref().is_some_and(|q| q.limit.is_none());
+        if let Some(q) = r.query.as_mut() {
+            q.limit.get_or_insert(DEFAULT_SEARCH_LIMIT as u64);
+        }
+        let key = QueryKey::of(ReadRpc::Search, &r);
+        let q: Query = r
             .query
             .ok_or_else(|| ConvertError("required field `SearchRequest.query` is missing".into()))?
             .try_into()?;
-        // Only a page the default limit filled is reported, so a small answer
-        // needs no paging round trips (a full one may have more behind it).
-        let defaulted = q.limit.is_none();
-        if defaulted {
-            q.limit = Some(DEFAULT_SEARCH_LIMIT);
-        }
+        // Only a page the default limit filled is reported as defaulted, so a
+        // small answer needs no paging round trips.
         let (hits, meta) = self.ctx.read(r.view, move |s| s.search(&q)).await?;
+        self.ctx.note_query(key, &meta);
         let hits_len = hits.len();
         Ok(reply(
             pb::SearchResponse {
