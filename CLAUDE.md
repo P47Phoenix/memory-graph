@@ -110,7 +110,13 @@ For every PR in this repo:
 **Practical notes:**
 - Use isolated worktrees for every agent (dev, reviewers) — never the shared main checkout.
 - Stage only the specific files an agent should touch.
-- Put run artifacts under `D:/tmp/<run-name>/` (for example `D:/tmp/a5-bench/`). That covers `CARGO_TARGET_DIR` build dirs, benchmark corpora and workdirs, review scratch dirs and test databases. Do not put them in the repo, worktrees, `C:` or other top-level `D:` folders. Delete the previous runs' `D:/tmp/*` dirs before starting the next run; keep a run's dir only while its results are still needed (e.g. a corpus being re-measured), and say so in the PR. (User request, 2026-10-06.)
+- Put run artifacts on this Windows dev machine under `D:/tmp/<task>-<purpose>/`, for example `D:/tmp/pr241-review-target/` or `D:/tmp/a5-bench-work/`. Name dirs so it is clear which task owns them. This covers `CARGO_TARGET_DIR` build dirs, benchmark corpora and workdirs, review scratch dirs and test databases. Do not put them in the repo, in worktrees, on `C:` or in other top-level `D:` folders. Before starting a run:
+  - Delete your own earlier runs' dirs under `D:/tmp/`.
+  - Never delete a dir that a live process or another session or agent may be using, and never clear `D:/tmp/` wholesale.
+  - Keep a dir only while its results are still needed (e.g. a benchmark corpus being re-measured), and say so in the PR; the next run deletes it once that PR is merged or closed.
+  - The pinned benchmark corpus (`scripts/fetch-bench-corpus.py --dest D:/tmp/bench-corpus`) follows the same rule. The fetch is resumable, so a deleted corpus is simply re-fetched.
+
+  (User request, 2026-10-06.)
 - Commit trailers: `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>` and a `Claude-Session:` URL for the session doing the work.
 - PR bodies end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)` plus the session URL.
 - Log deferred/follow-up findings as GitHub issues (not just chat) so they survive a session or machine change — see issue #19 for the ADR 0003 store-trait/v2 backlog.
