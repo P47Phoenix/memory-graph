@@ -767,11 +767,27 @@ impl Scanner<'_> {
     /// (`React.default`, `x.const` are property names).
     fn starts_statement(&self, c: usize, hi: usize) -> bool {
         let t = self.text(c);
-        if c > 0 && matches!(self.text(c - 1), "." | "?.") {
+        // After these the word is an operand or a modifier: `x.const`,
+        // `[1] as const`, `<const T>`, `new import(...)`, `typeof let`.
+        if c > 0
+            && matches!(
+                self.text(c - 1),
+                "." | "?." | "as" | "satisfies" | "new" | "typeof" | "keyof" | "<" | "is"
+            )
+        {
             return false;
         }
         if STATEMENT_WORDS.contains(&t) {
-            return !(t == "import" && c + 1 < hi && self.text(c + 1) == "(");
+            // A statement continues with a name, a literal, a binding
+            // pattern or `*` (`export * from`, `import {`, `const [a]`,
+            // `export = x`); anything else makes the word an operand
+            // (`import.meta`, `import("m")`, `let)` as an identifier).
+            if c + 1 >= hi {
+                return true;
+            }
+            return self.word_follows(c, hi)
+                || matches!(self.text(c + 1), "{" | "[" | "*")
+                || (t == "export" && self.text(c + 1) == "=");
         }
         // `abstract new () => X` is a constructor type, not a declaration.
         if t == "abstract" && c + 1 < hi && self.text(c + 1) == "new" {

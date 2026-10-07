@@ -540,3 +540,128 @@ fn constructor_generic_and_decorator_types() {
     let s = syms("type A = B |\nabstract class K { }\n");
     assert_eq!(find(&s, "A").3, "type A = B |");
 }
+
+/// Review of #213: statement words used as operands (`as const`,
+/// `import.meta`, identifiers named `let`/`type`/...) do not end a type, an
+/// arrow body or a field initializer.
+#[test]
+fn statement_words_as_operands_do_not_end_expressions() {
+    for (src, name, text) in [
+        (
+            "class F { arr = [1, 2] as const; m() {} }",
+            "arr",
+            "arr = [1, 2] as const;",
+        ),
+        (
+            "class F { h = () => ({ a: 1 }) as const; }",
+            "h",
+            "h = () => ({ a: 1 }) as const;",
+        ),
+        (
+            "const g = () => [1] as const;",
+            "g",
+            "const g = () => [1] as const;",
+        ),
+        (
+            "const s = () => x satisfies const;",
+            "s",
+            "const s = () => x satisfies const;",
+        ),
+        (
+            "const u = x => import.meta.url;",
+            "u",
+            "const u = x => import.meta.url;",
+        ),
+        (
+            "class F { u = import.meta.url; }",
+            "u",
+            "u = import.meta.url;",
+        ),
+        (
+            "const i = () => import(\"m\");",
+            "i",
+            "const i = () => import(\"m\");",
+        ),
+        ("class F { v = typeof let; }", "v", "v = typeof let;"),
+        ("class F { w = a.default; }", "w", "w = a.default;"),
+        ("class F { t = type; }", "t", "t = type;"),
+        (
+            "class F { n = module.exports; }",
+            "n",
+            "n = module.exports;",
+        ),
+        ("class F { d = declare; }", "d", "d = declare;"),
+        ("class F { a = abstract; }", "a", "a = abstract;"),
+        ("const k = () => async;", "k", "const k = () => async;"),
+        (
+            "type C = <const T>(x: T) => T;",
+            "C",
+            "type C = <const T>(x: T) => T;",
+        ),
+        (
+            "const p: X<const> = () => 1;",
+            "p",
+            "const p: X<const> = () => 1;",
+        ),
+    ] {
+        let s = syms(src);
+        assert_eq!(find(&s, name).3, text, "{src}");
+        assert_no_wrong_symbols(&s, src);
+    }
+    // Real statements still end an open expression.
+    let s = syms("class C { x = a |\nexport\n}\nexport const y = 1;");
+    assert_eq!(find(&s, "x").3, "x = a |");
+}
+
+/// No symbol is named after a statement or declaration word, and every
+/// field ends at its `;` or at the end of a line.
+fn assert_no_wrong_symbols(s: &[Sym], src: &str) {
+    for (name, _, lang, text) in s {
+        assert!(
+            ![
+                "export",
+                "import",
+                "default",
+                "const",
+                "let",
+                "var",
+                "declare",
+                "abstract",
+                "namespace",
+                "module",
+                "type",
+                "async",
+                "as"
+            ]
+            .contains(&name.as_str()),
+            "{src}: wrong symbol {name}"
+        );
+        if lang == "field" {
+            let rest = &src[src.find(text.as_str()).unwrap() + text.len()..];
+            assert!(
+                text.ends_with(';') || rest.is_empty() || rest.starts_with(['\n', '\r', ' ', '}']),
+                "{src}: field {text:?} ends mid-line"
+            );
+        }
+    }
+}
+
+proptest! {
+    /// Fields and arrows built from statement words used as operands keep
+    /// their full spans and never give a symbol named after the word.
+    #[test]
+    fn operand_words_keep_full_spans(
+        word in prop_oneof![
+            Just("const"), Just("import.meta"), Just("default"), Just("let"), Just("var"),
+            Just("type"), Just("module"), Just("namespace"), Just("declare"), Just("abstract"),
+            Just("async"), Just("export"),
+        ],
+        lead in prop_oneof![Just("x as "), Just("y satisfies "), Just("typeof "), Just("a."), Just("a?.")],
+    ) {
+        let src = format!("class F {{ f = {lead}{word}; m() {{}} }}\nconst g = () => {lead}{word};");
+        let s = syms(&src);
+        prop_assert_eq!(&find(&s, "f").3, &format!("f = {lead}{word};"));
+        prop_assert_eq!(&find(&s, "g").3, &format!("const g = () => {lead}{word};"));
+        assert_no_wrong_symbols(&s, &src);
+    }
+}
