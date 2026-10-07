@@ -1036,8 +1036,10 @@ static JSON_LOGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// `--quorum-loss-timeout`, and every CLI test failed with a stack overflow.
 /// A release build runs within 1 MiB (checked on Windows, 2026-09-29, with
 /// `run` on a 1 MiB thread: `describe` and `index` work); 8 MiB costs only
-/// address space, so both builds use it.
-const MAIN_STACK_BYTES: usize = 8 << 20;
+/// address space, so both builds use it. It is raised to
+/// `graph_core::EXTRACT_STACK_BYTES` (16 MiB) because `index-file` and the
+/// commit side of `index` run extractors on this thread too (#245).
+const MAIN_STACK_BYTES: usize = graph_core::EXTRACT_STACK_BYTES;
 
 fn main() {
     let result = std::thread::Builder::new()

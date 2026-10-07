@@ -9,6 +9,9 @@ use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind, TokenClass
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
+mod nesting;
+pub use nesting::{MAX_CHAIN_LEN, MAX_NESTING_DEPTH};
+
 pub struct RustExtractor;
 
 impl Extractor for RustExtractor {
@@ -17,15 +20,20 @@ impl Extractor for RustExtractor {
     }
 
     fn version(&self) -> String {
-        // `kw1`: keywords are classed `keyword` (#98). Part of the file
-        // fingerprint, so a store indexed before it re-indexes Rust files.
+        // `kw1`: keywords are classed `keyword` (#98). `deep1`: input
+        // nested too deep for `syn` is stored tokens only (#245). Part of
+        // the file fingerprint, so a store indexed before re-indexes Rust.
         format!(
-            "rust-syn-2+kw1+tok{}",
+            "rust-syn-2+kw1+deep1+tok{}",
             graph_core::tokenizer::TOKENIZER_VERSION
         )
     }
 
     fn extract(&self, source: &str) -> Extraction {
+        self.extract_noted(source).0
+    }
+
+    fn extract_noted(&self, source: &str) -> (Extraction, Option<String>) {
         let mut tokens = tokenize_with(
             source,
             TokenizerOptions {
@@ -51,16 +59,25 @@ impl Extractor for RustExtractor {
                 t.class = TokenClass::Keyword;
             }
         }
+        if let Some(why) = nesting::too_deep(&tokens) {
+            let ex = Extraction {
+                symbols: vec![],
+                tokens,
+                has_errors: false,
+            };
+            return (ex, Some(why));
+        }
         // syn strips a BOM before lexing, so its byte ranges start after it.
         let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
         let file = match syn::parse_file(&source[bom..]) {
             Ok(f) => f,
             Err(_) => {
-                return Extraction {
+                let ex = Extraction {
                     symbols: vec![],
                     tokens,
                     has_errors: true,
-                }
+                };
+                return (ex, None);
             }
         };
         let mut v = Collector {
@@ -71,11 +88,12 @@ impl Extractor for RustExtractor {
             out: vec![],
         };
         v.visit_file(&file);
-        Extraction {
+        let ex = Extraction {
             symbols: v.out,
             tokens,
             has_errors: false,
-        }
+        };
+        (ex, None)
     }
 }
 

@@ -61,6 +61,13 @@ pub trait Extractor: Send + Sync {
     /// Language string stored on File nodes.
     fn language(&self) -> &str;
     fn extract(&self, source: &str) -> Extraction;
+    /// [`Extractor::extract`] plus a note when the extractor deliberately
+    /// degraded the file (e.g. skipped its parser on input nested too deep
+    /// to parse safely, #245) and returned tokens only. The store reports
+    /// the note as the file's warning. The default never degrades.
+    fn extract_noted(&self, source: &str) -> (Extraction, Option<String>) {
+        (self.extract(source), None)
+    }
     /// Version of this extractor's output. Bump it whenever a change would
     /// alter what `extract` returns, so stored files are re-indexed.
     ///
@@ -83,6 +90,12 @@ pub trait Extractor: Send + Sync {
         &[]
     }
 }
+
+/// Stack size for threads that run extractors (#245): parsers such as
+/// `syn` recurse per nesting level, and the 2 MiB default of spawned
+/// threads overflows on deeply nested or generated sources. A large stack
+/// costs address space only; pages are committed as they are touched.
+pub const EXTRACT_STACK_BYTES: usize = 16 << 20;
 
 /// Base version of the fallback (tokenizer-only) extraction; its `version()`
 /// also carries `tokenizer::TOKENIZER_VERSION`.
@@ -161,6 +174,15 @@ impl Registry {
         match self.get(language) {
             Some(e) => e.extract(source),
             None => FallbackExtractor::new(language.to_ascii_lowercase()).extract(source),
+        }
+    }
+
+    /// [`Registry::extract`] with the extractor's degradation note (see
+    /// [`Extractor::extract_noted`]).
+    pub fn extract_noted(&self, language: &str, source: &str) -> (Extraction, Option<String>) {
+        match self.get(language) {
+            Some(e) => e.extract_noted(source),
+            None => (self.extract(language, source), None),
         }
     }
 

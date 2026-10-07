@@ -63,6 +63,7 @@ pub const CASES: &[(&str, Case)] = &[
         "invalid_symbol_spans_keep_tokens",
         invalid_symbol_spans_keep_tokens,
     ),
+    ("extractor_notes_are_warnings", extractor_notes_are_warnings),
     ("reopen_persists", reopen_persists),
     ("snapshot_is_frozen", snapshot_is_frozen),
     ("locking", locking),
@@ -772,6 +773,65 @@ fn invalid_symbol_spans_keep_tokens(h: &Harness) {
         s.describe(None, None).unwrap(),
         s.describe_by_scan(None, None).unwrap()
     );
+}
+
+/// Language `conf-noted`: tokens only, with a note that it degraded the
+/// file itself, as the Rust extractor does on input nested too deep (#245).
+struct NotedTokens;
+impl Extractor for NotedTokens {
+    fn language(&self) -> &str {
+        "conf-noted"
+    }
+    fn version(&self) -> String {
+        "conf-noted-1".into()
+    }
+    fn extract(&self, src: &str) -> Extraction {
+        plain(src)
+    }
+    fn extract_noted(&self, src: &str) -> (Extraction, Option<String>) {
+        (plain(src), Some("skipped parsing: too deep".into()))
+    }
+}
+
+/// #245: an extractor's own degradation note is reported as the file's
+/// warning on every write path, naming the extractor; the file keeps its
+/// tokens, and an unchanged re-index (nothing extracted) does not warn.
+fn extractor_notes_are_warnings(h: &Harness) {
+    let s = (h.open)(vec![Box::new(NotedTokens)]).expect("open store");
+    let warned = |st: &crate::IngestStats| {
+        let w = st.span_warning.as_deref().expect("a warning");
+        assert!(w.contains("conf-noted-1"), "names the extractor: {w}");
+        assert!(w.contains("skipped parsing: too deep"), "the note: {w}");
+        assert_eq!((st.symbols, st.tokens), (0, 5), "{st:?}");
+    };
+    let f = |p| BatchFile {
+        path: p,
+        bytes: OVERLAP_SRC,
+        language: Some("conf-noted"),
+        origin: None,
+        ..Default::default()
+    };
+    let d = IndexOptions::default();
+    warned(
+        s.index_batch("o", "r", &[f("a.n")], d).unwrap()[0]
+            .as_ref()
+            .unwrap(),
+    );
+    let p = s.prepare("o", "p", &f("a.n"), d).unwrap();
+    warned(
+        s.index_prepared("o", "p", vec![p], d).unwrap()[0]
+            .as_ref()
+            .unwrap(),
+    );
+    warned(
+        &s.index_bytes("o", "solo", "a.n", OVERLAP_SRC, Some("conf-noted"))
+            .unwrap(),
+    );
+    let again = s.index_batch("o", "r", &[f("a.n")], d).unwrap();
+    let again = again[0].as_ref().unwrap();
+    assert!(again.unchanged && again.span_warning.is_none(), "{again:?}");
+    let toks = s.file_tokens("o", "r", "a.n").unwrap().unwrap();
+    assert_eq!(toks.len(), 5);
 }
 
 /// [`run_differential`] over two stores that also hold #203's degraded

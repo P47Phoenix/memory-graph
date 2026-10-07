@@ -26,6 +26,8 @@ fn bumped_extractor_versions_are_pinned() {
         ("shell", "shell-scan-2+kw1+tok"),
         ("elixir", "elixir-scan-1+kw1+tok"),
         ("rpg", "rpg-scan-2+kw1+tok"),
+        // `+deep1` (#245): Rust nested too deep for `syn` is tokens only.
+        ("rust", "rust-syn-2+kw1+deep1+tok"),
     ] {
         let e = extractors
             .iter()

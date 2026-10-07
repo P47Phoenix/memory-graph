@@ -378,16 +378,24 @@ fn strict_refusal(path: &str, encoding: &'static Encoding) -> StoreError {
 /// Extract and validate spans, so a bad file only fails itself. When only
 /// the symbols are at fault (#203), the file keeps its tokens with no
 /// symbols and the second value is a warning naming the extractor and the
-/// span; when the tokens are invalid too, the file is rejected.
+/// span; when the tokens are invalid too, the file is rejected. An
+/// extractor that degraded the file itself (#245, see
+/// [`graph_core::Extractor::extract_noted`]) is reported the same way.
 pub(crate) fn extract_checked(
     registry: &Registry,
     path: &str,
     lang: &str,
     src: &str,
 ) -> (Prepared, Option<String>) {
-    let ex = registry.extract(lang, src);
+    let (ex, note) = registry.extract_noted(lang, src);
     let Err(StoreError::InvalidSpan(why)) = validate_spans(&ex) else {
-        return (Prepared::Extracted(ex), None);
+        let warning = note.map(|n| {
+            format!(
+                "extractor `{}` {n}; stored tokens only, no symbols",
+                registry.version(lang)
+            )
+        });
+        return (Prepared::Extracted(ex), warning);
     };
     let tokens_only = Extraction {
         symbols: Vec::new(),

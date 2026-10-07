@@ -97,6 +97,22 @@ fn keywords_are_classed_keyword() {
     }
 }
 
+/// Input nested too deep for `syn` comes back as tokens only, with a note
+/// for the store to report, and no symbols (#245).
+#[test]
+fn too_deep_input_is_tokens_only_with_a_note() {
+    let n = crate::MAX_NESTING_DEPTH + 1;
+    let src = format!("fn f() {{ {}1{}; }}", "(".repeat(n), ")".repeat(n));
+    let (ex, note) = RustExtractor.extract_noted(&src);
+    assert!(ex.symbols.is_empty() && !ex.has_errors);
+    // fn f ( ) { (.. 1 ..) ; }
+    assert_eq!(ex.tokens.len(), 2 * n + 8);
+    assert!(note.expect("a note").contains("nesting depth"));
+    assert_eq!(RustExtractor.extract(&src), ex);
+    let (ok, note) = RustExtractor.extract_noted("fn f() {}");
+    assert_eq!((ok.symbols.len(), note), (1, None));
+}
+
 /// The `+kw1` marker changes the fingerprint of every Rust file, so a store
 /// indexed before keyword classing re-indexes them; dropping it must fail.
 #[test]
@@ -104,7 +120,7 @@ fn version_pins_keyword_classing() {
     assert_eq!(
         RustExtractor.version(),
         format!(
-            "rust-syn-2+kw1+tok{}",
+            "rust-syn-2+kw1+deep1+tok{}",
             graph_core::tokenizer::TOKENIZER_VERSION
         )
     );

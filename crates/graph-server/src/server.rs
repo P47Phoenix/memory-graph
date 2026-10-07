@@ -1261,6 +1261,8 @@ fn build_runtime(
     worker_threads: Option<std::num::NonZeroUsize>,
 ) -> std::io::Result<tokio::runtime::Runtime> {
     let mut b = tokio::runtime::Builder::new_multi_thread();
+    // Writes are extracted on this runtime's blocking threads (#245).
+    b.thread_stack_size(graph_core::EXTRACT_STACK_BYTES);
     if let Some(n) = worker_threads {
         b.worker_threads(n.get());
     }
