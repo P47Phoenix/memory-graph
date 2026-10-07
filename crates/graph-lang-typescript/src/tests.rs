@@ -306,24 +306,9 @@ proptest! {
     ) {
         let src = parts.join("\n");
         assert_nested(&TypeScriptExtractor.extract(&src));
-        // #212: the overlap filter is a safety net; the scanners must not
-        // need it. Known exception, tracked by #213 (fixed there, not here):
-        // a type or arrow left open (a trailing `|`, `&`, `=`, `=>`) and
-        // followed by more code makes the two scans disagree, e.g.
-        // `const f = (): T =>\nexport\ntype A = B |` or
-        // `class C { x: A |\ntype A = B |\ndefault\n}`.
-        let left_open = parts[..parts.len().saturating_sub(1)]
-            .iter()
-            .filter(|p| ["=>", "|", "&", " ="].iter().any(|e| p.ends_with(e)))
-            .count();
-        let dropped = drops(&src);
-        if left_open > 0 {
-            // Each open fragment drops at most one symbol; more would be a
-            // new class of drop.
-            prop_assert!(dropped <= left_open, "{} dropped {}", src, dropped);
-        } else {
-            prop_assert_eq!(dropped, 0, "{}", src);
-        }
+        // #212/#213: the overlap filter is a safety net; the scanners must
+        // not need it, even with fragments left open.
+        prop_assert_eq!(drops(&src), 0, "{}", src);
     }
 }
 
@@ -424,7 +409,7 @@ fn keywords_are_classed_keyword() {
     assert_eq!(class("import"), [TokenClass::Identifier]);
     assert!(TypeScriptExtractor
         .version()
-        .starts_with("typescript-scan-3+kw1+tok"));
+        .starts_with("typescript-scan-4+kw1+tok"));
 }
 
 /// Review of #164: interface and type-literal members with reserved names
@@ -493,16 +478,65 @@ fn type_alias_stops_before_the_next_statement() {
     }
 }
 
-/// #212: the overlap filter's drops are visible to tests. The two shapes
-/// below are the known ones (#213); when #213 fixes them this test fails
-/// and should assert 0 instead.
+/// #212/#213: the overlap filter's drops are visible to tests, and the
+/// shapes the fragment proptest found no longer need it: an arrow body or
+/// a field initializer stops before a word that opens the next statement.
 #[test]
 fn known_overlap_drops_are_counted() {
     assert_eq!(drops("type A = B;\nclass C { m(): void {} }"), 0);
     for src in [
         "const f = (): T =>\nexport\ntype A = B |",
         "class C { x: A |\ntype A = B |\ndefault\n}",
+        "const f = () => x |\nexport\ntype A = B;",
+        "const f = (): T =>\ndeclare\ntype A = B;",
+        "class C { x = a |\n@dec\nm() {} }",
+        "class C { x: A |\ntype A = B |\ndeclare\n{\n}\n}",
     ] {
-        assert_eq!(drops(src), 1, "{src}");
+        assert_eq!(drops(src), 0, "{src}");
+        syms(src);
     }
+    // The alias keeps its span; the arrow with no body is not a symbol.
+    let s = syms("const f = (): T =>\nexport\ntype A = B |");
+    assert_eq!(find(&s, "A").3, "export\ntype A = B |");
+    assert!(s.iter().all(|x| x.0 != "f"), "{s:#?}");
+    // The stray field stops before `default`.
+    let s = syms("class C { x: A |\ntype A = B |\ndefault\n}");
+    assert_eq!(find(&s, "x").3, "x: A |");
+    // Async arrows are still arrows.
+    let s = syms("const f = () => async () => 1;");
+    assert_eq!(find(&s, "f").3, "const f = () => async () => 1;");
+}
+
+/// #213: `abstract new` constructor types, generic function types and a
+/// decorator after an open alias.
+#[test]
+fn constructor_generic_and_decorator_types() {
+    for (src, name, text) in [
+        (
+            "type U = abstract new () => X;",
+            "U",
+            "type U = abstract new () => X;",
+        ),
+        (
+            "type F = <const T>(x: T) => T;",
+            "F",
+            "type F = <const T>(x: T) => T;",
+        ),
+        ("type G = <T>(x: T) => T;", "G", "type G = <T>(x: T) => T;"),
+        ("type L = Array<T>;", "L", "type L = Array<T>;"),
+        (
+            "const v: abstract new () => X = () => null;",
+            "v",
+            "const v: abstract new () => X = () => null;",
+        ),
+        ("type A = B |\n@dec\nexport class K {}", "A", "type A = B |"),
+    ] {
+        let s = syms(src);
+        assert_eq!(find(&s, name).3, text, "{src}");
+    }
+    let s = syms("type A = B |\n@dec\nexport class K {}");
+    assert_eq!(find(&s, "K").3, "export class K {}");
+    // `abstract class` is still a declaration after an open alias.
+    let s = syms("type A = B |\nabstract class K { }\n");
+    assert_eq!(find(&s, "A").3, "type A = B |");
 }
