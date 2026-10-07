@@ -3,11 +3,13 @@
 //! `tools/call search` on the vendored corpus with exact spans, equal to
 //! `search --json`; against `--db` and against a `serve --server`. Stdout
 //! carries only protocol messages; logs go to stderr.
+mod common;
+
+use common::readiness::{start_serve, ServeProcess, StartOptions};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_memory-graph");
 
@@ -238,30 +240,19 @@ fn mcp_over_stdio_with_db() {
 fn mcp_over_stdio_with_server() {
     let d = tempfile::tempdir().unwrap();
     let db = indexed_db(d.path());
-    let mut serve = cmd()
-        .args(["serve", "--db"])
+    let mut c = cmd();
+    c.args(["serve", "--db"])
         .arg(&db)
-        .args(["--listen", "127.0.0.1:0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let out = serve.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for l in BufReader::new(out).lines().map_while(Result::ok) {
-            let _ = tx.send(l);
-        }
-    });
-    let line = rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("listening line");
-    let addr = line
-        .split("listening on ")
-        .nth(1)
-        .and_then(|r| r.split_whitespace().next())
-        .unwrap_or_else(|| panic!("no address in {line:?}"))
-        .to_string();
+        .args(["--listen", "127.0.0.1:0"]);
+    let options = StartOptions {
+        echo_stderr: false,
+        ..StartOptions::default()
+    };
+    let ServeProcess {
+        child: mut serve,
+        addr,
+        ..
+    } = start_serve(c, options);
     let result = std::panic::catch_unwind(|| session(&["--server", &addr]));
     let _ = serve.kill();
     let _ = serve.wait();

@@ -13,16 +13,17 @@
 //! catches what a byte-for-byte replay cannot: it negotiates the version
 //! itself, sends the headers it really sends (`Accept`, `Mcp-Session-Id`,
 //! `MCP-Protocol-Version`) and parses our answers with its own types.
+mod common;
+
+use common::readiness::{start_serve, StartOptions};
 use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
 use rmcp::service::RunningService;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_memory-graph");
 
@@ -218,36 +219,21 @@ impl Drop for Serve {
     }
 }
 
-#[allow(clippy::zombie_processes)]
 fn serve(db: &Path) -> (Serve, SocketAddr) {
-    let mut child = cmd()
-        .args(["serve", "--db"])
-        .arg(db)
-        .args(["--listen", "127.0.0.1:0", "--mcp-listen", "127.0.0.1:0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let out = child.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        for l in BufReader::new(out).lines().map_while(Result::ok) {
-            let _ = tx.send(l);
-        }
-    });
-    let s = Serve(child);
-    let mut mcp = None;
-    loop {
-        let l = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("serve printed its listening line");
-        if let Some((_, rest)) = l.split_once("mcp on http://") {
-            mcp = Some(rest.trim_end_matches("/mcp").parse().unwrap());
-        }
-        if l.contains("listening on ") {
-            return (s, mcp.expect("an `mcp on` line before `listening on`"));
-        }
-    }
+    let mut c = cmd();
+    c.args(["serve", "--db"]).arg(db).args([
+        "--listen",
+        "127.0.0.1:0",
+        "--mcp-listen",
+        "127.0.0.1:0",
+    ]);
+    let options = StartOptions {
+        echo_stderr: false,
+        ..StartOptions::default()
+    };
+    let s = start_serve(c, options);
+    let mcp = s.mcp.expect("an `mcp on` line before `listening on`");
+    (Serve(s.child), mcp)
 }
 
 #[test]
