@@ -106,6 +106,9 @@ Any MCP client with a stdio transport works: the command is `memory-graph`, the 
 | `--mcp-allow-origin URL` (`mcp-allow-origin = [..]`) | none | A browser `Origin` accepted, exactly (`http://localhost:6274`); repeatable. |
 | `--mcp-read local\|linearizable` (`mcp-read`) | `local` | How the tools read: this node's replica (a follower answers from its own copy and says `stale_possible` when it may lag), or after the leader's read barrier (`no_leader` without a quorum). |
 | `--mcp-max-inflight N` (`mcp-max-inflight`) | 16 | Requests served at once; more get HTTP 429 with `Retry-After: 1`. |
+| `--mcp-max-connections N` (`mcp-max-connections`) | 256 | Open connections at once; a connection past it is closed as soon as it is accepted. |
+| `--mcp-header-timeout DURATION` (`mcp-header-timeout`) | 20s | How long a client may take to send a request's headers before its connection is closed. |
+| `--mcp-idle-timeout DURATION` (`mcp-idle-timeout`) | 60s | A keep-alive connection with no request in flight for this long is closed. |
 
 Guards (ADR 0005 D4), in the order they apply:
 - **Host.** On a loopback address, a `Host` header other than `localhost` or the bound address (with the bound port, if it names a port) gets **403**. This stops DNS rebinding: a web page cannot reach the endpoint through a name of its own.
@@ -113,6 +116,7 @@ Guards (ADR 0005 D4), in the order they apply:
 - **Origin.** A request carrying an `Origin` not listed by `--mcp-allow-origin` gets **403**. Requests without an `Origin` (command-line and desktop clients) pass.
 - **Size.** A body over 1 MiB gets **413** (with `Connection: close`). A 429 and the session and JSON answers are sent after the whole body was read. An answer sent before the body was read (413, and the 403/404/405 refusals of a request with a body) carries `Connection: close` and is followed by a staged close (RFC 9112 section 9.6): the server stops sending, then reads and discards what the client still sends (for up to 30 s or 64 MiB, until 5 s pass with nothing) before it closes. Either way the client that is still sending gets the answer instead of a connection reset. An answer is at most about 4 MiB: a longer list is cut short with `next_offset`.
 - **Load.** Past `--mcp-max-inflight` requests at once: **429** (checked after the session, so a bad session still gets its 400/404). A call that runs past 30 s is answered with JSON-RPC error `-32001` (its read finishes in the background and still holds its slot until then).
+- **Connections (#234).** At most `--mcp-max-connections` (256) are open at once; one past it is closed as soon as it is accepted, before anything is read, and it does not count against `--mcp-max-inflight`. A client that has not sent a whole request's headers within `--mcp-header-timeout` (20 s) is disconnected (slowloris), and a keep-alive connection with no request in flight for `--mcp-idle-timeout` (60 s) is closed. Before exposing the endpoint with `--mcp-allow-remote`, put it behind a proxy that authenticates and also limits connections per client: the cap is global, so one remote client can still take every slot.
 - **Read-only.** There are no write tools.
 - **No TLS.** As for gRPC (ADR 0004): put a TLS-terminating, authenticating proxy in front if the endpoint must leave the host.
 

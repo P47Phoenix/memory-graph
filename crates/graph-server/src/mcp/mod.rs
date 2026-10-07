@@ -69,6 +69,15 @@ pub mod backend;
 pub const MAX_BODY_BYTES: usize = 1 << 20;
 /// Default `--mcp-max-inflight`.
 pub const DEFAULT_MAX_INFLIGHT: usize = 16;
+/// Default `--mcp-max-connections`: open connections at once; a connection
+/// past it is closed as soon as it is accepted, before anything is read.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+/// Default `--mcp-header-timeout`: how long a client may take to send a
+/// request's headers before the connection is closed (slowloris, #234).
+pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default `--mcp-idle-timeout`: a keep-alive connection with no request in
+/// flight for this long is closed.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long one call may run before it is answered with a timeout.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
 /// Sessions kept at once; the least recently used is ended when a new one
@@ -114,6 +123,12 @@ pub struct McpConfig {
     pub read: McpRead,
     /// `--mcp-max-inflight`: requests served at once; more get 429.
     pub max_inflight: usize,
+    /// `--mcp-max-connections` ([`DEFAULT_MAX_CONNECTIONS`]).
+    pub max_connections: usize,
+    /// `--mcp-header-timeout` ([`DEFAULT_HEADER_TIMEOUT`]).
+    pub header_timeout: Duration,
+    /// `--mcp-idle-timeout` ([`DEFAULT_IDLE_TIMEOUT`]).
+    pub idle_timeout: Duration,
     /// The per-call deadline ([`CALL_DEADLINE`]; tests shorten it).
     pub call_timeout: Duration,
     /// Testing only: every call sleeps this long on the blocking pool
@@ -136,6 +151,9 @@ impl McpConfig {
             allow_origins: Vec::new(),
             read: McpRead::Local,
             max_inflight: DEFAULT_MAX_INFLIGHT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            header_timeout: DEFAULT_HEADER_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             call_timeout: CALL_DEADLINE,
             testing_call_delay: None,
             session_idle: SESSION_IDLE,
@@ -165,11 +183,21 @@ impl Linger {
 }
 
 /// Refuse a non-loopback bind without `--mcp-allow-remote` (ADR 0005 D4),
-/// and a zero `--mcp-max-inflight`.
+/// and a zero `--mcp-max-inflight`, `--mcp-max-connections` or timeout.
 pub fn check_bind(cfg: &McpConfig) -> Result<(), StoreError> {
     if cfg.max_inflight == 0 {
         return Err(StoreError::Rejected(
             "--mcp-max-inflight must be at least 1".into(),
+        ));
+    }
+    if cfg.max_connections == 0 {
+        return Err(StoreError::Rejected(
+            "--mcp-max-connections must be at least 1".into(),
+        ));
+    }
+    if cfg.header_timeout.is_zero() || cfg.idle_timeout.is_zero() {
+        return Err(StoreError::Rejected(
+            "--mcp-header-timeout and --mcp-idle-timeout must be above zero".into(),
         ));
     }
     if !cfg.listen.ip().is_loopback() && !cfg.allow_remote {
@@ -261,6 +289,12 @@ pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdow
             close_if_body_unread(req.headers(), StatusCode::NOT_FOUND.into_response())
         })
         .with_state(state);
+    let slots = Arc::new(Semaphore::new(cfg.max_connections));
+    let limits = ConnLimits {
+        header_timeout: cfg.header_timeout,
+        idle_timeout: cfg.idle_timeout,
+        linger: cfg.testing_linger,
+    };
     let mut conns = tokio::task::JoinSet::new();
     loop {
         let stream = tokio::select! {
@@ -286,11 +320,23 @@ pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdow
         };
         // Reap the finished connections as we go.
         while conns.try_join_next().is_some() {}
+        // Past --mcp-max-connections: close at once, before reading
+        // anything, so a flood of sockets costs no task and no buffer. The
+        // slot is held until the connection's staged close ends.
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            tracing::debug!(
+                max = cfg.max_connections,
+                "MCP endpoint: connection limit reached; closing a new connection"
+            );
+            drop(stream);
+            continue;
+        };
         conns.spawn(serve_connection(
             stream,
             app.clone(),
             shutdown.clone(),
-            cfg.testing_linger,
+            limits,
+            slot,
         ));
     }
     drop(listener);
@@ -312,33 +358,112 @@ pub(crate) const LINGER_BYTES: u64 = 64 << 20;
 /// linger at once and each holds one.
 const LINGER_BUF: usize = 8 << 10;
 
+/// The per-connection bounds of [`serve_connection`].
+#[derive(Debug, Clone, Copy)]
+struct ConnLimits {
+    header_timeout: Duration,
+    idle_timeout: Duration,
+    linger: Linger,
+}
+
+/// Requests in flight on one connection, and when the last one finished:
+/// the keep-alive idle timeout counts from there while none is in flight.
+struct Activity {
+    inflight: std::sync::atomic::AtomicUsize,
+    last_done: Mutex<tokio::time::Instant>,
+}
+
+impl Activity {
+    /// When the connection's idle timeout passes, or `None` while a request
+    /// is in flight.
+    fn idle_deadline(&self, idle: Duration) -> Option<tokio::time::Instant> {
+        if self.inflight.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
+        let last = *self
+            .last_done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Some(last + idle)
+    }
+}
+
+/// Marks one request in flight on an [`Activity`] until dropped.
+struct InFlight(Arc<Activity>);
+
+impl InFlight {
+    fn start(a: &Arc<Activity>) -> Self {
+        a.inflight.fetch_add(1, Ordering::SeqCst);
+        InFlight(Arc::clone(a))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        *self
+            .0
+            .last_done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = tokio::time::Instant::now();
+        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// One HTTP/1.1 connection: hyper serves it, and the TCP connection is then
-/// closed in stages ([`linger`]) rather than at once.
+/// closed in stages ([`linger`]) rather than at once. Headers must arrive
+/// within `header_timeout` (hyper's timer), and a keep-alive connection with
+/// no request in flight for `idle_timeout` is closed (#234). `_slot` is the
+/// connection's `--mcp-max-connections` permit, held to the end.
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     app: axum::Router,
     shutdown: ShutdownHandle,
-    bounds: Linger,
+    limits: ConnLimits,
+    _slot: tokio::sync::OwnedSemaphorePermit,
 ) {
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioIo, TokioTimer};
     use tower_service::Service;
+    let activity = Arc::new(Activity {
+        inflight: std::sync::atomic::AtomicUsize::new(0),
+        last_done: Mutex::new(tokio::time::Instant::now()),
+    });
+    let svc_activity = Arc::clone(&activity);
     let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
         let mut app = app.clone();
+        let busy = InFlight::start(&svc_activity);
         // Boxed: `poll_without_shutdown` wants an `Unpin` future.
-        Box::pin(async move { app.call(req.map(Body::new)).await })
+        Box::pin(async move {
+            let r = app.call(req.map(Body::new)).await;
+            drop(busy);
+            r
+        })
     });
-    let mut conn =
-        hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc);
+    let mut conn = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_timeout)
+        .serve_connection(TokioIo::new(stream), svc);
     let mut stopping = false;
     let served = loop {
+        // While no request is in flight, wake at the idle deadline; while
+        // one is, check again one idle period later.
+        let wake = activity
+            .idle_deadline(limits.idle_timeout)
+            .unwrap_or_else(|| tokio::time::Instant::now() + limits.idle_timeout);
         let done = tokio::select! {
             r = std::future::poll_fn(|cx| conn.poll_without_shutdown(cx)) => Some(r),
             _ = shutdown.wait(), if !stopping => None,
+            () = tokio::time::sleep_until(wake), if !stopping => {
+                match activity.idle_deadline(limits.idle_timeout) {
+                    Some(d) if d <= tokio::time::Instant::now() => None,
+                    _ => continue,
+                }
+            }
         };
         match done {
             Some(r) => break r,
             None => {
-                // Finish the request in progress, then close.
+                // Shutdown or idle: finish the request in progress (if
+                // any), then close.
                 stopping = true;
                 std::pin::Pin::new(&mut conn).graceful_shutdown();
             }
@@ -352,7 +477,7 @@ async fn serve_connection(
     let stream = conn.into_parts().io.into_inner();
     if !shutdown.is_triggered() {
         tokio::select! {
-            () = linger(stream, bounds) => {}
+            () = linger(stream, limits.linger) => {}
             _ = shutdown.wait() => {}
         }
     }

@@ -654,3 +654,148 @@ fn session_idle_counts_from_the_last_use() {
     let fresh = McpHttpClient::new(addr);
     assert_eq!(fresh.post(&list).status, 200);
 }
+
+/// Whether the server closes `s` (EOF or an error on read) within `limit`.
+fn server_closes_within(s: &mut std::net::TcpStream, limit: Duration) -> bool {
+    use std::io::Read;
+    let t0 = std::time::Instant::now();
+    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let mut buf = [0u8; 4096];
+    while t0.elapsed() < limit {
+        match s.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// One keep-alive request on `s`, its response read through (the body is
+/// small, so one read past the headers is enough for the status line).
+fn keep_alive_initialize(s: &mut std::net::TcpStream, addr: SocketAddr) -> String {
+    use std::io::{Read, Write};
+    let body = initialize().to_string();
+    write!(
+        s,
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 8192];
+    let n = s.read(&mut buf).unwrap();
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// #234: a client that trickles a request's headers is cut off once the
+/// header timeout passes.
+#[test]
+fn a_slow_header_sender_is_closed_after_the_header_timeout() {
+    use std::io::Write;
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.header_timeout = Duration::from_millis(400);
+    let (_srv, addr) = server(&d, m);
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.write_all(b"POST /mcp HTTP/1.1\r\nHost: ").unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(
+        server_closes_within(&mut s, Duration::from_secs(10)),
+        "never closed"
+    );
+    assert!(
+        t0.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        t0.elapsed()
+    );
+    // A normal request still works.
+    assert_eq!(post(addr, &[], &initialize()).status, 200);
+}
+
+/// #234: past `max_connections` a new connection is closed at once; once a
+/// held one closes, connections are served again.
+#[test]
+fn connections_past_the_cap_are_closed_at_once() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.max_connections = 2;
+    let (_srv, addr) = server(&d, m);
+    let mut a = std::net::TcpStream::connect(addr).unwrap();
+    let mut b = std::net::TcpStream::connect(addr).unwrap();
+    // Both are being served (a keep-alive request each answers).
+    assert!(keep_alive_initialize(&mut a, addr).starts_with("HTTP/1.1 200"));
+    assert!(keep_alive_initialize(&mut b, addr).starts_with("HTTP/1.1 200"));
+    let mut c = std::net::TcpStream::connect(addr).unwrap();
+    assert!(
+        server_closes_within(&mut c, Duration::from_secs(5)),
+        "a third connection is closed"
+    );
+    drop(a);
+    // The slot comes back once the server has seen the close.
+    let t0 = std::time::Instant::now();
+    loop {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        use std::io::Write;
+        let body = initialize().to_string();
+        let ok = write!(
+            s,
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .is_ok()
+            && {
+                use std::io::Read;
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = [0u8; 64];
+                matches!(s.read(&mut buf), Ok(n) if n > 0 && buf[..n].starts_with(b"HTTP/1.1 200"))
+            };
+        if ok {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "slot never freed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(b);
+}
+
+/// #234: a keep-alive connection with no request in flight is closed after
+/// the idle timeout, counted from its last response.
+#[test]
+fn an_idle_keep_alive_connection_is_closed() {
+    let d = tempfile::tempdir().unwrap();
+    let mut m = loopback();
+    m.idle_timeout = Duration::from_millis(400);
+    let (_srv, addr) = server(&d, m);
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    assert!(keep_alive_initialize(&mut s, addr).starts_with("HTTP/1.1 200"));
+    let t0 = std::time::Instant::now();
+    assert!(
+        server_closes_within(&mut s, Duration::from_secs(10)),
+        "never closed"
+    );
+    assert!(
+        t0.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
+fn zero_connection_limits_are_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let mut m = loopback();
+    m.max_connections = 0;
+    let e = TestServer::try_start_with(&db, rust(), |c| c.mcp = Some(m))
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("--mcp-max-connections"), "{e}");
+}
