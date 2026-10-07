@@ -37,8 +37,11 @@ pub const OS_RESERVE: f64 = 0.20;
 /// into is `fraction × (free above the reserve) − page cache`, where the
 /// page cache is `--cache-bytes` or the derived size (ADR 0008 phase 1, up
 /// to 4 GiB), so the two no longer double-claim RAM. The result is still
-/// raised to the floor (see [`FLOOR`]); `index` warns when that happens
-/// with a cache in the way. A fixed `--memory` is taken as given (the cache
+/// raised to the floor (see [`FLOOR`]). When a *derived* cache would push
+/// it below the floor, `index` shrinks that cache (no lower than 64 MiB)
+/// until the budget sits at the floor, quietly, since that is routine on a
+/// 16 GB machine; an explicit `--cache-bytes` is kept, with one warning
+/// (see [`Sizing::fit_page_cache`]). A fixed `--memory` is taken as given (the cache
 /// is not subtracted from it), and `serve` is unchanged. The parse stack
 /// is not in the budget either (#254).
 pub const DEFAULT_FRACTION: f64 = 0.70;
@@ -941,7 +944,7 @@ impl Sizing {
         let target = fraction_target(spare, f, p.page_cache, p.expansion);
         (target < p.cap).then(|| {
             format!(
-                "warning: the {} page cache leaves less than the memory budget's floor: {}% of {} free above the {} OS reserve is {}, less the cache leaves {} of heap; using the {} source floor (about {} in memory). Pass a smaller --cache-bytes or a fixed --memory to choose the split (#236)",
+                "warning: the {} page cache (--cache-bytes) leaves less than the memory budget's floor: {}% of {} free above the {} OS reserve is {}, less the cache leaves {} of heap; using the {} source floor (about {} in memory). Pass a smaller --cache-bytes or a fixed --memory to choose the split (#236)",
                 mb(p.page_cache),
                 pct(f),
                 mb(m.available),
@@ -952,6 +955,40 @@ impl Sizing {
                 mb((p.cap as f64 * p.expansion) as u64),
             )
         })
+    }
+
+    /// The page cache `index` runs with, and a warning to print, given this
+    /// sizing (no cache subtracted yet) and the `cache` it would use (#236).
+    /// An `explicit` `--cache-bytes` is the user's choice: kept, with a
+    /// warning when it pushes the budget onto the floor. A derived cache is
+    /// our own default: when subtracting it would leave the budget below
+    /// the floor, it shrinks to the largest size that keeps the budget at
+    /// the floor (never below [`graph_store::MIN_DERIVED_CACHE_BYTES`]),
+    /// quietly, since that is the routine case on a 16 GB machine.
+    pub fn fit_page_cache(&self, cache: u64, explicit: bool) -> (u64, Option<String>) {
+        let s = self.clone().with_page_cache(cache);
+        let Some(warning) = s.page_cache_floor_warning() else {
+            return (cache, None);
+        };
+        if explicit {
+            return (cache, Some(warning));
+        }
+        let (MemorySpec::Fraction(f), Ok(m)) = (s.policy.spec, &s.memory) else {
+            return (cache, None);
+        };
+        let reserve = (m.total as f64 * OS_RESERVE) as u64;
+        let share = (m.available.saturating_sub(reserve) as f64 * f) as u64;
+        let floor_heap = (s.policy.cap as f64 * s.policy.expansion).ceil() as u64;
+        let fitted = share
+            .saturating_sub(floor_heap)
+            .max(graph_store::MIN_DERIVED_CACHE_BYTES)
+            .min(cache);
+        tracing::debug!(
+            derived = cache,
+            fitted,
+            "index: derived page cache shrunk to keep the memory budget at its floor (#236)"
+        );
+        (fitted, None)
     }
 }
 
@@ -1498,7 +1535,8 @@ mod tests {
     }
 
     /// On a small machine the cache eats the whole share: the floor sets
-    /// the budget and `index` gets one warning naming the numbers.
+    /// the budget, and the warning (printed for an explicit
+    /// `--cache-bytes`) names the numbers.
     #[test]
     fn a_small_machine_budget_clamps_to_the_floor_and_warns() {
         let m = mem_mb(2048, 1024);
@@ -1519,6 +1557,47 @@ mod tests {
         assert_eq!(
             Sizing::new(2, Ok(m), 0, None, 1).page_cache_floor_warning(),
             None
+        );
+    }
+
+    /// A 16 GB machine (the CI runner's numbers): a derived cache that
+    /// would push the budget below the floor shrinks quietly so the budget
+    /// sits at the floor; an explicit `--cache-bytes` is kept and warned.
+    #[test]
+    fn a_derived_cache_shrinks_to_keep_the_floor_and_an_explicit_one_warns() {
+        let m = mem_mb(16384, 12902);
+        let plain = Sizing::new(4, Ok(m), 0, None, 1);
+        let derived = 3174 * MIB;
+        let (fitted, warning) = plain.fit_page_cache(derived, false);
+        assert_eq!(warning, None);
+        assert!(
+            (graph_store::MIN_DERIVED_CACHE_BYTES..derived).contains(&fitted),
+            "{fitted}"
+        );
+        let floor = FLOOR.min(((16384 * MIB) as f64 * FLOOR_SHARE / INITIAL_EXPANSION) as u64);
+        assert_eq!(plain.clone().with_page_cache(fitted).memory_budget, floor);
+
+        let (kept, warning) = plain.fit_page_cache(derived, true);
+        assert_eq!(kept, derived);
+        assert!(warning.expect("explicit warns").contains("--cache-bytes"));
+
+        // A cache that fits is used as is, derived or not.
+        let big = Sizing::new(8, Ok(mem(64, 40)), 0, None, 1);
+        assert_eq!(big.fit_page_cache(4 << 30, false), (4 << 30, None));
+        assert_eq!(big.fit_page_cache(4 << 30, true), (4 << 30, None));
+        // A fixed --memory never shrinks or warns.
+        let fixed = Sizing::new(2, Ok(m), 0, Some(MemorySpec::Fixed(64 * MIB)), 1);
+        assert_eq!(fixed.fit_page_cache(derived, true), (derived, None));
+    }
+
+    /// On a tiny machine the derived cache shrinks no lower than the
+    /// smallest derived size.
+    #[test]
+    fn a_derived_cache_never_shrinks_below_the_minimum() {
+        let s = Sizing::new(2, Ok(mem_mb(2048, 1024)), 0, None, 1);
+        assert_eq!(
+            s.fit_page_cache(256 * MIB, false),
+            (graph_store::MIN_DERIVED_CACHE_BYTES, None)
         );
     }
 

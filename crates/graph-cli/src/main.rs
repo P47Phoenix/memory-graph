@@ -2138,10 +2138,16 @@ fn run() -> Result<i32> {
             };
             let mut remote_store = remote_store;
             // #236: size the page cache once, so the store opens with the
-            // same cache the budget subtracts.
+            // same cache the budget subtracts (a derived one shrunk if it
+            // would push the budget onto its floor).
             let page_cache_bytes = match &target {
                 Target::Embedded(_) => {
-                    graph_cli::sysinfo::cache_bytes_or_derived(overrides.cache_bytes)
+                    let (bytes, warning) =
+                        graph_cli::index_page_cache(overrides.cache_bytes, memory, deterministic);
+                    if let Some(w) = warning {
+                        eprintln!("{w}");
+                    }
+                    bytes
                 }
                 Target::Remote { .. } => 0,
             };
@@ -2249,7 +2255,7 @@ fn run() -> Result<i32> {
                     memory,
                     min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
                     // What `index` would subtract (#236): the same cache size.
-                    graph_cli::sysinfo::cache_bytes_or_derived(overrides.cache_bytes),
+                    graph_cli::index_page_cache(overrides.cache_bytes, memory, false).0,
                 );
                 if json {
                     out!("{}", serde_json::to_string_pretty(&r.json())?);
