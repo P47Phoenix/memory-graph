@@ -449,10 +449,17 @@ async fn committed<T>(change: WriteTask<T>) -> Result<T, StoreError> {
     match tokio::time::timeout(MEMBERSHIP_COMMIT_WAIT, change).await {
         Ok(Ok(r)) => r.map_err(write_err),
         Ok(Err(e)) => Err(join_err(e)),
-        Err(_) => Err(StoreError::Rejected(format!(
-            "the membership change did not commit within {MEMBERSHIP_COMMIT_WAIT:?} (a node              it adds does not accept the leader's log, or a quorum is unreachable); it may              still commit if the cluster recovers: check `cluster members`"
-        ))),
+        Err(_) => Err(StoreError::Rejected(commit_timeout_message())),
     }
+}
+
+/// The refusal of a membership change that did not commit in time.
+fn commit_timeout_message() -> String {
+    format!(
+        "the membership change did not commit within {MEMBERSHIP_COMMIT_WAIT:?} (a node \
+         it adds does not accept the leader's log, or a quorum is unreachable); it may \
+         still commit if the cluster recovers: check `cluster members`"
+    )
 }
 
 /// A proposal task that did not finish: cancelled by the runtime shutting
@@ -1334,6 +1341,12 @@ pub fn follower_stale(known: bool, recent: bool, applied: u64, leader_commit: Op
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_commit_timeout_message_reads_as_one_line() {
+        let m = super::commit_timeout_message();
+        assert!(!m.contains("  ") && !m.contains('\n'), "{m:?}");
+    }
+
     use super::*;
 
     /// Issue #211: the byte trigger counts every applied entry above the
