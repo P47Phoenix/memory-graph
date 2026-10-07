@@ -155,6 +155,46 @@ fn digit_led_paragraphs_are_extracted() {
     assert!(contains(&s, "PROCEDURE", "1000-ACCTFILE-GET-NEXT"));
 }
 
+#[test]
+fn lone_digit_led_paragraphs_fixed_format() {
+    let src = "       PROCEDURE DIVISION.\n       100A.\n           DISPLAY 1.\n       9X.\n           GOBACK.\n";
+    let s = syms(src);
+    let p = find(&s, "100A");
+    assert_eq!(p.2, "paragraph");
+    assert!(p.3.starts_with("100A."), "{p:?}");
+    assert_eq!(find(&s, "9X").2, "paragraph");
+}
+
+#[test]
+fn lone_digit_led_paragraphs_free_format() {
+    let src = ">>SOURCE FREE\nPROCEDURE DIVISION.\n100A.\n  DISPLAY 1.\n9x.\n  GOBACK.\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "100A").2, "paragraph");
+    assert_eq!(find(&s, "9x").2, "paragraph");
+}
+
+#[test]
+fn lone_digit_led_literals_outside_headers_stay_literals() {
+    let lit = |src: &str, word: &str| {
+        let t = token_texts(src);
+        let class = t.iter().find(|(s, _)| s == word).map(|(_, c)| *c);
+        assert_eq!(class, Some(TokenClass::Literal), "{src:?}: {t:?}");
+    };
+    lit("       MOVE 1E5 TO X.\n", "1E5");
+    lit("       1E5.\n", "1E5");
+    lit("       05 X PIC 999B99.\n", "999B99");
+    lit("       01 100A.\n", "100A");
+    // Area B, sentence start: not a header in fixed format.
+    lit("       P.\n           100A.\n", "100A");
+    lit("       ADD 100A TO B.\n", "100A");
+    // Not followed by a period.
+    lit("       100A TO B.\n", "100A");
+    let s = syms("       DATA DIVISION.\n       01 100A PIC X.\n");
+    assert!(!names(&s).contains(&"100A"), "{s:#?}");
+    let free = ">>SOURCE FREE\nPROCEDURE DIVISION.\nP. 100A.\n";
+    assert!(!names(&syms(free)).contains(&"100A"));
+}
+
 const FIXED: &str = "\
 000100 IDENTIFICATION DIVISION.                                         HELLO001
 000200 PROGRAM-ID. HELLO.
@@ -547,7 +587,7 @@ fn keywords_in_a_fixed_format_program() {
     );
     assert!(CobolExtractor
         .version()
-        .starts_with("cobol-scan-1+kw1+dw1+tok"));
+        .starts_with("cobol-scan-1+kw1+dw2+tok"));
 }
 
 /// A fixed sample of the list (so dropping a word from `KEYWORDS` fails).

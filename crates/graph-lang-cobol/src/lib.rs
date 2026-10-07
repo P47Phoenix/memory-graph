@@ -161,7 +161,8 @@ impl Extractor for CobolExtractor {
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
         // `dw1`: digit-led words (`1000-READ-NEXT`) are one identifier (#196).
-        format!("cobol-scan-1+kw1+dw1+tok{TOKENIZER_VERSION}")
+        // `dw2`: a lone digit-led paragraph header (`100A.`) is too (#209).
+        format!("cobol-scan-1+kw1+dw2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -271,7 +272,60 @@ pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
             i += 1;
         }
     }
-    join_digit_led_words(src, out)
+    let mut out = join_digit_led_words(src, out);
+    reclass_digit_led_headers(&mut out, free);
+    out
+}
+
+/// A lone digit-led word with a letter (`100A`, `9X`) lexes as a number
+/// literal. It is a user-defined word only where nothing but a word can
+/// stand: a paragraph header, i.e. a sentence start in Area A (columns
+/// 8-11 in fixed format, first on its line in free format) followed by `.`.
+/// Exponent literals (`1E5`, `1.5E3`) are never reclassed, and a PIC
+/// string or level-number operand is never at a sentence start.
+fn reclass_digit_led_headers(tokens: &mut [TokenDecl], free: bool) {
+    let code: Vec<usize> = (0..tokens.len())
+        .filter(|&i| tokens[i].class != TokenClass::Comment)
+        .collect();
+    for (k, &i) in code.iter().enumerate() {
+        let t = &tokens[i];
+        let candidate = t.class == TokenClass::Literal
+            && t.text.starts_with(|c: char| c.is_ascii_digit())
+            && t.text.bytes().all(|b| b.is_ascii_alphanumeric())
+            && t.text.bytes().any(|b| b.is_ascii_alphabetic())
+            && !is_exponent_literal(&t.text);
+        if !candidate {
+            continue;
+        }
+        let prev = k.checked_sub(1).map(|p| &tokens[code[p]]);
+        let sentence_start =
+            prev.is_none_or(|p| p.text == "." && p.class == TokenClass::Punctuation);
+        let next_is_period = code
+            .get(k + 1)
+            .is_some_and(|&n| tokens[n].text == "." && tokens[n].class == TokenClass::Punctuation);
+        let area_a = if free {
+            prev.is_none_or(|p| p.span.end_line < t.span.start_line)
+        } else {
+            (8..=11).contains(&t.span.start_col)
+        };
+        if sentence_start && next_is_period && area_a {
+            tokens[i].class = TokenClass::Identifier;
+        }
+    }
+}
+
+/// `1E5`, `12E+3`: digits, `E`, digits (a sign or fraction would not lex
+/// into one alphanumeric token, but digits-E-digits does).
+fn is_exponent_literal(text: &str) -> bool {
+    let u = text.to_ascii_uppercase();
+    match u.split_once('E') {
+        Some((m, e)) => {
+            !m.is_empty()
+                && m.bytes().all(|b| b.is_ascii_digit())
+                && e.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 /// Joins a user-defined word that starts with a digit (`1000-READ-NEXT`,
