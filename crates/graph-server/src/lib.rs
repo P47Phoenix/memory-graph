@@ -61,6 +61,7 @@ pub mod server;
 pub mod services;
 pub mod slot;
 pub mod snapshots;
+pub mod telemetry;
 pub mod testing;
 
 pub use disk::{DiskGuard, FreeSpaceProbe};

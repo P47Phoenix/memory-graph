@@ -75,7 +75,7 @@ pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// A fixed-bucket histogram ([`DURATION_BUCKETS`]); counts per bucket are
 /// not cumulative here, [`Histogram::render`] accumulates.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Histogram {
     counts: [u64; DURATION_BUCKETS.len()],
     count: u64,
@@ -98,6 +98,17 @@ impl Histogram {
 
     pub fn count(&self) -> u64 {
         self.count
+    }
+
+    /// Observations per bucket of [DURATION_BUCKETS] (not cumulative;
+    /// observations above the last bound are only in [count](Self::count)).
+    pub fn bucket_counts(&self) -> &[u64; DURATION_BUCKETS.len()] {
+        &self.counts
+    }
+
+    /// The sum of every observation, seconds.
+    pub fn sum(&self) -> f64 {
+        self.sum
     }
 
     /// `<name>_bucket{..,le=".."}` (cumulative), `_sum`, `_count`.
@@ -298,6 +309,99 @@ pub fn is_ready(r: Readiness, max_lag: u64, silence_limit: Duration) -> bool {
         && r.leader_commit.saturating_sub(r.applied) <= max_lag
 }
 
+// ---------------------------------------------------------------------------
+// The metrics snapshot: every family `/metrics` exports, gathered once.
+
+/// The kind of a metric family (its Prometheus `# TYPE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    Gauge,
+    Counter,
+    Histogram,
+}
+
+impl MetricKind {
+    /// The `# TYPE` word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetricKind::Gauge => "gauge",
+            MetricKind::Counter => "counter",
+            MetricKind::Histogram => "histogram",
+        }
+    }
+}
+
+/// One sample's value. Integer and float samples are kept apart so each
+/// renders exactly as it always has (`7`, not `7.0`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SampleValue {
+    Int(u64),
+    Float(f64),
+    Histogram(Histogram),
+}
+
+/// One sample of a family: its labels (in exposition order, values
+/// unescaped) and its value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sample {
+    pub labels: Vec<(&'static str, String)>,
+    pub value: SampleValue,
+}
+
+/// One metric family: a [`METRIC_NAMES`] entry, its help text, kind and
+/// samples (possibly none: a labelled family with nothing observed yet).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricFamily {
+    pub name: &'static str,
+    pub help: &'static str,
+    pub kind: MetricKind,
+    pub samples: Vec<Sample>,
+}
+
+impl MetricFamily {
+    fn new(name: &'static str, kind: MetricKind, help: &'static str) -> Self {
+        Self {
+            name,
+            help,
+            kind,
+            samples: Vec::new(),
+        }
+    }
+
+    fn with_sample(mut self, labels: Vec<(&'static str, String)>, value: SampleValue) -> Self {
+        self.samples.push(Sample { labels, value });
+        self
+    }
+
+    fn push(&mut self, labels: Vec<(&'static str, String)>, value: SampleValue) {
+        self.samples.push(Sample { labels, value });
+    }
+}
+
+/// Every family a node exports at one moment, in [`METRIC_NAMES`] exposition
+/// order: the one source both the Prometheus text ([`render`]) and, later,
+/// OTLP instruments (ADR 0009) read, so the two can never disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsSnapshot {
+    pub families: Vec<MetricFamily>,
+}
+
+impl MetricsSnapshot {
+    /// The family called `name`, if exported.
+    pub fn family(&self, name: &str) -> Option<&MetricFamily> {
+        self.families.iter().find(|f| f.name == name)
+    }
+
+    /// The Prometheus text exposition (format 0.0.4) of this snapshot.
+    pub fn to_prometheus(&self) -> String {
+        let mut out = String::with_capacity(8 * 1024);
+        for family in &self.families {
+            render_family(&mut out, family);
+        }
+        out
+    }
+}
+
 /// Escape a label value (exposition format 0.0.4).
 fn label(v: &str) -> String {
     v.replace('\\', "\\\\")
@@ -310,16 +414,65 @@ fn head(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# TYPE {name} {kind}");
 }
 
-fn gauge(out: &mut String, name: &str, help: &str, v: u64) {
-    head(out, name, "gauge", help);
-    let _ = writeln!(out, "{name} {v}");
+fn render_family(out: &mut String, family: &MetricFamily) {
+    head(out, family.name, family.kind.as_str(), family.help);
+    for sample in &family.samples {
+        let labels = sample
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}=\"{}\"", label(value)))
+            .collect::<Vec<_>>()
+            .join(",");
+        match &sample.value {
+            SampleValue::Int(v) => sample_line(out, family.name, &labels, v),
+            SampleValue::Float(v) => sample_line(out, family.name, &labels, v),
+            SampleValue::Histogram(h) => h.render(out, family.name, &labels),
+        }
+    }
+}
+
+fn sample_line(out: &mut String, name: &str, labels: &str, v: impl std::fmt::Display) {
+    if labels.is_empty() {
+        let _ = writeln!(out, "{name} {v}");
+    } else {
+        let _ = writeln!(out, "{name}{{{labels}}} {v}");
+    }
+}
+
+fn gauge(name: &'static str, help: &'static str, v: u64) -> MetricFamily {
+    MetricFamily::new(name, MetricKind::Gauge, help).with_sample(Vec::new(), SampleValue::Int(v))
+}
+
+fn counter(name: &'static str, help: &'static str, v: SampleValue) -> MetricFamily {
+    MetricFamily::new(name, MetricKind::Counter, help).with_sample(Vec::new(), v)
 }
 
 /// The whole `/metrics` document of this node.
 pub fn render(ctx: &Ctx) -> String {
+    snapshot(ctx).to_prometheus()
+}
+
+/// Every family this node exports, read now.
+pub fn snapshot(ctx: &Ctx) -> MetricsSnapshot {
+    snapshot_with(ctx, &graph_store::read_stats::snapshot())
+}
+
+/// [`snapshot`] with the process-wide read counters given (tests pin them).
+fn snapshot_with(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats) -> MetricsSnapshot {
+    let mut families = raft_families(ctx);
+    families.extend(storage_families(ctx));
+    families.extend(rpc_families(&ctx.raft.obs));
+    families.extend(cluster_families(ctx));
+    families.extend(apply_and_build_families(&ctx.raft.obs));
+    families.extend(backup_families(ctx));
+    families.extend(read_stats_families(read_stats));
+    families.extend(repeats_families(&ctx.raft.obs.repeats));
+    MetricsSnapshot { families }
+}
+
+/// `mg_raft_*`: term, leader, role, the log indices and replication lag.
+fn raft_families(ctx: &Ctx) -> Vec<MetricFamily> {
     let m = ctx.raft.metrics();
-    let obs = &ctx.raft.obs;
-    let mut out = String::with_capacity(8 * 1024);
     let applied = m.last_applied.as_ref().map_or(0, |l| l.index);
     let last_log = m.last_log_index.unwrap_or(0);
     let committed = ctx
@@ -328,328 +481,296 @@ pub fn render(ctx: &Ctx) -> String {
         .committed_index()
         .unwrap_or(0)
         .max(applied);
-    gauge(
-        &mut out,
-        "mg_raft_term",
-        "Current Raft term.",
-        m.current_term,
-    );
-    gauge(
-        &mut out,
-        "mg_raft_leader_id",
-        "Node id of the known leader (0: none).",
-        ctx.raft.leader().id.unwrap_or(0),
-    );
-    head(
-        &mut out,
+    let current = crate::services::admin::role(m.state);
+    let mut role = MetricFamily::new(
         "mg_raft_role",
-        "gauge",
+        MetricKind::Gauge,
         "1 for this node's current Raft role.",
     );
-    let current = crate::services::admin::role(m.state);
     for r in ["leader", "follower", "candidate", "learner", "shutdown"] {
-        let _ = writeln!(
-            out,
-            "mg_raft_role{{role=\"{r}\"}} {}",
-            u8::from(r == current)
+        role.push(
+            vec![("role", r.to_string())],
+            SampleValue::Int(u64::from(r == current)),
         );
     }
-    gauge(
-        &mut out,
-        "mg_raft_last_log_index",
-        "Index of the last entry in this node's Raft log.",
-        last_log,
-    );
-    gauge(
-        &mut out,
-        "mg_raft_committed_index",
-        "Last log index this node knows to be committed.",
-        committed,
-    );
-    gauge(
-        &mut out,
-        "mg_raft_applied_index",
-        "Last log index applied to the store.",
-        applied,
-    );
-    gauge(
-        &mut out,
-        "mg_raft_snapshot_index",
-        "Log index of the current snapshot (0: none).",
-        m.snapshot.map_or(0, |s| s.index),
-    );
-    gauge(
-        &mut out,
-        "mg_raft_purged_index",
-        "Last purged log index (0: none).",
-        m.purged.map_or(0, |p| p.index),
-    );
-    head(
-        &mut out,
+    let mut lag = MetricFamily::new(
         "mg_raft_replication_lag",
-        "gauge",
+        MetricKind::Gauge,
         "Leader only: entries each peer's matched index is behind the leader's last log index.",
     );
     if let Some(rep) = &m.replication {
         for (id, matched) in rep.iter().filter(|(id, _)| **id != ctx.info.node_id) {
-            let lag = last_log.saturating_sub(matched.as_ref().map_or(0, |l| l.index));
-            let _ = writeln!(out, "mg_raft_replication_lag{{peer=\"{id}\"}} {lag}");
+            let behind = last_log.saturating_sub(matched.as_ref().map_or(0, |l| l.index));
+            lag.push(vec![("peer", id.to_string())], SampleValue::Int(behind));
         }
     }
-    gauge(
-        &mut out,
-        "mg_store_bytes",
-        "Size of the store file on disk.",
-        std::fs::metadata(ctx.slot.path()).map_or(0, |m| m.len()),
+    vec![
+        gauge("mg_raft_term", "Current Raft term.", m.current_term),
+        gauge(
+            "mg_raft_leader_id",
+            "Node id of the known leader (0: none).",
+            ctx.raft.leader().id.unwrap_or(0),
+        ),
+        role,
+        gauge(
+            "mg_raft_last_log_index",
+            "Index of the last entry in this node's Raft log.",
+            last_log,
+        ),
+        gauge(
+            "mg_raft_committed_index",
+            "Last log index this node knows to be committed.",
+            committed,
+        ),
+        gauge(
+            "mg_raft_applied_index",
+            "Last log index applied to the store.",
+            applied,
+        ),
+        gauge(
+            "mg_raft_snapshot_index",
+            "Log index of the current snapshot (0: none).",
+            m.snapshot.map_or(0, |s| s.index),
+        ),
+        gauge(
+            "mg_raft_purged_index",
+            "Last purged log index (0: none).",
+            m.purged.map_or(0, |p| p.index),
+        ),
+        lag,
+    ]
+}
+
+/// File sizes and open snapshot handles.
+fn storage_families(ctx: &Ctx) -> Vec<MetricFamily> {
+    vec![
+        gauge(
+            "mg_store_bytes",
+            "Size of the store file on disk.",
+            std::fs::metadata(ctx.slot.path()).map_or(0, |m| m.len()),
+        ),
+        gauge(
+            "mg_log_bytes",
+            "Size of the Raft log file on disk.",
+            ctx.raft.log_bytes(),
+        ),
+        gauge(
+            "mg_snapshot_handles_open",
+            "Open snapshot handles held for paging clients.",
+            ctx.slot.snapshots().len() as u64,
+        ),
+    ]
+}
+
+/// `mg_rpc_duration_seconds` and `mg_rpc_total`, read under one lock so the
+/// two always agree.
+fn rpc_families(obs: &Observability) -> Vec<MetricFamily> {
+    let mut duration = MetricFamily::new(
+        "mg_rpc_duration_seconds",
+        MetricKind::Histogram,
+        "gRPC call duration until the response headers, by method and outcome.",
     );
-    gauge(
-        &mut out,
-        "mg_log_bytes",
-        "Size of the Raft log file on disk.",
-        ctx.raft.log_bytes(),
+    let mut total = MetricFamily::new(
+        "mg_rpc_total",
+        MetricKind::Counter,
+        "gRPC calls served, by method and outcome.",
     );
-    gauge(
-        &mut out,
-        "mg_snapshot_handles_open",
-        "Open snapshot handles held for paging clients.",
-        ctx.slot.snapshots().len() as u64,
-    );
-    {
-        let rpc = obs.rpc.lock().unwrap_or_else(PoisonError::into_inner);
-        head(
-            &mut out,
-            "mg_rpc_duration_seconds",
-            "histogram",
-            "gRPC call duration until the response headers, by method and outcome.",
-        );
-        for ((name, outcome), h) in rpc.iter() {
-            let labels = format!("rpc=\"{}\",outcome=\"{}\"", label(name), label(outcome));
-            h.render(&mut out, "mg_rpc_duration_seconds", &labels);
-        }
-        head(
-            &mut out,
-            "mg_rpc_total",
-            "counter",
-            "gRPC calls served, by method and outcome.",
-        );
-        for ((name, outcome), h) in rpc.iter() {
-            let _ = writeln!(
-                out,
-                "mg_rpc_total{{rpc=\"{}\",outcome=\"{}\"}} {}",
-                label(name),
-                label(outcome),
-                h.count()
-            );
-        }
+    let rpc = obs.rpc.lock().unwrap_or_else(PoisonError::into_inner);
+    for ((name, outcome), h) in rpc.iter() {
+        let labels = vec![("rpc", name.clone()), ("outcome", outcome.clone())];
+        total.push(labels.clone(), SampleValue::Int(h.count()));
+        duration.push(labels, SampleValue::Histogram(h.clone()));
     }
-    head(
-        &mut out,
-        "mg_writes_forwarded_total",
-        "counter",
-        "Writes and membership changes this node forwarded to the leader.",
-    );
-    let _ = writeln!(
-        out,
-        "mg_writes_forwarded_total {}",
-        ctx.fwd.forwarded_total()
-    );
-    head(
-        &mut out,
+    vec![duration, total]
+}
+
+/// Forwarded writes, quorum probes and MCP tool calls.
+fn cluster_families(ctx: &Ctx) -> Vec<MetricFamily> {
+    let (alive, dead) = ctx.raft.net_stats.probes();
+    let mut probes = MetricFamily::new(
         "mg_quorum_probes_total",
-        "counter",
+        MetricKind::Counter,
         "Leader liveness probes of silent voters while a write waited (quorum-loss check), by outcome.",
     );
-    let (alive, dead) = ctx.raft.net_stats.probes();
-    let _ = writeln!(out, "mg_quorum_probes_total{{outcome=\"alive\"}} {alive}");
-    let _ = writeln!(out, "mg_quorum_probes_total{{outcome=\"dead\"}} {dead}");
-    head(
-        &mut out,
+    probes.push(vec![("outcome", "alive".into())], SampleValue::Int(alive));
+    probes.push(vec![("outcome", "dead".into())], SampleValue::Int(dead));
+    let mut mcp = MetricFamily::new(
         "mg_mcp_tool_calls_total",
-        "counter",
+        MetricKind::Counter,
         "MCP tools/call requests on --mcp-listen, by tool and outcome (ok, error: an isError result, rejected: a JSON-RPC error, timeout: past the per-call deadline, refused: past --mcp-max-inflight (429), internal: the call itself failed).",
     );
-    for ((tool, outcome), n) in obs.mcp_calls() {
-        let _ = writeln!(
-            out,
-            "mg_mcp_tool_calls_total{{tool=\"{}\",outcome=\"{}\"}} {n}",
-            label(&tool),
-            label(&outcome)
+    for ((tool, outcome), n) in ctx.raft.obs.mcp_calls() {
+        mcp.push(
+            vec![("tool", tool), ("outcome", outcome)],
+            SampleValue::Int(n),
         );
     }
-    head(
-        &mut out,
-        "mg_apply_duration_seconds",
-        "histogram",
-        "Time to apply one committed log entry to the store.",
-    );
-    obs.apply
+    vec![
+        counter(
+            "mg_writes_forwarded_total",
+            "Writes and membership changes this node forwarded to the leader.",
+            SampleValue::Int(ctx.fwd.forwarded_total()),
+        ),
+        probes,
+        mcp,
+    ]
+}
+
+/// `mg_apply_duration_seconds` and `mg_build_info`.
+fn apply_and_build_families(obs: &Observability) -> Vec<MetricFamily> {
+    let apply = obs
+        .apply
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .render(&mut out, "mg_apply_duration_seconds", "");
-    head(
-        &mut out,
-        "mg_build_info",
-        "gauge",
-        "Always 1; the labels name the server version, protocol and store format.",
-    );
-    let _ = writeln!(
-        out,
-        "mg_build_info{{version=\"{}\",protocol=\"{}\",store_format=\"{}\"}} 1",
-        label(crate::SERVER_VERSION),
-        graph_proto::PROTOCOL_VERSION,
-        graph_store::SCHEMA_VERSION
-    );
+        .clone();
+    vec![
+        MetricFamily::new(
+            "mg_apply_duration_seconds",
+            MetricKind::Histogram,
+            "Time to apply one committed log entry to the store.",
+        )
+        .with_sample(Vec::new(), SampleValue::Histogram(apply)),
+        MetricFamily::new(
+            "mg_build_info",
+            MetricKind::Gauge,
+            "Always 1; the labels name the server version, protocol and store format.",
+        )
+        .with_sample(
+            vec![
+                ("version", crate::SERVER_VERSION.to_string()),
+                ("protocol", graph_proto::PROTOCOL_VERSION.to_string()),
+                ("store_format", graph_store::SCHEMA_VERSION.to_string()),
+            ],
+            SampleValue::Int(1),
+        ),
+    ]
+}
+
+/// The snapshot backup uploader's state (zeros without `--backup-url`).
+fn backup_families(ctx: &Ctx) -> Vec<MetricFamily> {
     let b = ctx.backup.as_ref().map(|b| b.stats()).unwrap_or_default();
-    gauge(
-        &mut out,
-        "mg_backup_last_success_timestamp",
-        "Unix seconds of the last snapshot backup committed (0: none).",
-        b.last_success_unix,
-    );
-    gauge(
-        &mut out,
-        "mg_backup_last_index",
-        "Log index of the last snapshot backup committed (0: none).",
-        b.last_index,
-    );
-    head(
-        &mut out,
-        "mg_backup_failures_total",
-        "counter",
-        "Snapshot backups that failed after every retry.",
-    );
-    let _ = writeln!(out, "mg_backup_failures_total {}", b.failures_total);
-    head(
-        &mut out,
-        "mg_backup_bytes_total",
-        "counter",
-        "Bytes written by successful snapshot backups.",
-    );
-    let _ = writeln!(out, "mg_backup_bytes_total {}", b.bytes_total);
-    render_read_stats(&mut out, &graph_store::read_stats::snapshot());
-    render_repeats(&mut out, &obs.repeats);
-    out
+    vec![
+        gauge(
+            "mg_backup_last_success_timestamp",
+            "Unix seconds of the last snapshot backup committed (0: none).",
+            b.last_success_unix,
+        ),
+        gauge(
+            "mg_backup_last_index",
+            "Log index of the last snapshot backup committed (0: none).",
+            b.last_index,
+        ),
+        counter(
+            "mg_backup_failures_total",
+            "Snapshot backups that failed after every retry.",
+            SampleValue::Int(b.failures_total),
+        ),
+        counter(
+            "mg_backup_bytes_total",
+            "Bytes written by successful snapshot backups.",
+            SampleValue::Int(b.bytes_total),
+        ),
+    ]
 }
 
 /// `mg_queries_total{rpc}` and `mg_query_exact_repeats_total{rpc}`: one
 /// sample per read RPC (a fixed set), zeros included.
-fn render_repeats(out: &mut String, log: &crate::repeats::RepeatLog) {
+fn repeats_families(log: &crate::repeats::RepeatLog) -> Vec<MetricFamily> {
     let counts = log.counts();
-    head(
-        out,
+    let mut queries = MetricFamily::new(
         "mg_queries_total",
-        "counter",
+        MetricKind::Counter,
         "Read RPCs answered by this node, by method.",
     );
-    for (rpc, c) in counts {
-        let _ = writeln!(
-            out,
-            "mg_queries_total{{rpc=\"{}\"}} {}",
-            rpc.as_str(),
-            c.queries
-        );
-    }
-    head(
-        out,
+    let mut repeats = MetricFamily::new(
         "mg_query_exact_repeats_total",
-        "counter",
+        MetricKind::Counter,
         "Read RPCs that repeated an identical request (any read view) answered within 60 s at the same Raft applied index, by method; an approximate lower bound (see docs/guide/observability.md).",
     );
     for (rpc, c) in counts {
-        let _ = writeln!(
-            out,
-            "mg_query_exact_repeats_total{{rpc=\"{}\"}} {}",
-            rpc.as_str(),
-            c.repeats
-        );
+        let labels = vec![("rpc", rpc.as_str().to_string())];
+        queries.push(labels.clone(), SampleValue::Int(c.queries));
+        repeats.push(labels, SampleValue::Int(c.repeats));
     }
-}
-
-fn counter(out: &mut String, name: &str, help: &str, v: impl std::fmt::Display) {
-    head(out, name, "counter", help);
-    let _ = writeln!(out, "{name} {v}");
+    vec![queries, repeats]
 }
 
 /// A counter family with one sample per decode kind.
-fn per_kind<V: std::fmt::Display>(
-    out: &mut String,
-    name: &str,
-    help: &str,
-    by_kind: [(&str, V); 4],
-) {
-    head(out, name, "counter", help);
+fn per_kind(
+    name: &'static str,
+    help: &'static str,
+    by_kind: [(&str, SampleValue); 4],
+) -> MetricFamily {
+    let mut family = MetricFamily::new(name, MetricKind::Counter, help);
     for (kind, v) in by_kind {
-        let _ = writeln!(out, "{name}{{kind=\"{kind}\"}} {v}");
+        family.push(vec![("kind", kind.to_string())], v);
     }
+    family
 }
 
 /// Nanoseconds as float seconds (the Prometheus base unit).
-fn secs(nanos: u64) -> f64 {
-    nanos as f64 / 1e9
+fn secs(nanos: u64) -> SampleValue {
+    SampleValue::Float(nanos as f64 / 1e9)
 }
 
 /// The read-path counters (ADR 0008 phase 0). They are process-wide: every
 /// store in this process adds to them, so several servers sharing one
 /// process report the same totals. The seconds families stay at zero unless
 /// read timing is on (`--read-timing`).
-fn render_read_stats(out: &mut String, r: &graph_store::read_stats::ReadStats) {
-    per_kind(
-        out,
-        "mg_read_decodes_total",
-        "Decodes done by queries, by kind (dict: reverse-dictionary block scans; symbol: symbol sections; lazy: stream headers; full: whole streams).",
-        [
-            ("dict", r.dict_block_decodes),
-            ("symbol", r.symbol_section_decodes),
-            ("lazy", r.lazy_stream_decodes),
-            ("full", r.full_stream_decodes),
-        ],
-    );
-    per_kind(
-        out,
-        "mg_read_decode_bytes_total",
-        "Encoded bytes behind query decodes, by kind: dict blocks scanned, symbol sections, the whole encoded size of streams whose header was decoded lazily (symbol bytes lie within it), whole streams decoded. Do not sum across kinds.",
-        [
-            ("dict", r.dict_bytes),
-            ("symbol", r.symbol_bytes),
-            ("lazy", r.lazy_bytes),
-            ("full", r.full_bytes),
-        ],
-    );
-    per_kind(
-        out,
-        "mg_read_decode_seconds_total",
-        "Seconds inside query decodes, by kind (--read-timing only).",
-        [
-            ("dict", secs(r.dict_decode_nanos)),
-            ("symbol", secs(r.symbol_decode_nanos)),
-            ("lazy", secs(r.lazy_decode_nanos)),
-            ("full", secs(r.full_decode_nanos)),
-        ],
-    );
-    counter(
-        out,
-        "mg_read_queries_total",
-        "Store read calls (queries) in this process, including rejected or expired ones.",
-        r.queries,
-    );
-    counter(
-        out,
-        "mg_read_query_seconds_total",
-        "Wall seconds inside store read calls, including opening the read transaction (--read-timing only).",
-        secs(r.query_nanos),
-    );
-    counter(
-        out,
-        "mg_read_txns_total",
-        "Read transactions opened by store read calls (snapshot reads reuse one).",
-        r.read_txns,
-    );
-    counter(
-        out,
-        "mg_read_dict_strings_total",
-        "Dictionary strings allocated by query-side term lookups.",
-        r.dict_strings_decoded,
-    );
+fn read_stats_families(r: &graph_store::read_stats::ReadStats) -> Vec<MetricFamily> {
+    use SampleValue::Int;
+    vec![
+        per_kind(
+            "mg_read_decodes_total",
+            "Decodes done by queries, by kind (dict: reverse-dictionary block scans; symbol: symbol sections; lazy: stream headers; full: whole streams).",
+            [
+                ("dict", Int(r.dict_block_decodes)),
+                ("symbol", Int(r.symbol_section_decodes)),
+                ("lazy", Int(r.lazy_stream_decodes)),
+                ("full", Int(r.full_stream_decodes)),
+            ],
+        ),
+        per_kind(
+            "mg_read_decode_bytes_total",
+            "Encoded bytes behind query decodes, by kind: dict blocks scanned, symbol sections, the whole encoded size of streams whose header was decoded lazily (symbol bytes lie within it), whole streams decoded. Do not sum across kinds.",
+            [
+                ("dict", Int(r.dict_bytes)),
+                ("symbol", Int(r.symbol_bytes)),
+                ("lazy", Int(r.lazy_bytes)),
+                ("full", Int(r.full_bytes)),
+            ],
+        ),
+        per_kind(
+            "mg_read_decode_seconds_total",
+            "Seconds inside query decodes, by kind (--read-timing only).",
+            [
+                ("dict", secs(r.dict_decode_nanos)),
+                ("symbol", secs(r.symbol_decode_nanos)),
+                ("lazy", secs(r.lazy_decode_nanos)),
+                ("full", secs(r.full_decode_nanos)),
+            ],
+        ),
+        counter(
+            "mg_read_queries_total",
+            "Store read calls (queries) in this process, including rejected or expired ones.",
+            Int(r.queries),
+        ),
+        counter(
+            "mg_read_query_seconds_total",
+            "Wall seconds inside store read calls, including opening the read transaction (--read-timing only).",
+            secs(r.query_nanos),
+        ),
+        counter(
+            "mg_read_txns_total",
+            "Read transactions opened by store read calls (snapshot reads reuse one).",
+            Int(r.read_txns),
+        ),
+        counter(
+            "mg_read_dict_strings_total",
+            "Dictionary strings allocated by query-side term lookups.",
+            Int(r.dict_strings_decoded),
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1054,10 @@ async fn answer(mut stream: TcpStream, ctx: &Ctx) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "observe_golden.rs"]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -943,8 +1068,10 @@ mod tests {
         r.symbol_decode_nanos = 1_500_000_000;
         r.query_nanos = 2_000_000_000;
         r.queries = 7;
-        let mut out = String::new();
-        render_read_stats(&mut out, &r);
+        let out = MetricsSnapshot {
+            families: read_stats_families(&r),
+        }
+        .to_prometheus();
         let families: Vec<&str> = out
             .lines()
             .filter_map(|l| l.strip_prefix("# TYPE "))
