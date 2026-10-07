@@ -6,6 +6,9 @@
 //! (the `Store.ExtractorGaps` RPC); and `serve` logs it at startup.
 use graph_core::tokenizer::tokenize;
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind};
+mod common;
+
+use common::readiness::{start_serve, StartOptions};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
@@ -81,31 +84,19 @@ struct Server {
 
 impl Server {
     fn start(db: &Path) -> Server {
-        let mut child = cmd()
-            .args(["serve", "--db"])
+        let mut c = cmd();
+        c.args(["serve", "--db"])
             .arg(db)
-            .args(["--listen", "127.0.0.1:0"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for l in BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = tx.send(l);
-            }
-        });
-        let line: String = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("serve printed its listening line");
-        let addr = line
-            .split("listening on ")
-            .nth(1)
-            .and_then(|r| r.split_whitespace().next())
-            .unwrap_or_else(|| panic!("no address in {line:?}"))
-            .to_string();
-        Server { child, addr }
+            .args(["--listen", "127.0.0.1:0"]);
+        let options = StartOptions {
+            echo_stderr: false,
+            ..StartOptions::default()
+        };
+        let s = start_serve(c, options);
+        Server {
+            child: s.child,
+            addr: s.addr,
+        }
     }
 }
 
