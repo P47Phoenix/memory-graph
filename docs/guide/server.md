@@ -46,6 +46,7 @@ A served file opened directly waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_W
 | 4 | A write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write; or a `--read linearizable` read that found no leader within `--read-deadline` |
 | 5 | The server speaks another protocol or store format version |
 | 6 | A data directory (or a node named in a membership change) belongs to another cluster (`WrongCluster`) |
+| 7 | `serve` refused its OpenTelemetry settings (an `https://` or malformed `--otlp-endpoint` / `otlp-endpoint`, a bad `--otlp-signals`) or could not build the exporters (`TELEMETRY_CONFIG`, [ADR 0009](../adr/0009-opentelemetry.md)). A problem in an `OTEL_*` environment variable is not fatal: it logs one error and `serve` runs with OpenTelemetry off |
 
 ## Retries and write deadlines
 

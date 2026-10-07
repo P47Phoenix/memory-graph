@@ -836,3 +836,60 @@ fn an_identical_search_counts_one_repeat_until_a_write() {
     );
     s.stop();
 }
+
+/// ADR 0009 D3: an `https://` endpoint from the flag is refused at startup
+/// with exit 7 (`TELEMETRY_CONFIG`) and a message naming the setting;
+/// nothing is opened or served.
+#[test]
+fn serve_refuses_an_https_otlp_endpoint_with_exit_7() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let o = cmd()
+        .env_remove("OTEL_SDK_DISABLED")
+        .args(["serve", "--db"])
+        .arg(&db)
+        .args(["--listen", "127.0.0.1:0", "--otlp-endpoint", "https://x"])
+        .output()
+        .unwrap();
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(7), "stderr: {err}");
+    assert!(err.contains("--otlp-endpoint"), "{err}");
+    assert!(err.contains("#104"), "{err}");
+    assert!(!db.exists(), "nothing was opened");
+}
+
+/// ADR 0009 D3: a problem that comes from the environment (here an
+/// unsupported per-signal endpoint next to a valid flag) logs one error
+/// and serves with OTLP off.
+#[test]
+fn serve_starts_with_otlp_off_on_an_environment_problem() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let mut child = cmd()
+        .env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://127.0.0.1:9")
+        .args(["serve", "--db"])
+        .arg(&db)
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--otlp-endpoint",
+            "http://127.0.0.1:9",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+    let started = line.contains("listening on");
+    let _ = child.kill();
+    let o = child.wait_with_output().unwrap();
+    let err = text(&o.stderr);
+    assert!(started, "serve started: {line} / {err}");
+    assert_eq!(
+        err.matches("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").count(),
+        1,
+        "one error naming the variable: {err}"
+    );
+}

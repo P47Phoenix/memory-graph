@@ -17,9 +17,10 @@
 //! to a local or sidecar collector, which handles TLS onward (#104), so an
 //! endpoint must be `http://`.
 //!
-//! The exporters run on a small runtime of their own (one worker thread),
-//! so telemetry never competes with, or outlives, the serving runtime, and
-//! can still flush after `serve` has stopped.
+//! The exporters' gRPC channels run on a small runtime of their own (one
+//! worker thread); the SDK adds one background thread per batch processor
+//! and one for the periodic metric reader. Telemetry never competes with
+//! the serving runtime, and can still flush after `serve` has stopped.
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -54,6 +55,7 @@ static ACTIVE_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether any [`TelemetryGuard`] (providers, exporters, the runtime) is
 /// alive in this process.
+#[doc(hidden)]
 pub fn is_active() -> bool {
     ACTIVE_GUARDS.load(Ordering::SeqCst) > 0
 }
@@ -65,8 +67,6 @@ pub enum TelemetryError {
     BadEndpoint { source: &'static str, why: String },
     /// `--otlp-signals` is empty or names an unknown signal.
     BadSignals(String),
-    /// An environment variable this build cannot honour.
-    UnsupportedEnv { var: &'static str, why: String },
     /// A setting out of range (a zero interval or queue).
     BadSetting(String),
     /// Building a provider or the exporter runtime failed.
@@ -78,7 +78,6 @@ impl fmt::Display for TelemetryError {
         match self {
             TelemetryError::BadEndpoint { source, why } => write!(f, "{source}: {why}"),
             TelemetryError::BadSignals(why) => write!(f, "--otlp-signals: {why}"),
-            TelemetryError::UnsupportedEnv { var, why } => write!(f, "{var}: {why}"),
             TelemetryError::BadSetting(why) => write!(f, "{why}"),
             TelemetryError::Build(why) => write!(f, "OpenTelemetry: {why}"),
         }
@@ -187,8 +186,18 @@ pub struct TelemetryConfig {
     pub batch: BatchTuning,
 }
 
+/// Resource keys only this process may set: whatever
+/// `OTEL_RESOURCE_ATTRIBUTES` says for them is dropped.
+const OWNED_RESOURCE_KEYS: [&str; 3] = [
+    "service.instance.id",
+    "service.version",
+    "memory_graph.cluster",
+];
+
 impl TelemetryConfig {
     /// Resolve from the explicit options and the process environment.
+    /// A problem in an explicit setting is an error (startup refuses it);
+    /// one in the environment logs one error and leaves OTLP off.
     pub fn resolve(
         options: &TelemetryOptions,
         identity: &NodeIdentity,
@@ -197,6 +206,7 @@ impl TelemetryConfig {
     }
 
     /// [`resolve`](Self::resolve) with the environment given (tests).
+    #[doc(hidden)]
     pub fn resolve_with_env(
         options: &TelemetryOptions,
         identity: &NodeIdentity,
@@ -215,6 +225,9 @@ impl TelemetryConfig {
             ));
         }
         let mut resource = parse_resource_attributes(env(ENV_RESOURCE_ATTRIBUTES).as_deref());
+        for key in OWNED_RESOURCE_KEYS {
+            resource.remove(key);
+        }
         let service_name = options
             .service_name
             .clone()
@@ -224,26 +237,40 @@ impl TelemetryConfig {
             .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
         resource.insert("service.name".into(), service_name.clone());
         resource.insert("service.version".into(), crate::SERVER_VERSION.into());
-        if let Some(id) = identity.node_id {
-            resource.insert("service.instance.id".into(), id.to_string());
-        }
-        if let Some(cluster) = &identity.cluster {
-            resource.insert("memory_graph.cluster".into(), cluster.clone());
-        }
         if let Some(host) = &identity.host_name {
             // OTEL_RESOURCE_ATTRIBUTES may name the host better (a pod).
             resource
                 .entry("host.name".into())
                 .or_insert_with(|| host.clone());
         }
-        Ok(TelemetryConfig {
+        let mut cfg = TelemetryConfig {
             endpoint,
             signals,
             service_name,
             metrics_interval,
             resource: resource.into_iter().collect(),
             batch: BatchTuning::default(),
-        })
+        };
+        cfg.apply_identity(identity);
+        Ok(cfg)
+    }
+
+    /// Set `service.instance.id` and `memory_graph.cluster` from what is
+    /// known about the node (call again once more is known, before
+    /// [`init`]); an unknown value leaves the attribute out.
+    pub fn apply_identity(&mut self, identity: &NodeIdentity) {
+        let mut set = |key: &str, value: Option<String>| {
+            self.resource.retain(|(k, _)| k != key);
+            if let Some(v) = value {
+                self.resource.push((key.to_string(), v));
+            }
+            self.resource.sort();
+        };
+        set(
+            "service.instance.id",
+            identity.node_id.map(|id| id.to_string()),
+        );
+        set("memory_graph.cluster", identity.cluster.clone());
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -251,60 +278,64 @@ impl TelemetryConfig {
     }
 }
 
-/// The endpoint, flag or config first, then the environment. Startup
-/// refuses a bad explicit endpoint; a bad environment one (other than
-/// `https://`, which only disables OTLP with an error log, since a shared
-/// environment may target another SDK) is refused too. Settings this build
-/// cannot honour are refused rather than silently ignored.
+/// The endpoint. `OTEL_SDK_DISABLED=true` turns everything off, the flag
+/// included (the OpenTelemetry spec). A bad explicit endpoint (flag or
+/// config key) is refused. An environment problem (an unsupported
+/// variable, or a bad or `https://` endpoint) logs one error and turns
+/// OTLP off: platforms inject `OTEL_*`, and that must not crash-loop
+/// `serve`. Unsupported variables are checked on every path, so none of
+/// them can silently change where export goes.
 fn resolve_endpoint(
     options: &TelemetryOptions,
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, TelemetryError> {
-    if let Some(explicit) = options.endpoint.as_deref().filter(|e| !e.trim().is_empty()) {
-        return validate_endpoint(explicit)
-            .map(Some)
-            .map_err(|why| TelemetryError::BadEndpoint {
-                source: "--otlp-endpoint",
-                why,
-            });
-    }
     if env(ENV_SDK_DISABLED).is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
         return Ok(None);
+    }
+    let explicit = options
+        .endpoint
+        .as_deref()
+        .filter(|e| !e.trim().is_empty())
+        .map(|e| {
+            validate_endpoint(e).map_err(|why| TelemetryError::BadEndpoint {
+                source: "--otlp-endpoint",
+                why,
+            })
+        })
+        .transpose()?;
+    if let Err(problem) = check_unsupported_env(env) {
+        disabled_by_env(&problem);
+        return Ok(None);
+    }
+    if explicit.is_some() {
+        return Ok(explicit);
     }
     let Some(from_env) = env(ENV_ENDPOINT) else {
         return Ok(None);
     };
-    check_unsupported_env(env)?;
-    if from_env.trim().to_ascii_lowercase().starts_with("https://") {
-        tracing::error!(
-            endpoint = %from_env,
-            "{ENV_ENDPOINT} is https://, but this build exports plain-text gRPC only \
-             (TLS belongs to the collector, #104); OpenTelemetry export is off"
-        );
-        return Ok(None);
-    }
-    validate_endpoint(&from_env)
-        .map(Some)
-        .map_err(|why| TelemetryError::BadEndpoint {
-            source: ENV_ENDPOINT,
-            why,
-        })
-}
-
-fn check_unsupported_env(env: &impl Fn(&str) -> Option<String>) -> Result<(), TelemetryError> {
-    for var in ENV_SIGNAL_ENDPOINTS {
-        if env(var).is_some() {
-            return Err(TelemetryError::UnsupportedEnv {
-                var,
-                why: format!("per-signal endpoints are not supported; set {ENV_ENDPOINT} only"),
-            });
+    match validate_endpoint(&from_env) {
+        Ok(endpoint) => Ok(Some(endpoint)),
+        Err(why) => {
+            disabled_by_env(&format!("{ENV_ENDPOINT}: {why}"));
+            Ok(None)
         }
     }
+}
+
+fn disabled_by_env(problem: &str) {
+    tracing::error!("{problem}; OpenTelemetry export is off");
+}
+
+fn check_unsupported_env(env: &impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    if let Some(var) = ENV_SIGNAL_ENDPOINTS.into_iter().find(|v| env(v).is_some()) {
+        return Err(format!(
+            "{var}: per-signal endpoints are not supported; set {ENV_ENDPOINT} only"
+        ));
+    }
     match env(ENV_PROTOCOL) {
-        Some(p) if !p.trim().eq_ignore_ascii_case("grpc") => Err(TelemetryError::UnsupportedEnv {
-            var: ENV_PROTOCOL,
-            why: format!("`{p}` is not supported; only grpc"),
-        }),
+        Some(p) if !p.trim().eq_ignore_ascii_case("grpc") => {
+            Err(format!("{ENV_PROTOCOL}: `{p}` is not supported; only grpc"))
+        }
         _ => Ok(()),
     }
 }
@@ -538,8 +569,10 @@ impl TelemetryGuard {
         self.inner.as_ref()?.providers.logger.as_ref()
     }
 
-    /// Flush and stop, waiting at most about [`SHUTDOWN_TIMEOUT`]; the
-    /// blocking work runs off the caller's runtime workers.
+    /// Flush and stop, waiting at most about twice [`SHUTDOWN_TIMEOUT`];
+    /// the blocking work runs off the caller's runtime workers. On a
+    /// timeout this returns, but the blocking task may keep running (each
+    /// provider bounds its own shutdown) until the runtime drops it.
     pub async fn shutdown(mut self) {
         let Some(inner) = self.take() else { return };
         let work = tokio::task::spawn_blocking(move || inner.finish(SHUTDOWN_TIMEOUT));
@@ -667,54 +700,96 @@ mod tests {
     }
 
     #[test]
-    fn https_from_the_environment_disables_and_others_refuse() {
-        let cfg = resolve(
-            &TelemetryOptions::default(),
-            &[(ENV_ENDPOINT, "https://c:4317")],
-        )
-        .unwrap();
-        assert!(!cfg.is_enabled());
-        let e = resolve(&TelemetryOptions::default(), &[(ENV_ENDPOINT, "c:4317")]).unwrap_err();
-        assert!(matches!(
-            e,
-            TelemetryError::BadEndpoint {
-                source: ENV_ENDPOINT,
-                ..
-            }
-        ));
-        for var in ENV_SIGNAL_ENDPOINTS {
-            let e = resolve(
-                &TelemetryOptions::default(),
-                &[(ENV_ENDPOINT, "http://c:4317"), (var, "http://x:4317")],
-            )
-            .unwrap_err();
-            assert!(matches!(e, TelemetryError::UnsupportedEnv { .. }), "{var}");
-        }
-        let e = resolve(
-            &TelemetryOptions::default(),
-            &[
+    fn environment_problems_turn_otlp_off_without_failing() {
+        let none = TelemetryOptions::default();
+        for env in [
+            vec![(ENV_ENDPOINT, "https://c:4317")],
+            vec![(ENV_ENDPOINT, "c:4317")],
+            vec![
                 (ENV_ENDPOINT, "http://c:4317"),
                 (ENV_PROTOCOL, "http/protobuf"),
             ],
-        )
-        .unwrap_err();
-        assert!(e.to_string().contains(ENV_PROTOCOL), "{e}");
+            vec![
+                (ENV_ENDPOINT, "http://c:4317"),
+                (ENV_SIGNAL_ENDPOINTS[0], "http://x:1"),
+            ],
+            vec![
+                (ENV_ENDPOINT, "http://c:4317"),
+                (ENV_SIGNAL_ENDPOINTS[1], "http://x:1"),
+            ],
+            vec![
+                (ENV_ENDPOINT, "http://c:4317"),
+                (ENV_SIGNAL_ENDPOINTS[2], "http://x:1"),
+            ],
+        ] {
+            let cfg = resolve(&none, &env).expect("an env problem is not fatal");
+            assert!(!cfg.is_enabled(), "{env:?}");
+        }
         let ok = resolve(
-            &TelemetryOptions::default(),
+            &none,
             &[(ENV_ENDPOINT, "http://c:4317"), (ENV_PROTOCOL, "grpc")],
         );
         assert!(ok.unwrap().is_enabled());
     }
 
     #[test]
-    fn sdk_disabled_turns_the_environment_off_but_not_a_flag() {
+    fn unsupported_env_turns_off_even_with_a_flag() {
+        for var in ENV_SIGNAL_ENDPOINTS {
+            let cfg = resolve(
+                &with_endpoint("http://f:4317"),
+                &[(var, "http://elsewhere:4317")],
+            )
+            .expect("not fatal");
+            assert!(!cfg.is_enabled(), "{var} must not leave export on");
+        }
+        let cfg = resolve(
+            &with_endpoint("http://f:4317"),
+            &[(ENV_PROTOCOL, "http/json")],
+        )
+        .unwrap();
+        assert!(!cfg.is_enabled());
+        // A bad flag is still refused, whatever the environment says.
+        let e = resolve(&with_endpoint("https://f"), &[(ENV_PROTOCOL, "http/json")]).unwrap_err();
+        assert!(matches!(e, TelemetryError::BadEndpoint { .. }));
+    }
+
+    #[test]
+    fn sdk_disabled_turns_everything_off_the_flag_included() {
         let env = [(ENV_ENDPOINT, "http://c:4317"), (ENV_SDK_DISABLED, "TRUE")];
         assert!(!resolve(&TelemetryOptions::default(), &env)
             .unwrap()
             .is_enabled());
-        assert!(resolve(&with_endpoint("http://f:4317"), &env)
+        assert!(!resolve(&with_endpoint("http://f:4317"), &env)
             .unwrap()
             .is_enabled());
+    }
+
+    #[test]
+    fn owned_resource_keys_come_from_the_node_only() {
+        let env = [(
+            ENV_RESOURCE_ATTRIBUTES,
+            "service.instance.id=99,service.version=0.0.0,memory_graph.cluster=evil,team=a",
+        )];
+        let options = with_endpoint("http://c:4317");
+        let identity = NodeIdentity::default();
+        let env_map: HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut cfg =
+            TelemetryConfig::resolve_with_env(&options, &identity, |k| env_map.get(k).cloned())
+                .unwrap();
+        assert_eq!(attr(&cfg, "service.instance.id"), None);
+        assert_eq!(attr(&cfg, "memory_graph.cluster"), None);
+        assert_eq!(attr(&cfg, "service.version"), Some(crate::SERVER_VERSION));
+        assert_eq!(attr(&cfg, "team"), Some("a"));
+        cfg.apply_identity(&NodeIdentity {
+            node_id: Some(4),
+            cluster: Some("c-9".into()),
+            host_name: None,
+        });
+        assert_eq!(attr(&cfg, "service.instance.id"), Some("4"));
+        assert_eq!(attr(&cfg, "memory_graph.cluster"), Some("c-9"));
     }
 
     #[test]

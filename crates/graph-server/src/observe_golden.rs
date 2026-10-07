@@ -382,11 +382,9 @@ fn pinned_read_stats() -> graph_store::read_stats::ReadStats {
     r
 }
 
-#[test]
-fn snapshot_renders_byte_identical_to_the_legacy_renderer() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let server = crate::testing::TestServer::start(&dir.path().join("golden.redb"), Vec::new());
-    let ctx = &server.running().expect("server is running").ctx;
+/// Record label values that need escaping, a NaN, an overflow-bucket
+/// observation and MCP calls on `ctx`'s node.
+fn exercise(ctx: &Ctx) {
     let obs = &ctx.raft.obs;
     obs.observe_rpc("search", "ok", 0.003);
     obs.observe_rpc("search", "ok", f64::NAN);
@@ -395,11 +393,13 @@ fn snapshot_renders_byte_identical_to_the_legacy_renderer() {
     obs.observe_mcp_call("to\"ol", "error");
     obs.observe_apply(0.0007);
     obs.observe_apply(3.0);
-    let read_stats = pinned_read_stats();
+}
 
-    // The node may still be settling (leader election, the first log
-    // entries): compare only once two legacy renders around the new one
-    // agree, so the node state is the same for all three.
+/// The node may still be settling (an election, the first log entries):
+/// compare only once two legacy renders around the new one agree, so the
+/// node state is the same for all three. Returns the agreed text.
+fn assert_golden(ctx: &Ctx) -> String {
+    let read_stats = pinned_read_stats();
     for _ in 0..50 {
         let before = render(ctx, &read_stats);
         let after = super::snapshot_with(ctx, &read_stats).to_prometheus();
@@ -409,15 +409,44 @@ fn snapshot_renders_byte_identical_to_the_legacy_renderer() {
                 after, before,
                 "MetricsSnapshot output differs from the legacy renderer"
             );
-            assert!(
-                before.contains("we\\\"ird\\\\rpc\\n"),
-                "label escaping exercised"
-            );
-            return;
+            return before;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     panic!("node state never settled for two consecutive renders");
+}
+
+#[test]
+fn snapshot_renders_byte_identical_to_the_legacy_renderer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = crate::testing::TestServer::start(&dir.path().join("golden.redb"), Vec::new());
+    let ctx = &server.running().expect("server is running").ctx;
+    exercise(ctx);
+    let text = assert_golden(ctx);
+    assert!(
+        text.contains("we\\\"ird\\\\rpc\\n"),
+        "label escaping exercised"
+    );
+}
+
+/// On a cluster leader, so the peer-labelled families (replication lag)
+/// are compared too.
+#[test]
+fn snapshot_renders_peer_families_like_the_legacy_renderer() {
+    let mut cluster = crate::testing::ClusterTestbed::new(2, Vec::new());
+    cluster.form();
+    let leader = cluster.wait_leader(crate::testing::CLUSTER_WAIT);
+    let ctx = &cluster
+        .node(leader)
+        .running()
+        .expect("leader is running")
+        .ctx;
+    exercise(ctx);
+    let text = assert_golden(ctx);
+    assert!(
+        text.contains("mg_raft_replication_lag{peer=\""),
+        "a peer sample was compared:\n{text}"
+    );
 }
 
 #[test]

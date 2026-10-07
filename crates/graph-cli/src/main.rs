@@ -941,6 +941,33 @@ fn join<'a>(it: impl Iterator<Item = &'a String>) -> String {
 }
 
 /// `--snapshot-max-age`: whole seconds, or a number with an s/m/h suffix.
+/// A refused OpenTelemetry setting or a provider that would not build:
+/// exit 7 (ADR 0009 D3).
+fn telemetry_exit(e: graph_server::telemetry::TelemetryError) -> anyhow::Error {
+    anyhow::Error::new(graph_cli::target::Exit {
+        code: graph_cli::target::exit::TELEMETRY_CONFIG,
+        message: e.to_string(),
+    })
+}
+
+/// The node id and cluster id as known before serving: the flag's id, else
+/// what `node.json` in the data directory says (a first start knows no
+/// cluster id yet; #249 sets it once the cluster forms).
+fn telemetry_identity(
+    node_id: Option<u64>,
+    data_dir: Option<&std::path::Path>,
+) -> graph_server::telemetry::NodeIdentity {
+    let json = data_dir
+        .map(graph_server::NodePaths::for_data_dir)
+        .and_then(|p| p.node_json)
+        .and_then(|path| graph_server::NodeJson::read(&path).ok().flatten());
+    graph_server::telemetry::NodeIdentity {
+        node_id: node_id.or_else(|| json.as_ref().map(|j| j.node_id)),
+        cluster: json.and_then(|j| j.cluster_id),
+        host_name: None,
+    }
+}
+
 fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
     let s = s.trim();
     let (num, mult) = match s.char_indices().last() {
@@ -1219,16 +1246,12 @@ fn run() -> Result<i32> {
             cluster: None,
             host_name: Some(host.clone()),
         };
-        let telemetry = match graph_server::telemetry::TelemetryConfig::resolve(
-            &telemetry_options,
-            &identity,
-        ) {
-            Ok(cfg) => graph_server::telemetry::init(&cfg)?,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return Ok(2);
-            }
-        };
+        // Resolved (and a bad flag or key refused, exit 7) before anything
+        // opens; the providers start just before serving, once the node's
+        // identity is known.
+        let mut telemetry_cfg =
+            graph_server::telemetry::TelemetryConfig::resolve(&telemetry_options, &identity)
+                .map_err(telemetry_exit)?;
         let bootstrap_or_join = match bootstrap_or_join {
             Some(peer) => {
                 let ordinal = graph_server::paths::hostname_ordinal(&host)
@@ -1482,6 +1505,8 @@ fn run() -> Result<i32> {
             (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
         };
         let log_format = *log_format;
+        telemetry_cfg.apply_identity(&telemetry_identity(*node_id, data_dir.as_deref()));
+        let telemetry = graph_server::telemetry::init(&telemetry_cfg).map_err(telemetry_exit)?;
         let served_result =
             graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
                 // Scripts and tests read these lines for the bound ports (the

@@ -1061,6 +1061,52 @@ mod golden;
 mod tests {
     use super::*;
 
+    /// A frozen snapshot renders to exactly this text (peers, labels,
+    /// escaping, int vs float, an empty family, a histogram).
+    #[test]
+    fn a_frozen_snapshot_renders_exactly() {
+        let mut h = Histogram::default();
+        h.observe(0.002);
+        h.observe(20.0);
+        let mut lag = MetricFamily::new("mg_raft_replication_lag", MetricKind::Gauge, "Lag.");
+        lag.push(vec![("peer", "2".into())], SampleValue::Int(0));
+        lag.push(vec![("peer", "3".into())], SampleValue::Int(17));
+        let snapshot = MetricsSnapshot {
+            families: vec![
+                gauge("mg_raft_term", "Term.", 4),
+                lag,
+                MetricFamily::new("mg_rpc_total", MetricKind::Counter, "Calls."),
+                counter(
+                    "mg_read_query_seconds_total",
+                    "Secs.",
+                    SampleValue::Float(1.5),
+                ),
+                MetricFamily::new("mg_apply_duration_seconds", MetricKind::Histogram, "Apply.")
+                    .with_sample(vec![("q", "a\"b".into())], SampleValue::Histogram(h)),
+            ],
+        };
+        let buckets: String = DURATION_BUCKETS
+            .iter()
+            .map(|b| {
+                let n = u8::from(*b >= 0.0025);
+                format!("mg_apply_duration_seconds_bucket{{q=\"a\\\"b\",le=\"{b}\"}} {n}\n")
+            })
+            .collect();
+        let expected = format!(
+            "# HELP mg_raft_term Term.\n# TYPE mg_raft_term gauge\nmg_raft_term 4\n\
+             # HELP mg_raft_replication_lag Lag.\n# TYPE mg_raft_replication_lag gauge\n\
+             mg_raft_replication_lag{{peer=\"2\"}} 0\nmg_raft_replication_lag{{peer=\"3\"}} 17\n\
+             # HELP mg_rpc_total Calls.\n# TYPE mg_rpc_total counter\n\
+             # HELP mg_read_query_seconds_total Secs.\n# TYPE mg_read_query_seconds_total counter\n\
+             mg_read_query_seconds_total 1.5\n\
+             # HELP mg_apply_duration_seconds Apply.\n# TYPE mg_apply_duration_seconds histogram\n\
+             {buckets}mg_apply_duration_seconds_bucket{{q=\"a\\\"b\",le=\"+Inf\"}} 2\n\
+             mg_apply_duration_seconds_sum{{q=\"a\\\"b\"}} 20.002\n\
+             mg_apply_duration_seconds_count{{q=\"a\\\"b\"}} 2\n"
+        );
+        assert_eq!(snapshot.to_prometheus(), expected);
+    }
+
     #[test]
     fn read_stats_render_as_counters_in_seconds() {
         // `ReadStats` is non-exhaustive: no struct literal outside its crate.
