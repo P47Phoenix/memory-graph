@@ -688,7 +688,7 @@ impl RaftNode {
     /// (ADR 0004 D7): returns the entry's response and its log index. The
     /// disk guard runs first (`RESOURCE_EXHAUSTED` on the wire).
     pub async fn propose(&self, req: LogRequest) -> Result<(LogResponse, u64), StoreError> {
-        let _in_flight = self.proposal()?;
+        let in_flight = self.proposal()?;
         if let Some(hold) = self.hold_proposal {
             tokio::time::sleep(hold).await;
         }
@@ -697,15 +697,27 @@ impl RaftNode {
         if self.metrics().state == ServerState::Leader {
             self.disk.check("write")?;
         }
-        let write = self.raft.client_write(req);
-        tokio::pin!(write);
+        // Once handed to openraft the entry is appended whether or not
+        // anyone still waits for it: dropping `client_write` does not
+        // withdraw it. So the write runs in its own task, which holds the
+        // in-flight count until openraft answers, not until this caller
+        // stops waiting (a cancelled RPC, or the quorum-loss answer below).
+        // Otherwise a transfer could drain to zero while the entry is still
+        // on its way into the log, check the target's lag, and then leave
+        // the target one entry short, so no voter grants it a vote (#232).
+        let raft = self.raft.clone();
+        let mut write = tokio::spawn(async move {
+            let _in_flight = in_flight;
+            raft.client_write(req).await
+        });
         tokio::select! {
             r = &mut write => match r {
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     let index = resp.log_id().index;
                     Ok((resp.response().clone(), index))
                 }
-                Err(e) => Err(write_err(e)),
+                Ok(Err(e)) => Err(write_err(e)),
+                Err(e) => Err(StoreError::Storage(format!("raft write task: {e}"))),
             },
             e = self.quorum_lost() => Err(e),
         }

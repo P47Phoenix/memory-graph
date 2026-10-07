@@ -709,14 +709,54 @@ async fn admin_client(
     pb::admin_client::AdminClient::with_interceptor(ch, graph_proto::SendVersion)
 }
 
+/// Every node's Raft state, for a failed transfer's diagnostics.
+fn dump_raft_state(tb: &ClusterTestbed) {
+    for id in tb.ids() {
+        let m = tb.node(id).raft().unwrap().metrics();
+        eprintln!(
+            "node {id}: state {:?} term {} leader {:?} vote {:?} last {:?} applied {:?} repl {:?}",
+            m.state,
+            m.current_term,
+            m.current_leader,
+            m.vote,
+            m.last_log_index,
+            m.last_applied,
+            m.replication
+        );
+    }
+}
+
+/// `TransferLeader`, asked again when the target did not answer one
+/// `TriggerElect` within `TRIGGER_TIMEOUT` (500 ms). That refusal is the
+/// transfer's documented fail-fast (leadership stays where it was, and
+/// heartbeats resume before any lease runs out), and a starved host hits
+/// it (#232: one core shared by four test binaries and CPU burners). Any
+/// other refusal, including "did not take over leadership", is returned.
+fn transfer_retrying_unanswered(c: &RemoteStore, target: u64) -> Result<u64, StoreError> {
+    let mut attempts = 0;
+    loop {
+        match c.admin_transfer_leader(target) {
+            Err(e) if attempts < 5 && e.to_string().contains("did not answer TriggerElect") => {
+                eprintln!("transfer refused, retrying: {e}");
+                attempts += 1;
+            }
+            r => return r,
+        }
+    }
+}
+
 /// Transfer leadership from the current leader to `target` (asked through
 /// node `via`, so forwarded unless `via` leads), and check that exactly the
 /// target leads afterwards and the old leader follows it.
 fn transfer_and_check(tb: &ClusterTestbed, via: u64, target: u64) -> Duration {
     let old = tb.leader();
     let t0 = Instant::now();
-    let now = tb.client(via).admin_transfer_leader(target).unwrap();
+    let now = transfer_retrying_unanswered(&tb.client(via), target);
     let took = t0.elapsed();
+    if now.is_err() {
+        dump_raft_state(tb);
+    }
+    let now = now.unwrap();
     assert_eq!(now, target, "the transfer answered another leader");
     assert_eq!(
         tb.leader(),
@@ -762,15 +802,12 @@ fn transfer_leader_moves_leadership() {
         let c = tb.client(via);
         std::thread::spawn(move || {
             let t0 = Instant::now();
-            (c.admin_transfer_leader(target), t0.elapsed())
+            (transfer_retrying_unanswered(&c, target), t0.elapsed())
         })
     };
     let (now, took) = transfer.join().unwrap();
     if now.is_err() {
-        for id in tb.ids() {
-            let m = tb.node(id).raft().unwrap().metrics();
-            eprintln!("DBG node {id}: state {:?} term {} leader {:?} vote {:?} last {:?} applied {:?} repl {:?}", m.state, m.current_term, m.current_leader, m.vote, m.last_log_index, m.last_applied, m.replication);
-        }
+        dump_raft_state(&tb);
     }
     assert_eq!(now.unwrap(), target);
     eprintln!("transfer 1 (under writes) took {took:?}");
@@ -823,6 +860,46 @@ fn transfer_leader_moves_leadership_five_nodes() {
     );
     let (p, b) = small_file(1);
     tb.client(old).index_bytes("o", "r", &p, &b, None).unwrap();
+}
+
+/// Issue #232: a write that reached openraft stays in flight (and holds a
+/// transfer's drain) until openraft answers it, even after the caller
+/// stopped waiting. Here the leader is cut off, so its write cannot
+/// commit and the client gives up with `NoLeader`; the entry is still in
+/// the leader's log, so the count must not drop until the partition heals
+/// and openraft answers it. Dropping it with the caller let a transfer
+/// check the target's lag before that entry landed and leave the target a
+/// log one entry short, which no voter grants a vote.
+#[test]
+fn an_abandoned_write_stays_in_flight_until_raft_answers_it() {
+    let _w = watchdog(
+        "an_abandoned_write_stays_in_flight_until_raft_answers_it",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let leader = tb.leader();
+    let others = node_ids_other_than(&tb, &[leader]);
+    index_files(&tb.client(leader), "o", "r", &[small_file(0)]);
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let node = tb.node(leader).raft().unwrap().clone();
+    assert_eq!(node.in_flight.load(Ordering::SeqCst), 0);
+    tb.partition(&[leader], &others);
+    let (p, b) = small_file(1);
+    let e = short_client(&tb, leader, Duration::from_secs(2))
+        .index_bytes("o", "r", &p, &b, None)
+        .unwrap_err();
+    assert!(matches!(e, StoreError::NoLeader { .. }), "{e:?}");
+    // The caller is gone; the entry is not: it is still counted.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        node.in_flight.load(Ordering::SeqCst) > 0,
+        "a write openraft has not answered left the in-flight count"
+    );
+    tb.heal();
+    wait_until("openraft answers the abandoned write", || {
+        node.in_flight.load(Ordering::SeqCst) == 0
+    });
 }
 
 /// A partition isolating one follower: `LOCAL` reads on it keep working,
@@ -1605,13 +1682,18 @@ fn sole_voter_suspends_ticks_until_the_membership_grows() {
     let mut tb = ClusterTestbed::new(1, exts());
     let suspended = |tb: &ClusterTestbed| tb.node(1).raft().unwrap().ticks.suspended();
     // Idle with ticks off: the metrics stay still for many tick periods.
+    // A starved host can deliver a trailing update of the last write or
+    // change late, inside a window (#232), so a few windows are tried: with
+    // ticks on, every window sees an update and all of them fail.
     let idle_metrics_still = |tb: &ClusterTestbed| {
         let mut rx = tb.node(1).raft().unwrap().raft.metrics();
-        // Past any trailing update of the last write or change.
-        std::thread::sleep(Duration::from_millis(300));
-        rx.borrow_and_update();
-        std::thread::sleep(Duration::from_millis(1500));
-        !rx.has_changed().unwrap()
+        (0..5).any(|_| {
+            // Past any trailing update of the last write or change.
+            std::thread::sleep(Duration::from_millis(300));
+            rx.borrow_and_update();
+            std::thread::sleep(Duration::from_millis(1500));
+            !rx.has_changed().unwrap()
+        })
     };
     wait_until("node 1, leading alone, suspends its ticks", || {
         suspended(&tb)
@@ -1622,15 +1704,27 @@ fn sole_voter_suspends_ticks_until_the_membership_grows() {
     tb.add_node(2, cfg, exts()).unwrap();
     assert!(!suspended(&tb), "ticks stay suspended with a learner");
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
-    // Idle, the learner still hears from the leader every heartbeat.
+    // Idle, the learner keeps hearing from the leader: it hears again
+    // (its time since the last message drops) heartbeat after heartbeat.
+    // Counted, not timed: a starved host stretches the gaps (#232: 1.09 s
+    // and 2.78 s seen with one core shared by four test binaries and CPU
+    // burners), but with the leader's ticks suspended it hears nothing.
     let learner = tb.node(2).raft().unwrap();
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(100));
-        let heard = learner.obs.since_heard_from_leader().unwrap();
+    let mut heard_again = 0;
+    let mut last = learner.obs.since_heard_from_leader().unwrap();
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    while heard_again < 5 {
         assert!(
-            heard < Duration::from_millis(1000),
-            "the idle learner has not heard from the leader for {heard:?}"
+            Instant::now() < deadline,
+            "the idle learner heard from the leader only {heard_again} times in \
+             {CLUSTER_WAIT:?}; last {last:?} ago"
         );
+        std::thread::sleep(Duration::from_millis(50));
+        let heard = learner.obs.since_heard_from_leader().unwrap();
+        if heard < last {
+            heard_again += 1;
+        }
+        last = heard;
     }
 
     tb.client(1).admin_remove(2, true).unwrap();
