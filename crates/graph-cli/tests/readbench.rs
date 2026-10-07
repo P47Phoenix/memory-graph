@@ -526,6 +526,12 @@ fn add(a: ReadStats, b: &ReadStats) -> ReadStats {
     out.lazy_bytes += b.lazy_bytes;
     out.full_bytes += b.full_bytes;
     out.symbol_decode_nanos += b.symbol_decode_nanos;
+    out.search_postings += b.search_postings;
+    out.search_posting_nanos += b.search_posting_nanos;
+    out.search_ctx_nanos += b.search_ctx_nanos;
+    out.search_walk_files += b.search_walk_files;
+    out.search_walk_nanos += b.search_walk_nanos;
+    out.search_walk_tokens += b.search_walk_tokens;
     out
 }
 
@@ -585,6 +591,18 @@ fn report(label: &str, readers: &[Reader], wall: Duration) {
         stats.symbol_section_decodes as f64 / n,
         stats.read_txns as f64 / n,
         bypass_rate(&stats),
+    );
+    // The search breakdown (issue #246): ms per query in each phase, and
+    // postings, walked files and token records read per query.
+    let ms_q = |nanos: u64| timed(format!("{:.3}", nanos as f64 / 1e6 / n));
+    println!(
+        "| {label} search | posting ms/q {} | ctx ms/q {} | walk ms/q {} | postings/q {:.1} | walk files/q {:.1} | walk tokens/q {:.1} |",
+        ms_q(stats.search_posting_nanos),
+        ms_q(stats.search_ctx_nanos),
+        ms_q(stats.search_walk_nanos),
+        stats.search_postings as f64 / n,
+        stats.search_walk_files as f64 / n,
+        stats.search_walk_tokens as f64 / n,
     );
 }
 

@@ -118,6 +118,7 @@ pub const CASES: &[(&str, Case)] = &[
     ),
     ("batch_level_encoding_hint", batch_level_encoding_hint),
     ("encoding_exposure", encoding_exposure),
+    ("hot_term_pages", hot_term_pages),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -4186,4 +4187,86 @@ fn batch_level_encoding_hint(h: &Harness) {
         s.describe(None, None).unwrap(),
         s.describe_by_scan(None, None).unwrap()
     );
+}
+
+/// Issue #246: a hot term over many files, at every grain and with and
+/// without a class filter, paged with every limit and offset up to past the
+/// end (so pages start and end inside a file and across file, repo and org
+/// boundaries). Each page must be exactly that slice of the unpaged answer,
+/// whatever shortcuts the walk takes.
+fn hot_term_pages(h: &Harness) {
+    let s = open(h);
+    let src = "fn o() { foo(); foo }
+fn p() { foo(); }
+struct foo;
+";
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![
+            sym(
+                "o",
+                SymbolKind::Function,
+                span_of(src, "fn o() { foo(); foo }"),
+            ),
+            sym("p", SymbolKind::Function, span_of(src, "fn p() { foo(); }")),
+        ],
+        tokens: tokenize(src),
+    };
+    for (o, r, f) in [
+        ("b", "r", "z.rs"),
+        ("a", "s", "a.rs"),
+        ("a", "r", "m.rs"),
+        ("a", "r", "d/b.rs"),
+        ("a", "r", "d/a.rs"),
+    ] {
+        s.ingest_file(o, r, f, "rust", &ex).unwrap();
+    }
+    s.ingest_file(
+        "a",
+        "r",
+        "c.zig",
+        "zig",
+        &plain(
+            "foo foo foo
+",
+        ),
+    )
+    .unwrap();
+    for grain in [
+        Grain::Token,
+        Grain::Symbol,
+        Grain::Method,
+        Grain::Class,
+        Grain::File,
+        Grain::Repo,
+        Grain::Org,
+    ] {
+        for class in [
+            None,
+            Some(graph_core::TokenClass::Identifier),
+            Some(graph_core::TokenClass::Keyword),
+        ] {
+            let mut q = Query::new("foo");
+            q.grain = grain;
+            q.class = class;
+            let all = s.search(&q).unwrap();
+            if class != Some(graph_core::TokenClass::Keyword) {
+                assert!(!all.is_empty(), "{grain:?} {class:?}");
+            }
+            let n = all.len();
+            for off in [None, Some(0), Some(1), Some(n / 2), Some(n), Some(n + 1)] {
+                for lim in [None, Some(0), Some(1), Some(2), Some(n), Some(n + 1)] {
+                    q.offset = off;
+                    q.limit = lim;
+                    let from = off.unwrap_or(0).min(n);
+                    let to = lim.map_or(n, |l| from.saturating_add(l).min(n));
+                    assert_eq!(
+                        s.search(&q).unwrap()[..],
+                        all[from..to],
+                        "{grain:?} {class:?} offset {off:?} limit {lim:?}"
+                    );
+                }
+            }
+        }
+    }
 }

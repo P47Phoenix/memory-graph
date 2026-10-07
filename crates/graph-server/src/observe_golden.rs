@@ -279,11 +279,11 @@ fn counter(out: &mut String, name: &str, help: &str, v: impl std::fmt::Display) 
 }
 
 /// A counter family with one sample per decode kind.
-fn per_kind<V: std::fmt::Display>(
+fn per_kind<V: std::fmt::Display, const N: usize>(
     out: &mut String,
     name: &str,
     help: &str,
-    by_kind: [(&str, V); 4],
+    by_kind: [(&str, V); N],
 ) {
     head(out, name, "counter", help);
     for (kind, v) in by_kind {
@@ -358,6 +358,26 @@ fn render_read_stats(out: &mut String, r: &graph_store::read_stats::ReadStats) {
         "Dictionary strings allocated by query-side term lookups.",
         r.dict_strings_decoded,
     );
+    per_kind(
+        out,
+        "mg_read_search_items_total",
+        "Search work, by kind (postings: candidate files' postings scanned; walk_files: files walked; walk_tokens: token records read through posting ordinals).",
+        [
+            ("postings", r.search_postings),
+            ("walk_files", r.search_walk_files),
+            ("walk_tokens", r.search_walk_tokens),
+        ],
+    );
+    per_kind(
+        out,
+        "mg_read_search_seconds_total",
+        "Seconds in search's phases, by kind (posting: the posting scan; ctx: resolving, filtering and sorting candidate files; walk: the per-file walk) (--read-timing only).",
+        [
+            ("posting", secs(r.search_posting_nanos)),
+            ("ctx", secs(r.search_ctx_nanos)),
+            ("walk", secs(r.search_walk_nanos)),
+        ],
+    );
 }
 
 /// Fixed, non-zero read counters: the process-wide ones move under
@@ -380,6 +400,12 @@ fn pinned_read_stats() -> graph_store::read_stats::ReadStats {
     r.query_nanos = 31;
     r.read_txns = 37;
     r.dict_strings_decoded = 41;
+    r.search_postings = 43;
+    r.search_walk_files = 47;
+    r.search_walk_tokens = 53;
+    r.search_posting_nanos = 500_000_000;
+    r.search_ctx_nanos = 59;
+    r.search_walk_nanos = 2_000_000_000;
     r
 }
 
