@@ -65,8 +65,13 @@
 | 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, gated) | High | 8 | P3 | 45 (gate), 46 |
 | 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, gated) | High | 5 | P3 | 47 |
 | 49 | Optional query-result cache (ADR 0008 phase 3, optional) | Low | 3 | P4 | 45, 48 |
+| 50 | OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot`, test seams (ADR 0009, **Proposed**) | Medium | 8 | P3 | 24 |
+| 51 | Traces and W3C propagation across client, forward and leader apply (ADR 0009, **Proposed**) | High | 8 | P3 | 50 |
+| 52 | Metrics over OTLP with the name mapping (ADR 0009, **Proposed**) | Medium | 5 | P3 | 50 |
+| 53 | Logs over OTLP; trace ids in JSON logs when traces are on (ADR 0009, **Proposed**) | Medium | 3 | P3 | 51 |
+| 54 | OpenTelemetry compose demo, CI, overhead numbers and docs (ADR 0009, **Proposed**) | Low | 3 | P3 | 52, 53 |
 
-Total: 49 stories, 249 pts (average about 5.1); 241 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional.
+Total (excluding proposed 50-54): 49 stories, 249 pts (average about 5.1); 241 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), which is **Proposed**; they are not counted in the totals above until the owner accepts it.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -626,6 +631,130 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 3.
 - Given story 45's request log, When reviewed, Then this story must start only if at least 20% of queries are exact repeats within 60 seconds at an unchanged generation.
 - Given a query at generation G, When the same query arrives at G, Then `serve` must return the cached result (a hit counter rises); given any write, Then the result cache must be cleared by raising its floor.
 - Given the result cache on and off, When `run_differential` and the consistency differential run, Then answers must be identical.
+
+<a id="story-50"></a>
+**50. OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot`, test seams (8 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. The new dependencies need the owner's approval in this story's PR.
+As a maintainer adding OpenTelemetry
+I want the pinned crates, a telemetry module, one metrics snapshot and a fake collector in place, with no change in behaviour
+So that traces, metrics and logs can be added and tested without touching the Prometheus contract.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D2, D3, D4, D6, D8 and D10.
+- Given the crates in ADR 0009 D2, When they are added to `[workspace.dependencies]` with exact pins and the listed features only, Then:
+  - `cargo tree -i ring` and `cargo tree -i aws-lc-sys` must print nothing;
+  - `check-no-c-deps.py` (all six targets), `test_gate.py` and `docker build` must pass;
+  - `cargo tree -d` must show no second tonic or prost;
+  - the PR must record that `tracing-opentelemetry` targets `opentelemetry 0.33`.
+- Given each pair of sources, When `--otlp-endpoint`, `--otlp-signals`, `--otel-service-name` and `--otlp-metrics-interval` are set by flag, config key or environment variable, Then `TelemetryConfig` must follow the precedence flag, then key, then environment (unit-tested for each pair).
+- Given environment variables only, When `serve` starts with just `OTEL_EXPORTER_OTLP_ENDPOINT`, Then OpenTelemetry must be enabled.
+- Given `OTEL_SDK_DISABLED=true`, When an endpoint is also set, Then OpenTelemetry must be off.
+- Given `--otlp-signals`, When it names a subset, Then only those providers may be built.
+- Given headers, When they are set, Then they must come only from `OTEL_EXPORTER_OTLP_HEADERS`, and their values must never appear in logs.
+- Given an `https://` endpoint from a flag or config key, When `serve` starts, Then it must exit with code 7 (`TELEMETRY_CONFIG`) and a message naming the setting (an e2e test).
+- Given an `https://` endpoint, a per-signal endpoint variable or a non-`grpc` `OTEL_EXPORTER_OTLP_PROTOCOL` from the environment, When `serve` starts, Then it must log one error, start, serve, and have OpenTelemetry off.
+- Given a valid endpoint that nothing listens on, When `serve` starts, Then it must start and serve.
+- Given no endpoint from any source, When `serve` starts, Then `telemetry::init` must return `None` and `telemetry::is_active()` must be false. This is a structural check, not a wait for nothing to arrive.
+- Given the `MetricsSnapshot` refactor, When `/metrics` is scraped, Then the output must be byte-identical to a golden file. The golden file is committed before the refactor, with volatile series normalised. The existing observability tests must also pass.
+- Given the resource, When it is built, Then:
+  - it must carry `service.name`, `service.version`, `service.instance.id`, `memory_graph.cluster` and `host.name`;
+  - `OTEL_SERVICE_NAME` must win over `service.name` in `OTEL_RESOURCE_ATTRIBUTES`;
+  - `OTEL_RESOURCE_ATTRIBUTES` must not override the instance id, the cluster or the version.
+- Given the test seams, When tests run, Then:
+  - `graph_server::testing::FakeCollector` must listen on 127.0.0.1:0, record traces, metrics and logs, and be able to stall, refuse, and stop and restart;
+  - the batch delay, queue size and export timeout must be settable in tests;
+  - no test may use port 4317 or a fixed sleep (they wait on collector counts with a deadline).
+- Given SDK 0.33's batch processors, When this story merges, Then the follow-up issue for queue-full drop counting must be filed.
+
+<a id="story-51"></a>
+**51. Traces and W3C propagation across client, forward and leader apply (8 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted.
+As an operator debugging a slow or failed request
+I want one trace from the client through the follower and the forward to the leader and its apply
+So that I can see where the time went across nodes.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D5, D8 and D9.
+- Given a test that sets it up, When `cluster_e2e` starts three real `serve` processes that export to one in-test `FakeCollector` (its port passed with `--otlp-endpoint`) and a client writes to a follower inside a test span, Then the collector must receive one trace in which, checked by span id:
+  - the follower's `rpc` has the client's span as its parent;
+  - `forward` has the follower's `rpc` as its parent;
+  - the leader's `rpc` has `forward` as its parent;
+  - the leader's `apply` for that write is linked to the leader's `rpc` (or is its child, whichever the ADR records);
+  - each span's `service.instance.id` is its node.
+- Given an rpc span, When it is exported, Then it must carry `rpc.system=grpc`, `rpc.service`, `rpc.method`, `rpc.grpc.status_code` and `server.address`, and `forward` must carry `memory_graph.forwarded_by`.
+- Given an incoming `traceparent`, When `RpcService::call` handles the request, Then the server span must be its child.
+- Given each outgoing call, When it is sent, Then `SendVersion` (with the sync facade instrumenting the call with the caller's span), `ForwardHeaders` and `RaftHeaders` (for snapshot install) must inject `traceparent` and `tracestate`.
+- Given an idle cluster with traces on, When heartbeats and AppendEntries run, Then the collector must receive no Raft-service spans.
+- Given a snapshot install, When it runs, Then exactly one `install_snapshot` span must be exported on each side, with no per-chunk spans.
+- Given MCP `tools/call`, an index batch and a `RemoteStore` call, When each runs with traces on, Then each must produce its span.
+- Given a sentinel query string in a search and an MCP call, When the spans are exported, Then the sentinel must appear in no attribute.
+- Given a stalled or stopped collector, When N RPCs run, Then all must succeed within a generous timeout (no timing assertion), and `mg_otel_export_failures_total{signal="traces"}` and `mg_otel_dropped_total{signal="traces"}` must rise.
+- Given a collector that dies mid-run and comes back, When RPCs continue, Then trace export must resume with no restart.
+- Given a shutdown under load, When `serve` stops, Then:
+  - with a responsive collector, the spans still queued must arrive;
+  - with a stalled collector, `serve` must exit within the shutdown bound.
+
+<a id="story-52"></a>
+**52. Metrics over OTLP with the name mapping (5 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted. Depends only on story 50, and can run in parallel with 51.
+As an operator whose metrics pipeline is OpenTelemetry
+I want every `/metrics` family exported over OTLP under an OTel-style name
+So that I get the same numbers without scraping.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D6 and D8.
+- Given the const mapping table in `telemetry.rs`, When the contract tests run, Then:
+  - it must equal the table parsed from ADR 0009;
+  - every `METRIC_NAMES` family must have exactly one OTLP twin, except the named exception `mg_rpc_total`;
+  - every OTLP metric must map back.
+- Given a frozen `MetricsSnapshot`, When it is converted to OTLP, Then every snapshot family must have exactly the expected instrument kind, unit, attributes and values. That includes one `memory_graph.raft.role` point per role (1 for the current role, 0 for the others) and `memory_graph.build.info`=1 with its three attributes.
+- Given the fake collector and a short `--otlp-metrics-interval`, When an interval passes, Then:
+  - every mapped metric must arrive;
+  - snapshot families must match a `/metrics` scrape coarsely (counters that keep moving get a tolerance);
+  - `rpc.server.call.duration` and `memory_graph.raft.apply.duration` must use the `DURATION_BUCKETS` bounds;
+  - the histograms' counts must approximately match `mg_rpc_total` and the apply histogram's count.
+- Given one collection, When several callbacks run, Then the snapshot must be built once (a counter shows it), and no callback may open a redb transaction.
+- Given the e2e workload, When it runs, Then no instrument may reach the SDK overflow stream (`otel.metric.overflow`).
+- Given this story, When it merges, Then the Prometheus golden file must change by exactly the two new families, `mg_otel_export_failures_total{signal}` and `mg_otel_dropped_total{signal}`. Both must be in `METRIC_NAMES` and stay 0 with OpenTelemetry off.
+- Given a stalled or stopped collector, When intervals pass, Then serving must be unaffected, the metrics failure counters must rise, and export must resume when the collector comes back.
+- Given a shutdown, When `serve` stops, Then a final metrics export must reach a responsive collector.
+
+<a id="story-53"></a>
+**53. Logs over OTLP; trace ids in JSON logs when traces are on (3 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted.
+As an operator reading logs next to traces
+I want `serve`'s log events exported over OTLP and tagged with trace ids
+So that a log line leads to its trace and back.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D7, D8 and D9.
+- Given `--otlp-signals traces,logs` and a fixed set of events emitted inside and outside an rpc span, When they are logged, Then:
+  - the collector must receive each record with the mapped severity, the message and only allow-listed fields;
+  - the records inside the span must carry its trace and span ids;
+  - the ids for each event must match in stdout JSON, the OTLP record and the exported span;
+  - `trace_id` must be 32 and `span_id` 16 lowercase hex characters;
+  - events outside a span must carry no id fields, and zero ids must never appear.
+- Given `--log-level` or `MEMORY_GRAPH_LOG`, When it is set, Then OTLP must receive the same events as stdout.
+- Given `--log-format json` with OpenTelemetry off, or with traces not among `--otlp-signals`, When events are logged inside a span, Then the JSON output must be unchanged from today. Text logs must be unchanged in every case.
+- Given a sentinel query string, When the request is logged, Then the sentinel must appear in no exported log body or field.
+- Given a refusing collector, When export errors happen, Then no record from the `opentelemetry*` targets may reach the collector after it recovers. This is a concrete test of the exporter never exporting its own errors.
+- Given a stalled or stopped collector, When events are logged, Then logging and serving must not block, and `mg_otel_export_failures_total{signal="logs"}` and `mg_otel_dropped_total{signal="logs"}` must rise.
+- Given a shutdown, When `serve` stops, Then queued log records must reach a responsive collector, and with a stalled collector `serve` must exit within the bound.
+
+<a id="story-54"></a>
+**54. OpenTelemetry compose demo, CI, overhead numbers and docs (3 pts)**
+Status: Proposed (ADR 0009 is Proposed). Not counted in the totals. Merges only after the ADR is accepted.
+As an operator trying OpenTelemetry for the first time
+I want a working compose recipe, measured overhead and a guide
+So that I can see traces, metrics and logs in minutes and know what they cost and how to run a collector with TLS.
+Design: [ADR 0009](adr/0009-opentelemetry.md) D3, D4, D5, D6, D9 and D11.
+- Given `deploy/compose/` with an `otel` profile, When `docker compose --profile otel up` runs, Then the collector's debug output must show traces, metrics and logs from all three nodes, started with `--otlp-endpoint http://otel-collector:4317`.
+  - Either a CI step runs the profile and greps the collector's debug log for all three signals,
+  - or the demo is labelled manual in `docs/deploy/compose.md` (the owner's call, ADR 0009 open question 7).
+- Given the existing compose CI job and `check.sh`, When they run, Then they must pass unchanged.
+- Given `rpc_bench`, When it is run by hand with OTLP on and off, Then the numbers must be recorded in `docs/spikes/rpc-overhead.md`. There is no CI assertion.
+- Given `docs/guide/observability.md`, When it is read, Then it must have an OpenTelemetry section covering:
+  - enabling it;
+  - the flags, keys and environment variables, with their precedence, `OTEL_SDK_DISABLED` and the unsupported settings;
+  - the resource attributes;
+  - the signals and the trace scope;
+  - the privacy allow-list;
+  - the metric name mapping;
+  - the failure behaviour, including the queue-full gap;
+  - a collector recipe that handles TLS at the collector.
+- Given the other docs, When they are read, Then `docs/deploy/compose.md`, the README, the CLAUDE.md crate notes (including exit code 7) and the release notes must point to that section, including the environment-variable configuration of the Docker image.
 
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
