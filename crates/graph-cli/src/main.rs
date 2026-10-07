@@ -441,6 +441,21 @@ enum Cmd {
         /// platform; the read counts are always on. Process-global, never turned off.
         #[arg(long)]
         read_timing: bool,
+        /// Export OpenTelemetry (OTLP over plain-text gRPC) to a collector at http://HOST:PORT;
+        /// off unless given (or OTEL_EXPORTER_OTLP_ENDPOINT is set). TLS and auth belong to
+        /// the collector; headers come from OTEL_EXPORTER_OTLP_HEADERS only
+        #[arg(long, value_name = "URL")]
+        otlp_endpoint: Option<String>,
+        /// The OpenTelemetry signals to export, a comma list of traces, metrics, logs
+        /// (default: all three)
+        #[arg(long, value_name = "LIST")]
+        otlp_signals: Option<String>,
+        /// OpenTelemetry service.name (default: OTEL_SERVICE_NAME, else memory-graph)
+        #[arg(long, value_name = "NAME")]
+        otel_service_name: Option<String>,
+        /// How often OpenTelemetry metrics are exported
+        #[arg(long, value_parser = parse_duration, default_value = "60s")]
+        otlp_metrics_interval: std::time::Duration,
         /// Serve MCP (Model Context Protocol, streamable HTTP; read-only tools) at
         /// http://<HOST:PORT>/mcp, on a port of its own. Off unless given. Loopback only
         /// (127.0.0.1, ::1) unless --mcp-allow-remote. See docs/mcp.md.
@@ -925,6 +940,33 @@ fn join<'a>(it: impl Iterator<Item = &'a String>) -> String {
     }
 }
 
+/// A refused OpenTelemetry setting or a provider that would not build:
+/// exit 7 (ADR 0009 D3).
+fn telemetry_exit(e: graph_server::telemetry::TelemetryError) -> anyhow::Error {
+    anyhow::Error::new(graph_cli::target::Exit {
+        code: graph_cli::target::exit::TELEMETRY_CONFIG,
+        message: e.to_string(),
+    })
+}
+
+/// The node id and cluster id as known before serving: the flag's id, else
+/// what `node.json` in the data directory says (a first start knows no
+/// cluster id yet; #249 sets it once the cluster forms).
+fn telemetry_identity(
+    node_id: Option<u64>,
+    data_dir: Option<&std::path::Path>,
+) -> graph_server::telemetry::NodeIdentity {
+    let json = data_dir
+        .map(graph_server::NodePaths::for_data_dir)
+        .and_then(|p| p.node_json)
+        .and_then(|path| graph_server::NodeJson::read(&path).ok().flatten());
+    graph_server::telemetry::NodeIdentity {
+        node_id: node_id.or_else(|| json.as_ref().map(|j| j.node_id)),
+        cluster: json.and_then(|j| j.cluster_id),
+        host_name: None,
+    }
+}
+
 /// `--snapshot-max-age`: whole seconds, or a number with an s/m/h suffix.
 fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
     let s = s.trim();
@@ -1141,6 +1183,10 @@ fn run() -> Result<i32> {
         log_level,
         metrics_listen,
         read_timing,
+        otlp_endpoint,
+        otlp_signals,
+        otel_service_name,
+        otlp_metrics_interval,
         mcp_listen,
         mcp_allow_remote,
         mcp_allow_origin,
@@ -1187,6 +1233,25 @@ fn run() -> Result<i32> {
         } else {
             *node_id
         };
+        // OpenTelemetry (ADR 0009): flag or config key (clap merged them),
+        // then OTEL_* env. Off without an endpoint: nothing is created.
+        let telemetry_options = graph_server::telemetry::TelemetryOptions {
+            endpoint: otlp_endpoint.clone(),
+            signals: otlp_signals.clone(),
+            service_name: otel_service_name.clone(),
+            metrics_interval: Some(*otlp_metrics_interval),
+        };
+        let identity = graph_server::telemetry::NodeIdentity {
+            node_id: *node_id,
+            cluster: None,
+            host_name: Some(host.clone()),
+        };
+        // Resolved (and a bad flag or key refused, exit 7) before anything
+        // opens; the providers start just before serving, once the node's
+        // identity is known.
+        let mut telemetry_cfg =
+            graph_server::telemetry::TelemetryConfig::resolve(&telemetry_options, &identity)
+                .map_err(telemetry_exit)?;
         let bootstrap_or_join = match bootstrap_or_join {
             Some(peer) => {
                 let ordinal = graph_server::paths::hostname_ordinal(&host)
@@ -1440,36 +1505,47 @@ fn run() -> Result<i32> {
             (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
         };
         let log_format = *log_format;
-        graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
-            // Scripts and tests read these lines for the bound ports (the
-            // metrics line first: the listening line is the start signal);
-            // JSON objects under --log-format json.
-            use graph_cli::logging::start_line;
-            if let Some(m) = r.metrics_addr {
-                let msg = format!("metrics on http://{m}/metrics");
+        telemetry_cfg.apply_identity(&telemetry_identity(*node_id, data_dir.as_deref()));
+        let telemetry = graph_server::telemetry::init(&telemetry_cfg).map_err(telemetry_exit)?;
+        if let (Some(_), Some(endpoint)) = (&telemetry, &telemetry_cfg.endpoint) {
+            tracing::info!(%endpoint, "OpenTelemetry export on");
+        }
+        let served_result =
+            graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
+                // Scripts and tests read these lines for the bound ports (the
+                // metrics line first: the listening line is the start signal);
+                // JSON objects under --log-format json.
+                use graph_cli::logging::start_line;
+                if let Some(m) = r.metrics_addr {
+                    let msg = format!("metrics on http://{m}/metrics");
+                    println!(
+                        "{}",
+                        start_line(log_format, "metrics", &msg, &m.to_string())
+                    );
+                }
+                if let Some(m) = r.mcp_addr {
+                    let msg = format!("mcp on {}", mcp_url(&m.to_string()));
+                    println!("{}", start_line(log_format, "mcp", &msg, &m.to_string()));
+                }
+                let msg = format!(
+                    "listening on {} ({shown}, {} worker threads)",
+                    r.addr,
+                    r.worker_threads()
+                );
                 println!(
                     "{}",
-                    start_line(log_format, "metrics", &msg, &m.to_string())
+                    start_line(log_format, "listening", &msg, &r.addr.to_string())
                 );
-            }
-            if let Some(m) = r.mcp_addr {
-                let msg = format!("mcp on {}", mcp_url(&m.to_string()));
-                println!("{}", start_line(log_format, "mcp", &msg, &m.to_string()));
-            }
-            let msg = format!(
-                "listening on {} ({shown}, {} worker threads)",
-                r.addr,
-                r.worker_threads()
-            );
-            println!(
-                "{}",
-                start_line(log_format, "listening", &msg, &r.addr.to_string())
-            );
-        })
-        .map_err(|e| match e {
-            StoreError::Locked(why) => graph_cli::target::locked_error(&served, &why),
-            e => anyhow::Error::from(e).context(format!("serving `{}`", served.display())),
-        })?;
+            })
+            .map_err(|e| match e {
+                StoreError::Locked(why) => graph_cli::target::locked_error(&served, &why),
+                e => anyhow::Error::from(e).context(format!("serving `{}`", served.display())),
+            });
+        // Flush OpenTelemetry (bounded) after the serving runtime is gone.
+        if let Some(telemetry) = telemetry {
+            telemetry.shutdown_blocking();
+        }
+        served_result?;
         tracing::info!("memory-graph serve: stopped");
         return Ok(0);
     }
@@ -2664,6 +2740,14 @@ mod serve_config_tests {
                 "--metrics-listen",
                 "0.0.0.0:9100",
                 "--read-timing",
+                "--otlp-endpoint",
+                "http://otel-collector:4317",
+                "--otlp-signals",
+                "traces,logs",
+                "--otel-service-name",
+                "mg-east",
+                "--otlp-metrics-interval",
+                "15s",
                 "--mcp-listen",
                 "0.0.0.0:7071",
                 "--mcp-allow-remote",
@@ -2739,6 +2823,10 @@ log-format = "json"
 log_level = "debug"
 metrics-listen = "0.0.0.0:9100"
 read-timing = true
+otlp-endpoint = "http://otel-collector:4317"
+otlp_signals = "traces,logs"
+otel-service-name = "mg-east"
+otlp-metrics-interval = "15s"
 mcp-listen = "0.0.0.0:7071"
 mcp_allow_remote = true
 mcp-allow-origin = ["http://localhost:6274", "https://a.example"]

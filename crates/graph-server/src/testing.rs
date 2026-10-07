@@ -10,9 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod cluster;
+pub mod fake_collector;
 pub mod fake_s3;
 pub mod mcp_http;
 pub use cluster::{ClusterTestbed, TestNode, CLUSTER_WAIT, TEST_RAFT};
+pub use fake_collector::{FakeCollector, Received as FakeReceived, Signal as FakeSignal};
 pub use fake_s3::{FakeS3, Faults};
 
 /// Make the snapshot pair at `data` (a `snap-*.redb` with its `.meta`)

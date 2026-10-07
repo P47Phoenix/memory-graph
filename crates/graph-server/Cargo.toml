@@ -23,6 +23,16 @@ prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# OTLP export (ADR 0009): providers in `telemetry`, off unless configured.
+# tracing-opentelemetry and the appender are wired by O2/O4.
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+# `testing::FakeCollector`'s OTLP services (already in the tree through
+# opentelemetry-otlp, same features).
+opentelemetry-proto.workspace = true
 tower-layer.workspace = true
 tower-service.workspace = true
 redb.workspace = true

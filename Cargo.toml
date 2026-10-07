@@ -55,6 +55,18 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # so it bumps graph_core::encoding::DECODER_VERSION too.
 encoding_rs = "=0.8.42"
 chardetng = "=1.0.0"
+# OpenTelemetry over OTLP/gRPC (ADR 0009, Proposed), pinned exactly. The
+# exporter rides the workspace's tonic/prost (no second copy) with no TLS,
+# HTTP, reqwest or zstd feature: TLS is the collector's job (#104), and the
+# pure-Rust gate refuses ring/aws-lc. `internal-logs` stays off so the SDK
+# never feeds its own diagnostics back into the tracing pipeline it exports.
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs"] }
+# 0.34 is the release that targets opentelemetry 0.33.
+tracing-opentelemetry = { version = "=0.34.0", default-features = false }
+opentelemetry-appender-tracing = { version = "=0.33.0", default-features = false }
+opentelemetry-proto = { version = "=0.33.0", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"] }
 
 # Optimise dependencies (redb, serde_json, ...) in dev/test builds so the
 # corpus test does not spend ~20s in unoptimised storage code.

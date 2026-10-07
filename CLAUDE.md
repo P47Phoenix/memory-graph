@@ -71,7 +71,7 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
   - `serve`: `--db`, or `--data-dir` with `--bootstrap`, `--restore`, `--join <peer>` (`--auto-promote` / `--standby`, `--accept-snapshot-overwrite`, `--join-timeout`), `--node-id`, `--advertise`, the snapshot, log and election knobs, and `--min-free-disk`;
   - `health`;
   - `cluster status/leader/snapshot/members/add-learner/promote/remove/transfer-leader` (membership changes are forwarded to the leader by any node; the guards live on the leader, `services/admin.rs`);
-  - exit codes in `target.rs`: 3 no leader (`cluster leader`), 4 write deadline (`NoLeader`), 5 protocol/format, 6 `WrongCluster`.
+  - exit codes in `target.rs`: 3 no leader (`cluster leader`), 4 write deadline (`NoLeader`), 5 protocol/format, 6 `WrongCluster`, 7 `TELEMETRY_CONFIG` (`serve` refused its OpenTelemetry settings or could not build the exporters, ADR 0009).
 
   Depends on the `graph-store` traits, not on redb directly.
 - **xtask** (not a workspace member; own `Cargo.toml` and lockfile): dev tooling, today only `proto` (`protox` + `tonic-prost-build`). Never shipped and not seen by the pure-Rust gate.

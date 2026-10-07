@@ -341,6 +341,9 @@ pub struct Running {
     pub identity: Arc<ClusterIdentity>,
     /// The backup uploader (`--backup-url`).
     pub backup: Option<crate::backup::Backup>,
+    /// The services' shared context (the metrics golden test renders it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) ctx: Arc<Ctx>,
 }
 
 impl Running {
@@ -1174,6 +1177,7 @@ pub async fn start(
         paths,
         identity,
         backup,
+        ctx,
     })
 }
 

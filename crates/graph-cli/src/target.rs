@@ -40,6 +40,10 @@ pub mod exit {
     /// another cluster (`WrongCluster`): `serve --join` a peer of another
     /// cluster, say.
     pub const WRONG_CLUSTER: i32 = 6;
+    /// `serve` refused its OpenTelemetry settings (an `https://` or
+    /// malformed `--otlp-endpoint`/`otlp-endpoint`, a bad `--otlp-signals`)
+    /// or could not build the exporters (ADR 0009 D3).
+    pub const TELEMETRY_CONFIG: i32 = 7;
 }
 
 /// An error that carries its own exit code.
