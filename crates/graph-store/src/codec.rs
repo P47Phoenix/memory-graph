@@ -620,6 +620,19 @@ impl Lazy<'_> {
         ords: &[usize],
         mut f: impl FnMut(usize, &TokRec),
     ) -> Result<(), StoreError> {
+        self.tokens_at_while(ords, |o, t| {
+            f(o, t);
+            true
+        })
+    }
+
+    /// [`Lazy::tokens_at`], stopping after the first record for which `f`
+    /// returns `false` (later ordinals are neither read nor checked).
+    pub fn tokens_at_while(
+        &self,
+        ords: &[usize],
+        mut f: impl FnMut(usize, &TokRec) -> bool,
+    ) -> Result<(), StoreError> {
         let mut r = Reader {
             b: self.toks,
             at: 0,
@@ -652,7 +665,9 @@ impl Lazy<'_> {
             let rec = self.record(&mut r, &prev)?;
             prev = rec.span;
             next += 1;
-            f(ord, &rec);
+            if !f(ord, &rec) {
+                break;
+            }
         }
         Ok(())
     }

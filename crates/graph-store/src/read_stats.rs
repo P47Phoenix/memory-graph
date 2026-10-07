@@ -82,6 +82,19 @@ pub struct ReadStats {
     pub full_bytes: u64,
     /// Nanoseconds inside symbol-section decodes (timing on only).
     pub symbol_decode_nanos: u64,
+    /// Postings (one per candidate file) read by `search` (issue #246).
+    pub search_postings: u64,
+    /// Nanoseconds in `search`'s posting scan (timing on only).
+    pub search_posting_nanos: u64,
+    /// Nanoseconds resolving candidate files' org/repo/file nodes and
+    /// filtering and sorting them, in `search` (timing on only).
+    pub search_ctx_nanos: u64,
+    /// Files `search` walked (read a posting count or a token stream for).
+    pub search_walk_files: u64,
+    /// Nanoseconds in `search`'s per-file walk (timing on only).
+    pub search_walk_nanos: u64,
+    /// Token records `search` read through posting ordinals.
+    pub search_walk_tokens: u64,
 }
 
 impl ReadStats {
@@ -120,6 +133,12 @@ impl ReadStats {
             self.lazy_bytes,
             self.full_bytes,
             self.symbol_decode_nanos,
+            self.search_postings,
+            self.search_posting_nanos,
+            self.search_ctx_nanos,
+            self.search_walk_files,
+            self.search_walk_nanos,
+            self.search_walk_tokens,
         ]
     }
 
@@ -143,6 +162,12 @@ impl ReadStats {
             lazy_bytes: v[Counter::LazyBytes as usize],
             full_bytes: v[Counter::FullBytes as usize],
             symbol_decode_nanos: v[Counter::SymbolNanos as usize],
+            search_postings: v[Counter::SearchPostings as usize],
+            search_posting_nanos: v[Counter::SearchPostingNanos as usize],
+            search_ctx_nanos: v[Counter::SearchCtxNanos as usize],
+            search_walk_files: v[Counter::SearchWalkFiles as usize],
+            search_walk_nanos: v[Counter::SearchWalkNanos as usize],
+            search_walk_tokens: v[Counter::SearchWalkTokens as usize],
         }
     }
 }
@@ -169,9 +194,15 @@ pub(crate) enum Counter {
     LazyBytes,
     FullBytes,
     SymbolNanos,
+    SearchPostings,
+    SearchPostingNanos,
+    SearchCtxNanos,
+    SearchWalkFiles,
+    SearchWalkNanos,
+    SearchWalkTokens,
 }
 
-const COUNTERS: usize = 18;
+const COUNTERS: usize = 24;
 
 static GLOBAL: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 static TIMING: AtomicBool = AtomicBool::new(false);
@@ -244,6 +275,43 @@ pub(crate) fn timed<T>(counter: Counter, nanos: Counter, f: impl FnOnce() -> T) 
         .max(1);
     add(nanos, spent);
     out
+}
+
+/// Add `n` events to a counter.
+#[inline]
+pub(crate) fn bump_by(counter: Counter, n: usize) {
+    add(counter, u64::try_from(n).unwrap_or(u64::MAX));
+}
+
+/// A phase timer: with timing on, adds the time from [`PhaseTimer::start`]
+/// to the drop (or [`PhaseTimer::stop`]) to `nanos`; free otherwise.
+pub(crate) struct PhaseTimer {
+    nanos: Counter,
+    start: Option<Instant>,
+}
+
+impl PhaseTimer {
+    #[inline]
+    pub(crate) fn start(nanos: Counter) -> Self {
+        PhaseTimer {
+            nanos,
+            start: timing().then(Instant::now),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn stop(self) {}
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        if let Some(start) = self.start.take() {
+            let spent = u64::try_from(start.elapsed().as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            add(self.nanos, spent);
+        }
+    }
 }
 
 /// Add `bytes` (the length of an encoded input) to a byte counter.

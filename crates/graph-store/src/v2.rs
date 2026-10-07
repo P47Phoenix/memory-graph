@@ -20,7 +20,7 @@
 //! is refused before anything is written (a retired v1 file with
 //! [`StoreError::LegacyFormat`], anything else with `SchemaMismatch`).
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
-use crate::read_stats::{self, Counter};
+use crate::read_stats::{self, Counter, PhaseTimer};
 use crate::{check_unchanged, dec, describe_in, enc, SnapshotStats, Store, StoreRead};
 use crate::{
     commit_prepared, prepare_file, stored_fingerprint_matches, stored_fingerprints, PreparedFile,
@@ -601,6 +601,19 @@ pub(crate) struct R {
     /// Per-query caches: dictionary texts and org/repo rows are read once.
     texts: RefCell<HashMap<u64, Rc<str>>>,
     ents: RefCell<HashMap<u64, Rc<Node>>>,
+}
+
+/// A file row's parent, path and language, decoded alone (see
+/// `file_slim`); the field names are `Node`'s. Only these fields are
+/// checked here: the rest of the row (e.g. the encoding name) is validated
+/// by the full decode, which `search` now runs only for files it walks, so
+/// a corrupt row that is filtered out or past the limit is no longer
+/// reported. Results on a healthy store are unchanged (issue #246).
+#[derive(serde::Deserialize)]
+struct FileSlim {
+    parent: Option<NodeId>,
+    name: String,
+    language: Option<String>,
 }
 
 /// One file with its containment path.
@@ -1483,6 +1496,16 @@ impl R {
         Ok(out)
     }
 
+    /// The fields of file `id`'s row that `search` filters and sorts on,
+    /// without decoding the rest of the node.
+    fn file_slim(&self, id: u64) -> Result<FileSlim> {
+        let v = self
+            .nodes
+            .get(id)?
+            .ok_or_else(|| StoreError::Corrupt(format!("dangling node {id}")))?;
+        serde_json::from_slice(v.value()).map_err(|e| StoreError::Corrupt(e.to_string()))
+    }
+
     fn ctx(&self, file_id: u64, cache: &mut HashMap<u64, FileCtx>) -> Result<()> {
         if cache.contains_key(&file_id) {
             return Ok(());
@@ -1772,40 +1795,59 @@ impl R {
         // Candidate files come from the postings; token, symbol and class
         // reads decode the stream, file/repo/org roll-ups without a class
         // filter use the posting counts alone.
-        let mut cands: Vec<(u64, Vec<u8>)> = Vec::new();
-        for r in self.post.range((term, 0)..=(term, u64::MAX))? {
-            let (k, v) = r?;
-            cands.push((k.value().1, v.value().to_vec()));
-        }
         let counts_only =
             q.class.is_none() && matches!(q.grain, Grain::File | Grain::Repo | Grain::Org);
+        // The scan keeps only the file id, plus the occurrence count for a
+        // counts-only roll-up (the posting's first varint); a stream grain
+        // reads a posting's ordinals only for a file the walk reaches
+        // (issue #246). A count's decode error surfaces only if its file is
+        // walked, as before.
+        let posting_timer = PhaseTimer::start(Counter::SearchPostingNanos);
+        type Cand = (u64, Option<Result<usize>>);
+        let mut cands: Vec<Cand> = Vec::new();
+        for r in self.post.range((term, 0)..=(term, u64::MAX))? {
+            let (k, v) = r?;
+            let count = counts_only.then(|| codec::posting_count(v.value()));
+            cands.push((k.value().1, count));
+        }
+        read_stats::bump_by(Counter::SearchPostings, cands.len());
+        posting_timer.stop();
+        let ctx_timer = PhaseTimer::start(Counter::SearchCtxNanos);
         let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
         let mut files: HashMap<u64, FileCtx> = HashMap::new();
-        let mut order: Vec<(u64, Vec<u8>)> = Vec::new();
+        // Filter and sort on a slim decode of each candidate's file row
+        // (parent, path, language) with the org and repo rows from the
+        // per-query entity cache; the whole file node is decoded only for a
+        // file the walk reaches (issue #246: on a hot term the full JSON
+        // decode of every candidate dominated the query).
+        let mut keyed: Vec<(Rc<Node>, Rc<Node>, String, Cand)> = Vec::new();
         for (fid, post) in cands {
-            self.ctx(fid, &mut files)?;
-            let c = &files[&fid];
+            let f = self.file_slim(fid)?;
+            let repo = self.entity(
+                f.parent
+                    .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?,
+            )?;
+            let org = self.entity(
+                repo.parent
+                    .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
+            )?;
             if want_lang
                 .as_ref()
-                .is_some_and(|l| c.file.language.as_ref() != Some(l))
-                || q.org.as_deref().is_some_and(|o| c.org.name != o)
-                || q.repo.as_deref().is_some_and(|r| c.repo.name != r)
+                .is_some_and(|l| f.language.as_ref() != Some(l))
+                || q.org.as_deref().is_some_and(|o| org.name != o)
+                || q.repo.as_deref().is_some_and(|r| repo.name != r)
             {
                 continue;
             }
-            order.push((fid, post));
+            keyed.push((org, repo, f.name, (fid, post)));
         }
         // Sorted-by-path order: every later file sorts after every row of the
         // earlier ones, so once the limit is met at a group boundary the walk
         // can stop without reading the remaining streams.
-        order.sort_by(|(a, _), (b, _)| {
-            let (a, b) = (&files[a], &files[b]);
-            (&a.org.name, &a.repo.name, &a.file.name).cmp(&(
-                &b.org.name,
-                &b.repo.name,
-                &b.file.name,
-            ))
-        });
+        keyed.sort_by(|a, b| (&a.0.name, &a.1.name, &a.2).cmp(&(&b.0.name, &b.1.name, &b.2)));
+        let order: Vec<Cand> = keyed.into_iter().map(|k| k.3).collect();
+        ctx_timer.stop();
+        let _walk_timer = PhaseTimer::start(Counter::SearchWalkNanos);
         // See `search_symbols`'s `want` comment: the stop threshold must
         // include rows that `offset` will later skip.
         let want = q
@@ -1822,6 +1864,7 @@ impl R {
         type SibKey = (u64, Option<u64>, String, Option<String>);
         let mut sib_owners: HashMap<SibKey, Option<(u64, Vec<Node>)>> = HashMap::new();
         for (fid, post) in order {
+            self.ctx(fid, &mut files)?;
             let c = &files[&fid];
             let group = match q.grain {
                 Grain::Org => (c.org.id, 0, 0),
@@ -1859,6 +1902,7 @@ impl R {
                 }
             }
             last_group = Some(group);
+            read_stats::bump(Counter::SearchWalkFiles);
             let base_hit = |count: usize| Hit {
                 grain: q.grain,
                 org: c.org.name.clone(),
@@ -1901,7 +1945,7 @@ impl R {
                 _ => {}
             };
             if counts_only {
-                let n_post = codec::posting_count(&post)?;
+                let n_post = post.ok_or_else(|| StoreError::Corrupt("count missing".into()))??;
                 let mut hit = base_hit(n_post);
                 roll(&mut hit);
                 rows.entry(file_key(q.grain))
@@ -1918,12 +1962,33 @@ impl R {
                 continue;
             }
             // Read only the postings' ordinals through the checkpoints.
+            let ords = {
+                let post = self.post.get((term, fid))?.ok_or_else(|| {
+                    StoreError::Corrupt(format!("posting ({term}, {fid}) vanished"))
+                })?;
+                codec::posting_ordinals(post.value())?
+            };
+            // Token grain: rows are keyed (path, span.start, ordinal), every
+            // match is its own row, and a stream stores its tokens sorted by
+            // start (`V2Prep::build`), so matches arrive in key order and,
+            // within this file, everything after the first `need` sorts past
+            // the `want` cut-off: stop reading there. Other grains key rows
+            // by symbol and must read every match.
+            let need = if q.grain == Grain::Token {
+                want.saturating_sub(rows.len())
+            } else {
+                usize::MAX
+            };
             let mut matches: Vec<(usize, TokRec)> = Vec::new();
-            lazy.tokens_at(&codec::posting_ordinals(&post)?, |ord, t| {
+            let mut read = 0usize;
+            lazy.tokens_at_while(&ords, |ord, t| {
+                read += 1;
                 if t.term == term && q.class.is_none_or(|c| c == t.class) {
                     matches.push((ord, t.clone()));
                 }
+                matches.len() < need
             })?;
+            read_stats::bump_by(Counter::SearchWalkTokens, read);
             if matches.is_empty() {
                 continue;
             }

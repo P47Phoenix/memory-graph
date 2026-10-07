@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 32] = [
+pub const METRIC_NAMES: [&str; 34] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -66,6 +66,8 @@ pub const METRIC_NAMES: [&str; 32] = [
     "mg_read_query_seconds_total",
     "mg_read_txns_total",
     "mg_read_dict_strings_total",
+    "mg_read_search_items_total",
+    "mg_read_search_seconds_total",
     "mg_queries_total",
     "mg_query_exact_repeats_total",
 ];
@@ -695,11 +697,11 @@ fn repeats_families(log: &crate::repeats::RepeatLog) -> Vec<MetricFamily> {
     vec![queries, repeats]
 }
 
-/// A counter family with one sample per decode kind.
-fn per_kind(
+/// A counter family with one sample per `kind` label value.
+fn per_kind<const N: usize>(
     name: &'static str,
     help: &'static str,
-    by_kind: [(&str, SampleValue); 4],
+    by_kind: [(&str, SampleValue); N],
 ) -> MetricFamily {
     let mut family = MetricFamily::new(name, MetricKind::Counter, help);
     for (kind, v) in by_kind {
@@ -769,6 +771,24 @@ fn read_stats_families(r: &graph_store::read_stats::ReadStats) -> Vec<MetricFami
             "mg_read_dict_strings_total",
             "Dictionary strings allocated by query-side term lookups.",
             Int(r.dict_strings_decoded),
+        ),
+        per_kind(
+            "mg_read_search_items_total",
+            "Search work, by kind (postings: candidate files' postings scanned; walk_files: files walked; walk_tokens: token records read through posting ordinals).",
+            [
+                ("postings", Int(r.search_postings)),
+                ("walk_files", Int(r.search_walk_files)),
+                ("walk_tokens", Int(r.search_walk_tokens)),
+            ],
+        ),
+        per_kind(
+            "mg_read_search_seconds_total",
+            "Seconds in search's phases, by kind (posting: the posting scan; ctx: resolving, filtering and sorting candidate files; walk: the per-file walk) (--read-timing only).",
+            [
+                ("posting", secs(r.search_posting_nanos)),
+                ("ctx", secs(r.search_ctx_nanos)),
+                ("walk", secs(r.search_walk_nanos)),
+            ],
         ),
     ]
 }
@@ -1122,7 +1142,7 @@ mod tests {
             .lines()
             .filter_map(|l| l.strip_prefix("# TYPE "))
             .collect();
-        assert_eq!(families.len(), 7, "{out}");
+        assert_eq!(families.len(), 9, "{out}");
         for f in families {
             let (name, kind) = f.split_once(' ').expect("TYPE name kind");
             assert_eq!(kind, "counter", "{name}");
