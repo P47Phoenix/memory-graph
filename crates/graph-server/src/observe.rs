@@ -697,7 +697,7 @@ fn repeats_families(log: &crate::repeats::RepeatLog) -> Vec<MetricFamily> {
     vec![queries, repeats]
 }
 
-/// A counter family with one sample per decode kind.
+/// A counter family with one sample per `kind` label value.
 fn per_kind<const N: usize>(
     name: &'static str,
     help: &'static str,

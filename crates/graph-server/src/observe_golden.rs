@@ -278,7 +278,7 @@ fn counter(out: &mut String, name: &str, help: &str, v: impl std::fmt::Display) 
     let _ = writeln!(out, "{name} {v}");
 }
 
-/// A counter family with one sample per decode kind.
+/// A counter family with one sample per `kind` label value.
 fn per_kind<V: std::fmt::Display, const N: usize>(
     out: &mut String,
     name: &str,

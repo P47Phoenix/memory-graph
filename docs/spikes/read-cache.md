@@ -383,7 +383,8 @@ All of it is read side only: no format change, and results are unchanged.
 2. **Lazy posting values.** The scan keeps only the file id, plus the count (the first varint) for a counts-only roll-up. A stream grain reads a posting's ordinals with a point lookup, and only for a file the walk reaches.
 3. **Org and repo rows** were already cached per query (`entity`, read cache phase 1), so `ctx` needed no new cache.
 4. **Token-grain early stop.** Inside a file, the token walk stops once `want - rows.len()` matches have passed the class filter (`Lazy::tokens_at_while`). Token rows are keyed (path, start, ordinal) and a stream stores tokens sorted by start, so later matches in that file sort past the cut-off. The symbol, method and class grains and the class-grain `past_cut` (#149) are untouched. On this workload it saves little: walk tokens per query went from 517.8 to 517.4.
-5. The optional top-k partial sort was skipped. The sort is no longer the cost, and a partial sort would complicate equivalence.
+5. **Validation note.** The full node decode, and with it the validation of the rest of the row (e.g. the encoding name), now runs only for walked files. So a corrupt file row that is filtered out or lies past the limit is no longer reported as an error. Results on a healthy store are unchanged.
+6. The optional top-k partial sort was skipped. The sort is no longer the cost, and a partial sort would complicate equivalence.
 
 ### Numbers
 

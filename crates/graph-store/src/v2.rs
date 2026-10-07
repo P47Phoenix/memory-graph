@@ -604,7 +604,11 @@ pub(crate) struct R {
 }
 
 /// A file row's parent, path and language, decoded alone (see
-/// `file_slim`); the field names are `Node`'s.
+/// `file_slim`); the field names are `Node`'s. Only these fields are
+/// checked here: the rest of the row (e.g. the encoding name) is validated
+/// by the full decode, which `search` now runs only for files it walks, so
+/// a corrupt row that is filtered out or past the limit is no longer
+/// reported. Results on a healthy store are unchanged (issue #246).
 #[derive(serde::Deserialize)]
 struct FileSlim {
     parent: Option<NodeId>,
