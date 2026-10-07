@@ -196,6 +196,10 @@ pub struct RedbLogStore {
     observer: Option<AppendObserver>,
     #[cfg(test)]
     compact_gate: Arc<std::sync::Mutex<Option<CompactGate>>>,
+    /// Test-only: why the last `compact_if_sparse` returned before
+    /// compacting (`None`: it compacted, or none ran yet).
+    #[cfg(test)]
+    last_skip: Arc<std::sync::Mutex<Option<&'static str>>>,
 }
 
 /// A redb transaction together with the read guard of the store's lock it
@@ -323,6 +327,8 @@ impl RedbLogStore {
             observer: None,
             #[cfg(test)]
             compact_gate: Arc::default(),
+            #[cfg(test)]
+            last_skip: Arc::default(),
         };
         Ok(s)
     }
@@ -399,7 +405,10 @@ impl RedbLogStore {
     }
 
     /// Test-only: `compact_if_sparse` calls this while it holds the write
-    /// side of the lock, before compacting (a test holds it open).
+    /// side of the lock, before compacting (a test holds it open). While a
+    /// gate is set the sparsity checks (floor, twice live, the cap) do not
+    /// skip: a gated test is about the locking, and must reach the gate
+    /// whatever redb's page accounting says on the machine at hand (#237).
     #[cfg(test)]
     pub(crate) fn set_compact_gate(&self, gate: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self
@@ -434,13 +443,15 @@ impl RedbLogStore {
     /// compacted; a failure is logged, never fatal (the log is intact
     /// either way).
     pub fn compact_if_sparse(&self) -> bool {
+        #[cfg(test)]
+        self.record_skip(None);
         if self.closing.load(Ordering::SeqCst) {
-            return false;
+            return self.skip("closing");
         }
         let file = self.file_bytes();
         let floor = self.compacted_bytes.load(Ordering::Relaxed);
-        if file < floor.saturating_add(COMPACT_SLACK) {
-            return false;
+        if file < floor.saturating_add(COMPACT_SLACK) && !self.gated() {
+            return self.skip("under the floor");
         }
         let live = {
             // A purge's pages are released only by later commits: two
@@ -462,18 +473,18 @@ impl RedbLogStore {
                 Ok(s) => s.allocated_pages() * s.page_size() as u64,
                 Err(e) => {
                     tracing::warn!(error = %e, "raft log: reading page stats failed");
-                    return false;
+                    return self.skip("page stats failed");
                 }
             }
         };
         // Not worth it while the file is within twice its live data (redb
         // keeps a floor: its region layout and power-of-two value
         // allocations).
-        if file < live.saturating_mul(2).saturating_add(COMPACT_SLACK) {
-            return false;
+        if file < live.saturating_mul(2).saturating_add(COMPACT_SLACK) && !self.gated() {
+            return self.skip("within twice live");
         }
         let max_live = self.max_live.load(Ordering::Relaxed);
-        if live > max_live {
+        if live > max_live && !self.gated() {
             tracing::info!(
                 file,
                 live,
@@ -481,7 +492,7 @@ impl RedbLogStore {
                 "raft log: compaction skipped, the live log is too large to rewrite without \
                  stalling appends (a later purge retries)"
             );
-            return false;
+            return self.skip("above the cap");
         }
         let mut db = self.db.write().unwrap_or_else(|p| p.into_inner());
         #[cfg(test)]
@@ -496,7 +507,7 @@ impl RedbLogStore {
             }
         }
         if self.closing.load(Ordering::SeqCst) {
-            return false;
+            return self.skip("closing");
         }
         // `compact` itself loops until a pass makes no progress.
         let started = std::time::Instant::now();
@@ -517,6 +528,46 @@ impl RedbLogStore {
     }
 
     /// Whether a background compaction (started by a purge) is running.
+    /// `compact_if_sparse` returns false for `_reason` (kept for tests).
+    fn skip(&self, _reason: &'static str) -> bool {
+        #[cfg(test)]
+        self.record_skip(Some(_reason));
+        false
+    }
+
+    #[cfg(test)]
+    fn record_skip(&self, reason: Option<&'static str>) {
+        *self
+            .last_skip
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reason;
+    }
+
+    /// Test-only: why the last `compact_if_sparse` skipped, if it did.
+    #[cfg(test)]
+    pub(crate) fn last_skip(&self) -> Option<&'static str> {
+        *self
+            .last_skip
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A test gate is set (see [`Self::set_compact_gate`]); always false
+    /// outside tests.
+    fn gated(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.compact_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     pub fn is_compacting(&self) -> bool {
         self.compacting.is_running()
     }
@@ -963,7 +1014,11 @@ mod tests {
                 .expect("purge returned while the compaction waits")
                 .unwrap()
         });
-        assert!(log.is_compacting());
+        assert!(
+            log.is_compacting(),
+            "the compaction ended before the gate: {:?}",
+            log.last_skip()
+        );
         // The held read transaction still reads the whole log as of its
         // start (before the purge).
         assert_eq!(rtxn.open_table(LOG).unwrap().len().unwrap(), 24);
