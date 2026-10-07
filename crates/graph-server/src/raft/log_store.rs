@@ -527,14 +527,17 @@ impl RedbLogStore {
         true
     }
 
-    /// Whether a background compaction (started by a purge) is running.
-    /// `compact_if_sparse` returns false for `_reason` (kept for tests).
+    // Skip bookkeeping for `compact_if_sparse` (the reasons are test-only).
+
+    /// `compact_if_sparse` gives up for `_reason`: records it (in tests)
+    /// and returns false.
     fn skip(&self, _reason: &'static str) -> bool {
         #[cfg(test)]
         self.record_skip(Some(_reason));
         false
     }
 
+    /// Test-only: set (or with `None`, clear) the reason `last_skip` reports.
     #[cfg(test)]
     fn record_skip(&self, reason: Option<&'static str>) {
         *self
@@ -568,6 +571,7 @@ impl RedbLogStore {
         }
     }
 
+    /// Whether a background compaction (started by a purge) is running.
     pub fn is_compacting(&self) -> bool {
         self.compacting.is_running()
     }
