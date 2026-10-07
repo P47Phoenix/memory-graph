@@ -135,6 +135,11 @@ pub struct DirOpts<'a> {
     /// replaced files, so the `vacuum --compact` hint is not printed (unless
     /// files failed: the run then errors before the caller compacts).
     pub compact: bool,
+    /// Bytes of store page cache the run's store holds (`--cache-bytes` or
+    /// the derived size), subtracted from a fraction `memory` budget so the
+    /// two do not double-claim RAM (#236); 0 subtracts nothing (a remote
+    /// store, whose cache lives in the server).
+    pub page_cache_bytes: u64,
 }
 
 /// Source bytes per redb transaction unless `--chunk-bytes` says otherwise
@@ -283,6 +288,31 @@ fn compact_hint(store: &dyn Store) {
 
 const BATCH_FILES: usize = 256;
 const BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// The least memory budget `index` ever sets: one whole batch in
+/// `--deterministic` (a fixed batch holds its files until it commits).
+fn index_budget_floor(deterministic: bool) -> u64 {
+    if deterministic {
+        BATCH_BYTES as u64
+    } else {
+        1
+    }
+}
+
+/// The page cache an embedded `index` opens its store with and subtracts
+/// from its memory budget (#236), and a warning to print: `explicit` is
+/// `--cache-bytes`, kept as given (warned about when it pushes the budget
+/// onto its floor); without it the derived size, shrunk quietly when it
+/// would (see [`sysinfo::Sizing::fit_page_cache`]).
+pub fn index_page_cache(
+    explicit: Option<u64>,
+    memory: Option<sysinfo::MemorySpec>,
+    deterministic: bool,
+) -> (u64, Option<String>) {
+    let cache = sysinfo::cache_bytes_or_derived(explicit);
+    sysinfo::Sizing::detect(0, memory, index_budget_floor(deterministic))
+        .fit_page_cache(cache, explicit.is_some())
+}
 
 /// Skip reason for a file refused by `--strict-encoding` (its decode was lossy).
 pub const STRICT_ENCODING_REFUSED: &str = "invalid in its encoding (--strict-encoding)";
@@ -1286,12 +1316,9 @@ pub fn index_dir_with(
     // A fixed batch holds its files' bytes until it commits, so in
     // deterministic mode the budget must always fit one whole batch; the
     // file that closes it is admitted on top (admission slack, below).
-    let floor = if o.deterministic {
-        BATCH_BYTES as u64
-    } else {
-        1
-    };
-    let sizing = sysinfo::Sizing::detect(o.jobs, o.memory, floor);
+    let floor = index_budget_floor(o.deterministic);
+    let sizing =
+        sysinfo::Sizing::detect_with_page_cache(o.jobs, o.memory, floor, o.page_cache_bytes);
     let mut board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
     if let Some(r) = remote {
         board.set_remote(r);
