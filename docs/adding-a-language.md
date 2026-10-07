@@ -14,7 +14,7 @@ These `graph-core` items are the stable surface for extractors:
 
 | Item | Role |
 |---|---|
-| `Extractor` | `language()`, `extract(src)`, `version()`, `extensions()` |
+| `Extractor` | `language()`, `extract(src)`, `extract_noted(src)`, `version()`, `extensions()` |
 | `Extraction` | `symbols`, `tokens`, `has_errors` |
 | `SymbolDecl` | `name`, `kind: SymbolKind`, `lang_kind: Option<String>`, `span`, `owner: Option<String>` |
 | `TokenDecl`, `Span`, `TokenClass`, `SymbolKind` | schema types |
@@ -36,6 +36,18 @@ These `graph-core` items are the stable surface for extractors:
 - `extract(src)` — returns tokens and symbols. It should never panic, and
   should set `has_errors` only when the source is truly unparseable for your
   extractor — a scanner that finds fewer symbols on odd input is not an error.
+- `extract_noted(src)` — optional; defaults to `(extract(src), None)`.
+  Override it when your extractor deliberately degrades a file (for example
+  the Rust extractor skips `syn` on input nested too deep to parse safely and
+  returns tokens only, #245): the note is reported as the file's warning,
+  naming your extractor's version. `extract` and `extract_noted` must
+  agree: `extract(src)` returns exactly `extract_noted(src).0`.
+- Stack: `memory-graph index` runs extractors on parse threads with
+  `graph_core::EXTRACT_STACK_BYTES` (16 MiB), but other callers (a server,
+  `index-file`, a library) may use smaller stacks. A recursive parser must
+  bound its own stack use. The Rust extractor does this by running `syn` on
+  an internal thread sized from the token count of the largest top-level
+  item, so any input is safe.
 - `version()` — part of every file's fingerprint. **Bump it whenever
   `extract`'s output could change**, and include `TOKENIZER_VERSION`, e.g.
   `format!("ini-scan-1+tok{TOKENIZER_VERSION}")`. Files indexed by an older

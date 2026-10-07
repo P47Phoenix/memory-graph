@@ -19,6 +19,9 @@ impl Extractor for SharedExtractor {
     fn extract(&self, source: &str) -> Extraction {
         self.0.extract(source)
     }
+    fn extract_noted(&self, source: &str) -> (Extraction, Option<String>) {
+        self.0.extract_noted(source)
+    }
     fn version(&self) -> String {
         self.0.version()
     }

@@ -786,7 +786,7 @@ fn run_pipeline(
         });
         for k in 0..board.sizing.parse_threads {
             let (job_rx, res_tx) = (job_rx.clone(), res_tx.clone());
-            sc.spawn(move || {
+            let spawned = spawn_extract_scoped(sc, format!("parse-{k}"), move || {
                 loop {
                     let why = if admit_blocked.load(Relaxed) {
                         "memory"
@@ -826,6 +826,12 @@ fn run_pipeline(
                 }
                 board.parse.done(k);
             });
+            if let Err(e) = spawned {
+                // Stop the walk, admission and already-started parse threads
+                // (all of them check `cancel`) so the scope can join them.
+                cancel.store(true, Relaxed);
+                return Err(e).context("could not start a parse thread");
+            }
         }
         drop((job_rx, res_tx));
         let finished = &finished;
@@ -1154,6 +1160,28 @@ fn commit_all(
             }
         }
     }
+}
+
+/// A thread builder for threads that run extractors: named, with
+/// [`graph_core::EXTRACT_STACK_BYTES`] of stack instead of the 2 MiB
+/// default, which `syn` overflows on deeply nested sources (#245).
+pub fn extract_thread(name: impl Into<String>) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(graph_core::EXTRACT_STACK_BYTES)
+}
+
+/// Spawn `f` as a scoped [`extract_thread`].
+pub fn spawn_extract_scoped<'scope, 'env, F, T>(
+    sc: &'scope std::thread::Scope<'scope, 'env>,
+    name: impl Into<String>,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    extract_thread(name).spawn_scoped(sc, f)
 }
 
 /// Index every text file under `dir`. Paths are stored relative to `dir`.

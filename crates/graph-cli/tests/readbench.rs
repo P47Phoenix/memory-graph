@@ -689,7 +689,13 @@ fn bump_cost_ns() -> f64 {
 fn measure_reads() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = Config::from_env(tmp.path());
-    let (db, workload) = prepare(&cfg);
+    // Indexing runs extractors: give it their stack (#245), not libtest's.
+    let (db, workload) = std::thread::scope(|sc| {
+        graph_cli::spawn_extract_scoped(sc, "readbench-index", || prepare(&cfg))
+            .expect("spawn the index thread")
+            .join()
+            .expect("index thread")
+    });
     let ops = workload.ops();
     println!("workload: {} queries per pass", ops.len());
 

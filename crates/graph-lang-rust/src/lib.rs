@@ -9,6 +9,11 @@ use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind, TokenClass
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
+mod nesting;
+mod stack;
+pub use nesting::{MAX_CHAIN_LEN, MAX_NESTING_DEPTH};
+pub use stack::{MAX_PARSE_STACK, STACK_BASE, STACK_PER_TOKEN};
+
 pub struct RustExtractor;
 
 impl Extractor for RustExtractor {
@@ -17,15 +22,20 @@ impl Extractor for RustExtractor {
     }
 
     fn version(&self) -> String {
-        // `kw1`: keywords are classed `keyword` (#98). Part of the file
-        // fingerprint, so a store indexed before it re-indexes Rust files.
+        // `kw1`: keywords are classed `keyword` (#98). `deep1`: input
+        // nested too deep for `syn` is stored tokens only (#245). Part of
+        // the file fingerprint, so a store indexed before re-indexes Rust.
         format!(
-            "rust-syn-2+kw1+tok{}",
+            "rust-syn-2+kw1+deep1+tok{}",
             graph_core::tokenizer::TOKENIZER_VERSION
         )
     }
 
     fn extract(&self, source: &str) -> Extraction {
+        self.extract_noted(source).0
+    }
+
+    fn extract_noted(&self, source: &str) -> (Extraction, Option<String>) {
         let mut tokens = tokenize_with(
             source,
             TokenizerOptions {
@@ -51,32 +61,48 @@ impl Extractor for RustExtractor {
                 t.class = TokenClass::Keyword;
             }
         }
-        // syn strips a BOM before lexing, so its byte ranges start after it.
-        let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
-        let file = match syn::parse_file(&source[bom..]) {
-            Ok(f) => f,
-            Err(_) => {
-                return Extraction {
-                    symbols: vec![],
-                    tokens,
-                    has_errors: true,
-                }
-            }
-        };
-        let mut v = Collector {
-            bom,
-            src: source,
-            line_starts: line_starts(source),
-            char_marks: char_marks(source),
-            out: vec![],
-        };
-        v.visit_file(&file);
-        Extraction {
-            symbols: v.out,
-            tokens,
-            has_errors: false,
+        if let Some(why) = nesting::too_deep(&tokens) {
+            let ex = Extraction {
+                symbols: vec![],
+                tokens,
+                has_errors: false,
+            };
+            return (ex, Some(why));
         }
+        let (symbols, has_errors, note) = match stack::parse_on_safe_stack(source, &tokens) {
+            Ok(Some(symbols)) => (symbols, false, None),
+            Ok(None) => (vec![], true, None),
+            Err(why) => (vec![], false, Some(why)),
+        };
+        let ex = Extraction {
+            symbols,
+            tokens,
+            has_errors,
+        };
+        (ex, note)
     }
+}
+
+/// Parse `source` with `syn` and collect its symbols, on the calling
+/// thread with no stack guard; `None` if it does not parse. The parse, the
+/// visit and the drop of the syntax tree all recurse once per nesting
+/// level, so this must run on a stack sized by [`stack`]. Public only for
+/// the `stack_probe` example that measures that size.
+#[doc(hidden)]
+pub fn parse_symbols_unguarded(source: &str) -> Option<Vec<SymbolDecl>> {
+    // syn strips a BOM before lexing, so its byte ranges start after it.
+    let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
+    let file = syn::parse_file(&source[bom..]).ok()?;
+    let mut v = Collector {
+        bom,
+        src: source,
+        line_starts: line_starts(source),
+        char_marks: char_marks(source),
+        out: vec![],
+    };
+    v.visit_file(&file);
+    drop(file);
+    Some(v.out)
 }
 
 /// Rust's strict and reserved keywords (the Reference, edition 2018 and
