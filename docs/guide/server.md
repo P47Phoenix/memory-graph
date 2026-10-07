@@ -54,6 +54,12 @@ A served file opened directly waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_W
 
 **Write deadline.** `--write-deadline <duration>` (or `MEMORY_GRAPH_WRITE_DEADLINE`; e.g. `500ms`, `10s`, `2m`; default `10s`) is how long a write keeps retrying through no leader or a lost connection before it fails with exit code 4. A membership change refused only for the moment (`cluster remove`'s quorum check right after a leader change, see the cluster guide) is retried within the same deadline, and then fails with that refusal (exit code 1).
 
+## Upgrades: one binary version per cluster during writes
+
+**Run one `memory-graph` version on every node of a cluster while it takes writes.** Upgrade between write bursts: stop writing, upgrade and restart the nodes, then write again. There is no guard for this; it is up to you (#212).
+
+Why: every replica applies a write itself, running its own build's code on it. Two builds can store the same file differently. For example, the build before the span safety net (#203) rejects a file whose symbol spans are invalid, while a later build stores its tokens with no symbols and a span warning. Replicas on different builds then hold different data and give different answers. Nodes refuse Raft traffic, snapshots and joins from a peer whose extractor versions (or store format, tokenizer or decoder versions) differ, so a bump of those stops replication rather than diverging. A change in behaviour that keeps those versions, like the one above, is not caught. So when an extractor's output changes, bump its version: the extractors hash then keeps mixed clusters apart.
+
 ## Not yet: TLS and authentication
 
 TLS (issue #104, once a pure-Rust provider passes the no-C gate) and authentication (#105), see [ADR 0004](../adr/0004-client-server-and-replication.md); bind to loopback or a private network meanwhile.
