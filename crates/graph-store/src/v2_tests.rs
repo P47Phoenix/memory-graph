@@ -2066,3 +2066,33 @@ fn cross_encoding_identifiers_share_one_dictionary_term() {
         "only the three identifiers (whitespace is not interned)"
     );
 }
+
+/// Issue #246: a token-grain search with a limit stops reading a file's
+/// posting ordinals once the page is full (`search_walk_tokens` counts the
+/// records read); without a limit, or at another grain, it reads them all.
+#[test]
+fn token_grain_limit_stops_the_walk_early() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("b.redb")).unwrap();
+    let src = "foo ".repeat(50);
+    let ex = graph_core::Extraction {
+        has_errors: false,
+        symbols: vec![],
+        tokens: graph_core::tokenizer::tokenize(&src),
+    };
+    s.ingest_file("o", "r", "x.txt", "text", &ex).unwrap();
+    let walked = |grain: Grain, offset: Option<usize>, limit: Option<usize>| {
+        let mut q = Query::new("foo");
+        q.grain = grain;
+        q.offset = offset;
+        q.limit = limit;
+        let before = crate::read_stats::thread_snapshot();
+        let hits = s.search(&q).unwrap();
+        let d = crate::read_stats::thread_snapshot().since(&before);
+        (hits.len(), d.search_walk_tokens)
+    };
+    assert_eq!(walked(Grain::Token, None, Some(3)), (3, 3));
+    assert_eq!(walked(Grain::Token, Some(2), Some(3)), (3, 5));
+    assert_eq!(walked(Grain::Token, None, None), (50, 50));
+    assert_eq!(walked(Grain::Symbol, None, Some(1)), (1, 50));
+}

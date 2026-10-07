@@ -366,3 +366,53 @@ Kept for the phase 3 real-usage confirmation and #246 profiling; delete them whe
 | `D:\tmp\a5-logs` | fetch, benchmark, serve and session logs, and the session JSON | small |
 
 Already deleted: `D:\mg-target-a5` (the release build), `D:\tmp\a5-readbench` (the partial db from the stack overflow) and `D:\tmp\a5-simtest` (a smoke-test db).
+
+## Hot-term search walks (#246, 2026-10-07)
+
+### What was measured
+
+New read-path counters split `search` into three phases (`read_stats`: `search_postings`, `search_walk_files`, `search_walk_tokens` and, with timing on, `search_posting_nanos`, `search_ctx_nanos`, `search_walk_nanos`; exported as `mg_read_search_items_total{kind}` and `mg_read_search_seconds_total{kind}`). `readbench` prints them as a `search` row under each phase. Same machine, db and workload as A5 (`MG_READBENCH_REUSE=1`, `D:\tmp\a5-readbench2`, 153 queries per pass), release build, `-j 2`.
+
+The baseline (origin/main at 91d6eb3 plus the counters) put the time in **ctx**, not in the walk: per warm query 24.5 ms resolving candidate files, against 1.4 ms in the posting scan and 0.8 ms in the walk. A hot term has about 14,000 candidate files per query on average. Each one's file row was decoded whole from JSON (origin, fingerprint and all) just to filter it and sort it by path, while the limit stops the walk after about 11 files.
+
+### What changed
+
+All of it is read side only: no format change, and results are unchanged.
+
+1. **Slim file decode for filter and sort.** Candidates are filtered and sorted on a decode of only the row's `parent`, `name` and `language`, with the org and repo rows from the per-query entity cache. The full file node is decoded only for files the walk reaches.
+2. **Lazy posting values.** The scan keeps only the file id, plus the count (the first varint) for a counts-only roll-up. A stream grain reads a posting's ordinals with a point lookup, and only for a file the walk reaches.
+3. **Org and repo rows** were already cached per query (`entity`, read cache phase 1), so `ctx` needed no new cache.
+4. **Token-grain early stop.** Inside a file, the token walk stops once `want - rows.len()` matches have passed the class filter (`Lazy::tokens_at_while`). Token rows are keyed (path, start, ordinal) and a stream stores tokens sorted by start, so later matches in that file sort past the cut-off. The symbol, method and class grains and the class-grain `past_cut` (#149) are untouched. On this workload it saves little: walk tokens per query went from 517.8 to 517.4.
+5. **Validation note.** The full node decode, and with it the validation of the rest of the row (e.g. the encoding name), now runs only for walked files. So a corrupt file row that is filtered out or lies past the limit is no longer reported as an error. Results on a healthy store are unchanged.
+6. The optional top-k partial sort was skipped. The sort is no longer the cost, and a partial sort would complicate equivalence.
+
+### Numbers
+
+| phase | p50 ms before | p50 ms after | p95 ms before | p95 ms after | qps before | qps after | store ms/q before | store ms/q after |
+|---|---|---|---|---|---|---|---|---|
+| cold redb cache (1 MiB, fresh process) | 0.432 | 0.424 | 510.6 | 360.5 | 14 | 19 | 72.1 | 53.0 |
+| warm x20, timing off | 0.069 | 0.071 | 212.4 | 93.1 | 32 | 71 | n/a | n/a |
+| warm x20, timing on | 0.069 | 0.073 | 208.9 | 93.3 | 33 | 71 | 30.7 | 14.1 |
+| 8 threads x20 | 0.084 | 0.089 | 282.0 | 129.0 | 188 | 405 | 42.4 | 19.3 |
+| 16 threads x20 | 0.115 | 0.133 | 455.0 | 201.9 | 233 | 529 | 68.1 | 30.0 |
+| 32 threads x20 | 0.149 | 0.188 | 764.2 | 341.2 | 273 | 624 | 110.7 | 49.9 |
+
+The search breakdown per query (warm, timing on):
+
+| | posting ms | ctx ms | walk ms | postings | walk files | walk tokens |
+|---|---|---|---|---|---|---|
+| before | 1.364 | 24.460 | 0.799 | 13,962 | 10.7 | 517.8 |
+| after | 1.113 | 11.936 | 0.603 | 13,962 | 10.7 | 517.4 |
+
+- **Timing overhead:** -0.3% to +0.4% (median -0.2%) after, against -5.0% to +4.5% (median -0.5%) before.
+- **What is left:** ctx is still most of the time, about 12 ms per query: about 14,000 point reads of file rows plus a JSON scan of each. Taking it further needs a compact per-file sort key (path and language) stored outside the JSON node, which is a format change, so it is not part of #246.
+
+### Equivalence evidence
+
+- **Conformance:** a new `hot_term_pages` case covers all seven grains, with no class filter, an identifier filter and a keyword filter. Six files sit in two orgs, two repos and a subdirectory. Every offset in {none, 0, 1, n/2, n, n+1} is crossed with every limit in {none, 0, 1, 2, n, n+1}, and each page must equal that slice of the unpaged answer. `run_all`, `run_differential` and `run_crash_rerun_differential` all pass (the graph-store suite: 192 tests).
+- **Corpus differential:** testdata/corpus was indexed once, as 31 repos across two orgs. The origin/main binary and this branch's binary then ran the same 924 searches, all exiting 0:
+  - 12 terms, hot (`the`, `return`, `(`, `{`, `if`, `self`, `int`, `=`, `;`) and cold (`cJSON_Parse`, `Rebus`, a missing term);
+  - × 7 grains;
+  - × 11 variants: no limit; limit 1, 7 or 100; offset 3 limit 5; offset 50 limit 20; offset 1000; an identifier filter with limit 30; a keyword filter; a language filter with limit 40; an org filter with limit 25.
+
+  The `--json` output is byte-identical: 77.9 MB.

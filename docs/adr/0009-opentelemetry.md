@@ -18,7 +18,7 @@ References are to `origin/main` on 2026-10-06.
 - **Logs.** `crates/graph-cli/src/logging.rs::init` (~35, called from `main.rs` ~1176) installs a plain `tracing_subscriber::fmt().try_init()`. It is not a layered `Registry`, so another layer cannot be added.
 - **Metrics:**
   - `render()` (`crates/graph-server/src/observe.rs` ~310) writes Prometheus text straight from about ten sources: openraft metrics, the log store, forward counts, quorum probes, MCP, backup, repeats and read stats. There is no snapshot type in between.
-  - `METRIC_NAMES` lists the 32 families (the contract), and `DURATION_BUCKETS` holds the histogram bounds (0.5 ms to 10 s).
+  - `METRIC_NAMES` lists the 34 families (the contract), and `DURATION_BUCKETS` holds the histogram bounds (0.5 ms to 10 s).
   - `observe_rpc` (~159) records each RPC's duration from `RpcService::call` (~765-796).
 - **Spans that exist.** `RpcLayer` opens an `rpc` span per RPC (`observe.rs` ~777-802, installed in `server.rs` ~908). The state machine opens an `apply` span per Raft apply (`raft/state_machine.rs` ~166).
 - **Spans that are missing.** MCP calls, index batches and `graph-client` have none. `#[instrument]` is used nowhere.
@@ -183,12 +183,14 @@ Exact pins in `[workspace.dependencies]`, as the workspace does for tonic and pr
 | `mg_read_query_seconds_total` | `memory_graph.read.query.time` | counter | `s` | none |
 | `mg_read_txns_total` | `memory_graph.read.transactions` | counter | `{transaction}` | none |
 | `mg_read_dict_strings_total` | `memory_graph.read.dict_strings` | counter | `{string}` | none |
+| `mg_read_search_items_total` | `memory_graph.read.search.items` | counter | `{item}` | `kind` |
+| `mg_read_search_seconds_total` | `memory_graph.read.search.duration` | counter | `s` | `kind` |
 | `mg_queries_total` | `memory_graph.queries` | counter | `{query}` | `rpc` |
 | `mg_query_exact_repeats_total` | `memory_graph.queries.exact_repeats` | counter | `{query}` | `rpc` |
 | `mg_otel_export_failures_total` (new, D8) | `memory_graph.otel.export.failures` | counter | `{export}` | `signal` |
 | `mg_otel_dropped_total` (new, D8) | `memory_graph.otel.dropped` | counter | `{item}` | `signal` |
 
-Sizes that can shrink (`mg_store_bytes`, `mg_log_bytes`, open handles) are up-down counters, following the OTel guidance for additive values. Values that are not additive (indexes, the term, the leader id, timestamps) are gauges. The two new families join `METRIC_NAMES`, which then has 34 entries; 33 of them have an OTLP twin.
+Sizes that can shrink (`mg_store_bytes`, `mg_log_bytes`, open handles) are up-down counters, following the OTel guidance for additive values. Values that are not additive (indexes, the term, the leader id, timestamps) are gauges. The two new families join `METRIC_NAMES`, which then has 36 entries; 35 of them have an OTLP twin.
 
 - **Cardinality.** Every attribute has a bounded value set:
 
