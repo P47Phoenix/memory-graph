@@ -1886,3 +1886,54 @@ fn compact_writes_no_log_entry() {
     assert_eq!(after.applied_index, before.applied_index);
     assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 5);
 }
+
+/// #212: a file whose symbol spans fail validation is stored tokens-only
+/// with a span warning; through the leader the caller gets that warning,
+/// and every follower stores the file exactly as an embedded store does.
+#[test]
+fn degraded_tokens_only_file_replicates_identically() {
+    use graph_store::conformance::invalid_symbol_span_extractors;
+    let src: &[u8] = b"alpha beta gamma delta epsilon\n";
+    let file = |path, language| BatchFile {
+        path,
+        bytes: src,
+        language: Some(language),
+        origin: None,
+        ..Default::default()
+    };
+    let d = IndexOptions::default();
+    let files = [file("ok.txt", "text"), file("bad.ov", "conf-overlap")];
+
+    let mut tb = ClusterTestbed::new(3, invalid_symbol_span_extractors());
+    tb.form();
+    let out = tb
+        .client(tb.leader())
+        .index_batch("o", "r", &files, d)
+        .unwrap();
+    assert!(out[0].as_ref().unwrap().span_warning.is_none());
+    let st = out[1].as_ref().expect("degraded, not rejected");
+    let w = st
+        .span_warning
+        .as_deref()
+        .expect("the warning reaches the caller");
+    assert!(w.contains("partially overlap"), "{w}");
+    assert_eq!((st.symbols, st.tokens), (0, 5), "{st:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let embedded =
+        graph_store::open_store(&dir.path().join("e.redb"), invalid_symbol_span_extractors())
+            .unwrap();
+    embedded.index_batch("o", "r", &files, d).unwrap();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    for id in tb.ids() {
+        assert_eq!(
+            summary(&tb.client(id)),
+            summary(embedded.as_ref()),
+            "node {id}"
+        );
+    }
+    let followers: Vec<u64> = tb.ids().into_iter().filter(|&i| i != tb.leader()).collect();
+    for &id in &followers {
+        run_differential(embedded.as_ref(), &replica(&tb, id));
+    }
+}

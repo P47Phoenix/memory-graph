@@ -65,6 +65,12 @@ impl Extractor for TypeScriptExtractor {
 /// Symbols in TypeScript tokens (as produced with [`TS_TOKENIZER`]), in
 /// source order (an enclosing symbol before what it contains).
 pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
+    symbols_and_drops(tokens).0
+}
+
+/// [`symbols`], plus how many symbols [`drop_partial_overlaps`] dropped, so
+/// tests can see a silent drop (#212).
+fn symbols_and_drops(tokens: &[TokenDecl]) -> (Vec<SymbolDecl>, usize) {
     let mut out = graph_lang_javascript::typescript_symbols(tokens);
     let code = code_index(tokens, &[TokenClass::Comment]);
     let closes = graph_core::scan::code_close_table(tokens, &code);
@@ -82,14 +88,15 @@ pub fn symbols(tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
             .cmp(&b.span.start)
             .then(b.span.end.cmp(&a.span.end))
     });
-    drop_partial_overlaps(&mut out);
-    out
+    let dropped = drop_partial_overlaps(&mut out);
+    (out, dropped)
 }
 
 /// Drops every symbol that partially overlaps one kept before it, so the
 /// merged output of two independent scans always nests (#203). `syms` must
-/// be sorted by start, then by end descending.
-fn drop_partial_overlaps(syms: &mut Vec<SymbolDecl>) {
+/// be sorted by start, then by end descending. Returns how many it dropped.
+fn drop_partial_overlaps(syms: &mut Vec<SymbolDecl>) -> usize {
+    let before = syms.len();
     let mut open: Vec<u32> = Vec::new();
     syms.retain(|s| {
         while open.last().is_some_and(|&end| end <= s.span.start) {
@@ -101,6 +108,7 @@ fn drop_partial_overlaps(syms: &mut Vec<SymbolDecl>) {
         }
         nests
     });
+    before - syms.len()
 }
 
 /// Words that may precede a declaration and belong to its span.
