@@ -9,7 +9,9 @@
 //! * Target selection errors, the embedded-only flag refusals, `health`
 //!   and `cluster leader` exit codes, the `Locked` message, and graceful
 //!   shutdown removing the LOCK sidecar (Admin.Shutdown; SIGTERM on unix).
-use std::io::{BufRead, BufReader};
+mod common;
+
+use common::readiness::{start_serve, StartOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -129,43 +131,14 @@ impl Server {
     /// `c` (a `serve` command with its target flags: `--db <db>`, or
     /// `--data-dir ...` whose store is `db`), listening on a free port.
     fn spawn(mut c: Command, db: &Path) -> Server {
-        let mut child = c
-            .arg("--listen")
-            .arg("127.0.0.1:0")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(l).is_err() {
-                            // Nobody listens any more; keep draining.
-                            continue;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
-        let line = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("serve printed its listening line");
-        let addr = line
-            .split("listening on ")
-            .nth(1)
-            .and_then(|r| r.split_whitespace().next())
-            .unwrap_or_else(|| panic!("no address in {line:?}"))
-            .to_string();
+        c.arg("--listen").arg("127.0.0.1:0");
+        let mut s = start_serve(c, StartOptions::default());
         Server {
-            child,
-            addr,
+            child: s.child,
+            addr: s.addr,
             db: db.to_path_buf(),
-            start_line: line,
-            lines: rx,
+            start_line: s.start_lines.pop().expect("the listening line"),
+            lines: s.stdout,
         }
     }
 

@@ -6,10 +6,12 @@
 //! only produce it when decoded as windows-1252, and its UTF-8 bytes only
 //! when decoded as UTF-8, so `search café --grain file` shows which files
 //! were decoded how.
+mod common;
+
+use common::readiness::{start_serve, StartOptions};
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_memory-graph");
@@ -443,31 +445,15 @@ struct Server {
 
 impl Server {
     fn start(db: &Path) -> Server {
-        let mut child = cmd()
-            .args(["serve", "--db"])
+        let mut c = cmd();
+        c.args(["serve", "--db"])
             .arg(db)
-            .args(["--listen", "127.0.0.1:0"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for l in BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = tx.send(l);
-            }
-        });
-        let line: String = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("serve printed its listening line");
-        let addr = line
-            .split("listening on ")
-            .nth(1)
-            .and_then(|r| r.split_whitespace().next())
-            .unwrap_or_else(|| panic!("no address in {line:?}"))
-            .to_string();
-        Server { child, addr }
+            .args(["--listen", "127.0.0.1:0"]);
+        let s = start_serve(c, StartOptions::default());
+        Server {
+            child: s.child,
+            addr: s.addr,
+        }
     }
 }
 
