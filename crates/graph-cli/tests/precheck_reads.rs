@@ -37,6 +37,7 @@ fn run(db: &Path, dir: &Path, reindex: bool) -> String {
             encoding: None,
             strict_encoding: false,
             compact: false,
+            page_cache_bytes: 0,
         },
         open,
         &mut out,

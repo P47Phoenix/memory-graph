@@ -16,16 +16,21 @@ pub struct Report {
     pub disk_source: &'static str,
     /// The free space `index` would keep on that volume.
     pub disk_min_free: u64,
+    /// The page cache `index` would subtract from its budget (#236); 0
+    /// when nothing is subtracted.
+    pub page_cache: u64,
 }
 
 impl Report {
-    /// Probe this machine as `index --db <db>` would with `spec` and
-    /// `min_free`.
-    pub fn detect(db: &Path, spec: Option<MemorySpec>, min_free: MinFree) -> Self {
+    /// Probe this machine as `index --db <db>` would with `spec`,
+    /// `min_free` and `page_cache` bytes of store cache (subtracted from a
+    /// fraction budget as `index` does, #236).
+    pub fn detect(db: &Path, spec: Option<MemorySpec>, min_free: MinFree, page_cache: u64) -> Self {
         let disk = diskinfo::sample_disk(db);
         Self {
             db: db.to_path_buf(),
-            sizing: Sizing::detect(0, spec, 1),
+            sizing: Sizing::detect_with_page_cache(0, spec, 1, page_cache),
+            page_cache,
             disk,
             disk_source: diskinfo::DISK_SOURCE,
             disk_min_free: min_free.resolve(disk.map(|d| d.total)),
@@ -50,8 +55,13 @@ impl Report {
             )),
             Err(e) => out.push_str(&format!("memory: unknown ({e})\n")),
         }
+        let label = if self.page_cache > 0 {
+            format!("index budget (after {} page cache)", mb(self.page_cache))
+        } else {
+            "budget".to_string()
+        };
         out.push_str(&format!(
-            "budget: {} of source (≈{} in memory): {}\n",
+            "{label}: {} of source (≈{} in memory): {}\n",
             mb(s.memory_budget),
             mb((s.memory_budget as f64 * s.policy.expansion) as u64),
             s.policy.reason
@@ -98,6 +108,7 @@ impl Report {
                 "in_memory": (s.memory_budget as f64 * s.policy.expansion) as u64,
                 "expansion": s.policy.expansion,
                 "reason": s.policy.reason,
+                "page_cache": self.page_cache,
             },
             "disk": {
                 "path": self.db.display().to_string(),
@@ -122,7 +133,29 @@ mod tests {
             disk,
             disk_source: "test disk",
             disk_min_free: 2 << 30,
+            page_cache: 0,
         }
+    }
+
+    #[test]
+    fn report_labels_the_budget_after_the_page_cache() {
+        let m = MemSample {
+            total: 64 << 30,
+            available: 32 << 30,
+            rss: None,
+            psi_some_avg10: None,
+            source: "test probe",
+        };
+        let mut r = report(Ok(m), None);
+        r.sizing = r.sizing.with_page_cache(1 << 30);
+        r.page_cache = 1 << 30;
+        let t = r.text();
+        assert!(
+            t.contains("index budget (after 1.0 GB page cache): ")
+                && t.contains("less the 1.0 GB page cache"),
+            "{t}"
+        );
+        assert_eq!(r.json()["budget"]["page_cache"], 1u64 << 30);
     }
 
     #[test]

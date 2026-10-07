@@ -672,6 +672,7 @@ impl BoardView {
             "transactions": self.txns,
             "memory": {
                 "budget_start": self.sizing.memory_budget,
+                "page_cache": self.sizing.policy.page_cache,
                 "budget_min": self.budget.cap_min,
                 "budget_max": self.budget.cap_max,
                 "budget_end": self.budget.cap,
