@@ -402,6 +402,10 @@ pub const ELECT_SETTLE: Duration = Duration::from_millis(300);
 /// a leader lease (heartbeats are off meanwhile).
 pub const TRIGGER_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// In the refusal of a transfer whose target did not answer `TriggerElect`
+/// (failed, or over [`TRIGGER_TIMEOUT`]): leadership stays here.
+pub const TRIGGER_UNANSWERED: &str = "did not answer TriggerElect";
+
 /// How often `TransferLeader` asks the target to campaign, and checks
 /// whether it won.
 pub const TRANSFER_POLL: Duration = Duration::from_millis(50);
@@ -529,13 +533,13 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
             // follower's lease runs out and nobody else campaigns.
             Ok(Err(e)) => {
                 return Err(rejected(format!(
-                    "node {to} did not answer TriggerElect ({}); node {me} keeps leadership",
+                    "node {to} {TRIGGER_UNANSWERED} ({}); node {me} keeps leadership",
                     e.message()
                 )))
             }
             Err(_) => {
                 return Err(rejected(format!(
-                    "node {to} did not answer TriggerElect within {TRIGGER_TIMEOUT:?}; node {me} \
+                    "node {to} {TRIGGER_UNANSWERED} within {TRIGGER_TIMEOUT:?}; node {me} \
                      keeps leadership"
                 )))
             }
