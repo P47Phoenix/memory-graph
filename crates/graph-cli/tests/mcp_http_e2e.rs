@@ -3,12 +3,14 @@
 //! initialize, `tools/list` and `tools/call search` with exact spans;
 //! `health` names it; a non-loopback bind is refused without
 //! `--mcp-allow-remote`, and warned about at start with it.
+mod common;
+
+use common::readiness::{start_serve, StartOptions};
 use graph_server::testing::mcp_http::McpHttpClient;
 use serde_json::json;
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -32,18 +34,6 @@ fn fill(db: &Path) {
         .unwrap();
 }
 
-/// Lines of a pipe, drained by a thread.
-fn lines(r: impl std::io::Read + Send + 'static) -> Receiver<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for l in BufReader::new(r).lines() {
-            let Ok(l) = l else { return };
-            let _ = tx.send(l);
-        }
-    });
-    rx
-}
-
 struct Serve {
     child: Child,
     grpc: String,
@@ -59,45 +49,24 @@ impl Drop for Serve {
 }
 
 /// `serve --db <db> --listen 127.0.0.1:0 <extra>`, once it prints its
-/// listening line. The child is killed and waited for by `Serve`'s drop
-/// (a panic before that point fails the test anyway).
-#[allow(clippy::zombie_processes)]
+/// listening line and answered a health check. The child is killed and
+/// waited for by `Serve`'s drop.
 fn serve(db: &Path, extra: &[&str]) -> Serve {
-    let mut child = cmd()
-        .args(["serve", "--db"])
+    let mut c = cmd();
+    c.args(["serve", "--db"])
         .arg(db)
         .args(["--listen", "127.0.0.1:0"])
-        .args(extra)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let out = lines(child.stdout.take().unwrap());
-    let stderr = lines(child.stderr.take().unwrap());
-    let mut mcp = None;
-    loop {
-        let l = out
-            .recv_timeout(Duration::from_secs(60))
-            .expect("serve printed its listening line");
-        // `memory-graph serve: mcp on http://<addr>/mcp`, then
-        // `memory-graph serve: listening on <addr> (...)`.
-        if let Some((_, rest)) = l.split_once("mcp on http://") {
-            mcp = Some(rest.trim_end_matches("/mcp").parse().unwrap());
-        }
-        if let Some((_, rest)) = l.split_once("mcp on bound on all interfaces, port ") {
-            // A wildcard bind is not advertised as a URL.
-            let port: u16 = rest.split_whitespace().next().unwrap().parse().unwrap();
-            mcp = Some(SocketAddr::from(([127, 0, 0, 1], port)));
-        }
-        if let Some((_, rest)) = l.split_once("listening on ") {
-            let grpc = rest.split_whitespace().next().unwrap().to_string();
-            return Serve {
-                child,
-                grpc,
-                mcp,
-                stderr,
-            };
-        }
+        .args(extra);
+    let options = StartOptions {
+        echo_stderr: false,
+        ..StartOptions::default()
+    };
+    let s = start_serve(c, options);
+    Serve {
+        child: s.child,
+        grpc: s.addr,
+        mcp: s.mcp,
+        stderr: s.stderr,
     }
 }
 

@@ -10,6 +10,9 @@
 //! at 10 M tokens in `docs/spikes/v2-checkpoint.md`), so a layout change
 //! that doubles the footprint fails here, not on a user's disk. The
 //! measured numbers are printed and put in every assertion.
+mod common;
+
+use common::readiness::{start_serve, ServeProcess, StartOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -267,10 +270,10 @@ fn reindex_with_compact_ends_within_bounds_of_a_fresh_index() {
 /// reuses freed pages but never shrinks the file on its own).
 #[test]
 fn raft_log_after_snapshot_and_purge_stays_within_bounds_of_source() {
-    use std::io::BufRead;
     let d = tempfile::tempdir().unwrap();
     let dir = d.path().join("node");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_memory-graph"));
+    serve
         .env_remove("MEMORY_GRAPH_SERVER")
         .arg("serve")
         .arg("--data-dir")
@@ -285,10 +288,8 @@ fn raft_log_after_snapshot_and_purge_stays_within_bounds_of_source() {
             "0",
             "--min-free-disk",
             "1",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        ]);
+    let ServeProcess { child, addr, .. } = start_serve(serve, StartOptions::default());
     struct Kill(std::process::Child);
     impl Drop for Kill {
         fn drop(&mut self) {
@@ -298,17 +299,7 @@ fn raft_log_after_snapshot_and_purge_stays_within_bounds_of_source() {
             }
         }
     }
-    let out = child.stdout.take().unwrap();
     let mut child = Kill(child);
-    let mut lines = std::io::BufReader::new(out).lines();
-    let line = lines.next().expect("serve prints a line").unwrap();
-    std::thread::spawn(move || lines.for_each(drop));
-    let addr = line
-        .split("listening on ")
-        .nth(1)
-        .and_then(|r| r.split_whitespace().next())
-        .unwrap_or_else(|| panic!("no address in {line:?}"))
-        .to_string();
 
     // Three passes (three repos) so the ratio measures the log, not redb's
     // fixed floor: an empty redb file is already 1.6 MB, about one pass of

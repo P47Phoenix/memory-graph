@@ -1,7 +1,6 @@
 //! A shared readiness wait for e2e tests that spawn `memory-graph serve`
-//! (issue #202). `cluster_e2e`, `backup_e2e`, `s3_e2e` and
-//! `observability_e2e` use it; other test binaries still parse the
-//! listening line themselves.
+//! (issues #202, #219). Every e2e test binary that starts a server uses
+//! it rather than parsing the listening line itself.
 //!
 //! [`start_serve`] spawns the command with both pipes drained by threads,
 //! reads stdout until the `listening on <addr>` start line, then confirms
@@ -56,12 +55,17 @@ pub struct ServeProcess {
     pub child: Child,
     /// The gRPC address from the `listening on <addr>` line.
     pub addr: String,
-    /// The `mcp on http://<addr>/mcp` endpoint, when printed.
+    /// The `mcp on http://<addr>/mcp` endpoint, when printed; for a
+    /// wildcard bind (`mcp on bound on all interfaces, port <p>`, not
+    /// advertised as a URL) it is `127.0.0.1:<p>`.
     pub mcp: Option<SocketAddr>,
     /// The `metrics on http://<addr>/metrics` endpoint, when printed.
     pub metrics: Option<SocketAddr>,
     /// Every stdout line up to and including the listening line.
     pub start_lines: Vec<String>,
+    /// Every later stdout line, as it arrives (the pipe keeps being
+    /// drained whether or not this is read or dropped).
+    pub stdout: Receiver<String>,
     /// Every stderr line, as it arrives (also echoed when
     /// [`StartOptions::echo_stderr`] is set), including those printed
     /// before readiness.
@@ -176,19 +180,18 @@ pub fn try_start_serve(
             }
         }
     };
-    // Keep draining so the server never blocks on a print.
-    std::thread::spawn(move || stdout.iter().for_each(drop));
-
     if let Err(reason) = await_health(&mut child, &addr, deadline) {
         return Err(fail(child, start_lines, reason));
     }
     capture.stop();
     Ok(ServeProcess {
         child,
-        mcp: endpoint(&start_lines, "mcp on http://", "/mcp"),
+        mcp: endpoint(&start_lines, "mcp on http://", "/mcp")
+            .or_else(|| wildcard_mcp(&start_lines)),
         metrics: endpoint(&start_lines, "metrics on http://", "/metrics"),
         addr,
         start_lines,
+        stdout,
         stderr,
     })
 }
@@ -206,6 +209,15 @@ fn endpoint(lines: &[String], prefix: &str, suffix: &str) -> Option<SocketAddr> 
         let (_, rest) = l.split_once(prefix)?;
         // The endpoint may be followed by more text on the line.
         rest.split(suffix).next()?.parse().ok()
+    })
+}
+
+/// `127.0.0.1:<port>` from `mcp on bound on all interfaces, port <port>`.
+fn wildcard_mcp(lines: &[String]) -> Option<SocketAddr> {
+    lines.iter().find_map(|l| {
+        let (_, rest) = l.split_once("mcp on bound on all interfaces, port ")?;
+        let port: u16 = rest.split_whitespace().next()?.parse().ok()?;
+        Some(SocketAddr::from(([127, 0, 0, 1], port)))
     })
 }
 
