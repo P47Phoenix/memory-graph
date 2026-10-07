@@ -159,6 +159,10 @@ pub(super) enum Promoted {
     New,
     /// A newer pair already existed; the file was discarded.
     Stale,
+    /// A build found a complete pair of this build at the same log id
+    /// already in place (a concurrent build won the race, #217); the file
+    /// was discarded and that pair returned.
+    Reused,
 }
 
 /// Called with each newly built snapshot pair (not a reused one).
@@ -325,11 +329,47 @@ impl SnapshotDir {
         membership: StoredMembership,
         snapshot_id: String,
     ) -> Result<(SnapshotSidecar, PathBuf, Promoted), StoreError> {
+        self.promote_with(data, last, membership, snapshot_id, false)
+    }
+
+    /// [`Self::promote`] for a build: if a complete pair of this build
+    /// (not [outdated](Self::is_outdated)) already exists at `last`, `data`
+    /// is removed and that pair returned with `Promoted::Reused`. The check
+    /// runs under `promote_lock`, so two builds at one index never both
+    /// promote, and the second's prune never removes the file the first
+    /// already handed to openraft (#217). An outdated pair at `last` is
+    /// still replaced (#151).
+    pub(super) fn promote_built(
+        &self,
+        data: &Path,
+        last: Option<LogId>,
+        membership: StoredMembership,
+        snapshot_id: String,
+    ) -> Result<(SnapshotSidecar, PathBuf, Promoted), StoreError> {
+        self.promote_with(data, last, membership, snapshot_id, true)
+    }
+
+    fn promote_with(
+        &self,
+        data: &Path,
+        last: Option<LogId>,
+        membership: StoredMembership,
+        snapshot_id: String,
+        reuse_same_index: bool,
+    ) -> Result<(SnapshotSidecar, PathBuf, Promoted), StoreError> {
         let _guard = self
             .promote_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((side, path)) = self.current() {
+            if reuse_same_index
+                && last.is_some()
+                && side.last_log_id == last
+                && !self.is_outdated(&side)
+            {
+                let _ = std::fs::remove_file(data);
+                return Ok((side, path, Promoted::Reused));
+            }
             if side.last_log_id > last {
                 tracing::info!(
                     current = ?side.last_log_id,
@@ -408,20 +448,14 @@ impl SnapshotDir {
             let copy = V2Store::open(&tmp.0)?;
             super::state_machine::StoreStateMachine::read_applied(&copy)?
         };
-        if let Some((side, path)) = self.current() {
-            if side.last_log_id == last && side.last_log_id.is_some() && !self.is_outdated(&side) {
-                return Ok(Snapshot {
-                    meta: side.meta(),
-                    snapshot: Box::new(SnapshotFile { path }),
-                });
-            }
-        }
+        // Reusing a pair already at this index is decided inside the
+        // promote, under its lock (#217).
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let snapshot_id = format!("{}-{nanos}", stem(last.as_ref()));
-        let (side, path, promoted) = self.promote(&tmp.0, last, membership, snapshot_id)?;
+        let (side, path, promoted) = self.promote_built(&tmp.0, last, membership, snapshot_id)?;
         drop(tmp);
         if promoted == Promoted::New {
             self.built.fetch_add(1, Ordering::SeqCst);
