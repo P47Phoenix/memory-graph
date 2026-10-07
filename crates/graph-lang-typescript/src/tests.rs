@@ -22,6 +22,11 @@ fn find<'a>(s: &'a [Sym], name: &str) -> &'a Sym {
         .unwrap_or_else(|| panic!("{name} not found in {s:#?}"))
 }
 
+/// How many symbols `drop_partial_overlaps` dropped for `src` (#212).
+fn drops(src: &str) -> usize {
+    symbols_and_drops(&tokenize_with(src, TS_TOKENIZER)).1
+}
+
 /// Every pair of spans nests or is disjoint (what the store requires).
 fn assert_nested(ex: &Extraction) {
     for a in &ex.symbols {
@@ -275,6 +280,7 @@ proptest! {
             prop_assert!(!s.name.is_empty());
         }
         assert_nested(&ex);
+        prop_assert_eq!(drops(&src), 0, "{}", src);
     }
 }
 
@@ -300,6 +306,24 @@ proptest! {
     ) {
         let src = parts.join("\n");
         assert_nested(&TypeScriptExtractor.extract(&src));
+        // #212: the overlap filter is a safety net; the scanners must not
+        // need it. Known exception, tracked by #213 (fixed there, not here):
+        // a type or arrow left open (a trailing `|`, `&`, `=`, `=>`) and
+        // followed by more code makes the two scans disagree, e.g.
+        // `const f = (): T =>\nexport\ntype A = B |` or
+        // `class C { x: A |\ntype A = B |\ndefault\n}`.
+        let left_open = parts[..parts.len().saturating_sub(1)]
+            .iter()
+            .filter(|p| ["=>", "|", "&", " ="].iter().any(|e| p.ends_with(e)))
+            .count();
+        let dropped = drops(&src);
+        if left_open > 0 {
+            // Each open fragment drops at most one symbol; more would be a
+            // new class of drop.
+            prop_assert!(dropped <= left_open, "{} dropped {}", src, dropped);
+        } else {
+            prop_assert_eq!(dropped, 0, "{}", src);
+        }
     }
 }
 
@@ -466,5 +490,19 @@ fn type_alias_stops_before_the_next_statement() {
     ] {
         let name = &alias[5..6];
         assert_eq!(find(&syms(alias), name).3, alias);
+    }
+}
+
+/// #212: the overlap filter's drops are visible to tests. The two shapes
+/// below are the known ones (#213); when #213 fixes them this test fails
+/// and should assert 0 instead.
+#[test]
+fn known_overlap_drops_are_counted() {
+    assert_eq!(drops("type A = B;\nclass C { m(): void {} }"), 0);
+    for src in [
+        "const f = (): T =>\nexport\ntype A = B |",
+        "class C { x: A |\ntype A = B |\ndefault\n}",
+    ] {
+        assert_eq!(drops(src), 1, "{src}");
     }
 }
