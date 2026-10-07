@@ -944,6 +944,66 @@ mod tests {
         assert_eq!(files_in(snaps.dir()), expected);
     }
 
+    /// #217: a build's promote of a second file at the current pair's index
+    /// returns that pair and removes the new file, promoting nothing.
+    #[test]
+    fn promoting_a_build_at_the_current_index_reuses_the_pair() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, snaps) = with_snapshot_at_1(d.path());
+        let (side1, path1) = snaps.current().unwrap();
+        let before = files_in(snaps.dir());
+        let second = snaps.dir().join("snap-build-second.redb.tmp");
+        slot.with_store(|s| s.export_snapshot(&second)).unwrap();
+        let built = snaps.built();
+        let (side, path, promoted) = snaps
+            .promote_built(
+                &second,
+                side1.last_log_id,
+                side1.membership.clone(),
+                "second".into(),
+            )
+            .unwrap();
+        assert_eq!(promoted, super::super::snapshot_dir::Promoted::Reused);
+        assert_eq!((side, path), (side1.clone(), path1.clone()));
+        assert!(!second.exists(), "the new file is removed");
+        assert_eq!(snaps.current().unwrap(), (side1, path1));
+        assert_eq!(files_in(snaps.dir()), before);
+        assert_eq!(snaps.built(), built);
+    }
+
+    /// #217: two builds at the same index racing on two threads leave one
+    /// pair, both return its (valid) meta, and no temp file is left.
+    #[test]
+    fn two_builds_at_the_same_index_share_one_pair() {
+        for _ in 0..100 {
+            let d = tempfile::tempdir().unwrap();
+            let (slot, snaps) = with_snapshot_at_1(d.path());
+            StoreStateMachine::apply_all(&slot, vec![blank(2)], NO_FP, &Default::default(), None)
+                .unwrap();
+            let built_before = snaps.built();
+            let barrier = std::sync::Barrier::new(2);
+            let (a, b) = std::thread::scope(|sc| {
+                let run = || {
+                    barrier.wait();
+                    snaps.build(&slot).unwrap().meta
+                };
+                let a = sc.spawn(run);
+                let b = sc.spawn(run);
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert_eq!(a, b, "both builds return the same snapshot");
+            assert_eq!(a.last_log_id, Some(log_id(2)));
+            assert_eq!(snaps.built(), built_before + 1, "only one build promoted");
+            let (side, cur) = snaps.current().unwrap();
+            assert_eq!(side.meta(), a);
+            let (sha, size) = super::super::snapshot_dir::sha256_file(&cur).unwrap();
+            assert_eq!((side.sha256, side.size), (sha, size));
+            let files = files_in(snaps.dir());
+            assert_eq!(files.len(), 2, "one pair, no orphans: {files:?}");
+            assert!(files.iter().all(|f| !f.ends_with(".tmp")));
+        }
+    }
+
     /// #185 review: temp files of every kind left by a crash are swept when
     /// the directory is opened; the complete pair is kept.
     #[test]
