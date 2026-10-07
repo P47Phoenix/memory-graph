@@ -718,7 +718,10 @@ impl Scanner<'_> {
             return None;
         }
         let body = arrow + 2;
-        if body >= hi || matches!(self.text(body), ";" | "," | ")" | "]" | "}") {
+        if body >= hi
+            || matches!(self.text(body), ";" | "," | ")" | "]" | "}")
+            || self.ends_expression(body, hi)
+        {
             return None;
         }
         let end = if self.text(body) == "{" {
@@ -764,13 +767,43 @@ impl Scanner<'_> {
     /// (`React.default`, `x.const` are property names).
     fn starts_statement(&self, c: usize, hi: usize) -> bool {
         let t = self.text(c);
-        if c > 0 && matches!(self.text(c - 1), "." | "?.") {
+        // After these the word is an operand or a modifier: `x.const`,
+        // `[1] as const`, `<const T>`, `new import(...)`, `typeof let`.
+        if c > 0
+            && matches!(
+                self.text(c - 1),
+                "." | "?." | "as" | "satisfies" | "new" | "typeof" | "keyof" | "<" | "is"
+            )
+        {
             return false;
         }
         if STATEMENT_WORDS.contains(&t) {
-            return !(t == "import" && c + 1 < hi && self.text(c + 1) == "(");
+            // A statement continues with a name, a literal, a binding
+            // pattern or `*` (`export * from`, `import {`, `const [a]`,
+            // `export = x`); anything else makes the word an operand
+            // (`import.meta`, `import("m")`, `let)` as an identifier).
+            if c + 1 >= hi {
+                return true;
+            }
+            return self.word_follows(c, hi)
+                || matches!(self.text(c + 1), "{" | "[" | "*")
+                || (t == "export" && self.text(c + 1) == "=");
+        }
+        // `abstract new () => X` is a constructor type, not a declaration.
+        if t == "abstract" && c + 1 < hi && self.text(c + 1) == "new" {
+            return false;
         }
         DECLARATION_WORDS.contains(&t) && self.word_follows(c, hi)
+    }
+
+    /// Whether an expression (an arrow's expression body, a field
+    /// initializer) cannot continue at `c` in TypeScript mode: a decorator,
+    /// or a word that opens the next statement (`async` aside, which can
+    /// start an async arrow). Stopping there keeps the expression's span out
+    /// of the declaration the TypeScript pass starts at that word (#213).
+    fn ends_expression(&self, c: usize, hi: usize) -> bool {
+        self.ts
+            && (self.text(c) == "@" || (self.text(c) != "async" && self.starts_statement(c, hi)))
     }
 
     /// See [`type_end`]. Only TypeScript mode calls it (every caller checks
@@ -806,14 +839,16 @@ impl Scanner<'_> {
                     after_paren = t == "(";
                     continue;
                 }
+                // A generic argument list (`A<T>`) completes an operand; a
+                // generic parameter list where an operand is expected
+                // (`<const T>(x: T) => T`) leaves one still to come.
                 "<" => match self.angle_close(c, hi) {
-                    Some(p) => {
-                        c = p + 1;
-                        operand = false;
-                    }
+                    Some(p) => c = p + 1,
                     None => return c,
                 },
                 ";" | "," | ")" | "]" | "}" | "=" | ">" => return c,
+                // A decorator opens the next declaration (#213).
+                "@" => return c,
                 // Reserved words that start a declaration, never a type: a
                 // type stops before them, so it cannot end inside the
                 // declaration (`type A = class B {}` must not give a type
@@ -869,6 +904,18 @@ impl Scanner<'_> {
                 }
                 ";" | "," => {
                     c += 1;
+                    continue;
+                }
+                // `type A = ...` / `type A<T> = ...` (not valid in a class,
+                // but the TypeScript pass reads it as a type alias at any
+                // depth): not a field `A`, whose initializer could end
+                // somewhere other than the alias's type (#213).
+                "type"
+                    if c + 2 < hi
+                        && self.is_ident(c + 1)
+                        && matches!(self.text(c + 2), "=" | "<") =>
+                {
+                    c += 2;
                     continue;
                 }
                 _ => {}
@@ -982,6 +1029,7 @@ impl Scanner<'_> {
                     c = close + 1;
                     continue;
                 }
+                _ if self.ends_expression(c, hi) => return last,
                 _ => {}
             }
             if c > eq + 1 && self.tok(c).span.start_line > self.tok(last).span.end_line {
@@ -1023,6 +1071,7 @@ impl Scanner<'_> {
                     c = close + 1;
                     continue;
                 }
+                _ if self.ends_expression(c, hi) => return Some(last),
                 _ => {}
             }
             // A line break ends the expression unless the next line continues
