@@ -1,29 +1,27 @@
-//! A linear pre-scan that keeps `syn` off input nested too deep to parse
-//! safely (#245). `syn` recurses once per delimiter, prefix operator and
-//! generic level, and builds (then visits and drops) one boxed node per
-//! link of a binary-operator or method chain, so a generated file such as
-//! rustc's `tests/ui/parser/survive-peano-lesson-queue.rs` (2005 nested
-//! parentheses) overflows a thread's stack. Such a file is stored tokens
-//! only instead.
+//! A cheap first filter for input nested too deep to be worth parsing
+//! (#245). It is not the safety guarantee: that is `stack.rs`, which runs
+//! `syn` on a stack sized from the token count whatever the shape. This
+//! scan only skips the obvious cases early, such as the 2005 nested calls of
+//! rustc's `tests/ui/parser/survive-peano-lesson-queue.rs`, so they never
+//! need a large parse thread. Such a file is stored tokens only, with a
+//! note.
 use graph_core::{TokenClass, TokenDecl};
 
-/// Deepest nesting `syn` is asked to parse: open delimiters plus an
-/// unbroken run of operators (`!!!!x`, `- - -x`) at that point. A release
-/// build on a 2 MiB thread parses 255 nested parentheses (rustc's
-/// `super-fast-paren-parsing.rs`) and overflows at 1000; extraction threads
-/// get 16 MiB (`graph_core::EXTRACT_STACK_BYTES`).
+/// Deepest nesting this filter lets through to `syn`: open delimiters plus
+/// an unbroken run of operators (`!!!!x`, `- - -x`) at that point. Real code
+/// stays far below it; rustc's `super-fast-paren-parsing.rs` (255 nested
+/// parentheses) just passes.
 pub const MAX_NESTING_DEPTH: usize = 256;
 
-/// Longest chain `syn` is asked to parse: operator and `.` tokens in one
+/// Longest chain this filter lets through: operator and `.` tokens in one
 /// delimiter group between separators (`;`, `,`, `=>`, a closed `{..}`
-/// block), such as `a + b + ...`, `x.a().b()...` or `Vec<Vec<...>>`. A
-/// release build on a 2 MiB thread survives 3000 links and overflows at
-/// 10000. Arrows (`->`, `=>`) and a lone `=` are not links.
+/// block), such as `a + b + ...`, `x.a().b()...` or `Vec<Vec<...>>`.
+/// Arrows (`->`, `=>`) and a lone `=` are not links.
 pub const MAX_CHAIN_LEN: usize = 1024;
 
-/// Why `tokens` are too deeply nested for `syn`, or `None` when it is safe
-/// to parse them. Comments and literals never count. The shared tokenizer
-/// emits one token per operator character, so `->` is `-`, `>`.
+/// Why `tokens` are nested too deep to be worth parsing, or `None`.
+/// Comments and literals never count. The shared tokenizer emits one token
+/// per operator character, so `->` is `-`, `>`.
 pub fn too_deep(tokens: &[TokenDecl]) -> Option<String> {
     // One chain counter per open delimiter group, plus the file level.
     let mut chains = vec![0usize];
@@ -126,6 +124,16 @@ mod tests {
         assert_eq!(scan(&parens(MAX_NESTING_DEPTH - 1)), None);
         let why = scan(&parens(MAX_NESTING_DEPTH)).expect("too deep");
         assert!(why.contains("nesting depth"), "{why}");
+    }
+
+    #[test]
+    fn fixed_depths_pass_and_fail() {
+        // Literal sizes, so the test does not move with the constant.
+        assert_eq!(
+            scan(&format!("{}1{}", "(".repeat(256), ")".repeat(256))),
+            None
+        );
+        assert!(scan(&format!("{}1{}", "(".repeat(257), ")".repeat(257))).is_some());
     }
 
     #[test]

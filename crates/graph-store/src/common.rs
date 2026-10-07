@@ -407,8 +407,10 @@ pub(crate) fn extract_checked(
         let e = StoreError::InvalidSpan(format!("`{path}`: {token_why}"));
         return (Prepared::Rejected(e), None);
     }
+    // Keep the extractor's own note too, if it had one.
+    let note = note.map_or_else(String::new, |n| format!("; it also noted: {n}"));
     let warning = format!(
-        "extractor `{}` produced an invalid span ({why}); stored tokens only, no symbols",
+        "extractor `{}` produced an invalid span ({why}){note}; stored tokens only, no symbols",
         registry.version(lang)
     );
     (Prepared::Extracted(tokens_only), Some(warning))

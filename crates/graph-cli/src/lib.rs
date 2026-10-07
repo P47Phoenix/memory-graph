@@ -827,7 +827,8 @@ fn run_pipeline(
                 board.parse.done(k);
             });
             if let Err(e) = spawned {
-                // Stop the walk and admission threads so the scope can join.
+                // Stop the walk, admission and already-started parse threads
+                // (all of them check `cancel`) so the scope can join them.
                 cancel.store(true, Relaxed);
                 return Err(e).context("could not start a parse thread");
             }

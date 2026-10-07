@@ -113,6 +113,61 @@ fn too_deep_input_is_tokens_only_with_a_note() {
     assert_eq!((ok.symbols.len(), note), (1, None));
 }
 
+fn code_tokens(src: &str) -> Vec<graph_core::TokenDecl> {
+    let opts = TokenizerOptions {
+        rust_literals: true,
+        ..Default::default()
+    };
+    tokenize_with(src, opts)
+}
+
+/// The stack bound holds for the worst shapes measured (#245): each parses
+/// on a thread of exactly `stack::bound` bytes, not the 16 MiB floor. The
+/// sizes are fixed so the test does not move with the constants.
+#[test]
+fn the_stack_bound_covers_the_worst_shapes() {
+    let e = |body: String| format!("fn f() {{ loop {{ {body}; }} }}\n");
+    let shapes = [
+        e(format!("{}1", "break ".repeat(3000))),
+        e(format!("{}1", "return ".repeat(3000))),
+        e(format!("{}{}", "{ ".repeat(2000), "}".repeat(2000))),
+        format!("type T = {}u8{};\n", "V<".repeat(2000), ">".repeat(2000)),
+        format!("{}{}", "fn f() { ".repeat(1000), "}".repeat(1000)),
+    ];
+    for src in shapes {
+        let need = crate::stack::bound(crate::stack::largest_item(&code_tokens(&src)));
+        let parsed = std::thread::Builder::new()
+            .stack_size(need)
+            .spawn(move || parse_symbols_unguarded(&src).is_some())
+            .expect("spawn")
+            .join()
+            .expect("no overflow");
+        assert!(parsed);
+    }
+}
+
+/// The largest item parsed in place (no parse thread) parses on a 2 MiB
+/// thread, the default for spawned threads.
+#[test]
+fn in_place_items_parse_on_a_2_mib_thread() {
+    let mut n = 0;
+    while crate::stack::plan(crate::stack::largest_item(&code_tokens(&format!(
+        "fn f() {{ {}1 }}",
+        "break ".repeat(n + 1)
+    )))) == crate::stack::Plan::InPlace
+    {
+        n += 1;
+    }
+    let src = format!("fn f() {{ {}1 }}", "break ".repeat(n));
+    let (ex, note) = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || RustExtractor.extract_noted(&src))
+        .expect("spawn")
+        .join()
+        .expect("no overflow");
+    assert_eq!((ex.symbols.len(), note), (1, None));
+}
+
 /// The `+kw1` marker changes the fingerprint of every Rust file, so a store
 /// indexed before keyword classing re-indexes them; dropping it must fail.
 #[test]

@@ -10,7 +10,9 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 mod nesting;
+mod stack;
 pub use nesting::{MAX_CHAIN_LEN, MAX_NESTING_DEPTH};
+pub use stack::{MAX_PARSE_STACK, STACK_BASE, STACK_PER_TOKEN};
 
 pub struct RustExtractor;
 
@@ -67,34 +69,40 @@ impl Extractor for RustExtractor {
             };
             return (ex, Some(why));
         }
-        // syn strips a BOM before lexing, so its byte ranges start after it.
-        let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
-        let file = match syn::parse_file(&source[bom..]) {
-            Ok(f) => f,
-            Err(_) => {
-                let ex = Extraction {
-                    symbols: vec![],
-                    tokens,
-                    has_errors: true,
-                };
-                return (ex, None);
-            }
+        let (symbols, has_errors, note) = match stack::parse_on_safe_stack(source, &tokens) {
+            Ok(Some(symbols)) => (symbols, false, None),
+            Ok(None) => (vec![], true, None),
+            Err(why) => (vec![], false, Some(why)),
         };
-        let mut v = Collector {
-            bom,
-            src: source,
-            line_starts: line_starts(source),
-            char_marks: char_marks(source),
-            out: vec![],
-        };
-        v.visit_file(&file);
         let ex = Extraction {
-            symbols: v.out,
+            symbols,
             tokens,
-            has_errors: false,
+            has_errors,
         };
-        (ex, None)
+        (ex, note)
     }
+}
+
+/// Parse `source` with `syn` and collect its symbols, on the calling
+/// thread with no stack guard; `None` if it does not parse. The parse, the
+/// visit and the drop of the syntax tree all recurse once per nesting
+/// level, so this must run on a stack sized by [`stack`]. Public only for
+/// the `stack_probe` example that measures that size.
+#[doc(hidden)]
+pub fn parse_symbols_unguarded(source: &str) -> Option<Vec<SymbolDecl>> {
+    // syn strips a BOM before lexing, so its byte ranges start after it.
+    let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
+    let file = syn::parse_file(&source[bom..]).ok()?;
+    let mut v = Collector {
+        bom,
+        src: source,
+        line_starts: line_starts(source),
+        char_marks: char_marks(source),
+        out: vec![],
+    };
+    v.visit_file(&file);
+    drop(file);
+    Some(v.out)
 }
 
 /// Rust's strict and reserved keywords (the Reference, edition 2018 and
