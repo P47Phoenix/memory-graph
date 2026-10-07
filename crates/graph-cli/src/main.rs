@@ -940,7 +940,6 @@ fn join<'a>(it: impl Iterator<Item = &'a String>) -> String {
     }
 }
 
-/// `--snapshot-max-age`: whole seconds, or a number with an s/m/h suffix.
 /// A refused OpenTelemetry setting or a provider that would not build:
 /// exit 7 (ADR 0009 D3).
 fn telemetry_exit(e: graph_server::telemetry::TelemetryError) -> anyhow::Error {
@@ -968,6 +967,7 @@ fn telemetry_identity(
     }
 }
 
+/// `--snapshot-max-age`: whole seconds, or a number with an s/m/h suffix.
 fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
     let s = s.trim();
     let (num, mult) = match s.char_indices().last() {
@@ -1507,6 +1507,9 @@ fn run() -> Result<i32> {
         let log_format = *log_format;
         telemetry_cfg.apply_identity(&telemetry_identity(*node_id, data_dir.as_deref()));
         let telemetry = graph_server::telemetry::init(&telemetry_cfg).map_err(telemetry_exit)?;
+        if let (Some(_), Some(endpoint)) = (&telemetry, &telemetry_cfg.endpoint) {
+            tracing::info!(%endpoint, "OpenTelemetry export on");
+        }
         let served_result =
             graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
                 // Scripts and tests read these lines for the bound ports (the

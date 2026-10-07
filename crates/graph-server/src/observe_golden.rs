@@ -22,7 +22,8 @@ fn gauge(out: &mut String, name: &str, help: &str, v: u64) {
     let _ = writeln!(out, "{name} {v}");
 }
 
-/// The renderer as it was before `MetricsSnapshot` (verbatim apart from\n/// the pinned read counters): the golden reference.
+/// The renderer as it was before `MetricsSnapshot` (verbatim apart from
+/// the pinned read counters): the golden reference.
 pub(super) fn render(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats) -> String {
     let m = ctx.raft.metrics();
     let obs = &ctx.raft.obs;
