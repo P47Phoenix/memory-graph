@@ -314,9 +314,15 @@ proptest! {
         // `class C { x: A |\ntype A = B |\ndefault\n}`.
         let left_open = parts[..parts.len().saturating_sub(1)]
             .iter()
-            .any(|p| p.ends_with(['|', '&', '=', '>']));
-        if !left_open {
-            prop_assert_eq!(drops(&src), 0, "{}", src);
+            .filter(|p| ["=>", "|", "&", " ="].iter().any(|e| p.ends_with(e)))
+            .count();
+        let dropped = drops(&src);
+        if left_open > 0 {
+            // Each open fragment drops at most one symbol; more would be a
+            // new class of drop.
+            prop_assert!(dropped <= left_open, "{} dropped {}", src, dropped);
+        } else {
+            prop_assert_eq!(dropped, 0, "{}", src);
         }
     }
 }

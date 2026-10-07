@@ -1916,7 +1916,8 @@ fn degraded_tokens_only_file_replicates_identically() {
         .span_warning
         .as_deref()
         .expect("the warning reaches the caller");
-    assert!(w.contains("partially overlap"), "{w}");
+    // Names the extractor and its version (`conf-overlap` version 1).
+    assert!(w.contains("conf-overlap-1"), "{w}");
     assert_eq!((st.symbols, st.tokens), (0, 5), "{st:?}");
 
     let dir = tempfile::tempdir().unwrap();
