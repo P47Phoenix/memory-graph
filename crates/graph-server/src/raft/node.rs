@@ -439,18 +439,32 @@ fn write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Store
 /// entry stays in the log and commits if the cluster recovers.
 pub const MEMBERSHIP_COMMIT_WAIT: Duration = Duration::from_secs(60);
 
-async fn committed<T>(
-    change: impl std::future::Future<
-        Output = Result<T, RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>>,
-    >,
-) -> Result<T, StoreError> {
+/// A spawned openraft write ([`RaftNode::spawn_holding`]).
+type WriteTask<T> =
+    tokio::task::JoinHandle<Result<T, RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>>>;
+
+async fn committed<T>(change: WriteTask<T>) -> Result<T, StoreError> {
+    // A timeout drops only this wait: the task (and the in-flight count
+    // and tick hold it owns) runs on until openraft answers.
     match tokio::time::timeout(MEMBERSHIP_COMMIT_WAIT, change).await {
-        Ok(r) => r.map_err(write_err),
+        Ok(Ok(r)) => r.map_err(write_err),
+        Ok(Err(e)) => Err(join_err(e)),
         Err(_) => Err(StoreError::Rejected(format!(
-            "the membership change did not commit within {MEMBERSHIP_COMMIT_WAIT:?} (a node \
-             it adds does not accept the leader's log, or a quorum is unreachable); it may \
-             still commit if the cluster recovers: check `cluster members`"
+            "the membership change did not commit within {MEMBERSHIP_COMMIT_WAIT:?} (a node              it adds does not accept the leader's log, or a quorum is unreachable); it may              still commit if the cluster recovers: check `cluster members`"
         ))),
+    }
+}
+
+/// A proposal task that did not finish: cancelled by the runtime shutting
+/// down (the node is going away: `NoLeader`, the client retries
+/// elsewhere), or panicked (a storage fault).
+fn join_err(e: tokio::task::JoinError) -> StoreError {
+    if e.is_cancelled() {
+        StoreError::NoLeader {
+            retry_after_ms: NO_LEADER_RETRY_MS,
+        }
+    } else {
+        StoreError::Storage(format!("raft proposal task: {e}"))
     }
 }
 
@@ -684,6 +698,27 @@ impl RaftNode {
         self.snapshots.installed()
     }
 
+    /// Run `f`'s openraft call in its own task, which owns `hold` (the
+    /// in-flight count, and for a membership change the tick hold) until
+    /// openraft answers. Once handed to openraft an entry is appended
+    /// whether or not anyone still waits, so the count must not drop with
+    /// a caller that stopped waiting (a cancelled RPC, a dropped forward,
+    /// a timeout): a transfer could drain to zero while the entry is still
+    /// on its way into the log (#232).
+    fn spawn_holding<H, T, F, Fut>(&self, hold: H, f: F) -> tokio::task::JoinHandle<T>
+    where
+        H: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(Raft<TypeConfig>) -> Fut,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let call = f(self.raft.clone());
+        tokio::spawn(async move {
+            let _hold = hold;
+            call.await
+        })
+    }
+
     /// Propose one command and wait for it to be applied on this node
     /// (ADR 0004 D7): returns the entry's response and its log index. The
     /// disk guard runs first (`RESOURCE_EXHAUSTED` on the wire).
@@ -705,11 +740,16 @@ impl RaftNode {
         // Otherwise a transfer could drain to zero while the entry is still
         // on its way into the log, check the target's lag, and then leave
         // the target one entry short, so no voter grants it a vote (#232).
-        let raft = self.raft.clone();
-        let mut write = tokio::spawn(async move {
-            let _in_flight = in_flight;
-            raft.client_write(req).await
-        });
+        //
+        // A partitioned leader holding such a write keeps a transfer from
+        // starting, but cannot hang it: the transfer's drain is bounded by
+        // `TRANSFER_CATCH_UP` and then refuses ("writes in flight did not
+        // finish"), leadership staying here.
+        let mut write =
+            self.spawn_holding(
+                in_flight,
+                |raft| async move { raft.client_write(req).await },
+            );
         tokio::select! {
             r = &mut write => match r {
                 Ok(Ok(resp)) => {
@@ -717,7 +757,7 @@ impl RaftNode {
                     Ok((resp.response().clone(), index))
                 }
                 Ok(Err(e)) => Err(write_err(e)),
-                Err(e) => Err(StoreError::Storage(format!("raft write task: {e}"))),
+                Err(e) => Err(join_err(e)),
             },
             e = self.quorum_lost() => Err(e),
         }
@@ -806,16 +846,19 @@ impl RaftNode {
         addr: &str,
         blocking: bool,
     ) -> Result<u64, StoreError> {
-        let in_flight = self.proposal()?;
-        let _ticks = self.tick_hold();
+        let hold = (self.proposal()?, self.tick_hold());
         // openraft's own `blocking` waits only its default half second and
         // then answers success whatever the learner's state, so the wait
         // for catch-up is ours, with a real timeout and a real error.
-        let r = committed(self.raft.add_learner(id, BasicNode::new(addr), false)).await?;
+        // The task drops the in-flight count once the entry is committed:
+        // the catch-up wait below appends nothing, so it must not hold up a
+        // transfer's drain.
+        let node = BasicNode::new(addr);
+        let r = committed(self.spawn_holding(hold, |raft| async move {
+            raft.add_learner(id, node, false).await
+        }))
+        .await?;
         let index = r.log_id().index;
-        // The entry is committed; the catch-up wait below appends nothing,
-        // so it must not hold up a transfer's drain.
-        drop(in_flight);
         if blocking && id != self.node_id {
             self.raft
                 .wait(Some(ADD_LEARNER_CATCH_UP))
@@ -843,9 +886,11 @@ impl RaftNode {
     /// Make exactly `voters` the voters (joint consensus, learners kept).
     /// Returns the final membership entry's index.
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<u64, StoreError> {
-        let _in_flight = self.proposal()?;
-        let _ticks = self.tick_hold();
-        let r = committed(self.raft.change_membership(voters, true)).await?;
+        let hold = (self.proposal()?, self.tick_hold());
+        let r = committed(self.spawn_holding(hold, |raft| async move {
+            raft.change_membership(voters, true).await
+        }))
+        .await?;
         Ok(r.log_id().index)
     }
 
@@ -854,12 +899,11 @@ impl RaftNode {
     /// replacement of the voter set, so two promotes racing each other
     /// both take effect. Returns the final membership entry's index.
     pub async fn promote(&self, id: NodeId) -> Result<u64, StoreError> {
-        let _in_flight = self.proposal()?;
-        let _ticks = self.tick_hold();
-        let r = committed(self.raft.change_membership(
-            openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id])),
-            true,
-        ))
+        let hold = (self.proposal()?, self.tick_hold());
+        let change = openraft::ChangeMembers::AddVoterIds(BTreeSet::from([id]));
+        let r = committed(self.spawn_holding(hold, |raft| async move {
+            raft.change_membership(change, true).await
+        }))
         .await?;
         Ok(r.log_id().index)
     }
@@ -868,15 +912,17 @@ impl RaftNode {
     /// is not kept as a learner). The guards are the caller's
     /// (`Admin.Remove`). Returns the final membership entry's index.
     pub async fn remove(&self, id: NodeId, voter: bool) -> Result<u64, StoreError> {
-        let _in_flight = self.proposal()?;
-        let _ticks = self.tick_hold();
+        let hold = (self.proposal()?, self.tick_hold());
         let ids = BTreeSet::from([id]);
         let change = if voter {
             openraft::ChangeMembers::RemoveVoters(ids)
         } else {
             openraft::ChangeMembers::RemoveNodes(ids)
         };
-        let r = committed(self.raft.change_membership(change, false)).await?;
+        let r = committed(self.spawn_holding(hold, |raft| async move {
+            raft.change_membership(change, false).await
+        }))
+        .await?;
         Ok(r.log_id().index)
     }
 
@@ -886,15 +932,14 @@ impl RaftNode {
     /// the new address). The guards are the caller's
     /// (`Admin.UpdateAdvertise`). Returns the entry's index.
     pub async fn set_node_addr(&self, id: NodeId, addr: &str) -> Result<u64, StoreError> {
-        let _in_flight = self.proposal()?;
-        let _ticks = self.tick_hold();
-        let r = committed(self.raft.change_membership(
-            openraft::ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
-                id,
-                BasicNode::new(addr),
-            )])),
-            false,
-        ))
+        let hold = (self.proposal()?, self.tick_hold());
+        let change = openraft::ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
+            id,
+            BasicNode::new(addr),
+        )]));
+        let r = committed(self.spawn_holding(hold, |raft| async move {
+            raft.change_membership(change, false).await
+        }))
         .await?;
         Ok(r.log_id().index)
     }

@@ -9,7 +9,7 @@ use graph_client::{ClientConfig, ReadMode, RemoteStore};
 use graph_core::{Extractor, NodeKind};
 use graph_proto::pb;
 use graph_server::raft::log_store::RedbLogStore;
-use graph_server::services::admin::QUORUM_REFUSAL;
+use graph_server::services::admin::{QUORUM_REFUSAL, TRIGGER_UNANSWERED};
 use graph_server::testing::{ClusterTestbed, TestServer, CLUSTER_WAIT, TEST_RAFT};
 use graph_server::{InitMode, JoinSpec, NodeJson, RaftSettings, ServeConfig};
 use graph_store::conformance::run_differential;
@@ -736,7 +736,7 @@ fn transfer_retrying_unanswered(c: &RemoteStore, target: u64) -> Result<u64, Sto
     let mut attempts = 0;
     loop {
         match c.admin_transfer_leader(target) {
-            Err(e) if attempts < 5 && e.to_string().contains("did not answer TriggerElect") => {
+            Err(e) if attempts < 5 && e.to_string().contains(TRIGGER_UNANSWERED) => {
                 eprintln!("transfer refused, retrying: {e}");
                 attempts += 1;
             }
@@ -898,6 +898,48 @@ fn an_abandoned_write_stays_in_flight_until_raft_answers_it() {
     );
     tb.heal();
     wait_until("openraft answers the abandoned write", || {
+        node.in_flight.load(Ordering::SeqCst) == 0
+    });
+}
+
+/// Issue #232, for a membership change: an `add_learner` whose caller
+/// drops it (a cancelled RPC or forward) while the leader is cut off
+/// stays in flight until openraft answers, after the partition heals.
+#[test]
+fn an_abandoned_membership_change_stays_in_flight_until_raft_answers_it() {
+    let _w = watchdog(
+        "an_abandoned_membership_change_stays_in_flight_until_raft_answers_it",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let leader = tb.leader();
+    let others = node_ids_other_than(&tb, &[leader]);
+    let node = tb.node(leader).raft().unwrap().clone();
+    assert_eq!(node.in_flight.load(Ordering::SeqCst), 0);
+    tb.partition(&[leader], &others);
+    // The change's task runs on this runtime: it must outlive the test
+    // (and run without being blocked on), so a multi-thread one, kept.
+    let caller = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dropped = caller.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            node.add_learner(4, "127.0.0.1:1", false),
+        )
+        .await
+    });
+    assert!(dropped.is_err(), "the change cannot commit: {dropped:?}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        node.in_flight.load(Ordering::SeqCst) > 0,
+        "a membership change openraft has not answered left the in-flight count"
+    );
+    tb.heal();
+    wait_until("openraft answers the abandoned change", || {
         node.in_flight.load(Ordering::SeqCst) == 0
     });
 }
