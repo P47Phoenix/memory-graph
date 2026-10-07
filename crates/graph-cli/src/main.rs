@@ -486,6 +486,24 @@ enum Cmd {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         mcp_max_inflight: Option<u64>,
+        /// Open MCP connections at once; a connection past it is closed as soon as it is
+        /// accepted (default 256)
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "mcp_listen",
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        mcp_max_connections: Option<u64>,
+        /// How long an MCP client may take to send a request's headers before its connection
+        /// is closed: seconds, or with an s/m/h suffix (default 20s). It also bounds the wait
+        /// for the next request on a keep-alive connection
+        #[arg(long, value_name = "DURATION", requires = "mcp_listen", value_parser = parse_duration)]
+        mcp_header_timeout: Option<std::time::Duration>,
+        /// An MCP keep-alive connection with no request in flight for this long is closed; at
+        /// most --mcp-header-timeout, which is the default
+        #[arg(long, value_name = "DURATION", requires = "mcp_listen", value_parser = parse_duration)]
+        mcp_idle_timeout: Option<std::time::Duration>,
         /// The memory-graph.ready health service is SERVING only while a leader is known and
         /// this node's applied index is within this many entries of the leader's commit index
         #[arg(long, value_name = "N", default_value_t = graph_server::DEFAULT_READY_MAX_LAG)]
@@ -1194,6 +1212,9 @@ fn run() -> Result<i32> {
         mcp_allow_origin,
         mcp_read,
         mcp_max_inflight,
+        mcp_max_connections,
+        mcp_header_timeout,
+        mcp_idle_timeout,
         ready_max_lag,
         snapshot_log_entries,
         snapshot_log_bytes,
@@ -1447,6 +1468,15 @@ fn run() -> Result<i32> {
             };
             if let Some(n) = mcp_max_inflight {
                 mc.max_inflight = usize::try_from(*n).unwrap_or(usize::MAX);
+            }
+            if let Some(n) = mcp_max_connections {
+                mc.max_connections = usize::try_from(*n).unwrap_or(usize::MAX);
+            }
+            if let Some(t) = mcp_header_timeout {
+                mc.header_timeout = *t;
+            }
+            if let Some(t) = mcp_idle_timeout {
+                mc.idle_timeout = Some(*t);
             }
             cfg.mcp = Some(mc);
         }
@@ -2761,6 +2791,12 @@ mod serve_config_tests {
                 "linearizable",
                 "--mcp-max-inflight",
                 "4",
+                "--mcp-max-connections",
+                "32",
+                "--mcp-header-timeout",
+                "15s",
+                "--mcp-idle-timeout",
+                "10s",
                 "--ready-max-lag",
                 "50",
                 "--snapshot-log-entries",
@@ -2834,6 +2870,9 @@ mcp_allow_remote = true
 mcp-allow-origin = ["http://localhost:6274", "https://a.example"]
 mcp-read = "linearizable"
 mcp-max-inflight = 4
+mcp-max-connections = 32
+mcp-header-timeout = "15s"
+mcp-idle-timeout = "10s"
 ready-max-lag = 50
 snapshot-log-entries = 500
 snapshot-log-bytes = "64M"
