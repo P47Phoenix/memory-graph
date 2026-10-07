@@ -1104,7 +1104,9 @@ fn main() {
 /// JSON document plus its text rendering under `text`, so `sysinfo
 /// --server` prints the same text a local `sysinfo` would.
 fn server_sysinfo(db: &std::path::Path) -> serde_json::Value {
-    let r = graph_cli::report::Report::detect(db, None, graph_cli::diskinfo::MinFree::Default);
+    // The server's own index path does not subtract a cache (#236), so
+    // neither does its report.
+    let r = graph_cli::report::Report::detect(db, None, graph_cli::diskinfo::MinFree::Default, 0);
     let mut j = r.json();
     j["text"] = serde_json::Value::String(r.text());
     j
@@ -2135,6 +2137,21 @@ fn run() -> Result<i32> {
                 }
             };
             let mut remote_store = remote_store;
+            // #236: size the page cache once, so the store opens with the
+            // same cache the budget subtracts.
+            let page_cache_bytes = match &target {
+                Target::Embedded(_) => {
+                    graph_cli::sysinfo::cache_bytes_or_derived(overrides.cache_bytes)
+                }
+                Target::Remote { .. } => 0,
+            };
+            let overrides = match &target {
+                Target::Embedded(_) => Overrides {
+                    cache_bytes: Some(page_cache_bytes),
+                    ..overrides
+                },
+                Target::Remote { .. } => overrides,
+            };
             let replaced = index_dir(
                 DirOpts {
                     db: &db,
@@ -2164,14 +2181,9 @@ fn run() -> Result<i32> {
                     encoding: encoding.and_then(|e| e.0),
                     strict_encoding,
                     compact,
-                    // #236: the embedded store's page cache comes off the
-                    // ingest budget (same size `open_v2` will use).
-                    page_cache_bytes: match &target {
-                        Target::Embedded(_) => {
-                            graph_cli::sysinfo::cache_bytes_or_derived(overrides.cache_bytes)
-                        }
-                        Target::Remote { .. } => 0,
-                    },
+                    // #236: comes off the ingest budget (0 with --server,
+                    // whose cache is the server's).
+                    page_cache_bytes,
                 },
                 |_| match remote_store.take() {
                     Some(s) => Ok(Box::new(s) as Box<dyn Store>),
@@ -2236,6 +2248,8 @@ fn run() -> Result<i32> {
                     db,
                     memory,
                     min_free_disk.unwrap_or(graph_cli::diskinfo::MinFree::Default),
+                    // What `index` would subtract (#236): the same cache size.
+                    graph_cli::sysinfo::cache_bytes_or_derived(overrides.cache_bytes),
                 );
                 if json {
                     out!("{}", serde_json::to_string_pretty(&r.json())?);

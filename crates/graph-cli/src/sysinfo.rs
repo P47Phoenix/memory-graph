@@ -597,6 +597,9 @@ pub struct MemoryPolicy {
     /// Bytes of store page cache taken out of a fraction budget's heap
     /// share (#236); 0 when nothing is subtracted.
     pub page_cache: u64,
+    /// `available` at the first sample (nothing held yet), the baseline
+    /// against which later samples see the page cache filling up.
+    pub first_available: Option<u64>,
 }
 
 /// Source bytes a fraction budget targets (#236): the `fraction` share of
@@ -659,6 +662,7 @@ impl MemoryPolicy {
             expansion: INITIAL_EXPANSION,
             unknown_cause: first.err().map(str::to_string),
             page_cache,
+            first_available: first.ok().map(|m| m.available),
         };
         let d = p.decide(first.ok(), 0, 0);
         p.apply(&d);
@@ -800,8 +804,18 @@ impl MemoryPolicy {
         } else {
             (held as f64 * self.expansion) as u64
         };
-        let spare = m.available.saturating_add(growth).saturating_sub(reserve);
-        let target = fraction_target(spare, fraction, self.page_cache, self.expansion);
+        let seen = m.available.saturating_add(growth);
+        let spare = seen.saturating_sub(reserve);
+        // redb's page cache fills as the run goes, and what it has taken
+        // already shows as a fall in `available` since the first sample
+        // (with what we hold added back, `seen`). Subtract only the part of
+        // the cache not yet reflected there, so a later sample does not take
+        // the cache off twice (#236). Anything else that grew in the
+        // meantime counts as cache here too, which only errs towards
+        // subtracting less of a cache that is already squeezed out.
+        let reflected = self.first_available.map_or(0, |f| f.saturating_sub(seen));
+        let cache_left = self.page_cache.saturating_sub(reflected);
+        let target = fraction_target(spare, fraction, cache_left, self.expansion);
         let ceiling = m.total / 2;
         let floor = self
             .floor
@@ -910,7 +924,10 @@ impl Sizing {
     }
 
     /// A warning when subtracting the page cache left a fraction budget
-    /// below its floor, so the floor (not the share) sets it (#236).
+    /// below its floor, so the floor (not the share) sets it (#236). Call
+    /// it right after [`Sizing::with_page_cache`], on the first sample with
+    /// nothing held yet: it recomputes that first decision (held = 0, the
+    /// whole cache subtracted), not a later adaptive one.
     pub fn page_cache_floor_warning(&self) -> Option<String> {
         let p = &self.policy;
         let (MemorySpec::Fraction(f), Ok(m)) = (p.spec, &self.memory) else {
@@ -1503,6 +1520,28 @@ mod tests {
             Sizing::new(2, Ok(m), 0, None, 1).page_cache_floor_warning(),
             None
         );
+    }
+
+    /// #236: as the cache fills, `available` falls by what it took; later
+    /// samples subtract only the rest of the cache, not all of it again.
+    #[test]
+    fn a_filling_cache_is_not_subtracted_twice() {
+        let g = 1u64 << 30;
+        let p =
+            MemoryPolicy::with_page_cache(MemorySpec::Fraction(0.7), 1, Ok(&mem(64, 40)), 4 * g);
+        let reserve = ((64 * g) as f64 * OS_RESERVE) as u64;
+        let x = INITIAL_EXPANSION;
+        assert_eq!(p.cap, fraction_target(40 * g - reserve, 0.7, 4 * g, x));
+        // 2 GiB of the cache filled: only the other 2 GiB come off.
+        let half = p.decide(Some(&mem(64, 38)), 0, 0).cap;
+        assert_eq!(half, fraction_target(38 * g - reserve, 0.7, 2 * g, x));
+        // All of it (and more) filled: nothing left to subtract.
+        let full = p.decide(Some(&mem(64, 35)), 0, 0).cap;
+        assert_eq!(full, fraction_target(35 * g - reserve, 0.7, 0, x));
+        // What this process holds is added back, not mistaken for cache.
+        let held = g / 25;
+        let with_held = p.decide(Some(&mem(64, 39)), held, g).cap;
+        assert_eq!(with_held, fraction_target(40 * g - reserve, 0.7, 4 * g, x));
     }
 
     /// A fixed `--memory` wins unchanged: the cache is not subtracted.
