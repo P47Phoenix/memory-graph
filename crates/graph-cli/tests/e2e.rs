@@ -2445,7 +2445,12 @@ fn sysinfo_reports_the_probes() {
     let (ok, out, err) = run(&["--db", &db, "sysinfo"]);
     assert!(ok, "{out}{err}");
     assert!(out.starts_with("cpus: "), "{out}");
-    assert!(out.contains("\nbudget: "), "{out}");
+    // "budget: " plain, or "index budget (after N page cache): " when the
+    // page cache is subtracted (#236).
+    assert!(
+        out.contains("\nbudget: ") || out.contains("\nindex budget (after "),
+        "{out}"
+    );
     assert!(out.contains("\ndisk ("), "{out}");
     let (ok, out, err) = run(&["--db", &db, "sysinfo", "--json", "--memory", "3G"]);
     assert!(ok, "{out}{err}");

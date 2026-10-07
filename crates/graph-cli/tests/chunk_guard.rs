@@ -157,3 +157,44 @@ fn stats_transactions_count_real_commits() {
     let t = v["stats"]["transactions"].as_u64().unwrap();
     assert!((1..=10).contains(&t), "{t}");
 }
+
+/// #236: `index` takes its store's page cache off the memory budget, and
+/// `--stats --json` reports the cache it subtracted; a fixed `--memory` is
+/// used as given.
+#[test]
+fn index_budget_subtracts_the_page_cache() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "word\n").unwrap();
+    let o = index(
+        &d.path().join("g1"),
+        &root,
+        &["--cache-bytes", "123456789", "index", "--stats", "--json"],
+    );
+    let v = summary(&o);
+    let m = &v["stats"]["memory"];
+    assert_eq!(m["page_cache"], 123456789, "{v}");
+    let reason = m["reason"].as_str().unwrap();
+    // A machine that reports memory and is not under pressure names the
+    // subtraction in the budget's reason.
+    if !reason.starts_with("pressure") && !reason.starts_with("free RAM unknown") {
+        assert!(reason.contains("less the 118 MB page cache"), "{reason}");
+    }
+    let o = index(
+        &d.path().join("g2"),
+        &root,
+        &[
+            "--cache-bytes",
+            "123456789",
+            "index",
+            "--memory",
+            "64M",
+            "--stats",
+            "--json",
+        ],
+    );
+    let v = summary(&o);
+    assert_eq!(v["stats"]["memory"]["budget_start"], 64 << 20, "{v}");
+    assert_eq!(v["stats"]["memory"]["reason"], "fixed by --memory", "{v}");
+}

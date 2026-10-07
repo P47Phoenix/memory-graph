@@ -8,3 +8,4 @@ cc f1ff0b618bd152536b098f99a6e2c122cd3dac3c2651893b86896dfb076a2295 # shrinks to
 cc af2af422f7232523fc1217c7d65269745eb8ef9feb534ce4d496493e15e89de5 # shrinks to parts = ["const f = (): T =>", "export", "type A = B |"]
 cc 4355fd4d324e57da3e06094aa35562523a422308b016aaad57c3e9ccb2c74f73 # shrinks to parts = ["class C { x: A |", "type A = B |", "default", "}"]
 cc 26fb421efd0d1678f37ff8fc8175a6835ba20e040b38e74349ffdde333ea7858 # shrinks to parts = ["const f = (): T =>", "export", "const f = (): T =>", "const f = (): T =>", "export", "type A = B;"]
+cc b5250b9ca822698139f9516b22e42c4b2a31dd9625b4c5ac4ecf600d2b742bc4 # shrinks to parts = ["class C { x: A |", "type A = B |", "declare", "{", "}", "}"]

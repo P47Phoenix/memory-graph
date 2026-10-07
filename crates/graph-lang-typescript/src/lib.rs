@@ -44,7 +44,10 @@ impl Extractor for TypeScriptExtractor {
         // `kw1`: reserved words are classed `keyword` (#143).
         // `scan-3`: a type stops before the next statement and the merged
         // spans always nest (#203).
-        format!("typescript-scan-3+kw1+tok{TOKENIZER_VERSION}")
+        // `scan-4`: `abstract new` types, `<T>(...) => T` generic function
+        // types, decorators and statement words end types and expressions,
+        // so the two scans no longer overlap (#213).
+        format!("typescript-scan-4+kw1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
