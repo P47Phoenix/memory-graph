@@ -261,7 +261,12 @@ To run the read benchmark against it, index the directory and point the benchmar
 
   The runs used `D:\mg-bench-corpus` and `D:\mg-target-a5`. Since then the corpus has moved to `D:\tmp\bench-corpus` and the build dir has been deleted, per the D:\tmp rule; the command above uses the current paths.
 - **Stack overflow:** the first indexing attempt died after 48 minutes with `STATUS_STACK_OVERFLOW` on the benchmark's indexing thread, which is the test harness's default 2 MiB thread. Setting `RUST_MIN_STACK` (256 MiB) got past it. Tracked in #245.
-  - We did not find which file triggers it, and we did not check whether `memory-graph index` (8 MiB main thread) hits the same overflow. See #245.
+  - Fixed in #245. The trigger was rustc's `tests/ui/parser/survive-peano-lesson-queue.rs`: 2005 nested calls, which `syn` recursed into. `memory-graph index` hit it too, on its 2 MiB parse workers.
+  - The Rust extractor now runs `syn` on an internal thread. The thread's stack is sized from the token count of the file's largest top-level item, at 12 KiB per token in release, measured with margin. So no input can overflow it, whatever its shape.
+  - An item that would need more than 2 GiB of stack is stored tokens only, with a warning. A cheap pre-scan does the same earlier for nesting deeper than 256 or a chain longer than 1024 links. The CLI's parse workers also get 16 MiB stacks.
+  - Re-run on 2026-10-07 with `RUST_MIN_STACK` unset: a release `memory-graph index` ran over all 31 repos, one run per repo into one db. It completed: 573,569 files, 877.3M tokens, 2,462 s, a 22,803 MiB db.
+  - The internal parse thread cost no indexing throughput. testdata/corpus took 0.41 s with and without it, and the rust repo 44.7-46.6 s against 44.8-45.3 s, with identical symbols.
+  - Rust files degraded by the depth guard: 4, all rustc stress tests. Spans already degraded files the same way through the #203 path: 6 in rust and 1 in llvm-project.
 - **Index:**
   - 572,360 files indexed (4,790.8 MiB; 10,399 skipped), 877.1M tokens.
   - Took 2,741 s (45.7 min).
@@ -294,7 +299,7 @@ Run 2 (reuse). Run 1 agreed within 2% on every timing column and exactly on ever
 
 - One machine, one corpus. The OS page cache was warm, so the cold row is a cold redb cache, not a cold disk.
 - The workload's terms are sampled from the first 8 MiB of each repo. Six hot terms over a corpus this size make a pass heavy-tailed; a workload of only rare terms would raise the share, but it would not be what the gate measures.
-- `RUST_MIN_STACK` was raised for the benchmark process; see the stack overflow note above.
+- `RUST_MIN_STACK` was raised for the benchmark process. It is no longer needed since #245; see the stack overflow note above.
 
 ## Scripted-session repeats (A5)
 
