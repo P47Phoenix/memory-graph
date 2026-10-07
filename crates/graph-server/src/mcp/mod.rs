@@ -75,9 +75,11 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// Default `--mcp-header-timeout`: how long a client may take to send a
 /// request's headers before the connection is closed (slowloris, #234).
 pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(20);
-/// Default `--mcp-idle-timeout`: a keep-alive connection with no request in
-/// flight for this long is closed.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest the staged close ([`linger`]) runs after a connection that
+/// ended in an error with no response written (a header timeout or a parse
+/// error): nothing the client sends then needs protecting, so a client
+/// trickling bytes must not hold a connection slot for the full linger.
+pub(crate) const LINGER_AFTER_ERROR: Duration = Duration::from_secs(2);
 /// How long one call may run before it is answered with a timeout.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
 /// Sessions kept at once; the least recently used is ended when a new one
@@ -127,8 +129,12 @@ pub struct McpConfig {
     pub max_connections: usize,
     /// `--mcp-header-timeout` ([`DEFAULT_HEADER_TIMEOUT`]).
     pub header_timeout: Duration,
-    /// `--mcp-idle-timeout` ([`DEFAULT_IDLE_TIMEOUT`]).
-    pub idle_timeout: Duration,
+    /// `--mcp-idle-timeout`: a keep-alive connection with no request in
+    /// flight this long is closed. `None` (the default) is the header
+    /// timeout, which also bounds that wait: hyper arms its header-read
+    /// timer while it waits for the next request head, so a longer idle
+    /// timeout could never take effect and is refused ([`check_bind`]).
+    pub idle_timeout: Option<Duration>,
     /// The per-call deadline ([`CALL_DEADLINE`]; tests shorten it).
     pub call_timeout: Duration,
     /// Testing only: every call sleeps this long on the blocking pool
@@ -153,7 +159,7 @@ impl McpConfig {
             max_inflight: DEFAULT_MAX_INFLIGHT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             header_timeout: DEFAULT_HEADER_TIMEOUT,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            idle_timeout: None,
             call_timeout: CALL_DEADLINE,
             testing_call_delay: None,
             session_idle: SESSION_IDLE,
@@ -195,10 +201,18 @@ pub fn check_bind(cfg: &McpConfig) -> Result<(), StoreError> {
             "--mcp-max-connections must be at least 1".into(),
         ));
     }
-    if cfg.header_timeout.is_zero() || cfg.idle_timeout.is_zero() {
+    if cfg.header_timeout.is_zero() || cfg.idle_timeout.is_some_and(|t| t.is_zero()) {
         return Err(StoreError::Rejected(
             "--mcp-header-timeout and --mcp-idle-timeout must be above zero".into(),
         ));
+    }
+    if let Some(idle) = cfg.idle_timeout.filter(|t| *t > cfg.header_timeout) {
+        return Err(StoreError::Rejected(format!(
+            "--mcp-idle-timeout ({idle:?}) must not exceed --mcp-header-timeout ({:?}): the \
+             header timeout also bounds the wait for the next request on a keep-alive \
+             connection, so a longer idle timeout never takes effect",
+            cfg.header_timeout
+        )));
     }
     if !cfg.listen.ip().is_loopback() && !cfg.allow_remote {
         return Err(StoreError::Rejected(format!(
@@ -292,7 +306,7 @@ pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdow
     let slots = Arc::new(Semaphore::new(cfg.max_connections));
     let limits = ConnLimits {
         header_timeout: cfg.header_timeout,
-        idle_timeout: cfg.idle_timeout,
+        idle_timeout: cfg.idle_timeout.unwrap_or(cfg.header_timeout),
         linger: cfg.testing_linger,
     };
     let mut conns = tokio::task::JoinSet::new();
@@ -431,6 +445,9 @@ async fn serve_connection(
     let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
         let mut app = app.clone();
         let busy = InFlight::start(&svc_activity);
+        // `busy` drops when the response head is ready, not when its body
+        // has been written; that is safe because the idle timeout closes
+        // with `graceful_shutdown`, which lets a body in progress finish.
         // Boxed: `poll_without_shutdown` wants an `Unpin` future.
         Box::pin(async move {
             let r = app.call(req.map(Body::new)).await;
@@ -469,15 +486,22 @@ async fn serve_connection(
             }
         }
     };
+    let mut bounds = limits.linger;
     if let Err(e) = served {
         tracing::debug!(error = %e, "MCP connection ended with an error");
+        // A header timeout or parse error: no response of ours is waiting
+        // in the client's buffers for the staged close to protect (#231
+        // needs it after a refusal, which ends without an error), so keep
+        // it short and free the slot.
+        bounds.time = bounds.time.min(LINGER_AFTER_ERROR);
+        bounds.idle = bounds.idle.min(LINGER_AFTER_ERROR);
     }
     // The IO back from hyper, which neither shut it down nor closed it:
     // the response it wrote is flushed.
     let stream = conn.into_parts().io.into_inner();
     if !shutdown.is_triggered() {
         tokio::select! {
-            () = linger(stream, limits.linger) => {}
+            () = linger(stream, bounds) => {}
             _ = shutdown.wait() => {}
         }
     }

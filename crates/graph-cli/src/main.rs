@@ -496,11 +496,12 @@ enum Cmd {
         )]
         mcp_max_connections: Option<u64>,
         /// How long an MCP client may take to send a request's headers before its connection
-        /// is closed: seconds, or with an s/m/h suffix (default 20s)
+        /// is closed: seconds, or with an s/m/h suffix (default 20s). It also bounds the wait
+        /// for the next request on a keep-alive connection
         #[arg(long, value_name = "DURATION", requires = "mcp_listen", value_parser = parse_duration)]
         mcp_header_timeout: Option<std::time::Duration>,
-        /// An MCP keep-alive connection with no request in flight for this long is closed
-        /// (default 60s)
+        /// An MCP keep-alive connection with no request in flight for this long is closed; at
+        /// most --mcp-header-timeout, which is the default
         #[arg(long, value_name = "DURATION", requires = "mcp_listen", value_parser = parse_duration)]
         mcp_idle_timeout: Option<std::time::Duration>,
         /// The memory-graph.ready health service is SERVING only while a leader is known and
@@ -1475,7 +1476,7 @@ fn run() -> Result<i32> {
                 mc.header_timeout = *t;
             }
             if let Some(t) = mcp_idle_timeout {
-                mc.idle_timeout = *t;
+                mc.idle_timeout = Some(*t);
             }
             cfg.mcp = Some(mc);
         }
@@ -2795,7 +2796,7 @@ mod serve_config_tests {
                 "--mcp-header-timeout",
                 "15s",
                 "--mcp-idle-timeout",
-                "2m",
+                "10s",
                 "--ready-max-lag",
                 "50",
                 "--snapshot-log-entries",
@@ -2869,9 +2870,9 @@ mcp_allow_remote = true
 mcp-allow-origin = ["http://localhost:6274", "https://a.example"]
 mcp-read = "linearizable"
 mcp-max-inflight = 4
-mcp_max_connections = 32
+mcp-max-connections = 32
 mcp-header-timeout = "15s"
-mcp-idle-timeout = "2m"
+mcp-idle-timeout = "10s"
 ready-max-lag = 50
 snapshot-log-entries = 500
 snapshot-log-bytes = "64M"
