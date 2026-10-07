@@ -135,6 +135,11 @@ pub struct DirOpts<'a> {
     /// replaced files, so the `vacuum --compact` hint is not printed (unless
     /// files failed: the run then errors before the caller compacts).
     pub compact: bool,
+    /// Bytes of store page cache the run's store holds (`--cache-bytes` or
+    /// the derived size), subtracted from a fraction `memory` budget so the
+    /// two do not double-claim RAM (#236); 0 subtracts nothing (a remote
+    /// store, whose cache lives in the server).
+    pub page_cache_bytes: u64,
 }
 
 /// Source bytes per redb transaction unless `--chunk-bytes` says otherwise
@@ -1291,7 +1296,11 @@ pub fn index_dir_with(
     } else {
         1
     };
-    let sizing = sysinfo::Sizing::detect(o.jobs, o.memory, floor);
+    let sizing =
+        sysinfo::Sizing::detect_with_page_cache(o.jobs, o.memory, floor, o.page_cache_bytes);
+    if let Some(w) = sizing.page_cache_floor_warning() {
+        eprintln!("{w}");
+    }
     let mut board = Board::new(&format!("{}/{}", o.org, o.repo), sizing, trace);
     if let Some(r) = remote {
         board.set_remote(r);

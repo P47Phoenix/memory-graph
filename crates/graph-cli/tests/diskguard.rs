@@ -58,6 +58,7 @@ fn run_with(
             encoding: None,
             strict_encoding: false,
             compact: false,
+            page_cache_bytes: 0,
         },
         open,
         &mut out,

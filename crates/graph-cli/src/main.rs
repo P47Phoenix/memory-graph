@@ -2164,6 +2164,14 @@ fn run() -> Result<i32> {
                     encoding: encoding.and_then(|e| e.0),
                     strict_encoding,
                     compact,
+                    // #236: the embedded store's page cache comes off the
+                    // ingest budget (same size `open_v2` will use).
+                    page_cache_bytes: match &target {
+                        Target::Embedded(_) => {
+                            graph_cli::sysinfo::cache_bytes_or_derived(overrides.cache_bytes)
+                        }
+                        Target::Remote { .. } => 0,
+                    },
                 },
                 |_| match remote_store.take() {
                     Some(s) => Ok(Box::new(s) as Box<dyn Store>),

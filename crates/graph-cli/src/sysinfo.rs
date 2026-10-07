@@ -29,11 +29,18 @@ pub const OS_RESERVE: f64 = 0.20;
 /// Default share of the free memory (above the reserve) this process may
 /// grow into. The budget itself is that share divided by the measured
 /// growth per source byte (see [`MemoryPolicy`]), so it is in RSS terms.
-/// The footprint leaves out allocator rounding and the store's caches
-/// (measured 6-25% under the real growth), which the 30% slack covers.
-/// That slack was measured with redb's old 1 GiB cache; the derived page
-/// cache (ADR 0008 phase 1) can reach 4 GiB on a large machine and is not
-/// in the budget either, so the slack is due a re-measure (#236).
+/// The footprint leaves out allocator rounding (measured 6-25% under the
+/// real growth), which the 30% slack covers.
+///
+/// During `index` the store's page cache is subtracted from that share
+/// before dividing by the growth (#236): the heap the pipeline may grow
+/// into is `fraction × (free above the reserve) − page cache`, where the
+/// page cache is `--cache-bytes` or the derived size (ADR 0008 phase 1, up
+/// to 4 GiB), so the two no longer double-claim RAM. The result is still
+/// raised to the floor (see [`FLOOR`]); `index` warns when that happens
+/// with a cache in the way. A fixed `--memory` is taken as given (the cache
+/// is not subtracted from it), and `serve` is unchanged. The parse stack
+/// is not in the budget either (#254).
 pub const DEFAULT_FRACTION: f64 = 0.70;
 /// Heap per source byte in flight assumed until measured. Measured on the
 /// test corpus: about 25x (the extraction's tokens, symbols and their
@@ -587,6 +594,18 @@ pub struct MemoryPolicy {
     /// Why the platform gave no first reading (shown in the fallback
     /// reason), if it gave none.
     pub unknown_cause: Option<String>,
+    /// Bytes of store page cache taken out of a fraction budget's heap
+    /// share (#236); 0 when nothing is subtracted.
+    pub page_cache: u64,
+}
+
+/// Source bytes a fraction budget targets (#236): the `fraction` share of
+/// `spare` (free memory above the OS reserve), less the store's
+/// `page_cache`, divided by the `expansion` (heap per source byte). Floors
+/// and the half-of-RAM ceiling are applied by the caller.
+pub fn fraction_target(spare: u64, fraction: f64, page_cache: u64, expansion: f64) -> u64 {
+    let heap = (spare as f64 * fraction) as u64;
+    (heap.saturating_sub(page_cache) as f64 / expansion) as u64
 }
 
 /// A change the policy decided on.
@@ -619,6 +638,18 @@ fn mb(b: u64) -> String {
 impl MemoryPolicy {
     /// Start from the first sample, or from why there is none.
     pub fn new(spec: MemorySpec, floor: u64, first: Result<&MemSample, &str>) -> Self {
+        Self::with_page_cache(spec, floor, first, 0)
+    }
+
+    /// As [`MemoryPolicy::new`], with `page_cache` bytes of store cache
+    /// subtracted from a fraction budget's heap share (#236). A fixed
+    /// `--memory` ignores it.
+    pub fn with_page_cache(
+        spec: MemorySpec,
+        floor: u64,
+        first: Result<&MemSample, &str>,
+        page_cache: u64,
+    ) -> Self {
         let mut p = Self {
             spec,
             floor: floor.max(1),
@@ -627,6 +658,7 @@ impl MemoryPolicy {
             cap: 1,
             expansion: INITIAL_EXPANSION,
             unknown_cause: first.err().map(str::to_string),
+            page_cache,
         };
         let d = p.decide(first.ok(), 0, 0);
         p.apply(&d);
@@ -769,7 +801,7 @@ impl MemoryPolicy {
             (held as f64 * self.expansion) as u64
         };
         let spare = m.available.saturating_add(growth).saturating_sub(reserve);
-        let target = (spare as f64 * fraction / self.expansion) as u64;
+        let target = fraction_target(spare, fraction, self.page_cache, self.expansion);
         let ceiling = m.total / 2;
         let floor = self
             .floor
@@ -786,10 +818,15 @@ impl MemoryPolicy {
             cap,
             under_pressure: false,
             reason: format!(
-                "{}% of {} free above the {} OS reserve ÷ {:.1}× growth per source byte{}{}",
+                "{}% of {} free above the {} OS reserve{} ÷ {:.1}× growth per source byte{}{}",
                 pct(fraction),
                 mb(m.available),
                 mb(reserve),
+                if self.page_cache > 0 {
+                    format!(", less the {} page cache", mb(self.page_cache))
+                } else {
+                    String::new()
+                },
                 self.expansion,
                 m.rss.map_or(String::new(), |r| format!("; RSS {}", mb(r))),
                 clamped
@@ -841,8 +878,63 @@ impl Sizing {
 
     /// Size for this machine.
     pub fn detect(jobs: usize, spec: Option<MemorySpec>, floor: u64) -> Self {
+        Self::detect_with_page_cache(jobs, spec, floor, 0)
+    }
+
+    /// As [`Sizing::detect`], subtracting `page_cache` bytes of store cache
+    /// from a fraction budget (#236; what `index` does).
+    pub fn detect_with_page_cache(
+        jobs: usize,
+        spec: Option<MemorySpec>,
+        floor: u64,
+        page_cache: u64,
+    ) -> Self {
         let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-        Self::new(cpus, sample_memory(), jobs, spec, floor)
+        Self::new(cpus, sample_memory(), jobs, spec, floor).with_page_cache(page_cache)
+    }
+
+    /// The same sizing with `page_cache` bytes subtracted from a fraction
+    /// budget's heap share (#236); a fixed `--memory` is unchanged.
+    pub fn with_page_cache(self, page_cache: u64) -> Self {
+        let policy = MemoryPolicy::with_page_cache(
+            self.policy.spec,
+            self.policy.floor,
+            self.memory.as_ref().map_err(String::as_str),
+            page_cache,
+        );
+        Self {
+            memory_budget: policy.cap,
+            policy,
+            ..self
+        }
+    }
+
+    /// A warning when subtracting the page cache left a fraction budget
+    /// below its floor, so the floor (not the share) sets it (#236).
+    pub fn page_cache_floor_warning(&self) -> Option<String> {
+        let p = &self.policy;
+        let (MemorySpec::Fraction(f), Ok(m)) = (p.spec, &self.memory) else {
+            return None;
+        };
+        if p.page_cache == 0 || p.under_pressure || m.total == 0 {
+            return None;
+        }
+        let reserve = (m.total as f64 * OS_RESERVE) as u64;
+        let spare = m.available.saturating_sub(reserve);
+        let target = fraction_target(spare, f, p.page_cache, p.expansion);
+        (target < p.cap).then(|| {
+            format!(
+                "warning: the {} page cache leaves less than the memory budget's floor: {}% of {} free above the {} OS reserve is {}, less the cache leaves {} of heap; using the {} source floor (about {} in memory). Pass a smaller --cache-bytes or a fixed --memory to choose the split (#236)",
+                mb(p.page_cache),
+                pct(f),
+                mb(m.available),
+                mb(reserve),
+                mb((spare as f64 * f) as u64),
+                mb(((spare as f64 * f) as u64).saturating_sub(p.page_cache)),
+                mb(p.cap),
+                mb((p.cap as f64 * p.expansion) as u64),
+            )
+        })
     }
 }
 
@@ -1342,5 +1434,84 @@ mod tests {
             let e = sample_memory().unwrap_err();
             assert!(e.starts_with("unsupported platform: "), "{e}");
         }
+    }
+
+    #[test]
+    fn fraction_target_subtracts_the_page_cache_before_the_growth() {
+        let g = 1u64 << 30;
+        assert_eq!(fraction_target(10 * g, 0.5, 0, 25.0), 5 * g / 25);
+        assert_eq!(fraction_target(10 * g, 0.5, g, 25.0), 4 * g / 25);
+        // A cache above the whole share leaves nothing, not a wrap.
+        assert_eq!(fraction_target(g, 0.5, 4 * g, 25.0), 0);
+    }
+
+    /// #236: on a large machine the derived 4 GiB cache comes off the heap
+    /// share; the floor does not bind, so there is no warning.
+    #[test]
+    fn a_large_machine_budget_leaves_room_for_the_page_cache() {
+        let m = mem(64, 40);
+        let plain = Sizing::new(8, Ok(m), 0, None, 1);
+        let s = Sizing::new(8, Ok(m), 0, None, 1).with_page_cache(4 << 30);
+        let spare = (40u64 << 30) - ((64u64 << 30) as f64 * OS_RESERVE) as u64;
+        let want = fraction_target(spare, DEFAULT_FRACTION, 4 << 30, INITIAL_EXPANSION);
+        assert_eq!(s.memory_budget, want);
+        assert_eq!(s.policy.page_cache, 4 << 30);
+        assert!(s.memory_budget < plain.memory_budget);
+        assert!(
+            s.policy.reason.contains("less the 4.0 GB page cache"),
+            "{}",
+            s.policy.reason
+        );
+        assert!(!plain.policy.reason.contains("page cache"));
+        assert_eq!(s.page_cache_floor_warning(), None);
+    }
+
+    /// An explicit `--cache-bytes` is subtracted the same way.
+    #[test]
+    fn an_explicit_cache_size_is_subtracted() {
+        let m = mem(64, 40);
+        let s =
+            Sizing::new(8, Ok(m), 0, Some(MemorySpec::Fraction(0.5)), 1).with_page_cache(512 * MIB);
+        let spare = (40u64 << 30) - ((64u64 << 30) as f64 * OS_RESERVE) as u64;
+        assert_eq!(
+            s.memory_budget,
+            fraction_target(spare, 0.5, 512 * MIB, INITIAL_EXPANSION)
+        );
+        assert_eq!(s.page_cache_floor_warning(), None);
+    }
+
+    /// On a small machine the cache eats the whole share: the floor sets
+    /// the budget and `index` gets one warning naming the numbers.
+    #[test]
+    fn a_small_machine_budget_clamps_to_the_floor_and_warns() {
+        let m = mem_mb(2048, 1024);
+        let s = Sizing::new(2, Ok(m), 0, None, 1).with_page_cache(512 * MIB);
+        let floor = FLOOR.min(((2048 * MIB) as f64 * FLOOR_SHARE / INITIAL_EXPANSION) as u64);
+        assert_eq!(s.memory_budget, floor);
+        let w = s.page_cache_floor_warning().expect("the floor clamps");
+        for needle in [
+            "512 MB page cache",
+            "floor",
+            "--cache-bytes",
+            "--memory",
+            "#236",
+        ] {
+            assert!(w.contains(needle), "{needle}: {w}");
+        }
+        // Without a cache nothing is subtracted, so nothing to warn about.
+        assert_eq!(
+            Sizing::new(2, Ok(m), 0, None, 1).page_cache_floor_warning(),
+            None
+        );
+    }
+
+    /// A fixed `--memory` wins unchanged: the cache is not subtracted.
+    #[test]
+    fn a_fixed_memory_budget_ignores_the_page_cache() {
+        let s = Sizing::new(8, Ok(mem(64, 40)), 0, Some(MemorySpec::Fixed(2 << 30)), 1)
+            .with_page_cache(4 << 30);
+        assert_eq!(s.memory_budget, 2 << 30);
+        assert_eq!(s.policy.reason, "fixed by --memory");
+        assert_eq!(s.page_cache_floor_warning(), None);
     }
 }
