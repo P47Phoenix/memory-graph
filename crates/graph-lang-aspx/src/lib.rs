@@ -79,8 +79,9 @@ impl Extractor for AspxExtractor {
     fn version(&self) -> String {
         // `kw1`: C# reserved words in server script bodies are classed
         // `keyword` (#143). `cb1`: `<% %>` blocks of C# pages are C# tokens
-        // with keywords and `local` symbols (#72).
-        format!("aspx-scan-2+kw1+cb1+tok{TOKENIZER_VERSION}")
+        // with keywords and `local` symbols (#72). `em1`: enum members in
+        // server script blocks are symbols (#269).
+        format!("aspx-scan-2+kw1+cb1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {

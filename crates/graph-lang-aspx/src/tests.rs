@@ -139,6 +139,28 @@ fn server_script_csharp_symbols() {
     }
 }
 
+/// #269: enum members in a server script block, as in a `.cs` file.
+#[test]
+fn server_script_enum_members() {
+    let src = "<%@ Page Language=\"C#\" %>\n<script runat=\"server\">\n    enum Mode { Off, [Obsolete] On = 1 << 1, }\n    class C { public enum Inner { X } }\n</script>\n";
+    let s = syms(src);
+    let members: Vec<_> = s
+        .iter()
+        .filter(|x| x.1 == "enum_member")
+        .map(|x| (x.0.as_str(), x.2.as_str()))
+        .collect();
+    assert_eq!(
+        members,
+        [("Off", "Off"), ("On", "[Obsolete] On = 1 << 1"), ("X", "X")]
+    );
+    let ex = AspxExtractor.extract(src);
+    assert!(ex
+        .symbols
+        .iter()
+        .filter(|x| x.lang_kind.as_deref() == Some("enum_member"))
+        .all(|x| x.kind == SymbolKind::Constant));
+}
+
 /// Only C# scripts are spliced: the script's `language`, else the
 /// directive's; no language at all means VB (the Web Forms default).
 #[test]
@@ -209,7 +231,7 @@ fn well_nested_detects_partial_overlap() {
 fn version_is_pinned() {
     assert!(AspxExtractor
         .version()
-        .starts_with("aspx-scan-2+kw1+cb1+tok"));
+        .starts_with("aspx-scan-2+kw1+cb1+em1+tok"));
 }
 
 #[test]
@@ -338,7 +360,7 @@ fn keywords_only_in_csharp_server_scripts() {
     );
     assert!(AspxExtractor
         .version()
-        .starts_with("aspx-scan-2+kw1+cb1+tok"));
+        .starts_with("aspx-scan-2+kw1+cb1+em1+tok"));
     // No directive language (VB, the default): `<% %>` stays unclassed.
     let toks = AspxExtractor.extract("<% if (x) { int n = 0; } %>").tokens;
     assert!(toks.iter().all(|t| t.class != TokenClass::Keyword));

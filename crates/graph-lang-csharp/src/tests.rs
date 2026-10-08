@@ -96,8 +96,10 @@ fn declarations() {
         .map(|x| x.2.as_str())
         .collect();
     assert_eq!(ctors, ["class", "constructor", "finalizer"]);
-    // Enum members and method locals are not symbols.
-    assert!(s.iter().all(|x| x.0 != "Open" && x.0 != "u"));
+    assert_eq!(k("Open"), (SymbolKind::Constant, "enum_member"));
+    assert_eq!(k("Closed"), (SymbolKind::Constant, "enum_member"));
+    // Method locals are not symbols.
+    assert!(s.iter().all(|x| x.0 != "u"));
     // Spans: attributes included; initializers included.
     assert!(find(&s, "Invoice")
         .3
@@ -359,7 +361,7 @@ fn keywords_are_classed_keyword() {
     );
     assert!(CSharpExtractor
         .version()
-        .starts_with("csharp-scan-1+kw1+tok"));
+        .starts_with("csharp-scan-1+kw1+em1+tok"));
 }
 
 /// `local_symbols` (#72): (name, lang_kind, span text) of each local.
@@ -438,4 +440,86 @@ fn nested_generic_closers_are_single_tokens() {
     assert_eq!(names("List<List<int>> x;"), ["x"]);
     assert_eq!(names("A<B<C<int>>> y = z;"), ["y"]);
     assert!(names("A<B<int> y;").is_empty());
+}
+
+/// `(name, kind, lang_kind, span text)` of the symbols whose span lies
+/// inside `outer`'s span (the store nests by span).
+fn members_of(src: &str, outer: &str) -> Vec<(String, String)> {
+    let ex = CSharpExtractor.extract(src);
+    assert_nested(&ex);
+    let o = ex
+        .symbols
+        .iter()
+        .find(|s| s.name == outer)
+        .expect("outer symbol")
+        .span;
+    ex.symbols
+        .iter()
+        .filter(|s| s.name != outer && o.start <= s.span.start && s.span.end <= o.end)
+        .map(|s| {
+            assert_eq!(s.kind, SymbolKind::Constant, "{}", s.name);
+            assert_eq!(s.lang_kind.as_deref(), Some("enum_member"));
+            let text = src[s.span.start as usize..s.span.end as usize].to_string();
+            (s.name.clone(), text)
+        })
+        .collect()
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+#[test]
+fn enum_members_simple() {
+    let src = "public enum Color { Red, Green, Blue }";
+    assert_eq!(find(&syms(src), "Color").2, "enum");
+    assert_eq!(
+        members_of(src, "Color"),
+        pairs(&[("Red", "Red"), ("Green", "Green"), ("Blue", "Blue")])
+    );
+}
+
+#[test]
+fn enum_members_initializers_attributes_and_comments() {
+    let src = "[Flags]\nenum F : byte\n{\n    None = 0, // none\n    /* a */ A = 1 << 2,\n    [Obsolete(\"x, y\")] B = A | C,\n    C = (int)(1 + 2),\n    D = Helper.Get(1, 2),\n}\n";
+    assert_eq!(
+        members_of(src, "F"),
+        pairs(&[
+            ("None", "None = 0"),
+            ("A", "A = 1 << 2"),
+            ("B", "[Obsolete(\"x, y\")] B = A | C"),
+            ("C", "C = (int)(1 + 2)"),
+            ("D", "D = Helper.Get(1, 2)"),
+        ])
+    );
+}
+
+#[test]
+fn enum_members_empty_and_nested() {
+    assert!(members_of("enum E { }", "E").is_empty());
+    assert!(members_of("enum E { , }", "E").is_empty());
+    let src = "class Outer { int x; public enum Inner { X, Y = 2 } void M() { } }";
+    assert_eq!(
+        members_of(src, "Inner"),
+        pairs(&[("X", "X"), ("Y", "Y = 2")])
+    );
+    let s = syms(src);
+    assert_eq!(find(&s, "M").1, SymbolKind::Method);
+    assert_eq!(find(&s, "x").2, "field");
+}
+
+#[test]
+fn enum_members_in_member_symbols() {
+    let toks = tokenize_with("enum E { A, B }", CSHARP_TOKENIZER);
+    let names: Vec<_> = member_symbols(&toks)
+        .into_iter()
+        .map(|s| (s.name, s.lang_kind.unwrap()))
+        .collect();
+    assert_eq!(
+        names,
+        [("E", "enum"), ("A", "enum_member"), ("B", "enum_member")]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+    );
 }

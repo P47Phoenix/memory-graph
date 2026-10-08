@@ -11,6 +11,7 @@
 //! | methods, constructors, finalizers, operators | Method | `method` `constructor` `finalizer` `operator` |
 //! | properties, indexers, events | Variable | `property` `indexer` `event` |
 //! | fields / `const` | Variable / Constant | `field` / `const` |
+//! | enum members (`A`, `B = 1 << 2`) | Constant | `enum_member` |
 //!
 //! A declaration's span runs from its first token (attributes and modifiers
 //! included) through its closing `}` or `;`. Method bodies are not scanned
@@ -137,7 +138,8 @@ impl Extractor for CSharpExtractor {
 
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
-        format!("csharp-scan-1+kw1+tok{TOKENIZER_VERSION}")
+        // `em1`: enum members are symbols (#269).
+        format!("csharp-scan-1+kw1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -765,7 +767,9 @@ impl Scanner<'_> {
             let name = self.text(name).to_string();
             push(self, name.clone(), SymbolKind::Type, &kind);
             if let End::Block { open, close, .. } = *end {
-                if kind != "enum" {
+                if kind == "enum" {
+                    self.enum_members(open + 1, close);
+                } else {
                     self.body(open + 1, close, &Level::Type(name));
                 }
             }
@@ -828,6 +832,43 @@ impl Scanner<'_> {
                 End::Semi { .. } => (SymbolKind::Variable, "field"),
             };
             push(self, name, kind, lang);
+        }
+    }
+
+    /// Members of an enum body in code positions `[lo, hi)`: comma-separated
+    /// `[Attr] Name = value` entries. Each span runs from its first token
+    /// (attributes included) through the end of its initializer.
+    fn enum_members(&mut self, lo: usize, hi: usize) {
+        let mut c = lo;
+        while c < hi {
+            let start = c;
+            let mut name = None;
+            let mut seen_eq = false;
+            while c < hi && self.text(c) != "," {
+                match self.text(c) {
+                    "(" | "[" | "{" => match self.close_of(c) {
+                        Some(close) if close < hi => {
+                            c = close + 1;
+                            continue;
+                        }
+                        _ => return,
+                    },
+                    "=" => seen_eq = true,
+                    _ if !seen_eq && name.is_none() && self.is_ident(c) => name = Some(c),
+                    _ => {}
+                }
+                c += 1;
+            }
+            if let (Some(n), true) = (name, c > start) {
+                self.out.push(SymbolDecl {
+                    owner: None,
+                    name: self.text(n).to_string(),
+                    kind: SymbolKind::Constant,
+                    lang_kind: Some("enum_member".into()),
+                    span: span_between(&self.tok(start).span, &self.tok(c - 1).span),
+                });
+            }
+            c += 1;
         }
     }
 

@@ -389,6 +389,31 @@ fn every_parsed_token_is_stored() {
             .starts_with("Rebus.Transport::AbstractRebusTransport::")),
         "no methods nested in AbstractRebusTransport"
     );
+    // #269: enum members are constants nested in their enum.
+    let mut q = graph_store::SymbolQuery::new("*");
+    q.language = Some("csharp".into());
+    q.kind = Some("constant".into());
+    let mut members: Vec<_> = store
+        .search_symbols(&q)
+        .unwrap()
+        .into_iter()
+        .filter(|h| h.file == "Rebus/Logging/LogLevel.cs")
+        .map(|h| {
+            assert_eq!(h.lang_kind.as_deref(), Some("enum_member"));
+            (h.span.map(|s| s.start_line), h.qualified)
+        })
+        .collect();
+    members.sort();
+    let members: Vec<_> = members.into_iter().map(|m| m.1).collect();
+    assert_eq!(
+        members,
+        [
+            "Rebus.Logging::LogLevel::Debug",
+            "Rebus.Logging::LogLevel::Info",
+            "Rebus.Logging::LogLevel::Warn",
+            "Rebus.Logging::LogLevel::Error"
+        ]
+    );
     let cs_symbols: usize = store
         .describe(None, None)
         .unwrap()
@@ -908,10 +933,12 @@ fn non_rust_corpus_token_streams_are_unchanged() {
 /// must be unchanged. Pins a hash of the (path, name, kind, lang_kind, span)
 /// of every symbol the shipped extractors find in every non-ASPX corpus
 /// file, computed before #72. If this fails, an extractor's symbols changed
-/// (bump its version, re-pin) or the corpus did.
+/// (bump its version, re-pin) or the corpus did. Re-pinned for #269: C#
+/// enum members became `Constant`/`enum_member` symbols, +26 (9 enums, all
+/// in rebus), with every other symbol unchanged.
 #[test]
 fn non_aspx_corpus_symbols_are_unchanged() {
-    const EXPECTED: (usize, usize, u64) = (787, 6952, 5569861369318968961);
+    const EXPECTED: (usize, usize, u64) = (787, 6978, 11329723090132233136);
     let registry = shipped_registry();
     let (mut n, mut syms, mut h) = (0usize, 0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
