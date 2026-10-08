@@ -19,10 +19,18 @@
 //! through the closing `}` (or a type alias's `;`, or the last token of its
 //! type). Decorators are ignored (they are not part of any span). Not
 //! symbols: interface members, `declare global`, overloads of arrow-typed
-//! variables. An enum member's span runs from its name through its
-//! initializer; a quoted name is stored without its quotes. A `,` inside
-//! `<...>` in an initializer (`A = f<B, C>()`) splits the member, and an
-//! unbalanced bracket in an enum body drops the members after it. TSX is scanned like TypeScript; JSX text that
+//! variables.
+//!
+//! Enum members are separated by `,` or `;`. A member's span runs from its
+//! name through its initializer; a quoted name is stored without its quotes,
+//! and a quoted or computed member's declaration position falls back to its
+//! span start. A type after `as` / `satisfies` is skipped whole
+//! (`A = x as Foo<B, C>`), but any other `,` inside `<...>` in an initializer
+//! (`A = f<B, C>()`) splits the member. An unbalanced bracket in an enum body
+//! drops the members after it, and an enum whose body is never closed yields
+//! neither the enum nor its members (unlike Java).
+//!
+//! TSX is scanned like TypeScript; JSX text that
 //! looks like a regex or unbalanced braces can cut a scan short, never
 //! producing invalid spans or `has_errors`.
 use graph_core::scan::{code_index, span_between, NestedEnds, Step};
@@ -306,19 +314,28 @@ impl Scanner<'_> {
         self.enum_members(open + 1, close, out);
     }
 
-    /// Members of an enum body in code positions `[lo, hi)`: comma-separated
-    /// `Name = value` entries, where the name is an identifier, a quoted
+    /// Members of an enum body in code positions `[lo, hi)`: `Name = value`
+    /// entries separated by `,` or `;`, where the name is an identifier, a quoted
     /// string (`'a-b'`, named without its quotes) or a computed `['a']` (named
     /// by its quoted string, else by its text). Each span runs from the name
     /// through the end of its initializer. Brackets in an initializer are
     /// skipped whole; an unbalanced one ends the scan (later members are
-    /// dropped). A `,` inside `<...>` (`f<A, B>()`) splits the member.
+    /// dropped). A type after `as` / `satisfies` is skipped whole; any other
+    /// `,` inside `<...>` (`f<A, B>()`) splits the member.
     fn enum_members(&self, lo: usize, hi: usize, out: &mut Vec<SymbolDecl>) {
         let mut c = lo;
         while c < hi {
             let start = c;
-            while c < hi && self.text(c) != "," {
+            while c < hi && !matches!(self.text(c), "," | ";") {
                 match self.text(c) {
+                    // `x as Foo<B, C>`: the type's commas do not split.
+                    "as" | "satisfies" if c > start && self.is_ident(c) => {
+                        let end = self.types.type_end(c + 1, hi);
+                        if end > c + 1 && end <= hi {
+                            c = end;
+                            continue;
+                        }
+                    }
                     "(" | "[" | "{" => match self.close_of(c).filter(|&p| p < hi) {
                         Some(close) => c = close,
                         None => return,

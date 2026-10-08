@@ -91,6 +91,33 @@ fn enum_members_initializers_strings_and_computed() {
 }
 
 #[test]
+fn enum_members_backtick_and_computed_non_string_names() {
+    let src = "enum E { `t` = 1, [a + b] = 2, C }";
+    assert_eq!(
+        members_of(src, "E"),
+        pairs(&[("t", "`t` = 1"), ("[a+b]", "[a + b] = 2"), ("C", "C")])
+    );
+}
+
+#[test]
+fn enum_members_type_assertions_and_semicolons() {
+    let src = "enum E { A = x as Foo<B, C>, D = y satisfies Map<K, V>, F }";
+    assert_eq!(
+        members_of(src, "E"),
+        pairs(&[
+            ("A", "A = x as Foo<B, C>"),
+            ("D", "D = y satisfies Map<K, V>"),
+            ("F", "F"),
+        ])
+    );
+    // A top-level `;` separates members like `,`.
+    assert_eq!(
+        members_of("enum E { A = 1; B; C, }", "E"),
+        pairs(&[("A", "A = 1"), ("B", "B"), ("C", "C")])
+    );
+}
+
+#[test]
 fn enum_members_empty_and_nested() {
     assert!(members_of("enum E { }", "E").is_empty());
     assert!(members_of("enum E { , }", "E").is_empty());

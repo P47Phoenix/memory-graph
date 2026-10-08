@@ -433,6 +433,14 @@ fn enum_constants_arguments_bodies_and_annotations() {
 }
 
 #[test]
+fn enum_constants_with_qualified_annotation_without_arguments() {
+    assert_eq!(
+        constants_of("enum E { @a.b.C X, Y }", "E"),
+        pairs(&[("X", "@a.b.C X"), ("Y", "Y")])
+    );
+}
+
+#[test]
 fn enum_constants_empty_and_nested() {
     assert!(constants_of("enum E { }", "E").is_empty());
     assert!(constants_of("enum E { ; }", "E").is_empty());

@@ -20,8 +20,8 @@
 //! constant class bodies (in `A { void m() {} }`, `m` is not a symbol). An
 //! enum constant's span runs from its first annotation through its
 //! arguments and class body; an unbalanced bracket in the constant list
-//! drops the constants after it. A multi-declarator field (`int a, b;`) yields one symbol, named by
-//! its first declarator. Odd input never sets `has_errors`: unbalanced
+//! drops the constants after it. A multi-declarator field (`int a, b;`)
+//! yields one symbol, named by its first declarator. Odd input never sets `has_errors`: unbalanced
 //! braces make the scanner resynchronize one token later. Type bodies nested
 //! more than [`MAX_DEPTH`] deep are not scanned (the outer types are kept).
 use graph_core::scan::{code_close_table, code_index, mark_keywords, span_between};
