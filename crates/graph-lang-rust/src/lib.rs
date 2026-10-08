@@ -4,6 +4,11 @@
 //! refuses to lex broken input, so tokens always come from
 //! `graph_core::tokenizer` (exact spans, comments kept). A file that does not
 //! parse yields tokens only and is flagged `has_errors`.
+//!
+//! Enum variants are `Constant` / `variant` symbols nested in their enum
+//! (#269); a variant's span runs from its first outer attribute or doc
+//! comment through its fields and `= discriminant`. Struct-variant fields
+//! are not symbols.
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions};
 use graph_core::{Extraction, Extractor, Span, SymbolDecl, SymbolKind, TokenClass};
 use syn::spanned::Spanned;
@@ -25,8 +30,9 @@ impl Extractor for RustExtractor {
         // `kw1`: keywords are classed `keyword` (#98). `deep1`: input
         // nested too deep for `syn` is stored tokens only (#245). Part of
         // the file fingerprint, so a store indexed before re-indexes Rust.
+        // `em1`: enum variants are symbols (#269).
         format!(
-            "rust-syn-2+kw1+deep1+tok{}",
+            "rust-syn-2+kw1+deep1+em1+tok{}",
             graph_core::tokenizer::TOKENIZER_VERSION
         )
     }
@@ -279,6 +285,18 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
         self.push(i.ident.to_string(), SymbolKind::Type, "enum", i.span());
         visit::visit_item_enum(self, i);
+    }
+    /// An enum variant (#269): `Constant` / `variant`, nested in its enum.
+    /// The span covers its outer attributes and doc comments, its tuple or
+    /// struct fields and any `= discriminant`. Fields are not symbols.
+    fn visit_variant(&mut self, v: &'ast syn::Variant) {
+        self.push(
+            v.ident.to_string(),
+            SymbolKind::Constant,
+            "variant",
+            v.span(),
+        );
+        visit::visit_variant(self, v);
     }
     fn visit_item_union(&mut self, i: &'ast syn::ItemUnion) {
         self.push(i.ident.to_string(), SymbolKind::Type, "union", i.span());

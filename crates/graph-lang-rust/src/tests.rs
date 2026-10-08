@@ -175,7 +175,7 @@ fn version_pins_keyword_classing() {
     assert_eq!(
         RustExtractor.version(),
         format!(
-            "rust-syn-2+kw1+deep1+tok{}",
+            "rust-syn-2+kw1+deep1+em1+tok{}",
             graph_core::tokenizer::TOKENIZER_VERSION
         )
     );
@@ -290,4 +290,79 @@ fn pos_matches_line_scan_differential() {
             assert_eq!(c.pos(off), (line, col), "case {case} off {off} {src:?}");
         }
     }
+}
+
+/// `(name, span text)` of the `variant` symbols, in order.
+fn variants(src: &str) -> Vec<(String, String)> {
+    syms(src)
+        .into_iter()
+        .filter(|s| s.2 == "variant")
+        .map(|s| {
+            assert_eq!(s.1, SymbolKind::Constant, "{}", s.0);
+            (s.0, s.3)
+        })
+        .collect()
+}
+
+/// #269: enum variants are `Constant` / `variant`; a span covers outer
+/// attributes, doc comments, fields and the discriminant.
+#[test]
+fn enum_variants_are_symbols() {
+    let src = "/// Doc.
+#[derive(Debug)]
+pub enum E {
+    /// The unit.
+    #[default]
+    Unit,
+    Tuple(u8, String),
+    Struct { a: i32, b: Vec<u8> },
+    #[deprecated = \"x\"] Disc = 1 << 2,
+    unit,
+}
+";
+    assert_eq!(
+        variants(src),
+        [
+            (
+                "Unit",
+                "/// The unit.
+    #[default]
+    Unit"
+            ),
+            ("Tuple", "Tuple(u8, String)"),
+            ("Struct", "Struct { a: i32, b: Vec<u8> }"),
+            ("Disc", "#[deprecated = \"x\"] Disc = 1 << 2"),
+            ("unit", "unit"),
+        ]
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+    );
+    let s = syms(src);
+    // The enum keeps its span (doc comment and attributes included) and
+    // every variant nests in it.
+    let e = s.iter().find(|x| x.2 == "enum").unwrap();
+    assert!(e.3.starts_with("/// Doc.") && e.3.ends_with('}'));
+    let ex = RustExtractor.extract(src);
+    let es = ex.symbols.iter().find(|x| x.name == "E").unwrap().span;
+    for v in ex.symbols.iter().filter(|x| x.kind == SymbolKind::Constant) {
+        assert!(
+            es.start <= v.span.start && v.span.end <= es.end,
+            "{}",
+            v.name
+        );
+    }
+    // Struct-variant fields are not symbols.
+    assert!(s.iter().all(|x| x.0 != "a" && x.0 != "b"), "{s:#?}");
+    assert_eq!(s.len(), 6, "{s:#?}");
+}
+
+#[test]
+fn enum_variants_empty_nested_and_in_fns() {
+    assert!(variants("enum Never {}").is_empty());
+    let src = "mod m { fn f() { enum Local { A } } pub enum G<T> where T: Copy { X(T), Y, } }";
+    assert_eq!(
+        variants(src),
+        [("A", "A"), ("X", "X(T)"), ("Y", "Y")].map(|(a, b)| (a.to_string(), b.to_string()))
+    );
+    // A broken file still yields no symbols.
+    assert!(RustExtractor.extract("enum E { A, B(").symbols.is_empty());
 }

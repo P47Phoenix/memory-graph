@@ -15,8 +15,8 @@ fn bumped_extractor_versions_are_pinned() {
         ("javascript", "javascript-scan-1+kw1+tok"),
         ("java", "java-scan-1+kw1+em1+tok"),
         ("go", "go-scan-2+kw1+tok"),
-        ("c", "c-scan-1+kw1+tok"),
-        ("cpp", "cpp-scan-1+kw1+tok"),
+        ("c", "c-scan-1+kw1+em1+tok"),
+        ("cpp", "cpp-scan-1+kw1+em1+tok"),
         ("scala", "scala-scan-1+kw1+tok"),
         ("haskell", "haskell-scan-1+kw1+tok"),
         ("fsharp", "fsharp-scan-1+kw1+tok"),
@@ -27,7 +27,7 @@ fn bumped_extractor_versions_are_pinned() {
         ("elixir", "elixir-scan-1+kw1+tok"),
         ("rpg", "rpg-scan-2+kw1+tok"),
         // `+deep1` (#245): Rust nested too deep for `syn` is tokens only.
-        ("rust", "rust-syn-2+kw1+deep1+tok"),
+        ("rust", "rust-syn-2+kw1+deep1+em1+tok"),
     ] {
         let e = extractors
             .iter()

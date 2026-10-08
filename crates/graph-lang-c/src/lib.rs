@@ -15,6 +15,7 @@
 //! | C++ `namespace` (named) | Module | `namespace` |
 //! | C++ member function (inline, declared, or out of class `A::f`) | Method | `method` `constructor` `destructor` `operator` |
 //! | C++ data member | Variable / Constant | `field` / `const` |
+//! | enumerator (`enum`, `enum class`/`struct`, typed, `typedef enum`) | Constant | `enumerator` |
 //!
 //! A declaration's span runs from its first token (`template <...>` and
 //! `[[attributes]]` included) through its closing `}` or `;`. Function
@@ -22,6 +23,12 @@
 //! symbols (inside a C++ class they are methods). C struct fields are not
 //! symbols; nested types in a C struct are. Odd input never sets
 //! `has_errors`.
+//!
+//! An enumerator's span runs from its name through its `[[attributes]]`
+//! and `= initializer`; it nests in its enum. An anonymous enum has no
+//! symbol, so its enumerators nest in what encloses it: the typedef of
+//! `typedef enum { A } Name;`, or the class, namespace or file. A forward
+//! declaration (`enum class E : int;`) has none.
 //!
 //! Known limits: preprocessor lines other than `#define` are dropped and
 //! only the first branch of each `#if`/`#ifdef`/`#ifndef` group is scanned
@@ -34,7 +41,13 @@
 //! definition qualified by a namespace (`ns::f() {}`) is reported as a
 //! method of `ns`. A destructor is named `~Box`. `extern` declarations and
 //! K&R-style parameter declarations are skipped. Bodies nested deeper than
-//! 64 levels are not scanned.
+//! 64 levels are not scanned. In an enum body, an entry whose name is
+//! followed by `(` is taken for an X-macro invocation and skipped; a `,`
+//! inside template arguments of an initializer (`= T<A, B>::v`) splits the
+//! entry; an unbalanced bracket drops the later enumerators. In an enum body, an entry whose name is
+//! followed by `(` is taken for an X-macro invocation and skipped; a `,`
+//! inside template arguments of an initializer (`= T<A, B>::v`) splits the
+//! entry; an unbalanced bracket drops the later enumerators.
 //!
 //! A `.h` file is C unless it uses C++-only syntax (`class X {`,
 //! `namespace X {`, `template <`, `public:`); then it is scanned with the
@@ -64,7 +77,8 @@ impl Extractor for CExtractor {
 
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
-        format!("c-scan-1+kw1+tok{TOKENIZER_VERSION}")
+        // `em1`: enumerators are symbols (#269).
+        format!("c-scan-1+kw1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -83,7 +97,8 @@ impl Extractor for CppExtractor {
 
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
-        format!("cpp-scan-1+kw1+tok{TOKENIZER_VERSION}")
+        // `em1`: enumerators are symbols (#269).
+        format!("cpp-scan-1+kw1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -1004,6 +1019,12 @@ impl Scanner<'_> {
                 }
             }
         }
+        let is_enum = self.text(kw) == "enum";
+        if is_enum && open < close {
+            // An anonymous enum has no symbol of its own: its enumerators
+            // nest in whatever encloses it (a typedef, class or namespace).
+            self.enumerators(open + 1, close);
+        }
         let Some(n) = name else {
             return;
         };
@@ -1011,8 +1032,52 @@ impl Scanner<'_> {
         let kw_text = self.text(kw).to_string();
         let last = last.max(first);
         self.push(name.clone(), SymbolKind::Type, &kw_text, first, last);
-        if kw_text != "enum" && open < close {
+        if !is_enum && open < close {
             self.body(open + 1, close, &Level::Class(name));
+        }
+    }
+
+    /// The enumerators of an enum body `[lo, hi)` (#269): comma-separated
+    /// `NAME [[attrs]] = expr` entries, each a `Constant` / `enumerator`
+    /// spanning its first token through its last (attributes and
+    /// initializer included). The name is the first identifier outside
+    /// bracket groups (`__attribute__` and friends skipped); an entry whose
+    /// name is followed by `(` is a macro invocation (X-macro), not an
+    /// enumerator. An unbalanced bracket ends the scan, dropping the later
+    /// enumerators.
+    fn enumerators(&mut self, lo: usize, hi: usize) {
+        let mut c = lo;
+        while c < hi {
+            let start = c;
+            let mut name = None;
+            let mut call = false;
+            while c < hi && self.text(c) != "," {
+                match self.text(c) {
+                    "(" | "[" | "{" => {
+                        if name == Some(c.wrapping_sub(1)) && self.text(c) == "(" {
+                            call = true;
+                        }
+                        match self.close_of(c) {
+                            Some(x) if x < hi => c = x + 1,
+                            _ => return,
+                        }
+                        continue;
+                    }
+                    _ if name.is_none()
+                        && self.is_ident(c)
+                        && !NOT_CALLS.contains(&self.text(c)) =>
+                    {
+                        name = Some(c)
+                    }
+                    _ => {}
+                }
+                c += 1;
+            }
+            if let (Some(n), false) = (name, call) {
+                let text = self.text(n).to_string();
+                self.push(text, SymbolKind::Constant, "enumerator", start, c - 1);
+            }
+            c += 1;
         }
     }
 

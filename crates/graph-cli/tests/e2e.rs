@@ -247,6 +247,97 @@ fn java_and_typescript_enum_members_end_to_end() {
     }
 }
 
+/// Issue #269: C/C++ enumerators (`constant`/`enumerator`) and Rust enum
+/// variants (`constant`/`variant`) are symbols nested in their enum (or, for
+/// an anonymous C enum, in its typedef), with exact spans; `--grain class`
+/// on a member resolves to the enum.
+#[test]
+fn c_cpp_and_rust_enum_members_end_to_end() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    let c =
+        "typedef enum {\n    LVL_LOW,\n#ifdef HIGH\n    LVL_HIGH = 1 << 4,\n#endif\n} level_t;\n";
+    let cpp = "namespace geo {\nenum class Kind : unsigned char { Square, Circle [[deprecated]] = 3 };\n}\n";
+    let rs = "pub enum Shape {\n    /// A dot.\n    Dot,\n    Rect { w: u32, h: u32 },\n    Code = 7,\n}\n";
+    std::fs::write(root.join("level.c"), c).unwrap();
+    std::fs::write(root.join("kind.cpp"), cpp).unwrap();
+    std::fs::write(root.join("shape.rs"), rs).unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let symbol = |name: &str| {
+        let (ok, out, err) = run(&["--db", &db, "symbols", "--json", name]);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let hits = v["results"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1, "{name}: {out}");
+        hits[0].clone()
+    };
+    let text = |src: &'static str, h: &serde_json::Value| {
+        let s = h["span"]["start"].as_u64().unwrap() as usize;
+        let e = h["span"]["end"].as_u64().unwrap() as usize;
+        src[s..e].to_string()
+    };
+    for (name, lang_kind, qualified, src, span) in [
+        ("LVL_LOW", "enumerator", "level_t::LVL_LOW", c, "LVL_LOW"),
+        (
+            "LVL_HIGH",
+            "enumerator",
+            "level_t::LVL_HIGH",
+            c,
+            "LVL_HIGH = 1 << 4",
+        ),
+        ("Square", "enumerator", "geo::Kind::Square", cpp, "Square"),
+        (
+            "Circle",
+            "enumerator",
+            "geo::Kind::Circle",
+            cpp,
+            "Circle [[deprecated]] = 3",
+        ),
+        ("Dot", "variant", "Shape::Dot", rs, "/// A dot.\n    Dot"),
+        (
+            "Rect",
+            "variant",
+            "Shape::Rect",
+            rs,
+            "Rect { w: u32, h: u32 }",
+        ),
+        ("Code", "variant", "Shape::Code", rs, "Code = 7"),
+    ] {
+        let h = symbol(name);
+        assert_eq!(h["kind"], "constant", "{h}");
+        assert_eq!(h["lang_kind"], lang_kind, "{h}");
+        assert_eq!(h["qualified"], qualified, "{h}");
+        assert_eq!(text(src, &h), span);
+    }
+    // Struct-variant fields are still not symbols.
+    let (ok, out, _) = run(&["--db", &db, "symbols", "--json", "w"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(v["results"].as_array().unwrap().is_empty(), "{out}");
+    // `--grain class`: a member's token rolls up to its enum.
+    for (token, enum_name) in [("Circle", "geo::Kind"), ("Code", "Shape")] {
+        let (ok, out, err) = run(&["--db", &db, "search", token, "--grain", "class", "--json"]);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let rows = v["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{out}");
+        assert_eq!(rows[0]["symbol"], enum_name, "{out}");
+        assert_eq!(rows[0]["lang_kind"], "enum", "{out}");
+    }
+}
+
 /// Issue #137: a Go receiver method rolls up under its struct with
 /// `--grain class` (through the extractor's owner hint), and `symbols
 /// --json` reports the owner.

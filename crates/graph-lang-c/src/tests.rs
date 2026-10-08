@@ -112,18 +112,11 @@ fn c_declarations() {
         .3
         .starts_with("API(const char *) api_fn"));
     assert!(s.iter().all(|x| x.0 != "API"));
-    // Fields, enumerators, locals, prototypes, externs and includes are not symbols.
-    for n in [
-        "x",
-        "y",
-        "z",
-        "RED",
-        "local",
-        "prototype",
-        "shared",
-        "stdio",
-        "a",
-    ] {
+    // #269: enumerators are symbols.
+    assert_eq!(k("RED", "enumerator"), SymbolKind::Constant);
+    assert_eq!(find(&s, "GREEN", "enumerator").3, "GREEN = 2");
+    // Fields, locals, prototypes, externs and includes are not symbols.
+    for n in ["x", "y", "z", "local", "prototype", "shared", "stdio", "a"] {
         assert!(s.iter().all(|x| x.0 != n), "{n} in {s:#?}");
     }
 }
@@ -214,7 +207,8 @@ fn cpp_declarations() {
     assert_eq!(k("free_fn", "function"), SymbolKind::Function);
     assert_eq!(k("hidden", "variable"), SymbolKind::Variable);
     assert_eq!(k("c_api", "function"), SymbolKind::Function);
-    for n in ["Helper", "Open", "x", "public", "void"] {
+    assert_eq!(find(&s, "Open", "enumerator").1, SymbolKind::Constant);
+    for n in ["Helper", "x", "public", "void"] {
         assert!(s.iter().all(|x| x.0 != n), "{n} in {s:#?}");
     }
 }
@@ -460,8 +454,8 @@ int class;
     for w in ["override", "A", "f", "x"] {
         assert_eq!(class(&cpp, w), [Identifier], "{w}");
     }
-    assert!(CExtractor.version().starts_with("c-scan-1+kw1+tok"));
-    assert!(CppExtractor.version().starts_with("cpp-scan-1+kw1+tok"));
+    assert!(CExtractor.version().starts_with("c-scan-1+kw1+em1+tok"));
+    assert!(CppExtractor.version().starts_with("cpp-scan-1+kw1+em1+tok"));
 }
 
 /// #143: every listed word, written bare, is classed `keyword`.
@@ -502,4 +496,195 @@ class A {};
         .map(|t| t.class)
         .collect();
     assert_eq!(class, [graph_core::TokenClass::Keyword]);
+}
+
+/// `(name, span text)` of the `enumerator` symbols, in source order.
+fn enumerators(s: &[Sym]) -> Vec<(String, String)> {
+    s.iter()
+        .filter(|x| x.2 == "enumerator")
+        .map(|x| {
+            assert_eq!(x.1, SymbolKind::Constant, "{}", x.0);
+            (x.0.clone(), x.3.clone())
+        })
+        .collect()
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+/// The symbol whose span most tightly contains the enumerator `name`.
+fn parent_of(src: &str, ex: &dyn Extractor, name: &str) -> String {
+    let syms = ex.extract(src).symbols;
+    let m = syms
+        .iter()
+        .find(|s| s.name == name && s.lang_kind.as_deref() == Some("enumerator"))
+        .expect("enumerator")
+        .span;
+    syms.iter()
+        .filter(|s| s.lang_kind.as_deref() != Some("enumerator"))
+        .filter(|s| s.span.start <= m.start && m.end <= s.span.end)
+        .min_by_key(|s| s.span.end - s.span.start)
+        .map(|s| format!("{}:{}", s.lang_kind.as_deref().unwrap_or(""), s.name))
+        .unwrap_or_default()
+}
+
+#[test]
+fn enumerators_c_forms() {
+    let want = pairs(&[("A", "A"), ("B", "B"), ("C", "C")]);
+    for src in [
+        "enum E { A, B, C };",
+        "enum E { A, B, C, };",
+        "enum E { A, B, C } e;",
+    ] {
+        assert_eq!(enumerators(&c(src)), want, "{src}");
+    }
+    // Initializers with expressions, casts, macros and calls.
+    let src = "enum flags {
+  F_NONE = 0,
+  F_A = 1 << 0,
+  F_B = (F_A | 2),
+  F_C = MAKE(1, 2),
+  F_D = sizeof(int) * 2
+};
+";
+    assert_eq!(
+        enumerators(&c(src)),
+        pairs(&[
+            ("F_NONE", "F_NONE = 0"),
+            ("F_A", "F_A = 1 << 0"),
+            ("F_B", "F_B = (F_A | 2)"),
+            ("F_C", "F_C = MAKE(1, 2)"),
+            ("F_D", "F_D = sizeof(int) * 2"),
+        ])
+    );
+    assert_eq!(parent_of(src, &CExtractor, "F_C"), "enum:flags");
+    // Members that differ only by case are distinct symbols.
+    assert_eq!(
+        enumerators(&c("enum E { red, Red, RED };")),
+        pairs(&[("red", "red"), ("Red", "Red"), ("RED", "RED")])
+    );
+}
+
+#[test]
+fn enumerators_typedef_and_anonymous() {
+    // `typedef enum { ... } Name;`: the enum has no name, so its
+    // enumerators nest in the typedef.
+    let src = "typedef enum { LOW, HIGH = 5 } level_t;
+";
+    let s = c(src);
+    assert_eq!(
+        enumerators(&s),
+        pairs(&[("LOW", "LOW"), ("HIGH", "HIGH = 5")])
+    );
+    assert_eq!(parent_of(src, &CExtractor, "HIGH"), "typedef:level_t");
+    // A named enum in a typedef keeps its own symbol.
+    let src = "typedef enum lvl { L1 } lvl_t;";
+    assert_eq!(parent_of(src, &CExtractor, "L1"), "enum:lvl");
+    // A bare anonymous enum: the enumerators nest in the enclosing scope.
+    let src = "enum { BUF = 64, MAXN };
+int f(void) { return 0; }
+";
+    let s = c(src);
+    assert_eq!(
+        enumerators(&s),
+        pairs(&[("BUF", "BUF = 64"), ("MAXN", "MAXN")])
+    );
+    assert_eq!(parent_of(src, &CExtractor, "BUF"), "");
+    let src = "namespace n { struct S { enum { K = 1 }; int x; }; }";
+    assert_eq!(parent_of(src, &CppExtractor, "K"), "struct:S");
+    assert_eq!(find(&cpp(src), "x", "field").1, SymbolKind::Variable);
+}
+
+#[test]
+fn enumerators_cpp_forms() {
+    let src = "namespace ns {
+enum class Color : std::uint8_t { Red, Green = 2 };
+enum struct Dir { Up, Down };
+enum Plain : int { P1 };
+enum class Fwd : int;
+class K { enum class Mode { On [[deprecated(\"no\")]] = 1, Off }; };
+}
+";
+    let s = cpp(src);
+    assert_eq!(
+        enumerators(&s),
+        pairs(&[
+            ("Red", "Red"),
+            ("Green", "Green = 2"),
+            ("Up", "Up"),
+            ("Down", "Down"),
+            ("P1", "P1"),
+            ("On", "On [[deprecated(\"no\")]] = 1"),
+            ("Off", "Off"),
+        ])
+    );
+    assert_eq!(parent_of(src, &CppExtractor, "Green"), "enum:Color");
+    assert_eq!(parent_of(src, &CppExtractor, "Down"), "enum:Dir");
+    assert_eq!(parent_of(src, &CppExtractor, "On"), "enum:Mode");
+    // A forward declaration has no enumerators and no symbol.
+    assert!(s.iter().all(|x| x.0 != "Fwd"));
+    // GCC attributes after the name are skipped when naming.
+    assert_eq!(
+        enumerators(&c("enum E { OLD __attribute__((deprecated)) = 1, NEW };")),
+        pairs(&[
+            ("OLD", "OLD __attribute__((deprecated)) = 1"),
+            ("NEW", "NEW")
+        ])
+    );
+}
+
+#[test]
+fn enumerators_with_preprocessor_lines_and_macros() {
+    // Preprocessor lines are not code: only the first `#if` branch is
+    // scanned, as everywhere else.
+    let src = "enum opt {
+  O_A,
+#ifdef HAVE_B
+  O_B,
+#else
+  O_NOT_B,
+#endif
+  // comment
+  O_C /* trailing */
+};
+";
+    assert_eq!(
+        enumerators(&c(src)),
+        pairs(&[("O_A", "O_A"), ("O_B", "O_B"), ("O_C", "O_C")])
+    );
+    // An X-macro invocation is not an enumerator.
+    let src = "enum e {
+  LIST(X)
+  E_LAST
+};
+";
+    assert!(enumerators(&c(src)).iter().all(|m| m.0 != "LIST"));
+}
+
+#[test]
+fn enumerators_empty_and_unbalanced() {
+    assert!(enumerators(&c("enum E { };")).is_empty());
+    assert!(enumerators(&c("enum E { , };")).is_empty());
+    // An unbalanced bracket ends the enumerator list; no panic, no overlap.
+    for src in [
+        "enum E { A, B = (1, C };",
+        "enum E { A, B = [1, C",
+        "enum E { A, B",
+        "enum { A = ( };",
+    ] {
+        let s = c(src);
+        assert!(
+            s.iter().filter(|x| x.2 == "enumerator").all(|x| x.0 != "C"),
+            "{src}: {s:#?}"
+        );
+        let _ = cpp(src);
+    }
+    // A stray closer is an ordinary token: the scan goes on.
+    assert_eq!(
+        enumerators(&c("enum E { A, B = 1), C };")),
+        pairs(&[("A", "A"), ("B", "B = 1)"), ("C", "C")])
+    );
 }
