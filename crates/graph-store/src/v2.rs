@@ -1767,7 +1767,8 @@ impl R {
             let Some(raw) = self.streams.get(fid)? else {
                 continue;
             };
-            // Only the symbol section is decoded, not the tokens.
+            // The symbol section is decoded whole; tokens are read only by
+            // the name walk (ADR 0010 D3), for rows that are returned.
             let lazy = codec::decode_lazy(raw.value())?;
             let syms = lazy.symbols()?;
             let c = &files[&fid];
@@ -1818,10 +1819,13 @@ impl R {
                 ));
             }
             rows.sort_by(|a, b| a.0.cmp(&b.0));
-            // The name walk only for rows that can survive the cut-off.
+            // The name walk only for rows that are returned: not past the
+            // cut-off, nor among those `offset` drains below.
             for (key, mut h) in rows.into_iter().take(want - out.len()) {
-                let (_, _, i) = split_id(key.2);
-                h.name_pos = Some(self.name_pos(&lazy, &syms[i])?);
+                if out.len() >= q.offset.unwrap_or(0) {
+                    let (_, _, i) = split_id(key.2);
+                    h.name_pos = Some(self.name_pos(&lazy, &syms[i])?);
+                }
                 out.push(h);
             }
         }
@@ -2078,9 +2082,6 @@ impl R {
                 };
                 let mut hit = base_hit(1);
                 let key: Key;
-                // The picked symbol's id, for its name walk (done only when
-                // its row is new).
-                let mut name_of: Option<u64> = None;
                 match q.grain {
                     Grain::Token => {
                         hit.symbol = qual(&chain);
@@ -2204,7 +2205,6 @@ impl R {
                                 hit.symbol_kind = s.symbol_kind;
                                 hit.lang_kind = s.lang_kind.clone();
                                 hit.span = s.span;
-                                name_of = Some(s.id);
                                 key = (
                                     base.0.clone(),
                                     base.1.clone(),
@@ -2228,27 +2228,21 @@ impl R {
                         key = file_key(g);
                     }
                 }
-                match rows.entry(key) {
-                    std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().count += 1,
-                    std::collections::btree_map::Entry::Vacant(e) => {
-                        if let Some(id) = name_of {
-                            hit.name_pos = match split_id(id) {
-                                (TAG_SYM, f, i) if f == fid => {
-                                    syms.get(i).map(|s| self.name_pos(&lazy, s)).transpose()?
-                                }
-                                _ => self.name_pos_of_id(id)?,
-                            };
-                        }
-                        e.insert(hit);
-                    }
-                }
+                rows.entry(key).and_modify(|h| h.count += 1).or_insert(hit);
             }
         }
-        Ok(rows
-            .into_values()
+        // The name walk (ADR 0010 D3) only for the rows returned: a picked
+        // symbol's row is keyed by its id (in any file, sibling owners too).
+        rows.into_iter()
             .skip(q.offset.unwrap_or(0))
             .take(q.limit.unwrap_or(usize::MAX))
-            .collect())
+            .map(|(key, mut h)| {
+                if q.grain.is_symbolic() && h.symbol.is_some() && !h.no_matching_symbol {
+                    h.name_pos = self.name_pos_of_id(key.4)?;
+                }
+                Ok(h)
+            })
+            .collect()
     }
 }
 

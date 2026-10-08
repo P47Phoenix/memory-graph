@@ -673,7 +673,8 @@ impl Lazy<'_> {
     }
 
     /// An ordinal at or before the first token starting at or after byte
-    /// `start`, at most `CHECKPOINT_EVERY - 1` records before it: the
+    /// `start`, at most `CHECKPOINT_EVERY - 1` records before it (when there
+    /// is such a token; otherwise the last block's first ordinal): the
     /// checkpoint block that holds it. Tokens are stored sorted by start, so
     /// this is a binary search over the checkpoints (each holds the start of
     /// the record before its block), with no record decoded.
@@ -1366,7 +1367,12 @@ mod tests {
                     .position(|t| t.span.start >= byte)
                     .unwrap_or(n);
                 let b = lazy.block_ordinal_at(byte);
-                assert!(b <= at && at - b <= CHECKPOINT_EVERY, "n={n} byte={byte}");
+                // At most `CHECKPOINT_EVERY - 1` records before the target;
+                // past the last token there is no target, only the bound.
+                assert!(b <= at, "n={n} byte={byte}");
+                if at < n {
+                    assert!(at - b < CHECKPOINT_EVERY, "n={n} byte={byte}");
+                }
             }
         }
     }

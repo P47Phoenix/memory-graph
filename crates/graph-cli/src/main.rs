@@ -2485,14 +2485,12 @@ fn run() -> Result<i32> {
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
-                    // A symbol row is a whole definition: from its declaration
-                    // (name) position (ADR 0010 D3) to where it ends.
+                    // A symbol row is a whole definition: show where it ends too
+                    // (the span; the declaration position is in `--json`).
                     let loc = h
                         .span
                         .map(|s| {
-                            if let Some(p) = symbol_name_pos(h) {
-                                format!(":{}:{}-{}:{}", p.line, p.col, s.end_line, s.end_col)
-                            } else if h.grain.is_symbolic() {
+                            if h.grain.is_symbolic() {
                                 format!(
                                     ":{}:{}-{}:{}",
                                     s.start_line, s.start_col, s.end_line, s.end_col

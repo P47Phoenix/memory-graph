@@ -52,10 +52,11 @@ References are to `origin/main` on 2026-10-08.
   - both `Hit` (search) and `SymbolHit` (`graph-store/src/api.rs` ~400) gain `name_pos` (line, column, byte offset);
   - both proto messages (`common.proto`, `SymbolHit` ~179, and the search hit) gain an optional `name_pos` (regenerated with the xtask; old clients ignore it, old servers leave it unset and clients fall back to the span start);
   - `graph-client` conversions and MCP output carry it;
-  - the CLI text output of `symbols` and `search` prints `path:line:col` of the declaration; `--json` keeps the full span unchanged and adds `name_line` and `name_col`.
+  - the CLI text output of `symbols` prints `path:line:col` of the declaration; `search` text output keeps the span range `start_line:start_col-end_line:end_col` unchanged (scripts parse it); `--json` of both keeps the full span unchanged and adds `name_line`, `name_col` and `name_pos`, and MCP items carry `name_pos`.
 - **Spans are unchanged**, so `--grain` roll-ups, `show` and every span test behave as today.
 - **Edge case:** when the name also appears as an identifier inside an attribute, the first match wins and the attribute's line is reported. `[Alias("Shape")] class Shape` is fine (a string literal, not an identifier, so line 2); `[Shape] class Shape` and `[Foo(Shape)] class Shape` report the attribute's line. That is no worse than today, and it is documented and pinned by tests rather than handled with language knowledge.
-- **Cost:** one bounded token walk per returned hit, over the symbol's leading tokens only, using the checkpointed stream reader. It is measured with readbench (`crates/graph-cli/tests/readbench.rs`) and reported in story 56's PR.
+- **Names that are not one same-text token** fall back to the span start: a name made of several tokens (C++ `operator+`) or stored in a different case from its source token (case-insensitive languages such as COBOL, SQL and RPG) is never matched.
+- **Cost:** one token walk per returned hit (rows skipped by `offset` or past `limit` are not walked), using the checkpointed stream reader: it starts at most `CHECKPOINT_EVERY - 1` records before the span and stops at the first match, so it usually covers only the leading tokens; when the name is not found it covers the whole span. It is measured with readbench (`crates/graph-cli/tests/readbench.rs`) and reported in story 56's PR.
 
 ### D4. Case-insensitive lookup by default
 

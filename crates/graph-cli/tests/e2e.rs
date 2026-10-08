@@ -129,11 +129,10 @@ fn attributed_class_reports_its_declaration_line() {
     assert_eq!(h["span"]["start_line"], 1, "{h}");
     assert_eq!(h["span"]["start_col"], 1, "{h}");
     assert_eq!(h["span"]["end_line"], 2, "{h}");
-    // Search: a symbolic grain runs from the declaration to the span's end;
-    // the token grain is unchanged.
+    // Search text keeps the span range; `--json` adds the declaration.
     let (ok, out, err) = run(&["--db", &db, "search", "Serializable", "--grain", "class"]);
     assert!(ok, "{err}");
-    assert!(out.starts_with("o/r/Shape.cs:2:14-2:23\t"), "{out}");
+    assert!(out.starts_with("o/r/Shape.cs:1:1-2:23\t"), "{out}");
     let (ok, out, err) = run(&[
         "--db",
         &db,
@@ -1027,11 +1026,10 @@ fn rust_symbols_grains_end_to_end() {
         !ok && err.contains("--grain symbol, method or class"),
         "{err}"
     );
-    // Text mode shows the definition from its declaration (name) position
-    // (ADR 0010 D3: `a` in `fn a`, column 8, not `fn` at 5) to its end.
+    // Text mode shows the definition's full span, start to end.
     let (ok, out, _) = run(&["--db", &db, "search", "foo", "--grain", "method"]);
     assert!(
-        ok && out.contains("lib.rs:3:8-3:34\trust\tS::a\thits=2"),
+        ok && out.contains("lib.rs:3:5-3:34\trust\tS::a\thits=2"),
         "{out}"
     );
     let (_, out, _) = run(&["--db", &db, "search", "foo"]);
