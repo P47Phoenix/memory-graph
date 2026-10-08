@@ -117,18 +117,12 @@ fn declarations() {
         .map(|x| x.2.as_str())
         .collect();
     assert_eq!(states, ["enum", "constructor"]);
-    // Not symbols: second declarator, enum constants, anonymous class
-    // members, initializer blocks, imports, locals.
-    for n in [
-        "b",
-        "OPEN",
-        "CLOSED",
-        "run",
-        "x",
-        "s",
-        "java.util.*",
-        "static",
-    ] {
+    assert_eq!(k("OPEN"), (SymbolKind::Constant, "enum_constant"));
+    assert_eq!(find(&s, "OPEN").3, "OPEN(\"o\") { void x() {} }");
+    assert_eq!(k("CLOSED"), (SymbolKind::Constant, "enum_constant"));
+    // Not symbols: second declarator, enum constant body methods, anonymous
+    // class members, initializer blocks, imports, locals.
+    for n in ["b", "run", "x", "s", "java.util.*", "static"] {
         assert!(s.iter().all(|x| x.0 != n), "{n} is a symbol: {s:#?}");
     }
     // Spans.
@@ -371,5 +365,112 @@ fn keywords_are_classed_keyword() {
     for w in ["var", "record", "C"] {
         assert_eq!(class(w), [graph_core::TokenClass::Identifier], "{w}");
     }
-    assert!(JavaExtractor.version().starts_with("java-scan-1+kw1+tok"));
+    assert!(JavaExtractor
+        .version()
+        .starts_with("java-scan-1+kw1+em1+tok"));
+}
+
+/// `(name, span text)` of the `enum_constant` symbols nested in `outer`.
+fn constants_of(src: &str, outer: &str) -> Vec<(String, String)> {
+    let ex = JavaExtractor.extract(src);
+    assert_nested(&ex);
+    let o = ex
+        .symbols
+        .iter()
+        .find(|s| s.name == outer)
+        .expect("outer symbol")
+        .span;
+    ex.symbols
+        .iter()
+        .filter(|s| s.lang_kind.as_deref() == Some("enum_constant"))
+        .filter(|s| o.start <= s.span.start && s.span.end <= o.end)
+        .map(|s| {
+            assert_eq!(s.kind, SymbolKind::Constant, "{}", s.name);
+            let text = src[s.span.start as usize..s.span.end as usize].to_string();
+            (s.name.clone(), text)
+        })
+        .collect()
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+#[test]
+fn enum_constants_simple_and_trailing_comma() {
+    let want = pairs(&[("RED", "RED"), ("GREEN", "GREEN"), ("BLUE", "BLUE")]);
+    for src in [
+        "enum Color { RED, GREEN, BLUE }",
+        "enum Color { RED, GREEN, BLUE, }",
+        "enum Color { RED, GREEN, BLUE; }",
+        "enum Color { RED, GREEN, BLUE,; }",
+    ] {
+        assert_eq!(constants_of(src, "Color"), want, "{src}");
+    }
+}
+
+#[test]
+fn enum_constants_arguments_bodies_and_annotations() {
+    let src = "enum Op {\n    // c\n    PLUS(\"+\", 1) { int apply(int a) { return a; } },\n    @Deprecated @a.b.C(x = {1, 2}) MINUS(\"-\"),\n    /** doc */ TIMES;\n    private final String sym;\n    Op(String s, int p) { sym = s; }\n    Op(String s) { this(s, 0); }\n    abstract int apply(int a);\n}\n";
+    assert_eq!(
+        constants_of(src, "Op"),
+        pairs(&[
+            ("PLUS", "PLUS(\"+\", 1) { int apply(int a) { return a; } }"),
+            ("MINUS", "@Deprecated @a.b.C(x = {1, 2}) MINUS(\"-\")"),
+            ("TIMES", "TIMES"),
+        ])
+    );
+    let s = syms(src);
+    // Members after the `;` are unchanged; the constant body's method is
+    // not a symbol (constant bodies are not scanned).
+    assert_eq!(find(&s, "sym").2, "field");
+    assert_eq!(s.iter().filter(|x| x.2 == "constructor").count(), 2);
+    let applies: Vec<_> = s.iter().filter(|x| x.0 == "apply").collect();
+    assert_eq!(applies.len(), 1);
+    assert_eq!(applies[0].3, "abstract int apply(int a);");
+}
+
+#[test]
+fn enum_constants_with_qualified_annotation_without_arguments() {
+    assert_eq!(
+        constants_of("enum E { @a.b.C X, Y }", "E"),
+        pairs(&[("X", "@a.b.C X"), ("Y", "Y")])
+    );
+}
+
+#[test]
+fn enum_constants_empty_and_nested() {
+    assert!(constants_of("enum E { }", "E").is_empty());
+    assert!(constants_of("enum E { ; }", "E").is_empty());
+    assert!(constants_of("enum E { , }", "E").is_empty());
+    let src = "class Outer { int x; enum Inner { X, Y(2) } void m() { } }";
+    assert_eq!(
+        constants_of(src, "Inner"),
+        pairs(&[("X", "X"), ("Y", "Y(2)")])
+    );
+    let s = syms(src);
+    assert_eq!(find(&s, "m").1, SymbolKind::Method);
+    assert_eq!(find(&s, "x").2, "field");
+    let src = "class A { interface I { enum E { P } } }";
+    assert_eq!(constants_of(src, "E"), pairs(&[("P", "P")]));
+}
+
+#[test]
+fn enum_constants_differing_by_case_are_distinct() {
+    assert_eq!(
+        constants_of("enum E { A, a(2) }", "E"),
+        pairs(&[("A", "A"), ("a", "a(2)")])
+    );
+}
+
+#[test]
+fn enum_constants_unbalanced_drop_the_rest() {
+    let s = syms("enum E { A, B(2, ; int f; }");
+    assert_eq!(find(&s, "A").2, "enum_constant");
+    assert!(s.iter().all(|x| x.0 != "B" && x.0 != "f"), "{s:?}");
+    // An unclosed enum body still yields its constants.
+    let s = syms("enum E { A, B");
+    assert_eq!(find(&s, "B").3, "B");
 }

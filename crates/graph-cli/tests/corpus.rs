@@ -414,6 +414,45 @@ fn every_parsed_token_is_stored() {
             "Rebus.Logging::LogLevel::Error"
         ]
     );
+    // #269: Java enum constants and TypeScript enum members likewise.
+    for (lang, lang_kind, file, want) in [
+        (
+            "java",
+            "enum_constant",
+            "src/main/java/io/spring/application/CursorPager.java",
+            &[
+                "io.spring.application::CursorPager::Direction::PREV",
+                "io.spring.application::CursorPager::Direction::NEXT",
+            ][..],
+        ),
+        (
+            "typescript",
+            "enum_member",
+            "src/app/core/models/loading-state.model.ts",
+            &[
+                "LoadingState::NOT_LOADED",
+                "LoadingState::LOADING",
+                "LoadingState::LOADED",
+            ][..],
+        ),
+    ] {
+        let mut q = graph_store::SymbolQuery::new("*");
+        q.language = Some(lang.into());
+        q.kind = Some("constant".into());
+        let mut members: Vec<_> = store
+            .search_symbols(&q)
+            .unwrap()
+            .into_iter()
+            .filter(|h| h.file == file)
+            .map(|h| {
+                assert_eq!(h.lang_kind.as_deref(), Some(lang_kind));
+                (h.span.map(|s| s.start_line), h.qualified)
+            })
+            .collect();
+        members.sort();
+        let members: Vec<_> = members.into_iter().map(|m| m.1).collect();
+        assert_eq!(members, want, "{file}");
+    }
     let cs_symbols: usize = store
         .describe(None, None)
         .unwrap()
@@ -935,10 +974,14 @@ fn non_rust_corpus_token_streams_are_unchanged() {
 /// file, computed before #72. If this fails, an extractor's symbols changed
 /// (bump its version, re-pin) or the corpus did. Re-pinned for #269: C#
 /// enum members became `Constant`/`enum_member` symbols, +26 (9 enums, all
-/// in rebus), with every other symbol unchanged.
+/// in rebus), with every other symbol unchanged. Re-pinned again for #269:
+/// Java enum constants (`enum_constant`) and TypeScript enum members
+/// (`enum_member`) became `Constant` symbols, +5 (`CursorPager.Direction`'s
+/// PREV/NEXT in conduit-api, `LoadingState`'s three in conduit-ui); with
+/// those filtered out the old pin matched exactly.
 #[test]
 fn non_aspx_corpus_symbols_are_unchanged() {
-    const EXPECTED: (usize, usize, u64) = (787, 6978, 11329723090132233136);
+    const EXPECTED: (usize, usize, u64) = (787, 6983, 14265243739283780656);
     let registry = shipped_registry();
     let (mut n, mut syms, mut h) = (0usize, 0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {

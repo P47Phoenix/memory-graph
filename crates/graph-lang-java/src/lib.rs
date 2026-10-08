@@ -11,13 +11,17 @@
 //! | methods / constructors (incl. annotation elements and compact record constructors) | Method | `method` / `constructor` |
 //! | fields | Variable | `field` |
 //! | `static final` fields, interface fields | Constant | `constant` |
+//! | enum constants (`A`, `@Ann B(1) { ... }`) | Constant | `enum_constant` |
 //!
 //! A declaration's span runs from its first token (annotations and modifiers
 //! included) through its closing `}` or `;`. The package's span runs to the
 //! end of the file, so every type nests in it. Method bodies are not scanned
-//! (no local or anonymous classes, no lambdas); enum constants are not
-//! symbols. A multi-declarator field (`int a, b;`) yields one symbol, named by
-//! its first declarator. Odd input never sets `has_errors`: unbalanced
+//! (no local or anonymous classes, no lambdas), and neither are enum
+//! constant class bodies (in `A { void m() {} }`, `m` is not a symbol). An
+//! enum constant's span runs from its first annotation through its
+//! arguments and class body; an unbalanced bracket in the constant list
+//! drops the constants after it. A multi-declarator field (`int a, b;`)
+//! yields one symbol, named by its first declarator. Odd input never sets `has_errors`: unbalanced
 //! braces make the scanner resynchronize one token later. Type bodies nested
 //! more than [`MAX_DEPTH`] deep are not scanned (the outer types are kept).
 use graph_core::scan::{code_close_table, code_index, mark_keywords, span_between};
@@ -42,7 +46,8 @@ impl Extractor for JavaExtractor {
 
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
-        format!("java-scan-1+kw1+tok{TOKENIZER_VERSION}")
+        // `em1`: enum constants are symbols (#269).
+        format!("java-scan-1+kw1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -493,14 +498,53 @@ impl Scanner<'_> {
         false
     }
 
-    /// The `;` ending an enum's constant list in `[lo, hi)`, if any.
-    fn enum_members(&self, mut c: usize, hi: usize) -> Option<usize> {
+    /// Emit the constants of an enum body in `[lo, hi)` and return the `;`
+    /// ending the constant list, if any. Constants are comma-separated
+    /// `@Ann NAME(args) { body }` entries before the first top-level `;`;
+    /// each span runs from its first token (annotations included) through
+    /// its last (arguments and class body included). An unbalanced bracket
+    /// ends the scan: later constants are dropped and the members after the
+    /// `;` are not scanned (as before #269).
+    fn enum_members(&mut self, mut c: usize, hi: usize) -> Option<usize> {
         while c < hi {
-            match self.text(c) {
-                "(" | "[" | "{" => c = self.close_of(c).filter(|&p| p < hi)? + 1,
-                ";" => return Some(c),
-                _ => c += 1,
+            let start = c;
+            let mut name = None;
+            while c < hi && !matches!(self.text(c), "," | ";") {
+                match self.text(c) {
+                    "@" if name.is_none() => {
+                        // `@Name`, `@a.b.Name`, `@Name(...)`.
+                        c += 2;
+                        while c + 1 < hi && self.text(c) == "." {
+                            c += 2;
+                        }
+                        if c < hi && self.text(c) == "(" {
+                            c = self.close_of(c).filter(|&p| p < hi)? + 1;
+                        }
+                        continue;
+                    }
+                    "(" | "[" | "{" => {
+                        c = self.close_of(c).filter(|&p| p < hi)? + 1;
+                        continue;
+                    }
+                    _ if name.is_none() && self.is_ident(c) => name = Some(c),
+                    _ => {}
+                }
+                c += 1;
             }
+            if let Some(n) = name {
+                // A name was seen, so the entry is non-empty.
+                let last = c.min(hi) - 1;
+                self.push(
+                    self.text(n).to_string(),
+                    SymbolKind::Constant,
+                    "enum_constant",
+                    (start, last),
+                );
+            }
+            if c < hi && self.text(c) == ";" {
+                return Some(c);
+            }
+            c += 1;
         }
         None
     }

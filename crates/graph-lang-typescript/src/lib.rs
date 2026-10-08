@@ -11,14 +11,26 @@
 //! | `declare function f(): T;` | Function | `function` |
 //! | `interface Name {...}` | Type | `interface` |
 //! | `type Name<T> = ...;` | Type | `type` |
-//! | `enum Name {...}` / `const enum` | Type | `enum` |
+//! | `enum Name {...}` / `const enum` / `declare enum` | Type | `enum` |
+//! | enum members (`A`, `B = 1 << 2`, `'a-b' = "x"`, `['c']`) | Constant | `enum_member` |
 //! | `namespace A.B {...}` / `module A {...}` / `declare module "m" {...}` | Module | `namespace` / `module` |
 //!
 //! Spans run from the first keyword (`export`, `declare`, `abstract`, ...)
 //! through the closing `}` (or a type alias's `;`, or the last token of its
 //! type). Decorators are ignored (they are not part of any span). Not
-//! symbols: interface members, enum members, `declare global`, overloads of
-//! arrow-typed variables. TSX is scanned like TypeScript; JSX text that
+//! symbols: interface members, `declare global`, overloads of arrow-typed
+//! variables.
+//!
+//! Enum members are separated by `,` or `;`. A member's span runs from its
+//! name through its initializer; a quoted name is stored without its quotes,
+//! and a quoted or computed member's declaration position falls back to its
+//! span start. A type after `as` / `satisfies` is skipped whole
+//! (`A = x as Foo<B, C>`), but any other `,` inside `<...>` in an initializer
+//! (`A = f<B, C>()`) splits the member. An unbalanced bracket in an enum body
+//! drops the members after it, and an enum whose body is never closed yields
+//! neither the enum nor its members (unlike Java).
+//!
+//! TSX is scanned like TypeScript; JSX text that
 //! looks like a regex or unbalanced braces can cut a scan short, never
 //! producing invalid spans or `has_errors`.
 use graph_core::scan::{code_index, span_between, NestedEnds, Step};
@@ -47,7 +59,8 @@ impl Extractor for TypeScriptExtractor {
         // `scan-4`: `abstract new` types, `<T>(...) => T` generic function
         // types, decorators and statement words end types and expressions,
         // so the two scans no longer overlap (#213).
-        format!("typescript-scan-4+kw1+tok{TOKENIZER_VERSION}")
+        // `em1`: enum members are symbols (#269).
+        format!("typescript-scan-4+kw1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -289,6 +302,7 @@ impl Scanner<'_> {
         let Some(close) = self.close_of(name + 1) else {
             return;
         };
+        let open = name + 1;
         let name = self.text(name).to_string();
         self.push(
             out,
@@ -297,6 +311,85 @@ impl Scanner<'_> {
             "enum",
             (self.start_of(kw), close),
         );
+        self.enum_members(open + 1, close, out);
+    }
+
+    /// Members of an enum body in code positions `[lo, hi)`: `Name = value`
+    /// entries separated by `,` or `;`, where the name is an identifier, a quoted
+    /// string (`'a-b'`, named without its quotes) or a computed `['a']` (named
+    /// by its quoted string, else by its text). Each span runs from the name
+    /// through the end of its initializer. Brackets in an initializer are
+    /// skipped whole; an unbalanced one ends the scan (later members are
+    /// dropped). A type after `as` / `satisfies` is skipped whole; any other
+    /// `,` inside `<...>` (`f<A, B>()`) splits the member.
+    fn enum_members(&self, lo: usize, hi: usize, out: &mut Vec<SymbolDecl>) {
+        let mut c = lo;
+        while c < hi {
+            let start = c;
+            while c < hi && !matches!(self.text(c), "," | ";") {
+                match self.text(c) {
+                    // `x as Foo<B, C>`: the type's commas do not split.
+                    "as" | "satisfies" if c > start && self.is_ident(c) => {
+                        let end = self.types.type_end(c + 1, hi);
+                        if end > c + 1 && end <= hi {
+                            c = end;
+                            continue;
+                        }
+                    }
+                    "(" | "[" | "{" => match self.close_of(c).filter(|&p| p < hi) {
+                        Some(close) => c = close,
+                        None => return,
+                    },
+                    ")" | "]" | "}" => return,
+                    _ => {}
+                }
+                c += 1;
+            }
+            if c > start {
+                if let Some(name) = self.member_name(start) {
+                    self.push(
+                        out,
+                        name,
+                        SymbolKind::Constant,
+                        "enum_member",
+                        (start, c - 1),
+                    );
+                }
+            }
+            c += 1;
+        }
+    }
+
+    /// The name of an enum member whose first token is at `c`.
+    fn member_name(&self, c: usize) -> Option<String> {
+        if self.is_ident(c) {
+            return Some(self.text(c).to_string());
+        }
+        if let Some(name) = self.unquoted(c) {
+            return Some(name);
+        }
+        if self.text(c) != "[" {
+            return None;
+        }
+        let close = self.close_of(c)?;
+        if close == c + 2 {
+            if let Some(name) = self.unquoted(c + 1) {
+                return Some(name);
+            }
+        }
+        Some((c..=close).map(|k| self.text(k)).collect())
+    }
+
+    /// The contents of a quoted string literal at `c`.
+    fn unquoted(&self, c: usize) -> Option<String> {
+        if self.tok(c).class != TokenClass::Literal {
+            return None;
+        }
+        let t = self.text(c);
+        let quoted = t.len() >= 2
+            && (t.starts_with('"') || t.starts_with('\'') || t.starts_with('`'))
+            && t.ends_with(&t[..1]);
+        quoted.then(|| t[1..t.len() - 1].to_string())
     }
 
     /// `namespace A.B {`, `module A {`, `declare module "m" {`.
