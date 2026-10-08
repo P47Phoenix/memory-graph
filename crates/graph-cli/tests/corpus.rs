@@ -414,7 +414,8 @@ fn every_parsed_token_is_stored() {
             "Rebus.Logging::LogLevel::Error"
         ]
     );
-    // #269: Java enum constants and TypeScript enum members likewise.
+    // #269: Java enum constants, TypeScript enum members, C/C++
+    // enumerators and Rust enum variants likewise.
     for (lang, lang_kind, file, want) in [
         (
             "java",
@@ -435,6 +436,37 @@ fn every_parsed_token_is_stored() {
                 "LoadingState::LOADED",
             ][..],
         ),
+        (
+            "c",
+            "enumerator",
+            "cJSON_Utils.c",
+            &[
+                "patch_operation::INVALID",
+                "patch_operation::ADD",
+                "patch_operation::REMOVE",
+                "patch_operation::REPLACE",
+                "patch_operation::MOVE",
+                "patch_operation::COPY",
+                "patch_operation::TEST",
+            ][..],
+        ),
+        (
+            "cpp",
+            "enumerator",
+            "include/cxxopts.hpp",
+            &[
+                "cxxopts::ImplicitArgPolicy::Disabled",
+                "cxxopts::ImplicitArgPolicy::Enabled",
+                "cxxopts::PositionalMode::Replace",
+                "cxxopts::PositionalMode::Append",
+            ][..],
+        ),
+        (
+            "rust",
+            "variant",
+            "src/chain.rs",
+            &["ChainState::Linked", "ChainState::Buffered"][..],
+        ),
     ] {
         let mut q = graph_store::SymbolQuery::new("*");
         q.language = Some(lang.into());
@@ -443,10 +475,11 @@ fn every_parsed_token_is_stored() {
             .search_symbols(&q)
             .unwrap()
             .into_iter()
-            .filter(|h| h.file == file)
+            // cxxopts also has `const` constants.
+            .filter(|h| h.file == file && h.lang_kind.as_deref() != Some("const"))
             .map(|h| {
                 assert_eq!(h.lang_kind.as_deref(), Some(lang_kind));
-                (h.span.map(|s| s.start_line), h.qualified)
+                (h.span.map(|s| s.start), h.qualified)
             })
             .collect();
         members.sort();
@@ -978,10 +1011,15 @@ fn non_rust_corpus_token_streams_are_unchanged() {
 /// Java enum constants (`enum_constant`) and TypeScript enum members
 /// (`enum_member`) became `Constant` symbols, +5 (`CursorPager.Direction`'s
 /// PREV/NEXT in conduit-api, `LoadingState`'s three in conduit-ui); with
-/// those filtered out the old pin matched exactly.
+/// those filtered out the old pin matched exactly. Re-pinned again for
+/// #269: C/C++ enumerators (`enumerator`) and Rust enum variants
+/// (`variant`) became `Constant` symbols, +18 (cjson's `patch_operation`,
+/// 7; cxxopts' `ImplicitArgPolicy` and `PositionalMode`, 4; anyhow's
+/// `ChainState` and three test enums, 7); with those filtered out the old
+/// pin matched exactly.
 #[test]
 fn non_aspx_corpus_symbols_are_unchanged() {
-    const EXPECTED: (usize, usize, u64) = (787, 6983, 14265243739283780656);
+    const EXPECTED: (usize, usize, u64) = (787, 7001, 7423260416691283572);
     let registry = shipped_registry();
     let (mut n, mut syms, mut h) = (0usize, 0usize, 0xcbf29ce484222325u64);
     for r in manifest()["repos"].as_array().unwrap() {
