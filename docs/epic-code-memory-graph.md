@@ -72,7 +72,7 @@
 | 54 | OpenTelemetry compose demo, CI, overhead numbers and docs (ADR 0009, **Proposed**) | Low | 3 | P3 | 52, 53 |
 | 55 | Enum members as `Constant` symbols in C#, Java, TypeScript, C/C++ and Rust (ADR 0010, **Proposed**; #269) | High | 5 | P2 | 27, 28 |
 | 56 | Declaration (name) position on symbol hits, computed at query time (ADR 0010, **Proposed**; #269) | High | 3 | P2 | 16 |
-| 57 | Case-insensitive symbol lookup by default: `sym_fold` index, self-heal, `--exact-case` (ADR 0010, **Proposed**, gated on acceptance; #269) | High | 5 | P2 | 56 |
+| 57 | Case-insensitive symbol lookup by default: `sym_fold` index, self-heal, `--exact-case` (ADR 0010, **Proposed**, gated on acceptance; #269) | High | 5 | P2 | 16 |
 
 Total (excluding proposed 50-57): 49 stories, 249 pts (average about 5.1); 241 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), which is **Proposed**; they are not counted in the totals above until the owner accepts it. Stories 55-57 (13 pts) were proposed on 2026-10-08 by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), which is **Proposed**; they are not counted in the totals above until the owner accepts it.
 
@@ -772,7 +772,10 @@ Design: [ADR 0010](adr/0010-symbol-lookup-and-positions.md) D2.
 - Given TypeScript `const enum` and C++ `enum class E : int`, When indexed, Then their members must be indexed like any other enum's.
 - Given each changed extractor, When the PR merges, Then its version must be bumped and pinned in `extractor_versions.rs` (ASPX too, in the C# PR).
 - Given the corpus, When a differential runs before and after, Then the only change must be new `Constant` members; `non_aspx_corpus_symbols_are_unchanged` must be re-pinned and a spot check added (for example a C# enum in `testdata/corpus/rebus-*`).
-- Given Go, F# and Haskell, When indexed, Then nothing must change.
+- Given an enum member, When `search --grain class` runs on it, Then the result must be its enum; given an enum nested in a class, Then the member's parent chain must be member, enum, class.
+- Given C# `enum E : byte`, a `[Flags]` enum, and members that differ only by case (`A`, `a`), When indexed, Then every member must be its own symbol with an exact span.
+- Given `[Obsolete] Red` in a C# enum, When returned (after story 56), Then its span must start at `[Obsolete]` and its name position must be `Red`.
+- Given Go, F#, Haskell and Python, When indexed, Then nothing must change.
 
 <a id="story-56"></a>
 **56. Declaration (name) position on symbol hits (3 pts)**
@@ -784,30 +787,35 @@ Design: [ADR 0010](adr/0010-symbol-lookup-and-positions.md) D3.
 - Given `[Serializable]` on line 1 and `public class Shape { }` on line 2, When `symbols Shape` runs, Then the text output must report line 2, and `--json` must report `name_line` 2 with the span still starting at line 1 (#269's third sample, as an e2e test).
 - Given a symbol with no attribute, When it is returned, Then its name position must be the name token's line and column.
 - Given a symbol whose name is not found in its span, When it is returned, Then the name position must be the span start.
+- Given `[Alias("Shape")]` on line 1 and `class Shape` on line 2, When returned, Then the name position must be line 2; given `[Shape] class Shape` and `[Foo(Shape)] class Shape` with the attribute on line 1, Then it must be line 1 (pinning ADR 0010 D3's documented first-match rule).
+- Given an attributed symbol whose span straddles a stream checkpoint boundary, When returned, Then its name position must be correct, and `run_differential` across chunk and cache settings must give identical name positions.
 - Given the conformance suite, When it runs, Then an attributed class must report its declaration line and an unchanged span, embedded and remote.
-- Given the proto, When regenerated with the xtask, Then the hit must gain an optional `name_pos`; when an old server leaves it unset, the client must use the span start; `run_differential` must pass embedded against remote.
+- Given the proto, When regenerated with the xtask, Then `Hit` and `SymbolHit` must gain an optional `name_pos`; when an old server leaves it unset (simulated with a test double that strips the field), the client must use the span start; `run_differential` must pass embedded against remote.
 - Given MCP `find_symbols` and the symbolic search grains, When they return hits, Then they must carry the name position.
 - Given readbench, When symbol lookups run before and after, Then the latency change must be recorded in the PR.
 - Given the store, When this story merges, Then no stored byte may change (golden-byte tests unchanged).
 
 <a id="story-57"></a>
 **57. Case-insensitive symbol lookup by default (5 pts)**
-Status: Proposed (ADR 0010 is Proposed). Not counted in the totals. Merges only after the owner accepts ADR 0010, because it changes default query results and adds an on-disk table.
+Status: Proposed (ADR 0010 is Proposed). Not counted in the totals. Merges only after the owner accepts ADR 0010, because it changes default query results and adds an on-disk table. It does not depend on story 56; the plan only orders it last.
 As a developer or agent searching for a symbol
 I want `widget` to find `Widget`, with an opt-out for exact case
 So that I do not need to know a name's casing to find it.
 Design: [ADR 0010](adr/0010-symbol-lookup-and-positions.md) D4.
-- Given `public class Widget { }`, When `symbols widget` runs, Then it must return `Widget` (#269's second sample, as an e2e test); with `--exact-case`, Then it must return nothing.
-- Given `Widget` and `widGet`, When `wid*` runs, Then both must be returned, deduplicated, in a deterministic order (existing order, ties broken by name bytes).
-- Given a non-ASCII name such as `Größe`, When it is looked up with different non-ASCII casing, Then it must not match; ASCII letters in it must still fold.
+- Given `public class Widget { }`, When `symbols widget` runs, Then it must return `Widget` (#269's second sample, as an e2e test); so must `WIDGET` and `WID*`; with `--exact-case`, Then `widget` must return nothing, embedded and remote.
+- Given `Widget` and `widGet`, When `wid*` runs, Then both must be returned in today's order (org, repo, path, then stream position); a symbol reachable through more than one folded key must appear once (a concrete dedup and order test).
+- Given a non-ASCII name such as `Größe`, When it is looked up with different non-ASCII casing, Then it must not match; ASCII letters in it must still fold; and `grö*` must match `Größe` while `GRÖ*` must not.
 - Given the literal `name\*` form, When it runs with and without `exact_case`, Then it must be honoured in both modes.
 - Given re-index, replace, prune, vacuum and rebuild-into-a-new-file, When each runs, Then `sym_fold` must agree with `sym_idx` (a conformance check).
-- Given a store written without `sym_fold`, When it is opened, Then `sym_fold` must be rebuilt, `derived_version_sym_fold` stamped, and queries must work; given a current store, Then the open must write nothing.
-- Given a read-only open of a store without `sym_fold`, When a case-insensitive query runs, Then it must either answer correctly through a folded scan or fail with an error naming `--exact-case` (ADR 0010 open question 2); it must never return silently empty results.
-- Given a follower, and a snapshot installed from an older leader, When the store is opened, Then `sym_fold` must be healed locally, and nothing about it may enter the Raft log (a cluster replication test).
-- Given `run_differential`, `run_crash_rerun_differential` and a remote conformance run, When they run, Then they must pass with the new default.
+- Given random names, When a property test runs exact and prefix lookups, Then `sym_fold` results must equal a brute-force fold-and-filter over `sym_idx`.
+- Given a store written without `sym_fold`, When it is opened, Then `sym_fold` must be rebuilt, `derived_version_sym_fold` stamped, and queries must work; given a store with a stale stamp, or with the stamp but no `sym_fold` table, Then it must be rebuilt too; given a current store, Then the open must write nothing, and a second reopen must leave the file byte-identical.
+- Given a failpoint that crashes during the rebuild, When the store is reopened, Then the rebuild must run again and queries must be correct.
+- Given that no read-only open exists today, When one is ever added, Then it must follow ADR 0010 open question 2 and never return silently empty results (no test until then).
+- Given a follower, and a snapshot installed from an older leader, When the store is opened, Then `sym_fold` must be healed locally; given a snapshot from a new leader installed on a follower, Then case-insensitive queries must still work afterwards; and no `LogCommand` variant may reference `sym_fold` (a cluster replication test).
+- Given `export_snapshot` and compaction, When they run, Then `sym_fold` must be in their table-copy lists.
+- Given `run_differential`, `run_crash_rerun_differential` and a remote conformance run, When they run, Then they must pass with the new default, and after a crash-rerun `sym_fold` must agree with `sym_idx` by query results, not only counts.
 - Given the CLI `--exact-case`, the MCP `find_symbols` `exact_case` parameter and the gRPC `SymbolQuery.exact_case` field, When each is set, Then the old answers must be returned; an old server receiving the field must answer case-sensitively.
-- Given the size gate, When it runs, Then it must pass, and the measured size of `sym_fold` and the rebuild time on a large existing index must be recorded in the PR.
+- Given the size gate, When it runs, Then it must pass with an explicit upper bound on `sym_fold`'s share of the file, and the measured size of `sym_fold` and the rebuild time on a large existing index must be recorded in the PR.
 - Given the docs, When read, Then `docs/guide/querying.md`, `docs/mcp.md` and the README must describe the new default and `--exact-case`.
 
 ### Rationale
