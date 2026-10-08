@@ -523,3 +523,50 @@ fn enum_members_in_member_symbols() {
             .map(|(a, b)| (a.to_string(), b.to_string()))
     );
 }
+
+#[test]
+fn enum_members_generic_initializers_and_braces() {
+    let src = "enum E { A = Gen<int, long>.Max, B = X.Y<Z>.W, C = 1 << 2, D = new[] { 1, 2 }.Length, = 5, F }";
+    assert_eq!(
+        members_of(src, "E"),
+        pairs(&[
+            ("A", "A = Gen<int, long>.Max"),
+            ("B", "B = X.Y<Z>.W"),
+            ("C", "C = 1 << 2"),
+            ("D", "D = new[] { 1, 2 }.Length"),
+            ("F", "F"),
+        ])
+    );
+}
+
+#[test]
+fn enum_members_unbalanced_initializer_drops_the_rest() {
+    let src = "enum E { A, B = (2, }";
+    let s = syms(src);
+    assert_eq!(find(&s, "A").2, "enum_member");
+    assert!(s.iter().all(|x| x.0 != "B"), "{s:?}");
+    assert_nested(&CSharpExtractor.extract(src));
+}
+
+#[test]
+fn enum_members_across_preprocessor_branches() {
+    let src = "enum E\n{\n    A,\n#if X\n    B = 1,\n#else\n    B = 2,\n#endif\n    C\n}\n";
+    assert_eq!(
+        members_of(src, "E"),
+        pairs(&[("A", "A"), ("B", "B = 1"), ("B", "B = 2"), ("C", "C")])
+    );
+    // A member whose initializer is split across branches.
+    let src = "enum E\n{\n    A =\n#if X\n    1,\n#else\n    2,\n#endif\n    C\n}\n";
+    assert_eq!(
+        members_of(src, "E"),
+        pairs(&[("A", "A =\n#if X\n    1"), ("C", "C")])
+    );
+}
+
+#[test]
+fn enum_members_differing_by_case_are_distinct() {
+    assert_eq!(
+        members_of("enum E { A, a = 2 }", "E"),
+        pairs(&[("A", "A"), ("a", "a = 2")])
+    );
+}

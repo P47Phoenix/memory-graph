@@ -94,6 +94,76 @@ fn aspnet_site_symbols() {
     }
 }
 
+/// Issue #269: C# enum members are `constant`/`enum_member` symbols nested
+/// in their enum (and an enum's in its class), with exact spans; `--grain
+/// class` on a member resolves to the enum.
+#[test]
+fn csharp_enum_members_end_to_end() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    let color = "public enum Color { Red, Green, Blue }\n";
+    let shape = "namespace Geo\n{\n    class Shape\n    {\n        public enum Kind { Square = 1, [Obsolete] Circle }\n    }\n}\n";
+    std::fs::write(root.join("Color.cs"), color).unwrap();
+    std::fs::write(root.join("Shape.cs"), shape).unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let symbol = |name: &str| {
+        let (ok, out, err) = run(&["--db", &db, "symbols", "--json", name]);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let hits = v["results"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1, "{name}: {out}");
+        hits[0].clone()
+    };
+    let text = |src: &'static str, h: &serde_json::Value| {
+        let s = h["span"]["start"].as_u64().unwrap() as usize;
+        let e = h["span"]["end"].as_u64().unwrap() as usize;
+        &src[s..e]
+    };
+    let c = symbol("Color");
+    assert_eq!(
+        (&c["kind"], &c["lang_kind"]),
+        (&"type".into(), &"enum".into())
+    );
+    assert_eq!(text(color, &c), "public enum Color { Red, Green, Blue }");
+    for name in ["Red", "Green", "Blue"] {
+        let h = symbol(name);
+        assert_eq!(h["kind"], "constant", "{h}");
+        assert_eq!(h["lang_kind"], "enum_member", "{h}");
+        assert_eq!(h["qualified"], format!("Color::{name}"), "{h}");
+        assert_eq!(text(color, &h), name);
+    }
+    // member -> enum -> class -> namespace.
+    let h = symbol("Circle");
+    assert_eq!(h["qualified"], "Geo::Shape::Kind::Circle", "{h}");
+    assert_eq!(text(shape, &h), "[Obsolete] Circle");
+    assert_eq!(text(shape, &symbol("Square")), "Square = 1");
+    assert_eq!(symbol("Kind")["qualified"], "Geo::Shape::Kind");
+    // `--grain class`: the member's token rolls up to the enum.
+    let (ok, out, err) = run(&["--db", &db, "search", "Green", "--grain", "class", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let rows = v["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0]["symbol"], "Color", "{out}");
+    assert_eq!(rows[0]["lang_kind"], "enum", "{out}");
+    assert_eq!(
+        text(color, &rows[0]),
+        "public enum Color { Red, Green, Blue }"
+    );
+}
+
 /// Issue #137: a Go receiver method rolls up under its struct with
 /// `--grain class` (through the extractor's owner hint), and `symbols
 /// --json` reports the owner.
