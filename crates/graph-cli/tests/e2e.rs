@@ -164,6 +164,89 @@ fn csharp_enum_members_end_to_end() {
     );
 }
 
+/// Issue #269: Java enum constants (`constant`/`enum_constant`) and
+/// TypeScript enum members (`constant`/`enum_member`) are symbols nested in
+/// their enum, with exact spans; `--grain class` on a member resolves to the
+/// enum.
+#[test]
+fn java_and_typescript_enum_members_end_to_end() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    let java = "package geo;\n\nclass Shape {\n    enum Kind {\n        SQUARE(4),\n        @Deprecated CIRCLE(0) { int sides() { return 0; } };\n        final int n;\n        Kind(int n) { this.n = n; }\n    }\n}\n";
+    let ts = "export const enum Mode { Off, 'on-high' = \"x\", Low = 1 << 2 }\n";
+    std::fs::write(root.join("Shape.java"), java).unwrap();
+    std::fs::write(root.join("mode.ts"), ts).unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let symbol = |name: &str| {
+        let (ok, out, err) = run(&["--db", &db, "symbols", "--json", name]);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let hits = v["results"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1, "{name}: {out}");
+        hits[0].clone()
+    };
+    let text = |src: &'static str, h: &serde_json::Value| {
+        let s = h["span"]["start"].as_u64().unwrap() as usize;
+        let e = h["span"]["end"].as_u64().unwrap() as usize;
+        src[s..e].to_string()
+    };
+    for (name, lang_kind, qualified, src, span) in [
+        (
+            "SQUARE",
+            "enum_constant",
+            "geo::Shape::Kind::SQUARE",
+            java,
+            "SQUARE(4)",
+        ),
+        (
+            "CIRCLE",
+            "enum_constant",
+            "geo::Shape::Kind::CIRCLE",
+            java,
+            "@Deprecated CIRCLE(0) { int sides() { return 0; } }",
+        ),
+        ("Off", "enum_member", "Mode::Off", ts, "Off"),
+        (
+            "on-high",
+            "enum_member",
+            "Mode::on-high",
+            ts,
+            "'on-high' = \"x\"",
+        ),
+        ("Low", "enum_member", "Mode::Low", ts, "Low = 1 << 2"),
+    ] {
+        let h = symbol(name);
+        assert_eq!(h["kind"], "constant", "{h}");
+        assert_eq!(h["lang_kind"], lang_kind, "{h}");
+        assert_eq!(h["qualified"], qualified, "{h}");
+        assert_eq!(text(src, &h), span);
+    }
+    // Members after the `;` are unchanged.
+    assert_eq!(symbol("n")["lang_kind"], "field");
+    // `--grain class`: a member's token rolls up to its enum.
+    for (token, enum_name) in [("SQUARE", "geo::Shape::Kind"), ("Low", "Mode")] {
+        let (ok, out, err) = run(&["--db", &db, "search", token, "--grain", "class", "--json"]);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let rows = v["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{out}");
+        assert_eq!(rows[0]["symbol"], enum_name, "{out}");
+        assert_eq!(rows[0]["lang_kind"], "enum", "{out}");
+    }
+}
+
 /// Issue #137: a Go receiver method rolls up under its struct with
 /// `--grain class` (through the extractor's owner hint), and `symbols
 /// --json` reports the owner.

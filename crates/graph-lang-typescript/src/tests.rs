@@ -27,6 +27,105 @@ fn drops(src: &str) -> usize {
     symbols_and_drops(&tokenize_with(src, TS_TOKENIZER)).1
 }
 
+/// `(name, span text)` of the `enum_member` symbols nested in `outer`; no
+/// symbol is dropped as a partial overlap.
+fn members_of(src: &str, outer: &str) -> Vec<(String, String)> {
+    assert_eq!(drops(src), 0, "{src}");
+    let ex = TypeScriptExtractor.extract(src);
+    assert_nested(&ex);
+    let o = ex
+        .symbols
+        .iter()
+        .find(|s| s.name == outer)
+        .expect("outer symbol")
+        .span;
+    ex.symbols
+        .iter()
+        .filter(|s| s.lang_kind.as_deref() == Some("enum_member"))
+        .filter(|s| o.start <= s.span.start && s.span.end <= o.end)
+        .map(|s| {
+            assert_eq!(s.kind, SymbolKind::Constant, "{}", s.name);
+            let text = src[s.span.start as usize..s.span.end as usize].to_string();
+            (s.name.clone(), text)
+        })
+        .collect()
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+#[test]
+fn enum_members_simple_trailing_comma_and_modifiers() {
+    let want = pairs(&[("Red", "Red"), ("Green", "Green"), ("Blue", "Blue")]);
+    for src in [
+        "enum Color { Red, Green, Blue }",
+        "enum Color { Red, Green, Blue, }",
+        "export const enum Color { Red, Green, Blue }",
+        "declare enum Color { Red, Green, Blue }",
+        "export declare const enum Color {\n  Red, // r\n  /* g */ Green,\n  Blue,\n}\n",
+    ] {
+        assert_eq!(members_of(src, "Color"), want, "{src}");
+    }
+}
+
+#[test]
+fn enum_members_initializers_strings_and_computed() {
+    let src = "enum E {\n  A = 1 << 2,\n  B = \"b, c\",\n  C = A | B,\n  D = f(1, 2),\n  E2 = `t${x}`,\n  'a-b' = 3,\n  \"q\" = 4,\n  ['k'] = 5,\n  F = (() => 1)(),\n}\n";
+    assert_eq!(
+        members_of(src, "E"),
+        pairs(&[
+            ("A", "A = 1 << 2"),
+            ("B", "B = \"b, c\""),
+            ("C", "C = A | B"),
+            ("D", "D = f(1, 2)"),
+            ("E2", "E2 = `t${x}`"),
+            ("a-b", "'a-b' = 3"),
+            ("q", "\"q\" = 4"),
+            ("k", "['k'] = 5"),
+            ("F", "F = (() => 1)()"),
+        ])
+    );
+}
+
+#[test]
+fn enum_members_empty_and_nested() {
+    assert!(members_of("enum E { }", "E").is_empty());
+    assert!(members_of("enum E { , }", "E").is_empty());
+    let src = "namespace N {\n  export enum Inner { X, Y = 2 }\n  export function f() { enum L { Z } }\n}\n";
+    assert_eq!(
+        members_of(src, "Inner"),
+        pairs(&[("X", "X"), ("Y", "Y = 2")])
+    );
+    assert_eq!(members_of(src, "L"), pairs(&[("Z", "Z")]));
+    let s = syms(src);
+    assert_eq!(find(&s, "f").1, SymbolKind::Function);
+    assert_eq!(find(&s, "N").1, SymbolKind::Module);
+}
+
+#[test]
+fn enum_members_differing_by_case_are_distinct() {
+    assert_eq!(
+        members_of("enum E { A, a = 2 }", "E"),
+        pairs(&[("A", "A"), ("a", "a = 2")])
+    );
+}
+
+#[test]
+fn enum_members_unbalanced_drop_the_rest() {
+    // An unbalanced `(` leaves the enum's `{` unmatched: nothing is found.
+    let s = syms("enum E { A, B = (2, C }");
+    assert!(s.iter().all(|x| x.2 != "enum_member"), "{s:?}");
+    // A stray closer inside the body ends the scan at that member.
+    let s = syms("enum E { A, B = 2), C }");
+    assert!(s.iter().all(|x| x.0 != "C"), "{s:?}");
+    // An unclosed enum is not a symbol, and neither are its members.
+    let s = syms("enum E { A, B");
+    assert!(s.is_empty(), "{s:?}");
+}
+
 /// Every pair of spans nests or is disjoint (what the store requires).
 fn assert_nested(ex: &Extraction) {
     for a in &ex.symbols {
@@ -150,8 +249,10 @@ fn declarations() {
     assert_eq!(k("add"), (SymbolKind::Function, "arrow_fn"));
     assert_eq!(k("typed"), (SymbolKind::Function, "arrow_fn"));
     assert_eq!(k("fetchAll"), (SymbolKind::Function, "function"));
-    // Interface and enum members, decorators, imports are not symbols.
-    for n in ["id", "greet", "Red", "Injectable", "Input", "user"] {
+    assert_eq!(k("Red"), (SymbolKind::Constant, "enum_member"));
+    assert_eq!(find(&s, "Red").3, "Red = 'r'");
+    // Interface members, decorators, imports are not symbols.
+    for n in ["id", "greet", "Injectable", "Input", "user"] {
         assert!(s.iter().all(|x| x.0 != n), "{n} is a symbol: {s:#?}");
     }
     // Spans.
@@ -409,7 +510,7 @@ fn keywords_are_classed_keyword() {
     assert_eq!(class("import"), [TokenClass::Identifier]);
     assert!(TypeScriptExtractor
         .version()
-        .starts_with("typescript-scan-4+kw1+tok"));
+        .starts_with("typescript-scan-4+kw1+em1+tok"));
 }
 
 /// Review of #164: interface and type-literal members with reserved names
