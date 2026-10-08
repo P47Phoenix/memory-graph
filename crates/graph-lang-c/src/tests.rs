@@ -656,12 +656,17 @@ fn enumerators_with_preprocessor_lines_and_macros() {
         pairs(&[("O_A", "O_A"), ("O_B", "O_B"), ("O_C", "O_C")])
     );
     // An X-macro invocation is not an enumerator.
-    let src = "enum e {
-  LIST(X)
-  E_LAST
-};
-";
-    assert!(enumerators(&c(src)).iter().all(|m| m.0 != "LIST"));
+    // An X-macro invocation is not an enumerator, but an identifier after
+    // it is (its span starts at the identifier).
+    let src = "enum e {\n  LIST(X)\n  E_LAST\n};\n";
+    assert_eq!(enumerators(&c(src)), pairs(&[("E_LAST", "E_LAST")]));
+    let src = "enum Z { E(a) E(b) LAST };";
+    assert_eq!(enumerators(&c(src)), pairs(&[("LAST", "LAST")]));
+    let src = "enum X { DECL(a), x1 };";
+    assert_eq!(enumerators(&c(src)), pairs(&[("x1", "x1")]));
+    // An unbalanced `(` drops the entry it is in and every later one.
+    assert!(enumerators(&c("enum V { v1 = (, v2 };")).is_empty());
+    assert!(enumerators(&cpp("enum V { v1 = (, v2 };")).is_empty());
 }
 
 #[test]

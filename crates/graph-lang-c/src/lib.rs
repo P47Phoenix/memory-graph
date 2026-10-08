@@ -41,13 +41,12 @@
 //! definition qualified by a namespace (`ns::f() {}`) is reported as a
 //! method of `ns`. A destructor is named `~Box`. `extern` declarations and
 //! K&R-style parameter declarations are skipped. Bodies nested deeper than
-//! 64 levels are not scanned. In an enum body, an entry whose name is
-//! followed by `(` is taken for an X-macro invocation and skipped; a `,`
-//! inside template arguments of an initializer (`= T<A, B>::v`) splits the
-//! entry; an unbalanced bracket drops the later enumerators. In an enum body, an entry whose name is
-//! followed by `(` is taken for an X-macro invocation and skipped; a `,`
-//! inside template arguments of an initializer (`= T<A, B>::v`) splits the
-//! entry; an unbalanced bracket drops the later enumerators.
+//! 64 levels are not scanned. In an enum body, a `NAME(...)` call is taken
+//! for an X-macro invocation and skipped (an identifier after it still
+//! names an enumerator, whose span starts at that identifier); a `,` inside
+//! template arguments of an initializer (`= T<A, B>::v`) splits the entry
+//! and may produce a spurious enumerator; an unbalanced bracket drops the
+//! enumerator it is in and every later one.
 //!
 //! A `.h` file is C unless it uses C++-only syntax (`class X {`,
 //! `namespace X {`, `template <`, `public:`); then it is scanned with the
@@ -1023,6 +1022,9 @@ impl Scanner<'_> {
         if is_enum && open < close {
             // An anonymous enum has no symbol of its own: its enumerators
             // nest in whatever encloses it (a typedef, class or namespace).
+            // Enumerators are pushed before their enum; the order does not
+            // matter, as nesting comes from span containment (`extract`
+            // sorts the symbols by span).
             self.enumerators(open + 1, close);
         }
         let Some(n) = name else {
@@ -1041,25 +1043,27 @@ impl Scanner<'_> {
     /// `NAME [[attrs]] = expr` entries, each a `Constant` / `enumerator`
     /// spanning its first token through its last (attributes and
     /// initializer included). The name is the first identifier outside
-    /// bracket groups (`__attribute__` and friends skipped); an entry whose
-    /// name is followed by `(` is a macro invocation (X-macro), not an
-    /// enumerator. An unbalanced bracket ends the scan, dropping the later
-    /// enumerators.
+    /// bracket groups (`__attribute__` and friends skipped). A name followed
+    /// by `(` is a macro invocation (X-macro), not an enumerator: the group
+    /// is skipped and the entry starts over after it, so in
+    /// `LIST(X) E_LAST` the enumerator is `E_LAST`, spanning from itself.
+    /// An unbalanced bracket ends the scan, dropping the entry it is in and
+    /// the later enumerators.
     fn enumerators(&mut self, lo: usize, hi: usize) {
         let mut c = lo;
         while c < hi {
-            let start = c;
+            let mut start = c;
             let mut name = None;
-            let mut call = false;
             while c < hi && self.text(c) != "," {
                 match self.text(c) {
                     "(" | "[" | "{" => {
-                        if name == Some(c.wrapping_sub(1)) && self.text(c) == "(" {
-                            call = true;
-                        }
+                        let call = name == Some(c.wrapping_sub(1)) && self.text(c) == "(";
                         match self.close_of(c) {
                             Some(x) if x < hi => c = x + 1,
                             _ => return,
+                        }
+                        if call {
+                            (start, name) = (c, None);
                         }
                         continue;
                     }
@@ -1073,7 +1077,7 @@ impl Scanner<'_> {
                 }
                 c += 1;
             }
-            if let (Some(n), false) = (name, call) {
+            if let Some(n) = name {
                 let text = self.text(n).to_string();
                 self.push(text, SymbolKind::Constant, "enumerator", start, c - 1);
             }
