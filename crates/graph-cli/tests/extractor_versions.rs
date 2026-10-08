@@ -6,12 +6,12 @@
 fn bumped_extractor_versions_are_pinned() {
     let extractors = graph_cli::shipped_extractors();
     for (lang, prefix) in [
-        ("aspx", "aspx-scan-2+kw1+cb1+tok"),
+        ("aspx", "aspx-scan-2+kw1+cb1+em1+tok"),
         ("cobol", "cobol-scan-1+kw1+dw2+tok"),
         ("asm", "asm-scan-1+kw2+cmt1+tok"),
         ("typescript", "typescript-scan-4+kw1+tok"),
         ("python", "python-scan-2+kw1+tok"),
-        ("csharp", "csharp-scan-1+kw1+tok"),
+        ("csharp", "csharp-scan-1+kw1+em1+tok"),
         ("javascript", "javascript-scan-1+kw1+tok"),
         ("java", "java-scan-1+kw1+tok"),
         ("go", "go-scan-2+kw1+tok"),

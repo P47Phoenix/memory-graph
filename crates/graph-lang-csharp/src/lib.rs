@@ -11,6 +11,7 @@
 //! | methods, constructors, finalizers, operators | Method | `method` `constructor` `finalizer` `operator` |
 //! | properties, indexers, events | Variable | `property` `indexer` `event` |
 //! | fields / `const` | Variable / Constant | `field` / `const` |
+//! | enum members (`A`, `B = 1 << 2`) | Constant | `enum_member` |
 //!
 //! A declaration's span runs from its first token (attributes and modifiers
 //! included) through its closing `}` or `;`. Method bodies are not scanned
@@ -24,7 +25,12 @@
 //! (`int x = 1, y = 2;`) yields one symbol, named by its first declarator;
 //! fixed-size buffers (`fixed byte b[4];`) and top-level local functions are
 //! not symbols; a string nested inside an interpolation hole (`$"{"x"}"`)
-//! ends the literal early (a tokenizer limit).
+//! ends the literal early (a tokenizer limit). Enum members: a comma inside
+//! `<...>` in an initializer splits the member unless the `<...>` reads as
+//! generic arguments made only of type words (`Gen<int, long>.Max` is
+//! fine); an unbalanced bracket in an enum body drops the members after it;
+//! since both `#if`/`#else` branches are kept, a member declared in each
+//! gives two symbols with the same name.
 use graph_core::scan::{code_close_table, mark_keywords, span_between};
 use graph_core::tokenizer::{tokenize_with, TokenizerOptions, TOKENIZER_VERSION};
 use graph_core::{Extraction, Extractor, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
@@ -137,7 +143,8 @@ impl Extractor for CSharpExtractor {
 
     fn version(&self) -> String {
         // `kw1`: reserved words are classed `keyword` (#143).
-        format!("csharp-scan-1+kw1+tok{TOKENIZER_VERSION}")
+        // `em1`: enum members are symbols (#269).
+        format!("csharp-scan-1+kw1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -765,7 +772,9 @@ impl Scanner<'_> {
             let name = self.text(name).to_string();
             push(self, name.clone(), SymbolKind::Type, &kind);
             if let End::Block { open, close, .. } = *end {
-                if kind != "enum" {
+                if kind == "enum" {
+                    self.enum_members(open + 1, close);
+                } else {
                     self.body(open + 1, close, &Level::Type(name));
                 }
             }
@@ -828,6 +837,60 @@ impl Scanner<'_> {
                 End::Semi { .. } => (SymbolKind::Variable, "field"),
             };
             push(self, name, kind, lang);
+        }
+    }
+
+    /// Members of an enum body in code positions `[lo, hi)`: comma-separated
+    /// `[Attr] Name = value` entries. Each span runs from its first token
+    /// (attributes included) through the end of its initializer. The name is
+    /// the first identifier before any `=` (an entry with none, such as
+    /// `= 1`, is not a symbol). In an initializer, a generic type
+    /// (`Gen<int, long>.Max`) is skipped whole so its commas do not split
+    /// the member; an unbalanced bracket ends the scan (later members of
+    /// that enum are dropped).
+    fn enum_members(&mut self, lo: usize, hi: usize) {
+        let mut c = lo;
+        while c < hi {
+            let start = c;
+            let mut name = None;
+            let mut in_initializer = false;
+            while c < hi && self.text(c) != "," {
+                match self.text(c) {
+                    "(" | "[" | "{" => match self.close_of(c) {
+                        Some(close) if close < hi => {
+                            c = close + 1;
+                            continue;
+                        }
+                        _ => return,
+                    },
+                    "=" => in_initializer = true,
+                    _ if in_initializer && self.is_ident(c) => {
+                        // `type_end` accepts `<...>` only when it holds
+                        // nothing but type words, `.`, `,`, `?` and `[]`.
+                        match type_end(self.tokens, self.code, c) {
+                            Some(end) if end > c + 1 && end <= hi => {
+                                c = end;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ if name.is_none() && self.is_ident(c) => name = Some(c),
+                    _ => {}
+                }
+                c += 1;
+            }
+            // A name was seen, so the entry is non-empty (`c > start`).
+            if let Some(n) = name {
+                self.out.push(SymbolDecl {
+                    owner: None,
+                    name: self.text(n).to_string(),
+                    kind: SymbolKind::Constant,
+                    lang_kind: Some("enum_member".into()),
+                    span: span_between(&self.tok(start).span, &self.tok(c - 1).span),
+                });
+            }
+            c += 1;
         }
     }
 
