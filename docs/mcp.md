@@ -148,13 +148,15 @@ All seven are read-only (`readOnlyHint: true`), address things by org, repo and 
 |---|---|---|
 | `describe` | `org?`, `repo?` | `{repos, stale_possible}`: per repo its files, languages, symbol kinds and token classes, `encodings` (files per non-UTF-8 source encoding) and `lossy` (the same as `describe --json`) |
 | `list_repos` | `org?`, paging | items `{org, repo}` |
-| `search` | `text`, `grain?` (`token`, `symbol` (default), `method`, `class`, `file`, `repo`, `org`), `language?`, `org?`, `repo?`, `token_class?`, `symbol_kind?`, paging | items as in `search --json`: `{grain, org, repo, file, language, symbol, symbol_kind, lang_kind, token_class, span, count, no_symbols, no_matching_symbol}`, plus `encoding`/`lossy` for a non-UTF-8 file |
-| `find_symbols` | `pattern` (`name`, `prefix*`, `*`), `kind?`, `language?`, `org?`, `repo?`, `file?`, paging | items as in `symbols --json` |
+| `search` | `text`, `grain?` (`token`, `symbol` (default), `method`, `class`, `file`, `repo`, `org`), `language?`, `org?`, `repo?`, `token_class?`, `symbol_kind?`, paging | items as in `search --json`: `{grain, org, repo, file, language, symbol, symbol_kind, lang_kind, token_class, span, name_pos, count, no_symbols, no_matching_symbol}`, plus `encoding`/`lossy` for a non-UTF-8 file |
+| `find_symbols` | `pattern` (`name`, `prefix*`, `*`), `kind?`, `language?`, `org?`, `repo?`, `file?`, paging | items as in `symbols --json`, with `name_pos` (without the CLI's flat `name_line`/`name_col`) |
 | `file_outline` | `org`, `repo`, `path`, paging | the file's symbols in source order |
 | `file_tokens` | `org`, `repo`, `path`, `start_line?`, `end_line?`, paging | items `{text, token_class, span}` of the tokens starting on those lines |
 | `list_files` | `org`, `repo`, `prefix?`, paging | items `{path, language, has_errors}`, plus `encoding`/`lossy` for a non-UTF-8 file |
 
 A span is `{start, end, start_line, start_col, end_line, end_col}`: byte offsets `[start, end)` and 1-based lines and columns, as in the CLI's `--json`.
+
+**Declaration position.** `find_symbols` items, and `search` rows of the `symbol`, `method` and `class` grains that picked a symbol, carry `name_pos` `{byte, line, col}`: where the symbol's name is, which can be below the span start when attributes or decorators come first (`[Serializable]` on line 1, `class Shape` on line 2: line 2). It is the first identifier token inside the span equal to the name, else the span start ([ADR 0010](adr/0010-symbol-lookup-and-positions.md) D3; see [Declaration position](guide/querying.md#declaration-position)).
 
 **Encodings.** Files in another encoding are decoded to UTF-8 before indexing ([ADR 0007](adr/0007-source-encodings.md)), and their spans point into the decoded text. An item about such a file (from `search`, `find_symbols`, `file_outline` or `list_files`) carries `encoding` (the WHATWG name, e.g. `UTF-16LE`, `windows-1252`, `Shift_JIS`) and, when invalid bytes were replaced with U+FFFD, `lossy: true`; both are absent for UTF-8. `describe` gives per repo `encodings` (files per non-UTF-8 encoding; the rest are UTF-8) and `lossy` (a count). See [Source encodings](guide/indexing.md#source-encodings).
 

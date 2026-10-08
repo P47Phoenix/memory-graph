@@ -198,12 +198,12 @@ fn session(target: &[&str]) -> String {
         "search",
         json!({"text": "Error", "org": "corpus", "repo": "anyhow", "limit": 7, "offset": 3}),
     );
-    assert_eq!(sym["items"], cli_symbols["results"]);
+    assert_eq!(sym["items"], without_name_fields(&cli_symbols["results"]));
     assert_eq!(sym["next_offset"], 10);
     assert_eq!(sym["stale_possible"], false);
     // find_symbols and describe equal their --json twins.
     let f = m.tool("find_symbols", json!({"pattern": "Error*", "limit": 500}));
-    assert_eq!(f["items"], cli_find["results"]);
+    assert_eq!(f["items"], without_name_fields(&cli_find["results"]));
     let d = m.tool("describe", json!({}));
     assert_eq!(d["repos"], cli_describe["repos"]);
     m.finish()
@@ -272,4 +272,16 @@ fn mcp_refuses_a_missing_database_on_stderr() {
     assert!(!o.status.success());
     assert!(o.stdout.is_empty(), "stdout stays protocol-only");
     assert!(String::from_utf8_lossy(&o.stderr).contains("does not exist"));
+}
+
+/// The CLI's `--json` rows less the flat `name_line` / `name_col` it adds
+/// (ADR 0010 D3); MCP carries the same position as `name_pos` only.
+fn without_name_fields(rows: &serde_json::Value) -> serde_json::Value {
+    let mut rows = rows.clone();
+    for r in rows.as_array_mut().unwrap() {
+        let o = r.as_object_mut().unwrap();
+        o.remove("name_line");
+        o.remove("name_col");
+    }
+    rows
 }

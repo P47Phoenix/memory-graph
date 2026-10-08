@@ -9,8 +9,8 @@
 use crate::pb;
 use graph_core::{Extraction, Node, NodeKind, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use graph_store::{
-    BatchFile, CompactStats, Grain, Hit, IndexOptions, IngestStats, LanguageInfo, Page, Query,
-    RepoInfo, SnapshotStats, StoreError, SymbolHit, SymbolQuery, VacuumStats,
+    BatchFile, CompactStats, Grain, Hit, IndexOptions, IngestStats, LanguageInfo, Page, Position,
+    Query, RepoInfo, SnapshotStats, StoreError, SymbolHit, SymbolQuery, VacuumStats,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -340,6 +340,7 @@ impl From<Hit> for pb::Hit {
             lang_kind: h.lang_kind,
             token_class: h.token_class.map(enum_i32::<_, pb::TokenClass>),
             span: h.span.map(Into::into),
+            name_pos: h.name_pos.map(Into::into),
             count: to_u64(h.count),
             no_symbols: h.no_symbols,
             no_matching_symbol: h.no_matching_symbol,
@@ -352,8 +353,19 @@ impl From<Hit> for pb::Hit {
 impl TryFrom<pb::Hit> for Hit {
     type Error = ConvertError;
     fn try_from(h: pb::Hit) -> Result<Self, ConvertError> {
+        let grain: Grain = enum_field("Hit.grain", h.grain)?;
+        let span = h.span.map(Span::try_from).transpose()?;
+        // An older server leaves `name_pos` unset (ADR 0010 D3): a picked
+        // symbol's position falls back to its span start.
+        let name_pos = match h.name_pos {
+            Some(p) => Some(p.into()),
+            None if grain.is_symbolic() && h.symbol.is_some() && !h.no_matching_symbol => {
+                span.as_ref().map(Position::start_of)
+            }
+            None => None,
+        };
         Ok(Hit {
-            grain: enum_field("Hit.grain", h.grain)?,
+            grain,
             org: h.org,
             repo: h.repo,
             file: h.file,
@@ -362,7 +374,8 @@ impl TryFrom<pb::Hit> for Hit {
             symbol_kind: opt_enum_field("Hit.symbol_kind", h.symbol_kind)?,
             lang_kind: h.lang_kind,
             token_class: opt_enum_field("Hit.token_class", h.token_class)?,
-            span: h.span.map(Span::try_from).transpose()?,
+            span,
+            name_pos,
             count: to_usize("Hit.count", h.count)?,
             no_symbols: h.no_symbols,
             no_matching_symbol: h.no_matching_symbol,
@@ -384,6 +397,7 @@ impl From<SymbolHit> for pb::SymbolHit {
             kind: enum_i32::<_, pb::SymbolKind>(h.kind),
             lang_kind: h.lang_kind,
             span: h.span.map(Into::into),
+            name_pos: h.name_pos.map(Into::into),
             owner: h.owner,
             encoding: h.encoding,
             lossy: h.lossy,
@@ -394,6 +408,10 @@ impl From<SymbolHit> for pb::SymbolHit {
 impl TryFrom<pb::SymbolHit> for SymbolHit {
     type Error = ConvertError;
     fn try_from(h: pb::SymbolHit) -> Result<Self, ConvertError> {
+        let span = h.span.map(Span::try_from).transpose()?;
+        // An older server leaves `name_pos` unset (ADR 0010 D3): fall back to
+        // the span start.
+        let name_pos = Position::name_or_start(h.name_pos.map(Into::into), span.as_ref());
         Ok(SymbolHit {
             org: h.org,
             repo: h.repo,
@@ -403,11 +421,32 @@ impl TryFrom<pb::SymbolHit> for SymbolHit {
             qualified: h.qualified,
             kind: enum_field("SymbolHit.kind", h.kind)?,
             lang_kind: h.lang_kind,
-            span: h.span.map(Span::try_from).transpose()?,
+            span,
+            name_pos,
             owner: h.owner,
             encoding: h.encoding,
             lossy: h.lossy,
         })
+    }
+}
+
+impl From<Position> for pb::Position {
+    fn from(p: Position) -> Self {
+        pb::Position {
+            byte: p.byte,
+            line: p.line,
+            col: p.col,
+        }
+    }
+}
+
+impl From<pb::Position> for Position {
+    fn from(p: pb::Position) -> Self {
+        Position {
+            byte: p.byte,
+            line: p.line,
+            col: p.col,
+        }
     }
 }
 

@@ -346,9 +346,19 @@ impl pb::store_server::Store for StoreService {
         let (hits, meta) = self.ctx.read(r.view, move |s| s.search_symbols(&q)).await?;
         self.ctx.note_query(key, &meta);
         let hits_len = hits.len();
+        let omit = self.ctx.omit_name_pos;
         Ok(reply(
             pb::SearchSymbolsResponse {
-                hits: hits.into_iter().map(Into::into).collect(),
+                hits: hits
+                    .into_iter()
+                    .map(|h| {
+                        let mut m: pb::SymbolHit = h.into();
+                        if omit {
+                            m.name_pos = None;
+                        }
+                        m
+                    })
+                    .collect(),
                 applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
             },
             meta,
@@ -376,9 +386,19 @@ impl pb::store_server::Store for StoreService {
         let (hits, meta) = self.ctx.read(r.view, move |s| s.search(&q)).await?;
         self.ctx.note_query(key, &meta);
         let hits_len = hits.len();
+        let omit = self.ctx.omit_name_pos;
         Ok(reply(
             pb::SearchResponse {
-                hits: hits.into_iter().map(Into::into).collect(),
+                hits: hits
+                    .into_iter()
+                    .map(|h| {
+                        let mut m: pb::Hit = h.into();
+                        if omit {
+                            m.name_pos = None;
+                        }
+                        m
+                    })
+                    .collect(),
                 applied_default_limit: defaulted && hits_len >= DEFAULT_SEARCH_LIMIT,
             },
             meta,

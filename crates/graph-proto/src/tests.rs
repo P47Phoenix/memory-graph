@@ -7,8 +7,8 @@ use graph_core::{
     Extraction, Node, NodeKind, SchemaError, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl,
 };
 use graph_store::{
-    CompactStats, Grain, Hit, IndexOptions, IngestStats, LanguageInfo, Page, Query, RepoInfo,
-    SnapshotStats, StoreError, SymbolHit, SymbolQuery, VacuumStats,
+    CompactStats, Grain, Hit, IndexOptions, IngestStats, LanguageInfo, Page, Position, Query,
+    RepoInfo, SnapshotStats, StoreError, SymbolHit, SymbolQuery, VacuumStats,
 };
 use proptest::collection::{btree_map, vec};
 use proptest::option;
@@ -213,6 +213,14 @@ fn symbol_query() -> impl Strategy<Value = SymbolQuery> {
         )
 }
 
+fn position() -> impl Strategy<Value = Position> {
+    (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(|(byte, line, col)| Position {
+        byte,
+        line,
+        col,
+    })
+}
+
 fn hit() -> impl Strategy<Value = Hit> {
     (
         (
@@ -232,29 +240,38 @@ fn hit() -> impl Strategy<Value = Hit> {
             any::<bool>(),
             any::<bool>(),
         ),
-        (option::of(text()), any::<bool>()),
+        (option::of(text()), any::<bool>(), option::of(position())),
     )
         .prop_map(
             |(
                 (grain, org, repo, file, language, symbol, symbol_kind),
                 (lang_kind, token_class, span, count, no_symbols, no_matching_symbol),
-                (encoding, lossy),
-            )| Hit {
-                grain,
-                org,
-                repo,
-                file,
-                language,
-                symbol,
-                symbol_kind,
-                lang_kind,
-                token_class,
-                span,
-                count,
-                no_symbols,
-                no_matching_symbol,
-                encoding,
-                lossy,
+                (encoding, lossy, name_pos),
+            )| {
+                // Unset only where a client would not fill in the span start.
+                let name_pos = name_pos.or_else(|| {
+                    (grain.is_symbolic() && symbol.is_some() && !no_matching_symbol)
+                        .then(|| span.as_ref().map(Position::start_of))
+                        .flatten()
+                });
+                Hit {
+                    grain,
+                    org,
+                    repo,
+                    file,
+                    language,
+                    symbol,
+                    symbol_kind,
+                    lang_kind,
+                    token_class,
+                    span,
+                    name_pos,
+                    count,
+                    no_symbols,
+                    no_matching_symbol,
+                    encoding,
+                    lossy,
+                }
             },
         )
 }
@@ -271,7 +288,7 @@ fn symbol_hit() -> impl Strategy<Value = SymbolHit> {
         option::of(text()),
         option::of(span()),
         option::of(text()),
-        (option::of(text()), any::<bool>()),
+        (option::of(text()), any::<bool>(), option::of(position())),
     )
         .prop_map(
             |(
@@ -285,9 +302,10 @@ fn symbol_hit() -> impl Strategy<Value = SymbolHit> {
                 lang_kind,
                 span,
                 owner,
-                (encoding, lossy),
+                (encoding, lossy, name_pos),
             )| {
                 SymbolHit {
+                    name_pos: Position::name_or_start(name_pos, span.as_ref()),
                     org,
                     repo,
                     file,
@@ -1209,4 +1227,90 @@ fn strict_encoding_survives_a_rewritten_message() {
     assert!(graph_store::is_strict_encoding_refusal(&legacy));
     let plain = StoreError::Rejected("strict encoding, but not the suffix".into());
     assert!(!graph_store::is_strict_encoding_refusal(&plain));
+}
+
+/// ADR 0010 D3: an older server leaves `name_pos` unset; the client falls
+/// back to the span start for a symbol hit and a picked symbol's search row,
+/// and leaves it unset for rows without a symbol position.
+#[test]
+fn unset_name_pos_falls_back_to_span_start() {
+    let span = Span {
+        start: 3,
+        end: 9,
+        start_line: 1,
+        start_col: 4,
+        end_line: 2,
+        end_col: 1,
+    };
+    let start = Position {
+        byte: 3,
+        line: 1,
+        col: 4,
+    };
+    let mut sh: pb::SymbolHit = SymbolHit {
+        org: "o".into(),
+        repo: "r".into(),
+        file: "f".into(),
+        language: None,
+        name: "n".into(),
+        qualified: "n".into(),
+        kind: SymbolKind::Type,
+        lang_kind: None,
+        span: Some(span),
+        name_pos: None,
+        owner: None,
+        encoding: None,
+        lossy: false,
+    }
+    .into();
+    assert!(sh.name_pos.is_none());
+    assert_eq!(
+        SymbolHit::try_from(sh.clone()).unwrap().name_pos,
+        Some(start)
+    );
+    sh.span = None;
+    assert_eq!(SymbolHit::try_from(sh).unwrap().name_pos, None);
+    let hit = |grain: Grain, symbol: Option<&str>, no_matching_symbol: bool| -> pb::Hit {
+        Hit {
+            grain,
+            org: "o".into(),
+            repo: None,
+            file: None,
+            language: None,
+            symbol: symbol.map(str::to_string),
+            symbol_kind: None,
+            lang_kind: None,
+            token_class: None,
+            span: Some(span),
+            name_pos: None,
+            count: 1,
+            no_symbols: false,
+            no_matching_symbol,
+            encoding: None,
+            lossy: false,
+        }
+        .into()
+    };
+    let got = |h: pb::Hit| Hit::try_from(h).unwrap().name_pos;
+    for g in [Grain::Symbol, Grain::Method, Grain::Class] {
+        assert_eq!(got(hit(g, Some("S"), false)), Some(start), "{g:?}");
+        assert_eq!(got(hit(g, None, true)), None, "{g:?}");
+    }
+    assert_eq!(got(hit(Grain::Token, Some("S"), false)), None);
+    assert_eq!(got(hit(Grain::File, None, false)), None);
+    // A position the server sent is kept as is.
+    let mut h = hit(Grain::Symbol, Some("S"), false);
+    h.name_pos = Some(pb::Position {
+        byte: 7,
+        line: 2,
+        col: 1,
+    });
+    assert_eq!(
+        got(h),
+        Some(Position {
+            byte: 7,
+            line: 2,
+            col: 1
+        })
+    );
 }

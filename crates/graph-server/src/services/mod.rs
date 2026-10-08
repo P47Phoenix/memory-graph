@@ -53,6 +53,8 @@ pub struct Ctx {
     pub stall_writes_after: Option<usize>,
     /// [`crate::server::TestingHooks::transfer_hold_ms`].
     pub transfer_hold: Option<std::time::Duration>,
+    /// [`crate::server::TestingHooks::omit_name_pos`].
+    pub omit_name_pos: bool,
     /// Write proposals seen so far (counted only with a stall hook set).
     pub writes_proposed: std::sync::atomic::AtomicUsize,
     /// Forwarding to the leader (writes, membership changes, the

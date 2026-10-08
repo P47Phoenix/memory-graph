@@ -119,6 +119,7 @@ pub const CASES: &[(&str, Case)] = &[
     ("batch_level_encoding_hint", batch_level_encoding_hint),
     ("encoding_exposure", encoding_exposure),
     ("hot_term_pages", hot_term_pages),
+    ("name_positions", name_positions),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1683,6 +1684,9 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         ENC_ID,
         ENC_LATIN,
         ENC_CJK,
+        "Shape",
+        "Big",
+        "Red",
     ] {
         for grain in grains {
             let mut q = Query::new(text);
@@ -1722,7 +1726,8 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         }
     }
     for pat in [
-        "*", "a", "S", "m*", "nope", "dup", "dup*", "z", "q", "b", "T",
+        "*", "a", "S", "m*", "nope", "dup", "dup*", "z", "q", "b", "T", "Shape", "Big", "Red",
+        "Color", "Missing",
     ] {
         let mut q = SymbolQuery::new(pat);
         let mut variants = vec![q.clone()];
@@ -1983,6 +1988,12 @@ fn differential_seed(s: &dyn Store) {
         encoding: Some(encoding_rs::UTF_8),
         ..Default::default()
     };
+    // ADR 0010 D3: attributed symbols, one straddling a checkpoint block, so
+    // name positions are compared on every backend and configuration.
+    for (p, src, syms) in name_pos_fixtures() {
+        s.ingest_file("o3", "attr", p, "attrtoy", &decl_extraction(&src, &syms))
+            .unwrap();
+    }
     let st = s
         .index_bytes_opts(
             "o2",
@@ -4269,4 +4280,185 @@ struct foo;
             }
         }
     }
+}
+
+/// A file with the given symbols, `(name, kind, span text)`: each span is
+/// the first occurrence of its text; tokens from the generic tokenizer.
+fn decl_extraction(src: &str, syms: &[NamePosSym]) -> Extraction {
+    Extraction {
+        has_errors: false,
+        symbols: syms
+            .iter()
+            .map(|s| sym(s.name, s.kind, span_of(src, &s.span)))
+            .collect(),
+        tokens: tokenize(src),
+    }
+}
+
+/// A symbol of a [`name_pos_fixtures`] file and its expected declaration
+/// position: the byte offset of `at` in the source (`None`: the span start).
+struct NamePosSym {
+    name: &'static str,
+    kind: SymbolKind,
+    span: String,
+    at: Option<&'static str>,
+}
+
+fn nps(name: &'static str, kind: SymbolKind, span: &str, at: Option<&'static str>) -> NamePosSym {
+    NamePosSym {
+        name,
+        kind,
+        span: span.to_string(),
+        at,
+    }
+}
+
+/// ADR 0010 D3 fixtures: `(path, source, symbols)`.
+fn name_pos_fixtures() -> Vec<(&'static str, String, Vec<NamePosSym>)> {
+    use SymbolKind::{Constant, Type};
+    // An attribute long enough that the symbol's span starts in one
+    // checkpoint block and its name sits in a later one.
+    let args: Vec<String> = (0..50).map(|i| format!("x{i}")).collect();
+    let lead: String = (0..10).map(|i| format!("int p{i} = {i};\n")).collect();
+    let big_decl = format!("[A({})]\npublic class Big {{ }}", args.join(", "));
+    let big = format!("{lead}{big_decl}\n");
+    vec![
+        (
+            // #269's sample: the declaration is line 2, the span starts on 1.
+            "attr.cs",
+            "[Serializable]\npublic class Shape { }\n".to_string(),
+            vec![nps(
+                "Shape",
+                Type,
+                "[Serializable]\npublic class Shape { }",
+                Some("Shape {"),
+            )],
+        ),
+        (
+            // A string literal is not an identifier: line 2.
+            "alias.cs",
+            "[Alias(\"Shape\")]\nclass Shape { }\n".to_string(),
+            vec![nps(
+                "Shape",
+                Type,
+                "[Alias(\"Shape\")]\nclass Shape { }",
+                Some("Shape {"),
+            )],
+        ),
+        (
+            // The documented first-match rule: the attribute's identifier.
+            "same.cs",
+            "[Shape]\nclass Shape { }\n".to_string(),
+            vec![nps(
+                "Shape",
+                Type,
+                "[Shape]\nclass Shape { }",
+                Some("Shape]"),
+            )],
+        ),
+        (
+            "foo.cs",
+            "[Foo(Shape)]\nclass Shape { }\n".to_string(),
+            vec![nps(
+                "Shape",
+                Type,
+                "[Foo(Shape)]\nclass Shape { }",
+                Some("Shape)"),
+            )],
+        ),
+        (
+            // No attribute: the name token; a name not in the span: the
+            // span start.
+            "plain.cs",
+            "class Plain { }\n  class Other { }\n".to_string(),
+            vec![
+                nps("Plain", Type, "class Plain { }", Some("Plain")),
+                nps("Missing", Type, "class Other { }", None),
+            ],
+        ),
+        (
+            // An attributed enum member (story 55): span from `[Obsolete]`,
+            // name at `Red`.
+            "enum.cs",
+            "enum Color {\n    [Obsolete] Red,\n}\n".to_string(),
+            vec![
+                nps(
+                    "Color",
+                    Type,
+                    "enum Color {\n    [Obsolete] Red,\n}",
+                    Some("Color"),
+                ),
+                nps("Red", Constant, "[Obsolete] Red", Some("Red")),
+            ],
+        ),
+        (
+            "big.cs",
+            big,
+            vec![nps("Big", Type, &big_decl, Some("Big"))],
+        ),
+    ]
+}
+
+/// ADR 0010 D3: symbol hits and symbolic search rows carry the declaration
+/// (name) position, and the span is unchanged.
+fn name_positions(h: &Harness) {
+    let s = open(h);
+    let fixtures = name_pos_fixtures();
+    for (p, src, syms) in &fixtures {
+        s.ingest_file("o", "r", p, "attrtoy", &decl_extraction(src, syms))
+            .unwrap();
+    }
+    for (p, src, syms) in &fixtures {
+        for want in syms {
+            let span = span_of(src, &want.span);
+            let pos = want.at.map_or(span, |at| span_of(src, at));
+            let mut q = SymbolQuery::new(want.name);
+            q.file = Some(p.to_string());
+            let hits = s.search_symbols(&q).unwrap();
+            let hit = hits
+                .iter()
+                .find(|h| h.span == Some(span))
+                .unwrap_or_else(|| panic!("{p} {}: {hits:?}", want.name));
+            let np = hit.name_pos.expect("name_pos");
+            assert_eq!(
+                (np.byte, np.line, np.col),
+                (pos.start, pos.start_line, pos.start_col),
+                "{p} {}",
+                want.name
+            );
+        }
+    }
+    // #269: line 2, while the span still starts on line 1.
+    let mut q = SymbolQuery::new("Shape");
+    q.file = Some("attr.cs".into());
+    let h = &s.search_symbols(&q).unwrap()[0];
+    assert_eq!(h.span.unwrap().start_line, 1);
+    assert_eq!(h.name_pos.unwrap().line, 2);
+    // The symbolic grains carry it too; the token grain does not.
+    for grain in [Grain::Symbol, Grain::Class] {
+        let mut q = Query::new("Big");
+        q.grain = grain;
+        let rows = s.search(&q).unwrap();
+        assert_eq!(rows.len(), 1, "{grain:?}: {rows:?}");
+        let src = &fixtures.iter().find(|f| f.0 == "big.cs").unwrap().1;
+        let at = span_of(src, "Big");
+        let np = rows[0].name_pos.expect("name_pos");
+        assert_eq!(
+            (np.byte, np.line, np.col),
+            (at.start, at.start_line, at.start_col)
+        );
+        assert_eq!(rows[0].span.unwrap().start_line, 11, "{grain:?}");
+    }
+    let mut q = Query::new("Red");
+    q.grain = Grain::Symbol;
+    let rows = s.search(&q).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].symbol.as_deref(), Some("Color::Red"));
+    let np = rows[0].name_pos.unwrap();
+    assert_eq!((np.line, np.col), (2, 16));
+    assert_eq!(rows[0].span.unwrap().start_col, 5);
+    q.grain = Grain::Token;
+    assert!(s.search(&q).unwrap().iter().all(|h| h.name_pos.is_none()));
+    q.grain = Grain::File;
+    assert!(s.search(&q).unwrap().iter().all(|h| h.name_pos.is_none()));
 }

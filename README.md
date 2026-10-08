@@ -65,7 +65,7 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 | `index --org O --repo R <DIR>` | Index a directory as one repo. Honors `.gitignore`, skips binary files and, with `--max-file-size`, large ones. |
 | `index-file --org O --repo R <PATH>` | Index a single file (`--language` overrides detection). Re-indexing replaces it. |
 | `search <TEXT>` | Find tokens by exact text. Filters: `--language`, `--org`, `--repo`, `--kind` (token class), `--grain` (token, symbol, method, class, file, repo, org), `--symbol-kind`. |
-| `symbols <PATTERN>` | Find symbol definitions by name: exact, `prefix*`, or `*` for everything. Filters: `--kind` (symbol kind), `--language`, `--org`, `--repo`, `--file`. |
+| `symbols <PATTERN>` | Find symbol definitions by name: exact, `prefix*`, or `*` for everything. Filters: `--kind` (symbol kind), `--language`, `--org`, `--repo`, `--file`. Each hit points at the line and column of its name, not at an attribute above it ([declaration position](docs/guide/querying.md#declaration-position)); `--json` also keeps the full span. |
 | `describe` | Per repo: files, languages, symbols, tokens and the symbol kinds present (`--org`/`--repo` to narrow). |
 | `sysinfo` | What `index` sizes itself from on this machine: CPUs, memory and its source, the starting budget, free disk on the database's volume. |
 | `vacuum [--compact]` | Drop dictionary terms no file uses; `--compact` rebuilds the file to give the space back. |

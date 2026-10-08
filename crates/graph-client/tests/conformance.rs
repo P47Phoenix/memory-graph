@@ -76,6 +76,66 @@ fn remote_matches_embedded_differential() {
     conformance::run_differential(&*embedded, &remote);
 }
 
+/// ADR 0010 D3: a server from before `name_pos` (simulated by a hook that
+/// strips the field from its answers) leaves it unset, and the client falls
+/// back to the span start; a current server sends the declaration line.
+#[test]
+fn server_without_name_pos_falls_back_to_span_start() {
+    use graph_core::{Extraction, Span, SymbolDecl, SymbolKind};
+    use graph_store::{Grain, Position, SymbolQuery};
+    let src = "[Serializable]\npublic class Shape { }\n";
+    let decl = src.trim_end();
+    let span = Span {
+        start: 0,
+        end: decl.len() as u32,
+        start_line: 1,
+        start_col: 1,
+        end_line: 2,
+        end_col: 23,
+    };
+    let ex = Extraction {
+        has_errors: false,
+        symbols: vec![SymbolDecl {
+            owner: None,
+            name: "Shape".into(),
+            kind: SymbolKind::Type,
+            lang_kind: None,
+            span,
+        }],
+        tokens: graph_core::tokenizer::tokenize(src),
+    };
+    let start = Some(Position::start_of(&span));
+    for omit in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let ts = TestServer::start_with(&d.path().join("s.redb"), vec![], |cfg| {
+            cfg.testing.omit_name_pos = omit;
+        });
+        let remote = connect(&ts);
+        remote
+            .ingest_file("o", "r", "attr.cs", "csharp", &ex)
+            .unwrap();
+        let hits = remote.search_symbols(&SymbolQuery::new("Shape")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].span, Some(span));
+        let mut q = Query::new("Serializable");
+        q.grain = Grain::Class;
+        let rows = remote.search(&q).unwrap();
+        assert_eq!(rows.len(), 1);
+        if omit {
+            assert_eq!(hits[0].name_pos, start, "old server: span start");
+            assert_eq!(rows[0].name_pos, start, "old server: span start");
+        } else {
+            let want = Some(Position {
+                byte: 28,
+                line: 2,
+                col: 14,
+            });
+            assert_eq!(hits[0].name_pos, want);
+            assert_eq!(rows[0].name_pos, want);
+        }
+    }
+}
+
 /// #203: a file whose symbols fail span validation is stored tokens-only by
 /// the server exactly as by an embedded store, warning included.
 #[test]

@@ -322,6 +322,32 @@ impl SymbolQuery {
     }
 }
 
+/// A point in a source file: byte offset, line and column, numbered as a
+/// [`Span`]'s start is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Position {
+    pub byte: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+impl Position {
+    /// A span's start.
+    pub fn start_of(span: &Span) -> Self {
+        Self {
+            byte: span.start,
+            line: span.start_line,
+            col: span.start_col,
+        }
+    }
+
+    /// `name_pos` when known, else the span's start (an old server leaves
+    /// `name_pos` unset, ADR 0010 D3); `None` only with no span either.
+    pub fn name_or_start(name_pos: Option<Position>, span: Option<&Span>) -> Option<Self> {
+        name_pos.or_else(|| span.map(Self::start_of))
+    }
+}
+
 /// A symbol with its containment path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolHit {
@@ -336,6 +362,13 @@ pub struct SymbolHit {
     /// Language-specific kind string (`struct`, `impl`, `fn`, ...).
     pub lang_kind: Option<String>,
     pub span: Option<Span>,
+    /// The declaration (name) position (ADR 0010 D3): the first identifier
+    /// token inside `span` whose text equals `name`, else the span's start.
+    /// Worked out at query time; `None` from an old server that does not
+    /// send it (use [`Position::name_or_start`]). Omitted from JSON when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_pos: Option<Position>,
     /// The extractor's owner hint (`SymbolDecl::owner`), e.g. a Go method's
     /// receiver type. Omitted from JSON when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -453,6 +486,11 @@ pub struct Hit {
     /// Token grain: the token; symbol, method and class grains: the picked
     /// symbol's full span.
     pub span: Option<Span>,
+    /// Symbol, method and class grains, when a symbol was picked: its
+    /// declaration (name) position, as [`SymbolHit::name_pos`]. Omitted from
+    /// JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_pos: Option<Position>,
     /// Number of matching tokens contained in this node.
     pub count: usize,
     /// Symbol, method and class grains only: the file has no symbols at all
