@@ -20,6 +20,9 @@
 //!   files are missing it warns and indexes afresh.
 //! - `MG_READBENCH_MAX_FILES` / `MG_READBENCH_MAX_BYTES`: stop indexing
 //!   after this many files / source bytes.
+//! - `MG_READBENCH_OPS`: `symbols` runs only the `search_symbols` steps,
+//!   `symbolic` those plus the symbol, method and class searches (to time
+//!   one path, e.g. the name-position walk of ADR 0010 D3); unset runs all.
 //!
 //! The walk is `index_dir`'s (`graph_cli::dir_walker`: the repo's
 //! `.gitignore` rules, `.git` skipped, the same binary check and size cap),
@@ -190,6 +193,15 @@ impl Workload {
             });
         }
         ops.push(Op::Describe);
+        match std::env::var("MG_READBENCH_OPS").ok().as_deref() {
+            Some("symbols") => ops.retain(|o| matches!(o, Op::Symbols(_))),
+            Some("symbolic") => ops.retain(|o| match o {
+                Op::Symbols(_) => true,
+                Op::Search(q) => q.grain.is_symbolic(),
+                _ => false,
+            }),
+            _ => {}
+        }
         ops
     }
 }

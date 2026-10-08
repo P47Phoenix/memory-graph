@@ -2372,15 +2372,21 @@ fn run() -> Result<i32> {
             q.offset = offset.map(|o| o as usize);
             let hits = store.search_symbols(&q)?;
             if json {
+                let results = with_name_fields(
+                    serde_json::to_value(&hits)?,
+                    hits.iter()
+                        .map(|h| graph_store::Position::name_or_start(h.name_pos, h.span.as_ref())),
+                );
                 let out = graph_cli::target::with_read_meta(
-                    serde_json::json!({ "query": pattern, "results": hits }),
+                    serde_json::json!({ "query": pattern, "results": results }),
                 );
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
-                    let loc = h
-                        .span
-                        .map(|s| format!(":{}:{}", s.start_line, s.start_col))
+                    // The declaration (name) position, not the attribute
+                    // above it (ADR 0010 D3).
+                    let loc = graph_store::Position::name_or_start(h.name_pos, h.span.as_ref())
+                        .map(|p| format!(":{}:{}", p.line, p.col))
                         .unwrap_or_default();
                     out!(
                         "{}/{}/{}{loc}\t{}\t{} ({})\t{}{}",
@@ -2469,17 +2475,24 @@ fn run() -> Result<i32> {
             q.offset = offset.map(|o| o as usize);
             let hits = store.search(&q)?;
             if json {
+                let results = with_name_fields(
+                    serde_json::to_value(&hits)?,
+                    hits.iter().map(symbol_name_pos),
+                );
                 let out = graph_cli::target::with_read_meta(
-                    serde_json::json!({ "query": text, "grain": grain, "results": hits }),
+                    serde_json::json!({ "query": text, "grain": grain, "results": results }),
                 );
                 out!("{}", serde_json::to_string(&out)?);
             } else {
                 for h in &hits {
-                    // A symbol row is a whole definition: show where it ends too.
+                    // A symbol row is a whole definition: from its declaration
+                    // (name) position (ADR 0010 D3) to where it ends.
                     let loc = h
                         .span
                         .map(|s| {
-                            if h.grain.is_symbolic() {
+                            if let Some(p) = symbol_name_pos(h) {
+                                format!(":{}:{}-{}:{}", p.line, p.col, s.end_line, s.end_col)
+                            } else if h.grain.is_symbolic() {
                                 format!(
                                     ":{}:{}-{}:{}",
                                     s.start_line, s.start_col, s.end_line, s.end_col
@@ -2517,6 +2530,34 @@ fn run() -> Result<i32> {
 
 /// The trailing column of a `symbols`/`search` text row for a file that is
 /// not UTF-8 (ADR 0007): `\tencoding=<name>[,lossy]`; empty for UTF-8.
+/// A symbolic-grain search row's declaration position: `name_pos`, else
+/// (an older server) the picked symbol's span start; `None` for other rows.
+fn symbol_name_pos(h: &graph_store::Hit) -> Option<graph_store::Position> {
+    if !h.grain.is_symbolic() || h.symbol.is_none() || h.no_matching_symbol {
+        return None;
+    }
+    graph_store::Position::name_or_start(h.name_pos, h.span.as_ref())
+}
+
+/// `--json` rows of `symbols` and `search`: each row keeps its span and
+/// gains `name_line` / `name_col`, the declaration position (ADR 0010 D3),
+/// falling back to the span start; rows without a symbol position are left
+/// as they are.
+fn with_name_fields(
+    mut rows: serde_json::Value,
+    name_pos: impl Iterator<Item = Option<graph_store::Position>>,
+) -> serde_json::Value {
+    if let Some(rows) = rows.as_array_mut() {
+        for (v, p) in rows.iter_mut().zip(name_pos) {
+            if let (Some(p), Some(o)) = (p, v.as_object_mut()) {
+                o.insert("name_line".into(), p.line.into());
+                o.insert("name_col".into(), p.col.into());
+            }
+        }
+    }
+    rows
+}
+
 fn encoding_column(encoding: Option<&str>, lossy: bool) -> String {
     match (encoding, lossy) {
         (None, false) => String::new(),

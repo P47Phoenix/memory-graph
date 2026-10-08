@@ -377,6 +377,20 @@ fn embedded_tools_equal_store_read() {
     assert!(by_path("src/lib.rs").get("encoding").is_none());
     let hits = c.ok("find_symbols", json!({"pattern": "widen"}));
     assert_eq!(hits["items"][0]["encoding"], "UTF-16LE", "{hits}");
+    // ADR 0010 D3: the declaration (name) position, `widen` after `pub fn `,
+    // while the span starts at `pub`.
+    let p = &hits["items"][0];
+    assert_eq!(p["span"]["start_col"], 1, "{hits}");
+    assert_eq!(
+        (&p["name_pos"]["line"], &p["name_pos"]["col"]),
+        (&1.into(), &8.into()),
+        "{hits}"
+    );
+    let rows = c.ok("search", json!({"text": "widen", "grain": "symbol"}));
+    let r = &rows["items"][0];
+    assert_eq!(r["name_pos"]["col"], 8, "{rows}");
+    let rows = c.ok("search", json!({"text": "widen", "grain": "token"}));
+    assert!(rows["items"][0].get("name_pos").is_none(), "{rows}");
 }
 
 #[test]

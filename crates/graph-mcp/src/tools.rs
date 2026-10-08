@@ -192,6 +192,18 @@ fn span_schema() -> Value {
     })
 }
 
+/// The declaration (name) position (ADR 0010 D3), present on symbol rows.
+fn name_pos_schema() -> Value {
+    let n = json!({"type": "integer", "minimum": 0});
+    json!({
+        "type": "object",
+        "description": "Where the symbol's name is declared: the first identifier token in its span equal to its name, else the span start (an attribute or decorator above it is inside the span but not here)",
+        "properties": {"byte": n, "line": n, "col": n},
+        "required": ["byte", "line", "col"],
+        "additionalProperties": false
+    })
+}
+
 fn opt_str() -> Value {
     json!({"type": ["string", "null"]})
 }
@@ -247,6 +259,7 @@ fn hit_schema() -> Value {
             "lang_kind": opt_str(),
             "token_class": token_class_schema(true),
             "span": span_schema(),
+            "name_pos": name_pos_schema(),
             "count": {"type": "integer", "minimum": 0},
             "no_symbols": {"type": "boolean"},
             "no_matching_symbol": {"type": "boolean"},
@@ -272,6 +285,7 @@ fn symbol_hit_schema() -> Value {
             "kind": symbol_kind_schema(false),
             "lang_kind": opt_str(),
             "span": span_schema(),
+            "name_pos": name_pos_schema(),
             "owner": {"type": "string"},
             "encoding": encoding_schema(),
             "lossy": lossy_schema()

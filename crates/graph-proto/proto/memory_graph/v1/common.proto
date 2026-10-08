@@ -56,6 +56,13 @@ enum Grain {
   GRAIN_ORG = 7;
 }
 
+// graph_store::Position: a point in a source file, numbered as a Span's start.
+message Position {
+  uint32 byte = 1;
+  uint32 line = 2;
+  uint32 col = 3;
+}
+
 // graph_core::Span: byte offsets `[start, end)`, 1-based lines, 1-based
 // columns counted in Unicode scalar values.
 message Span {
@@ -173,6 +180,9 @@ message Hit {
   optional string encoding = 14;
   // The hit's file was decoded lossily (U+FFFD replacements).
   bool lossy = 15;
+  // Symbolic grains, when a symbol was picked: its declaration (name)
+  // position (ADR 0010 D3). Unset from an older server; use the span start.
+  optional Position name_pos = 16;
 }
 
 // graph_store::SymbolHit: a symbol with its containment path.
@@ -193,6 +203,10 @@ message SymbolHit {
   optional string encoding = 11;
   // The file was decoded lossily.
   bool lossy = 12;
+  // The declaration (name) position (ADR 0010 D3): the first identifier token
+  // inside the span whose text equals the name, else the span start. Unset
+  // from an older server; use the span start.
+  optional Position name_pos = 13;
 }
 
 // graph_store::LanguageInfo: per-language contents of a repo.

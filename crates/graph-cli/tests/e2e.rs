@@ -94,6 +94,78 @@ fn aspnet_site_symbols() {
     }
 }
 
+/// Issue #269's third sample (ADR 0010 D3, story 56): `[Serializable]` on
+/// line 1 and `public class Shape { }` on line 2. `symbols` and `search`
+/// report the declaration on line 2; `--json` keeps the span (line 1) and
+/// adds `name_line` / `name_col`.
+#[test]
+fn attributed_class_reports_its_declaration_line() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    let src = "[Serializable]\npublic class Shape { }\n";
+    std::fs::write(root.join("Shape.cs"), src).unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = run(&["--db", &db, "symbols", "Shape"]);
+    assert!(ok, "{err}");
+    assert!(out.starts_with("o/r/Shape.cs:2:14\t"), "{out}");
+    let (ok, out, err) = run(&["--db", &db, "symbols", "--json", "Shape"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let h = &v["results"][0];
+    assert_eq!(h["name_line"], 2, "{h}");
+    assert_eq!(h["name_col"], 14, "{h}");
+    assert_eq!(h["span"]["start_line"], 1, "{h}");
+    assert_eq!(h["span"]["start_col"], 1, "{h}");
+    assert_eq!(h["span"]["end_line"], 2, "{h}");
+    // Search: a symbolic grain runs from the declaration to the span's end;
+    // the token grain is unchanged.
+    let (ok, out, err) = run(&["--db", &db, "search", "Serializable", "--grain", "class"]);
+    assert!(ok, "{err}");
+    assert!(out.starts_with("o/r/Shape.cs:2:14-2:23\t"), "{out}");
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "search",
+        "Serializable",
+        "--grain",
+        "class",
+        "--json",
+    ]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let h = &v["results"][0];
+    assert_eq!(
+        (&h["name_line"], &h["name_col"]),
+        (&2.into(), &14.into()),
+        "{h}"
+    );
+    assert_eq!(h["span"]["start_line"], 1, "{h}");
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "search",
+        "Serializable",
+        "--grain",
+        "token",
+        "--json",
+    ]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(v["results"][0].get("name_line").is_none(), "{out}");
+}
+
 /// Issue #269: C# enum members are `constant`/`enum_member` symbols nested
 /// in their enum (and an enum's in its class), with exact spans; `--grain
 /// class` on a member resolves to the enum.
@@ -955,10 +1027,11 @@ fn rust_symbols_grains_end_to_end() {
         !ok && err.contains("--grain symbol, method or class"),
         "{err}"
     );
-    // Text mode shows the definition's full span, start to end.
+    // Text mode shows the definition from its declaration (name) position
+    // (ADR 0010 D3: `a` in `fn a`, column 8, not `fn` at 5) to its end.
     let (ok, out, _) = run(&["--db", &db, "search", "foo", "--grain", "method"]);
     assert!(
-        ok && out.contains("lib.rs:3:5-3:34\trust\tS::a\thits=2"),
+        ok && out.contains("lib.rs:3:8-3:34\trust\tS::a\thits=2"),
         "{out}"
     );
     let (_, out, _) = run(&["--db", &db, "search", "foo"]);

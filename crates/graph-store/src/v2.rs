@@ -27,7 +27,7 @@ use crate::{
 };
 use crate::{
     grain_accepts, kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile,
-    Grain, Hit, IndexOptions, IngestStats, Query, RepoInfo, Scope, StoreError, SymbolHit,
+    Grain, Hit, IndexOptions, IngestStats, Position, Query, RepoInfo, Scope, StoreError, SymbolHit,
     SymbolQuery, Tally, CATALOG, CATALOG_VERSION, CHILDREN, META, NAMES, NODES, ORIGIN_DIRECTORY,
     SYMBOLS,
 };
@@ -861,6 +861,46 @@ impl R {
             .map(|t| t.to_string());
         n.span = Some(r.span);
         Ok(n)
+    }
+
+    /// A symbol's declaration (name) position (ADR 0010 D3): the first
+    /// identifier token inside its span whose text equals its name, else the
+    /// span's start. Language-agnostic: it compares dictionary ids (one id
+    /// per text) and token classes, nothing else. The walk starts at the
+    /// checkpoint block holding the span's start and stops at the first match
+    /// or the span's end.
+    fn name_pos(&self, lazy: &Lazy<'_>, sym: &SymRec) -> Result<Position> {
+        let span = sym.span;
+        let mut found = None;
+        lazy.tokens_from_while(lazy.block_ordinal_at(span.start), |_, t| {
+            if t.span.start < span.start {
+                return true;
+            }
+            if t.span.start >= span.end {
+                return false;
+            }
+            if t.term == sym.name && t.class == TokenClass::Identifier && t.span.end <= span.end {
+                found = Some(Position::start_of(&t.span));
+                return false;
+            }
+            true
+        })?;
+        Ok(found.unwrap_or_else(|| Position::start_of(&span)))
+    }
+
+    /// The name position of symbol `id` (a `TAG_SYM` sub-id) in a file other
+    /// than the one being walked, read from that file's stream.
+    fn name_pos_of_id(&self, id: u64) -> Result<Option<Position>> {
+        let (tag, file, i) = split_id(id);
+        if tag != TAG_SYM {
+            return Ok(None);
+        }
+        let Some(raw) = self.streams.get(file)? else {
+            return Ok(None);
+        };
+        let lazy = codec::decode_lazy(raw.value())?;
+        let syms = lazy.symbols()?;
+        syms.get(i).map(|s| self.name_pos(&lazy, s)).transpose()
     }
 
     /// The first symbol (in source order) of `syms` named by dictionary id
@@ -1728,7 +1768,8 @@ impl R {
                 continue;
             };
             // Only the symbol section is decoded, not the tokens.
-            let syms = codec::decode_lazy(raw.value())?.symbols()?;
+            let lazy = codec::decode_lazy(raw.value())?;
+            let syms = lazy.symbols()?;
             let c = &files[&fid];
             let mut rows: Vec<((u32, String, u64), SymbolHit)> = Vec::new();
             for &i in &by_file[&fid] {
@@ -1765,6 +1806,7 @@ impl R {
                         kind: sym.symbol_kind.unwrap_or(SymbolKind::Other),
                         lang_kind: sym.lang_kind,
                         span: sym.span,
+                        name_pos: None,
                         owner: syms[i]
                             .owner
                             .map(|o| self.text(o))
@@ -1776,7 +1818,12 @@ impl R {
                 ));
             }
             rows.sort_by(|a, b| a.0.cmp(&b.0));
-            out.extend(rows.into_iter().map(|(_, h)| h));
+            // The name walk only for rows that can survive the cut-off.
+            for (key, mut h) in rows.into_iter().take(want - out.len()) {
+                let (_, _, i) = split_id(key.2);
+                h.name_pos = Some(self.name_pos(&lazy, &syms[i])?);
+                out.push(h);
+            }
         }
         out.truncate(want);
         if let Some(off) = q.offset {
@@ -1914,6 +1961,7 @@ impl R {
                 lang_kind: None,
                 token_class: None,
                 span: None,
+                name_pos: None,
                 count,
                 no_symbols: false,
                 no_matching_symbol: false,
@@ -2030,6 +2078,9 @@ impl R {
                 };
                 let mut hit = base_hit(1);
                 let key: Key;
+                // The picked symbol's id, for its name walk (done only when
+                // its row is new).
+                let mut name_of: Option<u64> = None;
                 match q.grain {
                     Grain::Token => {
                         hit.symbol = qual(&chain);
@@ -2153,6 +2204,7 @@ impl R {
                                 hit.symbol_kind = s.symbol_kind;
                                 hit.lang_kind = s.lang_kind.clone();
                                 hit.span = s.span;
+                                name_of = Some(s.id);
                                 key = (
                                     base.0.clone(),
                                     base.1.clone(),
@@ -2176,7 +2228,20 @@ impl R {
                         key = file_key(g);
                     }
                 }
-                rows.entry(key).and_modify(|h| h.count += 1).or_insert(hit);
+                match rows.entry(key) {
+                    std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().count += 1,
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        if let Some(id) = name_of {
+                            hit.name_pos = match split_id(id) {
+                                (TAG_SYM, f, i) if f == fid => {
+                                    syms.get(i).map(|s| self.name_pos(&lazy, s)).transpose()?
+                                }
+                                _ => self.name_pos_of_id(id)?,
+                            };
+                        }
+                        e.insert(hit);
+                    }
+                }
             }
         }
         Ok(rows

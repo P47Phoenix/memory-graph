@@ -204,6 +204,10 @@ pub struct TestingHooks {
     /// before it reaches Raft, so a test can start a `TransferLeader`
     /// while a write is in flight (the transfer's drain).
     pub hold_proposal_ms: Option<u64>,
+    /// Answer `Search` and `SearchSymbols` without `name_pos`, as a server
+    /// from before ADR 0010 D3 does, so the client's fallback to the span
+    /// start can be tested end to end.
+    pub omit_name_pos: bool,
 }
 
 impl ServeConfig {
@@ -805,6 +809,7 @@ pub async fn start(
         sysinfo: cfg.sysinfo.clone(),
         stall_writes_after: cfg.testing.stall_writes_after,
         transfer_hold: cfg.testing.transfer_hold_ms.map(Duration::from_millis),
+        omit_name_pos: cfg.testing.omit_name_pos,
         writes_proposed: std::sync::atomic::AtomicUsize::new(0),
         fwd: crate::forward::Forwarder::new(node_id, cfg.fault_plan.clone())
             .with_default_timeout(cfg.testing.forward_timeout_ms.map(Duration::from_millis)),

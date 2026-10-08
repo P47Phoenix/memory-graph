@@ -671,6 +671,65 @@ impl Lazy<'_> {
         }
         Ok(())
     }
+
+    /// An ordinal at or before the first token starting at or after byte
+    /// `start`, at most `CHECKPOINT_EVERY - 1` records before it: the
+    /// checkpoint block that holds it. Tokens are stored sorted by start, so
+    /// this is a binary search over the checkpoints (each holds the start of
+    /// the record before its block), with no record decoded.
+    pub fn block_ordinal_at(&self, start: u32) -> usize {
+        self.cks.partition_point(|c| c.start < start) * CHECKPOINT_EVERY
+    }
+
+    /// Visit the token records from ordinal `first` onwards, in order,
+    /// starting at the nearest checkpoint at or before it, until `f` returns
+    /// `false` or the stream ends. The checkpoints are trusted, as in
+    /// [`Lazy::tokens_at`]. An ordinal at or past the token count visits
+    /// nothing.
+    pub fn tokens_from_while(
+        &self,
+        first: usize,
+        mut f: impl FnMut(usize, &TokRec) -> bool,
+    ) -> Result<(), StoreError> {
+        if first >= self.ntok {
+            return Ok(());
+        }
+        let block = first / CHECKPOINT_EVERY;
+        let (mut r, mut prev, mut ord) = if block == 0 {
+            (
+                Reader {
+                    b: self.toks,
+                    at: 0,
+                },
+                ZERO,
+                0,
+            )
+        } else {
+            let c = self.cks[block - 1];
+            (
+                Reader {
+                    b: self.toks,
+                    at: c.off,
+                },
+                Span {
+                    start: c.start,
+                    start_line: c.line,
+                    start_col: c.col,
+                    ..ZERO
+                },
+                block * CHECKPOINT_EVERY,
+            )
+        };
+        while ord < self.ntok {
+            let rec = self.record(&mut r, &prev)?;
+            prev = rec.span;
+            if ord >= first && !f(ord, &rec) {
+                break;
+            }
+            ord += 1;
+        }
+        Ok(())
+    }
 }
 
 /// Number of ordinals packed per block in a block-encoded posting (story 6,
@@ -1268,6 +1327,46 @@ mod tests {
             if n > 1 {
                 assert!(lazy.tokens_at(&[1, 0], |_, _| {}).is_err());
                 assert!(lazy.tokens_at(&[1, 1], |_, _| {}).is_err());
+            }
+        }
+    }
+
+    /// `tokens_from_while` walks from any ordinal (across checkpoints) to the
+    /// end, in order, and stops when told to.
+    #[test]
+    fn tokens_from_while_matches_full_decode_from_every_ordinal() {
+        for n in [0, 1, CHECKPOINT_EVERY, 3 * CHECKPOINT_EVERY + 5] {
+            let s = long(n);
+            let b = encode(&s);
+            let lazy = decode_lazy(&b).unwrap();
+            for first in 0..=n {
+                let mut got = Vec::new();
+                lazy.tokens_from_while(first, |o, t| {
+                    got.push((o, t.clone()));
+                    true
+                })
+                .unwrap();
+                let want: Vec<_> = (first..n).map(|o| (o, s.tokens[o].clone())).collect();
+                assert_eq!(got, want, "n={n} first={first}");
+                let mut seen = 0;
+                lazy.tokens_from_while(first, |_, _| {
+                    seen += 1;
+                    seen < 3
+                })
+                .unwrap();
+                assert_eq!(seen, (n - first).min(3), "n={n} first={first}");
+            }
+            // `block_ordinal_at` never skips past the first token starting at
+            // or after a byte, and lands less than a block before it.
+            let max = s.tokens.last().map_or(0, |t| t.span.end) + 2;
+            for byte in 0..max {
+                let at = s
+                    .tokens
+                    .iter()
+                    .position(|t| t.span.start >= byte)
+                    .unwrap_or(n);
+                let b = lazy.block_ordinal_at(byte);
+                assert!(b <= at && at - b <= CHECKPOINT_EVERY, "n={n} byte={byte}");
             }
         }
     }
