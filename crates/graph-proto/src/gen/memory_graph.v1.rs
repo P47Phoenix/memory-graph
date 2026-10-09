@@ -139,6 +139,11 @@ pub struct SymbolQuery {
     pub limit: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "8")]
     pub offset: ::core::option::Option<u64>,
+    /// Match the pattern's case exactly (ADR 0010 D4). The default, false,
+    /// folds ASCII letters on both sides; an older server ignores this field and
+    /// always matches exactly.
+    #[prost(bool, tag = "9")]
+    pub exact_case: bool,
 }
 /// graph_store::Hit: one search result row at the requested grain.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

@@ -3161,3 +3161,38 @@ fn index_reindex_compact() {
         "{err}"
     );
 }
+
+/// Issue #269's second sample (ADR 0010 D4, story 57): `symbols widget`
+/// finds `public class Widget { }`, so do `WIDGET` and `WID*`, and
+/// `--exact-case` keeps the old, case-sensitive answer.
+#[test]
+fn symbols_lookup_is_case_insensitive_by_default() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Widget.cs"), "public class Widget { }\n").unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    for pattern in ["widget", "WIDGET", "WID*", "Widget"] {
+        let (ok, out, err) = run(&["--db", &db, "symbols", pattern]);
+        assert!(ok, "{pattern}: {err}");
+        assert!(out.starts_with("o/r/Widget.cs:1:14\t"), "{pattern}: {out}");
+        assert_eq!(out.lines().count(), 1, "{pattern}: {out}");
+    }
+    let (ok, out, err) = run(&["--db", &db, "symbols", "--exact-case", "widget"]);
+    assert!(ok, "{err}");
+    assert!(!out.contains("Widget.cs"), "{out}");
+    let (ok, out, err) = run(&["--db", &db, "symbols", "--exact-case", "Widget"]);
+    assert!(ok, "{err}");
+    assert!(out.starts_with("o/r/Widget.cs:1:14\t"), "{out}");
+}

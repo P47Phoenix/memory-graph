@@ -151,6 +151,10 @@ message SymbolQuery {
   optional string file = 6;
   optional uint64 limit = 7;
   optional uint64 offset = 8;
+  // Match the pattern's case exactly (ADR 0010 D4). The default, false,
+  // folds ASCII letters on both sides; an older server ignores this field and
+  // always matches exactly.
+  bool exact_case = 9;
 }
 
 // graph_store::Hit: one search result row at the requested grain.

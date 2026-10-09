@@ -305,6 +305,7 @@ impl From<SymbolQuery> for pb::SymbolQuery {
             file: q.file,
             limit: q.limit.map(to_u64),
             offset: q.offset.map(to_u64),
+            exact_case: q.exact_case,
         }
     }
 }
@@ -321,6 +322,7 @@ impl TryFrom<pb::SymbolQuery> for SymbolQuery {
             file: q.file,
             limit: opt_usize("SymbolQuery.limit", q.limit)?,
             offset: opt_usize("SymbolQuery.offset", q.offset)?,
+            exact_case: q.exact_case,
         })
     }
 }

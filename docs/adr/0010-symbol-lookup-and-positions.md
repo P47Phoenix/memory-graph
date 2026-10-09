@@ -80,6 +80,10 @@ References are to `origin/main` on 2026-10-08.
   - a self-heal test (a store written without `sym_fold` is reopened, rebuilt and queried);
   - the size gate (`crates/graph-cli/tests/size_gate.rs`) still passes, and the size cost is measured and recorded;
   - a remote conformance run and a cluster replication test.
+- **Measured (story 57, 2026-10-09):**
+  - **Size:** on the vendored corpus indexed twice, `sym_fold` holds 434,176 B against 438,272 B for `sym_idx` (0.99x), 1.27% of the 34.2 MB file. The size gate pins it at no more than 1.5x `sym_idx` and 2% of the file.
+  - **Self-heal:** the one-time rebuild on a copy of the large A5 index (23.6 GB, 5.49 M symbols) took 16.1 s with a 442 MiB peak working set, and did not grow the file. The next open wrote nothing and took under 0.1 s.
+  - **Latency (readbench, `search_symbols` only, warm, one thread):** p50 and p95 are 0.005 and 0.070 ms before, 0.006 and 0.071 ms with `exact_case`, and 0.006 and 0.106 ms with the folded default. The default's p95 is higher because its prefix patterns match more names (46.0 KiB read per query against 33.4).
 
 ### D5. Owner gate and order
 

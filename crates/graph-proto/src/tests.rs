@@ -198,9 +198,10 @@ fn symbol_query() -> impl Strategy<Value = SymbolQuery> {
         option::of(text()),
         option::of(any::<usize>()),
         option::of(any::<usize>()),
+        any::<bool>(),
     )
         .prop_map(
-            |(pattern, kind, language, org, repo, file, limit, offset)| SymbolQuery {
+            |(pattern, kind, language, org, repo, file, limit, offset, exact_case)| SymbolQuery {
                 pattern,
                 kind,
                 language,
@@ -209,6 +210,7 @@ fn symbol_query() -> impl Strategy<Value = SymbolQuery> {
                 file,
                 limit,
                 offset,
+                exact_case,
             },
         )
 }

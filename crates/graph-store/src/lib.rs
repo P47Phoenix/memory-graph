@@ -305,6 +305,11 @@ pub struct SymbolQuery {
     /// Skip this many rows before collecting `limit` rows; see
     /// [`Query::offset`] for the paging convention this mirrors.
     pub offset: Option<usize>,
+    /// Match the pattern's case exactly (ADR 0010 D4). The default,
+    /// `false`, folds ASCII letters on both sides (`widget` finds
+    /// `Widget`); every other character still matches exactly.
+    #[serde(default)]
+    pub exact_case: bool,
 }
 
 impl SymbolQuery {
@@ -318,6 +323,7 @@ impl SymbolQuery {
             file: None,
             limit: None,
             offset: None,
+            exact_case: false,
         }
     }
 }
