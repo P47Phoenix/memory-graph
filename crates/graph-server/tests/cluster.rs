@@ -1938,3 +1938,84 @@ fn degraded_tokens_only_file_replicates_identically() {
         run_differential(embedded.as_ref(), &replica(&tb, id));
     }
 }
+
+/// ADR 0010 D4 / story 57: `sym_fold` is derived and local. A snapshot from
+/// a new leader carries it, a follower that installs that snapshot answers
+/// case-insensitive lookups at once, and nothing in the Raft log names it.
+#[test]
+fn a_follower_installing_a_snapshot_answers_case_insensitive_lookups() {
+    let raft_proto = include_str!("../../graph-proto/proto/memory_graph/v1/raft.proto");
+    assert!(
+        !raft_proto.contains("sym_fold") && !raft_proto.contains("exact_case"),
+        "no LogCommand variant may reference sym_fold"
+    );
+    let mut tb = ClusterTestbed::with_config(3, exts(), |_, c| c.raft = Some(snappy()));
+    tb.form();
+    let leader = tb.leader();
+    let laggard = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    let c = tb.client(leader);
+    index_files(&c, "o", "r", &[small_file(0)]);
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let behind = tb
+        .node(laggard)
+        .raft()
+        .unwrap()
+        .metrics()
+        .last_log_index
+        .unwrap();
+    tb.node_mut(laggard).stop();
+    c.index_bytes(
+        "o",
+        "r",
+        "Widget.cs",
+        b"public class Widget { }\npublic class widGet { }\n",
+        None,
+    )
+    .unwrap();
+    for i in 1..20 {
+        c.index_bytes("o", "r", &small_file(i).0, &small_file(i).1, None)
+            .unwrap();
+    }
+    let raft = tb.node(leader).raft().unwrap().raft.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        raft.wait(Some(CLUSTER_WAIT))
+            .metrics(
+                |m| m.purged.is_some_and(|p| p.index > behind),
+                "the leader purged past the laggard",
+            )
+            .await
+            .unwrap()
+    });
+    tb.node_mut(laggard).restart();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    assert!(
+        tb.node(laggard).raft().unwrap().snapshots_installed() >= 1,
+        "the laggard caught up through InstallSnapshot"
+    );
+    let names = |s: &dyn StoreRead, pattern: &str, exact_case: bool| -> Vec<String> {
+        let mut q = SymbolQuery::new(pattern);
+        q.exact_case = exact_case;
+        s.search_symbols(&q)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.name)
+            .collect()
+    };
+    let follower = tb.client(laggard);
+    assert_eq!(names(&follower, "widget", false), ["Widget", "widGet"]);
+    assert_eq!(names(&follower, "WID*", false), ["Widget", "widGet"]);
+    assert!(names(&follower, "widget", true).is_empty());
+    assert_eq!(names(&follower, "Widget", true), ["Widget"]);
+    for pat in ["widget", "WID*", "f1*", "F1*"] {
+        assert_eq!(
+            names(&follower, pat, false),
+            names(&tb.client(leader), pat, false),
+            "{pat}"
+        );
+    }
+    graph_store::conformance::run_differential(&replica(&tb, laggard), &replica(&tb, leader));
+}

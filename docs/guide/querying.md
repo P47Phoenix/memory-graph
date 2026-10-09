@@ -38,6 +38,12 @@ A hit with no enclosing symbol of that grain is rolled up to its file with `no_m
 
 `symbols` patterns: `name` (exact), `prefix*`, `*` (all), `name\*` (a literal `*`). `**` is rejected as ambiguous.
 
+### Case
+
+Symbol names match **case-insensitively by default**: `symbols widget` finds `Widget`, and so do `WIDGET` and `WID*`. Only ASCII letters fold (`A`-`Z` to `a`-`z`); every other character matches exactly, so `grö*` finds `Größe` while `GRÖ*` does not. Results come in the usual order (org, repo, file, position), each symbol once. `--exact-case` restores case-sensitive matching (`symbols --exact-case widget` finds nothing). The literal `name\*` form works in both modes. The language and kind filters were already ASCII-case-insensitive.
+
+The lookup uses a folded index, `sym_fold`, kept beside the exact one. A database written by an older build gets it on its first open by this one: the open rebuilds it from the exact index, once, and prints a line saying so; later opens write nothing. Over `--server`, an older server ignores `--exact-case`'s field and answers case-sensitively, and an older client talking to a new server gets case-insensitive results, because it cannot send the field and its default is `false` ([ADR 0010](../adr/0010-symbol-lookup-and-positions.md) D4).
+
 ## Paging and JSON
 
 Page with `--limit N --offset M`; results are ordered by org, repo, file, position. `--json` prints `{"query", "results": [...]}` (and `"grain"` for `search`).

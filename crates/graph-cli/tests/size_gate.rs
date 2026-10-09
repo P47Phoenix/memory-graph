@@ -143,7 +143,38 @@ fn database_size_stays_within_bounds_of_source_and_tokens() {
     // Still readable after compaction.
     let (ok, out, _) = run(&["--db", db, "describe"]);
     assert!(ok && out.contains("o/r1") && out.contains("o/r2"), "{out}");
+
+    // ADR 0010 D4 / story 57: the folded symbol index costs about what
+    // `sym_idx` does (one key per distinct folded name, the same ids), and
+    // a small share of the file. Bounds about 1.5x the measured values.
+    let store = graph_store::V2Store::open(db).unwrap();
+    let (idx, fold) = store.symbol_index_bytes().unwrap();
+    drop(store);
+    let db_bytes = std::fs::metadata(db).unwrap().len();
+    let fold_share = fold as f64 / db_bytes as f64;
+    let fold_per_idx = fold as f64 / idx as f64;
+    println!(
+        "size gate sym_fold: {fold} B ({:.2}% of the file, {fold_per_idx:.2}x sym_idx at {idx} B)",
+        fold_share * 100.0
+    );
+    assert!(fold > 0 && idx > 0, "both symbol indexes hold data");
+    assert!(
+        fold_per_idx <= SYM_FOLD_PER_SYM_IDX_MAX,
+        "sym_fold is {fold_per_idx:.2}x sym_idx ({fold} B vs {idx} B); limit {SYM_FOLD_PER_SYM_IDX_MAX}x"
+    );
+    assert!(
+        fold_share <= SYM_FOLD_SHARE_MAX,
+        "sym_fold is {:.2}% of the file ({fold} B of {db_bytes} B); limit {:.1}%",
+        fold_share * 100.0,
+        SYM_FOLD_SHARE_MAX * 100.0
+    );
 }
+
+/// `sym_fold` bytes per `sym_idx` byte (ADR 0010 D4; measured 0.99x on
+/// this corpus, 2026-10-09).
+const SYM_FOLD_PER_SYM_IDX_MAX: f64 = 1.5;
+/// `sym_fold`'s share of the compacted file (measured 1.27%).
+const SYM_FOLD_SHARE_MAX: f64 = 0.02;
 
 /// #90: a full `--reindex` leaves the file about twice its live data (every
 /// replacement is written before the old pages can be reused, and redb grows

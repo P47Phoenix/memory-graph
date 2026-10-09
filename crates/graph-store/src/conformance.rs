@@ -21,7 +21,8 @@
 //! ```
 //! The factory is called once per case, so each case sees an empty database.
 use crate::{
-    BatchFile, Grain, IndexOptions, Query, Store, StoreError, SymbolQuery, ORIGIN_DIRECTORY,
+    BatchFile, Grain, IndexOptions, Query, Store, StoreError, StoreRead, SymbolQuery,
+    ORIGIN_DIRECTORY,
 };
 use graph_core::tokenizer::tokenize;
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind, Span, SymbolDecl, SymbolKind};
@@ -120,6 +121,8 @@ pub const CASES: &[(&str, Case)] = &[
     ("encoding_exposure", encoding_exposure),
     ("hot_term_pages", hot_term_pages),
     ("name_positions", name_positions),
+    ("case_insensitive_symbols", case_insensitive_symbols),
+    ("sym_fold_follows_writes", sym_fold_follows_writes),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -1727,7 +1730,7 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
     }
     for pat in [
         "*", "a", "S", "m*", "nope", "dup", "dup*", "z", "q", "b", "T", "Shape", "Big", "Red",
-        "Color", "Missing",
+        "Color", "Missing", "s", "SHAPE", "sh*", "RED", "DUP*",
     ] {
         let mut q = SymbolQuery::new(pat);
         let mut variants = vec![q.clone()];
@@ -1746,6 +1749,10 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         variants.push(q.clone());
         q.language = None;
         q.limit = Some(1);
+        variants.push(q.clone());
+        // ADR 0010 D4: the exact-case path too.
+        q.limit = None;
+        q.exact_case = true;
         variants.push(q);
         for q in variants {
             assert_eq!(
@@ -1781,6 +1788,9 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         );
     }
     differential_traversal(a, b);
+    // ADR 0010 D4: each side's folded index agrees with its own symbols.
+    assert_fold_agrees(a, "differential a");
+    assert_fold_agrees(b, "differential b");
     for (o, r, p) in [
         ("o1", "r1", "lib.rs"),
         ("o2", "r2", "main.zig"),
@@ -1938,6 +1948,7 @@ pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
             crashed.search_symbols(&SymbolQuery::new("*")).unwrap(),
             "symbols {what}"
         );
+        assert_fold_agrees(crashed, what);
         assert!(
             !fresh.search(&Query::new("foo")).unwrap().is_empty(),
             "the corpus is indexed {what}"
@@ -4461,4 +4472,203 @@ fn name_positions(h: &Harness) {
     assert!(s.search(&q).unwrap().iter().all(|h| h.name_pos.is_none()));
     q.grain = Grain::File;
     assert!(s.search(&q).unwrap().iter().all(|h| h.name_pos.is_none()));
+}
+
+/// One symbol per line, `class <name> {}`, each spanning its own line (ADR
+/// 0010 D4 fixtures: the names are what matters).
+fn line_symbols(names: &[&str]) -> (String, Extraction) {
+    let src: String = names.iter().map(|n| format!("class {n} {{}}\n")).collect();
+    let symbols = names
+        .iter()
+        .map(|n| {
+            sym(
+                n,
+                SymbolKind::Type,
+                span_of(&src, &format!("class {n} {{}}")),
+            )
+        })
+        .collect();
+    let ex = Extraction {
+        has_errors: false,
+        symbols,
+        tokens: tokenize(&src),
+    };
+    (src, ex)
+}
+
+fn ingest_names(s: &dyn Store, org: &str, repo: &str, path: &str, names: &[&str]) {
+    let (_, ex) = line_symbols(names);
+    s.ingest_file(org, repo, path, "casetoy", &ex).unwrap();
+}
+
+fn symbol_rows(s: &dyn Store, pattern: &str, exact_case: bool) -> Vec<(String, String)> {
+    let mut q = SymbolQuery::new(pattern);
+    q.exact_case = exact_case;
+    s.search_symbols(&q)
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.file, h.name))
+        .collect()
+}
+
+/// ADR 0010 D4 / story 57: case-insensitive lookup by default (ASCII only),
+/// `exact_case` keeps today's answers, the literal `name\*` works in both
+/// modes, and every symbol appears once, in today's order.
+fn case_insensitive_symbols(h: &Harness) {
+    let s = open(h);
+    ingest_names(&*s, "o0", "r0", "z.cs", &["WidgetFactory"]);
+    ingest_names(
+        &*s,
+        "o1",
+        "r1",
+        "a.cs",
+        &["widGet", "Widget", "Gr\u{f6}\u{df}e", "Ptr*"],
+    );
+    ingest_names(&*s, "o1", "r1", "b.cs", &["WIDGET"]);
+    let rows = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(f, n)| (f.to_string(), n.to_string()))
+            .collect()
+    };
+    let exact3 = rows(&[("a.cs", "widGet"), ("a.cs", "Widget"), ("b.cs", "WIDGET")]);
+    // #269: `widget` finds `Widget`, and so do `WIDGET` and `wid*` forms.
+    assert_eq!(symbol_rows(&*s, "widget", false), exact3);
+    assert_eq!(symbol_rows(&*s, "WIDGET", false), exact3);
+    let prefix4 = rows(&[
+        ("z.cs", "WidgetFactory"),
+        ("a.cs", "widGet"),
+        ("a.cs", "Widget"),
+        ("b.cs", "WIDGET"),
+    ]);
+    assert_eq!(symbol_rows(&*s, "WID*", false), prefix4);
+    assert_eq!(symbol_rows(&*s, "wid*", false), prefix4);
+    // Once each, in org/repo/path then stream order, with a limit and offset.
+    let mut q = SymbolQuery::new("wId*");
+    q.offset = Some(1);
+    q.limit = Some(2);
+    let page: Vec<_> = s
+        .search_symbols(&q)
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.file, h.name))
+        .collect();
+    assert_eq!(page, prefix4[1..3].to_vec());
+    // exact_case: today's answers.
+    assert!(symbol_rows(&*s, "widget", true).is_empty());
+    assert_eq!(
+        symbol_rows(&*s, "Widget", true),
+        rows(&[("a.cs", "Widget")])
+    );
+    assert_eq!(symbol_rows(&*s, "wid*", true), rows(&[("a.cs", "widGet")]));
+    assert_eq!(
+        symbol_rows(&*s, "W*", true),
+        rows(&[
+            ("z.cs", "WidgetFactory"),
+            ("a.cs", "Widget"),
+            ("b.cs", "WIDGET")
+        ])
+    );
+    // Non-ASCII letters match exactly; ASCII letters around them still fold.
+    let grosse = rows(&[("a.cs", "Gr\u{f6}\u{df}e")]);
+    assert_eq!(symbol_rows(&*s, "gr\u{f6}\u{df}e", false), grosse);
+    assert_eq!(symbol_rows(&*s, "GR\u{f6}\u{df}E", false), grosse);
+    assert!(symbol_rows(&*s, "gr\u{d6}\u{df}e", false).is_empty());
+    assert_eq!(symbol_rows(&*s, "gr\u{f6}*", false), grosse);
+    assert!(symbol_rows(&*s, "GR\u{d6}*", false).is_empty());
+    assert!(symbol_rows(&*s, "gr\u{f6}\u{df}e", true).is_empty());
+    // The literal `name\*`, in both modes.
+    let ptr = rows(&[("a.cs", "Ptr*")]);
+    assert_eq!(symbol_rows(&*s, "ptr\\*", false), ptr);
+    assert_eq!(symbol_rows(&*s, "Ptr\\*", false), ptr);
+    assert_eq!(symbol_rows(&*s, "Ptr\\*", true), ptr);
+    assert!(symbol_rows(&*s, "ptr\\*", true).is_empty());
+    // `*` alone is unchanged.
+    assert_eq!(symbol_rows(&*s, "*", false), symbol_rows(&*s, "*", true));
+    assert_fold_agrees(&*s, "fixture");
+}
+
+/// ADR 0010 D4: `sym_fold` stays in step with `sym_idx` through re-index,
+/// replace, prune and vacuum, checked by query results.
+fn sym_fold_follows_writes(h: &Harness) {
+    let s = open(h);
+    ingest_names(&*s, "o", "r", "a.cs", &["Widget", "Gadget"]);
+    ingest_names(&*s, "o", "r", "b.cs", &["widget"]);
+    assert_eq!(symbol_rows(&*s, "WIDGET", false).len(), 2);
+    assert_fold_agrees(&*s, "ingest");
+    // Re-index unchanged: nothing moves.
+    ingest_names(&*s, "o", "r", "a.cs", &["Widget", "Gadget"]);
+    assert_eq!(symbol_rows(&*s, "WIDGET", false).len(), 2);
+    // Replace: the old names go, the new ones come.
+    ingest_names(&*s, "o", "r", "a.cs", &["Sprocket"]);
+    assert_eq!(
+        symbol_rows(&*s, "widget", false),
+        [("b.cs".to_string(), "widget".to_string())]
+    );
+    assert!(symbol_rows(&*s, "gadget", false).is_empty());
+    assert_eq!(symbol_rows(&*s, "SPROCKET", false).len(), 1);
+    assert_fold_agrees(&*s, "replace");
+    // Prune: c.cs (a directory origin) leaves; agent-supplied files stay.
+    let (_, ex) = line_symbols(&["Gizmo"]);
+    s.ingest_file_with_origin("o", "r", "c.cs", "casetoy", &ex, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+    let keep: HashSet<String> = HashSet::new();
+    assert_eq!(s.prune_files("o", "r", &keep, false).unwrap(), ["c.cs"]);
+    assert!(symbol_rows(&*s, "gizmo", false).is_empty());
+    assert_fold_agrees(&*s, "prune");
+    s.vacuum().unwrap();
+    assert_eq!(symbol_rows(&*s, "sprocket", false).len(), 1);
+    assert_fold_agrees(&*s, "vacuum");
+}
+
+/// The folded lookup agrees with a brute-force fold-and-filter over every
+/// symbol (ADR 0010 D4), for exact and prefix patterns, in both modes, and in
+/// the same order.
+pub(crate) fn assert_fold_agrees(s: &dyn StoreRead, what: &str) {
+    let fold = |t: &str| t.to_ascii_lowercase();
+    let mut all_q = SymbolQuery::new("*");
+    all_q.exact_case = true;
+    let all = s.search_symbols(&all_q).unwrap();
+    let key = |h: &crate::SymbolHit| (h.org.clone(), h.repo.clone(), h.file.clone(), h.span);
+    let mut names: Vec<&str> = all.iter().map(|h| h.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        if name.is_empty() || name.contains('*') || name.ends_with('\\') {
+            continue;
+        }
+        let filter = |pred: &dyn Fn(&str) -> bool| -> Vec<_> {
+            all.iter().filter(|h| pred(&h.name)).map(key).collect()
+        };
+        let run = |pattern: &str, exact_case: bool| -> Vec<_> {
+            let mut q = SymbolQuery::new(pattern);
+            q.exact_case = exact_case;
+            s.search_symbols(&q).unwrap().iter().map(key).collect()
+        };
+        let folded = fold(name);
+        let want = filter(&|n| fold(n) == folded);
+        assert_eq!(run(name, false), want, "{what}: `{name}`");
+        assert_eq!(
+            run(&name.to_ascii_uppercase(), false),
+            want,
+            "{what}: upper `{name}`"
+        );
+        assert_eq!(
+            run(name, true),
+            filter(&|n| n == name),
+            "{what}: exact `{name}`"
+        );
+        let cut = name.char_indices().nth(2).map_or(name.len(), |(i, _)| i);
+        let prefix = &name[..cut];
+        let pf = fold(prefix);
+        assert_eq!(
+            run(&format!("{}*", prefix.to_ascii_uppercase()), false),
+            filter(&|n| fold(n).starts_with(&pf)),
+            "{what}: prefix `{prefix}*`"
+        );
+        assert_eq!(
+            run(&format!("{prefix}*"), true),
+            filter(&|n| n.starts_with(prefix)),
+            "{what}: exact prefix `{prefix}*`"
+        );
+    }
 }

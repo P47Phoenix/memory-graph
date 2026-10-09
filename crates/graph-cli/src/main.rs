@@ -761,6 +761,10 @@ enum Cmd {
         /// paired with --limit to page through a large result set (ADR 0003 story 11)
         #[arg(long)]
         offset: Option<u64>,
+        /// Match the pattern's case exactly. By default ASCII letters match in either case
+        /// (`widget` finds `Widget`); other characters always match exactly (ADR 0010 D4)
+        #[arg(long)]
+        exact_case: bool,
         /// Print JSON instead of text
         #[arg(long)]
         json: bool,
@@ -2356,6 +2360,7 @@ fn run() -> Result<i32> {
             file,
             limit,
             offset,
+            exact_case,
             json,
         } => {
             let store = open_existing(&target, overrides)?;
@@ -2370,6 +2375,7 @@ fn run() -> Result<i32> {
             (q.kind, q.language, q.org, q.repo, q.file) = (kind, language, org, repo, file);
             q.limit = limit.map(|l| l as usize);
             q.offset = offset.map(|o| o as usize);
+            q.exact_case = exact_case;
             let hits = store.search_symbols(&q)?;
             if json {
                 let results = with_name_fields(

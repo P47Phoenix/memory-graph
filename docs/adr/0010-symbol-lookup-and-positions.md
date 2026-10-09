@@ -1,6 +1,6 @@
 # ADR 0010: Enum members, case-insensitive symbol lookup and declaration position
 
-**Status:** Proposed on 2026-10-08. The owner decides. The owner made the three scope decisions in D1 on 2026-10-08, in answer to issue [#269](https://github.com/P47Phoenix/memory-graph/issues/269). Builds on [ADR 0003](0003-data-model.md) (the v2 store, `sym_idx`, the `derived_version` self-heal) and [ADR 0002](0002-parsing-and-crate-layout.md) (token-stream extractors). Epic amendment, proposed: stories [55](../epic-code-memory-graph.md#story-55), [56](../epic-code-memory-graph.md#story-56) and [57](../epic-code-memory-graph.md#story-57). They are not counted in the epic totals until this ADR is accepted.
+**Status:** Accepted by the owner on 2026-10-09 (proposed on 2026-10-08). Stories 55 and 56 are delivered (#271-#274) and story 57 in #275. The owner made the three scope decisions in D1 on 2026-10-08, in answer to issue [#269](https://github.com/P47Phoenix/memory-graph/issues/269). Builds on [ADR 0003](0003-data-model.md) (the v2 store, `sym_idx`, the `derived_version` self-heal) and [ADR 0002](0002-parsing-and-crate-layout.md) (token-stream extractors). Epic amendment: stories [55](../epic-code-memory-graph.md#story-55), [56](../epic-code-memory-graph.md#story-56) and [57](../epic-code-memory-graph.md#story-57), added with the owner's approval.
 
 ## In plain words
 
@@ -80,6 +80,10 @@ References are to `origin/main` on 2026-10-08.
   - a self-heal test (a store written without `sym_fold` is reopened, rebuilt and queried);
   - the size gate (`crates/graph-cli/tests/size_gate.rs`) still passes, and the size cost is measured and recorded;
   - a remote conformance run and a cluster replication test.
+- **Measured (story 57, 2026-10-09):**
+  - **Size:** on the vendored corpus indexed twice, `sym_fold` holds 434,176 B against 438,272 B for `sym_idx` (0.99x), 1.27% of the 34.2 MB file. The size gate pins it at no more than 1.5x `sym_idx` and 2% of the file.
+  - **Self-heal:** the one-time rebuild on a copy of the large A5 index (23.6 GB, 5.49 M symbols) took 16.1 s with a 442 MiB peak working set, and did not grow the file. The next open wrote nothing and took under 0.1 s.
+  - **Latency (readbench, `search_symbols` only, warm, one thread):** p50 and p95 are 0.005 and 0.070 ms before, 0.006 and 0.071 ms with `exact_case`, and 0.006 and 0.106 ms with the folded default. The default's p95 is higher because its prefix patterns match more names (46.0 KiB read per query against 33.4).
 
 ### D5. Owner gate and order
 
@@ -89,8 +93,8 @@ References are to `origin/main` on 2026-10-08.
 
 ## Open questions (owner)
 
-1. Accept this ADR (Proposed to Accepted).
-2. If a read-only open is ever added (D4; none exists today), should a store without `sym_fold` fall back to a folded full scan or refuse case-insensitive queries with an error? The proposal leans to the fallback.
+1. Resolved on 2026-10-09: the owner accepted this ADR. The `meta` key is `derived_version_sym_fold`, as proposed in D4, following the `derived_version_<component>` naming of the refs and content_files stamps.
+2. Resolved by story 57: if `sym_fold` is ever missing at query time (only possible from a read-only open, none of which exists today), the store refuses a case-insensitive lookup with `Rejected` and an error naming `--exact-case`; it does not fall back to a scan. A read-only open that wants a fallback would need its own decision.
 
 ## Alternatives considered
 
@@ -112,6 +116,7 @@ References are to `origin/main` on 2026-10-08.
   - **Size:** `sym_fold` roughly duplicates `sym_idx`'s keys (less where names are already lowercase but still a second key per name). It must stay inside the size gate; the measured cost is recorded in story 57.
   - **Re-indexing:** extractor version bumps re-index affected files on the next run, and the corpus pins are re-pinned in each extractor PR.
   - The first open of an existing database after upgrading pays a one-time `sym_fold` rebuild.
+  - **Rollback leaves `sym_fold` stale.** If a database is written by this build, then by an older build (which does not maintain `sym_fold`), and then reopened by this build, the stamp is still current, so no rebuild runs and case-insensitive lookups miss or keep the older build's changes. `refs`/`content_files` have the same property. A writer-version guard is tracked as a follow-up (see issue); until then, do not write with an older build, or re-index after doing so.
   - The declaration position can be wrong in the rare unmarked-attribute case (D3).
 - **Neutral:**
   - No `V2_SCHEMA_VERSION` bump, no `LegacyFormat`, no Raft log change and no `PROTOCOL_VERSION` bump. Proto changes are additive fields.

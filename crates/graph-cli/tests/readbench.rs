@@ -23,6 +23,9 @@
 //! - `MG_READBENCH_OPS`: `symbols` runs only the `search_symbols` steps,
 //!   `symbolic` those plus the symbol, method and class searches (to time
 //!   one path, e.g. the name-position walk of ADR 0010 D3); unset runs all.
+//! - `MG_READBENCH_EXACT_CASE`: when set, `search_symbols` runs with
+//!   `exact_case` (the case-sensitive `sym_idx` path, ADR 0010 D4) instead
+//!   of the default folded lookup.
 //!
 //! The walk is `index_dir`'s (`graph_cli::dir_walker`: the repo's
 //! `.gitignore` rules, `.git` skipped, the same binary check and size cap),
@@ -184,6 +187,7 @@ impl Workload {
             }
             let mut sq = SymbolQuery::new(format!("{term}*"));
             sq.limit = Some(QUERY_LIMIT);
+            sq.exact_case = std::env::var_os("MG_READBENCH_EXACT_CASE").is_some();
             ops.push(Op::Symbols(sq));
         }
         for (repo, path) in &self.file_reads {

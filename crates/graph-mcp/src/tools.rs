@@ -428,7 +428,8 @@ pub fn tool_definitions() -> Vec<Value> {
         "language": language,
         "org": org,
         "repo": repo,
-        "file": s("Only symbols of this file path (as indexed, relative to the repo)")
+        "file": s("Only symbols of this file path (as indexed, relative to the repo)"),
+        "exact_case": {"type": ["boolean", "null"], "description": "Match the pattern's case exactly. Default false: ASCII letters match in either case (widget finds Widget); other characters always match exactly"}
     });
     paging(&mut find_p, MAX_LIMIT);
 
@@ -493,7 +494,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Find a token by its exact text and roll the matches up to a grain: the enclosing symbol (default), method, class, file, repo or org, or each token. Symbol, method and class rows carry that symbol's full span.",
             input(search_p, &["text"]), page_schema(hit_schema())),
         def("find_symbols", "Find symbols",
-            "Find symbol definitions (functions, types, methods, ...) by name: exact, `prefix*`, or `*` for all.",
+            "Find symbol definitions (functions, types, methods, ...) by name: exact, `prefix*`, or `*` for all. ASCII letters match in either case unless exact_case is true.",
             input(find_p, &["pattern"]), page_schema(symbol_hit_schema())),
         def("file_outline", "Outline a file",
             "The symbols defined in one file, in source order, with their kinds and spans.",
@@ -555,6 +556,14 @@ impl Args<'_> {
             }
             Some(Value::String(s)) => Ok(Some(s.clone())),
             Some(v) => Err(self.bad(format!("`{name}` must be a string, got {v}"))),
+        }
+    }
+
+    fn opt_bool(&self, name: &str) -> Result<Option<bool>, ToolError> {
+        match self.map.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(v) => Err(self.bad(format!("`{name}` must be a boolean, got {v}"))),
         }
     }
 
@@ -692,7 +701,13 @@ pub fn parse_call(name: &str, arguments: &Map<String, Value>) -> Result<ToolCall
         }
         "find_symbols" => {
             a.only(&with_page(&[
-                "pattern", "kind", "language", "org", "repo", "file",
+                "pattern",
+                "kind",
+                "language",
+                "org",
+                "repo",
+                "file",
+                "exact_case",
             ]))?;
             let pattern = match arguments.get("pattern") {
                 Some(Value::String(p)) => p.clone(),
@@ -705,6 +720,7 @@ pub fn parse_call(name: &str, arguments: &Map<String, Value>) -> Result<ToolCall
             query.org = a.opt_str("org")?;
             query.repo = a.opt_str("repo")?;
             query.file = a.opt_str("file")?;
+            query.exact_case = a.opt_bool("exact_case")?.unwrap_or(false);
             ToolCall::FindSymbols {
                 query,
                 page: a.page(MAX_LIMIT)?,

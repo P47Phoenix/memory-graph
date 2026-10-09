@@ -3553,3 +3553,278 @@ fn store_size_stays_within_1_5x_after_vacuum_and_compact_across_churn_rounds() {
          gate, re-running the churn spike's claim in docs/spikes/v2-checkpoint.md)"
     );
 }
+
+// --- ADR 0010 D4 / story 57: the `sym_fold` self-heal ---
+
+fn sym_fold_fixture(s: &V2Store) {
+    compact_fixture(s);
+    s.ingest_file(
+        "o",
+        "r1",
+        "w.cs",
+        "csharp",
+        &span_ext(
+            &[
+                ("Widget", SymbolKind::Type, 0, 10),
+                ("widGet", SymbolKind::Type, 11, 20),
+            ],
+            &[("x", 21, 22)],
+        ),
+    )
+    .unwrap();
+}
+
+fn sym_fold_stamp(s: &V2Store) -> Option<u64> {
+    let rt = s.db.begin_read().unwrap();
+    let v = rt
+        .open_table(crate::META)
+        .unwrap()
+        .get(crate::v2::DERIVED_VERSION_SYM_FOLD_KEY)
+        .unwrap()
+        .map(|v| v.value());
+    v
+}
+
+fn widget_names(s: &V2Store) -> Vec<String> {
+    s.search_symbols(&SymbolQuery::new("WIDGET"))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.name)
+        .collect()
+}
+
+/// Simulate an older or damaged file: `stamp` decides the stored stamp
+/// (`None` removes it), and `table` whether `sym_fold` survives (when it
+/// does, a bogus row is added so a heal is visible).
+fn damage_sym_fold(p: &std::path::Path, stamp: Option<u64>, table: bool) {
+    let s = V2Store::open(p).unwrap();
+    let wt = s.db.begin_write().unwrap();
+    {
+        let mut meta = wt.open_table(crate::META).unwrap();
+        match stamp {
+            Some(v) => meta
+                .insert(crate::v2::DERIVED_VERSION_SYM_FOLD_KEY, v)
+                .unwrap(),
+            None => meta
+                .remove(crate::v2::DERIVED_VERSION_SYM_FOLD_KEY)
+                .unwrap(),
+        };
+    }
+    if table {
+        wt.open_multimap_table(crate::v2::SYM_FOLD)
+            .unwrap()
+            .insert("bogus", 424_242u64)
+            .unwrap();
+    } else {
+        wt.delete_multimap_table(crate::v2::SYM_FOLD).unwrap();
+    }
+    wt.commit().unwrap();
+}
+
+fn assert_sym_fold_healed(p: &std::path::Path) {
+    let s = V2Store::open(p).unwrap();
+    assert_eq!(
+        sym_fold_stamp(&s),
+        Some(crate::v2::SYM_FOLD_DERIVED_VERSION)
+    );
+    assert!(!crate::v2::sym_fold_needs_rebuild(&s.db).unwrap());
+    s.check_consistency(false);
+    assert_eq!(widget_names(&s), ["Widget", "widGet"]);
+    crate::conformance::assert_fold_agrees(&s, "healed");
+    drop(s);
+    // Healed once: later reopens write nothing.
+    let before = sha(p);
+    drop(V2Store::open(p).unwrap());
+    assert_eq!(sha(p), before, "a second reopen must not write");
+    drop(V2Store::open(p).unwrap());
+    assert_eq!(sha(p), before);
+}
+
+#[test]
+fn sym_fold_heals_a_store_written_without_it() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    sym_fold_fixture(&V2Store::open(&p).unwrap());
+    damage_sym_fold(&p, None, false);
+    assert_sym_fold_healed(&p);
+}
+
+#[test]
+fn sym_fold_heals_a_missing_stamp_and_a_stale_stamp() {
+    for stamp in [None, Some(0)] {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("v.redb");
+        sym_fold_fixture(&V2Store::open(&p).unwrap());
+        damage_sym_fold(&p, stamp, true);
+        assert_sym_fold_healed(&p);
+    }
+}
+
+#[test]
+fn sym_fold_heals_a_current_stamp_without_the_table() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    sym_fold_fixture(&V2Store::open(&p).unwrap());
+    damage_sym_fold(&p, Some(crate::v2::SYM_FOLD_DERIVED_VERSION), false);
+    assert_sym_fold_healed(&p);
+}
+
+#[test]
+fn a_crash_during_the_sym_fold_rebuild_is_rebuilt_on_the_next_open() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    sym_fold_fixture(&V2Store::open(&p).unwrap());
+    damage_sym_fold(&p, None, false);
+    let damaged = sha(&p);
+    crate::v2::SYM_FOLD_REBUILD_FAIL_AFTER.with(|c| c.set(Some(2)));
+    let failed = V2Store::open(&p);
+    crate::v2::SYM_FOLD_REBUILD_FAIL_AFTER.with(|c| c.set(None));
+    let Err(StoreError::Storage(msg)) = failed else {
+        panic!("the failpoint must fail the open");
+    };
+    assert!(msg.contains("failpoint"), "{msg}");
+    // Nothing of the half-done rebuild was committed.
+    assert_eq!(sha(&p), damaged);
+    assert_sym_fold_healed(&p);
+}
+
+/// A brand-new store is created with `sym_fold` and its stamp, so the
+/// first open runs no rebuild (nor does the next one).
+#[test]
+fn creating_a_store_does_not_run_the_sym_fold_rebuild() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    crate::v2::SYM_FOLD_REBUILDS.with(|c| c.set(0));
+    let s = V2Store::open(&p).unwrap();
+    assert_eq!(
+        crate::v2::SYM_FOLD_REBUILDS.with(std::cell::Cell::get),
+        0,
+        "create rebuilt sym_fold"
+    );
+    assert_eq!(
+        sym_fold_stamp(&s),
+        Some(crate::v2::SYM_FOLD_DERIVED_VERSION)
+    );
+    drop(s);
+    drop(V2Store::open(&p).unwrap());
+    assert_eq!(
+        crate::v2::SYM_FOLD_REBUILDS.with(std::cell::Cell::get),
+        0,
+        "reopen rebuilt sym_fold"
+    );
+}
+
+#[test]
+fn a_new_store_is_stamped_and_snapshots_carry_sym_fold() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let s = V2Store::open(&p).unwrap();
+    assert_eq!(
+        sym_fold_stamp(&s),
+        Some(crate::v2::SYM_FOLD_DERIVED_VERSION)
+    );
+    sym_fold_fixture(&s);
+    let dest = d.path().join("snap.redb");
+    s.export_snapshot(&dest).unwrap();
+    {
+        let raw = redb::Database::open(&dest).unwrap();
+        assert!(
+            !crate::v2::sym_fold_needs_rebuild(&raw).unwrap(),
+            "the snapshot copies sym_fold and its stamp"
+        );
+    }
+    let before = sha(&dest);
+    let snap = V2Store::open(&dest).unwrap();
+    assert_eq!(widget_names(&snap), ["Widget", "widGet"]);
+    snap.check_consistency(false);
+    drop(snap);
+    assert_eq!(sha(&dest), before, "opening the snapshot must not rebuild");
+    // Compaction goes through the same copy.
+    let (s, _) = s.compact().unwrap();
+    assert!(!crate::v2::sym_fold_needs_rebuild(&s.db).unwrap());
+    assert_eq!(widget_names(&s), ["Widget", "widGet"]);
+    s.check_consistency(false);
+}
+
+mod sym_fold_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn name() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(vec![
+                'a', 'A', 'b', 'B', '\u{e9}', '\u{c9}', '_', '0', '9', '[', '`',
+            ]),
+            1..5,
+        )
+        .prop_map(|v| v.into_iter().collect())
+    }
+
+    /// The brute-force oracle: every `sym_idx` name whose fold matches,
+    /// each looked up with `exact_case`.
+    fn brute(s: &V2Store, pred: &dyn Fn(&str) -> bool) -> Vec<(String, String, u32)> {
+        let rt = s.db.begin_read().unwrap();
+        let idx = rt.open_multimap_table(crate::SYMBOLS).unwrap();
+        let mut out = Vec::new();
+        for row in idx.iter().unwrap() {
+            let (k, _) = row.unwrap();
+            let n = k.value().to_string();
+            if pred(&n.to_ascii_lowercase()) {
+                let mut q = SymbolQuery::new(n.as_str());
+                q.exact_case = true;
+                out.extend(
+                    s.search_symbols(&q)
+                        .unwrap()
+                        .into_iter()
+                        .map(|h| (h.file, h.name, h.span.unwrap().start)),
+                );
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn folded(s: &V2Store, pattern: &str) -> Vec<(String, String, u32)> {
+        let mut v: Vec<_> = s
+            .search_symbols(&SymbolQuery::new(pattern))
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.file, h.name, h.span.unwrap().start))
+            .collect();
+        let n = v.len();
+        v.sort();
+        v.dedup();
+        assert_eq!(v.len(), n, "no symbol twice");
+        v
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn sym_fold_lookups_equal_a_brute_force_fold_over_sym_idx(
+            files in prop::collection::vec(prop::collection::vec(name(), 1..5), 1..4),
+            probe in name(),
+        ) {
+            let d = tempfile::tempdir().unwrap();
+            let s = V2Store::open(d.path().join("p.redb")).unwrap();
+            for (f, names) in files.iter().enumerate() {
+                let syms: Vec<(&str, SymbolKind, u32, u32)> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.as_str(), SymbolKind::Function, i as u32 * 2, i as u32 * 2 + 1))
+                    .collect();
+                s.ingest_file("o", "r", &format!("f{f}.x"), "text", &span_ext(&syms, &[])).unwrap();
+            }
+            let mut probes: Vec<String> = files.iter().flatten().cloned().collect();
+            probes.push(probe);
+            for p in probes {
+                let fp = p.to_ascii_lowercase();
+                prop_assert_eq!(folded(&s, &p), brute(&s, &|n| n == fp));
+                prop_assert_eq!(folded(&s, &p.to_ascii_uppercase()), brute(&s, &|n| n == fp));
+                let cut = p.char_indices().nth(1).map_or(p.len(), |(i, _)| i);
+                let pre = fp[..cut].to_string();
+                prop_assert_eq!(folded(&s, &format!("{}*", &p[..cut])), brute(&s, &|n| n.starts_with(&pre)));
+            }
+        }
+    }
+}

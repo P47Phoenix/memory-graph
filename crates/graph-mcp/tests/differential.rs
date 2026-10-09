@@ -105,6 +105,11 @@ fn cases() -> Vec<(&'static str, Value)> {
         ("find_symbols", json!({"pattern": "*"})),
         ("find_symbols", json!({"pattern": "n*"})),
         ("find_symbols", json!({"pattern": "Point"})),
+        // ADR 0010 D4: case-insensitive by default, `exact_case` opts out.
+        ("find_symbols", json!({"pattern": "point"})),
+        ("find_symbols", json!({"pattern": "POINT*"})),
+        ("find_symbols", json!({"pattern": "point", "exact_case": true})),
+        ("find_symbols", json!({"pattern": "Point", "exact_case": true})),
         ("find_symbols", json!({"pattern": "*", "kind": "function"})),
         ("find_symbols", json!({"pattern": "*", "kind": "trait"})),
         ("find_symbols", json!({"pattern": "*", "language": "rust", "org": "acme", "repo": "geo"})),
@@ -185,6 +190,10 @@ fn oracle(store: &dyn StoreRead, name: &str, a: &Value) -> Value {
                 s(a, "repo"),
                 s(a, "file"),
             );
+            q.exact_case = a
+                .get("exact_case")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             paged(to_values(store.search_symbols(&q).unwrap()), a)
         }
         "file_outline" => {
@@ -321,6 +330,8 @@ fn check_refusals(c: &mut impl Tools) {
     );
     assert_eq!(e["code"], "invalid_argument");
     // A store refusal (an ambiguous pattern) is a typed isError result.
+    let e = c.tool_error("find_symbols", json!({"pattern": "*", "exact_case": "yes"}));
+    assert!(e["message"].as_str().unwrap().contains("boolean"), "{e}");
     let e = c.tool_error("find_symbols", json!({"pattern": "**"}));
     assert_eq!(e["code"], "rejected", "{e}");
     let e = c.tool_error("search", json!({"text": "x", "grain": "function"}));
@@ -375,6 +386,22 @@ fn embedded_tools_equal_store_read() {
     assert_eq!(by_path("LOSSY.txt")["lossy"], true);
     assert!(by_path("LOSSY.txt").get("encoding").is_none());
     assert!(by_path("src/lib.rs").get("encoding").is_none());
+    // ADR 0010 D4 / #269: `point` finds `Point`; `exact_case` keeps the old answer.
+    let hits = c.ok("find_symbols", json!({"pattern": "point"}));
+    assert!(
+        hits["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["name"] == "Point")
+            && !hits["items"].as_array().unwrap().is_empty(),
+        "{hits}"
+    );
+    let hits = c.ok(
+        "find_symbols",
+        json!({"pattern": "point", "exact_case": true}),
+    );
+    assert!(hits["items"].as_array().unwrap().is_empty(), "{hits}");
     let hits = c.ok("find_symbols", json!({"pattern": "widen"}));
     assert_eq!(hits["items"][0]["encoding"], "UTF-16LE", "{hits}");
     // ADR 0010 D3: the declaration (name) position, `widen` after `pub fn `,

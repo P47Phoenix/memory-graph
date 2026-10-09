@@ -127,6 +127,36 @@ pub(crate) const REFS: TableDefinition<u64, u64> = TableDefinition::new("refs");
 /// content id -> the file ids currently sharing that content.
 pub(crate) const CONTENT_FILES: MultimapTableDefinition<u64, u64> =
     MultimapTableDefinition::new("content_files");
+/// ASCII-lowercased symbol name -> the same symbol sub-ids as `SYMBOLS`
+/// (ADR 0010 D4): the index behind case-insensitive symbol lookup. Derived
+/// from `SYMBOLS`, kept in step with it on every write, and rebuilt on open
+/// when [`DERIVED_VERSION_SYM_FOLD_KEY`] is missing or stale or the table
+/// itself is missing. Never in the Raft log.
+pub(crate) const SYM_FOLD: MultimapTableDefinition<&str, u64> =
+    MultimapTableDefinition::new("sym_fold");
+
+/// Version of the derived `sym_fold` table (ADR 0010 D4), the same soft
+/// self-heal counter as [`REFS_DERIVED_VERSION`]. Bump it whenever the
+/// folding rule changes.
+pub const SYM_FOLD_DERIVED_VERSION: u64 = 1;
+/// `meta` key holding the stored [`SYM_FOLD_DERIVED_VERSION`].
+pub(crate) const DERIVED_VERSION_SYM_FOLD_KEY: &str = "derived_version_sym_fold";
+
+/// The folding rule of `sym_fold` (ADR 0010 D4): ASCII letters lowercased,
+/// every other byte unchanged, so lengths and byte prefixes are preserved.
+pub(crate) fn fold_symbol_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint: when set to `Some(n)`, the `sym_fold` rebuild fails
+    /// (without committing) after inserting `n` rows, simulating a crash.
+    pub(crate) static SYM_FOLD_REBUILD_FAIL_AFTER: Cell<Option<usize>> =
+        const { Cell::new(None) };
+    /// Test counter: how many `sym_fold` rebuilds started on this thread.
+    pub(crate) static SYM_FOLD_REBUILDS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The in-progress chunked-ingest marker (ADR 0003 story 3, decision D3,
 /// "Chunked-ingest visibility"): `"org"`/`"repo"` are present iff a chunked
@@ -585,6 +615,8 @@ pub(crate) struct R {
     pub(crate) rev: redb::ReadOnlyTable<u64, &'static [u8]>,
     pub(crate) post: redb::ReadOnlyTable<(u64, u64), &'static [u8]>,
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
+    /// `None` only on a file not yet healed (no such open exists today).
+    sym_fold: Option<redb::ReadOnlyMultimapTable<&'static str, u64>>,
     cat: redb::ReadOnlyTable<&'static str, u64>,
     kids: redb::ReadOnlyMultimapTable<u64, u64>,
     // Read only by `check_consistency` today (no read-path query needs
@@ -746,6 +778,11 @@ impl R {
             rev: rt.open_table(DICT_REV)?,
             post: rt.open_table(POST)?,
             sym_idx: rt.open_multimap_table(SYMBOLS)?,
+            sym_fold: match rt.open_multimap_table(SYM_FOLD) {
+                Ok(t) => Some(t),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            },
             cat: rt.open_table(CATALOG)?,
             refs: rt.open_table(REFS)?,
             content_files: rt.open_multimap_table(CONTENT_FILES)?,
@@ -1686,16 +1723,30 @@ impl R {
                 "pattern ending in `**` is ambiguous: use `prefix*` for a prefix or `name\\*` for a literal `*`".into(),
             ));
         }
+        // ADR 0010 D4: the default goes through `sym_fold` with the pattern
+        // folded the same way; `exact_case` keeps the `sym_idx` path.
+        let (index, pattern) = if q.exact_case {
+            (&self.sym_idx, q.pattern.clone())
+        } else {
+            let Some(fold) = self.sym_fold.as_ref() else {
+                return Err(StoreError::Rejected(
+                    "this store has no case-insensitive symbol index yet \
+                     (reopen it writable to build it, or use --exact-case)"
+                        .into(),
+                ));
+            };
+            (fold, fold_symbol_name(&q.pattern))
+        };
         let mut ids: Vec<u64> = Vec::new();
-        if let Some(lit) = q.pattern.strip_suffix("\\*") {
+        if let Some(lit) = pattern.strip_suffix("\\*") {
             let name = format!("{lit}*");
-            for v in self.sym_idx.get(name.as_str())? {
+            for v in index.get(name.as_str())? {
                 ids.push(v?.value());
             }
         } else {
-            match q.pattern.strip_suffix('*') {
+            match pattern.strip_suffix('*') {
                 Some(prefix) => {
-                    for r in self.sym_idx.range(prefix..)? {
+                    for r in index.range(prefix..)? {
                         let (k, vals) = r?;
                         if !k.value().starts_with(prefix) {
                             break;
@@ -1706,12 +1757,15 @@ impl R {
                     }
                 }
                 None => {
-                    for v in self.sym_idx.get(q.pattern.as_str())? {
+                    for v in index.get(pattern.as_str())? {
                         ids.push(v?.value());
                     }
                 }
             }
         }
+        // One symbol per sub-id, however many keys reached it.
+        ids.sort_unstable();
+        ids.dedup();
         let want_file = q.file.as_deref().map(normalize_path);
         let want_lang = q.language.as_deref().map(str::to_ascii_lowercase);
         // Group the index hits by file and apply the file-level filters
@@ -2257,6 +2311,7 @@ struct W<'t> {
     streams: redb::Table<'t, u64, &'static [u8]>,
     post: redb::Table<'t, (u64, u64), &'static [u8]>,
     sym_idx: redb::MultimapTable<'t, &'static str, u64>,
+    sym_fold: redb::MultimapTable<'t, &'static str, u64>,
     cat: redb::Table<'t, &'static str, u64>,
     refs: redb::Table<'t, u64, u64>,
     content_files: redb::MultimapTable<'t, u64, u64>,
@@ -2274,6 +2329,7 @@ impl<'t> W<'t> {
             streams: wt.open_table(STREAMS)?,
             post: wt.open_table(POST)?,
             sym_idx: wt.open_multimap_table(SYMBOLS)?,
+            sym_fold: wt.open_multimap_table(SYM_FOLD)?,
             cat: wt.open_table(CATALOG)?,
             refs: wt.open_table(REFS)?,
             content_files: wt.open_multimap_table(CONTENT_FILES)?,
@@ -2389,8 +2445,9 @@ impl<'t> W<'t> {
         }
         for (i, r) in s.symbols.iter().enumerate() {
             let name = self.text(r.name)?;
-            self.sym_idx
-                .remove(name.as_str(), sub_id(TAG_SYM, file, i))?;
+            let id = sub_id(TAG_SYM, file, i);
+            self.sym_idx.remove(name.as_str(), id)?;
+            self.sym_fold.remove(fold_symbol_name(&name).as_str(), id)?;
         }
         Ok(())
     }
@@ -2531,7 +2588,89 @@ fn rebuild_refs_in(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Recompute `sym_fold` from `sym_idx` (ADR 0010 D4) in one write
+/// transaction: drop the table, refill it with every `sym_idx` entry under
+/// its folded name, and stamp `derived_version_sym_fold`. A failure before
+/// the commit (or a crash) leaves the file as it was, so the next open
+/// rebuilds again.
+fn rebuild_sym_fold_in(db: &Database) -> Result<()> {
+    #[cfg(test)]
+    SYM_FOLD_REBUILDS.with(|c| c.set(c.get() + 1));
+    let wt = db.begin_write()?;
+    {
+        wt.delete_multimap_table(SYM_FOLD)?;
+        let src = wt.open_multimap_table(SYMBOLS)?;
+        let mut dst = wt.open_multimap_table(SYM_FOLD)?;
+        #[cfg(test)]
+        let fail_after = SYM_FOLD_REBUILD_FAIL_AFTER.with(Cell::get);
+        #[cfg(test)]
+        let mut written = 0usize;
+        for row in src.iter()? {
+            let (name, ids) = row?;
+            let folded = fold_symbol_name(name.value());
+            for id in ids {
+                #[cfg(test)]
+                {
+                    if fail_after == Some(written) {
+                        return Err(StoreError::Storage(
+                            "failpoint: sym_fold rebuild crashed".into(),
+                        ));
+                    }
+                    written += 1;
+                }
+                dst.insert(folded.as_str(), id?.value())?;
+            }
+        }
+        wt.open_table(META)?
+            .insert(DERIVED_VERSION_SYM_FOLD_KEY, SYM_FOLD_DERIVED_VERSION)?;
+    }
+    wt.commit()?;
+    Ok(())
+}
+
+/// Whether `sym_fold` needs a rebuild on open: its stamp is missing or not
+/// current, or the table itself is missing (whatever the stamp says).
+pub(crate) fn sym_fold_needs_rebuild(db: &Database) -> Result<bool> {
+    let rt = db.begin_read()?;
+    let stamp = match rt.open_table(META) {
+        Ok(t) => t.get(DERIVED_VERSION_SYM_FOLD_KEY)?.map(|v| v.value()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    if stamp != Some(SYM_FOLD_DERIVED_VERSION) {
+        return Ok(true);
+    }
+    match rt.open_multimap_table(SYM_FOLD) {
+        Ok(_) => Ok(false),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl V2Store {
+    /// Rebuild `sym_fold` from `sym_idx` by hand (the open does this by
+    /// itself when needed, ADR 0010 D4). For diagnostics and tests only; not
+    /// part of the supported API.
+    #[doc(hidden)]
+    pub fn rebuild_sym_fold(&self) -> Result<()> {
+        rebuild_sym_fold_in(&self.db)
+    }
+
+    /// Bytes held by the two symbol indexes, `(sym_idx, sym_fold)`: stored,
+    /// metadata and fragmented bytes of each table (the size gate pins the
+    /// cost of `sym_fold`, ADR 0010 D4). For diagnostics and tests only;
+    /// not part of the supported API.
+    #[doc(hidden)]
+    pub fn symbol_index_bytes(&self) -> Result<(u64, u64)> {
+        use redb::ReadableTableMetadata;
+        let rt = self.db.begin_read()?;
+        let size =
+            |s: redb::TableStats| s.stored_bytes() + s.metadata_bytes() + s.fragmented_bytes();
+        let idx = rt.open_multimap_table(SYMBOLS)?.stats()?;
+        let fold = rt.open_multimap_table(SYM_FOLD)?.stats()?;
+        Ok((size(idx), size(fold)))
+    }
+
     /// Test oracle: recompute every derived table from the streams (the source
     /// of truth) and require the stored ones to match exactly: postings, the
     /// symbol index, the dictionary in both directions, and the describe
@@ -2600,6 +2739,19 @@ impl V2Store {
             }
         }
         assert_eq!(got_sym, want_sym, "symbol index");
+        // ADR 0010 D4: `sym_fold` is `sym_idx` under folded keys.
+        let want_fold: BTreeSet<(String, u64)> = want_sym
+            .iter()
+            .map(|(n, id)| (fold_symbol_name(n), *id))
+            .collect();
+        let mut got_fold = BTreeSet::new();
+        for row in r.sym_fold.as_ref().expect("sym_fold table").iter().unwrap() {
+            let (k, vals) = row.unwrap();
+            for v in vals {
+                got_fold.insert((k.value().to_string(), v.unwrap().value()));
+            }
+        }
+        assert_eq!(got_fold, want_fold, "sym_fold");
         let (mut ndict, mut nrev) = (0, 0);
         for row in r.dict.iter().unwrap() {
             let (k, id) = row.unwrap();
@@ -2719,13 +2871,19 @@ impl V2Store {
         Ok(ranged.map(|_| (ntok, eager_decoded, ranged_decoded)))
     }
 
-    /// Test hook: add a raw symbol-index entry (to simulate a stale index).
+    /// Test hook: add a raw symbol-index entry (to simulate a stale index),
+    /// to both `sym_idx` and `sym_fold`, so the default (folded) lookup and
+    /// the exact-case one both meet it.
     #[cfg(test)]
     pub(crate) fn inject_symbol_index(&self, name: &str, id: u64) {
         let wt = self.db.begin_write().unwrap();
         wt.open_multimap_table(SYMBOLS)
             .unwrap()
             .insert(name, id)
+            .unwrap();
+        wt.open_multimap_table(SYM_FOLD)
+            .unwrap()
+            .insert(fold_symbol_name(name).as_str(), id)
             .unwrap();
         wt.commit().unwrap();
     }
@@ -2869,6 +3027,8 @@ impl V2Store {
                     wt.open_table(POST)?;
                     wt.open_multimap_table(CHILDREN)?;
                     wt.open_multimap_table(SYMBOLS)?;
+                    wt.open_multimap_table(SYM_FOLD)?;
+                    m.insert(DERIVED_VERSION_SYM_FOLD_KEY, SYM_FOLD_DERIVED_VERSION)?;
                     wt.open_table(REFS)?;
                     wt.open_multimap_table(CONTENT_FILES)?;
                     wt.open_table(OPEN_BATCH)?;
@@ -2895,6 +3055,11 @@ impl V2Store {
             wt.commit()?;
         }
 
+        // ADR 0010 D4: checked before the refs heal below, whose write
+        // transaction creates every `W` table (an empty `sym_fold` among
+        // them) and would hide a missing table from this check.
+        let rebuild_sym_fold = sym_fold_needs_rebuild(&db)?;
+
         // Soft self-heal (ADR 0003 story 9): an existing file whose
         // derived_version lags or is missing (any v2 file written before
         // this mechanism existed) gets refs/content_files rebuilt
@@ -2917,6 +3082,16 @@ impl V2Store {
                 path.display()
             );
             rebuild_refs_in(&db)?;
+        }
+        // The same soft self-heal for `sym_fold` (ADR 0010 D4): a current
+        // file is not written.
+        if rebuild_sym_fold {
+            eprintln!(
+                "memory-graph: v2 store {}: building the case-insensitive symbol \
+                 index (sym_fold) on open",
+                path.display()
+            );
+            rebuild_sym_fold_in(&db)?;
         }
 
         Ok(Self {
@@ -3394,6 +3569,7 @@ impl V2Store {
             copy_table(&rt, &wt, NAMES)?;
             copy_multimap(&rt, &wt, CHILDREN)?;
             copy_multimap(&rt, &wt, SYMBOLS)?;
+            copy_multimap(&rt, &wt, SYM_FOLD)?;
             copy_table(&rt, &wt, DICT)?;
             copy_table(&rt, &wt, DICT_REV)?;
             copy_table(&rt, &wt, STREAMS)?;
@@ -4074,10 +4250,10 @@ impl V2Store {
             .map(|t| w.intern(t, &mut next_term))
             .collect::<Result<Vec<u64>>>()?;
         for (idx, s) in stream.symbols.iter_mut().enumerate() {
-            w.sym_idx.insert(
-                terms[s.name as usize].as_str(),
-                sub_id(TAG_SYM, file_id, idx),
-            )?;
+            let name = terms[s.name as usize].as_str();
+            let id = sub_id(TAG_SYM, file_id, idx);
+            w.sym_idx.insert(name, id)?;
+            w.sym_fold.insert(fold_symbol_name(name).as_str(), id)?;
             s.name = ids[s.name as usize];
             s.lang_kind = s.lang_kind.map(|k| ids[k as usize]);
             s.owner = s.owner.map(|k| ids[k as usize]);
