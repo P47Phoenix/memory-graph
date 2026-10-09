@@ -11,28 +11,32 @@ None of the current hot paths is shaped for a GPU. The real limits are the singl
 | Tokenizing / extractor scan | 0% of the critical path: parse threads about 10% busy, writer about 100% busy (measured: dotnet-runtime, 104.9M tokens, 116.3 s) | 1.00x | No-go |
 | SHA-256 fingerprint | about 0.1% of parse CPU (ESTIMATE) | 1.00x | No-go |
 | Posting encode/decode | read: 0.2% of query time (measured, read-cache spike). Write: at most 10% of writer time (ESTIMATE) | 1.002x read, at most 1.1x write | No-go |
-| Compaction / vacuum | I/O and B-tree bound; not timed | about 1.0x | No-go |
+| Compaction / vacuum | I/O and B-tree bound; not timed | about 1.0x (ESTIMATE) | No-go |
 | Hot-term scan (#246) | p95 about 206 ms vs p50 0.07 ms (measured, read-cache spike) | at most 2-3x on hot queries, only if the data stays in GPU memory (ESTIMATE) | Revisit |
 | Embedding / semantic search (future) | not built | 10-50x on the embedding stage (ESTIMATE) | Go, once that feature is scoped |
 
 **Triggers for revisiting:**
 1. Embedding or semantic search is added to scope.
-2. Hot-term p95 is still above 100 ms at 1B tokens or more after the CPU fixes in #246.
+2. Hot-term p95 is still above 100 ms at 1B tokens or more after the CPU fixes in #246, and a layout that keeps the token streams resident in GPU memory is being considered anyway (PCIe upload otherwise erases the gain).
 
 No ADR 0011 is proposed now.
 
-**Measured micro-benchmark:** a 1 GiB term count on an RTX 3080 Ti took 380-406 ms end to end, against 27 ms with 32-thread rayon on a Ryzen 9 7950X. Upload over PCIe dominates, at 338-368 ms. Even the kernel alone (32-37 ms) did not beat the CPU. The outputs were byte-identical on Vulkan and DX12, on both NVIDIA and AMD.
+**Measured micro-benchmark:** a 1 GiB term count took 264-406 ms end to end on GPU (RTX 3080 Ti: 380-406 ms; RX 7900 XT: 264 ms), against 27 ms with 32-thread rayon on a Ryzen 9 7950X in the same run. Host-to-GPU upload dominates (191-368 ms). Note that this goes through wgpu's `write_buffer` staging path (about 3 GB/s), not raw PCIe bandwidth, so a pipelined upload would narrow the gap. The kernel time (32-69 ms, wall-clock around submit+poll, so an upper bound, with a naive kernel) did not beat rayon either. The outputs were byte-identical on Vulkan and DX12, on both NVIDIA and AMD.
+
+**Benchmark limits:**
+- 3 steady-state runs, spread under 2%. Whether a warm-up run was discarded was not recorded. No GPU timestamp queries were used.
+- The workload is a synthetic byte scan. It bounds the transfer cost, not the store's real hot-term walk (varint decode + checkpoint seek), so the hot-term verdict rests on the architect's estimate, not on this benchmark.
 
 **Technology:**
-- `wgpu` 30 passes `check-no-c-deps.py` on all shipped targets with `default-features = false, features = ["vulkan","dx12","metal","wgsl","std"]`. With default features it fails, because the GLES backend pulls in khronos-egl and wayland-sys.
+- `wgpu` 30 passes `check-no-c-deps.py` on all 8 targets the script checks (a superset of the six shipped targets) with `default-features = false, features = ["vulkan","dx12","metal","wgsl","std"]`. With default features it fails, because the GLES backend pulls in khronos-egl and wayland-sys.
 - `cubecl` fails the gate in every feature combination tried, including `ring`, which is on the deny-list.
 - `wgpu` adds about 5.9 MiB to the release binary and about 70 s to a clean `-j 2` build.
 
 **Docker:**
-- A static musl binary can never load a GPU driver (no runtime dlopen), so the `scratch` image stays GPU-free.
-- A future `memory-graph:gpu` image would be a glibc build on `debian:bookworm-slim` with `libvulkan1`, which adds about 80 MB.
-- On Linux hosts it would run with `--gpus all` and `NVIDIA_DRIVER_CAPABILITIES` including `graphics`, or with `/dev/dri` for AMD/Intel.
-- Measured on this Windows machine: Docker Desktop (WSL2) exposes CUDA only. `wgpu` inside a container saw only llvmpipe (a software CPU adapter), with or without `--gpus all`. macOS has no GPU passthrough.
+- A static musl binary can never load a GPU driver (no runtime dlopen; reasoned, not run on Linux), so the `scratch` image stays GPU-free.
+- A future `memory-graph:gpu` image would be a glibc build on `debian:bookworm-slim` with `libvulkan1`, which adds about 80 MB (ESTIMATE).
+- On Linux hosts it would run with `--gpus all` and `NVIDIA_DRIVER_CAPABILITIES` including `graphics`, or with `/dev/dri` for AMD/Intel. This Linux path is **unverified**: no Linux GPU host was available.
+- Measured on this Windows machine: Docker Desktop (WSL2) exposes CUDA only. `wgpu` inside a container saw only llvmpipe (a software CPU adapter), with or without `--gpus all` (probe used wgpu 24.0.3 with default features, not the wgpu 30 Vulkan/DX12/Metal subset; the WSL2 finding is about missing ICDs, so it should not depend on the version). macOS has no GPU passthrough.
 
 **Rules any future GPU path must follow:**
 - A `gpu` Cargo feature, off by default, plus `--gpu auto|off` / `MEMORY_GRAPH_GPU`.
@@ -60,17 +64,17 @@ Release build of this worktree (`cargo build --release -j 2`), Ryzen 9 7950X (32
 
 Parse CPU cost: 351 s / 104.9 M tokens = 3.35 us/token-CPU (walk + decode + SHA-256 + tokenize + extract + posting encode). The single redb writer (`V2Store` commit, `crates/graph-store/src/v2.rs` ~4200-4290: intern, `post`/`sym_idx`/`sym_fold` inserts, `codec::encode` of the stream) is the whole critical path. Scratch deleted.
 
-Consistent with A5 (`docs/spikes/read-cache.md:267`): 877.3 M tokens in 2,462 s = 356 k tok/s, i.e. the same writer rate as dotnet-runtime (902 k tok/s here; A5 includes more small files and 31 repos).
+Consistent with A5 (`docs/spikes/read-cache.md:267`): 877.3 M tokens in 2,462 s = 356 k tok/s, i.e. writer-bound in kind like dotnet-runtime, though at a lower rate (356 k vs 902 k tok/s; A5 includes more small files and 31 repos).
 
 ### Candidates
 
 #### 1. Tokenizing / extractor scanning
-- Code: `graph-core/src/tokenizer.rs:tokenize`, `graph_core::scan`, `graph-lang-*` extractors (Rust: `syn` on an internal thread), run on parse workers from `graph-cli/src/lib.rs:index_dir` (~line 817).
+- Code: `graph-core/src/tokenizer.rs:tokenize`, `graph_core::scan`, `graph-lang-*` extractors (Rust: `syn` on an internal thread), run on parse workers from `graph-cli/src/lib.rs:index_dir` (line 1226; the parse-worker spawn loop is around line 817).
 - Share: parse threads ~10% utilised; **0% of wall on the critical path** [M, table above]. data-model.md:139 already noted ingest "not extractor-bound (>=1 M tokens/s including tokenizing)".
 - Data-parallel: across files ~100%; within a file, sequential state machines (string/comment/dialect modes), `syn` is a recursive parser.
 - PCIe: ~1 B in per source byte, ~20-30 B out per token (span records) - output > input. Compute ~3 us/token is branch-bound, not FLOP-bound.
 - Irregularity: extreme (per-language branching, nesting, variable-length tokens, recursion).
-- Amdahl: 1.00x end-to-end while writer-bound (infinite speedup of a 0% critical-path share). Even if the writer were free, 31 CPU threads already give ~300 k-1 M tok/s per... ample headroom.
+- Amdahl: 1.00x end-to-end while writer-bound (infinite speedup of a 0% critical-path share). Even if the writer were free, 31 CPU threads already give roughly 300 k-1 M tok/s of parse capacity is available [E], ample headroom over the writer.
 - Verdict: **NO-GO.**
 
 #### 2. SHA-256 fingerprinting
@@ -83,7 +87,7 @@ Consistent with A5 (`docs/spikes/read-cache.md:267`): 877.3 M tokens in 2,462 s 
 
 #### 3. Posting encode/decode, compression (varint/delta codec)
 - Code: `graph-store/src/codec.rs` (`encode_posting`, `encode`, stream decode with checkpoints every 64 records, dict blocks). Postings are encoded on parse threads (`v2.rs:4759`); the stream `codec::encode` runs on the writer (`v2.rs:4275`) because it needs global term ids.
-- Share, write: [E] stream encode <=5-10% of writer time; the writer is dominated by redb B-tree inserts (intern lookups, one `post` row per (term,file), symbol index rows) and page writes. Read: timed decode = **0.2% of query time** on 877 M tokens [M, read-cache.md:284-296]; 17-37% only on the small corpus pre-fix (read-cache.md:118-123), fixed to below gate by phase 1.
+- Share, write: [E] stream encode <=5-10% of writer time; the writer is dominated by redb B-tree inserts (intern lookups, one `post` row per (term,file), symbol index rows) and page writes. Read: timed decode = **0.2% of query time** on 877 M tokens [M, read-cache.md:284-296]; 23-38% only on the small corpus pre-fix (read-cache.md:118-123), fixed to below gate by phase 1.
 - Data-parallel: varint delta streams are a serial dependency chain; parallel only per checkpoint block (64 records) and per file.
 - PCIe: decode output ~5-10x the encoded bytes; 1 MiB/query encoded (read-cache.md:291) = ~40 us transfer vs CPU decode of the same in well under 1 ms.
 - Irregularity: variable-length varints, data-dependent branches.
@@ -254,7 +258,8 @@ HEALTHCHECK ... (same as runtime, path /usr/local/bin/memory-graph)
 ENTRYPOINT ["/usr/local/bin/memory-graph"]
 CMD ["--help"]
 
-FROM runtime AS default   # keep scratch as the final stage so `docker build .` is unchanged
+# keep scratch as the final stage so `docker build .` is unchanged
+FROM runtime AS default
 ```
 Note: put `runtime-gpu` *before* the scratch `runtime` stage, or re-alias at the end, so a plain `docker build .` still produces the scratch image; the GPU image is `docker build --target runtime-gpu -t memory-graph:gpu .`. Image would have a shell (Debian); the smoke test "no shell" assertion applies only to the default image.
 
@@ -286,11 +291,11 @@ Default scratch image: unchanged (musl, no `gpu` feature, no libs).
 
 ### 5. Fallback when there is no adapter
 
-`--gpu auto` (default in the gpu build): request adapter with `Backends::VULKAN` (+ DX12/Metal natively), `force_fallback_adapter: false`; reject `DeviceType::Cpu` (llvmpipe/lavapipe/WARP) unless `MEMORY_GRAPH_GPU=force` for tests. No adapter, device creation error, device lost, OOM or a timeout -> log once at INFO with the reason, run the CPU path. Never fail a command because the GPU is missing; `--gpu on`/`require` (optional) is the only mode that errors (exit 5-ish config error). Per-batch: a GPU error mid-run retries that batch on CPU, never partial output. Init under a short deadline (adapter enumeration took <1 s here but driver init can hang).
+`--gpu auto` (default in the gpu build): request adapter with `Backends::VULKAN` (+ DX12/Metal natively), `force_fallback_adapter: false`; reject `DeviceType::Cpu` (llvmpipe/lavapipe/WARP) unless `MEMORY_GRAPH_GPU=force` for tests. No adapter, device creation error, device lost, OOM or a timeout -> log once at INFO with the reason, run the CPU path. Never fail a command because the GPU is missing; `--gpu on`/`require` (optional) is the only mode that errors (exit code to be chosen in the ADR). Per-batch: a GPU error mid-run retries that batch on CPU, never partial output. Init under a short deadline (adapter enumeration took <1 s here but driver init can hang).
 
 ### 6. Raft with mixed GPU / non-GPU nodes
 
-Bytes written to the store must be identical regardless of node hardware: the GPU only accelerates **pure functions whose CPU implementation is the oracle** (e.g. tokenization scan, fingerprinting, posting build, search scoring done in integers). The leader applies `LogCommand`s that already carry deterministic inputs; each node's state machine must produce identical redb contents, and snapshots are installed cross-node. Rules: no float reductions with order-dependent results (or use integer/fixed-point only); GPU output is verified-equivalent by a `run_differential` case (gpu vs cpu store, identical answers) plus a property test; no GPU info in fingerprints, `derived_version`, schema version or any stored byte; the fingerprint must not include "gpu used". A mixed cluster then needs no coordination; `cluster status` can show per-node accelerator for operators only. Reads served by any node are identical, which also keeps the configuration-equivalence invariant (GPU is just another "jobs/cache" knob).
+Bytes written to the store must be identical regardless of node hardware: the GPU only accelerates **pure functions whose CPU implementation is the oracle** (e.g. a hot-term scan or embedding similarity computed in integers or fixed point). The leader applies `LogCommand`s that already carry deterministic inputs; each node's state machine must produce identical redb contents, and snapshots are installed cross-node. Rules: no float reductions with order-dependent results (or use integer/fixed-point only); GPU output is verified-equivalent by a `run_differential` case (gpu vs cpu store, identical answers) plus a property test; no GPU info in fingerprints, `derived_version`, schema version or any stored byte; the fingerprint must not include "gpu used". A mixed cluster then needs no coordination; `cluster status` can show per-node accelerator for operators only. Reads served by any node are identical, which also keeps the configuration-equivalence invariant (GPU is just another "jobs/cache" knob).
 
 ### 7. OTel observability
 
@@ -305,3 +310,11 @@ Resource/startup attributes (once): `mg.gpu.mode` (auto/off), `mg.gpu.backend` (
 - On Windows Docker Desktop and macOS the gpu image gives zero benefit; document that clearly.
 - glibc image adds a shell and Debian CVE surface; scan it (Trivy) and pin the digest.
 - NVIDIA Vulkan in headless containers sometimes needs `NVIDIA_DRIVER_CAPABILITIES` with `display` on older drivers; not verifiable here (no Linux GPU host). Validate on a Linux GPU runner before shipping.
+
+## Cleanup
+
+All scratch directories (`D:/tmp/gpu-spike-arch`, `-dev`, `-ops`), the throwaway Docker images (`gpu-spike-*`), the temporary musl rustup target and the agents' worktrees were removed. No throwaway branches were pushed. The only branch is this PR's `spike/gpu-acceleration`.
+
+The Dockerfile in the ops notes is a sketch (pseudocode), not a tested file.
+
+Follow-up: `rayon-core` and `prettyplease` trip the gate's `links` check without compiling C. That only matters if a GPU feature or rayon is adopted.
