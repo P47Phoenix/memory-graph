@@ -154,6 +154,8 @@ thread_local! {
     /// (without committing) after inserting `n` rows, simulating a crash.
     pub(crate) static SYM_FOLD_REBUILD_FAIL_AFTER: Cell<Option<usize>> =
         const { Cell::new(None) };
+    /// Test counter: how many `sym_fold` rebuilds started on this thread.
+    pub(crate) static SYM_FOLD_REBUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The in-progress chunked-ingest marker (ADR 0003 story 3, decision D3,
@@ -2592,6 +2594,8 @@ fn rebuild_refs_in(db: &Database) -> Result<()> {
 /// the commit (or a crash) leaves the file as it was, so the next open
 /// rebuilds again.
 fn rebuild_sym_fold_in(db: &Database) -> Result<()> {
+    #[cfg(test)]
+    SYM_FOLD_REBUILDS.with(|c| c.set(c.get() + 1));
     let wt = db.begin_write()?;
     {
         wt.delete_multimap_table(SYM_FOLD)?;
@@ -2645,14 +2649,18 @@ pub(crate) fn sym_fold_needs_rebuild(db: &Database) -> Result<bool> {
 
 impl V2Store {
     /// Rebuild `sym_fold` from `sym_idx` by hand (the open does this by
-    /// itself when needed, ADR 0010 D4); for diagnostics and tests.
+    /// itself when needed, ADR 0010 D4). For diagnostics and tests only; not
+    /// part of the supported API.
+    #[doc(hidden)]
     pub fn rebuild_sym_fold(&self) -> Result<()> {
         rebuild_sym_fold_in(&self.db)
     }
 
     /// Bytes held by the two symbol indexes, `(sym_idx, sym_fold)`: stored,
     /// metadata and fragmented bytes of each table (the size gate pins the
-    /// cost of `sym_fold`, ADR 0010 D4).
+    /// cost of `sym_fold`, ADR 0010 D4). For diagnostics and tests only;
+    /// not part of the supported API.
+    #[doc(hidden)]
     pub fn symbol_index_bytes(&self) -> Result<(u64, u64)> {
         use redb::ReadableTableMetadata;
         let rt = self.db.begin_read()?;
@@ -2863,13 +2871,19 @@ impl V2Store {
         Ok(ranged.map(|_| (ntok, eager_decoded, ranged_decoded)))
     }
 
-    /// Test hook: add a raw symbol-index entry (to simulate a stale index).
+    /// Test hook: add a raw symbol-index entry (to simulate a stale index),
+    /// to both `sym_idx` and `sym_fold`, so the default (folded) lookup and
+    /// the exact-case one both meet it.
     #[cfg(test)]
     pub(crate) fn inject_symbol_index(&self, name: &str, id: u64) {
         let wt = self.db.begin_write().unwrap();
         wt.open_multimap_table(SYMBOLS)
             .unwrap()
             .insert(name, id)
+            .unwrap();
+        wt.open_multimap_table(SYM_FOLD)
+            .unwrap()
+            .insert(fold_symbol_name(name).as_str(), id)
             .unwrap();
         wt.commit().unwrap();
     }

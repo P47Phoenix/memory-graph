@@ -3688,6 +3688,32 @@ fn a_crash_during_the_sym_fold_rebuild_is_rebuilt_on_the_next_open() {
     assert_sym_fold_healed(&p);
 }
 
+/// A brand-new store is created with `sym_fold` and its stamp, so the
+/// first open runs no rebuild (nor does the next one).
+#[test]
+fn creating_a_store_does_not_run_the_sym_fold_rebuild() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    crate::v2::SYM_FOLD_REBUILDS.with(|c| c.set(0));
+    let s = V2Store::open(&p).unwrap();
+    assert_eq!(
+        crate::v2::SYM_FOLD_REBUILDS.with(std::cell::Cell::get),
+        0,
+        "create rebuilt sym_fold"
+    );
+    assert_eq!(
+        sym_fold_stamp(&s),
+        Some(crate::v2::SYM_FOLD_DERIVED_VERSION)
+    );
+    drop(s);
+    drop(V2Store::open(&p).unwrap());
+    assert_eq!(
+        crate::v2::SYM_FOLD_REBUILDS.with(std::cell::Cell::get),
+        0,
+        "reopen rebuilt sym_fold"
+    );
+}
+
 #[test]
 fn a_new_store_is_stamped_and_snapshots_carry_sym_fold() {
     let d = tempfile::tempdir().unwrap();
@@ -3726,7 +3752,9 @@ mod sym_fold_props {
 
     fn name() -> impl Strategy<Value = String> {
         prop::collection::vec(
-            prop::sample::select(vec!['a', 'A', 'b', 'B', '\u{e9}', '\u{c9}', '_']),
+            prop::sample::select(vec![
+                'a', 'A', 'b', 'B', '\u{e9}', '\u{c9}', '_', '0', '9', '[', '`',
+            ]),
             1..5,
         )
         .prop_map(|v| v.into_iter().collect())
