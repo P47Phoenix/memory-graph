@@ -1,6 +1,6 @@
 # ADR 0010: Enum members, case-insensitive symbol lookup and declaration position
 
-**Status:** Proposed on 2026-10-08. The owner decides. The owner made the three scope decisions in D1 on 2026-10-08, in answer to issue [#269](https://github.com/P47Phoenix/memory-graph/issues/269). Builds on [ADR 0003](0003-data-model.md) (the v2 store, `sym_idx`, the `derived_version` self-heal) and [ADR 0002](0002-parsing-and-crate-layout.md) (token-stream extractors). Epic amendment, proposed: stories [55](../epic-code-memory-graph.md#story-55), [56](../epic-code-memory-graph.md#story-56) and [57](../epic-code-memory-graph.md#story-57). They are not counted in the epic totals until this ADR is accepted.
+**Status:** Accepted by the owner on 2026-10-09 (proposed on 2026-10-08). Stories 55 and 56 are delivered (#271-#274); story 57 is in progress. The owner made the three scope decisions in D1 on 2026-10-08, in answer to issue [#269](https://github.com/P47Phoenix/memory-graph/issues/269). Builds on [ADR 0003](0003-data-model.md) (the v2 store, `sym_idx`, the `derived_version` self-heal) and [ADR 0002](0002-parsing-and-crate-layout.md) (token-stream extractors). Epic amendment: stories [55](../epic-code-memory-graph.md#story-55), [56](../epic-code-memory-graph.md#story-56) and [57](../epic-code-memory-graph.md#story-57), added with the owner's approval.
 
 ## In plain words
 
@@ -89,7 +89,7 @@ References are to `origin/main` on 2026-10-08.
 
 ## Open questions (owner)
 
-1. Accept this ADR (Proposed to Accepted).
+1. Resolved on 2026-10-09: the owner accepted this ADR. The `meta` key is `derived_version_sym_fold`, as proposed in D4, following the `derived_version_<component>` naming of the refs and content_files stamps.
 2. If a read-only open is ever added (D4; none exists today), should a store without `sym_fold` fall back to a folded full scan or refuse case-insensitive queries with an error? The proposal leans to the fallback.
 
 ## Alternatives considered

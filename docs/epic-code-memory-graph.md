@@ -70,11 +70,11 @@
 | 52 | Metrics over OTLP with the name mapping (ADR 0009, **Proposed**) | Medium | 5 | P3 | 50 |
 | 53 | Logs over OTLP; trace ids in JSON logs when traces are on (ADR 0009, **Proposed**) | Medium | 3 | P3 | 51 |
 | 54 | OpenTelemetry compose demo, CI, overhead numbers and docs (ADR 0009, **Proposed**) | Low | 3 | P3 | 52, 53 |
-| 55 | Enum members as `Constant` symbols in C#, Java, TypeScript, C/C++ and Rust (ADR 0010, **Proposed**; #269) | High | 5 | P2 | 27, 28 |
-| 56 | Declaration (name) position on symbol hits, computed at query time (ADR 0010, **Proposed**; #269) | High | 3 | P2 | 16 |
-| 57 | Case-insensitive symbol lookup by default: `sym_fold` index, self-heal, `--exact-case` (ADR 0010, **Proposed**, gated on acceptance; #269) | High | 5 | P2 | 16 |
+| 55 | Enum members as `Constant` symbols in C#, Java, TypeScript, C/C++ and Rust (ADR 0010, delivered; #271-#273) | High | 5 | P2 | 27, 28 |
+| 56 | Declaration (name) position on symbol hits, computed at query time (ADR 0010, delivered; #274) | High | 3 | P2 | 16 |
+| 57 | Case-insensitive symbol lookup by default: `sym_fold` index, self-heal, `--exact-case` (ADR 0010, in progress; #269) | High | 5 | P2 | 16 |
 
-Total (excluding proposed 50-57): 49 stories, 249 pts (average about 5.1); 241 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), which is **Proposed**; they are not counted in the totals above until the owner accepts it. Stories 55-57 (13 pts) were proposed on 2026-10-08 by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), which is **Proposed**; they are not counted in the totals above until the owner accepts it.
+Total (excluding proposed 50-54): 52 stories, 262 pts (average about 5.0); 254 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), which is **Proposed**; they are not counted in the totals above until the owner accepts it. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -761,7 +761,7 @@ Design: [ADR 0009](adr/0009-opentelemetry.md) D3, D4, D5, D6, D9 and D11.
 
 <a id="story-55"></a>
 **55. Enum members as `Constant` symbols (5 pts)**
-Status: Proposed (ADR 0010 is Proposed). Not counted in the totals. May merge before acceptance (it only adds symbols), in three PRs: C# (with ASPX), then Java and TypeScript, then C/C++ and Rust.
+Status: Delivered in PRs #271, #272 and #273 ([ADR 0010](adr/0010-symbol-lookup-and-positions.md), Accepted 2026-10-09).
 As a developer looking up an enum value
 I want enum members indexed as symbols under their enum
 So that `symbols Red` finds `Color.Red`, as it already does in Scala.
@@ -779,7 +779,7 @@ Design: [ADR 0010](adr/0010-symbol-lookup-and-positions.md) D2.
 
 <a id="story-56"></a>
 **56. Declaration (name) position on symbol hits (3 pts)**
-Status: Proposed (ADR 0010 is Proposed). Not counted in the totals. May merge before acceptance (additive fields, no format change).
+Status: Delivered in PR #274 ([ADR 0010](adr/0010-symbol-lookup-and-positions.md), Accepted 2026-10-09).
 As a developer jumping to a symbol
 I want results to point at the line where its name is declared, not at the attribute above it
 So that `[Serializable] class Shape` takes me to `class Shape`.
@@ -797,7 +797,7 @@ Design: [ADR 0010](adr/0010-symbol-lookup-and-positions.md) D3.
 
 <a id="story-57"></a>
 **57. Case-insensitive symbol lookup by default (5 pts)**
-Status: Proposed (ADR 0010 is Proposed). Not counted in the totals. Merges only after the owner accepts ADR 0010, because it changes default query results and adds an on-disk table. It does not depend on story 56; the plan only orders it last.
+Status: In progress ([ADR 0010](adr/0010-symbol-lookup-and-positions.md), Accepted 2026-10-09).
 As a developer or agent searching for a symbol
 I want `widget` to find `Widget`, with an opt-out for exact case
 So that I do not need to know a name's casing to find it.
