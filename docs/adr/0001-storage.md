@@ -2,6 +2,8 @@
 
 **Status:** Accepted (provisional)
 
+*Note, 2026-10-09:* [ADR 0003](0003-data-model.md), accepted by the owner on 2026-10-09, supersedes this ADR's "JSON node per token" layout. redb stays the storage engine.
+
 > **In plain words**
 > - **Problem:** we need somewhere to keep the [symbols](../glossary.md#symbol) and [tokens](../glossary.md#token) we read from code, and to search them fast.
 > - **Choice:** use [redb](../glossary.md#redb), a small database written in pure Rust, and build our own [graph](../glossary.md#graph--node--parent) on top of it. Each item remembers its [parent](../glossary.md#graph--node--parent).
