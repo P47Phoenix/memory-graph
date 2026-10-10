@@ -855,3 +855,42 @@ fn decorated_methods_are_found() {
         assert!(s.iter().all(|x| x.0 != bad), "{bad}: {s:#?}");
     }
 }
+
+#[test]
+fn decorated_members_review_regressions() {
+    let cases = [
+        ("class C { @dec<T>() m() {} }", "m", "m() {}"),
+        ("class C { @dec({a: {b: 1}}) m() {} }", "m", "m() {}"),
+        (
+            "class C { m(@inject() x: number) {} n() {} }",
+            "m",
+            "m(@inject() x: number) {}",
+        ),
+        (
+            "class C { @dec static async m() {} }",
+            "m",
+            "static async m() {}",
+        ),
+        ("class C { @dec #p() {} }", "#p", "#p() {}"),
+        (
+            "abstract class C { @dec abstract m(): void; }",
+            "m",
+            "abstract m(): void;",
+        ),
+        ("class C {\n  @dec\n  // note\n  m() {}\n}", "m", "m() {}"),
+    ];
+    for (src, name, text) in cases {
+        assert_no_overlap(src);
+        let s = syms(src);
+        let hit = s.iter().find(|x| x.0 == name);
+        let hit = hit.unwrap_or_else(|| panic!("{src}: no {name} in {s:#?}"));
+        assert_eq!(hit.1, SymbolKind::Method, "{src}: {s:#?}");
+        assert_eq!(hit.3, text, "{src}: {s:#?}");
+        for bad in ["dec", "inject", "T", "a", "b", "x"] {
+            assert!(s.iter().all(|x| x.0 != bad), "{src}: {bad} in {s:#?}");
+        }
+    }
+    // The parameter decorator does not hide the next method.
+    let s = syms("class C { m(@inject() x: number) {} n() {} }");
+    assert_eq!(find(&s, "n").3, "n() {}");
+}
