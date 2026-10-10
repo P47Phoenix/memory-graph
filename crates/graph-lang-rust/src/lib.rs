@@ -30,9 +30,10 @@ impl Extractor for RustExtractor {
         // `kw1`: keywords are classed `keyword` (#98). `deep1`: input
         // nested too deep for `syn` is stored tokens only (#245). Part of
         // the file fingerprint, so a store indexed before re-indexes Rust.
-        // `em1`: enum variants are symbols (#269).
+        // `em1`: enum variants are symbols (#269). `sb1`: exact spans after
+        // a shebang line; C strings and nested block comments lexed (#253).
         format!(
-            "rust-syn-2+kw1+deep1+em1+tok{}",
+            "rust-syn-2+kw1+deep1+em1+sb1+tok{}",
             graph_core::tokenizer::TOKENIZER_VERSION
         )
     }
@@ -99,8 +100,12 @@ pub fn parse_symbols_unguarded(source: &str) -> Option<Vec<SymbolDecl>> {
     // syn strips a BOM before lexing, so its byte ranges start after it.
     let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
     let file = syn::parse_file(&source[bom..]).ok()?;
+    // syn also cuts a shebang line (`#!` not followed by `[`) before
+    // lexing, up to but not including its `\n`, so its byte ranges start
+    // after that too (#253). Without a `\n` nothing is left to parse.
+    let skip = bom + file.shebang.as_ref().map_or(0, String::len);
     let mut v = Collector {
-        bom,
+        bom: skip,
         src: source,
         line_starts: line_starts(source),
         char_marks: char_marks(source),
@@ -206,6 +211,7 @@ fn char_marks(src: &str) -> Vec<u32> {
 }
 
 struct Collector<'a> {
+    /// Bytes syn never saw: a leading BOM plus any shebang line.
     bom: usize,
     src: &'a str,
     line_starts: Vec<usize>,
