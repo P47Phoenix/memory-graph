@@ -184,7 +184,8 @@ fn lone_digit_led_sections() {
         assert!(!ex.has_errors);
         assert_nested(&ex);
         for (name, header) in [("100A", "100A SECTION."), ("9X", "9X ")] {
-            let s = ex.symbols.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("{name}: {:#?}", ex.symbols));
+            let s = ex.symbols.iter().find(|s| s.name == name);
+            let s = s.unwrap_or_else(|| panic!("{name}: {:#?}", ex.symbols));
             assert_eq!(s.lang_kind.as_deref(), Some("section"), "{src:?}");
             let start = src.find(&format!("{name} ")).unwrap();
             assert_eq!(s.span.start as usize, start);
@@ -207,6 +208,30 @@ fn contains_sym(ex: &Extraction, outer: &str, inner: &str) -> bool {
     o.span.start <= i.span.start && i.span.end <= o.span.end
 }
 
+/// #268: a segment number after SECTION (`100A SECTION 50.`).
+#[test]
+fn lone_digit_led_sections_with_segment_number() {
+    for src in [
+        "       PROCEDURE DIVISION.\n       100A SECTION 50.\n       P1.\n           DISPLAY 1.\n",
+        ">>SOURCE FREE\nPROCEDURE DIVISION.\n100A SECTION 50.\nP1.\n  DISPLAY 1.\n",
+    ] {
+        let ex = CobolExtractor.extract(src);
+        assert!(!ex.has_errors);
+        assert_nested(&ex);
+        let s = ex.symbols.iter().find(|s| s.name == "100A");
+        let s = s.unwrap_or_else(|| panic!("{src:?}: {:#?}", ex.symbols));
+        assert_eq!(s.lang_kind.as_deref(), Some("section"));
+        let start = src.find("100A SECTION 50.").unwrap();
+        assert_eq!(s.span.start as usize, start);
+        assert_eq!(s.span.end as usize, src.find("DISPLAY 1.").unwrap() + 10);
+        let line = src[..start].matches('\n').count() as u32 + 1;
+        assert_eq!(s.span.start_line, line);
+        let col = (start - src[..start].rfind('\n').map_or(0, |p| p + 1)) as u32 + 1;
+        assert_eq!(s.span.start_col, col);
+        assert!(contains_sym(&ex, "100A", "P1"));
+    }
+}
+
 #[test]
 fn lone_digit_led_sections_negative() {
     let lit = |src: &str| {
@@ -225,6 +250,10 @@ fn lone_digit_led_sections_negative() {
     assert!(!names(&syms(free)).contains(&"100A"));
     // SECTION not followed by a period.
     lit("       PROCEDURE DIVISION.\n       100A SECTION X.\n");
+    // A segment number must be an integer literal followed by a period.
+    lit("       PROCEDURE DIVISION.\n       100A SECTION 50 X.\n");
+    let free = ">>SOURCE FREE\nPROCEDURE DIVISION.\n100A SECTION X.\n";
+    assert!(!names(&syms(free)).contains(&"100A"));
     // Exponent literal.
     let t = token_texts("       PROCEDURE DIVISION.\n       1E5 SECTION.\n");
     assert!(

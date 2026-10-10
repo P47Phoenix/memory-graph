@@ -307,12 +307,17 @@ fn reclass_digit_led_headers(tokens: &mut [TokenDecl], free: bool) {
                 tokens[n].text == "." && tokens[n].class == TokenClass::Punctuation
             })
         };
-        // `100A.` (paragraph) or `100A SECTION.` (section, #268).
+        // `100A.` (paragraph) or `100A SECTION [50].` (section, #268).
         let next_is_period = is_period(k + 1)
             || (code
                 .get(k + 1)
                 .is_some_and(|&n| tokens[n].text.eq_ignore_ascii_case("SECTION"))
-                && is_period(k + 2));
+                && (is_period(k + 2)
+                    || (code.get(k + 2).is_some_and(|&n| {
+                        tokens[n].class == TokenClass::Literal
+                            && !tokens[n].text.is_empty()
+                            && tokens[n].text.bytes().all(|b| b.is_ascii_digit())
+                    }) && is_period(k + 3))));
         let area_a = if free {
             prev.is_none_or(|p| p.span.end_line < t.span.start_line)
         } else {
