@@ -1,6 +1,6 @@
 # ADR 0012: Authentication
 
-**Status:** Proposed on 2026-10-09; the owner accepts it. No code before acceptance. Revised on 2026-10-09 after the dev and QA reviews of PR #281. Delivers issue [#105](https://github.com/P47Phoenix/memory-graph/issues/105) (ADR 0004 Q1) through [story 69](../epic-code-memory-graph.md#story-69), which unblocks story 33 (MCP write tools, [ADR 0005](0005-mcp.md) D2). Builds on [ADR 0004](0004-client-server-and-replication.md) (gRPC, `Hello`, forwarding, exit codes) and ADR 0005 (the MCP HTTP endpoint). TLS stays a follow-up: [#104](https://github.com/P47Phoenix/memory-graph/issues/104).
+**Status:** Accepted by the owner on 2026-10-10 (proposed on 2026-10-09), with its recommendations; the open questions are resolved in [Owner decisions (2026-10-10)](#owner-decisions-2026-10-10). Revised on 2026-10-09 after the dev and QA reviews of PR #281. Delivers issue [#105](https://github.com/P47Phoenix/memory-graph/issues/105) (ADR 0004 Q1) through [story 69](../epic-code-memory-graph.md#story-69), which unblocks story 33 (MCP write tools, [ADR 0005](0005-mcp.md) D2). Builds on [ADR 0004](0004-client-server-and-replication.md) (gRPC, `Hello`, forwarding, exit codes) and ADR 0005 (the MCP HTTP endpoint). TLS stays a follow-up: [#104](https://github.com/P47Phoenix/memory-graph/issues/104).
 
 ## In plain words
 
@@ -97,7 +97,7 @@ sha256 = "9f86d0...c3a"    # 64 hex chars: sha256 of the token
 - `memory-graph auth new-token --id <id> --role <read|write>` prints the token once to stdout and the TOML stanza to stderr. With `--append <file>` it appends the stanza instead, creating the file with mode 0600 on Unix. The token never appears in the stanza, in `--append` errors or in any other output. `--token-out <file>` writes the token to a new 0600 file instead of stdout.
 - **State:** the parsed set lives in an `ArcSwap<TokenSet>`. Each request loads one snapshot at its start and uses it to the end, so a swap never splits a request.
 - **Reload:** on SIGHUP (Unix) and on a poll every 5 s on all platforms. The poll re-resolves the path, following symlinks, and compares a SHA-256 of the file's content, not its mtime, which covers Kubernetes secret mounts that swap a `..data` symlink. A SIGHUP and a poll that land together serialize on one reload mutex, and a reload of identical content is a no-op. A file that fails to parse or validate, is half-written, or has been deleted **keeps the old set** and logs an error (rate-limited). A reload never opens the server. Tests drive reloads through a `reload_now()` hook, not sleeps.
-- Each node of a cluster has its own `--auth-tokens` file. The file is not replicated through Raft in v1, because that would turn the log into a secret store. Operators distribute it like any other secret. Open question Q2.
+- Each node of a cluster has its own `--auth-tokens` file. The file is not replicated through Raft in v1, because that would turn the log into a secret store. Operators distribute it like any other secret. Owner decision Q2 (2026-10-10).
 - **File-permission warnings:** on Unix, the server warns if the token file or the cluster-secret file is readable by group or others, and the client warns the same about `--token-file`. On Windows no ACL check is made in v1; `docs/security.md` says to restrict the file to the service account.
 - **Client surface**, highest precedence first: `--token-file <path>`, then `MEMORY_GRAPH_TOKEN_FILE`, then `MEMORY_GRAPH_TOKEN`. There is no `--token <value>` flag, because command-line arguments leak through `ps` and shell history. `docs/security.md` documents the env-var risk (process environment, CI logs, crash dumps). No error or log line ever echoes an env value. The file is read once, with one trailing newline trimmed.
 - `ClientConfig` gains `credentials: Option<Credentials>`, whose `Debug` is redacted. `RemoteStore` adds the header on every call through a client interceptor.
@@ -118,7 +118,7 @@ sha256 = "9f86d0...c3a"    # 64 hex chars: sha256 of the token
 - **Risk, stated plainly:** without TLS, the bearer token, the cluster secret and all data cross the network in clear text. Anyone on the path can read a token and replay it. Auth without TLS protects against callers who can reach the port but cannot see the traffic (a shared host, a flat office network, a misconfigured security group), not against an on-path attacker.
 - **Recommended deployment:** bind `serve` to loopback or a private interface and terminate TLS in front of it (Envoy, nginx `grpc_pass`, Caddy, or a mesh sidecar such as Linkerd or Istio with mTLS between pods). Peer traffic should go over a private network or the mesh. A new `docs/security.md` gives an Envoy and a Caddy example and repeats the boxed warning.
 - **Guard rail:** with auth on, `serve` refuses to start if `--listen`, `--advertise` or `--mcp-listen` is not loopback, unless `--insecure-transport` is passed. Loopback means `127.0.0.0/8`, `::1` and `localhost` as resolved; `0.0.0.0` and `[::]` are not loopback. The flag's name says what it is, and a proxy or mesh deployment passes it knowingly. **A multi-host cluster always needs the flag**, because its `--advertise` addresses are not loopback. That is intended: running a cluster without TLS is exactly the risk being acknowledged. `serve --help` and the start-up log carry the warning.
-- The client refuses `--server https://...` in v1, with a message pointing to the proxy setup: the client cannot speak TLS either, so a client-side proxy or a mesh handles it. Open question Q1.
+- The client refuses `--server https://...` in v1, with a message pointing to the proxy setup: the client cannot speak TLS either, so a client-side proxy or a mesh handles it. Owner decision Q1 (2026-10-10).
 
 ### D5. Roles: deny by default
 
@@ -281,11 +281,13 @@ Out of v1. A scope check would have to look inside each request (an `Index` stre
 - There is no per-tenant isolation: one `read` token reads every org.
 - The new dependencies (`subtle`, `zeroize`, `arc-swap`, plus crates already in the graph) are gate-clean.
 
-## Open questions for the owner
+## Owner decisions (2026-10-10)
 
-- **Q1.** Should the `--insecure-transport` start-up refusal (D4) be kept, given that every multi-host cluster must pass it, or only warn?
-- **Q2.** Should token files be replicated through Raft later (one place to rotate), or stay per-node files?
-- **Q3.** Separate exit codes 8 and 9, or one code for both?
-- **Q4.** Per-org/repo scopes (D6): file the follow-up now? Should it cover reads (result filtering) or only writes?
-- **Q5.** The trimmed unauthenticated `Hello` (D7) hides the node id, cluster id and leader address. Is that right, or is the full response wanted for tooling?
-- **Q6.** Should the metrics listener (D9) stay unauthenticated in v1?
+The owner accepted this ADR with its recommendations, and made Q1 explicit.
+
+- **Q1.** Should the `--insecure-transport` start-up refusal (D4) be kept, given that every multi-host cluster must pass it, or only warn? **Kept, as a refusal, not a warning:** with auth on, `serve` on a non-loopback address refuses to start unless `--insecure-transport` is given explicitly.
+- **Q2.** Should token files be replicated through Raft later (one place to rotate), or stay per-node files? **Per-node files** in v1, as D2 recommends; the Raft log does not become a secret store.
+- **Q3.** Separate exit codes 8 and 9, or one code for both? **Separate:** 8 for `UNAUTHENTICATED`, 9 for `PERMISSION_DENIED` (D8).
+- **Q4.** Per-org/repo scopes (D6): file the follow-up now? Should it cover reads (result filtering) or only writes? **As D6 recommends:** v1 has the `read` and `write` roles only, and the follow-up for per-org/repo scopes is [#289](https://github.com/P47Phoenix/memory-graph/issues/289). Whether scopes cover reads (result filtering) as well as writes is decided in that follow-up.
+- **Q5.** The trimmed unauthenticated `Hello` (D7) hides the node id, cluster id and leader address. Is that right, or is the full response wanted for tooling? **Trimmed, as D7 proposes;** the full response needs a token.
+- **Q6.** Should the metrics listener (D9) stay unauthenticated in v1? **Yes,** aggregate counters only, under the same `--insecure-transport` guard (D9).
