@@ -76,17 +76,17 @@
 | 58 | Derived tables self-heal after an older binary writes to the file (#276) | High | 3 | P2 | 57 |
 | 59 | Document today's substring matching and answer #278 | Medium | 1 | P2 | none |
 | 60 | Rust extractor: exact spans on shebang and raw-string files (#253) | High | 3 | P2 | 9 |
-| 61 | Compact per-file sort key on the read path (#262; format change, approved 2026-10-09) | High | 5 | P2 | 58 |
+| 61 | Compact per-file sort key on the read path (#262; format change, approved 2026-10-09) | High | 5 | P2 | 58 (preferably) |
 | 62 | Membership changes keep in-flight tracking until Raft answers (#260) | Medium | 3 | P3 | 22 |
-| 63 | Rust parse stack counted in the ingest memory budget (#254) | Medium | 3 | P3 | 60 |
+| 63 | Rust parse stack counted in the ingest memory budget (#254) | Medium | 3 | P3 | 60 (preferably) |
 | 64 | TypeScript decorated methods are found (#266) | Medium | 2 | P2 | 27 |
 | 65 | asm extractor: exact spans on libunwind `UnwindRegistersSave.S` (#252) | Low | 2 | P3 | 30 |
 | 66 | COBOL digit-led `SECTION` names such as `100A SECTION.` (#268) | Low | 1 | P3 | 30 |
 | 67 | Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (#115) | Medium | 5 | P3 | 22 |
-| 68 | Infix (substring) symbol search (#278; gated on ADR 0011, not yet written) | High | 5 | P3 | ADR 0011, 61 |
+| 68 | Infix (substring) symbol search (#278; gated on ADR 0011, not yet written) | High | 5 | P3 | ADR 0011; 61 (preferably) |
 | 69 | Authentication for `serve` (#105; gated on ADR 0012, not yet written) | High | 8 | P3 | ADR 0012, 20 |
 
-Total: 69 stories, 328 pts (average about 4.8); 320 pts excluding the deferred stories 33 and 39. Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each need an ADR (0011 and 0012) before any code.
+Total: 69 stories, 328 pts (average about 4.8); 320 pts excluding the deferred stories 33 and 39. (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each need an ADR (0011 and 0012) before any code.
 
 **Next phase (2026-10-09).** Waves, from [plan-next-phase.md](plan-next-phase.md):
 - **W1:** stories 58, 59, 60, 64 and 66, plus drafting ADRs 0011 (infix search) and 0012 (authentication).
@@ -445,7 +445,7 @@ Design: [ADR 0005](adr/0005-mcp.md) D1, D3, D4 (Accepted).
 - Given the three backends (embedded, `RemoteStore` over `TestServer`, the in-serve adapter over a 3-node `ClusterTestbed`), When the tool conformance suite runs, Then all three must pass.
 
 **33. Opt-in MCP write tools (3 pts)**
-Status: **Deferred** until authentication (#105); the owner decided on 2026-09-29 that an unauthenticated endpoint stays read-only.
+Status: **Deferred** until authentication (#105); the owner decided on 2026-09-29 that an unauthenticated endpoint stays read-only. Depends on story 69 (authentication, scheduled 2026-10-09), which delivers #105.
 As an AI-agent integrator
 I want `index_path` and `prune` tools
 So that an assistant can keep the graph current without a separate CLI call.
@@ -731,7 +731,7 @@ Design: [ADR 0009](adr/0009-opentelemetry.md) D6 and D8.
   - the histograms' counts must approximately match `mg_rpc_total` and the apply histogram's count.
 - Given one collection, When several callbacks run, Then the snapshot must be built once (a counter shows it), and no callback may open a redb transaction.
 - Given the e2e workload, When it runs, Then no instrument may reach the SDK overflow stream (`otel.metric.overflow`).
-- Given a tiny `BatchTuning::max_queue_size` and `FakeCollector::stall`, When more spans or log records are queued than fit, Then `mg_otel_dropped_total{signal}` must count every dropped item, through a wrapping exporter or processor, or a narrowly filtered internal-logs path, since SDK 0.33 exposes no public drop counter (#250). Stories 51 and 53 rely on this counter.
+- Given a tiny `BatchTuning::max_queue_size` and `FakeCollector::stall`, When more spans or log records are queued than fit, Then the items queued minus the items exported must equal the rise in `mg_otel_dropped_total{signal}`, counted through a wrapping exporter or processor, or a narrowly filtered internal-logs path, since SDK 0.33 exposes no public drop counter (#250). Stories 51 and 53 rely on this counter.
 - Given this story, When it merges, Then the Prometheus golden file must change by exactly the two new families, `mg_otel_export_failures_total{signal}` and `mg_otel_dropped_total{signal}`. Both must be in `METRIC_NAMES` and stay 0 with OpenTelemetry off.
 - Given a stalled or stopped collector, When intervals pass, Then serving must be unaffected, the metrics failure counters must rise, and export must resume when the collector comes back.
 - Given a shutdown, When `serve` stops, Then a final metrics export must reach a responsive collector.
@@ -844,11 +844,12 @@ Status: Added 2026-10-09 (#276). Counted in the totals.
 As an operator who rolls back to an older binary and forward again
 I want derived tables rebuilt when a writer that does not maintain them touched the file
 So that symbol lookup never returns silently stale or missing results.
-- Given a file written by the current binary, When a simulated older binary (one that does not maintain `sym_fold` or `refs`) writes to it and the current binary reopens it, Then the store must detect the older write (for example a writer version or write-generation stamp next to each derived stamp) and rebuild every derived table that writer did not maintain.
+The detection must work against real pre-fix binaries, which cannot bump a stamp they do not know. So it must key on state that those binaries already change on every write, not on a new stamp that only fixed binaries maintain. The PR records which state it keys on.
+- Given a file written by the current binary, When a pre-fix binary (one that maintains neither `sym_fold` nor `refs`/`content_files`) writes to it and the current binary reopens it, Then the store must detect that write and rebuild `sym_fold` and `refs`/`content_files` before answering a query.
 - Given that old-writer write followed by a reopen, When `run_differential` compares it with a fresh index of the same inputs, Then every query must answer identically (a conformance case).
 - Given a store that no older binary has written, When it is reopened, Then no derived table may be rebuilt and the open must write nothing (a test asserts no rebuild).
 - Given a failpoint that crashes during the rebuild, When the store is reopened, Then the rebuild must run again and queries must be correct.
-- Given the detection needs a new stamp, When it is added, Then it must follow the on-disk versioning rule in CLAUDE.md, with golden-byte tests updated.
+- Given the detection needs stored state, When it is added, Then it must follow the on-disk versioning rule in CLAUDE.md, with golden-byte tests updated.
 
 <a id="story-59"></a>
 **59. Document today's substring matching and answer #278 (1 pt)**
@@ -866,19 +867,22 @@ Status: Added 2026-10-09 (#253). Counted in the totals.
 As a developer indexing the Rust toolchain
 I want symbols for every valid Rust file
 So that `symbols` finds definitions in files that start with `#!` or contain `r#"..."#`.
-- Given the six rustc files named by an index run of the pinned bench corpus, When they are indexed, Then each must have symbols and no span warning.
+The six file paths were not recorded in #253 or PR #251. The first task is to list them, from an index run's span warnings on rust-lang/rust at the pinned commit `db23a2d392783030c008a5fafbe6cb139d1f7707` (`scripts/fetch-bench-corpus.py`). They go into the PR and into #253.
+- Given those six rustc files at that commit, When they are indexed, Then each must have symbols and no span warning.
 - Given a reduced fixture for each case (a shebang first line, `#![attr]` on the first line, which is not a shebang, and raw strings with 0 to 3 hashes), When indexed, Then every symbol's text, byte range, line and column must match the source exactly (exact-span tests).
 - Given the change, When it merges, Then the Rust extractor version must be bumped and pinned, a corpus differential must show only the fixed files changing, and the corpus test and size gate must stay green.
 
 <a id="story-61"></a>
 **61. Compact per-file sort key on the read path (5 pts)**
-Status: Added 2026-10-09 (#262). Counted in the totals. The on-disk format change was approved by the owner on 2026-10-09. Depends on story 58 (the same derived-version machinery).
+Status: Added 2026-10-09 (#262). Counted in the totals. The on-disk format change was approved by the owner on 2026-10-09. Preferably after story 58: both touch the derived-version self-heal on open, and 58 changes how its stamps are trusted, so landing 61 first would mean reworking its upgrade path.
 As a user of a large (about 1B-token) index
 I want hot-term queries to answer fast
 So that common words like `return` do not stall an agent.
-- Given the 877M-token bench index and `crates/graph-cli/tests/readbench.rs`, When it runs on the pinned bench host recorded in the PR (the same host and corpus as PR #261), with one warm-up pass discarded and then 5 measured runs, Then the hot-term warm p95 (the median of the 5 runs' p95) must be below 60 ms (from 93 ms), and the candidate-file time per query must drop by at least 50%.
+- Given the A5 index used in PR #261 (877M tokens, built from the bench corpus of `scripts/fetch-bench-corpus.py`) on the same host as PR #261's numbers, When `crates/graph-cli/tests/readbench.rs` runs with `MG_READBENCH_REUSE=1`, one warm-up pass discarded and then 5 measured runs, Then:
+  - the hot-term warm `p95 ms` (the median of the 5 runs' p95) must be below 60 ms (from 93 ms);
+  - the `ctx ms/q` column of the search phase-timer row (`search_ctx_nanos`; 11.9 ms after PR #261) must drop by at least 50%.
 - Given the 924 searches of PR #261, When they run with `--json` before and after, Then the output must be byte-identical.
-- Given the new side table, When it ships, Then it must follow the versioning rule (upgrade on open through a `derived_version` preferred, or a `V2_SCHEMA_VERSION` bump), with golden-byte tests, and an older file must be upgraded on open.
+- Given the new side table, When it ships, Then it must follow the versioning rule, with golden-byte tests, and an older file must be upgraded on open. The PR must record which option it took: a `derived_version` (preferred) or a `V2_SCHEMA_VERSION` bump.
 - Given `run_differential` and `run_crash_rerun_differential`, When they run, Then they must pass with the side table.
 - Given the size gate, When it runs, Then it must stay at or below 15x and 105 B/token.
 - Given the result, When it is measured, Then it must be recorded against GPU trigger 2 in `docs/spikes/gpu-acceleration.md`.
@@ -890,17 +894,19 @@ As an operator transferring leadership during a membership change
 I want the drain to wait for every appended entry
 So that the target never has a shorter log.
 - Given `add_learner` and `change_membership` in `crates/graph-server/src/raft/node.rs`, When the caller stops waiting (cancellation, or a quorum-loss `NoLeader`), Then the in-flight count must be held until openraft answers the entry, as `propose` does since #259.
-- Given a partition test like `an_abandoned_write_stays_in_flight_until_raft_answers_it`, When a membership change is abandoned mid-way and a leader transfer follows, Then the drain must wait for it (ClusterTestbed).
-- Given the 1-core starvation flakes listed in #260, When each is reproduced with the state dump, Then it must be classified as test timing or a real bug, fixed, and pass 50 consecutive runs on 1 CPU (documented in the PR); the transfer drain bound must be tied to the election and heartbeat config.
+- Given one partition test per path, modelled on `an_abandoned_write_stays_in_flight_until_raft_answers_it`, When an `add_learner` (first test) or a `change_membership` (second test) is abandoned mid-way and a leader transfer follows, Then the drain must wait for it (ClusterTestbed).
+- Given the transfer drain, When its bound is set, Then it must be a fixed multiple of the configured `election_timeout_max` (the multiple is recorded in the PR) instead of a fixed 10 s, and a test must assert that the bound changes when the election config changes.
+- Given 1-CPU starvation with 8 CPU burners (the #260 setup), When `transfer_leader_moves_leadership_five_nodes`, `remove_needs_a_quorum_of_the_old_voter_set_too` and `a_transfer_waits_for_a_write_in_flight` are run, Then each failure must be reproduced with the state dump and classified as test timing or a real bug, and after the fix each must pass 50 consecutive runs (documented in the PR).
 
 <a id="story-63"></a>
 **63. Rust parse stack counted in the ingest memory budget (3 pts)**
-Status: Added 2026-10-09 (#254). Counted in the totals.
+Status: Added 2026-10-09 (#254). Counted in the totals. Preferably after story 60: both change the Rust extractor and its pinned version, so landing them in order avoids two version bumps racing.
 As an operator indexing untrusted repos
 I want the Rust parse stack counted against `--memory`
 So that parallel adversarial files cannot exceed the budget.
 - Given `--memory`, When a parse job needs a big stack, Then admission must reserve its planned touched stack before parsing (or limit big-stack parses to one at a time).
-- Given two near-cap adversarial files indexed in parallel under a set `--memory`, When indexing runs, Then the budget assertion `parse_stack_reservations_stay_within_memory_budget` must pass: the reserved parse stacks plus the other budgeted memory must never exceed the budget.
+- Given two near-cap adversarial files made by a new fixture generator, `near_cap_rust_source` (added by this story, beside the `scanner_robustness` fixtures), indexed in parallel with `--memory 1GiB`, When indexing runs, Then the budget assertion `parse_stack_reservations_stay_within_memory_budget` must pass: the reserved parse stacks plus the other budgeted memory must never exceed 1 GiB. The PR must report the measured peak private bytes (it was 1.69 GB before the fix, per #254).
+- Given a small and a large `--memory` and different `--jobs`, When `run_differential` compares the resulting stores, Then every query must answer identically.
 - Given the docs, When read, Then they must state that in-place parses (bound under 256 KiB) need 256 KiB of free stack on the caller's thread, and `stack.rs` must explain why not tracking angle brackets is sound.
 
 <a id="story-64"></a>
@@ -909,7 +915,8 @@ Status: Added 2026-10-09 (#266). Counted in the totals.
 As a TypeScript developer
 I want decorated methods reported wherever they appear in a class body
 So that `symbols` finds them after a field without a semicolon or after a method body.
-- Given the reduced fixtures `class I { f = 1\n  @dec m() {} }` and `class C { @dec() m(...) {} @log n() {} }`, When indexed, Then `m` and `n` must be methods with exact spans (exact-span tests).
+- Given the reduced fixtures `class I { f = 1\n  @dec m() {} }` and `class C { @dec() m(...) {} @log n() {} }`, When indexed, Then `m` and `n` must be methods with exact spans (exact-span tests), and no two symbols may overlap in either fixture.
+- Given `class I { f = 1\n  @dec m() {} }`, When indexed, Then `f` must stay a field that ends before `@dec` (a regression for the #265 fix).
 - Given the change, When it merges, Then the TS extractor version must be bumped and pinned, the fuzz no-overlap test must stay green, and a corpus differential must show only new methods.
 
 <a id="story-65"></a>
@@ -918,8 +925,8 @@ Status: Added 2026-10-09 (#252). Counted in the totals.
 As a C and assembly user
 I want `UnwindRegistersSave.S` indexed with symbols
 So that its functions are found by `symbols`.
-- Given the bench corpus file, When indexed, Then it must have symbols and no span warning.
-- Given a reduced fixture with the overlapping or partly nested symbols, When indexed, Then every symbol must have an exact span and no two may overlap (exact-span tests).
+- Given `libunwind/src/UnwindRegistersSave.S` from llvm/llvm-project at the pinned commit `75cc30c7b35ce8d5ddd311b67872ed498997d58f` (`scripts/fetch-bench-corpus.py`), When indexed, Then it must have symbols and no span warning.
+- Given a reduced fixture with the symbols that failed `validate_spans`, When indexed, Then every symbol must have an exact span, with no partial overlap (proper nesting allowed) (exact-span tests).
 - Given the change, When it merges, Then the asm extractor version must be bumped and pinned, and a corpus differential must show only the fixed file changing.
 
 <a id="story-66"></a>
@@ -930,7 +937,7 @@ I want digit-led section names recognised
 So that `100A SECTION.` is a section symbol.
 - Given reduced fixtures with `100A SECTION.` and `100A SECTION .` in Area A at sentence start, When indexed, Then each must emit a section symbol with an exact span.
 - Given the same text outside Area A or not at sentence start, When indexed, Then no section symbol may be emitted (negative tests).
-- Given the change, When it merges, Then the COBOL extractor version must be bumped and pinned, and a corpus differential must run.
+- Given the change, When it merges, Then the COBOL extractor version must be bumped and pinned. A corpus differential must then show changes only in COBOL files with digit-led section names without a hyphen, or no change if the corpus has none.
 
 <a id="story-67"></a>
 **67. Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (5 pts)**
@@ -938,14 +945,18 @@ Status: Added 2026-10-09 (#115). Counted in the totals.
 As an operator
 I want a full disk during append or apply to refuse the write without stopping the node
 So that the cluster keeps serving and recovers when space is freed.
-- Given a ClusterTestbed disk-full failpoint that fails the leader's append or apply with an I/O error after the pre-propose disk check passed, When a write runs, Then the client must get RESOURCE_EXHAUSTED, the write must stay unacknowledged, the store marker must be unchanged, and the node must keep serving reads.
-- Given the same failpoint on a follower's apply, When a write commits, Then the follower must stay up and catch up after space is freed.
+- Given a ClusterTestbed disk-full failpoint that fails the leader's Raft log append with an I/O error after the pre-propose disk check passed, When a write runs, Then:
+  - the client must get RESOURCE_EXHAUSTED;
+  - the write must stay unacknowledged and the store marker unchanged;
+  - the node must not exit or restart, and must keep serving reads.
+- Given a ClusterTestbed disk-full failpoint that fails the state-machine apply with an I/O error (on the leader, and separately on a follower), When a write commits, Then the client must get RESOURCE_EXHAUSTED from a failing leader, the store marker must be unchanged, and the node must not exit or restart. A failing follower must catch up after space is freed.
 - Given space is freed (the failpoint cleared), When the client retries, Then the write must succeed and be applied exactly once on every node.
+- Given the CLI, When a write fails with RESOURCE_EXHAUSTED, Then it must exit with code 1. RESOURCE_EXHAUSTED maps to `StoreError::Storage`, which `exit_code` in `crates/graph-cli/src/target.rs` does not single out, and the message must say the disk is full.
 - Given the design, When it is chosen (non-fatal apply errors in openraft 0.9, or a pre-apply space reservation), Then it must be recorded in a dated note in [ADR 0004](adr/0004-client-server-and-replication.md).
 
 <a id="story-68"></a>
 **68. Infix (substring) symbol search (5 pts)**
-Status: Added 2026-10-09 (#278). Counted in the totals. Gated on ADR 0011 (infix search), not yet written; no code before it is accepted. Depends on story 61.
+Status: Added 2026-10-09 (#278). Counted in the totals. Gated on ADR 0011 (infix search), not yet written; no code before it is accepted. The story is not ready until ADR 0011 sets a p95 threshold for infix queries (about 50 ms is the starting point). Preferably after story 61: both change the read path on the same bench, and measuring infix p95 on top of 61's numbers keeps the two effects apart.
 As a developer or agent who remembers part of a name
 I want `symbols` to match inside a name
 So that `get` can find `widgetGetter`.
@@ -953,19 +964,20 @@ Open question for ADR 0011: the developer recommends symbol names only, scanning
 - Given ADR 0011's syntax, When an infix query runs, Then it must return every symbol whose name contains the substring, with case folding as in story 57, embedded and remote (a `run_all` case for infix semantics).
 - Given random names and queries, When a property test runs, Then infix results must equal a brute-force substring filter over all symbol names (a brute-force oracle proptest).
 - Given the query parser, When a fuzz test feeds it arbitrary input, Then it must never panic and must reject bad input with an error.
-- Given the size gate and readbench, When they run, Then the size gate must stay at or below 15x and 105 B/token, and infix p95 must be recorded in the PR.
+- Given the size gate and readbench, When they run, Then the size gate must stay at or below 15x and 105 B/token, and infix p95 must be within ADR 0011's threshold and recorded in the PR.
 
 <a id="story-69"></a>
 **69. Authentication for `serve` (8 pts)**
-Status: Added 2026-10-09 (#105). Counted in the totals. Gated on ADR 0012 (authentication), not yet written; no code before it is accepted. Unblocks story 33.
+Status: Added 2026-10-09 (#105). Counted in the totals. Gated on ADR 0012 (authentication), not yet written; no code before it is accepted. When ADR 0012 is accepted, it replaces the placeholder criteria below with concrete ones. Unblocks story 33.
 As an operator running a shared server
 I want clients to authenticate before they read or write
 So that only trusted callers can reach the data.
-Open question for ADR 0012: token auth through a tonic interceptor with constant-time comparison (`subtle`), and no TLS in v1, because rustls's default providers are aws-lc-rs and ring, which are deny-listed.
+Open question for ADR 0012: token auth through a tonic interceptor with constant-time comparison (`subtle`), and no TLS in v1, because rustls's default providers are aws-lc-rs and ring, which are deny-listed. Per-org and per-repo write permissions (raised in #105) are out of scope for v1; ADR 0012 may plan them as a follow-up.
 - Given auth on, When `RemoteStore` conformance runs with valid credentials, Then it must pass; without credentials or with wrong ones, Then every call must fail with UNAUTHENTICATED and return no data.
 - Given auth off, When `RemoteStore` conformance runs without credentials, Then it must pass unchanged.
 - Given a write sent to a follower, When it is forwarded to the leader, Then the forward must authenticate, and a forwarded write without valid credentials must be refused (the forwarded-write path).
-- Given Raft peer traffic, the health service and MCP over HTTP, When auth is on, Then each must behave as ADR 0012 decides, and the token must never appear in logs.
+- Given Raft peer traffic, the health service and MCP over HTTP, When auth is on, Then each must behave as ADR 0012 decides.
+- Given logs captured at trace level during the authenticated conformance run, When they are searched, Then the token must not appear in them.
 - Given the pure-Rust gate, When the story merges, Then `check-no-c-deps.py` must pass and `cargo tree -i ring` and `cargo tree -i aws-lc-sys` must print nothing.
 
 ### Rationale

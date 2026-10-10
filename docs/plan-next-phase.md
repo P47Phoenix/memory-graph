@@ -74,8 +74,8 @@ RICE = Reach x Impact x Confidence / Effort. Reach is on a 1-10 scale (share of 
 | 9 | S9 COBOL digit-led SECTION names | #268 | 1 | 1 | 0.9 | 0.25 | 3.6 | Could | 1 |
 | 10 | S10 Leader disk-full answers RESOURCE_EXHAUSTED | #115 | 2 | 2 | 0.6 | 2 | 1.2 | Could | 5 |
 | 11 | S11 Infix (substring) symbol search | #278 (if the owner opts in) | 7 | 2 | 0.5 | 3 | 2.3 | Could (needs owner decision) | 8 |
-| - | OTel export stories 51-54 + #249, #250 | #249, #250 | - | - | - | - | - | Won't (this phase), unless ADR 0009 is accepted | - |
-| - | TLS, auth, sharding, openraft tick, read cache 47-49 | #104, #105, #108, #226 | - | - | - | - | - | Won't (this phase) | - |
+| - | OTel export stories 51-54 + #249, #250 | #249, #250 | - | - | - | - | - | Won't (this phase), unless ADR 0009 is accepted. *Changed 2026-10-09: ADR 0009 accepted; stories 51-54 run in W2, with #249 and #250 folded into 51 and 52.* | - |
+| - | TLS, auth, sharding, openraft tick, read cache 47-49 | #104, #105, #108, #226 | - | - | - | - | - | Won't (this phase). *Changed 2026-10-09: auth (#105) is scheduled as story 69 (S12); the rest stay deferred.* | - |
 | - | GPU acceleration | spike | - | - | - | - | - | Won't (no-go; triggers not met) | - |
 
 \* S2 tops the raw RICE score because its effort is tiny. It is ranked second because S1 is a silent-wrong-results bug. The order mixes RICE with risk.
