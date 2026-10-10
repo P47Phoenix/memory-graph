@@ -3687,6 +3687,21 @@ fn a_crash_during_the_sym_fold_rebuild_is_rebuilt_on_the_next_open() {
     // writer check, so the refs rebuild before it did commit.)
     let db = redb::Database::open(&p).unwrap();
     assert!(crate::v2::sym_fold_needs_rebuild(&db).unwrap());
+    // The refs rebuild committed its stamp, and the old write is still
+    // detected, so the next open runs the heal again. (This fixture was
+    // written by the current binary, so its repo rows were marked before the
+    // damage; the lengths are what detect it.)
+    {
+        let rt = db.begin_read().unwrap();
+        let refs_stamp = rt
+            .open_table(crate::META)
+            .unwrap()
+            .get(crate::v2::DERIVED_VERSION_REFS_KEY)
+            .unwrap()
+            .map(|v| v.value());
+        assert_eq!(refs_stamp, Some(crate::v2::REFS_DERIVED_VERSION));
+    }
+    assert!(crate::v2::old_writer_detected(&db).unwrap());
     drop(db);
     assert_sym_fold_healed(&p);
 }

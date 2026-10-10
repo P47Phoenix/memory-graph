@@ -6,6 +6,7 @@
 use super::*;
 use crate::v2_tests::span_ext;
 use graph_core::Extraction;
+use redb::ReadableMultimapTable;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -156,6 +157,63 @@ fn an_old_writer_that_only_removes_is_detected_and_rebuilt() {
         .search_symbols(&SymbolQuery::new("beta"))
         .unwrap()
         .is_empty());
+}
+
+/// Pins the `stream` vs `refs`/`content_files` check alone: an old binary
+/// prunes a file with no symbols, so `sym_idx`/`sym_fold` stay equal and no
+/// repo row is written.
+#[test]
+fn an_old_writer_removing_a_symbol_free_file_is_detected_by_refs_lengths() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    {
+        let s = V2Store::open(&p).unwrap();
+        for (path, names) in [("a.cs", &["Alpha"][..]), ("README", &[][..])] {
+            s.ingest_file_with_origin(
+                "o",
+                "r",
+                path,
+                "text",
+                &cs(names),
+                Some(crate::ORIGIN_DIRECTORY),
+            )
+            .unwrap();
+        }
+    }
+    as_old_writer(&p, |s| {
+        let keep: HashSet<String> = ["a.cs".to_string()].into();
+        assert_eq!(s.prune_files("o", "r", &keep, false).unwrap(), ["README"]);
+        assert!(repo_rows(s)
+            .iter()
+            .all(|(_, v)| *v == crate::v2::DERIVED_WRITER_MARK));
+    });
+    assert!(detected(&p));
+    assert_old_writer_healed(&p);
+}
+
+/// Pins the `sym_idx` vs `sym_fold` check alone: `sym_fold` is one entry
+/// short while the stream/refs lengths agree and every repo row is marked.
+#[test]
+fn a_short_sym_fold_is_detected_by_symbol_lengths() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    {
+        let s = V2Store::open(&p).unwrap();
+        s.ingest_file("o", "r", "a.cs", "csharp", &cs(&["Alpha", "Beta"]))
+            .unwrap();
+    }
+    {
+        let db = redb::Database::open(&p).unwrap();
+        let wt = db.begin_write().unwrap();
+        {
+            let mut fold = wt.open_multimap_table(crate::v2::SYM_FOLD).unwrap();
+            let id = fold.get("alpha").unwrap().next().unwrap().unwrap().value();
+            fold.remove("alpha", id).unwrap();
+        }
+        wt.commit().unwrap();
+    }
+    assert!(detected(&p));
+    assert_old_writer_healed(&p);
 }
 
 /// A store only the current binary wrote (ingest, replace, prune, vacuum,

@@ -153,11 +153,15 @@ pub const SYM_FOLD_DERIVED_VERSION: u64 = 2;
 /// before this mark existed already change, since they cannot bump a stamp
 /// they do not know. Every v2 binary ever released inserts that row with the
 /// value 0 on every ingest (readers only test its presence), so an ingest by
-/// any of them leaves a 0 behind. A removal by them is caught by the table
-/// lengths instead: it shrinks `sym_idx` but not `sym_fold`, and `stream`
-/// but not `refs`/`content_files` (redb keeps lengths in its table headers,
-/// so these reads are O(1)). [`old_writer_detected`] checks both on open;
-/// a hit rebuilds every derived table and then sets the rows to this mark.
+/// any of them leaves a 0 behind. A removal by them writes no such row, so
+/// table lengths back it up: a removal by a binary without `sym_fold`
+/// shrinks `sym_idx` but not `sym_fold`; the `stream` vs `refs`/
+/// `content_files` comparison mainly matters for very old v2 binaries that
+/// predate those tables. redb keeps lengths in its table headers, so these
+/// reads are O(1). [`old_writer_detected`] checks all of this on open; a
+/// hit rebuilds every derived table and then sets the rows to this mark.
+/// The derived-version bumps to 2 that came with the mark are belt and
+/// braces: the mark alone already makes older files rebuild once.
 pub(crate) const DERIVED_WRITER_MARK: u64 = 1;
 /// `meta` key holding the stored [`SYM_FOLD_DERIVED_VERSION`].
 pub(crate) const DERIVED_VERSION_SYM_FOLD_KEY: &str = "derived_version_sym_fold";
