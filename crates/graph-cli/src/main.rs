@@ -731,7 +731,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Find symbols (definitions) by name; a trailing `*` matches a prefix
+    /// Find symbols (definitions) by name; a trailing `*` matches a prefix. There is no infix
+    /// match: `Gad*` finds `Gadget`, `Get` and `*dget` do not
     Symbols {
         /// Exact name, `prefix*` (a prefix), `*` (everything) or `name\*` (a name ending in a literal `*`).
         /// Edges: `**` at the end is rejected as ambiguous (so `a\**` is too), and a trailing backslash not
@@ -778,7 +779,7 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Find tokens by exact text
+    /// Find whole tokens by exact text (case-sensitive; no wildcards, no partial-word match)
     Search {
         /// Exact token text
         text: String,

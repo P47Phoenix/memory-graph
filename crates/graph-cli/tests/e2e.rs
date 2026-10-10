@@ -3196,3 +3196,45 @@ fn symbols_lookup_is_case_insensitive_by_default() {
     assert!(ok, "{err}");
     assert!(out.starts_with("o/r/Widget.cs:1:14\t"), "{out}");
 }
+
+/// Story 59 / issue #278: the documented matching rules on
+/// `public class Gadget { }` (docs/guide/querying.md, "What matches").
+/// Prefix and case-insensitive symbol lookups find it; an infix fragment,
+/// a leading `*` and a partial `search` token do not (infix is story 68).
+#[test]
+fn symbols_prefix_matches_but_infix_does_not() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("src");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Gadget.cs"), "public class Gadget { }\n").unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    for (args, found) in [
+        (&["symbols", "Gadget"][..], true),
+        (&["symbols", "gadget"][..], true),
+        (&["symbols", "Gad*"][..], true),
+        (&["symbols", "--exact-case", "gad*"][..], false),
+        (&["symbols", "Get"][..], false),
+        (&["symbols", "dget"][..], false),
+        (&["symbols", "*dget"][..], false),
+        (&["search", "Gadget"][..], true),
+        (&["search", "Gad"][..], false),
+        (&["search", "gadget"][..], false),
+    ] {
+        let mut full = vec!["--db", db.as_str()];
+        full.extend_from_slice(args);
+        let (ok, out, err) = run(&full);
+        assert!(ok, "{args:?}: {err}");
+        assert_eq!(out.contains("Gadget.cs"), found, "{args:?}: {out}");
+    }
+}
