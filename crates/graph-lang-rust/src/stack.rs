@@ -168,7 +168,7 @@ pub(crate) fn bound(item_tokens: usize) -> usize {
 /// The stack a parse thread of `size` bytes may actually touch: the size
 /// over the 3x margin built into [`STACK_PER_TOKEN`] and [`STACK_BASE`].
 /// This is what it reserves from the caller's memory budget (#254).
-pub fn touched(size: usize) -> u64 {
+pub(crate) fn touched(size: usize) -> u64 {
     (size / 3) as u64
 }
 

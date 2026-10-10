@@ -2891,10 +2891,18 @@ fn memory_budget_bounds_bytes_in_flight() {
         // files plan a 16 MiB+ thread) goes through alone, like a file
         // bigger than the budget (#254), so it may come on top.
         let scratch = sum["stats"]["memory"]["scratch_peak"].as_u64().unwrap();
-        assert!(
-            peak <= cap + scratch,
-            "{mode:?}: peak {peak} > budget {cap} + scratch {scratch}"
-        );
+        if scratch <= cap {
+            assert!(peak <= cap, "{mode:?}: peak {peak} > budget {cap}");
+        } else {
+            // At most one stack over the cap, never a byte overrun.
+            // touched(MAX_PARSE_STACK): the 2 GiB cap over its 3x margin.
+            let one = (2u64 << 30) / 3;
+            assert!(scratch <= one, "{mode:?}: scratch {scratch} > one stack");
+            assert!(
+                peak <= cap + scratch,
+                "{mode:?}: peak {peak} > budget {cap} + scratch {scratch}"
+            );
+        }
         if !mode.contains(&"--deterministic") {
             assert_eq!(cap, 16 * 1024, "adaptive keeps the requested budget");
             assert!(sum["stats"]["transactions"].as_u64().unwrap() > 1);

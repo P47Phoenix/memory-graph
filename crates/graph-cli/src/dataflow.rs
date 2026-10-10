@@ -335,6 +335,12 @@ impl Budget {
     /// waits on it (the writer commits in walk order), so waiting longer
     /// could never end. Or when `cancel` is set.
     pub fn acquire_scratch(&self, n: u64, oldest: &dyn Fn() -> bool, cancel: &AtomicBool) {
+        // Lock order: `oldest()` takes the pipeline's `inflight` lock while
+        // `used` is held (`used` -> `inflight`); nothing takes `used` while
+        // holding `inflight`. A benign race: a younger job can briefly see
+        // itself as oldest (an older job just left `inflight` but has not
+        // reached the writer yet). It then goes over the cap only while no
+        // other scratch is held, so at most one stack is ever over the cap.
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         while *used + n > self.cap.load(Relaxed)
             && !(self.scratch.load(Relaxed) == 0 && oldest())
