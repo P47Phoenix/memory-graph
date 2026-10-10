@@ -831,6 +831,16 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         return r;
     };
+    // ADR 0009 D5/D9: one `mcp.tools_call` span per tool call, with the
+    // tool's (bounded) label and the outcome; never its arguments.
+    let span = match &tool {
+        Some(t) => tracing::info_span!(
+            "mcp.tools_call",
+            memory_graph.tool = %t,
+            outcome = tracing::field::Empty,
+        ),
+        None => tracing::Span::none(),
+    };
     let rt = tokio::runtime::Handle::current();
     let svc = Arc::clone(&st.svc);
     let view = st.view;
@@ -852,13 +862,19 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             .expect("a session holds a supported version");
         server.handle_bytes(&bytes)
     });
-    let outcome = tokio::time::timeout(st.call_timeout, work).await;
+    let outcome = {
+        use tracing::Instrument;
+        tokio::time::timeout(st.call_timeout, work)
+            .instrument(span.clone())
+            .await
+    };
     let reply = match outcome {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "MCP call failed");
             if let Some(t) = &tool {
                 st.ctx.raft.obs.observe_mcp_call(t, "internal");
+                span.record("outcome", "internal");
             }
             let id = parsed.as_ref().and_then(|v| v.get("id")).cloned();
             return json_reply(
@@ -869,6 +885,7 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         Err(_) => {
             if let Some(t) = &tool {
                 st.ctx.raft.obs.observe_mcp_call(t, "timeout");
+                span.record("outcome", "timeout");
             }
             if !has_id {
                 return StatusCode::ACCEPTED.into_response();
@@ -891,7 +908,9 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         return StatusCode::ACCEPTED.into_response();
     };
     if let Some(t) = &tool {
-        st.ctx.raft.obs.observe_mcp_call(t, call_outcome(&reply));
+        let outcome = call_outcome(&reply);
+        st.ctx.raft.obs.observe_mcp_call(t, outcome);
+        span.record("outcome", outcome);
     }
     json_reply(StatusCode::OK, reply)
 }

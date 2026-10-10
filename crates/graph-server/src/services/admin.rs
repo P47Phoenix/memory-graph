@@ -757,6 +757,7 @@ macro_rules! on_leader {
                 .deadline($req.metadata(), crate::forward::FORWARD_ADMIN_TIMEOUT);
             let mut client = $self.ctx.fwd.admin_client(&addr)?;
             let resp = crate::forward::within(
+                $self.ctx.fwd.me(),
                 deadline,
                 client.$method(crate::forward::Forwarder::request(
                     $req.into_inner(),

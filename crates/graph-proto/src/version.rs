@@ -15,12 +15,15 @@ use tonic::{Request, Status};
 /// The metadata key carrying the client's protocol version.
 pub const PROTOCOL_VERSION_HEADER: &str = "mg-protocol-version";
 
-/// Client-side interceptor: stamps [`PROTOCOL_VERSION`] on every request.
+/// Client-side interceptor: stamps [`PROTOCOL_VERSION`] on every request,
+/// and the caller's W3C trace context when its span has one (ADR 0009 D5,
+/// [`crate::trace_context`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendVersion;
 
 impl Interceptor for SendVersion {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        crate::trace_context::inject_current(req.metadata_mut());
         req.metadata_mut().insert(
             PROTOCOL_VERSION_HEADER,
             PROTOCOL_VERSION

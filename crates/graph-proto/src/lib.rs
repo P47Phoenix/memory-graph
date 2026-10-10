@@ -20,6 +20,7 @@
 pub mod convert;
 pub mod error;
 pub mod read_meta;
+pub mod trace_context;
 pub mod version;
 
 /// The generated `memory_graph.v1` package.

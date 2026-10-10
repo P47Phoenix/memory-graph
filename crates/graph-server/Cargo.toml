@@ -23,8 +23,10 @@ prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# The OpenTelemetry layer and its per-layer filter (ADR 0009 D5).
+tracing-subscriber.workspace = true
 # OTLP export (ADR 0009): providers in `telemetry`, off unless configured.
-# tracing-opentelemetry and the appender are wired by O2/O4.
+# Traces (story 51) go through tracing-opentelemetry; the appender is O4.
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true

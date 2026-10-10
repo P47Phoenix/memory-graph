@@ -10,8 +10,17 @@
 //!   target/release/memory-graph --db /tmp/corpus.redb index --org corpus --repo "$(basename "$r")" "$r"
 //! done
 //! cargo run --release -p graph-client --example rpc_bench -- /tmp/corpus.redb \
-//!   [--iters 500] [--rare TEXT] [--common TEXT]
+//!   [--iters 500] [--rare TEXT] [--common TEXT] [--otlp] [--writes N]
 //! ```
+//!
+//! `--otlp` (ADR 0009 D5): the in-process server runs with OpenTelemetry
+//! traces on, exporting to an in-process `FakeCollector` (this process's
+//! global subscriber gets the OpenTelemetry layer, so the client spans and
+//! W3C propagation are on too). Compare with a run without it.
+//! `--writes N` also times N single-file writes (`index_bytes`, a new file
+//! each), which with `--otlp` pay the leader's `ApplyLinks` hashing; the
+//! writes change the database, so run on a copy. A line also times the
+//! hash alone on a 1 MiB and a 4 MiB entry.
 //!
 //! The server runs in this process (its own runtime, `graph_server::testing`)
 //! on 127.0.0.1: every remote call is a real TCP round trip through tonic,
@@ -27,6 +36,8 @@ struct Args {
     iters: usize,
     rare: String,
     common: String,
+    otlp: bool,
+    writes: usize,
 }
 
 fn args() -> Args {
@@ -36,12 +47,16 @@ fn args() -> Args {
         iters: 500,
         rare: "Ensure".into(),
         common: "return".into(),
+        otlp: false,
+        writes: 0,
     };
     while let Some(x) = a.next() {
         match x.as_str() {
             "--iters" => out.iters = a.next().and_then(|v| v.parse().ok()).expect("--iters N"),
             "--rare" => out.rare = a.next().expect("--rare TEXT"),
             "--common" => out.common = a.next().expect("--common TEXT"),
+            "--otlp" => out.otlp = true,
+            "--writes" => out.writes = a.next().and_then(|v| v.parse().ok()).expect("--writes N"),
             p => out.db = PathBuf::from(p),
         }
     }
@@ -120,6 +135,26 @@ fn main() {
     }
     drop(embedded);
 
+    // OpenTelemetry on for the remote half only (the embedded half never
+    // exports): a collector in this process, traces only.
+    let telemetry = a.otlp.then(|| {
+        use graph_server::telemetry::{self, NodeIdentity, TelemetryConfig, TelemetryOptions};
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let collector = graph_server::testing::FakeCollector::start();
+        let options = TelemetryOptions {
+            endpoint: Some(collector.endpoint()),
+            signals: Some("traces".into()),
+            ..Default::default()
+        };
+        let cfg = TelemetryConfig::resolve_with_env(&options, &NodeIdentity::default(), |_| None)
+            .expect("telemetry config");
+        let guard = telemetry::init(&cfg).expect("telemetry").expect("on");
+        tracing_subscriber::registry()
+            .with(telemetry::tracing_layer(&guard).expect("traces"))
+            .init();
+        (collector, guard)
+    });
     let server = TestServer::start(&a.db, vec![]);
     let remote = RemoteStore::connect(ClientConfig::new(server.endpoint())).expect("connect");
     let ping = measure(a.iters, || {
@@ -129,8 +164,22 @@ fn main() {
     for (_, op) in &ops {
         remote_rows.push(measure(a.iters, || op(&remote)));
     }
+    let writes = (a.writes > 0).then(|| {
+        let mut i = 0usize;
+        measure(a.writes, || {
+            i += 1;
+            let src = format!("pub fn bench_write_{i}() -> usize {{ {i} }}\n");
+            remote
+                .index_bytes("bench", "writes", &format!("w{i}.rs"), src.as_bytes(), None)
+                .unwrap();
+        })
+    });
     drop(remote);
     drop(server);
+    let spans = telemetry.map(|(collector, guard)| {
+        guard.shutdown_blocking();
+        collector.received().spans().len()
+    });
 
     println!(
         "db {} ({} MB), {} iterations each; rare `{}` = {} hits, common `{}` = {} hits (limit 100)",
@@ -162,5 +211,30 @@ fn main() {
             ms(r50.saturating_sub(*e50))
         );
     }
+    if let Some((p50, p95)) = writes {
+        println!(
+            "| write (index_bytes, remote) | - | - | {} | {} | - |",
+            ms(p50),
+            ms(p95)
+        );
+    }
     println!("(milliseconds)");
+    println!(
+        "otlp: {}",
+        match spans {
+            Some(n) => format!("on, {n} spans exported"),
+            None => "off".into(),
+        }
+    );
+    // The leader's ApplyLinks key (the same hasher), per entry size.
+    for mib in [1usize, 4] {
+        use std::hash::{Hash, Hasher};
+        let buf = vec![0x5au8; mib << 20];
+        let (p50, _) = measure(50, || {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            buf.hash(&mut h);
+            std::hint::black_box(h.finish());
+        });
+        println!("ApplyLinks hash of a {mib} MiB entry: p50 {} ms", ms(p50));
+    }
 }

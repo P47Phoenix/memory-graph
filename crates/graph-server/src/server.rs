@@ -913,7 +913,10 @@ pub async fn start(
 
     let no_limit = usize::MAX;
     let router = tonic::transport::Server::builder()
-        .layer(crate::observe::RpcLayer::new(Arc::clone(&obs)))
+        .layer(
+            crate::observe::RpcLayer::new(Arc::clone(&obs))
+                .with_server_address(&ctx.info.advertise),
+        )
         .add_service(health)
         .add_service(InterceptedService::new(
             StoreServer::new(StoreService {

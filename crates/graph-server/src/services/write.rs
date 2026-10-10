@@ -39,6 +39,7 @@ macro_rules! forward_unary {
             .deadline(req.metadata(), crate::forward::FORWARD_UNARY_TIMEOUT);
         let mut client = $self.ctx.fwd.write_client(&$addr)?;
         let resp = crate::forward::within(
+            $self.ctx.fwd.me(),
             deadline,
             client.$method(Forwarder::request(req.into_inner(), deadline)),
         )
@@ -67,6 +68,7 @@ impl WriteService {
         let mut client = self.ctx.fwd.write_client(addr)?;
         let (tx, rx) = tokio::sync::mpsc::channel::<pb::IndexRequest>(FORWARD_BUFFER);
         let call = crate::forward::within(
+            self.ctx.fwd.me(),
             deadline,
             client.index(Forwarder::request(
                 tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -103,6 +105,74 @@ impl WriteService {
         let mut resp = resp.into_inner();
         resp.forwarded_to_leader = true;
         Ok(Response::new(resp))
+    }
+
+    /// The `Index` stream, on the leader: cut into entries and proposed.
+    async fn index_here(
+        &self,
+        mut stream: Streaming<pb::IndexRequest>,
+        span: &tracing::Span,
+    ) -> Result<Response<pb::IndexResponse>, Status> {
+        let header = match stream.next().await {
+            Some(Ok(pb::IndexRequest {
+                msg: Some(pb::index_request::Msg::Header(h)),
+            })) => h,
+            Some(Ok(_)) => {
+                return Err(
+                    ConvertError("Index stream must start with an IndexHeader".into()).into(),
+                )
+            }
+            Some(Err(e)) => return Err(e),
+            None => return Err(ConvertError("empty Index stream".into()).into()),
+        };
+        let reindex = header.options.map(|o| o.reindex).unwrap_or(false);
+        let mut results = Vec::new();
+        let mut applied_index = 0;
+        let mut entries = 0usize;
+        let mut pending: Vec<pb::FileBytes> = Vec::new();
+        let mut pending_bytes = 0usize;
+        while let Some(msg) = stream.next().await {
+            let file = match msg?.msg {
+                Some(pb::index_request::Msg::File(f)) => f,
+                Some(pb::index_request::Msg::Header(_)) => {
+                    return Err(ConvertError("a second IndexHeader in the stream".into()).into())
+                }
+                None => return Err(ConvertError("empty IndexRequest".into()).into()),
+            };
+            // A bad encoding hint is refused before anything is proposed.
+            file.resolved_encoding_hint()?;
+            if !pending.is_empty() && pending_bytes + file.bytes.len() > RAFT_ENTRY_MAX_BYTES {
+                let (r, idx) = self
+                    .index_chunk(
+                        &header.org,
+                        &header.repo,
+                        reindex,
+                        std::mem::take(&mut pending),
+                    )
+                    .await?;
+                results.extend(r);
+                applied_index = idx;
+                entries += 1;
+                pending_bytes = 0;
+            }
+            pending_bytes += file.bytes.len();
+            pending.push(file);
+        }
+        if !pending.is_empty() {
+            let (r, idx) = self
+                .index_chunk(&header.org, &header.repo, reindex, pending)
+                .await?;
+            results.extend(r);
+            applied_index = idx;
+            entries += 1;
+        }
+        span.record("memory_graph.files", results.len());
+        span.record("memory_graph.entries", entries);
+        Ok(Response::new(pb::IndexResponse {
+            results,
+            forwarded_to_leader: false,
+            applied_index,
+        }))
     }
 
     async fn propose(&self, cmd: Cmd) -> Result<(LogResponse, u64), Status> {
@@ -192,62 +262,17 @@ impl pb::write_server::Write for WriteService {
         if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
             return self.forward_index(&addr, req).await;
         }
-        let mut stream = req.into_inner();
-        let header = match stream.next().await {
-            Some(Ok(pb::IndexRequest {
-                msg: Some(pb::index_request::Msg::Header(h)),
-            })) => h,
-            Some(Ok(_)) => {
-                return Err(
-                    ConvertError("Index stream must start with an IndexHeader".into()).into(),
-                )
-            }
-            Some(Err(e)) => return Err(e),
-            None => return Err(ConvertError("empty Index stream".into()).into()),
-        };
-        let reindex = header.options.map(|o| o.reindex).unwrap_or(false);
-        let mut results = Vec::new();
-        let mut applied_index = 0;
-        let mut pending: Vec<pb::FileBytes> = Vec::new();
-        let mut pending_bytes = 0usize;
-        while let Some(msg) = stream.next().await {
-            let file = match msg?.msg {
-                Some(pb::index_request::Msg::File(f)) => f,
-                Some(pb::index_request::Msg::Header(_)) => {
-                    return Err(ConvertError("a second IndexHeader in the stream".into()).into())
-                }
-                None => return Err(ConvertError("empty IndexRequest".into()).into()),
-            };
-            // A bad encoding hint is refused before anything is proposed.
-            file.resolved_encoding_hint()?;
-            if !pending.is_empty() && pending_bytes + file.bytes.len() > RAFT_ENTRY_MAX_BYTES {
-                let (r, idx) = self
-                    .index_chunk(
-                        &header.org,
-                        &header.repo,
-                        reindex,
-                        std::mem::take(&mut pending),
-                    )
-                    .await?;
-                results.extend(r);
-                applied_index = idx;
-                pending_bytes = 0;
-            }
-            pending_bytes += file.bytes.len();
-            pending.push(file);
-        }
-        if !pending.is_empty() {
-            let (r, idx) = self
-                .index_chunk(&header.org, &header.repo, reindex, pending)
-                .await?;
-            results.extend(r);
-            applied_index = idx;
-        }
-        Ok(Response::new(pb::IndexResponse {
-            results,
-            forwarded_to_leader: false,
-            applied_index,
-        }))
+        // ADR 0009 D5: one `index_batch` span per Index stream handled
+        // here, a child of its `rpc` span (counts only, never paths).
+        use tracing::Instrument;
+        let span = tracing::info_span!(
+            "index_batch",
+            memory_graph.files = tracing::field::Empty,
+            memory_graph.entries = tracing::field::Empty,
+        );
+        self.index_here(req.into_inner(), &span)
+            .instrument(span.clone())
+            .await
     }
 
     async fn index_file(
