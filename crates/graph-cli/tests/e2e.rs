@@ -3223,13 +3223,17 @@ fn symbols_prefix_matches_but_infix_does_not() {
         (&["symbols", "Gadget"][..], true),
         (&["symbols", "gadget"][..], true),
         (&["symbols", "Gad*"][..], true),
+        (&["symbols", "gad*"][..], true),
+        (&["symbols", "--exact-case", "Gad*"][..], true),
         (&["symbols", "--exact-case", "gad*"][..], false),
+        (&["symbols", "*"][..], true),
         (&["symbols", "Get"][..], false),
         (&["symbols", "dget"][..], false),
         (&["symbols", "*dget"][..], false),
         (&["search", "Gadget"][..], true),
         (&["search", "Gad"][..], false),
         (&["search", "gadget"][..], false),
+        (&["search", "Gad*"][..], false),
     ] {
         let mut full = vec!["--db", db.as_str()];
         full.extend_from_slice(args);
