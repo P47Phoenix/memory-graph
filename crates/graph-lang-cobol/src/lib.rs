@@ -162,7 +162,8 @@ impl Extractor for CobolExtractor {
         // `kw1`: reserved words are classed `keyword` (#143).
         // `dw1`: digit-led words (`1000-READ-NEXT`) are one identifier (#196).
         // `dw2`: a lone digit-led paragraph header (`100A.`) is too (#209).
-        format!("cobol-scan-1+kw1+dw2+tok{TOKENIZER_VERSION}")
+        // `dw3`: and a digit-led section header (`100A SECTION.`, #268).
+        format!("cobol-scan-1+kw1+dw3+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
@@ -280,7 +281,8 @@ pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
 /// A lone digit-led word with a letter (`100A`, `9X`) lexes as a number
 /// literal. It is a user-defined word only where nothing but a word can
 /// stand: a paragraph header, i.e. a sentence start in Area A (columns
-/// 8-11 in fixed format, first on its line in free format) followed by `.`.
+/// 8-11 in fixed format, first on its line in free format) followed by `.`,
+/// or a section header, followed by `SECTION` and `.`.
 /// Exponent literals (`1E5`, `1.5E3`) are never reclassed, and a PIC
 /// string or level-number operand is never at a sentence start.
 fn reclass_digit_led_headers(tokens: &mut [TokenDecl], free: bool) {
@@ -300,9 +302,17 @@ fn reclass_digit_led_headers(tokens: &mut [TokenDecl], free: bool) {
         let prev = k.checked_sub(1).map(|p| &tokens[code[p]]);
         let sentence_start =
             prev.is_none_or(|p| p.text == "." && p.class == TokenClass::Punctuation);
-        let next_is_period = code
-            .get(k + 1)
-            .is_some_and(|&n| tokens[n].text == "." && tokens[n].class == TokenClass::Punctuation);
+        let is_period = |at: usize| {
+            code.get(at).is_some_and(|&n| {
+                tokens[n].text == "." && tokens[n].class == TokenClass::Punctuation
+            })
+        };
+        // `100A.` (paragraph) or `100A SECTION.` (section, #268).
+        let next_is_period = is_period(k + 1)
+            || (code
+                .get(k + 1)
+                .is_some_and(|&n| tokens[n].text.eq_ignore_ascii_case("SECTION"))
+                && is_period(k + 2));
         let area_a = if free {
             prev.is_none_or(|p| p.span.end_line < t.span.start_line)
         } else {
