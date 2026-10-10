@@ -373,6 +373,9 @@ pub struct RaftHeaders {
 impl Interceptor for RaftHeaders {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         let md = req.metadata_mut();
+        // Only `install_snapshot` runs inside an exported span (ADR 0009
+        // D5); for heartbeats and AppendEntries there is none to send.
+        graph_proto::trace_context::inject_current(md);
         md.insert(
             PROTOCOL_VERSION_HEADER,
             graph_proto::PROTOCOL_VERSION
@@ -748,11 +751,36 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
         cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<NodeId>, StreamingError<TypeConfig, Fatal<NodeId>>> {
+        // One span for the whole stream, no per-chunk spans (ADR 0009 D5):
+        // a root here; `RaftHeaders` sends its context to the receiver.
+        use tracing::Instrument;
+        let span = tracing::info_span!(
+            parent: None,
+            "install_snapshot",
+            otel.kind = "client",
+            memory_graph.peer_id = self.target,
+            memory_graph.snapshot_bytes = tracing::field::Empty,
+        );
+        self.send_snapshot(vote, snapshot, cancel, &span)
+            .instrument(span.clone())
+            .await
+    }
+}
+
+impl GrpcConnection {
+    async fn send_snapshot(
+        &mut self,
+        vote: Vote<NodeId>,
+        snapshot: Snapshot<TypeConfig>,
+        cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
+        span: &tracing::Span,
+    ) -> Result<SnapshotResponse<NodeId>, StreamingError<TypeConfig, Fatal<NodeId>>> {
         let path = snapshot.snapshot.path.clone();
         let side = read_sidecar(&path).map_err(|e| self.failed(e))?;
         // Open before streaming: a newer build may remove the file later,
         // and an open handle keeps its bytes readable.
         let file = std::fs::File::open(&path).map_err(|e| self.failed(e))?;
+        span.record("memory_graph.snapshot_bytes", side.size);
         let header = pb::InstallSnapshotHeader {
             vote: Some(wire::vote_to_pb(&vote)),
             last_log_id: snapshot.meta.last_log_id.as_ref().map(wire::log_id_to_pb),

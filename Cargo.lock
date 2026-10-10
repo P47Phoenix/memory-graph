@@ -746,6 +746,7 @@ dependencies = [
  "ignore",
  "indicatif",
  "libc",
+ "opentelemetry",
  "redb",
  "rmcp",
  "rustix",
@@ -754,6 +755,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "windows-sys 0.59.0",
  "yaml-rust2",
@@ -988,6 +990,8 @@ version = "0.1.0"
 dependencies = [
  "graph-core",
  "graph-store",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "proptest",
  "prost",
  "prost-types",
@@ -996,6 +1000,8 @@ dependencies = [
  "serde_json",
  "tonic",
  "tonic-prost",
+ "tracing",
+ "tracing-opentelemetry",
 ]
 
 [[package]]
@@ -1042,6 +1048,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "windows-sys 0.59.0",
 ]
 

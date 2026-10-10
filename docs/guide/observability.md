@@ -55,6 +55,17 @@ The `mg_read_*` families (read cache phase 0, [ADR 0008](../adr/0008-read-cache.
 
 Contract note on `outcome`: it is read from the response headers, so an error a streaming call (`Descendants`, `FileTokens`, snapshot download) reports in its trailers after its first message counts as `ok`; alert on stream failures from the client side.
 
+## Traces (OpenTelemetry)
+
+Off by default ([ADR 0009](../adr/0009-opentelemetry.md)). `serve --otlp-endpoint http://HOST:4317` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) exports spans over OTLP/gRPC, without TLS, to a collector next to the node; `--otlp-signals traces` narrows the export to traces. Sampling is parent-based, always on, unless `OTEL_TRACES_SAMPLER` says otherwise.
+
+- **One trace per request across nodes.** A `RemoteStore` call is a `client` span (a child of the caller's span, when the calling program has an OpenTelemetry layer); the server's `rpc` span is its child through W3C `traceparent`/`tracestate` metadata. A follower that forwards a write opens `forward` (`memory_graph.forwarded_by`), and the leader's `rpc` is its child. The leader's `apply` of the entry runs on the state machine's task, so it is not a child: it carries a **span link** to the leader's `rpc`, with `memory_graph.log_index`. Replication to followers and their applies are not part of the request's trace (a log entry carries no trace context); a follower's `apply` is a root of its own.
+- `rpc` spans carry `rpc.system=grpc`, `rpc.service`, `rpc.method`, `rpc.grpc.status_code` (from the response headers, like `outcome`) and `server.address` (this node's advertised host). The OpenTelemetry fields are recorded only when traces are on, so the local logs are unchanged otherwise.
+- Other spans: `index_batch` (an `Index` stream on the leader, `memory_graph.files`, `memory_graph.entries`), `mcp.tools_call` (`memory_graph.tool`, `outcome`), and `install_snapshot`, one span on each side of a snapshot install (the receiver's a child of the sender's), never one per chunk.
+- **Not exported:** the Raft service's own `rpc` spans (heartbeats, AppendEntries, votes; they stay in the local logs), log events, and anything outside memory-graph's own crates. Span attributes are operational only: no query text, tool arguments, source, paths or header values.
+- **Resource:** `service.name`, `service.version`, `host.name`, `service.instance.id` (the node id) and `memory_graph.cluster`. A node's first start learns its cluster id while starting; its spans wait (up to 8,192) until it has, so the first ones carry it too.
+- **A collector that is down or stalled never fails or slows an RPC.** Each export is bounded by `OTEL_EXPORTER_OTLP_TIMEOUT` (default 10 s); failed exports and the spans they carried are counted (`telemetry::export_failures` / `dropped`, exported as `mg_otel_export_failures_total{signal}` / `mg_otel_dropped_total{signal}` with [story 52](../epic-code-memory-graph.md#story-52)), errors are logged at most once a minute, and export resumes by itself when the collector is back. Spans dropped because the SDK's queue was full are not counted yet (#250). On shutdown, queued spans are flushed, bounded by 10 s whether or not the collector answers.
+
 ## Health
 
 gRPC `grpc.health.v1`:

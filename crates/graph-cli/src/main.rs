@@ -1249,8 +1249,6 @@ fn run() -> Result<i32> {
                 return Ok(2);
             }
         };
-        graph_cli::logging::init(*log_format, log_level)?;
-        let _ = JSON_LOGS.set(*log_format == graph_cli::logging::LogFormat::Json);
         if *auto_promote && join.is_none() && bootstrap_or_join.is_none() {
             bail!("--auto-promote needs --join <peer> (or --bootstrap-or-join <peer>)");
         }
@@ -1282,6 +1280,25 @@ fn run() -> Result<i32> {
         let mut telemetry_cfg =
             graph_server::telemetry::TelemetryConfig::resolve(&telemetry_options, &identity)
                 .map_err(telemetry_exit)?;
+        // The providers start before logging: the subscriber takes the
+        // OpenTelemetry layer (traces on) when it is installed. What is
+        // known of the node's identity goes in now; the rest once `start`
+        // resolved it (the on-ready hook below, #249).
+        telemetry_cfg.apply_identity(&telemetry_identity(*node_id, data_dir.as_deref()));
+        let telemetry = graph_server::telemetry::init(&telemetry_cfg).map_err(telemetry_exit)?;
+        let otel_layer = telemetry
+            .as_ref()
+            .and_then(graph_server::telemetry::tracing_layer);
+        if otel_layer.is_some() {
+            // Spans wait for the node's identity (set on ready, below).
+            graph_server::telemetry::hold_until_identity();
+        }
+        graph_cli::logging::init(*log_format, log_level, otel_layer)?;
+        let _ = JSON_LOGS.set(*log_format == graph_cli::logging::LogFormat::Json);
+        telemetry_cfg.log_problems();
+        if let (Some(_), Some(endpoint)) = (&telemetry, &telemetry_cfg.endpoint) {
+            tracing::info!(%endpoint, "OpenTelemetry export on");
+        }
         let bootstrap_or_join = match bootstrap_or_join {
             Some(peer) => {
                 let ordinal = graph_server::paths::hostname_ordinal(&host)
@@ -1544,13 +1561,13 @@ fn run() -> Result<i32> {
             (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
         };
         let log_format = *log_format;
-        telemetry_cfg.apply_identity(&telemetry_identity(*node_id, data_dir.as_deref()));
-        let telemetry = graph_server::telemetry::init(&telemetry_cfg).map_err(telemetry_exit)?;
-        if let (Some(_), Some(endpoint)) = (&telemetry, &telemetry_cfg.endpoint) {
-            tracing::info!(%endpoint, "OpenTelemetry export on");
-        }
         let served_result =
             graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
+                // The node's identity as `start` resolved it: a first start
+                // (bootstrap, or a join without --node-id) knows its node
+                // and cluster ids only now (#249).
+                let identity = std::sync::Arc::clone(&r.identity);
+                graph_server::telemetry::set_node_identity(r.raft.node_id, move || identity.get());
                 // Scripts and tests read these lines for the bound ports (the
                 // metrics line first: the listening line is the start signal);
                 // JSON objects under --log-format json.

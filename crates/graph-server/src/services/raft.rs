@@ -157,6 +157,32 @@ impl pb::raft_server::Raft for RaftService {
         &self,
         req: Request<Streaming<pb::InstallSnapshotRequest>>,
     ) -> Result<Response<pb::InstallSnapshotResponse>, Status> {
+        // One span for the whole stream, no per-chunk spans (ADR 0009 D5).
+        // The Raft service's `rpc` span is not exported, so its parent is
+        // the sender's `install_snapshot`, from the extracted traceparent.
+        use tracing::Instrument;
+        let span = tracing::info_span!(
+            parent: None,
+            "install_snapshot",
+            otel.kind = "server",
+            memory_graph.snapshot_bytes = tracing::field::Empty,
+        );
+        if let Some(parent) = req.extensions().get::<crate::observe::RemoteParent>() {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            let _ = span.set_parent(parent.0.clone());
+        }
+        self.receive_snapshot(req, &span)
+            .instrument(span.clone())
+            .await
+    }
+}
+
+impl RaftService {
+    async fn receive_snapshot(
+        &self,
+        req: Request<Streaming<pb::InstallSnapshotRequest>>,
+        span: &tracing::Span,
+    ) -> Result<Response<pb::InstallSnapshotResponse>, Status> {
         self.check_headers(&req, true)?;
         self.obs.note_heard_from_leader();
         let mut stream = req.into_inner();
@@ -178,6 +204,7 @@ impl pb::raft_server::Raft for RaftService {
         self.disk
             .check_extra("snapshot install", header.size.saturating_mul(2))
             .map_err(disk_full)?;
+        span.record("memory_graph.snapshot_bytes", header.size);
         let vote = wire::vote_from_pb(header.vote).map_err(bad)?;
         let meta = SnapshotMeta {
             last_log_id: header.last_log_id.map(wire::log_id_from_pb),

@@ -147,20 +147,37 @@ impl Node {
     /// Start node `id` on `listen` with `extra` flags; returns once it
     /// printed its listening line.
     fn start(id: u64, dir: &Path, listen: &str, extra: &[&str]) -> Node {
+        Self::start_env(Some(id), dir, listen, extra, &[])
+    }
+
+    /// [`start`](Self::start) with environment variables, and without
+    /// `--node-id` when `id` is `None` (a joiner the leader numbers; `id`
+    /// is then 0 here, ask [`status`](Self::status)).
+    fn start_env(
+        id: Option<u64>,
+        dir: &Path,
+        listen: &str,
+        extra: &[&str],
+        env: &[(&str, &str)],
+    ) -> Node {
         let mut c = cmd();
-        c.arg("serve")
-            .arg("--data-dir")
-            .arg(dir)
-            .args(["--node-id", &id.to_string(), "--listen", listen])
+        c.arg("serve").arg("--data-dir").arg(dir);
+        if let Some(id) = id {
+            c.args(["--node-id", &id.to_string()]);
+        }
+        c.args(["--listen", listen])
             .args(RAFT_TIMING)
             // The test machine's free space is not what is being tested.
             .args(["--min-free-disk", "1"])
             .args(extra);
+        for (k, v) in env {
+            c.env(k, v);
+        }
         let started = start_serve(c, StartOptions::default());
         let (child, addr, mcp, metrics) =
             (started.child, started.addr, started.mcp, started.metrics);
         Node {
-            id,
+            id: id.unwrap_or(0),
             dir: dir.to_path_buf(),
             child: Some(child),
             addr,
@@ -1524,4 +1541,186 @@ fn mcp_on_a_follower_survives_a_leader_kill() {
     assert!(calls("search") >= 6, "{}", m.body);
     assert_eq!(calls("describe"), 1, "{}", m.body);
     drop(n3);
+}
+
+/// ADR 0009 D5 and epic story 51 (with #249): three real processes export
+/// traces to one in-test collector, and a write sent to a follower from
+/// inside a span of the test's is one trace, checked by span id: the
+/// follower's `rpc` is the client's child, `forward` the follower `rpc`'s,
+/// the leader's `rpc` the `forward`'s, and the leader's `apply` of the
+/// entry links to the leader's `rpc` (a link: the apply runs on the state
+/// machine's task, ADR 0009 D5). Every span's resource names its node and
+/// the cluster, the first ones too: node 1 bootstrapped and node 3 joined
+/// without `--node-id`, so both learn their ids only inside `start`. Last,
+/// a stalled collector does not hold up a node's shutdown.
+#[test]
+fn a_write_to_a_follower_is_one_trace_across_three_processes() {
+    use graph_server::telemetry::{
+        self, BatchTuning, NodeIdentity, TelemetryConfig, TelemetryOptions,
+    };
+    use graph_server::testing::{CollectedSpan, FakeCollector};
+    use graph_store::Store;
+    use tracing_subscriber::layer::SubscriberExt;
+    let collector = FakeCollector::start();
+    // The test process's own spans (the caller's and the client's) go to
+    // the same collector.
+    let options = TelemetryOptions {
+        endpoint: Some(collector.endpoint()),
+        signals: Some("traces".into()),
+        ..Default::default()
+    };
+    let mut cfg =
+        TelemetryConfig::resolve_with_env(&options, &NodeIdentity::default(), |_| None).unwrap();
+    cfg.batch = BatchTuning {
+        schedule_delay: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let guard = telemetry::init(&cfg).unwrap().expect("traces on");
+    let subscriber = tracing_subscriber::registry().with(telemetry::tracing_layer(&guard).unwrap());
+    let endpoint = collector.endpoint();
+    let otlp = [
+        "--otlp-endpoint",
+        endpoint.as_str(),
+        "--otlp-signals",
+        "traces",
+    ];
+    let env = [("OTEL_BSP_SCHEDULE_DELAY", "100")];
+    let d = tempfile::tempdir().unwrap();
+    let dir = |i: u64| d.path().join(format!("n{i}"));
+    let with = |a: &[&str]| -> Vec<String> {
+        a.iter().chain(otlp.iter()).map(|s| s.to_string()).collect()
+    };
+    fn args(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    let a1 = with(&["--bootstrap"]);
+    let n1 = Node::start_env(Some(1), &dir(1), "127.0.0.1:0", &args(&a1), &env);
+    wait_for("node 1 to elect itself", || {
+        (n1.leader() == Some(1)).then_some(())
+    });
+    let join = with(&["--join", n1.addr.as_str(), "--auto-promote"]);
+    let n2 = Node::start_env(Some(2), &dir(2), "127.0.0.1:0", &args(&join), &env);
+    let mut n3 = Node::start_env(Some(3), &dir(3), "127.0.0.1:0", &args(&join), &env);
+    wait_for("three voters", || (voters(&n1).len() == 3).then_some(()));
+    let n3_id = 3;
+    let cluster = n1.status().unwrap()["cluster_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(n1.leader(), Some(1));
+
+    // The write, sent to node 2 (a follower) inside the test's span.
+    let (trace, test_span_id) = tracing::subscriber::with_default(subscriber, || {
+        use opentelemetry::trace::TraceContextExt;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let root = tracing::info_span!(target: "graph_cli_e2e", "test");
+        let sc = root.context().span().span_context().clone();
+        // The client's runtime threads see the caller's span through the
+        // instrumented future (ADR 0009 D5), not through a thread default.
+        let _in = root.enter();
+        let c =
+            graph_client::RemoteStore::connect(graph_client::ClientConfig::new(&n2.addr)).unwrap();
+        c.index_bytes("o", "r", "traced.rs", b"pub fn traced() {}\n", None)
+            .unwrap();
+        (sc.trace_id().to_string(), sc.span_id().to_string())
+    });
+    // A call on node 3 too, so its own spans are exported.
+    assert!(n3.status().is_some());
+
+    let node_of = |s: &CollectedSpan| s.resource.get("service.instance.id").cloned();
+    let is_rpc_on =
+        |s: &CollectedSpan, node: u64| s.name == "rpc" && node_of(s) == Some(node.to_string());
+    let is_write_on = |s: &CollectedSpan, node: u64| {
+        is_rpc_on(s, node) && s.attr("rpc.method") == Some("IndexFile")
+    };
+    let spans = collector.wait_spans(WAIT, |all| {
+        let t: Vec<_> = all.iter().filter(|s| s.trace_id == trace).collect();
+        let leader_rpc = t.iter().find(|s| is_write_on(s, 1));
+        leader_rpc.is_some_and(|r| {
+            all.iter()
+                .any(|a| a.name == "apply" && a.links.iter().any(|l| l.1 == r.span_id))
+        }) && t.iter().any(|s| s.name == "client")
+            && all.iter().any(|s| is_rpc_on(s, n3_id))
+    });
+    let t: Vec<_> = spans.iter().filter(|s| s.trace_id == trace).collect();
+    let find = |what: &str, f: &dyn Fn(&CollectedSpan) -> bool| {
+        t.iter()
+            .copied()
+            .find(|s| f(s))
+            .unwrap_or_else(|| panic!("{what} in the trace: {t:#?}"))
+    };
+    let client = find("the client span", &|s| s.name == "client");
+    assert_eq!(
+        client.parent_span_id, test_span_id,
+        "client under the test's span"
+    );
+    let f_rpc = find("node 2's IndexFile rpc", &|s| is_write_on(s, 2));
+    assert_eq!(
+        f_rpc.parent_span_id, client.span_id,
+        "follower rpc <- client"
+    );
+    assert_eq!(f_rpc.attr("rpc.method"), Some("IndexFile"));
+    let fwd = find("the forward span", &|s| s.name == "forward");
+    assert_eq!(fwd.parent_span_id, f_rpc.span_id, "forward <- follower rpc");
+    assert_eq!(fwd.attr("memory_graph.forwarded_by"), Some("2"));
+    assert_eq!(node_of(fwd).as_deref(), Some("2"));
+    let l_rpc = find("node 1's IndexFile rpc", &|s| is_write_on(s, 1));
+    assert_eq!(l_rpc.parent_span_id, fwd.span_id, "leader rpc <- forward");
+    for s in [f_rpc, l_rpc] {
+        assert_eq!(s.attr("rpc.system"), Some("grpc"));
+        assert_eq!(s.attr("rpc.service"), Some("memory_graph.v1.Write"));
+        assert_eq!(s.attr("rpc.grpc.status_code"), Some("0"));
+        assert_eq!(s.attr("server.address"), Some("127.0.0.1"));
+    }
+    let apply = spans
+        .iter()
+        .find(|a| a.name == "apply" && a.links.iter().any(|l| l.1 == l_rpc.span_id))
+        .expect("the leader's apply links to its rpc");
+    assert_eq!(node_of(apply).as_deref(), Some("1"));
+    let link = apply.links.iter().find(|l| l.1 == l_rpc.span_id).unwrap();
+    assert_eq!(link.0, trace, "the link names the request's trace");
+    assert_eq!(
+        link.2.get("memory_graph.log_index"),
+        apply.attributes.get("index"),
+        "the link carries the log index"
+    );
+    // #249: every server span, the very first ones of nodes 1 and 3
+    // included, carries its node and the cluster.
+    let servers: Vec<_> = spans
+        .iter()
+        .filter(|s| s.resource.contains_key("host.name") && s.name != "test" && s.name != "client")
+        .collect();
+    for s in &servers {
+        assert!(
+            s.resource.contains_key("service.instance.id"),
+            "no node id: {s:#?}"
+        );
+        assert_eq!(
+            s.resource.get("memory_graph.cluster"),
+            Some(&cluster),
+            "cluster: {s:#?}"
+        );
+    }
+    assert!(spans.iter().any(|s| is_rpc_on(s, n3_id)), "node 3 exports");
+    assert!(
+        !spans
+            .iter()
+            .any(|s| s.attr("rpc.service") == Some("memory_graph.v1.Raft")),
+        "Raft rpc spans are not exported"
+    );
+
+    // D8: a stalled collector does not hold up a shutdown (the exporter's
+    // flush is bounded; serve's shutdown bound, with room for a slow CI).
+    collector.stall();
+    assert!(n3.status().is_some(), "serving with a stalled collector");
+    let t0 = Instant::now();
+    n3.shutdown();
+    assert!(
+        t0.elapsed() < Duration::from_secs(45),
+        "shutdown took {:?} with a stalled collector",
+        t0.elapsed()
+    );
+    collector.release();
+    drop((n1, n2));
+    guard.shutdown_blocking();
 }

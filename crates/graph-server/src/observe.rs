@@ -162,6 +162,9 @@ pub struct Observability {
     mcp_calls: Mutex<BTreeMap<(String, String), u64>>,
     /// Read RPCs answered and their exact repeats (ADR 0008 phase 3 gate).
     pub repeats: crate::repeats::RepeatLog,
+    /// Traced proposals in flight, for the leader's `apply` span links
+    /// (ADR 0009 D5).
+    pub apply_links: crate::telemetry::ApplyLinks,
 }
 
 impl Observability {
@@ -853,17 +856,71 @@ fn snake(camel: &str) -> String {
     s
 }
 
+/// The gRPC status code of a trailers-only response (every error tonic
+/// answers before a body), else 0 (`OK`; an error a stream reports in its
+/// trailers after the headers is not seen here).
+fn status_code_of(headers: &http::HeaderMap) -> i64 {
+    headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// `rpc.service` and `rpc.method` (OpenTelemetry semantic conventions) of
+/// a known path, `/memory_graph.v1.Store/Search` -> (`memory_graph.v1.Store`,
+/// `Search`); `unknown` for both otherwise (bounded, like [`rpc_name`]).
+pub fn rpc_parts(path: &str) -> (String, String) {
+    if rpc_name(path) == UNKNOWN_RPC {
+        return (UNKNOWN_RPC.into(), UNKNOWN_RPC.into());
+    }
+    match path.trim_start_matches('/').split_once('/') {
+        Some((svc, method)) => (svc.to_string(), method.to_string()),
+        None => (UNKNOWN_RPC.into(), UNKNOWN_RPC.into()),
+    }
+}
+
+/// The remote trace context an incoming request carried (`traceparent`),
+/// in the request's extensions for handlers that open a span of their own
+/// whose parent must be the caller's even though their `rpc` span is not
+/// exported (the Raft service's `install_snapshot`, ADR 0009 D5).
+#[derive(Clone, Debug)]
+pub struct RemoteParent(pub opentelemetry::Context);
+
+/// The host of an advertised `host:port` (`server.address`).
+fn host_of(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string(),
+        _ => addr.to_string(),
+    }
+}
+
 /// A tower layer for the tonic server: every call gets an `rpc` span
-/// (method, peer, outcome, duration_ms), a `debug` event when it ends, and
-/// an observation in `mg_rpc_duration_seconds` / `mg_rpc_total`.
+/// (method, peer, outcome, duration_ms, and the OpenTelemetry RPC
+/// attributes), a `debug` event when it ends, and an observation in
+/// `mg_rpc_duration_seconds` / `mg_rpc_total`. A W3C `traceparent` on the
+/// request makes the span its child (ADR 0009 D5).
 #[derive(Clone)]
 pub struct RpcLayer {
     obs: Arc<Observability>,
+    server_address: Arc<str>,
 }
 
 impl RpcLayer {
     pub fn new(obs: Arc<Observability>) -> Self {
-        Self { obs }
+        Self {
+            obs,
+            server_address: Arc::from(""),
+        }
+    }
+
+    /// `server.address` on every span: this node's advertised host.
+    pub fn with_server_address(mut self, advertise: &str) -> Self {
+        self.server_address = Arc::from(host_of(advertise));
+        self
     }
 }
 
@@ -873,6 +930,7 @@ impl<S> tower_layer::Layer<S> for RpcLayer {
         RpcService {
             inner,
             obs: Arc::clone(&self.obs),
+            server_address: Arc::clone(&self.server_address),
         }
     }
 }
@@ -881,9 +939,33 @@ impl<S> tower_layer::Layer<S> for RpcLayer {
 pub struct RpcService<S> {
     inner: S,
     obs: Arc<Observability>,
+    server_address: Arc<str>,
 }
 
 type BoxFut<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
+
+/// The `rpc` span; `$target` must be a constant (a span's target is fixed
+/// where the macro is called), hence one call per target. The
+/// OpenTelemetry fields start empty and are recorded only with traces on,
+/// so local logs are unchanged when OpenTelemetry is off (ADR 0009 D1).
+macro_rules! rpc_span {
+    ($target:expr, $rpc:expr, $peer:expr) => {
+        tracing::info_span!(
+            target: $target,
+            "rpc",
+            method = %$rpc,
+            peer = %$peer,
+            outcome = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+            otel.kind = tracing::field::Empty,
+            rpc.system = tracing::field::Empty,
+            rpc.service = tracing::field::Empty,
+            rpc.method = tracing::field::Empty,
+            rpc.grpc.status_code = tracing::field::Empty,
+            server.address = tracing::field::Empty,
+        )
+    };
+}
 
 impl<S, B, RB> tower_service::Service<http::Request<B>> for RpcService<S>
 where
@@ -903,11 +985,12 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
         // The clone that was polled ready serves this call (tower's rule).
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let rpc = rpc_name(req.uri().path());
+        let (svc, method) = rpc_parts(req.uri().path());
         let peer = req
             .extensions()
             .get::<ConnInfo>()
@@ -915,31 +998,55 @@ where
             .map(|p| p.to_string())
             .unwrap_or_default();
         let obs = Arc::clone(&self.obs);
-        let span = tracing::info_span!(
-            "rpc",
-            method = %rpc,
-            peer = %peer,
-            outcome = tracing::field::Empty,
-            duration_ms = tracing::field::Empty,
-        );
+        // The Raft service's spans get a target of their own, which the
+        // OpenTelemetry layer filters out (heartbeats and AppendEntries
+        // would flood the collector); local logs see them as before.
+        let span = if svc == "memory_graph.v1.Raft" {
+            rpc_span!(crate::telemetry::RAFT_RPC_TARGET, rpc, peer)
+        } else {
+            rpc_span!(module_path!(), rpc, peer)
+        };
+        let traced = crate::telemetry::traces_on();
+        if traced {
+            span.record("otel.kind", "server");
+            span.record("rpc.system", "grpc");
+            span.record("rpc.service", svc.as_str());
+            span.record("rpc.method", method.as_str());
+            span.record("server.address", &*self.server_address);
+            let parent = graph_proto::trace_context::extract(req.headers());
+            {
+                use opentelemetry::trace::TraceContextExt;
+                use tracing_opentelemetry::OpenTelemetrySpanExt;
+                if parent.span().span_context().is_valid() {
+                    // Fails only for a span the layer does not see (Raft).
+                    let _ = span.set_parent(parent.clone());
+                }
+            }
+            req.extensions_mut().insert(RemoteParent(parent));
+        }
         let fut = {
             let span = span.clone();
             async move {
                 let t = Instant::now();
                 let r = inner.call(req).await;
                 let secs = t.elapsed().as_secs_f64();
-                let outcome = match &r {
-                    Ok(resp) => outcome_of(resp.headers()),
-                    Err(_) => "transport_error".into(),
+                let (outcome, code) = match &r {
+                    Ok(resp) => (outcome_of(resp.headers()), status_code_of(resp.headers())),
+                    // UNKNOWN: the transport failed before any status.
+                    Err(_) => ("transport_error".into(), 2),
                 };
                 span.record("outcome", outcome.as_str());
+                if traced {
+                    span.record("rpc.grpc.status_code", code);
+                }
                 span.record("duration_ms", secs * 1000.0);
                 obs.observe_rpc(&rpc, &outcome, secs);
                 tracing::debug!("rpc finished");
                 r
             }
         };
-        Box::pin(fut.instrument(span))
+        let scoped = crate::telemetry::RPC_SPAN.scope(span.clone(), fut);
+        Box::pin(scoped.instrument(span))
     }
 }
 

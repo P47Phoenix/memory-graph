@@ -80,16 +80,37 @@ pub fn incoming_timeout(md: &tonic::metadata::MetadataMap) -> Option<Duration> {
 /// on it, and this node stops waiting at the same moment (a leader that
 /// hangs cannot hold the handler forever). An expired deadline answers
 /// `DEADLINE_EXCEEDED`.
+///
+/// The call runs in a `forward` span (ADR 0009 D5), a child of the
+/// request's `rpc` span, with `memory_graph.forwarded_by` = `me`;
+/// [`ForwardHeaders`] sends its W3C context, so the leader's `rpc` span is
+/// its child.
 pub async fn within<T>(
+    me: NodeId,
     deadline: Duration,
     call: impl std::future::Future<Output = Result<T, Status>>,
 ) -> Result<T, Status> {
-    match tokio::time::timeout(deadline, call).await {
+    use tracing::Instrument;
+    let span = tracing::info_span!(
+        "forward",
+        memory_graph.forwarded_by = me,
+        outcome = tracing::field::Empty,
+    );
+    let r = match tokio::time::timeout(deadline, call)
+        .instrument(span.clone())
+        .await
+    {
         Ok(r) => r,
         Err(_) => Err(Status::deadline_exceeded(format!(
             "the forwarded request got no answer from the leader within {deadline:?}"
         ))),
+    };
+    if let Err(st) = &r {
+        span.record("outcome", format!("{:?}", st.code()).as_str());
+    } else {
+        span.record("outcome", "ok");
     }
+    r
 }
 
 /// Stamps the protocol version and [`FORWARDED_BY_HEADER`] on a forwarded
@@ -102,6 +123,7 @@ pub struct ForwardHeaders {
 impl Interceptor for ForwardHeaders {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         let md = req.metadata_mut();
+        graph_proto::trace_context::inject_current(md);
         md.insert(
             PROTOCOL_VERSION_HEADER,
             PROTOCOL_VERSION
@@ -211,6 +233,11 @@ impl Forwarder {
         let mut r = Request::new(msg);
         r.set_timeout(deadline);
         r
+    }
+
+    /// This node's id (`memory_graph.forwarded_by` on a `forward` span).
+    pub fn me(&self) -> NodeId {
+        self.me
     }
 
     /// Requests this node forwarded to a leader so far.
@@ -393,15 +420,18 @@ mod tests {
     #[tokio::test]
     async fn a_forward_past_its_deadline_is_deadline_exceeded() {
         let st = within(
+            1,
             Duration::from_millis(10),
             std::future::pending::<Result<(), Status>>(),
         )
         .await
         .unwrap_err();
         assert_eq!(st.code(), Code::DeadlineExceeded);
-        assert!(within(Duration::from_secs(1), async { Ok::<_, Status>(1) })
-            .await
-            .is_ok());
+        assert!(
+            within(1, Duration::from_secs(1), async { Ok::<_, Status>(1) })
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
