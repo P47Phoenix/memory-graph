@@ -840,7 +840,7 @@ Design: [ADR 0010](adr/0010-symbol-lookup-and-positions.md) D4.
 
 <a id="story-58"></a>
 **58. Derived tables self-heal after an older binary writes to the file (3 pts)**
-Status: Added 2026-10-09 (#276). Counted in the totals.
+Status: Added 2026-10-09 (#276). Counted in the totals. Implemented: detection keys on each repo's `r\0{org}\0{repo}` catalog row, which every v2 binary inserts as 0 on every ingest and story 58's binaries write as 1, plus the `sym_idx`/`sym_fold` and `stream`/`refs`/`content_files` lengths that an older binary's removal leaves apart (`old_writer_detected` in `graph-store/src/v2.rs`).
 As an operator who rolls back to an older binary and forward again
 I want derived tables rebuilt when a writer that does not maintain them touched the file
 So that symbol lookup never returns silently stale or missing results.

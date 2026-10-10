@@ -3675,7 +3675,6 @@ fn a_crash_during_the_sym_fold_rebuild_is_rebuilt_on_the_next_open() {
     let p = d.path().join("v.redb");
     sym_fold_fixture(&V2Store::open(&p).unwrap());
     damage_sym_fold(&p, None, false);
-    let damaged = sha(&p);
     crate::v2::SYM_FOLD_REBUILD_FAIL_AFTER.with(|c| c.set(Some(2)));
     let failed = V2Store::open(&p);
     crate::v2::SYM_FOLD_REBUILD_FAIL_AFTER.with(|c| c.set(None));
@@ -3683,8 +3682,12 @@ fn a_crash_during_the_sym_fold_rebuild_is_rebuilt_on_the_next_open() {
         panic!("the failpoint must fail the open");
     };
     assert!(msg.contains("failpoint"), "{msg}");
-    // Nothing of the half-done rebuild was committed.
-    assert_eq!(sha(&p), damaged);
+    // Nothing of the half-done rebuild was committed. (The missing table
+    // also leaves `sym_idx` and `sym_fold` lengths apart, the story-58 old
+    // writer check, so the refs rebuild before it did commit.)
+    let db = redb::Database::open(&p).unwrap();
+    assert!(crate::v2::sym_fold_needs_rebuild(&db).unwrap());
+    drop(db);
     assert_sym_fold_healed(&p);
 }
 
