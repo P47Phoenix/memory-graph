@@ -3,8 +3,12 @@
 //! Off by default: with no endpoint configured, [`init`] returns `None` and
 //! no provider, exporter, thread or runtime exists. With one, it builds the
 //! tracer, meter and logger providers (OTLP gRPC exporters, batch span and
-//! log processors, a periodic metric reader) for the selected signals. No
-//! instrument, `tracing` layer or global provider is registered here: O2-O4
+//! log processors, a metric reader) for the selected signals. Metrics
+//! (story 52, `metrics`): the server attaches its node through
+//! [`TelemetryGuard::metrics`], and every `/metrics` family is exported
+//! under the [`METRIC_MAPPING`] names. Exports are counted per signal
+//! (`counting`: `mg_otel_export_failures_total`, `mg_otel_dropped_total`).
+//! No `tracing` layer or global provider is registered here: O2 and O4
 //! attach those to the providers this guard holds.
 //!
 //! Configuration precedence, highest first: a `serve` flag, its key in the
@@ -29,7 +33,19 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+mod counting;
+mod metrics;
+use counting::Accounting;
+pub use counting::{
+    otel_counters, OtelCounter, PipelineCounts, DROPPED_HELP, EXPORT_FAILURES_HELP, SIGNALS,
+};
+pub use metrics::{
+    rpc_attributes, status_code, CollectionCounts, OtlpMetrics, OtlpRecorders, SnapshotSource,
+    APPLY_DURATION, RPC_DURATION,
+};
 
 /// `service.name` when nothing else names the service.
 pub const DEFAULT_SERVICE_NAME: &str = "memory-graph";
@@ -412,6 +428,20 @@ struct Providers {
     tracer: Option<SdkTracerProvider>,
     meter: Option<SdkMeterProvider>,
     logger: Option<SdkLoggerProvider>,
+    /// The meter provider's node hook (story 52).
+    metrics: Option<OtlpMetrics>,
+    /// Per-signal export accounting, in [`SIGNALS`] order.
+    accounting: [Option<Arc<Accounting>>; 3],
+}
+
+/// A batch queue bound: the test tuning, else the SDK's variable, else its
+/// default. The same value bounds the counting processor and the SDK's
+/// channel, so the SDK never drops silently (see `counting`).
+fn queue_bound(tuning: Option<usize>, var: &str) -> usize {
+    tuning
+        .or_else(|| std::env::var(var).ok()?.trim().parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2_048)
 }
 
 impl Providers {
@@ -427,6 +457,7 @@ impl Providers {
             TelemetryError::Build(format!("{what} exporter: {e}"))
         };
         let timeout = cfg.batch.export_timeout;
+        let mut accounting: [Option<Arc<Accounting>>; 3] = [None, None, None];
         let tracer = if cfg.signals.traces {
             let mut b = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
@@ -435,9 +466,22 @@ impl Providers {
                 b = b.with_timeout(t);
             }
             let exporter = b.build().map_err(|e| built("span", e))?;
-            let processor = opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter)
-                .with_batch_config(span_batch_config(&cfg.batch))
-                .build();
+            let bound = queue_bound(
+                cfg.batch.max_queue_size,
+                opentelemetry_sdk::trace::OTEL_BSP_MAX_QUEUE_SIZE,
+            );
+            let acct = Accounting::new(0, bound);
+            accounting[0] = Some(Arc::clone(&acct));
+            let exporter = counting::CountingSpanExporter {
+                inner: exporter,
+                acct: Arc::clone(&acct),
+            };
+            let processor = counting::CountingSpanProcessor {
+                inner: opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter)
+                    .with_batch_config(span_batch_config(&cfg.batch, bound))
+                    .build(),
+                acct,
+            };
             Some(
                 SdkTracerProvider::builder()
                     .with_span_processor(processor)
@@ -455,15 +499,22 @@ impl Providers {
                 b = b.with_timeout(t);
             }
             let exporter = b.build().map_err(|e| built("metric", e))?;
-            let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-                .with_interval(cfg.metrics_interval)
-                .build();
-            Some(
-                SdkMeterProvider::builder()
-                    .with_reader(reader)
-                    .with_resource(resource.clone())
-                    .build(),
+            let acct = Accounting::new(1, usize::MAX);
+            accounting[1] = Some(Arc::clone(&acct));
+            let cache = Arc::new(metrics::SnapshotCache::default());
+            let reader = metrics::OtlpReader::start(
+                exporter,
+                cfg.metrics_interval,
+                Arc::clone(&cache),
+                acct,
+                tokio::runtime::Handle::current(),
             )
+            .map_err(|e| TelemetryError::Build(format!("metric reader thread: {e}")))?;
+            let provider = SdkMeterProvider::builder()
+                .with_reader(reader)
+                .with_resource(resource.clone())
+                .build();
+            Some(OtlpMetrics::new(provider, cache))
         } else {
             None
         };
@@ -475,9 +526,22 @@ impl Providers {
                 b = b.with_timeout(t);
             }
             let exporter = b.build().map_err(|e| built("log", e))?;
-            let processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(exporter)
-                .with_batch_config(log_batch_config(&cfg.batch))
-                .build();
+            let bound = queue_bound(
+                cfg.batch.max_queue_size,
+                opentelemetry_sdk::logs::OTEL_BLRP_MAX_QUEUE_SIZE,
+            );
+            let acct = Accounting::new(2, bound);
+            accounting[2] = Some(Arc::clone(&acct));
+            let exporter = counting::CountingLogExporter {
+                inner: exporter,
+                acct: Arc::clone(&acct),
+            };
+            let processor = counting::CountingLogProcessor {
+                inner: opentelemetry_sdk::logs::BatchLogProcessor::builder(exporter)
+                    .with_batch_config(log_batch_config(&cfg.batch, bound))
+                    .build(),
+                acct,
+            };
             Some(
                 SdkLoggerProvider::builder()
                     .with_log_processor(processor)
@@ -489,8 +553,10 @@ impl Providers {
         };
         Ok(Providers {
             tracer,
-            meter,
+            meter: meter.as_ref().map(|m| m.provider.clone()),
             logger,
+            metrics: meter,
+            accounting,
         })
     }
 
@@ -513,24 +579,18 @@ impl Providers {
     }
 }
 
-fn span_batch_config(t: &BatchTuning) -> opentelemetry_sdk::trace::BatchConfig {
-    let mut b = opentelemetry_sdk::trace::BatchConfigBuilder::default();
+fn span_batch_config(t: &BatchTuning, bound: usize) -> opentelemetry_sdk::trace::BatchConfig {
+    let mut b = opentelemetry_sdk::trace::BatchConfigBuilder::default().with_max_queue_size(bound);
     if let Some(d) = t.schedule_delay {
         b = b.with_scheduled_delay(d);
-    }
-    if let Some(n) = t.max_queue_size {
-        b = b.with_max_queue_size(n);
     }
     b.build()
 }
 
-fn log_batch_config(t: &BatchTuning) -> opentelemetry_sdk::logs::BatchConfig {
-    let mut b = opentelemetry_sdk::logs::BatchConfigBuilder::default();
+fn log_batch_config(t: &BatchTuning, bound: usize) -> opentelemetry_sdk::logs::BatchConfig {
+    let mut b = opentelemetry_sdk::logs::BatchConfigBuilder::default().with_max_queue_size(bound);
     if let Some(d) = t.schedule_delay {
         b = b.with_scheduled_delay(d);
-    }
-    if let Some(n) = t.max_queue_size {
-        b = b.with_max_queue_size(n);
     }
     b.build()
 }
@@ -567,6 +627,24 @@ impl TelemetryGuard {
 
     pub fn logger_provider(&self) -> Option<&SdkLoggerProvider> {
         self.inner.as_ref()?.providers.logger.as_ref()
+    }
+
+    /// The OTLP metrics hook to hand to the server
+    /// (`ServeConfig::otlp_metrics`), when metrics are on.
+    pub fn metrics(&self) -> Option<OtlpMetrics> {
+        self.inner.as_ref()?.providers.metrics.clone()
+    }
+
+    /// One signal's export accounting (`traces`, `metrics`, `logs`), when
+    /// that signal is on.
+    #[doc(hidden)]
+    pub fn pipeline_counts(&self, signal: &str) -> Option<PipelineCounts> {
+        let i = SIGNALS.iter().position(|s| *s == signal)?;
+        Some(
+            self.inner.as_ref()?.providers.accounting[i]
+                .as_ref()?
+                .counts(),
+        )
     }
 
     /// Flush and stop, waiting at most about twice [`SHUTDOWN_TIMEOUT`];
@@ -611,6 +689,421 @@ impl Drop for TelemetryGuard {
         if let Some(inner) = self.take() {
             // Fallback only: never block whoever drops us.
             std::thread::spawn(move || inner.finish(SHUTDOWN_TIMEOUT));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The metric name mapping (ADR 0009 D6): the source of truth in code. A test
+// parses the ADR's table and compares; another checks it against
+// `observe::METRIC_NAMES` both ways.
+
+/// An OTLP instrument kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtelInstrument {
+    /// An observable gauge.
+    Gauge,
+    /// An observable up-down counter.
+    UpDownCounter,
+    /// An observable monotonic counter.
+    Counter,
+    /// A synchronous histogram ([`crate::observe::DURATION_BUCKETS`]).
+    Histogram,
+}
+
+/// One `/metrics` family and its OTLP twin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricMapping {
+    pub prometheus: &'static str,
+    /// `None`: no twin (only `mg_rpc_total`, see [`UNMAPPED`]).
+    pub otel: Option<&'static str>,
+    pub instrument: OtelInstrument,
+    pub unit: &'static str,
+    pub attributes: &'static [&'static str],
+}
+
+/// The families with no OTLP twin: `mg_rpc_total` is the count of the
+/// `rpc.server.call.duration` histogram.
+pub const UNMAPPED: [&str; 1] = ["mg_rpc_total"];
+
+const fn map(
+    prometheus: &'static str,
+    otel: &'static str,
+    instrument: OtelInstrument,
+    unit: &'static str,
+    attributes: &'static [&'static str],
+) -> MetricMapping {
+    MetricMapping {
+        prometheus,
+        otel: Some(otel),
+        instrument,
+        unit,
+        attributes,
+    }
+}
+
+/// Every `/metrics` family, in [`crate::observe::METRIC_NAMES`] order.
+pub const METRIC_MAPPING: [MetricMapping; 36] = {
+    use OtelInstrument::{Counter, Gauge, Histogram, UpDownCounter};
+    [
+        map(
+            "mg_raft_term",
+            "memory_graph.raft.term",
+            Gauge,
+            "{term}",
+            &[],
+        ),
+        map(
+            "mg_raft_leader_id",
+            "memory_graph.raft.leader_id",
+            Gauge,
+            "1",
+            &[],
+        ),
+        map(
+            "mg_raft_role",
+            "memory_graph.raft.role",
+            Gauge,
+            "1",
+            &["role"],
+        ),
+        map(
+            "mg_raft_last_log_index",
+            "memory_graph.raft.last_log_index",
+            Gauge,
+            "{entry}",
+            &[],
+        ),
+        map(
+            "mg_raft_committed_index",
+            "memory_graph.raft.committed_index",
+            Gauge,
+            "{entry}",
+            &[],
+        ),
+        map(
+            "mg_raft_applied_index",
+            "memory_graph.raft.applied_index",
+            Gauge,
+            "{entry}",
+            &[],
+        ),
+        map(
+            "mg_raft_snapshot_index",
+            "memory_graph.raft.snapshot_index",
+            Gauge,
+            "{entry}",
+            &[],
+        ),
+        map(
+            "mg_raft_purged_index",
+            "memory_graph.raft.purged_index",
+            Gauge,
+            "{entry}",
+            &[],
+        ),
+        map(
+            "mg_raft_replication_lag",
+            "memory_graph.raft.replication_lag",
+            Gauge,
+            "{entry}",
+            &["peer"],
+        ),
+        map(
+            "mg_store_bytes",
+            "memory_graph.store.size",
+            UpDownCounter,
+            "By",
+            &[],
+        ),
+        map(
+            "mg_log_bytes",
+            "memory_graph.log.size",
+            UpDownCounter,
+            "By",
+            &[],
+        ),
+        map(
+            "mg_snapshot_handles_open",
+            "memory_graph.snapshot_handles.open",
+            UpDownCounter,
+            "{handle}",
+            &[],
+        ),
+        map(
+            "mg_rpc_duration_seconds",
+            "rpc.server.call.duration",
+            Histogram,
+            "s",
+            &[
+                "rpc.system",
+                "rpc.service",
+                "rpc.method",
+                "rpc.grpc.status_code",
+            ],
+        ),
+        MetricMapping {
+            prometheus: "mg_rpc_total",
+            otel: None,
+            instrument: Counter,
+            unit: "",
+            attributes: &[],
+        },
+        map(
+            "mg_writes_forwarded_total",
+            "memory_graph.writes.forwarded",
+            Counter,
+            "{write}",
+            &[],
+        ),
+        map(
+            "mg_quorum_probes_total",
+            "memory_graph.quorum.probes",
+            Counter,
+            "{probe}",
+            &["outcome"],
+        ),
+        map(
+            "mg_apply_duration_seconds",
+            "memory_graph.raft.apply.duration",
+            Histogram,
+            "s",
+            &[],
+        ),
+        map(
+            "mg_build_info",
+            "memory_graph.build.info",
+            Gauge,
+            "1",
+            &["version", "protocol", "store_format"],
+        ),
+        map(
+            "mg_backup_last_success_timestamp",
+            "memory_graph.backup.last_success.time",
+            Gauge,
+            "s",
+            &[],
+        ),
+        map(
+            "mg_backup_last_index",
+            "memory_graph.backup.last_index",
+            Gauge,
+            "{entry}",
+            &[],
+        ),
+        map(
+            "mg_backup_failures_total",
+            "memory_graph.backup.failures",
+            Counter,
+            "{failure}",
+            &[],
+        ),
+        map(
+            "mg_backup_bytes_total",
+            "memory_graph.backup.written",
+            Counter,
+            "By",
+            &[],
+        ),
+        map(
+            "mg_mcp_tool_calls_total",
+            "memory_graph.mcp.tool_calls",
+            Counter,
+            "{call}",
+            &["tool", "outcome"],
+        ),
+        map(
+            "mg_read_decodes_total",
+            "memory_graph.read.decodes",
+            Counter,
+            "{decode}",
+            &["kind"],
+        ),
+        map(
+            "mg_read_decode_bytes_total",
+            "memory_graph.read.decode.size",
+            Counter,
+            "By",
+            &["kind"],
+        ),
+        map(
+            "mg_read_decode_seconds_total",
+            "memory_graph.read.decode.time",
+            Counter,
+            "s",
+            &["kind"],
+        ),
+        map(
+            "mg_read_queries_total",
+            "memory_graph.read.queries",
+            Counter,
+            "{query}",
+            &[],
+        ),
+        map(
+            "mg_read_query_seconds_total",
+            "memory_graph.read.query.time",
+            Counter,
+            "s",
+            &[],
+        ),
+        map(
+            "mg_read_txns_total",
+            "memory_graph.read.transactions",
+            Counter,
+            "{transaction}",
+            &[],
+        ),
+        map(
+            "mg_read_dict_strings_total",
+            "memory_graph.read.dict_strings",
+            Counter,
+            "{string}",
+            &[],
+        ),
+        map(
+            "mg_read_search_items_total",
+            "memory_graph.read.search.items",
+            Counter,
+            "{item}",
+            &["kind"],
+        ),
+        map(
+            "mg_read_search_seconds_total",
+            "memory_graph.read.search.duration",
+            Counter,
+            "s",
+            &["kind"],
+        ),
+        map(
+            "mg_queries_total",
+            "memory_graph.queries",
+            Counter,
+            "{query}",
+            &["rpc"],
+        ),
+        map(
+            "mg_query_exact_repeats_total",
+            "memory_graph.queries.exact_repeats",
+            Counter,
+            "{query}",
+            &["rpc"],
+        ),
+        map(
+            "mg_otel_export_failures_total",
+            "memory_graph.otel.export.failures",
+            Counter,
+            "{export}",
+            &["signal"],
+        ),
+        map(
+            "mg_otel_dropped_total",
+            "memory_graph.otel.dropped",
+            Counter,
+            "{item}",
+            &["signal"],
+        ),
+    ]
+};
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    /// One row of the ADR's table: (prometheus, otel, instrument, unit,
+    /// attributes); `None` where the ADR says "none".
+    type Row = (
+        String,
+        Option<String>,
+        Option<OtelInstrument>,
+        String,
+        Vec<String>,
+    );
+
+    fn ticked(cell: &str) -> Vec<String> {
+        cell.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn adr_rows() -> Vec<Row> {
+        let adr = include_str!("../../../docs/adr/0009-opentelemetry.md");
+        let start = adr
+            .find("| Prometheus name | OTel name |")
+            .expect("D6 table");
+        adr[start..]
+            .lines()
+            .skip(2)
+            .take_while(|l| l.starts_with('|'))
+            .map(|line| {
+                let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+                assert_eq!(cells.len(), 5, "{line}");
+                let prometheus = ticked(cells[0]).remove(0);
+                let otel = ticked(cells[1]).into_iter().next();
+                let instrument = match cells[2] {
+                    c if c.starts_with("gauge") => Some(OtelInstrument::Gauge),
+                    c if c.starts_with("up-down counter") => Some(OtelInstrument::UpDownCounter),
+                    c if c.starts_with("counter") => Some(OtelInstrument::Counter),
+                    c if c.starts_with("histogram") => Some(OtelInstrument::Histogram),
+                    "none" => None,
+                    other => panic!("instrument `{other}` in {line}"),
+                };
+                let unit = ticked(cells[3]).into_iter().next().unwrap_or_default();
+                (prometheus, otel, instrument, unit, ticked(cells[4]))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_const_table_equals_the_adr_table() {
+        let from_adr = adr_rows();
+        let from_code: Vec<Row> = METRIC_MAPPING
+            .iter()
+            .map(|m| {
+                (
+                    m.prometheus.to_string(),
+                    m.otel.map(str::to_string),
+                    m.otel.map(|_| m.instrument),
+                    m.unit.to_string(),
+                    m.attributes.iter().map(|a| a.to_string()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(from_code, from_adr);
+    }
+
+    #[test]
+    fn every_family_has_one_twin_and_every_twin_maps_back() {
+        let names = crate::observe::METRIC_NAMES;
+        let mapped: Vec<&str> = METRIC_MAPPING.iter().map(|m| m.prometheus).collect();
+        assert_eq!(mapped, names.to_vec(), "one row per family, in order");
+        for m in METRIC_MAPPING {
+            assert_eq!(
+                m.otel.is_none(),
+                UNMAPPED.contains(&m.prometheus),
+                "{}: only the named exception has no twin",
+                m.prometheus
+            );
+        }
+        let mut twins: Vec<&str> = METRIC_MAPPING.iter().filter_map(|m| m.otel).collect();
+        assert_eq!(twins.len(), names.len() - UNMAPPED.len());
+        twins.sort_unstable();
+        twins.dedup();
+        assert_eq!(
+            twins.len(),
+            names.len() - UNMAPPED.len(),
+            "no two families share a twin"
+        );
+        for twin in twins {
+            let back: Vec<&str> = METRIC_MAPPING
+                .iter()
+                .filter(|m| m.otel == Some(twin))
+                .map(|m| m.prometheus)
+                .collect();
+            assert_eq!(back.len(), 1, "{twin} maps back to one family");
+            assert!(names.contains(&back[0]));
         }
     }
 }
