@@ -124,6 +124,10 @@ pub const CASES: &[(&str, Case)] = &[
     ("case_insensitive_symbols", case_insensitive_symbols),
     ("sym_fold_follows_writes", sym_fold_follows_writes),
     ("file_keys_follow_writes", file_keys_follow_writes),
+    (
+        "many_candidates_keep_full_order",
+        many_candidates_keep_full_order,
+    ),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -4755,6 +4759,50 @@ fn file_keys_follow_writes(h: &Harness) {
             row("o2", "r", "b.zig", "zig"),
         ]
     );
+}
+
+/// Epic story 61: with many more candidate files than the lazy sort's first
+/// chunk (64), across orgs, repos and directories ingested out of order, an
+/// unlimited or large-limit search returns every file in full (org, repo,
+/// path) order, as do pages that cross chunk boundaries.
+fn many_candidates_keep_full_order(h: &Harness) {
+    let s = open(h);
+    let mut want: Vec<(String, String, String)> = Vec::new();
+    // 210 files, in a scrambled ingest order (i * 97 mod 210).
+    for k in 0..210u32 {
+        let i = (k * 97) % 210;
+        let org = ["ob", "oa"][(i % 2) as usize];
+        let repo = ["r3", "r1", "r2"][(i % 3) as usize];
+        let path = format!("d{}/f{:03}.zig", i % 5, (i * 37) % 211);
+        s.ingest_file(org, repo, &path, "zig", &plain("hot"))
+            .unwrap();
+        want.push((org.into(), repo.into(), path));
+    }
+    want.sort();
+    let got = |q: &Query| -> Vec<(String, String, String)> {
+        s.search(q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.org, h.repo.unwrap(), h.file.unwrap()))
+            .collect()
+    };
+    for grain in [Grain::Token, Grain::File] {
+        let mut q = Query::new("hot");
+        q.grain = grain;
+        assert_eq!(got(&q), want, "{grain:?}, no limit");
+        q.limit = Some(1000);
+        assert_eq!(got(&q), want, "{grain:?}, limit 1000");
+        for (off, lim) in [(0, 65), (60, 10), (63, 2), (100, 100), (190, 50)] {
+            q.offset = Some(off);
+            q.limit = Some(lim);
+            let end = (off + lim).min(want.len());
+            assert_eq!(
+                got(&q),
+                want[off..end],
+                "{grain:?} offset {off} limit {lim}"
+            );
+        }
+    }
 }
 
 /// The folded lookup agrees with a brute-force fold-and-filter over every

@@ -21,6 +21,8 @@ None of the current hot paths is shaped for a GPU. The real limits are the singl
 
 No ADR 0011 is proposed now.
 
+*Trigger 2 check, 2026-10-10 (epic story 61, #262):* after #246 and story 61's compact per-file sort key, the hot-term warm p95 on the A5 index (877M tokens) is **45.8 ms**: the median of 5 readbench runs, which ranged from 45.0 to 46.5 ms, down from 106.7 ms on main in the same series (see [read-cache.md](read-cache.md), story 61 section). That is well under the 100 ms threshold. Trigger 2 is not met, and the GPU stays no-go.
+
 **Measured micro-benchmark:** a 1 GiB term count took 264-406 ms end to end on GPU (RTX 3080 Ti: 380-406 ms; RX 7900 XT: 264 ms), against 27 ms with 32-thread rayon on a Ryzen 9 7950X in the same run. Host-to-GPU upload dominates (191-368 ms). Note that this goes through wgpu's `write_buffer` staging path (about 3 GB/s), not raw PCIe bandwidth, so a pipelined upload would narrow the gap. The kernel time (32-69 ms, wall-clock around submit+poll, so an upper bound, with a naive kernel) did not beat rayon either. The outputs were byte-identical on Vulkan and DX12, on both NVIDIA and AMD.
 
 **Benchmark limits:**

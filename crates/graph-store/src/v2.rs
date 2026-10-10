@@ -756,6 +756,9 @@ impl<T, F: FnMut(&T, &T) -> std::cmp::Ordering> LazySorted<T, F> {
         let cmp = &mut self.cmp;
         let mut by = |a: &Option<T>, b: &Option<T>| match (a, b) {
             (Some(a), Some(b)) => cmp(a, b),
+            // `prepare` orders only `items[pos..]`, and only `next` takes
+            // an item, always at `pos` before advancing it, so every item
+            // compared here is still `Some`.
             _ => unreachable!("only unread items are ordered"),
         };
         let rest = &mut self.items[self.pos..];
@@ -3477,9 +3480,19 @@ impl V2Store {
         }
         // Epic story 61: an older file gets its compact sort keys once.
         if rebuild_file_keys && !old_writer {
+            // O(1): redb keeps table lengths in its headers.
+            let files = {
+                use redb::ReadableTableMetadata;
+                let rt = db.begin_read()?;
+                match rt.open_table(STREAMS) {
+                    Ok(t) => t.len()?,
+                    Err(redb::TableError::TableDoesNotExist(_)) => 0,
+                    Err(e) => return Err(e.into()),
+                }
+            };
             eprintln!(
                 "memory-graph: v2 store {}: building the file sort keys \
-                 (file_keys) on open",
+                 (file_keys) for {files} files on open",
                 path.display()
             );
         }
@@ -3968,6 +3981,8 @@ impl V2Store {
             copy_multimap(&rt, &wt, CHILDREN)?;
             copy_multimap(&rt, &wt, SYMBOLS)?;
             copy_multimap(&rt, &wt, SYM_FOLD)?;
+            // Always present here: `open` creates `file_keys` on a new file
+            // and builds it on an older one before `self` exists.
             copy_table(&rt, &wt, FILE_KEYS)?;
             copy_table(&rt, &wt, DICT)?;
             copy_table(&rt, &wt, DICT_REV)?;

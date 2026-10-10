@@ -443,7 +443,7 @@ Setup:
 | ctx ms/q (warm, timing on) | 13.44 | 4.83 | -64% (-59% against #246's 11.9) |
 | walk ms/q | 0.71 | 0.79 | +0.08 (the lazy sort's later chunks) |
 
-The five p95 values were 107.8, 106.7, 108.2, 99.1 and 101.6 before, and 46.0, 46.5, 45.8, 45.2 and 45.0 after. The ctx values were 13.85, 13.44, 13.86, 12.65 and 13.01 before, and 4.94, 4.83, 4.83, 4.77 and 4.77 after.
+Spread (min to max of the 5 measured runs): warm p95 99.1 to 108.2 ms before and 45.0 to 46.5 ms after; ctx 12.65 to 13.86 ms/q before and 4.77 to 4.94 ms/q after. The five p95 values were 107.8, 106.7, 108.2, 99.1 and 101.6 before, and 46.0, 46.5, 45.8, 45.2 and 45.0 after. The ctx values were 13.85, 13.44, 13.86, 12.65 and 13.01 before, and 4.94, 4.83, 4.83, 4.77 and 4.77 after.
 
 One run per binary (the third measured run):
 
