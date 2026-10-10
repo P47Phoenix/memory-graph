@@ -537,7 +537,7 @@ fn keywords_are_classed_keyword() {
     assert_eq!(class("import"), [TokenClass::Identifier]);
     assert!(TypeScriptExtractor
         .version()
-        .starts_with("typescript-scan-4+kw1+em1+tok"));
+        .starts_with("typescript-scan-5+kw1+em1+tok"));
 }
 
 /// Review of #164: interface and type-literal members with reserved names
@@ -792,4 +792,105 @@ proptest! {
         prop_assert_eq!(&find(&s, "g").3, &format!("const g = () => {lead}{word};"));
         assert_no_wrong_symbols(&s, &src);
     }
+}
+
+/// Every pair of symbols either nests or is disjoint, and none is dropped
+/// as a partial overlap.
+fn assert_no_overlap(src: &str) {
+    assert_eq!(drops(src), 0, "{src}");
+    let ex = TypeScriptExtractor.extract(src);
+    for a in &ex.symbols {
+        for b in &ex.symbols {
+            let (x, y) = (a.span, b.span);
+            let disjoint = x.end <= y.start || y.end <= x.start;
+            let nested =
+                (x.start <= y.start && y.end <= x.end) || (y.start <= x.start && x.end <= y.end);
+            assert!(disjoint || nested, "{src}: {} overlaps {}", a.name, b.name);
+        }
+    }
+}
+
+/// Story 64 (#266): a decorator before a class member does not eat the
+/// member's name, after a field without a semicolon or after a method body.
+#[test]
+fn decorated_methods_are_found() {
+    let src = "class I { f = 1\n  @dec m() {} }";
+    assert_no_overlap(src);
+    let s = syms(src);
+    // #265 regression: `f` stays a field that ends before `@dec`.
+    assert_eq!(find(&s, "f").1, SymbolKind::Variable);
+    assert_eq!(find(&s, "f").2, "field");
+    assert_eq!(find(&s, "f").3, "f = 1");
+    assert_eq!(find(&s, "m").1, SymbolKind::Method);
+    assert_eq!(find(&s, "m").3, "m() {}");
+    assert!(s.iter().all(|x| x.0 != "dec"), "{s:#?}");
+
+    let src = "class C { @dec() m(...) {} @log n() {} }";
+    assert_no_overlap(src);
+    let s = syms(src);
+    assert_eq!(find(&s, "m").1, SymbolKind::Method);
+    assert_eq!(find(&s, "m").3, "m(...) {}");
+    assert_eq!(find(&s, "n").1, SymbolKind::Method);
+    assert_eq!(find(&s, "n").3, "n() {}");
+    let start = src.find("n() {}").unwrap() as u64;
+    let n = TypeScriptExtractor
+        .extract(src)
+        .symbols
+        .into_iter()
+        .find(|x| x.name == "n")
+        .unwrap();
+    assert_eq!((n.span.start as u64, n.span.end as u64), (start, start + 6));
+    assert_eq!((n.span.start_line, n.span.start_col), (1, start as u32 + 1));
+    assert!(s.iter().all(|x| x.0 != "log"), "{s:#?}");
+
+    // Dotted, called and stacked decorators, fields and accessors.
+    let src = "class D {\n  @a.b.c(1) @d x = 2;\n  @e get y() { return 1 }\n  @f.g z(): void {}\n}";
+    assert_no_overlap(src);
+    let s = syms(src);
+    assert_eq!(find(&s, "x").3, "x = 2;");
+    assert_eq!(find(&s, "y").2, "get");
+    assert_eq!(find(&s, "y").3, "get y() { return 1 }");
+    assert_eq!(find(&s, "z").3, "z(): void {}");
+    for bad in ["a", "b", "c", "d", "e", "g"] {
+        assert!(s.iter().all(|x| x.0 != bad), "{bad}: {s:#?}");
+    }
+}
+
+#[test]
+fn decorated_members_review_regressions() {
+    let cases = [
+        ("class C { @dec<T>() m() {} }", "m", "m() {}"),
+        ("class C { @dec({a: {b: 1}}) m() {} }", "m", "m() {}"),
+        (
+            "class C { m(@inject() x: number) {} n() {} }",
+            "m",
+            "m(@inject() x: number) {}",
+        ),
+        (
+            "class C { @dec static async m() {} }",
+            "m",
+            "static async m() {}",
+        ),
+        ("class C { @dec #p() {} }", "#p", "#p() {}"),
+        (
+            "abstract class C { @dec abstract m(): void; }",
+            "m",
+            "abstract m(): void;",
+        ),
+        ("class C {\n  @dec\n  // note\n  m() {}\n}", "m", "m() {}"),
+    ];
+    for (src, name, text) in cases {
+        assert_no_overlap(src);
+        let s = syms(src);
+        let hit = s.iter().find(|x| x.0 == name);
+        let hit = hit.unwrap_or_else(|| panic!("{src}: no {name} in {s:#?}"));
+        assert_eq!(hit.1, SymbolKind::Method, "{src}: {s:#?}");
+        assert_eq!(hit.3, text, "{src}: {s:#?}");
+        for bad in ["dec", "inject", "T", "a", "b", "x"] {
+            assert!(s.iter().all(|x| x.0 != bad), "{src}: {bad} in {s:#?}");
+        }
+    }
+    // The parameter decorator does not hide the next method.
+    let s = syms("class C { m(@inject() x: number) {} n() {} }");
+    assert_eq!(find(&s, "n").3, "n() {}");
 }

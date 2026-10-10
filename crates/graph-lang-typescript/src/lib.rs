@@ -60,7 +60,9 @@ impl Extractor for TypeScriptExtractor {
         // types, decorators and statement words end types and expressions,
         // so the two scans no longer overlap (#213).
         // `em1`: enum members are symbols (#269).
-        format!("typescript-scan-4+kw1+em1+tok{TOKENIZER_VERSION}")
+        // `scan-5`: a decorator before a class member no longer eats the
+        // member's name, so `@dec m() {}` is a method (#266).
+        format!("typescript-scan-5+kw1+em1+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
