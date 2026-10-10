@@ -499,6 +499,9 @@ impl Providers {
                 b = b.with_timeout(t);
             }
             let exporter = b.build().map_err(|e| built("metric", e))?;
+            // Metrics have no queue: points go straight from a collection
+            // into one export, so the bound is never used (`offered`, not
+            // `admit`).
             let acct = Accounting::new(1, usize::MAX);
             accounting[1] = Some(Arc::clone(&acct));
             let cache = Arc::new(metrics::SnapshotCache::default());

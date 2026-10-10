@@ -215,6 +215,16 @@ fn a_frozen_snapshot_converts_exactly() {
         if m.instrument == OtelInstrument::Histogram {
             continue; // synchronous: nothing recorded here
         }
+        // Only seconds are float instruments: a float sample anywhere else
+        // would be truncated to an integer.
+        let family = frozen.family(m.prometheus).expect(m.prometheus);
+        if family
+            .samples
+            .iter()
+            .any(|s| matches!(s.value, SampleValue::Float(_)))
+        {
+            assert_eq!(m.unit, "s", "{} has float samples", m.prometheus);
+        }
         let want = samples(&frozen, m.prometheus);
         if want.is_empty() {
             // A labelled family with nothing observed: no points either.
@@ -386,6 +396,87 @@ fn a_stalled_collector_is_counted_and_export_resumes() {
     assert!(
         collector.wait_for(FakeSignal::Metrics, before + 2, WAIT),
         "export resumes"
+    );
+    guard.shutdown_blocking();
+}
+
+fn guard_at(endpoint: String, interval: Duration) -> TelemetryGuard {
+    let options = TelemetryOptions {
+        endpoint: Some(endpoint),
+        signals: Some("metrics".into()),
+        metrics_interval: Some(interval),
+        ..Default::default()
+    };
+    let mut cfg = TelemetryConfig::resolve_with_env(&options, &NodeIdentity::default(), |_| None)
+        .expect("config");
+    cfg.batch.export_timeout = Some(Duration::from_millis(500));
+    telemetry::init(&cfg).expect("init").expect("enabled")
+}
+
+/// A collector that stops (connections closed) and comes back on the same
+/// port: failures rise while it is gone, and export resumes with no restart.
+#[test]
+fn a_stopped_collector_is_counted_and_export_resumes_after_restart() {
+    let _w = watchdog(
+        "a_stopped_collector_is_counted_and_export_resumes_after_restart",
+        TEST_LIMIT,
+    );
+    let mut collector = FakeCollector::start();
+    let guard = guard_at(collector.endpoint(), Duration::from_millis(100));
+    let otlp = guard.metrics().expect("metrics on");
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(&dir.path().join("stop.redb"), exts(), |c| {
+        c.otlp_metrics = Some(otlp.clone());
+    });
+    let client = RemoteStore::connect(ClientConfig::new(server.endpoint())).unwrap();
+    assert!(collector.wait_for(FakeSignal::Metrics, 1, WAIT));
+    collector.stop();
+    let base = guard.pipeline_counts("metrics").unwrap().failures;
+    wait_until("metrics export failures while stopped", || {
+        assert!(client.health("").unwrap(), "serving is unaffected");
+        guard.pipeline_counts("metrics").unwrap().failures >= base + 2
+    });
+    let before = collector.received().metrics.len();
+    collector.restart();
+    assert!(
+        collector.wait_for(FakeSignal::Metrics, before + 2, WAIT),
+        "export resumes after the restart"
+    );
+    guard.shutdown_blocking();
+}
+
+/// An endpoint nothing ever listened on: init and serving start at once,
+/// and the failures count from the first interval.
+#[test]
+fn a_collector_that_never_existed_delays_nothing() {
+    let _w = watchdog("a_collector_that_never_existed_delays_nothing", TEST_LIMIT);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port(); // the listener closes here: nothing listens on `port`
+    let t = Instant::now();
+    let guard = guard_at(
+        format!("http://127.0.0.1:{port}"),
+        Duration::from_millis(100),
+    );
+    let otlp = guard.metrics().expect("metrics on");
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(&dir.path().join("none.redb"), exts(), |c| {
+        c.otlp_metrics = Some(otlp.clone());
+    });
+    let client = RemoteStore::connect(ClientConfig::new(server.endpoint())).unwrap();
+    assert!(client.health("").unwrap());
+    // Generous: a start that waited on the collector would retry forever.
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
+    wait_until("the first failures", || {
+        assert!(client.health("").unwrap());
+        guard.pipeline_counts("metrics").unwrap().failures >= 1
+    });
+    let scrape = client.admin_metrics().unwrap();
+    assert!(
+        sample_sum(&scrape, "mg_otel_export_failures_total") >= 1.0,
+        "{scrape}"
     );
     guard.shutdown_blocking();
 }

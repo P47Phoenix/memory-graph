@@ -162,6 +162,17 @@ impl Accounting {
         admitted
     }
 
+    /// After the processor's shutdown returned: items never handed to the
+    /// exporter (a shutdown that timed out) are dropped. Should the
+    /// abandoned worker still export them later, they are counted again
+    /// (as exported or dropped): a known, shutdown-only over-count.
+    fn abandon_pending(&self) {
+        let n = self.pending.swap(0, Ordering::SeqCst);
+        if n > 0 {
+            self.drop_items(n);
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
     }
@@ -240,7 +251,9 @@ impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanP
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
         self.acct.close();
-        self.inner.shutdown_with_timeout(timeout)
+        let r = self.inner.shutdown_with_timeout(timeout);
+        self.acct.abandon_pending();
+        r
     }
 
     fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
@@ -311,7 +324,9 @@ impl<P: opentelemetry_sdk::logs::LogProcessor> opentelemetry_sdk::logs::LogProce
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
         self.acct.close();
-        self.inner.shutdown_with_timeout(timeout)
+        let r = self.inner.shutdown_with_timeout(timeout);
+        self.acct.abandon_pending();
+        r
     }
 
     fn event_enabled(
@@ -373,6 +388,33 @@ impl<E: opentelemetry_sdk::logs::LogExporter> opentelemetry_sdk::logs::LogExport
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Many threads at once: the bound holds exactly and every item is
+    /// either admitted or dropped.
+    #[test]
+    fn admit_holds_the_bound_under_contention() {
+        let mut acct = Accounting::new(0, 64);
+        Arc::get_mut(&mut acct).expect("unshared").global = false;
+        let admitted = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..2_000 {
+                        if acct.admit() {
+                            admitted.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        let c = acct.counts();
+        assert_eq!(c.queued, 16_000);
+        assert_eq!(admitted.load(Ordering::SeqCst), 64, "exactly the bound");
+        assert_eq!(c.pending, 64);
+        assert_eq!(c.dropped, 16_000 - 64);
+        acct.abandon_pending();
+        assert_eq!(acct.counts().dropped, 16_000);
+    }
 
     #[test]
     fn the_queue_bound_drops_and_counts() {

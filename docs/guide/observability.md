@@ -61,7 +61,7 @@ Contract note on `outcome`: it is read from the response headers, so an error a 
 
 With `--otlp-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) and `metrics` among `--otlp-signals`, every family above is also pushed to the collector every `--otlp-metrics-interval` (default 60 s), under the OTel names in [ADR 0009 D6](../adr/0009-opentelemetry.md#d6-metrics) (`mg_raft_term` is `memory_graph.raft.term`, `mg_store_bytes` is `memory_graph.store.size`, and so on). Labels keep their names. Counters are cumulative monotonic sums; sizes that can shrink are up-down counters; the rest are gauges. The two duration histograms become `rpc.server.call.duration` (attributes `rpc.system`, `rpc.service`, `rpc.method`, `rpc.grpc.status_code`) and `memory_graph.raft.apply.duration`, with the same buckets. `mg_rpc_total` has no OTLP twin: it is the count of `rpc.server.call.duration`. A collector that is down or slow never slows serving: the failed exports show up in `mg_otel_export_failures_total{signal="metrics"}` on `/metrics`, and export resumes when the collector comes back.
 
-Spans and log records wait in a bounded batch queue (2,048 by default, `OTEL_BSP_MAX_QUEUE_SIZE` / `OTEL_BLRP_MAX_QUEUE_SIZE`). When it is full, new items are dropped and counted in `mg_otel_dropped_total`, never waited for.
+Spans and log records wait in a bounded batch queue (2,048 by default, `OTEL_BSP_MAX_QUEUE_SIZE` / `OTEL_BLRP_MAX_QUEUE_SIZE`). When it is full, new items are dropped and counted in `mg_otel_dropped_total`, never waited for. Items still queued when a shutdown times out are counted as dropped too. Both `mg_otel_*` counters are **process-wide**, like the `mg_read_*` ones: several servers sharing one process (as in tests) report the same totals.
 
 ## Health
 

@@ -48,9 +48,12 @@ pub(crate) struct SnapshotCache {
 impl SnapshotCache {
     /// Before a collection: build the snapshot once.
     fn refresh(&self) {
-        self.collections.fetch_add(1, Ordering::SeqCst);
         let built = {
             let source = self.source.lock().unwrap_or_else(PoisonError::into_inner);
+            // Collections count from the moment a node is attached.
+            if source.is_some() {
+                self.collections.fetch_add(1, Ordering::SeqCst);
+            }
             source.as_ref().and_then(|f| f())
         };
         if let Some(snapshot) = built {
@@ -176,6 +179,7 @@ impl MetricReader for OtlpReader {
         self.0.manual.collect(rm)
     }
 
+    /// Blocks until the export ends: not for async code.
     fn force_flush(&self) -> OTelSdkResult {
         if *self
             .0
@@ -276,6 +280,8 @@ impl OtlpMetrics {
     }
 
     /// Collect and export now (tests; the reader also does it on its own).
+    /// Blocks on the telemetry runtime: never call it (or the provider's
+    /// `force_flush`) from async code; use `spawn_blocking`.
     #[doc(hidden)]
     pub fn collect_now(&self) -> OTelSdkResult {
         self.provider.force_flush()
