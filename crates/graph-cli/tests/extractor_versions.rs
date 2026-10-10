@@ -7,9 +7,9 @@ fn bumped_extractor_versions_are_pinned() {
     let extractors = graph_cli::shipped_extractors();
     for (lang, prefix) in [
         ("aspx", "aspx-scan-2+kw1+cb1+em1+tok"),
-        ("cobol", "cobol-scan-1+kw1+dw2+tok"),
+        ("cobol", "cobol-scan-1+kw1+dw3+tok"),
         ("asm", "asm-scan-1+kw2+cmt1+tok"),
-        ("typescript", "typescript-scan-4+kw1+em1+tok"),
+        ("typescript", "typescript-scan-5+kw1+em1+tok"),
         ("python", "python-scan-2+kw1+tok"),
         ("csharp", "csharp-scan-1+kw1+em1+tok"),
         ("javascript", "javascript-scan-1+kw1+tok"),
@@ -27,7 +27,7 @@ fn bumped_extractor_versions_are_pinned() {
         ("elixir", "elixir-scan-1+kw1+tok"),
         ("rpg", "rpg-scan-2+kw1+tok"),
         // `+deep1` (#245): Rust nested too deep for `syn` is tokens only.
-        ("rust", "rust-syn-2+kw1+deep1+em1+tok"),
+        ("rust", "rust-syn-2+kw1+deep1+em1+sb1+tok"),
     ] {
         let e = extractors
             .iter()

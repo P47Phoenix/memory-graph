@@ -677,6 +677,9 @@ impl Lexer<'_> {
                     n = rest[..n].find("%>").unwrap_or(n);
                 }
                 (n, TokenClass::Comment)
+            } else if opts.rust_literals && rest.starts_with("/*") {
+                // Rust block comments nest (#253).
+                (nested_len(rest, "/*", "*/"), TokenClass::Comment)
             } else if let Some(after) = rest
                 .strip_prefix("/*")
                 .filter(|_| !markup && !opts.no_block_slash_comments)
@@ -1335,7 +1338,8 @@ fn quoted_len(rest: &str, q: char) -> usize {
 /// unterminated raw string runs to end of input.
 fn prefixed_literal_len(rest: &str) -> Option<usize> {
     let b = rest.as_bytes();
-    let mut p = usize::from(b[0] == b'b');
+    // `b` (byte) and `c` (C string, Rust 1.77) prefixes, each optionally raw.
+    let mut p = usize::from(b[0] == b'b' || b[0] == b'c');
     if b.get(p) == Some(&b'r') {
         p += 1;
         let hashes = b[p..].iter().take_while(|&&c| c == b'#').count();
@@ -1353,12 +1357,11 @@ fn prefixed_literal_len(rest: &str) -> Option<usize> {
                 .map_or(rest.len(), |q| body + q + close.len()),
         );
     }
-    if b[0] != b'b' {
-        return None;
-    }
-    match b.get(1) {
-        Some(b'"') => Some(1 + quoted_len(&rest[1..], '"')),
-        Some(b'\'') if is_char_literal(&rest[1..]) => Some(1 + quoted_len(&rest[1..], '\'')),
+    match (b[0], b.get(1)) {
+        (b'b' | b'c', Some(b'"')) => Some(1 + quoted_len(&rest[1..], '"')),
+        (b'b', Some(b'\'')) if is_char_literal(&rest[1..]) => {
+            Some(1 + quoted_len(&rest[1..], '\''))
+        }
         _ => None,
     }
 }
@@ -1388,7 +1391,7 @@ mod tests {
     }
 
     const GOLDEN: u64 = 0x4ee808b12b2ae44e;
-    const RUST_GOLDEN: u64 = 0x9ec89e415b7c7bac;
+    const RUST_GOLDEN: u64 = 0xaac01cc84d24d2e3;
     const GOLDEN_VERSION: u32 = 1;
 
     /// Golden test: pins tokenizer output for a fixed source set.
@@ -1406,6 +1409,8 @@ mod tests {
             "const A: &str = r#\"a\"b\"#; let b = br##\"x\"#y\"##; b\"by\\\"te\" b'x' r\"raw\\\"",
             "let r = br + bar; r#type unterminated r#\"never closed",
             "fn main() { let x = 1 + 2; // hi\n}\n",
+            // C strings and nested block comments (#253).
+            "c\"cs\" cr#\"a\"b\"# /* a /* nested */ still */ x",
         ];
         // FNV-1a 64 over the Debug rendering of every token.
         let fnv = |srcs: &[&str], opts: TokenizerOptions| {
@@ -1426,7 +1431,8 @@ mod tests {
         let rh = fnv(RUST_SOURCES, rust);
         assert_eq!(
             rh, RUST_GOLDEN,
-            "rust-dialect output changed (hash {rh:#x}): bump TOKENIZER_VERSION and update RUST_GOLDEN"
+            "rust-dialect output changed (hash {rh:#x}): bump the Rust extractor version \
+             (graph-lang-rust, the only rust_literals user) and update RUST_GOLDEN"
         );
         assert_eq!(
             h, GOLDEN,

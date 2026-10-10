@@ -423,7 +423,7 @@ pub fn tool_definitions() -> Vec<Value> {
     paging(&mut search_p, MAX_LIMIT);
 
     let mut find_p = json!({
-        "pattern": s("Exact symbol name, `prefix*` for a prefix, or `*` for every symbol"),
+        "pattern": s("Exact symbol name, `prefix*` for a prefix, `*` for every symbol, or `name\\*` for a name ending in a literal `*`. No infix match: `Gad*` finds Gadget, `Get` and `*dget` do not"),
         "kind": s("Only symbols of this kind, generic (function, type, ...) or language-specific (struct, trait, ...)"),
         "language": language,
         "org": org,
@@ -491,10 +491,10 @@ pub fn tool_definitions() -> Vec<Value> {
             "The indexed repositories (org and repo names), optionally of one org.",
             input(list_repos_p, &[]), list_repos_out),
         def("search", "Search tokens",
-            "Find a token by its exact text and roll the matches up to a grain: the enclosing symbol (default), method, class, file, repo or org, or each token. Symbol, method and class rows carry that symbol's full span.",
+            "Find a whole token by its exact text (case-sensitive; no wildcards, no partial-word match) and roll the matches up to a grain: the enclosing symbol (default), method, class, file, repo or org, or each token. Symbol, method and class rows carry that symbol's full span.",
             input(search_p, &["text"]), page_schema(hit_schema())),
         def("find_symbols", "Find symbols",
-            "Find symbol definitions (functions, types, methods, ...) by name: exact, `prefix*`, or `*` for all. ASCII letters match in either case unless exact_case is true.",
+            "Find symbol definitions (functions, types, methods, ...) by name: exact, `prefix*`, `*` for all, or `name\\*` for a literal `*`. There is no infix (inside-a-name) match. ASCII letters match in either case unless exact_case is true.",
             input(find_p, &["pattern"]), page_schema(symbol_hit_schema())),
         def("file_outline", "Outline a file",
             "The symbols defined in one file, in source order, with their kinds and spans.",

@@ -173,6 +173,96 @@ fn lone_digit_led_paragraphs_free_format() {
     assert_eq!(find(&s, "9x").2, "paragraph");
 }
 
+/// #268: `100A SECTION.` and `100A SECTION .` are section headers.
+#[test]
+fn lone_digit_led_sections() {
+    for src in [
+        "       PROCEDURE DIVISION.\n       100A SECTION.\n       P1.\n           DISPLAY 1.\n       9X SECTION .\n           GOBACK.\n",
+        ">>SOURCE FREE\nPROCEDURE DIVISION.\n100A SECTION.\nP1.\n  DISPLAY 1.\n9X section .\n  GOBACK.\n",
+    ] {
+        let ex = CobolExtractor.extract(src);
+        assert!(!ex.has_errors);
+        assert_nested(&ex);
+        for (name, header) in [("100A", "100A SECTION."), ("9X", "9X ")] {
+            let s = ex.symbols.iter().find(|s| s.name == name);
+            let s = s.unwrap_or_else(|| panic!("{name}: {:#?}", ex.symbols));
+            assert_eq!(s.lang_kind.as_deref(), Some("section"), "{src:?}");
+            let start = src.find(&format!("{name} ")).unwrap();
+            assert_eq!(s.span.start as usize, start);
+            assert!(src[start..].starts_with(header));
+            let line = src[..start].matches('\n').count() as u32 + 1;
+            assert_eq!(s.span.start_line, line, "{name}");
+            let col = (start - src[..start].rfind('\n').map_or(0, |p| p + 1)) as u32 + 1;
+            assert_eq!(s.span.start_col, col, "{name}");
+        }
+        // The paragraph nests in the digit-led section; the section runs to the next one.
+        assert!(contains_sym(&ex, "100A", "P1"));
+        let sec = ex.symbols.iter().find(|s| s.name == "100A").unwrap();
+        assert!(src[sec.span.start as usize..sec.span.end as usize].ends_with("DISPLAY 1."));
+    }
+}
+
+fn contains_sym(ex: &Extraction, outer: &str, inner: &str) -> bool {
+    let o = ex.symbols.iter().find(|s| s.name == outer).unwrap();
+    let i = ex.symbols.iter().find(|s| s.name == inner).unwrap();
+    o.span.start <= i.span.start && i.span.end <= o.span.end
+}
+
+/// #268: a segment number after SECTION (`100A SECTION 50.`).
+#[test]
+fn lone_digit_led_sections_with_segment_number() {
+    for src in [
+        "       PROCEDURE DIVISION.\n       100A SECTION 50.\n       P1.\n           DISPLAY 1.\n",
+        ">>SOURCE FREE\nPROCEDURE DIVISION.\n100A SECTION 50.\nP1.\n  DISPLAY 1.\n",
+    ] {
+        let ex = CobolExtractor.extract(src);
+        assert!(!ex.has_errors);
+        assert_nested(&ex);
+        let s = ex.symbols.iter().find(|s| s.name == "100A");
+        let s = s.unwrap_or_else(|| panic!("{src:?}: {:#?}", ex.symbols));
+        assert_eq!(s.lang_kind.as_deref(), Some("section"));
+        let start = src.find("100A SECTION 50.").unwrap();
+        assert_eq!(s.span.start as usize, start);
+        assert_eq!(s.span.end as usize, src.find("DISPLAY 1.").unwrap() + 10);
+        let line = src[..start].matches('\n').count() as u32 + 1;
+        assert_eq!(s.span.start_line, line);
+        let col = (start - src[..start].rfind('\n').map_or(0, |p| p + 1)) as u32 + 1;
+        assert_eq!(s.span.start_col, col);
+        assert!(contains_sym(&ex, "100A", "P1"));
+    }
+}
+
+#[test]
+fn lone_digit_led_sections_negative() {
+    let lit = |src: &str| {
+        let t = token_texts(src);
+        let class = t.iter().find(|(s, _)| s == "100A").map(|(_, c)| *c);
+        assert_eq!(class, Some(TokenClass::Literal), "{src:?}: {t:?}");
+        assert!(!names(&syms(src)).contains(&"100A"), "{src:?}");
+    };
+    // Area B.
+    lit("       PROCEDURE DIVISION.\n       P.\n           100A SECTION.\n");
+    // Not at sentence start.
+    lit("       PROCEDURE DIVISION.\n       P. MOVE X TO 100A SECTION.\n");
+    lit("       PROCEDURE DIVISION.\n       DISPLAY\n       100A SECTION.\n");
+    // Free format, not first on its line.
+    let free = ">>SOURCE FREE\nPROCEDURE DIVISION.\nP. 100A SECTION.\n";
+    assert!(!names(&syms(free)).contains(&"100A"));
+    // SECTION not followed by a period.
+    lit("       PROCEDURE DIVISION.\n       100A SECTION X.\n");
+    // A segment number must be an integer literal followed by a period.
+    lit("       PROCEDURE DIVISION.\n       100A SECTION 50 X.\n");
+    let free = ">>SOURCE FREE\nPROCEDURE DIVISION.\n100A SECTION X.\n";
+    assert!(!names(&syms(free)).contains(&"100A"));
+    // Exponent literal.
+    let t = token_texts("       PROCEDURE DIVISION.\n       1E5 SECTION.\n");
+    assert!(
+        t.iter()
+            .any(|(s, c)| s == "1E5" && *c == TokenClass::Literal),
+        "{t:?}"
+    );
+}
+
 #[test]
 fn lone_digit_led_literals_outside_headers_stay_literals() {
     let lit = |src: &str, word: &str| {
@@ -587,7 +677,7 @@ fn keywords_in_a_fixed_format_program() {
     );
     assert!(CobolExtractor
         .version()
-        .starts_with("cobol-scan-1+kw1+dw2+tok"));
+        .starts_with("cobol-scan-1+kw1+dw3+tok"));
 }
 
 /// A fixed sample of the list (so dropping a word from `KEYWORDS` fails).
