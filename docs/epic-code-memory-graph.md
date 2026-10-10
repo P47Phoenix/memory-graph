@@ -73,20 +73,20 @@
 | 55 | Enum members as `Constant` symbols in C#, Java, TypeScript, C/C++ and Rust (ADR 0010, delivered; #271-#273) | High | 5 | P2 | 27, 28 |
 | 56 | Declaration (name) position on symbol hits, computed at query time (ADR 0010, delivered; #274) | High | 3 | P2 | 16 |
 | 57 | Case-insensitive symbol lookup by default: `sym_fold` index, self-heal, `--exact-case` (ADR 0010, delivered; #275) | High | 5 | P2 | 16 |
-| 58 | Derived tables self-heal after an older binary writes to the file (#276) | High | 3 | P2 | 57 |
-| 59 | Document today's substring matching and answer #278 | Medium | 1 | P2 | none |
-| 60 | Rust extractor: exact spans on shebang and raw-string files (#253) | High | 3 | P2 | 9 |
+| 58 | Derived tables self-heal after an older binary writes to the file (#276; delivered in #286) | High | 3 | P2 | 57 |
+| 59 | Document today's substring matching and answer #278 (delivered in #282) | Medium | 1 | P2 | none |
+| 60 | Rust extractor: exact spans on shebang and raw-string files (#253; delivered in #287) | High | 3 | P2 | 9 |
 | 61 | Compact per-file sort key on the read path (#262; format change, approved 2026-10-09) | High | 5 | P2 | 58 (preferably) |
 | 62 | Membership changes keep in-flight tracking until Raft answers (#260) | Medium | 3 | P3 | 22 |
 | 63 | Rust parse stack counted in the ingest memory budget (#254) | Medium | 3 | P3 | 60 (preferably) |
-| 64 | TypeScript decorated methods are found (#266) | Medium | 2 | P2 | 27 |
+| 64 | TypeScript decorated methods are found (#266; delivered in #283) | Medium | 2 | P2 | 27 |
 | 65 | asm extractor: exact spans on libunwind `UnwindRegistersSave.S` (#252) | Low | 2 | P3 | 30 |
-| 66 | COBOL digit-led `SECTION` names such as `100A SECTION.` (#268) | Low | 1 | P3 | 30 |
+| 66 | COBOL digit-led `SECTION` names such as `100A SECTION.` (#268; delivered in #284) | Low | 1 | P3 | 30 |
 | 67 | Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (#115) | Medium | 5 | P3 | 22 |
-| 68 | Infix (substring) symbol search (#278; gated on ADR 0011, not yet written) | High | 5 | P3 | ADR 0011; 61 (preferably) |
-| 69 | Authentication for `serve` (#105; gated on ADR 0012, not yet written) | High | 8 | P3 | ADR 0012, 20 |
+| 68 | Infix (substring) symbol search (#278; [ADR 0011](adr/0011-infix-search.md), Accepted 2026-10-10) | High | 5 | P3 | 61 (preferably) |
+| 69 | Authentication for `serve` (#105; [ADR 0012](adr/0012-authentication.md), Accepted 2026-10-10) | High | 8 | P3 | 20 |
 
-Total: 69 stories, 328 pts (average about 4.8); 320 pts excluding the deferred stories 33 and 39. (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each need an ADR (0011 and 0012) before any code.
+Total: 69 stories, 328 pts (average about 4.8); 320 pts excluding the deferred stories 33 and 39. (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each needed an ADR before any code: [ADR 0011](adr/0011-infix-search.md) and [ADR 0012](adr/0012-authentication.md), both Accepted by the owner on 2026-10-10.
 
 **Next phase (2026-10-09).** Waves, from [plan-next-phase.md](plan-next-phase.md):
 - **W1:** stories 58, 59, 60, 64 and 66, plus drafting ADRs 0011 (infix search) and 0012 (authentication).
@@ -840,7 +840,7 @@ Design: [ADR 0010](adr/0010-symbol-lookup-and-positions.md) D4.
 
 <a id="story-58"></a>
 **58. Derived tables self-heal after an older binary writes to the file (3 pts)**
-Status: Added 2026-10-09 (#276). Counted in the totals. Implemented: detection keys on each repo's `r\0{org}\0{repo}` catalog row, which every v2 binary inserts as 0 on every ingest and story 58's binaries write as 1, plus the `sym_idx`/`sym_fold` and `stream`/`refs`/`content_files` lengths that an older binary's removal leaves apart (`old_writer_detected` in `graph-store/src/v2.rs`).
+Status: Delivered in PR #286. Added 2026-10-09 (#276). Counted in the totals. Implemented: detection keys on each repo's `r\0{org}\0{repo}` catalog row, which every v2 binary inserts as 0 on every ingest and story 58's binaries write as 1, plus the `sym_idx`/`sym_fold` and `stream`/`refs`/`content_files` lengths that an older binary's removal leaves apart (`old_writer_detected` in `graph-store/src/v2.rs`).
 As an operator who rolls back to an older binary and forward again
 I want derived tables rebuilt when a writer that does not maintain them touched the file
 So that symbol lookup never returns silently stale or missing results.
@@ -853,7 +853,7 @@ The detection must work against real pre-fix binaries, which cannot bump a stamp
 
 <a id="story-59"></a>
 **59. Document today's substring matching and answer #278 (1 pt)**
-Status: Added 2026-10-09 (#278). Counted in the totals.
+Status: Delivered in PR #282. Added 2026-10-09 (#278). Counted in the totals.
 As a user searching for part of a name
 I want the docs to say exactly what `search` and `symbols` match
 So that I do not mistake "no results" for "not indexed".
@@ -863,7 +863,7 @@ So that I do not mistake "no results" for "not indexed".
 
 <a id="story-60"></a>
 **60. Rust extractor: exact spans on shebang and raw-string files (3 pts)**
-Status: Added 2026-10-09 (#253). Counted in the totals.
+Status: Delivered in PR #287. Added 2026-10-09 (#253). Counted in the totals. Note (2026-10-10, approved by the owner): the corpus differential changed more than the fixed files. Symbols changed in 10 shebang files: the 6 named in #253, plus 4 that had passed the span check with shifted spans. Tokens changed in about 100 files with C strings or nested comments, all from the same bug classes. The criterion below that only the fixed files change is met in that sense.
 As a developer indexing the Rust toolchain
 I want symbols for every valid Rust file
 So that `symbols` finds definitions in files that start with `#!` or contain `r#"..."#`.
@@ -911,7 +911,7 @@ So that parallel adversarial files cannot exceed the budget.
 
 <a id="story-64"></a>
 **64. TypeScript decorated methods are found (2 pts)**
-Status: Added 2026-10-09 (#266). Counted in the totals.
+Status: Delivered in PR #283. Added 2026-10-09 (#266). Counted in the totals.
 As a TypeScript developer
 I want decorated methods reported wherever they appear in a class body
 So that `symbols` finds them after a field without a semicolon or after a method body.
@@ -931,7 +931,7 @@ So that its functions are found by `symbols`.
 
 <a id="story-66"></a>
 **66. COBOL digit-led `SECTION` names (1 pt)**
-Status: Added 2026-10-09 (#268). Counted in the totals.
+Status: Delivered in PR #284. Added 2026-10-09 (#268). Counted in the totals.
 As a COBOL user
 I want digit-led section names recognised
 So that `100A SECTION.` is a section symbol.
@@ -956,11 +956,11 @@ So that the cluster keeps serving and recovers when space is freed.
 
 <a id="story-68"></a>
 **68. Infix (substring) symbol search (5 pts)**
-Status: Added 2026-10-09 (#278). Counted in the totals. Gated on ADR 0011 (infix search), not yet written; no code before it is accepted. The story is not ready until ADR 0011 sets a p95 threshold for infix queries (about 50 ms is the starting point). Preferably after story 61: both change the read path on the same bench, and measuring infix p95 on top of 61's numbers keeps the two effects apart.
+Status: Added 2026-10-09 (#278). Counted in the totals. Design: [ADR 0011](adr/0011-infix-search.md), Accepted by the owner on 2026-10-10; it sets the infix p95 threshold at 50 ms. The ADR's hard prerequisite, story 58, applies to step 2 (the `sym_tri` side table) only and was delivered in #286. Preferably after story 61: both change the read path on the same bench, and measuring infix p95 on top of 61's numbers keeps the two effects apart.
 As a developer or agent who remembers part of a name
 I want `symbols` to match inside a name
 So that `get` can find `widgetGetter`.
-Open question for ADR 0011: the developer recommends symbol names only, scanning the interned name dictionary first and adding a trigram side table over distinct names only if p95 is above about 50 ms. A token-level n-gram index would break the 105 B/token size gate.
+Resolved by ADR 0011 (originally an open question): the developer recommended symbol names only, scanning the interned name dictionary first and adding a trigram side table over distinct names only if p95 is above about 50 ms. A token-level n-gram index would break the 105 B/token size gate.
 - Given ADR 0011's syntax, When an infix query runs, Then it must return every symbol whose name contains the substring, with case folding as in story 57, embedded and remote (a `run_all` case for infix semantics).
 - Given random names and queries, When a property test runs, Then infix results must equal a brute-force substring filter over all symbol names (a brute-force oracle proptest).
 - Given the query parser, When a fuzz test feeds it arbitrary input, Then it must never panic and must reject bad input with an error.
@@ -968,11 +968,11 @@ Open question for ADR 0011: the developer recommends symbol names only, scanning
 
 <a id="story-69"></a>
 **69. Authentication for `serve` (8 pts)**
-Status: Added 2026-10-09 (#105). Counted in the totals. Gated on ADR 0012 (authentication), not yet written; no code before it is accepted. When ADR 0012 is accepted, it replaces the placeholder criteria below with concrete ones. Unblocks story 33.
+Status: Added 2026-10-09 (#105). Counted in the totals. Design: [ADR 0012](adr/0012-authentication.md), Accepted by the owner on 2026-10-10. Its concrete criteria replace the placeholder criteria below when the story starts. Unblocks story 33.
 As an operator running a shared server
 I want clients to authenticate before they read or write
 So that only trusted callers can reach the data.
-Open question for ADR 0012: token auth through a tonic interceptor with constant-time comparison (`subtle`), and no TLS in v1, because rustls's default providers are aws-lc-rs and ring, which are deny-listed. Per-org and per-repo write permissions (raised in #105) are out of scope for v1; ADR 0012 may plan them as a follow-up.
+Resolved by ADR 0012 (originally an open question): token auth through a tonic interceptor with constant-time comparison (`subtle`), and no TLS in v1, because rustls's default providers are aws-lc-rs and ring, which are deny-listed. Per-org and per-repo write permissions (raised in #105) are out of scope for v1; ADR 0012 may plan them as a follow-up.
 - Given auth on, When `RemoteStore` conformance runs with valid credentials, Then it must pass; without credentials or with wrong ones, Then every call must fail with UNAUTHENTICATED and return no data.
 - Given auth off, When `RemoteStore` conformance runs without credentials, Then it must pass unchanged.
 - Given a write sent to a follower, When it is forwarded to the leader, Then the forward must authenticate, and a forwarded write without valid credentials must be refused (the forwarded-write path).

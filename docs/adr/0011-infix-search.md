@@ -1,6 +1,6 @@
 # ADR 0011: Infix (substring) symbol search
 
-**Status:** Proposed on 2026-10-09. The owner accepts it; no code for story 68 lands before that. Answers issue [#278](https://github.com/P47Phoenix/memory-graph/issues/278). Builds on [ADR 0003](0003-data-model.md) (the v2 store, the interned dictionary, `derived_version` self-heal) and [ADR 0010](0010-symbol-lookup-and-positions.md) D4 (case-insensitive lookup, `sym_fold`, `--exact-case`). Epic: story [68](../epic-code-memory-graph.md#story-68), preferably after story 61, and after story 58 (derived-table self-heal), which is a hard prerequisite of step 2.
+**Status:** Accepted by the owner on 2026-10-10 (proposed on 2026-10-09), as proposed; the open questions are resolved in [Owner decisions (2026-10-10)](#owner-decisions-2026-10-10). Answers issue [#278](https://github.com/P47Phoenix/memory-graph/issues/278). Builds on [ADR 0003](0003-data-model.md) (the v2 store, the interned dictionary, `derived_version` self-heal) and [ADR 0010](0010-symbol-lookup-and-positions.md) D4 (case-insensitive lookup, `sym_fold`, `--exact-case`). Epic: story [68](../epic-code-memory-graph.md#story-68), preferably after story 61, and after story 58 (derived-table self-heal), which is a hard prerequisite of step 2.
 
 ## In plain words
 
@@ -167,9 +167,11 @@ Expected parses. Needle lengths are in bytes (D3).
 - Older servers need the `capabilities` field to be detected. It is a small additive proto change.
 - Token-level substring search remains unsupported, by design.
 
-## Open questions for the owner
+## Owner decisions (2026-10-10)
 
-1. Keep suffix queries (`*needle`), or allow only `*needle*`?
-2. Is the 2-byte minimum right, or should 1-byte infix be allowed?
-3. Is the in-memory name cache (step 1), charged to the ADR 0008 pool, acceptable before considering `sym_tri`?
-4. Accept the `capabilities` field in `HelloResponse` (D6, a proto change), or accept the silent empty result from older servers?
+The owner accepted this ADR as proposed. Each open question is resolved with the ADR's own proposal.
+
+1. Keep suffix queries (`*needle`), or allow only `*needle*`? **Kept:** `*needle` is supported.
+2. Is the 2-byte minimum right, or should 1-byte infix be allowed? **Kept:** the 2-byte minimum stays.
+3. Is the in-memory name cache (step 1), charged to the ADR 0008 pool, acceptable before considering `sym_tri`? **Allowed.**
+4. Accept the `capabilities` field in `HelloResponse` (D6, a proto change), or accept the silent empty result from older servers? **The `capabilities` field is used:** the client refuses an infix query against a server that does not advertise `symbol_infix`.
