@@ -94,7 +94,11 @@ pub const UPGRADABLE_SCHEMA_VERSIONS: &[u64] = &[9, 10, 11];
 /// write transaction. Bump it whenever `rebuild_refs`'s output would change
 /// for existing data (i.e. whenever the refs/content_files derivation rule
 /// itself changes).
-pub const REFS_DERIVED_VERSION: u64 = 1;
+///
+/// Version 2 (epic story 58, #276): a rebuild also leaves the store marked
+/// as last written by a binary that maintains the derived tables (see
+/// [`DERIVED_WRITER_MARK`]).
+pub const REFS_DERIVED_VERSION: u64 = 2;
 /// `meta` key holding the stored [`REFS_DERIVED_VERSION`] a file was last
 /// rebuilt/stamped at.
 pub(crate) const DERIVED_VERSION_REFS_KEY: &str = "derived_version_refs_content_files";
@@ -137,8 +141,28 @@ pub(crate) const SYM_FOLD: MultimapTableDefinition<&str, u64> =
 
 /// Version of the derived `sym_fold` table (ADR 0010 D4), the same soft
 /// self-heal counter as [`REFS_DERIVED_VERSION`]. Bump it whenever the
-/// folding rule changes.
-pub const SYM_FOLD_DERIVED_VERSION: u64 = 1;
+/// folding rule changes. Version 2: the writer mark of story 58
+/// ([`DERIVED_WRITER_MARK`]).
+pub const SYM_FOLD_DERIVED_VERSION: u64 = 2;
+
+/// Epic story 58 (#276): the value of each repo's `r\0{org}\0{repo}`
+/// catalog row when the last binary to ingest into that repo maintained the
+/// derived tables (`sym_fold`, `refs`, `content_files`).
+///
+/// Detecting an older writer has to key on state that binaries released
+/// before this mark existed already change, since they cannot bump a stamp
+/// they do not know. Every v2 binary ever released inserts that row with the
+/// value 0 on every ingest (readers only test its presence), so an ingest by
+/// any of them leaves a 0 behind. A removal by them writes no such row, so
+/// table lengths back it up: a removal by a binary without `sym_fold`
+/// shrinks `sym_idx` but not `sym_fold`; the `stream` vs `refs`/
+/// `content_files` comparison mainly matters for very old v2 binaries that
+/// predate those tables. redb keeps lengths in its table headers, so these
+/// reads are O(1). [`old_writer_detected`] checks all of this on open; a
+/// hit rebuilds every derived table and then sets the rows to this mark.
+/// The derived-version bumps to 2 that came with the mark are belt and
+/// braces: the mark alone already makes older files rebuild once.
+pub(crate) const DERIVED_WRITER_MARK: u64 = 1;
 /// `meta` key holding the stored [`SYM_FOLD_DERIVED_VERSION`].
 pub(crate) const DERIVED_VERSION_SYM_FOLD_KEY: &str = "derived_version_sym_fold";
 
@@ -156,6 +180,13 @@ thread_local! {
         const { Cell::new(None) };
     /// Test counter: how many `sym_fold` rebuilds started on this thread.
     pub(crate) static SYM_FOLD_REBUILDS: Cell<usize> = const { Cell::new(0) };
+    /// Test counter: how many `refs`/`content_files` rebuilds started on
+    /// this thread.
+    pub(crate) static REFS_REBUILDS: Cell<usize> = const { Cell::new(0) };
+    /// Test switch (epic story 58): write like a binary released before the
+    /// derived tables existed -- no `sym_fold`, `refs` or `content_files`
+    /// maintenance, and a repo catalog row of 0 -- to simulate a rollback.
+    pub(crate) static LEGACY_WRITER: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The in-progress chunked-ingest marker (ADR 0003 story 3, decision D3,
@@ -2415,6 +2446,13 @@ impl<'t> W<'t> {
         let s = read_stats::uncounted(|| codec::decode(raw.value()))?;
         drop(raw);
 
+        #[cfg(test)]
+        let legacy = LEGACY_WRITER.with(Cell::get);
+        #[cfg(not(test))]
+        let legacy = false;
+        if legacy {
+            return self.remove_stream(file, scope, tally, &s, legacy);
+        }
         let cid = content_id(file);
         self.content_files.remove(cid, file)?;
         let count = self.refs.get(cid)?.map(|v| v.value()).unwrap_or(0);
@@ -2433,9 +2471,21 @@ impl<'t> W<'t> {
             return Ok(());
         }
         self.refs.remove(cid)?;
+        self.remove_stream(file, scope, tally, &s, legacy)
+    }
 
+    /// Delete `file`'s stream, postings and symbol index entries (`sym_fold`
+    /// too unless `legacy`, the story-58 test writer).
+    fn remove_stream(
+        &mut self,
+        file: u64,
+        scope: &Scope,
+        tally: &mut Tally,
+        s: &Stream,
+        legacy: bool,
+    ) -> Result<()> {
         self.streams.remove(file)?;
-        self.tally_stream(tally, scope, file, &s, -1)?;
+        self.tally_stream(tally, scope, file, s, -1)?;
         let mut terms: BTreeSet<u64> = BTreeSet::new(); // ordered: reproducible file
         for t in &s.tokens {
             terms.insert(t.term);
@@ -2447,7 +2497,9 @@ impl<'t> W<'t> {
             let name = self.text(r.name)?;
             let id = sub_id(TAG_SYM, file, i);
             self.sym_idx.remove(name.as_str(), id)?;
-            self.sym_fold.remove(fold_symbol_name(&name).as_str(), id)?;
+            if !legacy {
+                self.sym_fold.remove(fold_symbol_name(&name).as_str(), id)?;
+            }
         }
         Ok(())
     }
@@ -2540,6 +2592,8 @@ fn rebuild_encoding_catalog_in(wt: &redb::WriteTransaction) -> Result<()> {
 /// in the same write transaction. Shared by [`V2Store::rebuild_refs`] (manual
 /// call) and the self-heal check in `open`/`open_with_cache_bytes`.
 fn rebuild_refs_in(db: &Database) -> Result<()> {
+    #[cfg(test)]
+    REFS_REBUILDS.with(|c| c.set(c.get() + 1));
     let wt = db.begin_write()?;
     {
         let mut w = W::new(&wt)?;
@@ -2645,6 +2699,60 @@ pub(crate) fn sym_fold_needs_rebuild(db: &Database) -> Result<bool> {
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Whether a binary that does not maintain the derived tables has written to
+/// the file since they were last rebuilt (epic story 58, see
+/// [`DERIVED_WRITER_MARK`]): a repo catalog row without the mark, or table
+/// lengths that a removal by such a binary leaves apart. O(repos).
+pub(crate) fn old_writer_detected(db: &Database) -> Result<bool> {
+    use redb::ReadableTableMetadata;
+    let rt = db.begin_read()?;
+    match rt.open_table(CATALOG) {
+        Ok(cat) => {
+            for row in cat.range("r\0".."r\u{1}")? {
+                if row?.1.value() != DERIVED_WRITER_MARK {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    fn len<T>(
+        t: std::result::Result<T, redb::TableError>,
+        f: impl Fn(&T) -> std::result::Result<u64, redb::StorageError>,
+    ) -> Result<u64> {
+        match t {
+            Ok(t) => Ok(f(&t)?),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+    let symbols = len(rt.open_multimap_table(SYMBOLS), |t| t.len())?;
+    let fold = len(rt.open_multimap_table(SYM_FOLD), |t| t.len())?;
+    let streams = len(rt.open_table(STREAMS), |t| t.len())?;
+    let refs = len(rt.open_table(REFS), |t| t.len())?;
+    let content = len(rt.open_multimap_table(CONTENT_FILES), |t| t.len())?;
+    Ok(symbols != fold || streams != refs || streams != content)
+}
+
+/// Set every repo catalog row to [`DERIVED_WRITER_MARK`] (epic story 58),
+/// once the derived tables were rebuilt.
+fn mark_derived_writer_in(db: &Database) -> Result<()> {
+    let wt = db.begin_write()?;
+    {
+        let mut cat = wt.open_table(CATALOG)?;
+        let keys: Vec<String> = cat
+            .range("r\0".."r\u{1}")?
+            .map(|r| r.map(|(k, _)| k.value().to_string()))
+            .collect::<std::result::Result<_, _>>()?;
+        for k in keys {
+            cat.insert(k.as_str(), DERIVED_WRITER_MARK)?;
+        }
+    }
+    wt.commit()?;
+    Ok(())
 }
 
 impl V2Store {
@@ -3059,13 +3167,26 @@ impl V2Store {
         // transaction creates every `W` table (an empty `sym_fold` among
         // them) and would hide a missing table from this check.
         let rebuild_sym_fold = sym_fold_needs_rebuild(&db)?;
+        // Epic story 58 (#276): a binary that does not maintain the derived
+        // tables wrote to the file (an operator rolled back and forward
+        // again), so their stamps cannot be trusted. Checked before any
+        // rebuild below, which would change the lengths it compares.
+        let old_writer = old_writer_detected(&db)?;
+        if old_writer {
+            eprintln!(
+                "memory-graph: v2 store {}: written by a binary that does not \
+                 maintain the derived tables; rebuilding them on open",
+                path.display()
+            );
+        }
 
         // Soft self-heal (ADR 0003 story 9): an existing file whose
         // derived_version lags or is missing (any v2 file written before
         // this mechanism existed) gets refs/content_files rebuilt
         // automatically, silently -- this is not an error, and never
-        // refuses the open. A file already at the current version does not
-        // write at all, so a plain reopen stays byte-identical.
+        // refuses the open. A file already at the current version, and not
+        // written by an older binary since, does not write at all, so a
+        // plain reopen stays byte-identical.
         let derived_refs_version = {
             let rt = db.begin_read()?;
             match rt.open_table(META) {
@@ -3074,24 +3195,34 @@ impl V2Store {
                 Err(e) => return Err(e.into()),
             }
         };
-        if derived_refs_version != Some(REFS_DERIVED_VERSION) {
+        let rebuild_refs = derived_refs_version != Some(REFS_DERIVED_VERSION);
+        if rebuild_refs && !old_writer {
             eprintln!(
                 "memory-graph: v2 store {}: refs/content_files derived_version \
                  {derived_refs_version:?} != current {REFS_DERIVED_VERSION}; \
                  self-healing (rebuilding) on open",
                 path.display()
             );
+        }
+        if rebuild_refs || old_writer {
             rebuild_refs_in(&db)?;
         }
         // The same soft self-heal for `sym_fold` (ADR 0010 D4): a current
         // file is not written.
-        if rebuild_sym_fold {
+        if rebuild_sym_fold && !old_writer {
             eprintln!(
                 "memory-graph: v2 store {}: building the case-insensitive symbol \
                  index (sym_fold) on open",
                 path.display()
             );
+        }
+        if rebuild_sym_fold || old_writer {
             rebuild_sym_fold_in(&db)?;
+        }
+        // Last, so a crash in either rebuild leaves the old write detected
+        // and the next open runs both again.
+        if old_writer {
+            mark_derived_writer_in(&db)?;
         }
 
         Ok(Self {
@@ -4203,7 +4334,14 @@ impl V2Store {
         let (repo_id, _) = ensure(&mut w, Some(org_id), NodeKind::Repo, repo, None)?;
         let (file_id, existed) =
             ensure(&mut w, Some(repo_id), NodeKind::File, path, Some(language))?;
-        w.cat.insert(format!("r\0{org}\0{repo}").as_str(), 0)?;
+        #[cfg(test)]
+        let legacy = LEGACY_WRITER.with(Cell::get);
+        #[cfg(not(test))]
+        let legacy = false;
+        // Epic story 58: the mark says this repo's last ingest kept the
+        // derived tables in step (binaries before it write 0 here).
+        let mark = if legacy { 0 } else { DERIVED_WRITER_MARK };
+        w.cat.insert(format!("r\0{org}\0{repo}").as_str(), mark)?;
         let scope = Scope {
             org,
             repo,
@@ -4253,7 +4391,9 @@ impl V2Store {
             let name = terms[s.name as usize].as_str();
             let id = sub_id(TAG_SYM, file_id, idx);
             w.sym_idx.insert(name, id)?;
-            w.sym_fold.insert(fold_symbol_name(name).as_str(), id)?;
+            if !legacy {
+                w.sym_fold.insert(fold_symbol_name(name).as_str(), id)?;
+            }
             s.name = ids[s.name as usize];
             s.lang_kind = s.lang_kind.map(|k| ids[k as usize]);
             s.owner = s.owner.map(|k| ids[k as usize]);
@@ -4279,8 +4419,10 @@ impl V2Store {
         // these two tables now so enabling fan-out later needs no format
         // change here.
         let cid = content_id(file_id);
-        w.refs.insert(cid, 1)?;
-        w.content_files.insert(cid, file_id)?;
+        if !legacy {
+            w.refs.insert(cid, 1)?;
+            w.content_files.insert(cid, file_id)?;
+        }
         for (n, count) in &tally_nodes {
             tally.node(&scope, n, *count);
         }

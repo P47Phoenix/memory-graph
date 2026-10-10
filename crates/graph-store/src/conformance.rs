@@ -1819,6 +1819,61 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
     }
 }
 
+/// Epic story 58 (#276), the first half of an old-writer history: files of
+/// `zz/old` whose symbol names [`run_differential`] queries. A test writes
+/// this with the current binary, then [`old_writer_phase2`] with a binary
+/// that does not maintain the derived tables, reopens, and compares the
+/// result with a fresh index of both phases by `run_differential`.
+pub fn old_writer_phase1(s: &dyn Store) {
+    for (path, names) in [
+        ("a.cs", &["Shape", "Red"][..]),
+        ("b.cs", &["Big"][..]),
+        ("c.cs", &["Color", "dup"][..]),
+    ] {
+        let (_, ex) = line_symbols(names);
+        s.ingest_file_with_origin("zz", "old", path, "casetoy", &ex, Some(ORIGIN_DIRECTORY))
+            .unwrap();
+    }
+}
+
+/// The second half of the story-58 history (see [`old_writer_phase1`]): a
+/// rename that keeps every count (`a.cs`), a prune (`c.cs`) and a new file.
+pub fn old_writer_phase2(s: &dyn Store) {
+    let (_, ex) = line_symbols(&["Missing", "Big"]);
+    s.ingest_file_with_origin("zz", "old", "a.cs", "casetoy", &ex, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+    let keep: HashSet<String> = ["a.cs", "b.cs"].iter().map(|p| p.to_string()).collect();
+    assert_eq!(s.prune_files("zz", "old", &keep, false).unwrap(), ["c.cs"]);
+    let (_, ex) = line_symbols(&["RED"]);
+    s.ingest_file_with_origin("zz", "old", "d.cs", "casetoy", &ex, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+}
+
+/// What a store holding both story-58 phases must answer (ADR 0010 D4: the
+/// case-insensitive path through `sym_fold`).
+pub fn assert_old_writer_phases(s: &dyn Store) {
+    let rows = |p: &str| -> Vec<(String, String)> { symbol_rows(s, p, false) };
+    let want = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(f, n)| (f.to_string(), n.to_string()))
+            .collect()
+    };
+    assert_eq!(rows("shape"), want(&[]), "renamed away");
+    assert_eq!(rows("missing"), want(&[("a.cs", "Missing")]), "renamed to");
+    assert_eq!(rows("color"), want(&[]), "pruned");
+    assert_eq!(
+        rows("red"),
+        want(&[("d.cs", "RED")]),
+        "renamed away, then added elsewhere"
+    );
+    assert_eq!(
+        rows("BIG"),
+        want(&[("a.cs", "Big"), ("b.cs", "Big")]),
+        "both files"
+    );
+    assert_fold_agrees(s, "old writer");
+}
+
 /// Crash-then-rerun equivalence: `crashed` indexes a batch that fails with a
 /// storage error part-way (a file whose language holds a NUL poisons its
 /// chunk: earlier chunks may stay committed, later files are never reached),

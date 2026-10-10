@@ -105,6 +105,29 @@ fn degraded_files_are_query_equivalent_across_configurations() {
     conformance::run_invalid_symbol_span_differential(&*a, &b);
 }
 
+/// Epic story 58 (#276): a store written by the current binary, then by one
+/// that maintains no derived table (`LEGACY_WRITER`), then reopened, answers
+/// every query like a fresh index of the same inputs.
+#[test]
+fn an_old_writer_then_reopen_matches_a_fresh_index() {
+    let d = tempfile::tempdir().unwrap();
+    let fresh = open_store(&d.path().join("fresh.redb"), Vec::new()).unwrap();
+    conformance::old_writer_phase1(&*fresh);
+    conformance::old_writer_phase2(&*fresh);
+
+    let p = d.path().join("old.redb");
+    conformance::old_writer_phase1(&V2Store::open(&p).unwrap());
+    crate::v2::LEGACY_WRITER.with(|c| c.set(true));
+    conformance::old_writer_phase2(&V2Store::open(&p).unwrap());
+    crate::v2::LEGACY_WRITER.with(|c| c.set(false));
+    let healed = V2Store::open(&p).unwrap();
+
+    conformance::assert_old_writer_phases(&*fresh);
+    conformance::assert_old_writer_phases(&healed);
+    healed.check_consistency(false);
+    conformance::run_differential(&*fresh, &healed);
+}
+
 /// A batch that crashes mid-way (storage error in one chunk) and is re-run
 /// ends up identical to a fresh index, whatever the chunking.
 #[test]
