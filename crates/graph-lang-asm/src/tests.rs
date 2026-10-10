@@ -429,7 +429,7 @@ fn asm_directive_positions() {
     );
     assert!(AsmExtractor
         .version()
-        .starts_with("asm-scan-1+kw2+cmt1+tok"));
+        .starts_with("asm-scan-1+kw2+cmt2+tok"));
 }
 
 /// Labels and assignments named like bare directives stay identifiers;
@@ -581,4 +581,99 @@ fn trailing_comment_markers_need_syntax_evidence() {
     let src = "f:\n  movl %eax, %ebx # done\n  ret # x\n";
     let tokenized = tokenize_with(src, ASM_TOKENIZER);
     assert_eq!(AsmExtractor.extract(src).symbols, symbols(&tokenized));
+}
+
+/// #252: libunwind's `UnwindRegistersSave.S` mixes AT&T x86 (so `#` is the
+/// trailing-comment marker) with Hexagon, where `r0 = #0  // ...` is an
+/// assignment whose `#0` became part of a comment token: the constant ended
+/// inside that token and the file lost its symbols. Reduced from
+/// llvm/llvm-project@75cc30c7b35ce8d5ddd311b67872ed498997d58f.
+#[test]
+fn libunwind_symbol_never_ends_inside_a_trailing_comment() {
+    let src = "#if defined(__x86_64__)\n\
+DEFINE_LIBUNWIND_FUNCTION(__unw_getcontext)\n  movq  %rax,   (%rdi)\n  xorl  %eax, %eax  # return UNW_ESUCCESS\n  ret\n\
+#elif defined(__hexagon__)\n\
+DEFINE_LIBUNWIND_FUNCTION(__unw_getcontext)\n  memw(r0+#0) = r0\n\n  r0 = #0                  // return UNW_ESUCCESS\n  jumpr r31\n\
+#endif\n";
+    let ex = AsmExtractor.extract(src);
+    for s in &ex.symbols {
+        let a = &s.span;
+        for t in &ex.tokens {
+            let b = &t.span;
+            let crosses = a.start < b.end && b.start < a.end;
+            let within = a.start <= b.start && b.end <= a.end;
+            assert!(
+                !crosses || within,
+                "{} {a:?} cuts token {:?}",
+                s.name,
+                t.text
+            );
+        }
+    }
+    let s = syms(src);
+    let r0 = find(&s, "r0");
+    assert_eq!(r0.3, "r0 =");
+    let at = src.find("r0 = #0").unwrap();
+    let span = ex.symbols.iter().find(|x| x.name == "r0").unwrap().span;
+    assert_eq!((span.start as usize, span.end as usize), (at, at + 4));
+    assert_eq!((span.start_line, span.end_line), (10, 10));
+    assert_eq!((span.start_col, span.end_col), (3, 7));
+}
+
+/// #252: a label inside an ARM32 `@` comment (`Name:` in `@CHECK: Name: foo`, as in llvm's
+/// `test/MC/ARM/elf-thumbfunc.s`) starts inside the merged comment and is
+/// dropped; real labels are kept.
+#[test]
+fn label_inside_arm_comment_is_dropped() {
+    let src = "\t.syntax unified\nfoo:\n\tbx\tlr\n@CHECK:        Symbol {\n@CHECK: Name: foo\nbar:\n\tbx\tlr\n";
+    let ex = AsmExtractor.extract(src);
+    let n = names_of(&ex);
+    assert!(n.contains(&"foo") && n.contains(&"bar"), "{n:?}");
+    assert!(!n.contains(&"Name"), "{n:?}");
+    let raw = symbols(&tokenize_with(src, ASM_TOKENIZER));
+    assert!(
+        raw.iter().any(|s| s.name == "Name"),
+        "fixture no longer exercises the drop"
+    );
+}
+
+fn names_of(ex: &Extraction) -> Vec<&str> {
+    ex.symbols.iter().map(|s| s.name.as_str()).collect()
+}
+
+/// #252: a symbol that would be clipped but has no token of its own before
+/// the comment is dropped rather than given an empty or inverted span.
+#[test]
+fn clipped_symbol_without_a_token_before_the_comment_is_dropped() {
+    let sp = |start: u32, end: u32| Span {
+        start,
+        end,
+        start_line: 1,
+        start_col: start + 1,
+        end_line: 1,
+        end_col: end + 1,
+    };
+    let tok = |text: &str, class, start, end| TokenDecl {
+        text: text.into(),
+        class,
+        span: sp(start, end),
+    };
+    let sym = |name: &str, start, end| SymbolDecl {
+        name: name.into(),
+        kind: SymbolKind::Other,
+        lang_kind: None,
+        span: sp(start, end),
+        owner: None,
+    };
+    // "a  # c": `a` 0..1, comment 3..6.
+    let tokens = vec![
+        tok("a", TokenClass::Identifier, 0, 1),
+        tok("# c", TokenClass::Comment, 3, 6),
+    ];
+    // `gap` starts in the blank after `a` and ends in the comment: no token
+    // of its own precedes the comment. `a` is clipped to its token.
+    let out = clip_to_comments(vec![sym("a", 0, 4), sym("gap", 2, 4)], &tokens);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0].name, "a");
+    assert_eq!((out[0].span.start, out[0].span.end), (0, 1));
 }
