@@ -1,7 +1,8 @@
 //! Golden test for the MetricsSnapshot refactor (ADR 0009 O1): the
 //! Prometheus renderer as it stood before the refactor, kept verbatim, must
 //! produce byte-identical text to [super::render] for the same node state.
-//! Delete this module once O3 lands and the contract tests cover OTLP too.
+//! Story 52 (O3) added exactly the two `mg_otel_*` families to both; kept
+//! as the byte-level guard of the Prometheus output.
 use crate::services::Ctx;
 use std::fmt::Write as _;
 use std::sync::PoisonError;
@@ -236,7 +237,40 @@ pub(super) fn render(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats)
     let _ = writeln!(out, "mg_backup_bytes_total {}", b.bytes_total);
     render_read_stats(&mut out, read_stats);
     render_repeats(&mut out, &obs.repeats);
+    render_otel(&mut out);
     out
+}
+
+/// `mg_otel_export_failures_total{signal}` and `mg_otel_dropped_total{signal}`
+/// (story 52): the only change to the golden output since story 50.
+fn render_otel(out: &mut String) {
+    let counts = crate::telemetry::otel_counters();
+    head(
+        out,
+        "mg_otel_export_failures_total",
+        "counter",
+        crate::telemetry::EXPORT_FAILURES_HELP,
+    );
+    for c in &counts {
+        let _ = writeln!(
+            out,
+            "mg_otel_export_failures_total{{signal=\"{}\"}} {}",
+            c.signal, c.failures
+        );
+    }
+    head(
+        out,
+        "mg_otel_dropped_total",
+        "counter",
+        crate::telemetry::DROPPED_HELP,
+    );
+    for c in &counts {
+        let _ = writeln!(
+            out,
+            "mg_otel_dropped_total{{signal=\"{}\"}} {}",
+            c.signal, c.dropped
+        );
+    }
 }
 
 /// `mg_queries_total{rpc}` and `mg_query_exact_repeats_total{rpc}`: one

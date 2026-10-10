@@ -1549,6 +1549,7 @@ fn run() -> Result<i32> {
         if let (Some(_), Some(endpoint)) = (&telemetry, &telemetry_cfg.endpoint) {
             tracing::info!(%endpoint, "OpenTelemetry export on");
         }
+        cfg.otlp_metrics = telemetry.as_ref().and_then(|t| t.metrics());
         let served_result =
             graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
                 // Scripts and tests read these lines for the bound ports (the
