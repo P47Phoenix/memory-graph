@@ -47,7 +47,17 @@ These `graph-core` items are the stable surface for extractors:
   `index-file`, a library) may use smaller stacks. A recursive parser must
   bound its own stack use. The Rust extractor does this by running `syn` on
   an internal thread sized from the token count of the largest top-level
-  item, so any input is safe.
+  item, so any input is safe. A parse whose bound is under 256 KiB runs in
+  place, on the caller's thread, so a library caller must leave at least
+  256 KiB of free stack on the thread that calls `extract`.
+- Scratch memory: an extractor that needs a large amount of working memory
+  for one file (beyond its input and output) should reserve it first with
+  `graph_core::reserve_scratch(bytes)` and hold the returned guard while it
+  uses it. `memory-graph index` installs its `--memory` budget on each parse
+  thread (`graph_core::with_scratch_budget`), so parallel parses wait for
+  each other instead of exceeding it; with no budget installed the call is a
+  no-op. The Rust extractor reserves the stack its parse thread may touch
+  (#254).
 - `version()` — part of every file's fingerprint. **Bump it whenever
   `extract`'s output could change**, and include `TOKENIZER_VERSION`, e.g.
   `format!("ini-scan-1+tok{TOKENIZER_VERSION}")`. Files indexed by an older

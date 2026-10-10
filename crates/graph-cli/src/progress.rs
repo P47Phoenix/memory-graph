@@ -17,7 +17,7 @@ pub struct Board {
     pub walk: Stage,
     pub parse: Stage,
     pub commit: Stage,
-    pub budget: Budget,
+    pub budget: std::sync::Arc<Budget>,
     /// Entries found by the walk so far (files and walk-time skips).
     pub found: AtomicU64,
     pub found_bytes: AtomicU64,
@@ -159,7 +159,7 @@ impl Board {
         Self {
             label: label.to_string(),
             budget: {
-                let b = Budget::new(sizing.memory_budget);
+                let b = std::sync::Arc::new(Budget::new(sizing.memory_budget));
                 b.set_cap(
                     sizing.memory_budget,
                     &sizing.policy.reason,
@@ -686,6 +686,7 @@ impl BoardView {
                 "error": self.memory_error,
                 "expansion": self.expansion,
                 "footprint_in_flight": self.footprint,
+                "scratch_peak": self.budget.scratch_peak,
                 "budget_end_in_memory": (self.budget.cap as f64 * self.expansion) as u64,
             },
             "disk": {
@@ -825,6 +826,7 @@ mod tests {
                 pressure: false,
                 pressure_episodes: 0,
                 pressure_time: Duration::ZERO,
+                scratch_peak: 0,
             },
             memory: Some(MemSample {
                 total: 16 << 30,

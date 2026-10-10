@@ -5,6 +5,7 @@ pub mod extractor;
 pub mod language;
 pub mod scan;
 pub mod schema;
+pub mod scratch;
 pub mod tokenizer;
 
 pub use extractor::{
@@ -13,3 +14,4 @@ pub use extractor::{
 };
 pub use language::{detect_language, detect_language_from_content, normalize_path};
 pub use schema::*;
+pub use scratch::{reserve_scratch, with_scratch_budget, ScratchBudget, ScratchReservation};

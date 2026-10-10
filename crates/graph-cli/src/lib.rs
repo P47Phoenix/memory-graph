@@ -752,6 +752,34 @@ fn walk(
     board.walk.done(0);
 }
 
+/// One parse job's view of the ingest budget for extractor scratch (#254):
+/// a reservation waits until it fits under `--memory`, unless this file is
+/// the oldest still being parsed and no other scratch is held (see
+/// [`dataflow::Budget::acquire_scratch`]).
+struct JobScratch {
+    budget: std::sync::Arc<dataflow::Budget>,
+    inflight: std::sync::Arc<std::sync::Mutex<BTreeMap<u64, String>>>,
+    cancel: std::sync::Arc<AtomicBool>,
+    seq: u64,
+}
+
+impl graph_core::ScratchBudget for JobScratch {
+    fn reserve(&self, bytes: u64) {
+        let oldest = || {
+            self.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .next()
+                .is_none_or(|&s| s >= self.seq)
+        };
+        self.budget.acquire_scratch(bytes, &oldest, &self.cancel);
+    }
+    fn release(&self, bytes: u64) {
+        self.budget.release_scratch(bytes);
+    }
+}
+
 /// Streams the directory through walk → admit (memory budget) → parse ×N →
 /// commit (one writer, walk order). Stages never wait on each other except
 /// through the byte budget: parsed files pile up in memory, up to the
@@ -764,13 +792,16 @@ fn run_pipeline(
     board: &Board,
     display: &mut Display,
 ) -> Result<Collected> {
-    let cancel = AtomicBool::new(false);
+    let cancel_shared = std::sync::Arc::new(AtomicBool::new(false));
+    let cancel: &AtomicBool = &cancel_shared;
     let finished = AtomicBool::new(false);
     let (walk_tx, walk_rx) = crossbeam_channel::unbounded::<(u64, Item)>();
     let (job_tx, job_rx) = crossbeam_channel::unbounded::<(u64, Item, u64)>();
     // (walk sequence, outcome, source bytes, heap footprint)
     let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Result<Outcome>, u64, u64)>();
-    let inflight = std::sync::Mutex::new(BTreeMap::<u64, String>::new());
+    let inflight_shared =
+        std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::<u64, String>::new()));
+    let inflight: &std::sync::Mutex<BTreeMap<u64, String>> = &inflight_shared;
     let admit_blocked = AtomicBool::new(false);
     // The stored fingerprints, read once before any commit of this run
     // (#172): the parse threads skip unchanged files from this snapshot and
@@ -785,7 +816,8 @@ fn run_pipeline(
             .context("database error while reading stored fingerprints")?
     };
     std::thread::scope(|sc| {
-        let (cancel, board, inflight, known) = (&cancel, board, &inflight, &known);
+        let (board, known) = (board, &known);
+        let (cancel_shared, inflight_shared) = (&cancel_shared, &inflight_shared);
         sc.spawn(move || walk(o, board, walk_tx, cancel));
         // Admission: hold each file's bytes against the budget, in walk
         // order, before it may be read (so the writer can always progress).
@@ -838,7 +870,17 @@ fn run_pipeline(
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(seq, rel.clone());
                     }
-                    let oc = work(store, o, cfg, known, &item, board, k);
+                    // The extractor's scratch (the Rust parse stack, #254)
+                    // is reserved from the same budget as the bytes.
+                    let scratch = std::sync::Arc::new(JobScratch {
+                        budget: board.budget.clone(),
+                        inflight: inflight_shared.clone(),
+                        cancel: cancel_shared.clone(),
+                        seq,
+                    });
+                    let oc = graph_core::with_scratch_budget(scratch, || {
+                        work(store, o, cfg, known, &item, board, k)
+                    });
                     let mut fp = 0;
                     if let Ok(Outcome::Prepared(_, p)) = &oc {
                         board.parse.count(1, size);

@@ -203,3 +203,98 @@ fn unclosed_keyword_and_declaration_runs_are_linear() {
         }
     }
 }
+
+/// A Rust file whose one top-level item is just under the parse stack cap
+/// (#254): `syn` gets a dedicated thread of nearly `MAX_PARSE_STACK`, and the
+/// `break` chain (the deepest shape per token measured, `stack.rs`) makes the
+/// parse touch as much of it as any input can. `salt` varies the names so
+/// two files differ. Sized for the build the test runs in (the debug cap is
+/// smaller than release's).
+#[cfg(feature = "lang-rust")]
+fn near_cap_rust_source(salt: usize) -> String {
+    use graph_lang_rust::{MAX_PARSE_STACK, STACK_BASE, STACK_PER_TOKEN};
+    let cap = (MAX_PARSE_STACK - STACK_BASE) / STACK_PER_TOKEN;
+    // `fn fN ( ) { loop { <breaks> 1 ; } }` is 12 tokens besides the breaks.
+    let breaks = cap - 12 - 16;
+    format!(
+        "fn f{salt}() {{ loop {{ {}1; }} }}\n",
+        "break ".repeat(breaks)
+    )
+}
+
+/// Run the CLI's `index --json --stats` and return its summary.
+#[cfg(feature = "lang-rust")]
+fn index_stats(db: &std::path::Path, dir: &std::path::Path, extra: &[&str]) -> serde_json::Value {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+        .arg("--db")
+        .arg(db)
+        .args(["index", "--org", "o", "--repo", "r", "--json", "--stats"])
+        .args(extra)
+        .arg(dir)
+        .output()
+        .expect("run memory-graph");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("stdout is JSON")
+}
+
+/// Two near-cap files indexed in parallel under `--memory 1GiB` (#254):
+/// each parse reserves the stack it may touch from the ingest budget before
+/// it starts its thread, so the reserved parse stacks plus every other
+/// budgeted byte never exceed the 1 GiB (the second file waits for the
+/// first), and both files still get their symbols.
+#[cfg(feature = "lang-rust")]
+#[test]
+fn parse_stack_reservations_stay_within_memory_budget() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    for i in 0..2 {
+        std::fs::write(src.join(format!("near{i}.rs")), near_cap_rust_source(i)).unwrap();
+    }
+    let sum = index_stats(
+        &d.path().join("g.redb"),
+        &src,
+        &["--memory", "1GiB", "--jobs", "2"],
+    );
+    let stats = &sum["stats"];
+    let cap = stats["memory_budget"].as_u64().unwrap();
+    let peak = stats["peak_in_flight"].as_u64().unwrap();
+    let scratch = stats["memory"]["scratch_peak"].as_u64().unwrap();
+    assert_eq!(cap, 1 << 30, "{sum}");
+    assert!(peak <= cap, "peak {peak} > budget {cap}: {sum}");
+    // One stack of nearly 2 GiB / 3 was reserved, never both at once.
+    let one = (graph_lang_rust::MAX_PARSE_STACK / 3) as u64;
+    assert!(
+        scratch > one / 2 && scratch <= one,
+        "scratch peak {scratch}: {sum}"
+    );
+    assert_eq!(sum["files"], 2, "{sum}");
+    assert_eq!(sum["symbols"], 2, "both parsed: {sum}");
+}
+
+/// The store does not depend on the budget or the jobs (#254): a run
+/// that reserves near-cap parse stacks under a small `--memory` with one
+/// job answers every query like one under a large `--memory` with four.
+#[cfg(feature = "lang-rust")]
+#[test]
+fn parse_stack_budget_does_not_change_the_store() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    for i in 0..2 {
+        std::fs::write(src.join(format!("near{i}.rs")), near_cap_rust_source(i)).unwrap();
+    }
+    std::fs::write(src.join("ok.rs"), "fn ok() {}\nstruct S;\n").unwrap();
+    let small = d.path().join("small.redb");
+    let large = d.path().join("large.redb");
+    index_stats(&small, &src, &["--memory", "1MiB", "--jobs", "1"]);
+    index_stats(&large, &src, &["--memory", "4GiB", "--jobs", "4"]);
+    let a = graph_store::open_store(&small, graph_cli::shipped_extractors()).expect("open");
+    let b = graph_store::open_store(&large, graph_cli::shipped_extractors()).expect("open");
+    graph_store::conformance::run_differential(&*a, &*b);
+}
