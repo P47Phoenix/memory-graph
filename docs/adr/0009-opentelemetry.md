@@ -1,6 +1,6 @@
 # ADR 0009: OpenTelemetry (OTLP traces, metrics and logs)
 
-**Status:** Proposed on 2026-10-06, and revised the same day after dev and QA review. The owner decides. The owner made the scope decisions in D1 on 2026-10-06 (signals, transport, default). Builds on [ADR 0004](0004-client-server-and-replication.md) D10 (observability), which gets a dated note pointing here. Epic amendment, proposed: stories [50](../epic-code-memory-graph.md#story-50), [51](../epic-code-memory-graph.md#story-51), [52](../epic-code-memory-graph.md#story-52), [53](../epic-code-memory-graph.md#story-53) and [54](../epic-code-memory-graph.md#story-54). They are not counted in the epic totals until this ADR is accepted.
+**Status:** Accepted by the owner on 2026-10-09. Proposed on 2026-10-06, and revised the same day after dev and QA review. The owner made the scope decisions in D1 on 2026-10-06 (signals, transport, default). Builds on [ADR 0004](0004-client-server-and-replication.md) D10 (observability), which gets a dated note pointing here. Epic amendment: stories [50](../epic-code-memory-graph.md#story-50), [51](../epic-code-memory-graph.md#story-51), [52](../epic-code-memory-graph.md#story-52), [53](../epic-code-memory-graph.md#story-53) and [54](../epic-code-memory-graph.md#story-54). They are counted in the epic totals since this ADR was accepted on 2026-10-09.
 
 ## In plain words
 

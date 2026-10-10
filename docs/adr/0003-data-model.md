@@ -1,6 +1,6 @@
 # ADR 0003: Data model for tokens, symbols and postings
 
-**Status:** Proposed (revised after architecture-board, developer and QA review; not accepted). Evidence: [docs/spikes/data-model.md](../spikes/data-model.md) (raw data and prototype code: `spikes/data-model/`). Proposed to supersede the "JSON node per token" part of [ADR 0001](0001-storage.md); redb stays as the per-shard engine.
+**Status:** Accepted by the owner on 2026-10-09. Previously Proposed (revised after architecture-board, developer and QA review); the v2 store it describes has been the only storage format since 2026-09-25. Evidence: [docs/spikes/data-model.md](../spikes/data-model.md) (raw data and prototype code: `spikes/data-model/`). Supersedes the "JSON node per token" part of [ADR 0001](0001-storage.md); redb stays as the per-shard engine.
 
 ## In plain words
 
