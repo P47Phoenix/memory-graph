@@ -891,11 +891,16 @@ impl Scanner<'_> {
         let mut c = lo;
         while c < hi {
             match self.text(c) {
-                // Decorator: `@a.b(...)`.
+                // Decorator: `@a.b(...)`. Its name is one dotted path, so
+                // the member name after it (`@dec m() {}`) is not eaten
+                // as part of the decorator (#266).
                 "@" => {
                     c += 1;
-                    while c < hi && (self.is_ident(c) || self.text(c) == ".") {
+                    if c < hi && self.is_ident(c) {
                         c += 1;
+                        while c + 1 < hi && self.text(c) == "." && self.is_ident(c + 1) {
+                            c += 2;
+                        }
                     }
                     if c < hi && self.text(c) == "(" {
                         c = self.close_of(c).map_or(hi, |p| p + 1);
