@@ -68,16 +68,21 @@ impl Extractor for AsmExtractor {
         // `kw1`: assembler directives are classed `keyword` (#143); `kw2`:
         // not the operand of a mnemonic (`call proc`) nor a name before a
         // named directive (`section db 1`) (#200). `cmt1`: AT&T trailing `#`
-        // and ARM32 `@` comments (#197).
-        format!("asm-scan-1+kw2+cmt1+tok{TOKENIZER_VERSION}")
+        // and ARM32 `@` comments (#197); `cmt2`: no symbol ends inside one
+        // (#252).
+        format!("asm-scan-1+kw2+cmt2+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
         let tokens = tokenize_with(source, ASM_TOKENIZER);
-        let symbols = symbols(&tokens);
+        let mut symbols = symbols(&tokens);
         // After the symbol scan, which reads tokens as it always has.
         let mut tokens = match trailing_comment_marker(&tokens) {
-            Some(marker) => merge_trailing_comments(source, tokens, marker),
+            Some(marker) => {
+                let merged = merge_trailing_comments(source, tokens, marker);
+                symbols = clip_to_comments(symbols, &merged);
+                merged
+            }
             None => tokens,
         };
         mark_keywords_ignore_case(&mut tokens, DOT_DIRECTIVES, |t, i| {
@@ -1023,6 +1028,41 @@ fn parse_line(it: &[Item], line_last: usize, in_struct: bool, masm: bool, out: &
         Ev::Instr
     };
     out.push(whole(ev));
+}
+
+/// Keep symbols off the inside of merged trailing comments (#252): the
+/// symbol scan reads the unmerged tokens, so a statement such as Hexagon's
+/// `r0 = #0  // ...` in a file whose marker is `#` can end inside the
+/// comment token that `#0 ...` became. Such a symbol ends instead at the
+/// last token before the comment; one that starts inside a comment is
+/// dropped. Spans only shrink, so nesting is kept (and re-checked).
+fn clip_to_comments(syms: Vec<SymbolDecl>, tokens: &[TokenDecl]) -> Vec<SymbolDecl> {
+    let inside = |pos: u32| {
+        let i = tokens.partition_point(|t| t.span.end <= pos);
+        tokens
+            .get(i)
+            .filter(|t| t.class == TokenClass::Comment && t.span.start < pos)
+            .map(|_| i)
+    };
+    let out = syms
+        .into_iter()
+        .filter_map(|mut s| {
+            if inside(s.span.start).is_some() {
+                return None;
+            }
+            if let Some(i) = inside(s.span.end) {
+                let prev = tokens[..i]
+                    .iter()
+                    .rev()
+                    .find(|t| t.span.end > s.span.start)?;
+                s.span.end = prev.span.end;
+                s.span.end_line = prev.span.end_line;
+                s.span.end_col = prev.span.end_col;
+            }
+            Some(s)
+        })
+        .collect();
+    no_partial_overlap(out)
 }
 
 /// Drop any symbol whose span partially overlaps an earlier-kept one (the
