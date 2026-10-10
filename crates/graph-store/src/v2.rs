@@ -166,6 +166,44 @@ pub(crate) const DERIVED_WRITER_MARK: u64 = 1;
 /// `meta` key holding the stored [`SYM_FOLD_DERIVED_VERSION`].
 pub(crate) const DERIVED_VERSION_SYM_FOLD_KEY: &str = "derived_version_sym_fold";
 
+/// File id -> the file's compact sort key (epic story 61, #262; see
+/// [`codec::encode_file_key`]): repo id, language and path, the fields
+/// `search` filters and sorts candidate files on, so a hot term no longer
+/// decodes every candidate's JSON `nodes` row. Derived from the File nodes,
+/// kept in step with them on every write, and rebuilt on open when
+/// [`DERIVED_VERSION_FILE_KEYS_KEY`] is missing or stale, the table is
+/// missing, or an older writer is detected (epic story 58). Never in the
+/// Raft log. This is a `derived_version`, not a `V2_SCHEMA_VERSION` bump:
+/// an older binary still opens the file and ignores the table, and the
+/// writer mark makes this binary rebuild it after such a binary wrote.
+pub(crate) const FILE_KEYS: TableDefinition<u64, &[u8]> = TableDefinition::new("file_keys");
+/// Version of the derived `file_keys` table; bump it whenever its row
+/// layout ([`codec::encode_file_key`]) or derivation changes.
+pub const FILE_KEYS_DERIVED_VERSION: u64 = 1;
+/// `meta` key holding the stored [`FILE_KEYS_DERIVED_VERSION`].
+pub(crate) const DERIVED_VERSION_FILE_KEYS_KEY: &str = "derived_version_file_keys";
+
+/// The `file_keys` row for a File node.
+fn file_key_row(n: &Node) -> Result<Vec<u8>> {
+    let parent = n
+        .parent
+        .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?;
+    Ok(codec::encode_file_key(&codec::FileKey {
+        parent,
+        language: n.language.as_deref(),
+        name: &n.name,
+    }))
+}
+
+/// Whether this write runs as a binary without the derived tables would
+/// (the `LEGACY_WRITER` test switch; always false outside tests).
+fn legacy_writer() -> bool {
+    #[cfg(test)]
+    return LEGACY_WRITER.with(Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
 /// The folding rule of `sym_fold` (ADR 0010 D4): ASCII letters lowercased,
 /// every other byte unchanged, so lengths and byte prefixes are preserved.
 pub(crate) fn fold_symbol_name(name: &str) -> String {
@@ -183,6 +221,8 @@ thread_local! {
     /// Test counter: how many `refs`/`content_files` rebuilds started on
     /// this thread.
     pub(crate) static REFS_REBUILDS: Cell<usize> = const { Cell::new(0) };
+    /// Test counter: how many `file_keys` rebuilds started on this thread.
+    pub(crate) static FILE_KEYS_REBUILDS: Cell<usize> = const { Cell::new(0) };
     /// Test switch (epic story 58): write like a binary released before the
     /// derived tables existed -- no `sym_fold`, `refs` or `content_files`
     /// maintenance, and a repo catalog row of 0 -- to simulate a rollback.
@@ -648,6 +688,9 @@ pub(crate) struct R {
     sym_idx: redb::ReadOnlyMultimapTable<&'static str, u64>,
     /// `None` only on a file not yet healed (no such open exists today).
     sym_fold: Option<redb::ReadOnlyMultimapTable<&'static str, u64>>,
+    /// `None` only on a file not yet healed (no such open exists today);
+    /// `search` then falls back to the `nodes` rows.
+    file_keys: Option<redb::ReadOnlyTable<u64, &'static [u8]>>,
     cat: redb::ReadOnlyTable<&'static str, u64>,
     kids: redb::ReadOnlyMultimapTable<u64, u64>,
     // Read only by `check_consistency` today (no read-path query needs
@@ -679,6 +722,59 @@ struct FileSlim {
     language: Option<String>,
 }
 
+/// A vector handed out in sorted order, sorted only as far as it is read
+/// (epic story 61): each refill selects the next chunk (`select_nth`, linear)
+/// and sorts just that chunk, doubling the chunk size each time, so reading
+/// k of n items costs O(n + k log k) instead of O(n log n). The order must be
+/// total; then the items come out exactly as a full sort would give them.
+pub(crate) struct LazySorted<T, F> {
+    items: Vec<Option<T>>,
+    pos: usize,
+    sorted_to: usize,
+    chunk: usize,
+    cmp: F,
+}
+
+impl<T, F: FnMut(&T, &T) -> std::cmp::Ordering> LazySorted<T, F> {
+    const FIRST_CHUNK: usize = 64;
+
+    pub(crate) fn new(items: Vec<T>, cmp: F) -> Self {
+        Self {
+            items: items.into_iter().map(Some).collect(),
+            pos: 0,
+            sorted_to: 0,
+            chunk: Self::FIRST_CHUNK,
+            cmp,
+        }
+    }
+
+    /// Order the next chunk when everything ordered so far was read.
+    pub(crate) fn prepare(&mut self) {
+        if self.pos < self.sorted_to || self.pos >= self.items.len() {
+            return;
+        }
+        let cmp = &mut self.cmp;
+        let mut by = |a: &Option<T>, b: &Option<T>| match (a, b) {
+            (Some(a), Some(b)) => cmp(a, b),
+            _ => unreachable!("only unread items are ordered"),
+        };
+        let rest = &mut self.items[self.pos..];
+        let k = self.chunk.min(rest.len());
+        if k < rest.len() {
+            rest.select_nth_unstable_by(k - 1, &mut by);
+        }
+        rest[..k].sort_unstable_by(&mut by);
+        self.sorted_to = self.pos + k;
+        self.chunk = self.chunk.saturating_mul(2);
+    }
+
+    pub(crate) fn next(&mut self) -> Option<T> {
+        self.prepare();
+        let item = self.items.get_mut(self.pos)?.take();
+        self.pos += 1;
+        item
+    }
+}
 /// One file with its containment path.
 struct FileCtx {
     org: Rc<Node>,
@@ -810,6 +906,11 @@ impl R {
             post: rt.open_table(POST)?,
             sym_idx: rt.open_multimap_table(SYMBOLS)?,
             sym_fold: match rt.open_multimap_table(SYM_FOLD) {
+                Ok(t) => Some(t),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            },
+            file_keys: match rt.open_table(FILE_KEYS) {
                 Ok(t) => Some(t),
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
                 Err(e) => return Err(e.into()),
@@ -1607,6 +1708,18 @@ impl R {
     /// The fields of file `id`'s row that `search` filters and sorts on,
     /// without decoding the rest of the node.
     fn file_slim(&self, id: u64) -> Result<FileSlim> {
+        // Epic story 61: the compact `file_keys` row when there is one;
+        // the JSON row otherwise (same fields, same values).
+        if let Some(keys) = &self.file_keys {
+            if let Some(v) = keys.get(id)? {
+                let k = codec::decode_file_key(v.value())?;
+                return Ok(FileSlim {
+                    parent: Some(k.parent),
+                    name: k.name.to_owned(),
+                    language: k.language.map(str::to_owned),
+                });
+            }
+        }
         let v = self
             .nodes
             .get(id)?
@@ -1956,32 +2069,96 @@ impl R {
         // per-query entity cache; the whole file node is decoded only for a
         // file the walk reaches (issue #246: on a hot term the full JSON
         // decode of every candidate dominated the query).
-        let mut keyed: Vec<(Rc<Node>, Rc<Node>, String, Cand)> = Vec::new();
-        for (fid, post) in cands {
-            let f = self.file_slim(fid)?;
-            let repo = self.entity(
-                f.parent
-                    .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?,
-            )?;
-            let org = self.entity(
-                repo.parent
-                    .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
-            )?;
-            if want_lang
-                .as_ref()
-                .is_some_and(|l| f.language.as_ref() != Some(l))
-                || q.org.as_deref().is_some_and(|o| org.name != o)
-                || q.repo.as_deref().is_some_and(|r| repo.name != r)
-            {
-                continue;
+        // Epic story 61 (#262): read each candidate's compact `file_keys`
+        // row in place (the JSON row only as a fallback), resolve and
+        // filter each repo once, and sort on (repo rank, path), where the
+        // rank orders the repos by (org name, repo name): the same order as
+        // sorting on the three names, without comparing org and repo
+        // strings for every pair of files.
+        let mut repos: HashMap<u64, Option<usize>> = HashMap::new();
+        let mut repo_names: Vec<(Rc<Node>, Rc<Node>)> = Vec::new();
+        let mut keyed: Vec<(usize, String, Cand)> = Vec::with_capacity(cands.len());
+        let mut consider = |parent: Option<u64>,
+                            lang: Option<&str>,
+                            name: &str,
+                            cand: Cand,
+                            keyed: &mut Vec<(usize, String, Cand)>|
+         -> Result<()> {
+            let parent = parent.ok_or_else(|| StoreError::Corrupt("file without repo".into()))?;
+            let slot = match repos.get(&parent) {
+                Some(s) => *s,
+                None => {
+                    let repo = self.entity(parent)?;
+                    let org = self.entity(
+                        repo.parent
+                            .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
+                    )?;
+                    let s = if q.org.as_deref().is_some_and(|o| org.name != o)
+                        || q.repo.as_deref().is_some_and(|r| repo.name != r)
+                    {
+                        None
+                    } else {
+                        repo_names.push((org, repo));
+                        Some(repo_names.len() - 1)
+                    };
+                    repos.insert(parent, s);
+                    s
+                }
+            };
+            let Some(slot) = slot else {
+                return Ok(());
+            };
+            if want_lang.as_deref().is_some_and(|l| lang != Some(l)) {
+                return Ok(());
             }
-            keyed.push((org, repo, f.name, (fid, post)));
+            keyed.push((slot, name.to_owned(), cand));
+            Ok(())
+        };
+        for (fid, post) in cands {
+            let row = match &self.file_keys {
+                Some(keys) => keys.get(fid)?,
+                None => None,
+            };
+            match row {
+                Some(v) => {
+                    let k = codec::decode_file_key(v.value())?;
+                    consider(Some(k.parent), k.language, k.name, (fid, post), &mut keyed)?;
+                }
+                None => {
+                    let f = self.file_slim(fid)?;
+                    consider(
+                        f.parent,
+                        f.language.as_deref(),
+                        &f.name,
+                        (fid, post),
+                        &mut keyed,
+                    )?;
+                }
+            }
         }
         // Sorted-by-path order: every later file sorts after every row of the
         // earlier ones, so once the limit is met at a group boundary the walk
-        // can stop without reading the remaining streams.
-        keyed.sort_by(|a, b| (&a.0.name, &a.1.name, &a.2).cmp(&(&b.0.name, &b.1.name, &b.2)));
-        let order: Vec<Cand> = keyed.into_iter().map(|k| k.3).collect();
+        // can stop without reading the remaining streams. No two candidates
+        // share (repo, path), so the order is total and deterministic.
+        let mut by_name: Vec<usize> = (0..repo_names.len()).collect();
+        by_name.sort_by(|&a, &b| {
+            let (x, y) = (&repo_names[a], &repo_names[b]);
+            (&x.0.name, &x.1.name).cmp(&(&y.0.name, &y.1.name))
+        });
+        let mut rank = vec![0usize; repo_names.len()];
+        for (r, &slot) in by_name.iter().enumerate() {
+            rank[slot] = r;
+        }
+        // Sorted lazily (epic story 61): the walk usually stops after a few
+        // files, so only the prefix it reaches is put in order. The first
+        // chunk is ordered here, inside the ctx phase.
+        let mut order = LazySorted::new(
+            keyed,
+            move |a: &(usize, String, Cand), b: &(usize, String, Cand)| {
+                (rank[a.0], &a.1).cmp(&(rank[b.0], &b.1))
+            },
+        );
+        order.prepare();
         ctx_timer.stop();
         let _walk_timer = PhaseTimer::start(Counter::SearchWalkNanos);
         // See `search_symbols`'s `want` comment: the stop threshold must
@@ -1999,7 +2176,7 @@ impl R {
         let mut sib_files: HashMap<u64, FileCtx> = HashMap::new();
         type SibKey = (u64, Option<u64>, String, Option<String>);
         let mut sib_owners: HashMap<SibKey, Option<(u64, Vec<Node>)>> = HashMap::new();
-        for (fid, post) in order {
+        while let Some((_, _, (fid, post))) = order.next() {
             self.ctx(fid, &mut files)?;
             let c = &files[&fid];
             let group = match q.grain {
@@ -2343,6 +2520,7 @@ struct W<'t> {
     post: redb::Table<'t, (u64, u64), &'static [u8]>,
     sym_idx: redb::MultimapTable<'t, &'static str, u64>,
     sym_fold: redb::MultimapTable<'t, &'static str, u64>,
+    file_keys: redb::Table<'t, u64, &'static [u8]>,
     cat: redb::Table<'t, &'static str, u64>,
     refs: redb::Table<'t, u64, u64>,
     content_files: redb::MultimapTable<'t, u64, u64>,
@@ -2361,6 +2539,7 @@ impl<'t> W<'t> {
             post: wt.open_table(POST)?,
             sym_idx: wt.open_multimap_table(SYMBOLS)?,
             sym_fold: wt.open_multimap_table(SYM_FOLD)?,
+            file_keys: wt.open_table(FILE_KEYS)?,
             cat: wt.open_table(CATALOG)?,
             refs: wt.open_table(REFS)?,
             content_files: wt.open_multimap_table(CONTENT_FILES)?,
@@ -2701,6 +2880,50 @@ pub(crate) fn sym_fold_needs_rebuild(db: &Database) -> Result<bool> {
     }
 }
 
+/// Recompute `file_keys` from the File nodes (epic story 61) in one write
+/// transaction and stamp `derived_version_file_keys`. A failure before the
+/// commit leaves the file as it was, so the next open rebuilds again.
+fn rebuild_file_keys_in(db: &Database) -> Result<()> {
+    #[cfg(test)]
+    FILE_KEYS_REBUILDS.with(|c| c.set(c.get() + 1));
+    let wt = db.begin_write()?;
+    {
+        wt.delete_table(FILE_KEYS)?;
+        let nodes = wt.open_table(NODES)?;
+        let mut dst = wt.open_table(FILE_KEYS)?;
+        for row in nodes.iter()? {
+            let (id, raw) = row?;
+            let n = dec(raw.value())?;
+            if n.kind == NodeKind::File {
+                dst.insert(id.value(), file_key_row(&n)?.as_slice())?;
+            }
+        }
+        wt.open_table(META)?
+            .insert(DERIVED_VERSION_FILE_KEYS_KEY, FILE_KEYS_DERIVED_VERSION)?;
+    }
+    wt.commit()?;
+    Ok(())
+}
+
+/// Whether `file_keys` needs a rebuild on open: its stamp is missing or not
+/// current, or the table itself is missing.
+pub(crate) fn file_keys_need_rebuild(db: &Database) -> Result<bool> {
+    let rt = db.begin_read()?;
+    let stamp = match rt.open_table(META) {
+        Ok(t) => t.get(DERIVED_VERSION_FILE_KEYS_KEY)?.map(|v| v.value()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    if stamp != Some(FILE_KEYS_DERIVED_VERSION) {
+        return Ok(true);
+    }
+    match rt.open_table(FILE_KEYS) {
+        Ok(_) => Ok(false),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(true),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Whether a binary that does not maintain the derived tables has written to
 /// the file since they were last rebuilt (epic story 58, see
 /// [`DERIVED_WRITER_MARK`]): a repo catalog row without the mark, or table
@@ -2734,7 +2957,15 @@ pub(crate) fn old_writer_detected(db: &Database) -> Result<bool> {
     let streams = len(rt.open_table(STREAMS), |t| t.len())?;
     let refs = len(rt.open_table(REFS), |t| t.len())?;
     let content = len(rt.open_multimap_table(CONTENT_FILES), |t| t.len())?;
-    Ok(symbols != fold || streams != refs || streams != content)
+    // Epic story 61: every file has a stream and a `file_keys` row, so a
+    // removal by a binary without `file_keys` leaves these apart. A
+    // missing `file_keys` table is the stamp check's job, not this one.
+    let keys_apart = match rt.open_table(FILE_KEYS) {
+        Ok(t) => t.len()? != streams,
+        Err(redb::TableError::TableDoesNotExist(_)) => false,
+        Err(e) => return Err(e.into()),
+    };
+    Ok(symbols != fold || streams != refs || streams != content || keys_apart)
 }
 
 /// Set every repo catalog row to [`DERIVED_WRITER_MARK`] (epic story 58),
@@ -2860,6 +3091,27 @@ impl V2Store {
             }
         }
         assert_eq!(got_fold, want_fold, "sym_fold");
+        // Epic story 61: `file_keys` is one row per File node, its fields.
+        let mut want_keys: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for row in r.nodes.iter().unwrap() {
+            let (id, raw) = row.unwrap();
+            let n = dec(raw.value()).unwrap();
+            if n.kind == NodeKind::File {
+                want_keys.insert(id.value(), file_key_row(&n).unwrap());
+            }
+        }
+        let mut got_keys: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for row in r
+            .file_keys
+            .as_ref()
+            .expect("file_keys table")
+            .iter()
+            .unwrap()
+        {
+            let (id, v) = row.unwrap();
+            got_keys.insert(id.value(), v.value().to_vec());
+        }
+        assert_eq!(got_keys, want_keys, "file_keys");
         let (mut ndict, mut nrev) = (0, 0);
         for row in r.dict.iter().unwrap() {
             let (k, id) = row.unwrap();
@@ -3137,6 +3389,8 @@ impl V2Store {
                     wt.open_multimap_table(SYMBOLS)?;
                     wt.open_multimap_table(SYM_FOLD)?;
                     m.insert(DERIVED_VERSION_SYM_FOLD_KEY, SYM_FOLD_DERIVED_VERSION)?;
+                    wt.open_table(FILE_KEYS)?;
+                    m.insert(DERIVED_VERSION_FILE_KEYS_KEY, FILE_KEYS_DERIVED_VERSION)?;
                     wt.open_table(REFS)?;
                     wt.open_multimap_table(CONTENT_FILES)?;
                     wt.open_table(OPEN_BATCH)?;
@@ -3167,6 +3421,8 @@ impl V2Store {
         // transaction creates every `W` table (an empty `sym_fold` among
         // them) and would hide a missing table from this check.
         let rebuild_sym_fold = sym_fold_needs_rebuild(&db)?;
+        // Epic story 61: the same for `file_keys`.
+        let rebuild_file_keys = file_keys_need_rebuild(&db)?;
         // Epic story 58 (#276): a binary that does not maintain the derived
         // tables wrote to the file (an operator rolled back and forward
         // again), so their stamps cannot be trusted. Checked before any
@@ -3218,6 +3474,17 @@ impl V2Store {
         }
         if rebuild_sym_fold || old_writer {
             rebuild_sym_fold_in(&db)?;
+        }
+        // Epic story 61: an older file gets its compact sort keys once.
+        if rebuild_file_keys && !old_writer {
+            eprintln!(
+                "memory-graph: v2 store {}: building the file sort keys \
+                 (file_keys) on open",
+                path.display()
+            );
+        }
+        if rebuild_file_keys || old_writer {
+            rebuild_file_keys_in(&db)?;
         }
         // Last, so a crash in either rebuild leaves the old write detected
         // and the next open runs both again.
@@ -3701,6 +3968,7 @@ impl V2Store {
             copy_multimap(&rt, &wt, CHILDREN)?;
             copy_multimap(&rt, &wt, SYMBOLS)?;
             copy_multimap(&rt, &wt, SYM_FOLD)?;
+            copy_table(&rt, &wt, FILE_KEYS)?;
             copy_table(&rt, &wt, DICT)?;
             copy_table(&rt, &wt, DICT_REV)?;
             copy_table(&rt, &wt, STREAMS)?;
@@ -4231,6 +4499,9 @@ impl V2Store {
                     w.remove_content(fid, &scope, &mut tally)?;
                     tally.file(&scope, -1);
                     w.nodes.remove(fid)?;
+                    if !legacy_writer() {
+                        w.file_keys.remove(fid)?;
+                    }
                     w.names
                         .remove(name_key(Some(repo_id), NodeKind::File, &f.name).as_str())?;
                     w.children.remove(repo_id, fid)?;
@@ -4334,10 +4605,7 @@ impl V2Store {
         let (repo_id, _) = ensure(&mut w, Some(org_id), NodeKind::Repo, repo, None)?;
         let (file_id, existed) =
             ensure(&mut w, Some(repo_id), NodeKind::File, path, Some(language))?;
-        #[cfg(test)]
-        let legacy = LEGACY_WRITER.with(Cell::get);
-        #[cfg(not(test))]
-        let legacy = false;
+        let legacy = legacy_writer();
         // Epic story 58: the mark says this repo's last ingest kept the
         // derived tables in step (binaries before it write 0 here).
         let mark = if legacy { 0 } else { DERIVED_WRITER_MARK };
@@ -4374,6 +4642,9 @@ impl V2Store {
         f.encoding = meta.encoding.map(Into::into);
         f.lossy = meta.lossy;
         w.nodes.insert(file_id, enc(&f).as_slice())?;
+        if !legacy {
+            w.file_keys.insert(file_id, file_key_row(&f)?.as_slice())?;
+        }
 
         let V2Prep {
             terms,
