@@ -18,6 +18,11 @@ fn sha(p: &Path) -> Vec<u8> {
 fn reset_rebuild_counters() {
     crate::v2::SYM_FOLD_REBUILDS.with(|c| c.set(0));
     crate::v2::REFS_REBUILDS.with(|c| c.set(0));
+    crate::v2::FILE_KEYS_REBUILDS.with(|c| c.set(0));
+}
+
+fn file_keys_rebuilds() -> usize {
+    crate::v2::FILE_KEYS_REBUILDS.with(std::cell::Cell::get)
 }
 
 /// `(refs rebuilds, sym_fold rebuilds)` on this thread since the last reset.
@@ -76,6 +81,7 @@ fn assert_old_writer_healed(p: &Path) {
     reset_rebuild_counters();
     let s = V2Store::open(p).unwrap();
     assert_eq!(rebuild_counters(), (1, 1), "one rebuild of each table");
+    assert_eq!(file_keys_rebuilds(), 1, "one file_keys rebuild");
     s.check_consistency(false);
     crate::conformance::assert_fold_agrees(&s, "old writer healed");
     assert!(repo_rows(&s)
@@ -88,6 +94,7 @@ fn assert_old_writer_healed(p: &Path) {
     drop(V2Store::open(p).unwrap());
     drop(V2Store::open(p).unwrap());
     assert_eq!(rebuild_counters(), (0, 0), "a healed store rebuilt again");
+    assert_eq!(file_keys_rebuilds(), 0, "a healed store rebuilt file_keys");
     assert_eq!(sha(p), before, "a healed store was written on reopen");
 }
 
@@ -240,6 +247,7 @@ fn a_store_no_old_binary_wrote_is_not_rebuilt_or_written_on_reopen() {
     drop(s);
     drop(V2Store::open(&p).unwrap());
     assert_eq!(rebuild_counters(), (0, 0), "a reopen rebuilt");
+    assert_eq!(file_keys_rebuilds(), 0, "a reopen rebuilt file_keys");
     assert_eq!(sha(&p), before, "a reopen wrote");
 }
 
@@ -315,4 +323,162 @@ fn writer_mark_golden_values() {
         })
         .collect();
     assert_eq!(rows, [(b"r\0o\0r".to_vec(), vec![1, 0, 0, 0, 0, 0, 0, 0])]);
+}
+
+// --- Epic story 61 (#262): the derived `file_keys` table ---
+
+/// Every file-grain answer for `hot`, in order.
+type FileRow = (String, Option<String>, Option<String>, Option<String>);
+
+fn hot_files(s: &V2Store) -> Vec<FileRow> {
+    let mut q = crate::Query::new("hot");
+    q.grain = crate::Grain::File;
+    s.search(&q)
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.org, h.repo, h.file, h.language))
+        .collect()
+}
+
+fn seed_hot(s: &V2Store) {
+    for (o, r, p, l) in [
+        ("o2", "r", "b.zig", "zig"),
+        ("o1", "r2", "a.zig", "odin"),
+        ("o1", "r1", "z/c.zig", "zig"),
+    ] {
+        s.ingest_file(o, r, p, l, &span_ext(&[], &[("hot", 0, 3)]))
+            .unwrap();
+    }
+}
+
+/// A file written before story 61 (no `file_keys` table, no stamp) gets the
+/// table built once on open, answers as before, and is not written again.
+#[test]
+fn a_file_from_before_file_keys_is_upgraded_once_on_open() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let want = {
+        let s = V2Store::open(&p).unwrap();
+        seed_hot(&s);
+        hot_files(&s)
+    };
+    {
+        let db = redb::Database::open(&p).unwrap();
+        let wt = db.begin_write().unwrap();
+        wt.delete_table(crate::v2::FILE_KEYS).unwrap();
+        wt.open_table(crate::META)
+            .unwrap()
+            .remove(crate::v2::DERIVED_VERSION_FILE_KEYS_KEY)
+            .unwrap();
+        wt.commit().unwrap();
+    }
+    assert!(!detected(&p), "a missing table is the stamp's job");
+    reset_rebuild_counters();
+    let s = V2Store::open(&p).unwrap();
+    assert_eq!(file_keys_rebuilds(), 1);
+    assert_eq!(rebuild_counters(), (0, 0), "only file_keys is rebuilt");
+    s.check_consistency(false);
+    assert_eq!(hot_files(&s), want);
+    drop(s);
+    let before = sha(&p);
+    reset_rebuild_counters();
+    drop(V2Store::open(&p).unwrap());
+    assert_eq!(file_keys_rebuilds(), 0);
+    assert_eq!(sha(&p), before, "an upgraded store was written on reopen");
+}
+
+/// A stale stamp is rebuilt on its own; a short table behind a current
+/// stamp is caught by the writer-mark length check (rows vs streams).
+#[test]
+fn a_stale_or_short_file_keys_table_is_rebuilt_on_open() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v.redb");
+    let want = {
+        let s = V2Store::open(&p).unwrap();
+        seed_hot(&s);
+        hot_files(&s)
+    };
+    for stale in [true, false] {
+        {
+            let db = redb::Database::open(&p).unwrap();
+            let wt = db.begin_write().unwrap();
+            if stale {
+                wt.open_table(crate::META)
+                    .unwrap()
+                    .insert(crate::v2::DERIVED_VERSION_FILE_KEYS_KEY, 0)
+                    .unwrap();
+            } else {
+                let mut t = wt.open_table(crate::v2::FILE_KEYS).unwrap();
+                let first = t.first().unwrap().unwrap().0.value();
+                t.remove(first).unwrap();
+            }
+            wt.commit().unwrap();
+        }
+        assert_eq!(detected(&p), !stale);
+        reset_rebuild_counters();
+        let s = V2Store::open(&p).unwrap();
+        assert_eq!(file_keys_rebuilds(), 1, "stale={stale}");
+        s.check_consistency(false);
+        assert_eq!(hot_files(&s), want);
+    }
+}
+
+/// Golden value of the story-61 derived version (CLAUDE.md, on-disk
+/// versioning), and the row a fresh ingest writes.
+#[test]
+fn file_keys_golden_values() {
+    assert_eq!(crate::v2::FILE_KEYS_DERIVED_VERSION, 1);
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("v.redb")).unwrap();
+    s.ingest_file("o", "r", "src/a.rs", "Rust", &cs(&["A"]))
+        .unwrap();
+    let rt = s.db.begin_read().unwrap();
+    let rows: Vec<(u64, Vec<u8>)> = rt
+        .open_table(crate::v2::FILE_KEYS)
+        .unwrap()
+        .iter()
+        .unwrap()
+        .map(|r| {
+            let (k, v) = r.unwrap();
+            (k.value(), v.value().to_vec())
+        })
+        .collect();
+    // Ids: org 1, repo 2, file 3. Row: varint(2), varint(4 + 1), "rust",
+    // "src/a.rs".
+    let mut row = vec![2u8, 5];
+    row.extend_from_slice(b"rust");
+    row.extend_from_slice(b"src/a.rs");
+    assert_eq!(rows, [(3, row)]);
+    let stamp = rt
+        .open_table(crate::META)
+        .unwrap()
+        .get(crate::v2::DERIVED_VERSION_FILE_KEYS_KEY)
+        .unwrap()
+        .map(|v| v.value());
+    assert_eq!(stamp, Some(1));
+}
+
+/// `search`'s lazy sort (epic story 61) hands items out exactly as a full
+/// sort does, whatever the size and however far it is read.
+#[test]
+fn lazy_sorted_matches_a_full_sort() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for n in [0usize, 1, 2, 63, 64, 65, 200, 1000, 5000] {
+        let v: Vec<(u64, u64)> = (0..n as u64).map(|i| (rnd() % 37, i)).collect();
+        let mut want = v.clone();
+        want.sort();
+        for take in [0, 1, 10, 64, 65, 300, n] {
+            let mut l =
+                crate::v2::LazySorted::new(v.clone(), |a: &(u64, u64), b: &(u64, u64)| a.cmp(b));
+            l.prepare();
+            let got: Vec<_> = std::iter::from_fn(|| l.next()).take(take).collect();
+            assert_eq!(got, want[..take.min(n)], "n={n} take={take}");
+        }
+    }
 }
