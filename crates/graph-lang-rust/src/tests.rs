@@ -175,7 +175,7 @@ fn version_pins_keyword_classing() {
     assert_eq!(
         RustExtractor.version(),
         format!(
-            "rust-syn-2+kw1+deep1+em1+tok{}",
+            "rust-syn-2+kw1+deep1+em1+sb1+tok{}",
             graph_core::tokenizer::TOKENIZER_VERSION
         )
     );
@@ -365,4 +365,127 @@ fn enum_variants_empty_nested_and_in_fns() {
     );
     // A broken file still yields no symbols.
     assert!(RustExtractor.extract("enum E { A, B(").symbols.is_empty());
+}
+
+/// Every symbol and token span is exact: its byte range lies on char
+/// boundaries, its line/col match a recount of the source (a BOM takes no
+/// column), and symbols nest with no partial overlap of tokens (#253).
+fn assert_exact(src: &str) -> Extraction {
+    let e = RustExtractor.extract(src);
+    let pos = |off: usize| {
+        let before = &src[..off];
+        let line = before.matches('\n').count() as u32 + 1;
+        let ls = before.rfind('\n').map_or(0, |i| i + 1);
+        let col = src[ls..off].chars().filter(|&c| c != '\u{feff}').count() as u32 + 1;
+        (line, col)
+    };
+    let spans = e
+        .symbols
+        .iter()
+        .map(|s| s.span)
+        .chain(e.tokens.iter().map(|t| t.span));
+    for sp in spans {
+        let (a, b) = (sp.start as usize, sp.end as usize);
+        assert!(a < b && b <= src.len(), "{a}..{b} in {src:?}");
+        assert!(src.is_char_boundary(a) && src.is_char_boundary(b));
+        assert_eq!(
+            (sp.start_line, sp.start_col),
+            pos(a),
+            "start of {a}..{b} in {src:?}"
+        );
+        assert_eq!(
+            (sp.end_line, sp.end_col),
+            pos(b),
+            "end of {a}..{b} in {src:?}"
+        );
+    }
+    for s in &e.symbols {
+        for t in &e.tokens {
+            let inside = t.span.start >= s.span.start && t.span.end <= s.span.end;
+            let apart = t.span.end <= s.span.start || t.span.start >= s.span.end;
+            assert!(
+                inside || apart,
+                "token {:?} crosses symbol {}",
+                t.text,
+                s.name
+            );
+        }
+    }
+    e
+}
+
+fn texts(src: &str) -> Vec<(String, String)> {
+    assert_exact(src)
+        .symbols
+        .iter()
+        .map(|s| {
+            let t = &src[s.span.start as usize..s.span.end as usize];
+            (s.name.clone(), t.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn shebang_first_line_spans_are_exact() {
+    for src in [
+        "#!/usr/bin/env run-cargo-script\nfn main() {}\n",
+        "\u{feff}#!/usr/bin/env rust\nfn main() {}\n",
+        "#!    \n\nfn main() {}\n",
+        "#!//bin/bash\n\nfn main() {\n    println!(\"a\")\n}\n",
+        "#!/x\r\nfn main() {}\r\n",
+    ] {
+        let s = texts(src);
+        let body = src[src.find("fn main").unwrap()..].trim_end();
+        assert_eq!(s, vec![("main".into(), body.into())], "{src:?}");
+        let m = &RustExtractor.extract(src).symbols[0];
+        assert_eq!(m.span.start_col, 1);
+    }
+}
+
+#[test]
+fn inner_attribute_first_line_is_not_a_shebang() {
+    for src in [
+        "#![allow(dead_code)]\nfn f() {}\n",
+        "#! [allow(dead_code)]\nfn f() {}\n",
+        "#!\n[allow(dead_code)]\nfn f() {}\n",
+    ] {
+        assert_eq!(
+            texts(src),
+            vec![("f".into(), "fn f() {}".into())],
+            "{src:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_strings_zero_to_three_hashes_spans_are_exact() {
+    for pre in ["r", "br", "cr"] {
+        for n in 0..4 {
+            let h = "#".repeat(n);
+            // The body holds every shorter closing run, so only the
+            // matching `"` + n hashes ends it.
+            let inner: String = (0..n).map(|k| format!("\"{} ", "#".repeat(k))).collect();
+            let lit = format!("{pre}{h}\"a {inner}\n b\"{h}");
+            let src = format!("fn a() {{ let _ = {lit}; }}\nconst C: () = ();\nfn b() {{}}\n");
+            let e = assert_exact(&src);
+            assert!(e.tokens.iter().any(|t| t.text == lit), "{lit:?} in {src:?}");
+            let names: Vec<_> = e.symbols.iter().map(|s| s.name.as_str()).collect();
+            assert!(names.contains(&"b") && names.contains(&"C"), "{src:?}");
+        }
+    }
+    // A C string with an escaped quote.
+    let src = "fn a() { let _ = c\"x\\\"y\"; }\nfn b() {}\n";
+    assert!(assert_exact(src)
+        .tokens
+        .iter()
+        .any(|t| t.text == "c\"x\\\"y\""));
+}
+
+#[test]
+fn nested_block_comment_spans_are_exact() {
+    let src = "/**\n```c\nint main(void) {\n    /* inner */\n}\n```\n*/\nconst A: u8 = 1;\n";
+    let e = assert_exact(src);
+    assert_eq!(e.tokens[0].text, &src[..src.find("\nconst").unwrap()]);
+    // The doc comment is the const's `#[doc]` attribute, so inside its span.
+    assert_eq!(texts(src), vec![("A".into(), src.trim_end().into())]);
 }
