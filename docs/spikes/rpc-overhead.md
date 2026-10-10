@@ -39,3 +39,33 @@ Before the `applied_default_limit` fix, the unlimited rare search measured 0.996
 
 - ADR 0004 D1 / ADR 0003 Q5 trigger ("measured RPC overhead exceeds 5 ms at p50"): **not tripped**. The largest overhead measured is 0.16 ms at p50 for a 100-row answer. [M]
 - The 10 M-token point in the story's acceptance criterion was not run here; the daemon spike measured, at 9.9 M tokens, that overhead depends on answer size, not database size, so the corpus numbers are the relevant ones for typical answers. Re-run the harness on a large database (`rpc_bench <db>`) when one is at hand. [E]
+
+## OpenTelemetry traces on versus off (epic story 51, ADR 0009 D5)
+
+Date 2026-10-10, the same machine as above (AMD Ryzen 9 7950X, 63 GB RAM, NVMe, Windows 11 Pro 10.0.26200), `--release`, other programs running, warm page cache. [M]
+
+- **Method.** The same harness, run twice back to back on two copies of one corpus database (the vendored corpus indexed by the release CLI, 16 MB). One run is with OpenTelemetry off. The other uses `--otlp`: the in-process server exports traces to an in-process `FakeCollector`, and the bench's own subscriber carries the OpenTelemetry layer, so client spans and W3C propagation are on too. `--writes 200` adds single-file writes (`index_bytes`, a new file each), so the leader registers and looks up an `ApplyLinks` entry per write. Both runs use the default batch processor (5 s delay).
+
+```sh
+cargo run --release -p graph-client --example rpc_bench -- off.redb --iters 1000 --rare Subscribe --common public --writes 200
+cargo run --release -p graph-client --example rpc_bench -- on.redb  --iters 1000 --rare Subscribe --common public --writes 200 --otlp
+```
+
+Remote latency in milliseconds; the embedded columns of the same runs agree within noise. [M]
+
+| operation | off p50 | off p95 | on p50 | on p95 | on - off p50 |
+|---|---:|---:|---:|---:|---:|
+| ping (Health.Check) | 0.069 | 0.101 | 0.081 | 0.122 | 0.012 |
+| describe | 0.472 | 0.546 | 0.504 | 0.628 | 0.032 |
+| search rare (19 hits) | 0.250 | 0.318 | 0.282 | 0.379 | 0.032 |
+| search rare, limit 1000 | 0.242 | 0.296 | 0.273 | 0.344 | 0.031 |
+| search common, limit 100 | 1.033 | 1.207 | 1.065 | 1.211 | 0.032 |
+| write (index_bytes) | 4.364 | 4.942 | 4.857 | 5.275 | 0.493 |
+
+- The "on" run exported 11,663 spans.
+- **`ApplyLinks` hashing alone**, with the same `DefaultHasher` over the entry bytes, done once at propose and once at apply on the leader: p50 **0.136 ms for a 1 MiB entry** and **0.543 ms for 4 MiB**. For the small writes above, the entry is a few hundred bytes, so hashing is negligible there. [M]
+- **Verdict.**
+  - Reads with traces on cost about 0.01 to 0.03 ms more at p50: the client and server spans plus the propagation headers.
+  - A small write costs about 0.5 ms more at p50 (about 11%). That covers more spans per write (`client`, `rpc`, `apply`, the link), not hashing. This is a single run with the processes sharing one machine, so treat it as an upper estimate. [M]
+  - With traces off, `ApplyLinks` costs one atomic load per apply and nothing at propose. [E: from the code]
+  - A 4 MiB index chunk pays about 1.1 ms of hashing on the leader with traces on. That is small next to the chunk's own apply. [E: hash time times two]

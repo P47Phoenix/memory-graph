@@ -1640,6 +1640,8 @@ fn a_write_to_a_follower_is_one_trace_across_three_processes() {
             all.iter()
                 .any(|a| a.name == "apply" && a.links.iter().any(|l| l.1 == r.span_id))
         }) && t.iter().any(|s| s.name == "client")
+            && t.iter().any(|s| is_write_on(s, 2))
+            && t.iter().any(|s| s.name == "forward")
             && all.iter().any(|s| is_rpc_on(s, n3_id))
     });
     let t: Vec<_> = spans.iter().filter(|s| s.trace_id == trace).collect();

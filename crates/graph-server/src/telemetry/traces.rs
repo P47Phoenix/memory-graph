@@ -154,8 +154,12 @@ pub(super) fn release_hold() {
     HOLD_FOR_IDENTITY.store(false, Ordering::SeqCst);
 }
 
-fn held() -> bool {
-    HOLD_FOR_IDENTITY.load(Ordering::SeqCst)
+/// Whether spans are held now. The flag and the identity are process
+/// globals (one `serve` per process): only `serve` sets the flag, so tests
+/// and embedded users never hold; the exporter's own `force_hold` is the
+/// test seam that does not touch them.
+fn held(force_hold: bool) -> bool {
+    (force_hold || HOLD_FOR_IDENTITY.load(Ordering::SeqCst))
         && IDENTITY
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -180,6 +184,8 @@ pub(super) struct TraceExporter<E> {
     runtime: tokio::runtime::Handle,
     /// Spans held while [`held`] (the node's identity is not known yet).
     pending: Mutex<Vec<SpanData>>,
+    /// Tests: hold as if `serve` had asked to, until [`release`].
+    force_hold: AtomicBool,
 }
 
 impl<E: SpanExporter> TraceExporter<E> {
@@ -192,7 +198,52 @@ impl<E: SpanExporter> TraceExporter<E> {
             timeout,
             runtime,
             pending: Mutex::new(Vec::new()),
+            force_hold: AtomicBool::new(false),
         }
+    }
+
+    fn held(&self) -> bool {
+        held(self.force_hold.load(Ordering::SeqCst))
+    }
+
+    /// Export what is still held (a shutdown or a flush after the hold was
+    /// released, when the batch processor has nothing new to send, so it
+    /// never calls `export`: a start that failed before the identity was
+    /// set, say). Runs on the exporter's runtime, bounded by `timeout`;
+    /// whatever cannot be sent is counted as dropped, never lost silently.
+    fn drain_pending(&self, timeout: Duration) {
+        let batch =
+            std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
+        if batch.is_empty() {
+            return;
+        }
+        let items = batch.len();
+        // Blocking on our runtime is only allowed off its workers.
+        let inner = match (tokio::runtime::Handle::try_current(), self.inner.try_lock()) {
+            (Err(_), Ok(inner)) => inner,
+            _ => {
+                count_export(
+                    0,
+                    items,
+                    &Err(OTelSdkError::InternalFailure(
+                        "held spans not sent at shutdown".into(),
+                    )),
+                );
+                return;
+            }
+        };
+        let resource = self.refreshed();
+        let mut inner = inner;
+        if let Some(r) = &resource {
+            inner.set_resource(r);
+        }
+        let r = self.runtime.block_on(async {
+            match tokio::time::timeout(timeout, inner.export(batch)).await {
+                Ok(r) => r,
+                Err(_) => Err(OTelSdkError::Timeout(timeout)),
+            }
+        });
+        count_export(0, items, &r);
     }
 
     /// The resource to switch to, when the identity changed since the last
@@ -228,7 +279,7 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
     async fn export(&self, mut batch: Vec<SpanData>) -> OTelSdkResult {
         {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            if held() {
+            if self.held() {
                 let room = HELD_MAX.saturating_sub(pending.len());
                 if batch.len() > room {
                     DROPPED[0].fetch_add((batch.len() - room) as u64, Ordering::Relaxed);
@@ -265,6 +316,10 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        // A shutdown sends what was held, identity or not.
+        self.force_hold.store(false, Ordering::SeqCst);
+        release_hold();
+        self.drain_pending(timeout);
         match self.inner.try_lock() {
             Ok(inner) => inner.shutdown_with_timeout(timeout),
             // An export is still running (a stalled collector): it ends at
@@ -274,6 +329,9 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
     }
 
     fn force_flush(&self) -> OTelSdkResult {
+        if !self.held() {
+            self.drain_pending(self.timeout);
+        }
         match self.inner.try_lock() {
             Ok(inner) => inner.force_flush(),
             Err(_) => Ok(()),
@@ -294,9 +352,13 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
 /// hash of the proposed bytes -> the request's `rpc` span. The leader's
 /// apply of those bytes links to it ([`link`](Self::link)). Empty, and
 /// never hashed, unless traces are on.
+///
+/// Two proposals of identical bytes in flight at once share a key: both
+/// requests are kept, and an apply of those bytes links to every one of
+/// them (it cannot tell which proposal it is; they are the same write).
 #[derive(Debug, Default)]
 pub struct ApplyLinks {
-    map: Mutex<HashMap<u64, SpanContext>>,
+    map: Mutex<HashMap<u64, Vec<SpanContext>>>,
     live: AtomicUsize,
 }
 
@@ -304,6 +366,7 @@ pub struct ApplyLinks {
 pub struct LinkGuard<'a> {
     links: &'a ApplyLinks,
     key: u64,
+    rpc: SpanContext,
 }
 
 impl Drop for LinkGuard<'_> {
@@ -313,8 +376,14 @@ impl Drop for LinkGuard<'_> {
             .map
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if m.remove(&self.key).is_some() {
-            self.links.live.fetch_sub(1, Ordering::Relaxed);
+        if let Some(v) = m.get_mut(&self.key) {
+            if let Some(i) = v.iter().position(|c| *c == self.rpc) {
+                v.swap_remove(i);
+                self.links.live.fetch_sub(1, Ordering::Relaxed);
+            }
+            if v.is_empty() {
+                m.remove(&self.key);
+            }
         }
     }
 }
@@ -336,10 +405,13 @@ impl ApplyLinks {
         }
         let key = key_of(payload);
         let mut m = self.map.lock().unwrap_or_else(PoisonError::into_inner);
-        if m.insert(key, rpc).is_none() {
-            self.live.fetch_add(1, Ordering::Relaxed);
-        }
-        Some(LinkGuard { links: self, key })
+        m.entry(key).or_default().push(rpc.clone());
+        self.live.fetch_add(1, Ordering::Relaxed);
+        Some(LinkGuard {
+            links: self,
+            key,
+            rpc,
+        })
     }
 
     /// Link `span` (an `apply`) to the request that proposed `payload` at
@@ -353,8 +425,9 @@ impl ApplyLinks {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&key_of(payload))
-            .cloned();
-        if let Some(rpc) = found {
+            .cloned()
+            .unwrap_or_default();
+        for rpc in found {
             use tracing_opentelemetry::OpenTelemetrySpanExt;
             span.add_link_with_attributes(
                 rpc,
@@ -426,11 +499,116 @@ mod tests {
             false,
             TraceState::default(),
         );
+        let other = SpanContext::new(
+            TraceId::from_bytes([3; 16]),
+            SpanId::from_bytes([4; 8]),
+            TraceFlags::SAMPLED,
+            false,
+            TraceState::default(),
+        );
         {
-            let _g = links.register(b"payload", sc).expect("registered");
+            let _g = links.register(b"payload", sc.clone()).expect("registered");
             assert_eq!(links.live.load(Ordering::Relaxed), 1);
+            {
+                // The same bytes proposed twice at once: both kept.
+                let _h = links.register(b"payload", other).expect("registered");
+                assert_eq!(links.map.lock().unwrap()[&key_of(b"payload")].len(), 2);
+            }
+            assert_eq!(links.map.lock().unwrap()[&key_of(b"payload")], vec![sc]);
         }
         assert_eq!(links.live.load(Ordering::Relaxed), 0);
         assert!(links.map.lock().unwrap().is_empty());
+    }
+
+    /// Records what reaches the wire.
+    #[derive(Debug, Default)]
+    struct Sink(Arc<Mutex<Vec<String>>>);
+
+    impl SpanExporter for Sink {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(batch.into_iter().map(|s| s.name.into_owned()));
+            Ok(())
+        }
+    }
+
+    fn span(name: &'static str) -> SpanData {
+        use opentelemetry::trace::{SpanId, SpanKind, Status};
+        SpanData {
+            span_context: SpanContext::empty_context(),
+            parent_span_id: SpanId::INVALID,
+            parent_span_is_remote: false,
+            span_kind: SpanKind::Internal,
+            name: name.into(),
+            start_time: std::time::SystemTime::now(),
+            end_time: std::time::SystemTime::now(),
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            events: Default::default(),
+            links: Default::default(),
+            status: Status::Unset,
+            instrumentation_scope: Default::default(),
+        }
+    }
+
+    /// More than [`HELD_MAX`] spans before the identity is known: the rest
+    /// are dropped and counted.
+    #[test]
+    fn a_hold_overflow_is_counted_as_dropped() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let e = TraceExporter::new(
+            Sink(Arc::clone(&wire)),
+            Duration::from_secs(5),
+            rt.handle().clone(),
+        );
+        e.force_hold.store(true, Ordering::SeqCst);
+        let before = dropped("traces");
+        for _ in 0..3 {
+            let batch = (0..3000).map(|_| span("x")).collect();
+            assert!(rt.block_on(e.export(batch)).is_ok());
+        }
+        assert!(dropped("traces") >= before + (9000 - HELD_MAX) as u64);
+        e.shutdown_with_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            wire.lock().unwrap().len(),
+            HELD_MAX,
+            "what was held is sent"
+        );
+    }
+
+    /// Review finding: spans held for the identity reach the collector at
+    /// shutdown even when nothing else is exported after the hold ends (a
+    /// start that failed before its on-ready hook).
+    #[test]
+    fn held_spans_are_sent_at_shutdown() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let e = TraceExporter::new(
+            Sink(Arc::clone(&wire)),
+            Duration::from_secs(5),
+            rt.handle().clone(),
+        );
+        e.force_hold.store(true, Ordering::SeqCst);
+        let r = rt.block_on(e.export(vec![span("a"), span("b")]));
+        assert!(r.is_ok());
+        assert!(wire.lock().unwrap().is_empty(), "held");
+        // A flush while still held sends nothing.
+        e.force_flush().unwrap();
+        assert!(wire.lock().unwrap().is_empty());
+        let failures = export_failures("traces");
+        e.shutdown_with_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(*wire.lock().unwrap(), ["a", "b"]);
+        assert_eq!(export_failures("traces"), failures, "sent, not dropped");
     }
 }

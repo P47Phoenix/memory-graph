@@ -368,14 +368,17 @@ fn unreachable(target: NodeId, what: impl std::fmt::Display) -> Unreachable {
 pub struct RaftHeaders {
     identity: Arc<ClusterIdentity>,
     extractors_hash: Arc<str>,
+    /// Send the W3C trace context: only `InstallSnapshot`'s client sets it
+    /// (ADR 0009 D5); heartbeats and AppendEntries never carry one.
+    trace: bool,
 }
 
 impl Interceptor for RaftHeaders {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         let md = req.metadata_mut();
-        // Only `install_snapshot` runs inside an exported span (ADR 0009
-        // D5); for heartbeats and AppendEntries there is none to send.
-        graph_proto::trace_context::inject_current(md);
+        if self.trace {
+            graph_proto::trace_context::inject_current(md);
+        }
         md.insert(
             PROTOCOL_VERSION_HEADER,
             graph_proto::PROTOCOL_VERSION
@@ -580,6 +583,12 @@ fn is_transport(code: tonic::Code) -> bool {
 
 impl GrpcConnection {
     fn client(&self) -> Result<Client, Unreachable> {
+        self.client_traced(false)
+    }
+
+    /// [`client`](Self::client); `trace`: its calls carry the current
+    /// span's W3C context (`InstallSnapshot` only).
+    fn client_traced(&self, trace: bool) -> Result<Client, Unreachable> {
         let ch = self
             .net
             .channel(self.target, &self.addr)
@@ -587,6 +596,7 @@ impl GrpcConnection {
         let headers = RaftHeaders {
             identity: Arc::clone(&self.net.identity),
             extractors_hash: Arc::clone(&self.net.extractors_hash),
+            trace,
         };
         Ok(RaftClient::with_interceptor(ch, headers)
             .max_decoding_message_size(NO_LIMIT)
@@ -814,7 +824,7 @@ impl GrpcConnection {
                 }
             }
         });
-        let mut c = self.client()?;
+        let mut c = self.client_traced(true)?;
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let r = tokio::select! {
             r = c.install_snapshot(stream) => r,

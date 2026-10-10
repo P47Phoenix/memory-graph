@@ -1561,6 +1561,9 @@ fn run() -> Result<i32> {
             (false, n) => format!("db {}, node {}", served.display(), n.unwrap_or(1)),
         };
         let log_format = *log_format;
+        let tracer_provider = telemetry
+            .as_ref()
+            .and_then(|t| t.tracer_provider().cloned());
         let served_result =
             graph_server::run_blocking_with(cfg, graph_cli::shipped_extractors(), move |r| {
                 // The node's identity as `start` resolved it: a first start
@@ -1568,6 +1571,12 @@ fn run() -> Result<i32> {
                 // and cluster ids only now (#249).
                 let identity = std::sync::Arc::clone(&r.identity);
                 graph_server::telemetry::set_node_identity(r.raft.node_id, move || identity.get());
+                // The batch processor skips an empty queue, so on an idle
+                // node the spans held until now would wait for the next
+                // span: send them now (the exporter drains what it held).
+                if let Some(p) = &tracer_provider {
+                    let _ = p.force_flush();
+                }
                 // Scripts and tests read these lines for the bound ports (the
                 // metrics line first: the listening line is the start signal);
                 // JSON objects under --log-format json.
