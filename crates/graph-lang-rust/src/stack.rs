@@ -17,7 +17,18 @@
 //! 16 MiB), and skips `syn` (tokens only, with a note) only when the bound
 //! exceeds [`MAX_PARSE_STACK`]. The thread is internal to the extractor, so
 //! library callers of `RustExtractor::extract` get the same guarantee on
-//! any thread that has 256 KiB of stack free.
+//! any thread that has 256 KiB of stack free. That is a requirement on the
+//! caller: an in-place parse (bound under 256 KiB) runs on the caller's own
+//! thread and needs 256 KiB of free stack there, so a library caller that
+//! runs extraction on a small custom stack must leave at least that much.
+//!
+//! A dedicated thread's stack stays committed, as far as it was touched,
+//! until the thread exits, and parse jobs run in parallel (#254). Before it
+//! spawns one, the parse reserves the stack it may touch ([`touched`]: the
+//! bound over its 3x margin) from the caller's memory budget through
+//! [`graph_core::reserve_scratch`], and gives it back once the thread has
+//! been joined. The CLI installs its `--memory` ingest budget there, so
+//! parallel near-cap files wait for each other instead of exceeding it.
 //!
 //! The tokenizer's token count is never less than the tokens `syn` sees:
 //! it splits multi-character operators (`&&`, `->`) that `syn` reads as one.
@@ -118,6 +129,12 @@ pub(crate) fn largest_item(tokens: &[TokenDecl]) -> usize {
     for (i, t) in code.iter().enumerate() {
         item += 1;
         let text = t.text.as_str();
+        // Angle brackets are not tracked: `<` and `>` are also comparison
+        // and shift operators, which tokens alone cannot tell apart. That is
+        // sound because a `}` inside `<...>` (a const generic block such as
+        // `T<{ N }>`) is, in valid code, always followed by `,` or `>`, never
+        // by `#`, an item keyword or `name!`, so it never ends an item early
+        // and never under-counts one.
         match text {
             "(" | "[" | "{" => depth += 1,
             ")" | "]" | "}" => depth = depth.saturating_sub(1),
@@ -146,6 +163,13 @@ pub(crate) fn bound(item_tokens: usize) -> usize {
     item_tokens
         .saturating_mul(STACK_PER_TOKEN)
         .saturating_add(STACK_BASE)
+}
+
+/// The stack a parse thread of `size` bytes may actually touch: the size
+/// over the 3x margin built into [`STACK_PER_TOKEN`] and [`STACK_BASE`].
+/// This is what it reserves from the caller's memory budget (#254).
+pub fn touched(size: usize) -> u64 {
+    (size / 3) as u64
 }
 
 /// Where a parse runs.
@@ -182,6 +206,8 @@ pub(crate) fn parse_on_safe_stack(
             ))
         }
     };
+    // Held until the thread has been joined, when its stack is unmapped.
+    let _reserved = graph_core::reserve_scratch(touched(size));
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .name("rust-parse".into())

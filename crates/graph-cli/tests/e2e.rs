@@ -2887,7 +2887,14 @@ fn memory_budget_bounds_bytes_in_flight() {
         assert_eq!(sum["files"], 200, "{sum}");
         let peak = sum["stats"]["peak_in_flight"].as_u64().unwrap();
         let cap = sum["stats"]["memory_budget"].as_u64().unwrap();
-        assert!(peak <= cap, "{mode:?}: peak {peak} > budget {cap}");
+        // A parse stack bigger than the whole budget (in debug, these
+        // files plan a 16 MiB+ thread) goes through alone, like a file
+        // bigger than the budget (#254), so it may come on top.
+        let scratch = sum["stats"]["memory"]["scratch_peak"].as_u64().unwrap();
+        assert!(
+            peak <= cap + scratch,
+            "{mode:?}: peak {peak} > budget {cap} + scratch {scratch}"
+        );
         if !mode.contains(&"--deterministic") {
             assert_eq!(cap, 16 * 1024, "adaptive keeps the requested budget");
             assert!(sum["stats"]["transactions"].as_u64().unwrap() > 1);

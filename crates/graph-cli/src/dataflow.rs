@@ -206,6 +206,10 @@ pub struct Budget {
     pressure_episodes: AtomicU64,
     pressure_ns: AtomicU64,
     pressure_since: Mutex<Option<Instant>>,
+    /// Extractor scratch (parse stacks) held now, and at most, included in
+    /// `used`.
+    scratch: AtomicU64,
+    scratch_peak: AtomicU64,
 }
 
 /// How the cap moved over a run (`--stats`).
@@ -220,6 +224,8 @@ pub struct BudgetView {
     pub pressure: bool,
     pub pressure_episodes: u64,
     pub pressure_time: Duration,
+    /// Most extractor scratch (parse stacks) reserved at once.
+    pub scratch_peak: u64,
 }
 
 impl Budget {
@@ -237,6 +243,8 @@ impl Budget {
             pressure_episodes: AtomicU64::new(0),
             pressure_ns: AtomicU64::new(0),
             pressure_since: Mutex::new(None),
+            scratch: AtomicU64::new(0),
+            scratch_peak: AtomicU64::new(0),
         }
     }
 
@@ -288,6 +296,7 @@ impl Budget {
             pressure: self.pressure.load(Relaxed),
             pressure_episodes: self.pressure_episodes.load(Relaxed),
             pressure_time: Duration::from_nanos(ns),
+            scratch_peak: self.scratch_peak(),
         }
     }
 
@@ -316,6 +325,46 @@ impl Budget {
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         *used = used.saturating_sub(n);
         self.cv.notify_all();
+    }
+
+    /// Reserve `n` bytes of an extractor's scratch memory (the Rust parse
+    /// stack, #254) on top of the bytes in flight, so admission sees it too.
+    /// Waits until it fits under the cap. It goes through over the cap only
+    /// when no other scratch is held and `oldest()` says the caller's file
+    /// is the oldest still being parsed: everything held beyond it then
+    /// waits on it (the writer commits in walk order), so waiting longer
+    /// could never end. Or when `cancel` is set.
+    pub fn acquire_scratch(&self, n: u64, oldest: &dyn Fn() -> bool, cancel: &AtomicBool) {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used + n > self.cap.load(Relaxed)
+            && !(self.scratch.load(Relaxed) == 0 && oldest())
+            && !cancel.load(Relaxed)
+        {
+            used = self
+                .cv
+                .wait_timeout(used, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *used += n;
+        let scratch = self.scratch.fetch_add(n, Relaxed) + n;
+        self.scratch_peak.fetch_max(scratch, Relaxed);
+        self.peak.fetch_max(*used, Relaxed);
+    }
+
+    /// Give back scratch reserved with [`Budget::acquire_scratch`].
+    pub fn release_scratch(&self, n: u64) {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(n);
+        // Only changed under the `used` lock.
+        let s = self.scratch.load(Relaxed);
+        self.scratch.store(s.saturating_sub(n), Relaxed);
+        self.cv.notify_all();
+    }
+
+    /// Most scratch held at once.
+    pub fn scratch_peak(&self) -> u64 {
+        self.scratch_peak.load(Relaxed)
     }
 
     pub fn wake_all(&self) {
@@ -455,6 +504,39 @@ mod tests {
         b.release(500);
         assert!(t.join().unwrap());
         assert_eq!(b.used(), 31);
+    }
+
+    #[test]
+    fn scratch_waits_under_the_cap_unless_its_file_is_oldest_and_alone() {
+        let b = std::sync::Arc::new(Budget::new(100));
+        let cancel = AtomicBool::new(false);
+        assert!(b.acquire(10, 0, &cancel));
+        b.acquire_scratch(60, &|| false, &cancel);
+        assert_eq!((b.used(), b.scratch_peak()), (70, 60));
+        // Does not fit: waits, even for the oldest file, while scratch is held.
+        let b2 = b.clone();
+        let t = std::thread::spawn(move || {
+            b2.acquire_scratch(60, &|| true, &AtomicBool::new(false));
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!t.is_finished(), "waits while another scratch is held");
+        b.release_scratch(60);
+        t.join().unwrap();
+        assert!(b.peak() <= 100, "{}", b.peak());
+        b.release_scratch(60);
+        // The oldest file alone goes through over the cap (no deadlock).
+        b.acquire_scratch(500, &|| true, &cancel);
+        assert_eq!(b.used(), 510);
+        b.release_scratch(500);
+        assert_eq!(b.used(), 10);
+        // A file that is not the oldest waits until it fits or a cancel.
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (b2, c2) = (b.clone(), cancel.clone());
+        let t = std::thread::spawn(move || b2.acquire_scratch(500, &|| false, &c2));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!t.is_finished());
+        cancel.store(true, Relaxed);
+        t.join().unwrap();
     }
 
     #[test]
