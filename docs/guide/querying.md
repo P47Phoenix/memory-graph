@@ -34,6 +34,35 @@ A symbol's span covers everything that belongs to it, including attributes, deco
 
 A hit with no enclosing symbol of that grain is rolled up to its file with `no_matching_symbol`; a file with no symbols at all (a language without an extractor) with `no_symbols`.
 
+## What matches: whole tokens, prefixes, no infix
+
+Neither command matches part of a word in the middle of a name yet:
+
+- `search <TEXT>` matches **whole tokens exactly**, case included. `search Gadget` finds the identifier `Gadget`; `search Gad`, `search gadget` and `search Gad*` do not (there is no wildcard on `search`).
+- `symbols <PATTERN>` matches a **whole name**, or a **prefix** with a trailing `*`. It is case-insensitive by default; `--exact-case` makes it case-sensitive ([case](#case)).
+- There is **no infix (substring) match** on either command: a leading `*` is not a wildcard (`*dget` looks for a symbol literally named `*dget`), and a fragment from inside a name finds nothing. Infix symbol search is planned as [story 68](../epic-code-memory-graph.md#story-68).
+
+Worked example, a file `Gadget.cs` containing `public class Gadget { }`:
+
+| Command | Finds `Gadget`? | Why |
+|---|---|---|
+| `symbols Gadget` | yes | exact name |
+| `symbols gadget` | yes | case-insensitive by default |
+| `symbols Gad*` | yes | prefix |
+| `symbols gad*` | yes | prefix, case-insensitive by default |
+| `symbols --exact-case Gad*` | yes | prefix, same case |
+| `symbols --exact-case gad*` | no | the case differs |
+| `symbols '*'` | yes | `*` alone lists every symbol |
+| `symbols Get` | no | `Get` is not the name and not a prefix of it (no infix match) |
+| `symbols dget` | no | a fragment from inside the name |
+| `symbols '*dget'` | no | a leading `*` is not a wildcard |
+| `search Gadget` | yes (the token) | whole token, exact text |
+| `search Gad` | no | part of a token |
+| `search gadget` | no | `search` is case-sensitive |
+| `search Gad*` | no | `search` has no wildcard |
+
+An empty answer therefore means "no name or prefix matched", not "not indexed": `describe` shows what a repo holds, and `symbols '*' --file <path>` lists every symbol in one file.
+
 ## Symbol patterns
 
 `symbols` patterns: `name` (exact), `prefix*`, `*` (all), `name\*` (a literal `*`). `**` is rejected as ambiguous.
