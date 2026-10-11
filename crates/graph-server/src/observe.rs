@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 37] = [
+pub const METRIC_NAMES: [&str; 38] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",

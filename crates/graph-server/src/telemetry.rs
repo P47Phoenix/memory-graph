@@ -792,7 +792,7 @@ const fn map(
 }
 
 /// Every `/metrics` family, in [`crate::observe::METRIC_NAMES`] order.
-pub const METRIC_MAPPING: [MetricMapping; 37] = {
+pub const METRIC_MAPPING: [MetricMapping; 38] = {
     use OtelInstrument::{Counter, Gauge, Histogram, UpDownCounter};
     [
         map(
