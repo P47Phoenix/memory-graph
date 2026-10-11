@@ -67,6 +67,9 @@ pub struct Ctx {
     pub last_elect: std::sync::Mutex<Option<Instant>>,
     /// The backup uploader (`--backup-url`), for status and metrics.
     pub backup: Option<crate::backup::Backup>,
+    /// Authentication (ADR 0012): the token set, the cluster secret and
+    /// the refusal counters.
+    pub auth: std::sync::Arc<crate::auth::Auth>,
 }
 
 /// How long a follower's `LINEARIZABLE` read waits to apply the leader's
@@ -195,6 +198,9 @@ impl Ctx {
                 Ok((v, meta))
             }
             View::Snapshot(id) => {
+                slot.snapshots()
+                    .check_owner(id, crate::snapshots::owner_of_current().as_deref())
+                    .map_err(status)?;
                 let snap = slot.snapshots().get(id).map_err(status)?;
                 // The handle's own freshness, frozen when it opened (a
                 // linearizable handle is never stale_possible).

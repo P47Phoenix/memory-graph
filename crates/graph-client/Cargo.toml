@@ -17,6 +17,10 @@ prost.workspace = true
 rand.workspace = true
 sha2.workspace = true
 tracing.workspace = true
+# ADR 0012: the token stays in zeroized memory; `AuthChannel` is a tower
+# service over tonic's channel (both already in the tree).
+zeroize = "1"
+tower-service.workspace = true
 
 [dev-dependencies]
 # rpc_bench --otlp: the OpenTelemetry layer in the bench's subscriber.

@@ -29,6 +29,12 @@ struct Cli {
     /// together with --db. With --json, read commands add `stale_possible`
     #[arg(long, global = true, value_name = "HOST:PORT[,HOST:PORT...]")]
     server: Option<String>,
+    /// With --server: read the bearer token (`mgt_...`, from `auth new-token`) from this file
+    /// and send it on every call (ADR 0012). Without it: MEMORY_GRAPH_TOKEN_FILE, then
+    /// MEMORY_GRAPH_TOKEN. There is no flag that takes the token itself (it would show in `ps`
+    /// and shell history). Exit code 8: no or a refused token; 9: its role is too low
+    #[arg(long, global = true, value_name = "FILE")]
+    token_file: Option<PathBuf>,
     /// With --server: how reads are served, `local` (the node's store as it is) or `linearizable`
     /// (sees every acknowledged write). Also read from MEMORY_GRAPH_READ. Default local
     #[arg(long, global = true, value_parser = graph_cli::target::parse_read_mode)]
@@ -150,6 +156,78 @@ fn reject_legacy_backend(backend: Option<LegacyBackend>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Subcommand)]
+enum AuthCmd {
+    /// Create a client token. The token is printed once on stdout (or written to --token-out);
+    /// the [[token]] entry for the server's --auth-tokens file (its id, role and SHA-256, never
+    /// the token) goes to stderr, or is appended to --append <file>. Keep the token secret: the
+    /// server stores only its hash, so a lost token is replaced, not recovered
+    NewToken {
+        /// The token's name in the server's logs (letters, digits, . _ - @ : / +)
+        #[arg(long)]
+        id: String,
+        /// read (every query) or write (also index, prune, vacuum and admin)
+        #[arg(long)]
+        role: String,
+        /// Refuse the token from this instant on (RFC 3339, e.g. 2027-01-01T00:00:00Z)
+        #[arg(long, value_name = "TIME")]
+        expires: Option<String>,
+        /// Append the entry to this token file (created with mode 0600) instead of printing it;
+        /// refused if the file would no longer be valid (a duplicate id, say)
+        #[arg(long, value_name = "FILE")]
+        append: Option<PathBuf>,
+        /// Write the token to this new file (mode 0600) instead of stdout
+        #[arg(long, value_name = "FILE")]
+        token_out: Option<PathBuf>,
+    },
+    /// Create a cluster secret (`mgc_...`) for --cluster-secret-file: printed on stdout, or
+    /// written to --out. Every node of a cluster uses the same one
+    NewSecret {
+        /// Write it to this new file (mode 0600) instead of stdout
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+}
+
+/// `memory-graph auth ...`.
+fn auth_cmd(cmd: &AuthCmd) -> Result<i32> {
+    match cmd {
+        AuthCmd::NewToken {
+            id,
+            role,
+            expires,
+            append,
+            token_out,
+        } => {
+            let t =
+                graph_cli::auth_cmd::new_token(id, role, expires.as_deref(), append.as_deref())?;
+            match token_out {
+                Some(p) => {
+                    graph_cli::auth_cmd::write_secret_file(p, &t.token)?;
+                    eprintln!("token `{id}` written to {}", p.display());
+                }
+                None => out!("{}", *t.token),
+            }
+            match append {
+                Some(p) => eprintln!("token `{id}` ({role}) added to {}", p.display()),
+                None => eprint!("{}", t.stanza),
+            }
+            Ok(0)
+        }
+        AuthCmd::NewSecret { out } => {
+            let s = graph_server::auth::new_credential(graph_proto::auth::SECRET_PREFIX);
+            match out {
+                Some(p) => {
+                    graph_cli::auth_cmd::write_secret_file(p, &s)?;
+                    eprintln!("cluster secret written to {}", p.display());
+                }
+                None => out!("{}", *s),
+            }
+            Ok(0)
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -460,15 +538,34 @@ enum Cmd {
         /// http://<HOST:PORT>/mcp, on a port of its own. Off unless given. Loopback only
         /// (127.0.0.1, ::1) unless --mcp-allow-remote. See docs/mcp.md.
         /// +----------------------------------------------------------------------+
-        /// | WARNING: The MCP endpoint has no authentication. Anyone who can      |
-        /// | reach it can read every indexed source token. Keep it on loopback    |
-        /// | or behind an authenticating proxy until #105.                        |
+        /// | WARNING: Without serve --auth-tokens the MCP endpoint has no         |
+        /// | authentication. Anyone who can reach it can read every indexed       |
+        /// | source token. Keep it on loopback, behind an authenticating proxy,   |
+        /// | or turn on --auth-tokens (ADR 0012).                                 |
         /// +----------------------------------------------------------------------+
         #[arg(long, value_name = "HOST:PORT", verbatim_doc_comment)]
         mcp_listen: Option<String>,
         /// Let --mcp-listen be a non-loopback address (logs a warning at every start)
         #[arg(long, requires = "mcp_listen")]
         mcp_allow_remote: bool,
+        /// Require a bearer token on every call (ADR 0012): this TOML file lists each token's id,
+        /// role (read or write) and SHA-256 (`memory-graph auth new-token --append <file>`
+        /// writes one). Reloaded on change (and on SIGHUP); a file that fails validation keeps
+        /// the loaded set. With it, every listener and --advertise must be loopback unless
+        /// --insecure-transport. Default: no authentication
+        #[arg(long, value_name = "FILE")]
+        auth_tokens: Option<PathBuf>,
+        /// With --auth-tokens on a --data-dir node (required there): the cluster secret every node
+        /// uses to authenticate to the others (`memory-graph auth new-secret`); one line, or two
+        /// (current, then next) during a rotation. The same file on every node
+        #[arg(long, value_name = "FILE", requires = "auth_tokens")]
+        cluster_secret_file: Option<PathBuf>,
+        /// With --auth-tokens: allow --listen, --advertise, --mcp-listen and --metrics-listen on
+        /// addresses other than loopback. This server has no TLS: tokens, the cluster secret and
+        /// all data then cross the network in clear text unless a TLS-terminating proxy or a
+        /// mesh is in front (docs/security.md)
+        #[arg(long, requires = "auth_tokens")]
+        insecure_transport: bool,
         /// A browser Origin the MCP endpoint accepts, exactly (`http://localhost:6274`);
         /// repeatable. A request with any other Origin gets 403 (default: none; requests
         /// without an Origin, such as non-browser clients, are accepted)
@@ -551,6 +648,11 @@ enum Cmd {
         /// many-core host or a Docker Desktop VM. Env: MEMORY_GRAPH_WORKER_THREADS
         #[arg(long, env = "MEMORY_GRAPH_WORKER_THREADS", value_name = "N", value_parser = parse_worker_threads)]
         worker_threads: Option<std::num::NonZeroUsize>,
+    },
+    /// Create credentials for a server with --auth-tokens (ADR 0012)
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
     },
     /// Check a server's health (grpc.health.v1): exit 0 when serving, 1 when not (or unreachable).
     /// With --ready: the memory-graph.ready service, SERVING while a leader is known and this node
@@ -825,9 +927,10 @@ enum Cmd {
     /// Over stdio no port is opened: only the client that started the process can talk to it.
     /// The HTTP endpoint (`serve --mcp-listen`) is another matter:
     /// +----------------------------------------------------------------------+
-    /// | WARNING: The MCP endpoint has no authentication. Anyone who can      |
-    /// | reach it can read every indexed source token. Keep it on loopback    |
-    /// | or behind an authenticating proxy until #105.                        |
+    /// | WARNING: Without serve --auth-tokens the MCP endpoint has no         |
+    /// | authentication. Anyone who can reach it can read every indexed       |
+    /// | source token. Keep it on loopback, behind an authenticating proxy,   |
+    /// | or turn on --auth-tokens (ADR 0012).                                 |
     /// +----------------------------------------------------------------------+
     #[command(verbatim_doc_comment)]
     Mcp,
@@ -1166,6 +1269,10 @@ fn run() -> Result<i32> {
     if let Some(d) = cli.read_deadline {
         graph_cli::target::set_read_deadline(d);
     }
+    graph_cli::target::set_token_file(cli.token_file.clone());
+    if let Cmd::Auth { cmd } = &cli.cmd {
+        return auth_cmd(cmd);
+    }
     let _ = REMOTE_IS_READ.set(matches!(
         cli.cmd,
         Cmd::Describe { .. }
@@ -1217,6 +1324,9 @@ fn run() -> Result<i32> {
         otlp_metrics_interval,
         mcp_listen,
         mcp_allow_remote,
+        auth_tokens,
+        cluster_secret_file,
+        insecure_transport,
         mcp_allow_origin,
         mcp_read,
         mcp_max_inflight,
@@ -1505,6 +1615,11 @@ fn run() -> Result<i32> {
             }
             cfg.mcp = Some(mc);
         }
+        cfg.auth = graph_server::AuthConfig {
+            tokens: auth_tokens.clone(),
+            cluster_secret: cluster_secret_file.clone(),
+        };
+        cfg.insecure_transport = *insecure_transport;
         cfg.snapshot_max_age = *snapshot_max_age;
         cfg.worker_threads = worker_threads;
         cfg.restore_allow_extractor_mismatch = *restore_allow_extractor_mismatch;
@@ -1633,7 +1748,7 @@ fn run() -> Result<i32> {
         })
     };
     match cli.cmd {
-        Cmd::Serve { .. } => unreachable!("handled above"),
+        Cmd::Serve { .. } | Cmd::Auth { .. } => unreachable!("handled above"),
         Cmd::Mcp => {
             // Stdout is the protocol channel: everything else goes to stderr.
             let backend = match &remote_addr {
@@ -1674,12 +1789,17 @@ fn run() -> Result<i32> {
             } else {
                 ""
             };
-            let r = graph_cli::target::connect_with(
-                &addr,
-                read,
-                Some(std::time::Duration::from_secs(2)),
-            )
-            .and_then(|s| Ok(s.health(service)?));
+            // The health service needs no token (ADR 0012 D9): probed
+            // directly, the first endpoint that answers decides.
+            let _ = read;
+            let mut r = Err(anyhow::anyhow!("no endpoint"));
+            for ep in graph_cli::target::endpoints(&addr)? {
+                r = graph_client::probe_health(&ep, service, std::time::Duration::from_secs(2))
+                    .map_err(|e| anyhow::Error::new(e).context(format!("server {ep}")));
+                if r.is_ok() {
+                    break;
+                }
+            }
             return Ok(match r {
                 Ok(true) => {
                     out!("SERVING");

@@ -137,6 +137,8 @@ pub fn store_error_code(e: &StoreError) -> &'static str {
         StoreError::Protocol(_) => "protocol",
         StoreError::WrongCluster { .. } => "wrong_cluster",
         StoreError::AlreadyApplied { .. } => "already_applied",
+        StoreError::Unauthenticated(_) => "unauthenticated",
+        StoreError::PermissionDenied { .. } => "permission_denied",
     }
 }
 

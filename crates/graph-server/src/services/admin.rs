@@ -138,16 +138,19 @@ async fn probe_node(ctx: &Ctx, id: NodeId, addr: &str) -> Result<pb::StatusRespo
             .connect()
             .await
             .map_err(|e| Status::unavailable(format!("cannot reach node {id} at {addr}: {e}")))?;
-        pb::admin_client::AdminClient::with_interceptor(ch, graph_proto::SendVersion)
-            .status(pb::StatusRequest {})
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(|e| {
-                Status::unavailable(format!(
-                    "node {id} at {addr} did not answer Status: {}",
-                    e.message()
-                ))
-            })
+        pb::admin_client::AdminClient::with_interceptor(
+            ch,
+            crate::auth::NodeHeaders::new(&ctx.auth),
+        )
+        .status(pb::StatusRequest {})
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|e| {
+            Status::unavailable(format!(
+                "node {id} at {addr} did not answer Status: {}",
+                e.message()
+            ))
+        })
     };
     let st = tokio::time::timeout(PROBE_TIMEOUT, st)
         .await

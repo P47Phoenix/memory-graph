@@ -169,6 +169,17 @@ pub enum StoreError {
     /// skip); it never reaches a client.
     #[error("raft marker {index} already applied")]
     AlreadyApplied { index: u64 },
+    /// The server requires a credential and this call had none that it
+    /// accepts (ADR 0012 D1/D8: missing, malformed, unknown or expired; the
+    /// server never says which). Never produced by the embedded store. The
+    /// message never contains the credential.
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    /// The credential is valid but may not call this method (ADR 0012
+    /// D5/D8): its role is too low, or the method is not in the server's
+    /// role table. `required_role` is `read`, `write`, `node`, or empty.
+    #[error("permission denied: {msg}")]
+    PermissionDenied { msg: String, required_role: String },
 }
 
 fn not_leader_hint(id: &Option<u64>, addr: &Option<String>) -> String {

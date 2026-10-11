@@ -44,6 +44,59 @@ pub mod exit {
     /// malformed `--otlp-endpoint`/`otlp-endpoint`, a bad `--otlp-signals`)
     /// or could not build the exporters (ADR 0009 D3).
     pub const TELEMETRY_CONFIG: i32 = 7;
+    /// The server requires a token and none was given, or it refused the
+    /// one given (`UNAUTHENTICATED`, ADR 0012 D8).
+    pub const UNAUTHENTICATED: i32 = 8;
+    /// The token is valid but its role may not do this
+    /// (`PERMISSION_DENIED`, ADR 0012 D8).
+    pub const PERMISSION_DENIED: i32 = 9;
+}
+
+/// The token file when `--token-file` is not given (ADR 0012 D2).
+pub const ENV_TOKEN_FILE: &str = "MEMORY_GRAPH_TOKEN_FILE";
+/// The token itself, when neither `--token-file` nor
+/// `MEMORY_GRAPH_TOKEN_FILE` is set. Its value is never echoed.
+pub const ENV_TOKEN: &str = "MEMORY_GRAPH_TOKEN";
+
+/// `--token-file` of this process (set once, before any connect).
+static TOKEN_FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record `--token-file` (once per process; a second call is ignored).
+pub fn set_token_file(p: Option<PathBuf>) {
+    let _ = TOKEN_FILE.set(p);
+}
+
+/// The client credential, highest precedence first: `--token-file`,
+/// `MEMORY_GRAPH_TOKEN_FILE`, `MEMORY_GRAPH_TOKEN`; `None` when none is
+/// set. No error message ever contains an environment variable's value.
+pub fn credentials_from(
+    flag: Option<&Path>,
+    env_file: Option<&str>,
+    env_token: Option<&str>,
+) -> Result<Option<graph_client::Credentials>> {
+    if let Some(p) = flag {
+        return Ok(Some(
+            graph_client::Credentials::from_file(p).map_err(|e| anyhow!("--token-file: {e}"))?,
+        ));
+    }
+    if let Some(p) = env_file.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some(
+            graph_client::Credentials::from_file(Path::new(p))
+                .map_err(|e| anyhow!("{ENV_TOKEN_FILE}: {e}"))?,
+        ));
+    }
+    if let Some(t) = env_token.filter(|s| !s.trim().is_empty()) {
+        return Ok(Some(graph_client::Credentials::from_token(ENV_TOKEN, t)?));
+    }
+    Ok(None)
+}
+
+/// [`credentials_from`] with this process's flag and environment.
+pub fn credentials() -> Result<Option<graph_client::Credentials>> {
+    let flag = TOKEN_FILE.get().cloned().flatten();
+    let env_file = std::env::var(ENV_TOKEN_FILE).ok();
+    let env_token = std::env::var(ENV_TOKEN).ok();
+    credentials_from(flag.as_deref(), env_file.as_deref(), env_token.as_deref())
 }
 
 /// An error that carries its own exit code.
@@ -62,13 +115,15 @@ impl std::fmt::Display for Exit {
 impl std::error::Error for Exit {}
 
 /// The exit code for a failed command: an [`Exit`] anywhere in the chain
-/// wins; then `NoLeader` (4), `Protocol` (5) and `WrongCluster` (6) store
-/// errors; else 1.
+/// wins; then `NoLeader` (4), `Protocol` (5), `WrongCluster` (6),
+/// `Unauthenticated` (8) and `PermissionDenied` (9) store errors; else 1.
 pub fn exit_code(e: &anyhow::Error) -> i32 {
     if let Some(x) = e.chain().find_map(|c| c.downcast_ref::<Exit>()) {
         return x.code;
     }
     match e.chain().find_map(|c| c.downcast_ref::<StoreError>()) {
+        Some(StoreError::Unauthenticated(_)) => exit::UNAUTHENTICATED,
+        Some(StoreError::PermissionDenied { .. }) => exit::PERMISSION_DENIED,
         Some(StoreError::NoLeader { .. }) => exit::WRITE_DEADLINE,
         Some(StoreError::Protocol(_)) => exit::PROTOCOL,
         Some(StoreError::WrongCluster { .. }) => exit::WRONG_CLUSTER,
@@ -356,6 +411,7 @@ pub fn connect_with(addr: &str, read: ReadMode, budget: Option<Duration>) -> Res
     if let Some(b) = budget.or_else(|| READ_DEADLINE.get().copied()) {
         cfg.retry.budget = b;
     }
+    cfg.credentials = credentials()?;
     let store = RemoteStore::connect(cfg).map_err(|e| match e {
         StoreError::Protocol(_) | StoreError::SchemaMismatch { .. } => anyhow::Error::new(Exit {
             code: exit::PROTOCOL,
@@ -381,6 +437,16 @@ pub fn endpoints(addr: &str) -> Result<Vec<String>> {
         .collect();
     if eps.is_empty() {
         bail!("--server `{addr}` names no endpoint (give host:port[,host:port...])");
+    }
+    if let Some(e) = eps.iter().find(|e| {
+        e.get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    }) {
+        bail!(
+            "--server {e}: this client does not speak TLS (ADR 0012 D4, #104); reach a TLS \
+             server through a local TLS-terminating proxy or a mesh sidecar and give its plain \
+             host:port (docs/security.md)"
+        );
     }
     Ok(eps)
 }
@@ -412,6 +478,42 @@ pub fn with_read_meta(mut doc: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn https_is_refused_and_auth_errors_have_their_own_codes() {
+        let e = endpoints("a:1,HTTPS://b:2").unwrap_err().to_string();
+        assert!(e.contains("TLS") && e.contains("docs/security.md"), "{e}");
+        let e = anyhow::Error::from(StoreError::Unauthenticated("x".into())).context("ctx");
+        assert_eq!(exit_code(&e), exit::UNAUTHENTICATED);
+        let e = anyhow::Error::from(StoreError::PermissionDenied {
+            msg: "x".into(),
+            required_role: "write".into(),
+        });
+        assert_eq!(exit_code(&e), exit::PERMISSION_DENIED);
+    }
+
+    #[test]
+    fn credentials_follow_precedence_and_never_echo_the_env() {
+        let body = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(credentials_from(None, None, None).unwrap().is_none());
+        assert!(credentials_from(None, Some(" "), Some(""))
+            .unwrap()
+            .is_none());
+        assert!(credentials_from(None, None, Some(&format!("mgt_{body}")))
+            .unwrap()
+            .is_some());
+        let bad = format!("mgc_{body}");
+        let e = credentials_from(None, None, Some(&bad)).unwrap_err();
+        assert!(!format!("{e:#}").contains(body), "{e:#}");
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("t");
+        std::fs::write(&f, format!("mgt_{body}\n")).unwrap();
+        // The flag wins over a broken env value; the env file over the env token.
+        assert!(credentials_from(Some(&f), Some("/nope"), Some(&bad)).is_ok());
+        assert!(credentials_from(None, f.to_str(), Some(&bad)).is_ok());
+        let e = credentials_from(None, Some("/nope/x"), None).unwrap_err();
+        assert!(format!("{e:#}").contains(ENV_TOKEN_FILE), "{e:#}");
+    }
 
     #[test]
     fn server_takes_a_comma_separated_endpoint_list() {

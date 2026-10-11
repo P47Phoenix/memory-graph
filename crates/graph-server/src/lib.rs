@@ -28,6 +28,8 @@
 //!   tracing/metrics layer and the `/metrics` HTTP responder (stage E).
 //! * [`backup`]: snapshot backups to a `file://` directory and verified
 //!   restores from one (ADR 0006).
+//! * [`auth`]: bearer tokens, the cluster secret and the deny-by-default
+//!   role table in front of every service (ADR 0012).
 //! * [`disk`]: the disk guard (`--min-free-disk`).
 //! * [`lock`]: the LOCK sidecar naming the holder.
 //! * [`powercut`]: a test-only in-memory redb storage backend that can
@@ -44,6 +46,7 @@
 //! and a `snapshot_id` reads a frozen handle.
 
 pub mod advertise;
+pub mod auth;
 pub mod backup;
 pub mod conn;
 pub mod disk;
@@ -64,6 +67,7 @@ pub mod snapshots;
 pub mod telemetry;
 pub mod testing;
 
+pub use auth::{AuthConfig, Role};
 pub use disk::{DiskGuard, FreeSpaceProbe};
 pub use extractors::{extractors_hash, SharedExtractor};
 pub use lock::LockFile;

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod auth;
 pub mod cluster;
 pub mod fake_collector;
 pub mod fake_s3;

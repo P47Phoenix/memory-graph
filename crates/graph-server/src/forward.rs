@@ -114,10 +114,13 @@ pub async fn within<T>(
 }
 
 /// Stamps the protocol version and [`FORWARDED_BY_HEADER`] on a forwarded
-/// request.
-#[derive(Debug, Clone, Copy)]
+/// request; with auth on also the cluster secret, the role the caller was
+/// granted here and its token id (ADR 0012 D3). The caller's own bearer
+/// token is never copied.
+#[derive(Debug, Clone)]
 pub struct ForwardHeaders {
     pub me: NodeId,
+    pub auth: std::sync::Arc<crate::auth::Auth>,
 }
 
 impl Interceptor for ForwardHeaders {
@@ -138,6 +141,30 @@ impl Interceptor for ForwardHeaders {
                 .parse()
                 .expect("a number is valid ASCII metadata"),
         );
+        if self.auth.secret_header().is_some() {
+            crate::auth::stamp_secret(&self.auth, md);
+            // The caller this handler serves (authorized here already); a
+            // node-originated call (no caller: a background task) acts with
+            // the node's own authority.
+            let caller = crate::auth::current_caller();
+            let role = caller
+                .as_ref()
+                .map_or(Some(crate::auth::Role::Write), |c| c.role());
+            if let Some(role) = role {
+                md.insert(
+                    graph_proto::auth::FORWARDED_ROLE_HEADER,
+                    tonic::metadata::MetadataValue::from_static(role.as_str()),
+                );
+            }
+            if let Some(id) = caller.and_then(|c| match c.kind {
+                crate::auth::CallerKind::Token { id, .. } => Some(id),
+                _ => None,
+            }) {
+                if let Ok(v) = id.parse() {
+                    md.insert(graph_proto::auth::FORWARDED_TOKEN_ID_HEADER, v);
+                }
+            }
+        }
         Ok(req)
     }
 }
@@ -162,6 +189,7 @@ pub struct Forwarder {
     channels: Mutex<HashMap<String, Channel>>,
     forwarded: AtomicU64,
     default_timeout: Option<Duration>,
+    auth: std::sync::Arc<crate::auth::Auth>,
 }
 
 /// Whether `req` was forwarded by another node.
@@ -212,7 +240,14 @@ impl Forwarder {
             channels: Mutex::new(HashMap::new()),
             forwarded: AtomicU64::new(0),
             default_timeout: None,
+            auth: crate::auth::Auth::disabled(),
         }
+    }
+
+    /// Forward with this node's cluster secret (ADR 0012 D3).
+    pub fn with_auth(mut self, auth: std::sync::Arc<crate::auth::Auth>) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Test hook: every forward's default deadline is this instead.
@@ -306,7 +341,10 @@ impl Forwarder {
     fn intercepted(&self, addr: &str) -> Result<ForwardChannel, Status> {
         Ok(InterceptedService::new(
             self.channel(addr)?,
-            ForwardHeaders { me: self.me },
+            ForwardHeaders {
+                me: self.me,
+                auth: std::sync::Arc::clone(&self.auth),
+            },
         ))
     }
 
@@ -436,7 +474,12 @@ mod tests {
 
     #[test]
     fn forwarded_requests_are_marked() {
-        let req = ForwardHeaders { me: 3 }.call(Request::new(())).unwrap();
+        let req = ForwardHeaders {
+            me: 3,
+            auth: crate::auth::Auth::disabled(),
+        }
+        .call(Request::new(()))
+        .unwrap();
         assert!(was_forwarded(&req));
         assert_eq!(
             req.metadata().get(FORWARDED_BY_HEADER).unwrap(),

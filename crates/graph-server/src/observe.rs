@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 36] = [
+pub const METRIC_NAMES: [&str; 37] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -51,6 +51,7 @@ pub const METRIC_NAMES: [&str; 36] = [
     "mg_rpc_duration_seconds",
     "mg_rpc_total",
     "mg_writes_forwarded_total",
+    "mg_auth_refusals_total",
     "mg_quorum_probes_total",
     "mg_apply_duration_seconds",
     "mg_build_info",
@@ -651,12 +652,21 @@ fn cluster_families(ctx: &Ctx) -> Vec<MetricFamily> {
             SampleValue::Int(n),
         );
     }
+    let mut refusals = MetricFamily::new(
+        "mg_auth_refusals_total",
+        MetricKind::Counter,
+        "Calls refused by authentication or the role table (ADR 0012), by reason; zero with auth off.",
+    );
+    for (reason, n) in ctx.auth.refusal_counts() {
+        refusals.push(vec![("reason", reason.into())], SampleValue::Int(n));
+    }
     vec![
         counter(
             "mg_writes_forwarded_total",
             "Writes and membership changes this node forwarded to the leader.",
             SampleValue::Int(ctx.fwd.forwarded_total()),
         ),
+        refusals,
         probes,
         mcp,
     ]
@@ -1013,6 +1023,8 @@ macro_rules! rpc_span {
             rpc.method = tracing::field::Empty,
             rpc.grpc.status_code = tracing::field::Empty,
             server.address = tracing::field::Empty,
+            auth.token_id = tracing::field::Empty,
+            auth.role = tracing::field::Empty,
         )
     };
 }
