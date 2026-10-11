@@ -285,9 +285,18 @@ async fn search_symbols_page(
         view: view_of(view),
         query: Some(q.clone().into()),
     };
+    // ADR 0011 D3: the server stops an infix scan at this deadline with a
+    // typed `DeadlineExceeded` (it uses ~95% of it, so its answer arrives
+    // before tonic's own detail-less timeout would fire).
+    let deadline = std::time::Instant::now() + c.read_deadline();
     let r = c
         .read_call(view, |ch| {
-            let req = req.clone();
+            let mut req = tonic::Request::new(req.clone());
+            req.set_timeout(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .max(std::time::Duration::from_millis(1)),
+            );
             async move { store_client(ch).search_symbols(req).await }
         })
         .await

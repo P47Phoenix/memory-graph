@@ -3886,7 +3886,6 @@ mod infix_props {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
         /// The brute-force oracle (ADR 0011 tests): fold ASCII only, filter
         /// every name by substring or `ends_with`, in both case modes; the
         /// store's answer is that list in the same (org, repo, path,

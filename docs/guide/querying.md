@@ -89,6 +89,13 @@ Quote any pattern with a `*` so the shell does not expand it. Rules for infix an
 - The lookup walks every distinct symbol name, so a very common needle costs the most. Over `--server` a deadline the client sets (`grpc-timeout`) stops it with `DeadlineExceeded`, never a partial page.
 - An older server would read `*get*` as the prefix `*get` and answer nothing, so the client sends an infix or suffix pattern only to a server whose `Hello` lists the `symbol_infix` capability, and otherwise fails with "this server does not support infix symbol search; upgrade it".
 
+**Changed with infix search (story 68).** Patterns that meant something else before:
+
+- `*foo` is now a **suffix** query (names ending in `foo`). It used to look for a name literally starting with `*`; write `\*foo` for that now.
+- `\*get*` is now the **prefix** `*get` (a leading `\*` is a literal `*`). It used to be the prefix `\*get`, backslash included.
+- `\*\*` is now the exact name `**`. It used to be the exact name `\**`.
+- A symbol query stopped by its deadline (`DeadlineExceeded`, see above) is an ordinary error: the CLI prints it and exits with code 1, with no rows printed. Over `--server`, the client sends `--read-deadline` as the request's deadline.
+
 Refused: an empty pattern, any pattern ending in `**` (ambiguous; so `**`, `***` and `a\**`), and the infix/suffix cases above.
 
 ### Case

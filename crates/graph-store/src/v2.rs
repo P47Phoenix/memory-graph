@@ -1945,7 +1945,11 @@ impl R {
         }
         let mut files: HashMap<u64, FileCtx> = HashMap::new();
         let mut order: Vec<u64> = Vec::new();
-        for &fid in by_file.keys() {
+        for (k, &fid) in by_file.keys().enumerate() {
+            // ADR 0011 D3: the deadline also bounds collecting the hits.
+            if k % 256 == 255 {
+                crate::deadline::check_query_deadline()?;
+            }
             if self.node(fid)?.is_none_or(|n| n.kind != NodeKind::File) {
                 continue;
             }
@@ -1983,6 +1987,7 @@ impl R {
             if out.len() >= want {
                 break;
             }
+            crate::deadline::check_query_deadline()?;
             let Some(raw) = self.streams.get(fid)? else {
                 continue;
             };

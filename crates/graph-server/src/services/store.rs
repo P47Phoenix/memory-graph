@@ -330,9 +330,12 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::SearchSymbolsRequest>,
     ) -> Result<Response<pb::SearchSymbolsResponse>, Status> {
         // ADR 0011 D3: the client's deadline bounds the scan; past it the
-        // store answers `DeadlineExceeded`, never a partial page.
+        // store answers `DeadlineExceeded`, never a partial page. It stops at
+        // 95% of the client's timeout, so the typed answer reaches the
+        // client before tonic's detail-less timeout (which would read as a
+        // lost connection and be resent to another node).
         let deadline = crate::forward::incoming_timeout(req.metadata())
-            .and_then(|t| std::time::Instant::now().checked_add(t));
+            .and_then(|t| std::time::Instant::now().checked_add(t.mul_f64(0.95)));
         let mut r = req.into_inner();
         // The key sees the default limit applied, so an omitted limit and
         // the default one are the same query.

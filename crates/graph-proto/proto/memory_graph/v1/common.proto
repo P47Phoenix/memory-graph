@@ -403,7 +403,7 @@ message StoreErrorDetail {
     WrongCluster wrong_cluster = 16;
     Binary binary = 17;
     StrictEncoding strict_encoding = 18;
-    DeadlineExceeded deadline_exceeded = 19;
+    DeadlineExceeded deadline_exceeded = 21;
   }
 }
 

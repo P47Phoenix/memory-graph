@@ -429,7 +429,7 @@ pub struct Extraction {
 pub struct StoreErrorDetail {
     #[prost(
         oneof = "store_error_detail::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21"
     )]
     pub kind: ::core::option::Option<store_error_detail::Kind>,
 }
@@ -606,7 +606,7 @@ pub mod store_error_detail {
         Binary(Binary),
         #[prost(message, tag = "18")]
         StrictEncoding(StrictEncoding),
-        #[prost(message, tag = "19")]
+        #[prost(message, tag = "21")]
         DeadlineExceeded(DeadlineExceeded),
     }
 }

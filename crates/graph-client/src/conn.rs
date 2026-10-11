@@ -487,6 +487,13 @@ impl Conn {
         self.call_at(Kind::Read, pin, f).await.map(|(v, _)| v)
     }
 
+    /// The read deadline (the retry budget, `--read-deadline`), sent as a
+    /// read's `grpc-timeout` where the server bounds its work by it
+    /// (`SearchSymbols`, ADR 0011 D3).
+    pub fn read_deadline(&self) -> Duration {
+        self.cfg.retry.budget
+    }
+
     /// The read view for this connection's configured mode.
     pub fn view(&self) -> View {
         match self.cfg.read_mode {
