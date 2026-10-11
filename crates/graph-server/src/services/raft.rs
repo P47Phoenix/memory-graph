@@ -19,8 +19,9 @@
 //! room for two copies of the snapshot (the received file and the staged
 //! store) on top of `--min-free-disk`, and is refused the same way before
 //! receiving. (A leader's own disk is checked before it proposes a write;
-//! an I/O error while appending or applying anyway stops the node, see
-//! the state machine.)
+//! a disk-full error while appending or applying anyway is retried in
+//! place and answers the write `RESOURCE_EXHAUSTED`, see
+//! `raft::disk_stall`; any other I/O error there stops the node.)
 //!
 //! `InstallSnapshot` writes the streamed chunks to a temp file under the
 //! snapshots directory, checks size and SHA-256 against the header, refuses
@@ -129,6 +130,16 @@ impl pb::raft_server::Raft for RaftService {
             }
         }
         let rpc = wire::append_from_pb(req).map_err(bad)?;
+        // Before Raft sees it: a core held by a stalled append (story 67)
+        // cannot, and the write path asks here for a newer leader. Only
+        // after `check_headers` above passed (same cluster id, same
+        // extractors), so a foreign sender's term is never noted.
+        if rpc.vote.is_committed() {
+            self.obs.note_seen_leader(
+                rpc.vote.leader_id().term,
+                rpc.vote.leader_id().voted_for().unwrap_or(0),
+            );
+        }
         let leader_commit = rpc.leader_commit.map(|l| l.index);
         let resp = self.raft.append_entries(rpc).await.map_err(raft_status)?;
         // Any answer but a higher vote means a live leader of this term

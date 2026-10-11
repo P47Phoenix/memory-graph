@@ -580,6 +580,9 @@ mod tests {
         assert_eq!(exit_code(&e), exit::WRITE_DEADLINE);
         let e = anyhow::Error::from(StoreError::Protocol("v2".into()));
         assert_eq!(exit_code(&e), exit::PROTOCOL);
+        // Story 67: RESOURCE_EXHAUSTED (a full disk) is a plain failure.
+        let e = anyhow::Error::from(StoreError::Storage("disk full: no space".into()));
+        assert_eq!(exit_code(&e), 1);
         let e = anyhow::Error::from(StoreError::WrongCluster {
             expected: "a".into(),
             found: "b".into(),

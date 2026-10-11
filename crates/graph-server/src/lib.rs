@@ -49,6 +49,8 @@ pub mod conn;
 pub mod disk;
 pub mod extractors;
 pub mod forward;
+#[doc(hidden)]
+pub mod full_disk;
 pub mod join;
 pub mod lock;
 pub mod mcp;

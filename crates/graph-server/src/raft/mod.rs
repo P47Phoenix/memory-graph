@@ -24,6 +24,7 @@
 // boxing it is not ours to decide.
 #![allow(clippy::result_large_err)]
 
+pub mod disk_stall;
 pub mod log_store;
 pub mod network;
 pub mod node;

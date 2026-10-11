@@ -13,9 +13,12 @@
 //! (`LogResponse::Failed`), the same on every replica; the refused write
 //! rolls back and the marker alone then moves to the entry in its own
 //! transaction, so the store's marker always equals openraft's
-//! `last_applied`. An I/O-class error (`Storage`, `Corrupt`, `Locked`) is
-//! returned to openraft as a `StorageError`: it stops the node rather than
-//! let one replica silently diverge; a restart replays from the marker.
+//! `last_applied`. A disk-full error is retried in place until space is
+//! freed ([`DiskStall`], story 67): the node keeps running and serving
+//! reads, and writes waiting on it answer `RESOURCE_EXHAUSTED`. Any other
+//! I/O-class error (`Storage`, `Corrupt`, `Locked`) is returned to openraft
+//! as a `StorageError`: it stops the node rather than let one replica
+//! silently diverge; a restart replays from the marker.
 //!
 //! Snapshots live in a [`SnapshotDir`] (`snapshots/snap-<term>-<index>.redb`
 //! plus a `.meta`; see that module for the crash-safety argument):
@@ -37,6 +40,7 @@
 //! fingerprints (an unchanged file is a no-op), `Prune` and `Vacuum` by
 //! construction, and `IngestExtraction` when the extraction is identical,
 //! which a retry of the same request is (ADR 0004 D2/D7).
+use super::disk_stall::{DiskStall, StallSource};
 use super::snapshot_dir::SnapshotDir;
 use super::types::{
     log_id_of, marker_of, Entry, ErrDetail, LogId, LogResponse, SnapshotFile, SnapshotMeta,
@@ -65,6 +69,7 @@ pub struct StoreStateMachine {
     failpoints: SmFailpoints,
     obs: Arc<crate::observe::Observability>,
     testing_apply_gate: Option<TestingApplyGate>,
+    stall: DiskStall,
 }
 
 /// Testing only, not a supported API (#[doc(hidden)]): called (on the
@@ -108,6 +113,7 @@ impl StoreStateMachine {
             failpoints: SmFailpoints::default(),
             obs: Arc::default(),
             testing_apply_gate: None,
+            stall: DiskStall::new(),
         }
     }
 
@@ -121,6 +127,13 @@ impl StoreStateMachine {
     /// Record apply timings (and spans) into `obs`.
     pub fn with_obs(mut self, obs: Arc<crate::observe::Observability>) -> Self {
         self.obs = obs;
+        self
+    }
+
+    /// The node's disk-full stall state: an entry whose apply fails with a
+    /// disk-full error is retried in place (story 67).
+    pub fn with_disk_stall(mut self, stall: DiskStall) -> Self {
+        self.stall = stall;
         self
     }
 
@@ -140,13 +153,30 @@ impl StoreStateMachine {
         Ok((last, membership))
     }
 
-    /// Apply `entries` in order; the blocking body of `apply`.
+    /// [`apply_all_with`](Self::apply_all_with) without a stall state of
+    /// the node's (unit tests).
+    #[cfg(test)]
     fn apply_all(
         slot: &StoreSlot,
         entries: Vec<Entry>,
         failpoints: SmFailpoints,
         obs: &crate::observe::Observability,
         gate: Option<&TestingApplyGate>,
+    ) -> Result<Vec<LogResponse>, StorageError> {
+        Self::apply_all_with(slot, entries, failpoints, obs, gate, &DiskStall::new())
+    }
+
+    /// Apply `entries` in order; the blocking body of `apply`. An entry
+    /// whose apply fails with a disk-full error is retried in place until
+    /// space is freed (its transaction rolled back, so the marker has not
+    /// moved), and the responses of the entries before it are kept.
+    fn apply_all_with(
+        slot: &StoreSlot,
+        entries: Vec<Entry>,
+        failpoints: SmFailpoints,
+        obs: &crate::observe::Observability,
+        gate: Option<&TestingApplyGate>,
+        stall: &DiskStall,
     ) -> Result<Vec<LogResponse>, StorageError> {
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
@@ -175,7 +205,40 @@ impl StoreStateMachine {
             }
             let _enter = span.enter();
             let started = std::time::Instant::now();
-            let r = slot.with_store(|s| Self::apply_one(s, &e));
+            // A client's write grows the store; blank and membership
+            // entries only move the marker (and must not block an
+            // election's entry on a node short of space).
+            let normal = matches!(e.payload, EntryPayload::Normal(_));
+            // Set when a reopen after an I/O error failed: the store is
+            // closed, and the next try reopens it first.
+            let reopen = std::cell::Cell::new(false);
+            let r = stall.retry(
+                StallSource::Apply,
+                || {
+                    if reopen.get() {
+                        slot.reopen_after_io_error()?;
+                        reopen.set(false);
+                    }
+                    if normal {
+                        // Below --min-free-disk: stall before redb meets
+                        // ENOSPC (which would poison the database).
+                        stall.precheck("apply")?;
+                    }
+                    slot.with_store(|s| {
+                        if let Some(io) = stall.injected(StallSource::Apply) {
+                            // Testing: the entry's transaction met a full disk.
+                            return Err(StoreError::Storage(io.to_string()));
+                        }
+                        Self::apply_one(s, &e)
+                    })
+                },
+                || {
+                    if let Err(err) = slot.reopen_after_io_error() {
+                        tracing::warn!(error = %err, "store: reopen failed; retrying");
+                        reopen.set(true);
+                    }
+                },
+            );
             let secs = started.elapsed().as_secs_f64();
             span.record("duration_ms", secs * 1000.0);
             obs.observe_apply(secs);
@@ -353,9 +416,10 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
         let fp = self.failpoints;
         let obs = Arc::clone(&self.obs);
         let gate = self.testing_apply_gate.clone();
+        let stall = self.stall.clone();
         // Parsing and committing block; keep them off the runtime workers.
         tokio::task::spawn_blocking(move || {
-            Self::apply_all(&slot, entries, fp, &obs, gate.as_ref())
+            Self::apply_all_with(&slot, entries, fp, &obs, gate.as_ref(), &stall)
         })
         .await
         .map_err(|e| sm_err(std::io::Error::other(format!("apply task: {e}"))))?
@@ -450,6 +514,52 @@ mod tests {
     #[test]
     fn openraft_storage_suite() {
         Suite::test_all(Builder).unwrap();
+    }
+
+    /// Story 67: a disk-full stall in the middle of a batch is retried in
+    /// place; the entries before it stay applied (their responses are
+    /// kept), the marker stops before the stalled one, and once space is
+    /// back every entry is answered, in order.
+    #[test]
+    fn a_mid_batch_disk_full_stall_keeps_the_earlier_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, _) = sm_at(d.path());
+        let stall = DiskStall::new();
+        let s2 = stall.clone();
+        let gate: TestingApplyGate = Arc::new(move |i| {
+            if i == 2 {
+                s2.fail_apply(true);
+            }
+        });
+        let (s3, slot3) = (stall.clone(), Arc::clone(&slot));
+        let clearer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !s3.is_stalled(StallSource::Apply) {
+                assert!(std::time::Instant::now() < deadline, "no stall");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let marker = slot3.with_store(|s| s.raft_marker()).unwrap().unwrap();
+            s3.fail_apply(false);
+            marker.index
+        });
+        let out = StoreStateMachine::apply_all_with(
+            &slot,
+            vec![blank(1), blank(2), blank(3)],
+            NO_FP,
+            &Default::default(),
+            Some(&gate),
+            &stall,
+        )
+        .unwrap();
+        assert_eq!(clearer.join().unwrap(), 1, "stalled before entry 2");
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter().all(|r| matches!(r, LogResponse::Marked)),
+            "{out:?}"
+        );
+        let marker = slot.with_store(|s| s.raft_marker()).unwrap().unwrap();
+        assert_eq!(marker.index, 3);
+        assert_eq!(stall.current(), None);
     }
 
     #[test]

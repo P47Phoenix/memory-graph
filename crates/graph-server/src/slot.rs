@@ -361,6 +361,26 @@ impl StoreSlot {
         })
     }
 
+    /// Close and reopen the store after an I/O error (story 67): redb
+    /// answers every operation `PreviousIo` after one (a full disk) until
+    /// the database is reopened, and the reopen repairs the file if the
+    /// failed commit left it needing it. Snapshot handles are dropped and
+    /// drained first, as for a swap ([`replace`](Self::replace)). If the
+    /// reopen fails the store stays closed (`Locked` for every call) until
+    /// a later call succeeds.
+    pub fn reopen_after_io_error(&self) -> Result<(), StoreError> {
+        let mut g = self
+            .store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dropped = self.snapshots.clear();
+        self.drain(dropped)?;
+        drop(g.take());
+        *g = Some(self.reopen()?);
+        tracing::warn!(path = %self.path.display(), "store reopened after an I/O error");
+        Ok(())
+    }
+
     /// Close the store for good (shutdown): later calls answer `Locked`.
     pub fn close(&self) {
         let mut g = self

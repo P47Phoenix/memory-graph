@@ -142,17 +142,25 @@ impl Ctx {
         .read_index;
         self.raft.read_index_waits.fetch_add(1, Ordering::SeqCst);
         let _waiting = WaitGuard(Arc::clone(&self.raft.read_index_waits));
-        self.raft
-            .raft
-            .wait(Some(READ_INDEX_WAIT))
-            .applied_index_at_least(Some(index), "the leader's read index")
-            .await
-            .map_err(|e| {
-                tracing::debug!(index, error = %e, "read index not applied in time");
-                status(StoreError::NoLeader {
-                    retry_after_ms: crate::raft::node::NO_LEADER_RETRY_MS,
-                })
-            })?;
+        // This node's apply stalled on a full disk (story 67): it cannot
+        // reach the read index until space is freed; answer at once.
+        if let Some(m) = self.raft.disk_stall.current() {
+            return Err(status(StoreError::Storage(m)));
+        }
+        let waiter = self.raft.raft.wait(Some(READ_INDEX_WAIT));
+        let wait = waiter.applied_index_at_least(Some(index), "the leader's read index");
+        let applied = tokio::select! {
+            r = wait => r,
+            m = self.raft.disk_stall.stalled() => {
+                return Err(status(StoreError::Storage(m)));
+            }
+        };
+        applied.map_err(|e| {
+            tracing::debug!(index, error = %e, "read index not applied in time");
+            status(StoreError::NoLeader {
+                retry_after_ms: crate::raft::node::NO_LEADER_RETRY_MS,
+            })
+        })?;
         Ok(())
     }
 

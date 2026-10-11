@@ -148,6 +148,9 @@ impl TestNode {
     /// and `tests/process_kill.rs` kills a real server process.
     pub fn kill(&mut self) {
         if let Some(r) = self.running.take() {
+            // A disk-full retry on the blocking pool would outlive the
+            // runtime (and keep the files open): end it first.
+            r.raft.disk_stall.stop();
             drop(r);
             if let Some(rt) = self.rt.take() {
                 rt.shutdown_timeout(Duration::from_secs(5));

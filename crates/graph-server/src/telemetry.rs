@@ -792,7 +792,7 @@ const fn map(
 }
 
 /// Every `/metrics` family, in [`crate::observe::METRIC_NAMES`] order.
-pub const METRIC_MAPPING: [MetricMapping; 36] = {
+pub const METRIC_MAPPING: [MetricMapping; 37] = {
     use OtelInstrument::{Counter, Gauge, Histogram, UpDownCounter};
     [
         map(
@@ -878,6 +878,13 @@ pub const METRIC_MAPPING: [MetricMapping; 36] = {
             UpDownCounter,
             "{handle}",
             &[],
+        ),
+        map(
+            "mg_disk_stalled",
+            "memory_graph.disk.stalled",
+            Gauge,
+            "1",
+            &["source"],
         ),
         map(
             "mg_rpc_duration_seconds",
