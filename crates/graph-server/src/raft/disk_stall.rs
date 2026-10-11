@@ -252,6 +252,15 @@ impl DiskStall {
                     } else if full {
                         previous_io = 0;
                     }
+                    if previous_io > MAX_PREVIOUS_IO {
+                        tracing::error!(
+                            source = ?src,
+                            reopens = previous_io - 1,
+                            error = %cause,
+                            "redb still answers PreviousIo after {MAX_PREVIOUS_IO} reopenings \
+                             with no disk-full error: giving up (the node stops)"
+                        );
+                    }
                     if !(full || poisoned) || previous_io > MAX_PREVIOUS_IO || self.stopping() {
                         return Err(e);
                     }

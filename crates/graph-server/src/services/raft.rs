@@ -131,7 +131,9 @@ impl pb::raft_server::Raft for RaftService {
         }
         let rpc = wire::append_from_pb(req).map_err(bad)?;
         // Before Raft sees it: a core held by a stalled append (story 67)
-        // cannot, and the write path asks here for a newer leader.
+        // cannot, and the write path asks here for a newer leader. Only
+        // after `check_headers` above passed (same cluster id, same
+        // extractors), so a foreign sender's term is never noted.
         if rpc.vote.is_committed() {
             self.obs.note_seen_leader(
                 rpc.vote.leader_id().term,
