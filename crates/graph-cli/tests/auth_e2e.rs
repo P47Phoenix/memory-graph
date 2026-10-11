@@ -70,8 +70,8 @@ fn tokens_roles_and_exit_codes() {
     let read = new_token(&tokens, "bot", "read");
     let write_file = d.path().join("w.token");
     let read_file = d.path().join("r.token");
-    std::fs::write(&write_file, format!("{write}\n")).unwrap();
-    std::fs::write(&read_file, format!("{read}\n")).unwrap();
+    write_private(&write_file, &format!("{write}\n"));
+    write_private(&read_file, &format!("{read}\n"));
     let wrong_file = d.path().join("x.token");
     let o = cmd()
         .args([
@@ -127,7 +127,7 @@ fn tokens_roles_and_exit_codes() {
     let first = |o: &Output| {
         String::from_utf8_lossy(&o.stderr)
             .lines()
-            .next()
+            .find(|l| l.starts_with("Error:"))
             .unwrap_or("")
             .to_string()
     };
@@ -215,6 +215,65 @@ fn tokens_roles_and_exit_codes() {
 
     let _ = s.child.kill();
     let _ = s.child.wait();
+}
+
+/// A token file as a user would keep it: mode 0600 on Unix.
+fn write_private(path: &Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+/// A group- or world-readable token file is used, with a warning first.
+#[cfg(unix)]
+#[test]
+fn a_readable_token_file_is_warned_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("t.token");
+    let o = cmd()
+        .args(["auth", "new-token", "--id", "x", "--role", "read"])
+        .output()
+        .unwrap();
+    let token = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    std::fs::write(&f, format!("{token}\n")).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // Nothing listens there: the warning comes from reading the file.
+    let o = cmd()
+        .args([
+            "--server",
+            "127.0.0.1:1",
+            "--read-deadline",
+            "200ms",
+            "--token-file",
+        ])
+        .arg(&f)
+        .arg("describe")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("is readable by group or others"), "{err}");
+    assert!(!err.contains(&token[4..]), "{err}");
+    write_private(&f, &format!("{token}\n"));
+    let o = cmd()
+        .args([
+            "--server",
+            "127.0.0.1:1",
+            "--read-deadline",
+            "200ms",
+            "--token-file",
+        ])
+        .arg(&f)
+        .arg("describe")
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&o.stderr).contains("readable by group"),
+        "0600: no warning"
+    );
 }
 
 #[test]
