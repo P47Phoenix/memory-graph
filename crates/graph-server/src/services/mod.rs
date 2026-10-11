@@ -69,6 +69,9 @@ pub struct Ctx {
     pub last_elect: std::sync::Mutex<Option<Instant>>,
     /// The backup uploader (`--backup-url`), for status and metrics.
     pub backup: Option<crate::backup::Backup>,
+    /// Authentication (ADR 0012): the token set, the cluster secret and
+    /// the refusal counters.
+    pub auth: std::sync::Arc<crate::auth::Auth>,
 }
 
 /// How long a follower's `LINEARIZABLE` read waits to apply the leader's
@@ -129,7 +132,11 @@ impl Ctx {
         let deadline = self
             .fwd
             .deadline(&tonic::metadata::MetadataMap::new(), FORWARD_UNARY_TIMEOUT);
-        let mut client = self.fwd.admin_client(&addr)?;
+        // An in-process read (the MCP endpoint) has no client caller: the
+        // barrier asks for `read` only, explicitly.
+        let mut client = self
+            .fwd
+            .admin_client_as_node(&addr, crate::auth::Role::Read)?;
         let index = within(
             self.fwd.me(),
             deadline,
@@ -144,17 +151,25 @@ impl Ctx {
         .read_index;
         self.raft.read_index_waits.fetch_add(1, Ordering::SeqCst);
         let _waiting = WaitGuard(Arc::clone(&self.raft.read_index_waits));
-        self.raft
-            .raft
-            .wait(Some(READ_INDEX_WAIT))
-            .applied_index_at_least(Some(index), "the leader's read index")
-            .await
-            .map_err(|e| {
-                tracing::debug!(index, error = %e, "read index not applied in time");
-                status(StoreError::NoLeader {
-                    retry_after_ms: crate::raft::node::NO_LEADER_RETRY_MS,
-                })
-            })?;
+        // This node's apply stalled on a full disk (story 67): it cannot
+        // reach the read index until space is freed; answer at once.
+        if let Some(m) = self.raft.disk_stall.current() {
+            return Err(status(StoreError::Storage(m)));
+        }
+        let waiter = self.raft.raft.wait(Some(READ_INDEX_WAIT));
+        let wait = waiter.applied_index_at_least(Some(index), "the leader's read index");
+        let applied = tokio::select! {
+            r = wait => r,
+            m = self.raft.disk_stall.stalled() => {
+                return Err(status(StoreError::Storage(m)));
+            }
+        };
+        applied.map_err(|e| {
+            tracing::debug!(index, error = %e, "read index not applied in time");
+            status(StoreError::NoLeader {
+                retry_after_ms: crate::raft::node::NO_LEADER_RETRY_MS,
+            })
+        })?;
         Ok(())
     }
 
@@ -197,6 +212,9 @@ impl Ctx {
                 Ok((v, meta))
             }
             View::Snapshot(id) => {
+                slot.snapshots()
+                    .check_owner(id, crate::snapshots::owner_of_current().as_deref())
+                    .map_err(status)?;
                 let snap = slot.snapshots().get(id).map_err(status)?;
                 // The handle's own freshness, frozen when it opened (a
                 // linearizable handle is never stale_possible).

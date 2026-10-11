@@ -492,6 +492,9 @@ fn store_error() -> impl Strategy<Value = StoreError> {
         text().prop_map(StoreError::Protocol),
         (text(), text()).prop_map(|(expected, found)| StoreError::WrongCluster { expected, found }),
         text().prop_map(StoreError::DeadlineExceeded),
+        text().prop_map(StoreError::Unauthenticated),
+        (text(), text())
+            .prop_map(|(msg, required_role)| StoreError::PermissionDenied { msg, required_role }),
     ]
 }
 
@@ -846,6 +849,15 @@ fn code_table_matches_adr_0004() {
             E::DeadlineExceeded("x".into()).into(),
             Code::DeadlineExceeded,
         ),
+        (E::Unauthenticated("x".into()).into(), Code::Unauthenticated),
+        (
+            E::PermissionDenied {
+                msg: "x".into(),
+                required_role: "write".into(),
+            }
+            .into(),
+            Code::PermissionDenied,
+        ),
     ];
     for (e, code) in cases {
         assert_eq!(e.code(), code, "{e:?}");
@@ -922,6 +934,56 @@ fn a_redb_wrapped_disk_full_io_error_is_resource_exhausted() {
     assert_eq!(store_error_to_status(&e).code(), Code::ResourceExhausted);
     let other = StoreError::from(redb::StorageError::Io(std::io::Error::other("boom")));
     assert_eq!(store_error_to_status(&other).code(), Code::Internal);
+}
+
+/// Story 67: the quota and Windows handle codes, the `io::ErrorKind`
+/// texts, the source chain, and redb's `PreviousIo`.
+#[test]
+fn disk_full_classification_covers_quotas_kinds_and_chains() {
+    use crate::error::{error_is_disk_full, is_disk_full, is_previous_io};
+    if cfg!(windows) {
+        for code in [39, 112] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(is_disk_full(&e.to_string()), "{e}");
+        }
+    }
+    if cfg!(target_os = "linux") {
+        for code in [28, 122] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(is_disk_full(&e.to_string()), "{e}");
+        }
+        // 39 is ENOTEMPTY on Linux.
+        let e = std::io::Error::from_raw_os_error(39);
+        assert!(!is_disk_full(&e.to_string()), "{e}");
+    }
+    for kind in [
+        std::io::ErrorKind::StorageFull,
+        std::io::ErrorKind::QuotaExceeded,
+    ] {
+        let e = std::io::Error::from(kind);
+        assert!(is_disk_full(&e.to_string()), "{e}");
+        assert!(error_is_disk_full(&e), "{e}");
+        // Wrapped, under a message that says nothing about it.
+        let outer = std::io::Error::other(Wrapped(std::io::Error::new(kind, "x")));
+        assert!(error_is_disk_full(&outer));
+    }
+    assert!(!error_is_disk_full(&std::io::Error::other("boom")));
+    let prev = StoreError::from(redb::StorageError::PreviousIo);
+    assert!(is_previous_io(&prev.to_string()), "{prev}");
+    assert!(!is_previous_io("disk full"));
+}
+
+#[derive(Debug)]
+struct Wrapped(std::io::Error);
+impl std::fmt::Display for Wrapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wrapped")
+    }
+}
+impl std::error::Error for Wrapped {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
 }
 
 /// `AlreadyApplied` is server-internal; should it ever reach the wire it

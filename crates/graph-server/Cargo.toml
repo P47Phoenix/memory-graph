@@ -53,6 +53,15 @@ bytes = "1"
 percent-encoding = "2"
 quick-xml = "0.37"
 hmac = "0.12"
+# Authentication (ADR 0012, all pure Rust and gate-checked in the ADR):
+# constant-time digest compare, the token set swapped on reload, secrets
+# wiped from memory, the token file (TOML, as `serve --config`) and the
+# token body (base64url; already in the tree).
+subtle = "2.6"
+arc-swap = "1"
+zeroize = "1"
+toml = { version = "0.9", features = ["preserve_order"] }
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
@@ -65,6 +74,8 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 proptest.workspace = true
+# tests/auth.rs: a raw call to any method path (an empty message both ways).
+tonic-prost.workspace = true
 graph-lang-rust = { path = "../graph-lang-rust" }
 graph-lang-csharp = { path = "../graph-lang-csharp" }
 graph-lang-javascript = { path = "../graph-lang-javascript" }

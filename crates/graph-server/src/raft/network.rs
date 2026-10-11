@@ -371,6 +371,8 @@ pub struct RaftHeaders {
     /// Send the W3C trace context: only `InstallSnapshot`'s client sets it
     /// (ADR 0009 D5); heartbeats and AppendEntries never carry one.
     trace: bool,
+    /// The cluster secret every Raft RPC carries (ADR 0012 D3).
+    auth: Arc<crate::auth::Auth>,
 }
 
 impl Interceptor for RaftHeaders {
@@ -394,6 +396,7 @@ impl Interceptor for RaftHeaders {
         if let Ok(v) = self.extractors_hash.parse() {
             md.insert(EXTRACTORS_HASH_HEADER, v);
         }
+        crate::auth::stamp_secret(&self.auth, md);
         Ok(req)
     }
 }
@@ -408,6 +411,7 @@ pub struct GrpcNetwork {
     channels: Arc<Mutex<HashMap<NodeId, (String, Channel)>>>,
     connect_timeout: Duration,
     stats: NetStats,
+    auth: Arc<crate::auth::Auth>,
 }
 
 impl GrpcNetwork {
@@ -418,7 +422,14 @@ impl GrpcNetwork {
             channels: Arc::new(Mutex::new(HashMap::new())),
             connect_timeout: Duration::from_secs(2),
             stats,
+            auth: crate::auth::Auth::disabled(),
         }
+    }
+
+    /// Send this node's cluster secret on every Raft RPC (ADR 0012 D3).
+    pub fn with_auth(mut self, auth: Arc<crate::auth::Auth>) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// The cached channel to `target` at `addr`, rebuilt if the address
@@ -597,6 +608,7 @@ impl GrpcConnection {
             identity: Arc::clone(&self.net.identity),
             extractors_hash: Arc::clone(&self.net.extractors_hash),
             trace,
+            auth: Arc::clone(&self.net.auth),
         };
         Ok(RaftClient::with_interceptor(ch, headers)
             .max_decoding_message_size(NO_LIMIT)

@@ -148,6 +148,9 @@ impl TestNode {
     /// and `tests/process_kill.rs` kills a real server process.
     pub fn kill(&mut self) {
         if let Some(r) = self.running.take() {
+            // A disk-full retry on the blocking pool would outlive the
+            // runtime (and keep the files open): end it first.
+            r.raft.disk_stall.stop();
             drop(r);
             if let Some(rt) = self.rt.take() {
                 rt.shutdown_timeout(Duration::from_secs(5));
@@ -226,6 +229,8 @@ impl Drop for TestNode {
 pub struct ClusterTestbed {
     nodes: BTreeMap<NodeId, TestNode>,
     plan: FaultPlan,
+    /// What [`client`](Self::client) authenticates with (ADR 0012).
+    credentials: Option<graph_client::Credentials>,
     // Last: the directories outlive the nodes.
     _root: tempfile::TempDir,
 }
@@ -304,6 +309,7 @@ impl ClusterTestbed {
         Self {
             nodes,
             plan,
+            credentials: None,
             _root: root,
         }
     }
@@ -526,7 +532,14 @@ impl ClusterTestbed {
     pub fn client(&self, id: NodeId) -> RemoteStore {
         let mut cfg = ClientConfig::new(self.node(id).endpoint());
         cfg.write_deadline = Duration::from_secs(15);
+        cfg.credentials = self.credentials.clone();
         RemoteStore::connect(cfg).unwrap_or_else(|e| panic!("connect to node {id}: {e}"))
+    }
+
+    /// The token [`client`](Self::client) (and [`form`](Self::form)) send
+    /// from now on (a cluster with `--auth-tokens`).
+    pub fn set_client_credentials(&mut self, creds: Option<graph_client::Credentials>) {
+        self.credentials = creds;
     }
 
     /// Run `f` with a client of the current leader.

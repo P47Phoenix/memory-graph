@@ -121,6 +121,12 @@ message StatusResponse {
   // Snapshot backups (ADR 0006, `serve --backup-url`); absent when this
   // node has no backup location.
   optional BackupStatus backup = 32;
+  // Story 67: what this node is retrying a full disk for, in place: `log`
+  // (Raft log writes) and/or `apply` (the store); empty: not stalled
+  // (or the server predates the field). Writes answer RESOURCE_EXHAUSTED
+  // meanwhile, with `disk_stall_message`.
+  repeated string disk_stalled = 34;
+  string disk_stall_message = 35;
 }
 
 // This node's snapshot backups since it started.

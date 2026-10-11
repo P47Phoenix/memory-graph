@@ -673,7 +673,12 @@ fn remove_lost_self_retries_only_the_transient_refusal() {
     let timeout = Duration::from_secs(20);
     let t0 = Instant::now();
     let e = rt()
-        .block_on(graph_server::join::remove_lost_self(&via, leader, timeout))
+        .block_on(graph_server::join::remove_lost_self(
+            &via,
+            leader,
+            timeout,
+            &graph_server::auth::Auth::disabled(),
+        ))
         .unwrap_err();
     assert!(e.contains("transfer leadership first"), "{e}");
     assert!(
@@ -683,8 +688,13 @@ fn remove_lost_self_retries_only_the_transient_refusal() {
     );
     let (old, target, slow) = transfer_with_a_held_peer(&tb, Duration::from_secs(3));
     let old_ep = tb.node(old).endpoint();
-    rt().block_on(graph_server::join::remove_lost_self(&old_ep, old, timeout))
-        .unwrap_or_else(|e| panic!("remove_lost_self after the transfer: {e}"));
+    rt().block_on(graph_server::join::remove_lost_self(
+        &old_ep,
+        old,
+        timeout,
+        &graph_server::auth::Auth::disabled(),
+    ))
+    .unwrap_or_else(|e| panic!("remove_lost_self after the transfer: {e}"));
     eprintln!(
         "remove_lost_self after the transfer done at {:?}",
         t0.elapsed()

@@ -12,6 +12,8 @@ prost.workspace = true
 prost-types.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+# ADR 0012: the digest a server keeps for a bearer credential (`auth`).
+sha2.workspace = true
 # W3C trace context in gRPC metadata (ADR 0009 D5, `trace_context`): the
 # current `tracing` span's OpenTelemetry context, injected and extracted
 # with the SDK's TraceContextPropagator. No exporter here.

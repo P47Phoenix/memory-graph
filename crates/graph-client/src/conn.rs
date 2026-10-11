@@ -1,5 +1,6 @@
 //! The connection: endpoint selection, the `Hello` handshake, and the retry
 //! policy every RPC goes through.
+use crate::auth::AuthChannel as Channel;
 use crate::{ClientConfig, ReadMode, RetryConfig};
 use graph_proto::error::WireError;
 use graph_proto::error::{is_transient_rejection, is_transport_loss};
@@ -15,7 +16,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Endpoint;
 use tonic::{Code, Status};
 
 /// What the server said in `Hello`.
@@ -32,6 +33,8 @@ pub struct HelloInfo {
     /// Optional features the server supports (ADR 0011 D6); empty for a
     /// server older than the field.
     pub capabilities: Vec<String>,
+    /// The server checks bearer tokens (ADR 0012).
+    pub auth_required: bool,
     /// The endpoint that answered.
     pub endpoint: String,
 }
@@ -48,6 +51,7 @@ impl From<(pb::HelloResponse, String)> for HelloInfo {
             leader_addr: h.leader_addr,
             cluster_id: h.cluster_id,
             capabilities: h.capabilities,
+            auth_required: h.auth_required,
             endpoint,
         }
     }
@@ -171,6 +175,14 @@ fn endpoint_for(addr: &str, connect_timeout: Duration) -> Result<Endpoint, Store
     Endpoint::from_shared(uri)
         .map(|e| e.tcp_nodelay(true).connect_timeout(connect_timeout))
         .map_err(|e| StoreError::Rejected(format!("bad endpoint `{addr}`: {e}")))
+}
+
+/// A lazily connecting channel to `addr` that carries `cfg`'s credentials.
+fn lazy(addr: &str, connect_timeout: Duration, cfg: &ClientConfig) -> Result<Channel, StoreError> {
+    Ok(Channel::new(
+        endpoint_for(addr, connect_timeout)?.connect_lazy(),
+        cfg.credentials.as_ref(),
+    ))
 }
 
 /// A status without a typed detail from the transport layer (connection
@@ -305,7 +317,7 @@ impl Conn {
                 } else {
                     cfg.connect_timeout.min(QUICK_CONNECT_TIMEOUT)
                 };
-                let channel = endpoint_for(&ep, timeout)?.connect_lazy();
+                let channel = lazy(&ep, timeout, &cfg)?;
                 match Self::hello_on(&ep, &channel, &cfg, retry).await {
                     Ok(h) => {
                         let hello = HelloInfo::from((h, ep.clone()));
@@ -313,7 +325,7 @@ impl Conn {
                         let channel = if retry {
                             channel
                         } else {
-                            endpoint_for(&ep, cfg.connect_timeout)?.connect_lazy()
+                            lazy(&ep, cfg.connect_timeout, &cfg)?
                         };
                         return Ok(Conn {
                             cfg,
@@ -328,9 +340,15 @@ impl Conn {
                     }
                     Err(e) => {
                         tracing::debug!(endpoint = %ep, error = %e, "hello failed");
-                        // A protocol mismatch is definitive for that server;
-                        // an unreachable endpoint means try the next.
-                        if matches!(e, StoreError::Protocol(_)) {
+                        // A protocol mismatch or an auth refusal is
+                        // definitive for that server; an unreachable
+                        // endpoint means try the next.
+                        if matches!(
+                            e,
+                            StoreError::Protocol(_)
+                                | StoreError::Unauthenticated(_)
+                                | StoreError::PermissionDenied { .. }
+                        ) {
                             return Err(e);
                         }
                         last = Some(e);
@@ -365,6 +383,20 @@ impl Conn {
                             "server speaks protocol version {}, this client speaks {PROTOCOL_VERSION}",
                             h.protocol_version
                         )));
+                    }
+                    // ADR 0012 D7: a trimmed answer (no server version)
+                    // means the server did not accept this client's
+                    // credential, or it sent none.
+                    if h.auth_required && h.server_version.is_empty() {
+                        return Err(StoreError::Unauthenticated(
+                            if cfg.credentials.is_none() {
+                                "server requires a token: set --token-file or \
+                                 MEMORY_GRAPH_TOKEN_FILE"
+                            } else {
+                                "the token was refused"
+                            }
+                            .into(),
+                        ));
                     }
                     return Ok(h);
                 }
@@ -440,7 +472,7 @@ impl Conn {
         let channel = if cur == endpoint {
             ch
         } else {
-            endpoint_for(endpoint, self.cfg.connect_timeout)?.connect_lazy()
+            lazy(endpoint, self.cfg.connect_timeout, &self.cfg)?
         };
         self.pins
             .lock()
@@ -511,7 +543,7 @@ impl Conn {
     }
 
     fn switch_to(&self, addr: &str) -> Result<(), StoreError> {
-        let channel = endpoint_for(addr, self.cfg.connect_timeout)?.connect_lazy();
+        let channel = lazy(addr, self.cfg.connect_timeout, &self.cfg)?;
         let mut a = self
             .active
             .write()

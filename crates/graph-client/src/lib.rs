@@ -39,17 +39,24 @@
 //!   deadline, which then reports that refusal, not `NoLeader`. A read
 //!   whose connection was lost fails with a `Storage` error naming the
 //!   server. Every call carries the `mg-protocol-version` header.
+//! * Authentication (ADR 0012): with [`ClientConfig::credentials`] every
+//!   call carries `authorization: Bearer <token>` (a sensitive header).
+//!   `UNAUTHENTICATED` and `PERMISSION_DENIED` are final, never retried. A
+//!   server that requires a token while none is configured is refused at
+//!   `connect` with a message naming `--token-file`.
 //!
 //! [`Store::snapshot`]: graph_store::Store::snapshot
 
+mod auth;
 mod conn;
 mod reads;
 mod remote;
 mod snapshot;
 
+pub use auth::{AuthChannel, Credentials};
 pub use conn::{block_on, HelloInfo, ReadLog, QUICK_CONNECT_TIMEOUT};
 pub use graph_proto::ReadMeta;
-pub use remote::{RemoteStore, RemoveOutcome, ENCODING_STORE_FORMAT};
+pub use remote::{probe_health, RemoteStore, RemoveOutcome, ENCODING_STORE_FORMAT};
 pub use snapshot::RemoteSnapshot;
 
 pub use graph_proto::{PROTOCOL_VERSION, RAFT_ENTRY_MAX_BYTES};
@@ -117,6 +124,9 @@ pub struct ClientConfig {
     pub admin_deadline: Duration,
     /// Reported in `Hello` for the server's logs.
     pub client_version: String,
+    /// The bearer token sent on every call (ADR 0012); `None`: none. Its
+    /// `Debug` is redacted.
+    pub credentials: Option<Credentials>,
 }
 
 impl ClientConfig {
@@ -129,6 +139,7 @@ impl ClientConfig {
             connect_timeout: Duration::from_secs(5),
             admin_deadline: Duration::from_secs(180),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
+            credentials: None,
         }
     }
 }

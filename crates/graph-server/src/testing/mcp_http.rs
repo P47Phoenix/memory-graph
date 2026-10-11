@@ -121,10 +121,22 @@ pub struct McpHttpClient {
     pub session: String,
     pub protocol: String,
     next_id: i64,
+    /// `Authorization: Bearer <token>` on every request (ADR 0012).
+    pub token: Option<String>,
 }
 
 impl McpHttpClient {
     pub fn new(addr: SocketAddr) -> Self {
+        Self::with_token(addr, None)
+    }
+
+    /// [`new`](Self::new), sending `token` as a bearer credential.
+    pub fn with_token(addr: SocketAddr, token: Option<&str>) -> Self {
+        let auth = token.map(|t| format!("Bearer {t}"));
+        let mut init_headers = vec![("Content-Type", "application/json")];
+        if let Some(a) = &auth {
+            init_headers.push(("Authorization", a.as_str()));
+        }
         let init = json!({
             "jsonrpc": "2.0", "id": 0, "method": "initialize",
             "params": {
@@ -137,7 +149,7 @@ impl McpHttpClient {
             addr,
             "POST",
             "/mcp",
-            &[("Content-Type", "application/json")],
+            &init_headers,
             init.to_string().as_bytes(),
         )
         .expect("initialize");
@@ -155,6 +167,7 @@ impl McpHttpClient {
             session,
             protocol,
             next_id: 1,
+            token: token.map(str::to_string),
         };
         let n = c.post(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         assert_eq!(n.status, 202, "{n:?}");
@@ -163,16 +176,21 @@ impl McpHttpClient {
 
     /// POST one message with this session's headers.
     pub fn post(&self, msg: &Value) -> HttpReply {
+        let auth = self.token.as_ref().map(|t| format!("Bearer {t}"));
+        let mut headers = vec![
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json, text/event-stream"),
+            ("Mcp-Session-Id", self.session.as_str()),
+            ("MCP-Protocol-Version", self.protocol.as_str()),
+        ];
+        if let Some(a) = &auth {
+            headers.push(("Authorization", a.as_str()));
+        }
         http(
             self.addr,
             "POST",
             "/mcp",
-            &[
-                ("Content-Type", "application/json"),
-                ("Accept", "application/json, text/event-stream"),
-                ("Mcp-Session-Id", &self.session),
-                ("MCP-Protocol-Version", &self.protocol),
-            ],
+            &headers,
             msg.to_string().as_bytes(),
         )
         .expect("an HTTP answer")

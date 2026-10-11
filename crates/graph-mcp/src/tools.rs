@@ -138,6 +138,8 @@ pub fn store_error_code(e: &StoreError) -> &'static str {
         StoreError::WrongCluster { .. } => "wrong_cluster",
         StoreError::AlreadyApplied { .. } => "already_applied",
         StoreError::DeadlineExceeded(_) => "deadline_exceeded",
+        StoreError::Unauthenticated(_) => "unauthenticated",
+        StoreError::PermissionDenied { .. } => "permission_denied",
     }
 }
 

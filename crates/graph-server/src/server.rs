@@ -145,6 +145,13 @@ pub struct ServeConfig {
     /// OTLP metrics (ADR 0009 D6): the node's snapshot and duration
     /// histograms are exported through it once the node is up.
     pub otlp_metrics: Option<crate::telemetry::OtlpMetrics>,
+    /// `--auth-tokens` and `--cluster-secret-file` (ADR 0012); the default
+    /// (no token file) is auth off.
+    pub auth: crate::auth::AuthConfig,
+    /// `--insecure-transport` (ADR 0012 D4): with auth on, listen and
+    /// advertise on addresses other than loopback anyway (tokens then cross
+    /// the network in clear text unless a proxy or mesh adds TLS).
+    pub insecure_transport: bool,
 }
 
 /// How long a restart whose `node.json` address differs from the one its
@@ -249,6 +256,8 @@ impl ServeConfig {
             restore_s3: crate::backup::S3Options::default(),
             worker_threads: None,
             otlp_metrics: None,
+            auth: crate::auth::AuthConfig::default(),
+            insecure_transport: false,
         }
     }
 
@@ -295,6 +304,8 @@ impl std::fmt::Debug for ServeConfig {
             .field("restore_s3", &self.restore_s3)
             .field("worker_threads", &self.worker_threads)
             .field("otlp_metrics", &self.otlp_metrics.is_some())
+            .field("auth", &self.auth)
+            .field("insecure_transport", &self.insecure_transport)
             .finish()
     }
 }
@@ -363,6 +374,13 @@ impl Running {
         self.shutdown.clone()
     }
 
+    /// The node's auth state (ADR 0012): tests reload it with
+    /// [`Auth::reload_now`](crate::auth::Auth::reload_now) and read its
+    /// refusal counters.
+    pub fn auth(&self) -> Arc<crate::auth::Auth> {
+        Arc::clone(&self.ctx.auth)
+    }
+
     /// Every metric family this node exports, read now (what `/metrics`
     /// and OTLP export).
     pub fn metrics_snapshot(&self) -> crate::observe::MetricsSnapshot {
@@ -426,6 +444,11 @@ pub async fn start(
             "test-only fault injection hooks are active"
         );
     }
+    // ADR 0012: the token and secret files are read (and refused on any
+    // problem) and the transport guard checked before anything else, so a
+    // misconfigured node never talks to its peers.
+    let auth = crate::auth::Auth::load(&cfg.auth, cfg.data_dir.is_some())?;
+    check_transport(&cfg, auth.enabled())?;
     // `--bootstrap-or-join` becomes a bootstrap or a join first (ordinal
     // 0 on an empty directory asks its siblings; a lost volume must not
     // create a second cluster).
@@ -435,6 +458,7 @@ pub async fn start(
             dir,
             cfg.node_id,
             cfg.advertise.as_deref(),
+            &auth,
         )
         .await?;
     }
@@ -484,7 +508,7 @@ pub async fn start(
     // opened (ADR 0004 D6).
     if let (InitMode::Join(spec), Some(p)) = (&cfg.init, &plan) {
         if let Some(mine) = p.existing.as_ref().and_then(|j| j.cluster_id.as_deref()) {
-            crate::join::check_peer_cluster(&spec.peer, mine).await?;
+            crate::join::check_peer_cluster(&spec.peer, mine, &auth).await?;
         }
     }
     // Bind before anything is written: a port in use must not leave a store
@@ -759,6 +783,7 @@ pub async fn start(
         append_observer: cfg.append_observer.clone(),
         obs: Arc::clone(&obs),
         testing_apply_gate: cfg.testing_apply_gate.clone(),
+        auth: Arc::clone(&auth),
     })
     .await?;
     // A restart that keeps node.json's address (no move asked for): the
@@ -831,11 +856,14 @@ pub async fn start(
         omit_name_pos: cfg.testing.omit_name_pos,
         writes_proposed: std::sync::atomic::AtomicUsize::new(0),
         fwd: crate::forward::Forwarder::new(node_id, cfg.fault_plan.clone())
-            .with_default_timeout(cfg.testing.forward_timeout_ms.map(Duration::from_millis)),
+            .with_default_timeout(cfg.testing.forward_timeout_ms.map(Duration::from_millis))
+            .with_auth(Arc::clone(&auth)),
         auto_promoting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         last_elect: std::sync::Mutex::new(None),
         backup: backup.clone(),
+        auth: Arc::clone(&auth),
     });
+    auth.spawn_reloader(shutdown.clone());
     if let Some(otlp) = &cfg.otlp_metrics {
         // A weak link: the exporter must not keep a stopped node alive.
         let node = Arc::downgrade(&ctx);
@@ -944,6 +972,9 @@ pub async fn start(
             crate::observe::RpcLayer::new(Arc::clone(&obs))
                 .with_server_address(&ctx.info.advertise),
         )
+        // Inside the RPC layer (a refusal is counted and spanned like any
+        // answer), outside every service (before the version check).
+        .layer(crate::auth::AuthLayer::new(Arc::clone(&auth)))
         .add_service(health)
         .add_service(InterceptedService::new(
             StoreServer::new(StoreService {
@@ -1099,14 +1130,20 @@ pub async fn start(
             spec.auto_promote,
         );
         if identity.get().is_none() {
-            if let Err(e) = crate::join::join(spec, req.clone(), &identity).await {
+            if let Err(e) = crate::join::join(spec, req.clone(), &identity, &auth).await {
                 shutdown.trigger();
                 let _ = task.await;
                 return Err(e);
             }
         }
         if spec.auto_promote {
-            crate::join::spawn_rejoin(raft.clone(), spec.peer.clone(), req, shutdown.clone());
+            crate::join::spawn_rejoin(
+                raft.clone(),
+                spec.peer.clone(),
+                req,
+                shutdown.clone(),
+                Arc::clone(&auth),
+            );
         }
     }
     // `--update-advertise`: serving at the new address now (the leader asks
@@ -1130,6 +1167,7 @@ pub async fn start(
             node_id,
             &json.advertise,
             cfg.update_advertise_timeout,
+            &auth,
         )
         .await;
         // Committed, but node.json not rewritten: say so, and how to finish.
@@ -1214,6 +1252,95 @@ pub async fn start(
         backup,
         ctx,
     })
+}
+
+/// Whether `host` (an IP address or a name, resolved) is loopback only:
+/// `127.0.0.0/8`, `::1`, `localhost`. A name that does not resolve, or
+/// resolves to any other address, is not.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    use std::net::ToSocketAddrs;
+    match (h, 0u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// The host part of an `--advertise` value (`host:port`, `[v6]:port` or a
+/// URI).
+pub fn advertise_host(a: &str) -> &str {
+    let a = a.split_once("://").map_or(a, |(_, rest)| rest);
+    let a = a.trim_end_matches('/');
+    if let Some(rest) = a.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(h, _)| h);
+    }
+    a.rsplit_once(':').map_or(a, |(h, _)| h)
+}
+
+/// ADR 0012 D4: with auth on, every listener (`--listen`, `--mcp-listen`,
+/// `--metrics-listen`) and the advertised address must be loopback unless
+/// `--insecure-transport` is given: without TLS a token crosses the network
+/// in clear text.
+pub fn check_transport(cfg: &ServeConfig, auth_on: bool) -> Result<(), StoreError> {
+    if !auth_on {
+        return Ok(());
+    }
+    let mut exposed: Vec<String> = Vec::new();
+    if !cfg.listen.ip().is_loopback() {
+        exposed.push(format!("--listen {}", cfg.listen));
+    }
+    for (flag, a) in [
+        ("--advertise", cfg.advertise.as_deref()),
+        ("--update-advertise", cfg.update_advertise.as_deref()),
+    ] {
+        if let Some(a) = a {
+            if !is_loopback_host(advertise_host(a)) {
+                exposed.push(format!("{flag} {a}"));
+            }
+        }
+    }
+    if let Some(m) = &cfg.mcp {
+        if !m.listen.ip().is_loopback() {
+            exposed.push(format!("--mcp-listen {}", m.listen));
+        }
+    }
+    if let Some(m) = cfg.metrics_listen {
+        if !m.ip().is_loopback() {
+            exposed.push(format!("--metrics-listen {m}"));
+        }
+    }
+    if exposed.is_empty() {
+        return Ok(());
+    }
+    if cfg.insecure_transport {
+        eprintln!(
+            "memory-graph serve: WARNING: --insecure-transport: {} not loopback; bearer tokens, \
+             the cluster secret and all data cross the network in clear text unless a \
+             TLS-terminating proxy or mesh is in front (docs/security.md)",
+            exposed.join(", ")
+        );
+        tracing::warn!(
+            exposed = %exposed.join(", "),
+            "--insecure-transport: tokens and data cross the network in clear text unless a TLS \
+             proxy or mesh is in front"
+        );
+        return Ok(());
+    }
+    Err(StoreError::Rejected(format!(
+        "with --auth-tokens, {} must be loopback: this server has no TLS, so tokens would cross \
+         the network in clear text. Put a TLS-terminating proxy or mesh in front and pass \
+         --insecure-transport to acknowledge it (docs/security.md)",
+        exposed.join(", ")
+    )))
 }
 
 /// Whether `memory-graph.ready` is `SERVING`: a leader is known (and the

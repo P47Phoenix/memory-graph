@@ -124,6 +124,23 @@ pub(super) fn render(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats)
         ctx.slot.snapshots().len() as u64,
     );
     {
+        use crate::raft::disk_stall::StallSource;
+        let st = &ctx.raft.disk_stall;
+        head(
+            &mut out,
+            "mg_disk_stalled",
+            "gauge",
+            crate::observe::DISK_STALLED_HELP,
+        );
+        let log = st.is_stalled(StallSource::LogAppend) || st.is_stalled(StallSource::LogMeta);
+        let _ = writeln!(out, "mg_disk_stalled{{source=\"log\"}} {}", u64::from(log));
+        let _ = writeln!(
+            out,
+            "mg_disk_stalled{{source=\"apply\"}} {}",
+            u64::from(st.is_stalled(StallSource::Apply))
+        );
+    }
+    {
         let rpc = obs.rpc.lock().unwrap_or_else(PoisonError::into_inner);
         head(
             &mut out,
@@ -162,6 +179,15 @@ pub(super) fn render(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats)
         "mg_writes_forwarded_total {}",
         ctx.fwd.forwarded_total()
     );
+    head(
+        &mut out,
+        "mg_auth_refusals_total",
+        "counter",
+        "Calls refused by authentication or the role table (ADR 0012), by reason; zero with auth off.",
+    );
+    for (reason, n) in ctx.auth.refusal_counts() {
+        let _ = writeln!(out, "mg_auth_refusals_total{{reason=\"{reason}\"}} {n}");
+    }
     head(
         &mut out,
         "mg_quorum_probes_total",

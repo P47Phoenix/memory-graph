@@ -37,6 +37,7 @@ pub async fn update_advertise(
     node_id: NodeId,
     addr: &str,
     timeout: Duration,
+    auth: &std::sync::Arc<crate::auth::Auth>,
 ) -> Result<u64, StoreError> {
     if endpoints.is_empty() {
         return Err(StoreError::Rejected(
@@ -54,7 +55,7 @@ pub async fn update_advertise(
     let mut last: String;
     loop {
         let attempt = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
-            admin(&target, Duration::from_secs(5))
+            admin(&target, Duration::from_secs(5), auth)
                 .await?
                 .update_advertise(req.clone())
                 .await

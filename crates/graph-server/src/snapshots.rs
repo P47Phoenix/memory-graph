@@ -40,6 +40,9 @@ struct Handle {
     /// The node's read freshness when the handle opened (ADR 0004 D8): the
     /// handle is frozen there, so every read through it reports this.
     meta: Option<graph_proto::ReadMeta>,
+    /// With auth on (ADR 0012 D5): the token id and connection that
+    /// opened it; any other caller is answered as for a missing handle.
+    owner: Option<String>,
 }
 
 /// The table of open handles.
@@ -135,6 +138,18 @@ impl SnapshotTable {
         store: &V2Store,
         meta: Option<graph_proto::ReadMeta>,
     ) -> Result<u64, Status> {
+        self.open_owned(conn, store, meta, None)
+    }
+
+    /// [`open_with_meta`](Self::open_with_meta) for `owner` (ADR 0012 D5,
+    /// see [`owner_of`]): only that caller can use or close it.
+    pub fn open_owned(
+        &self,
+        conn: u64,
+        store: &V2Store,
+        meta: Option<graph_proto::ReadMeta>,
+        owner: Option<String>,
+    ) -> Result<u64, Status> {
         self.check_caps(&self.lock(), conn)?;
         let snap = store
             .snapshot_owned()
@@ -154,6 +169,7 @@ impl SnapshotTable {
                 created: Instant::now(),
                 snap: Arc::new(Mutex::new(snap)),
                 meta,
+                owner,
             },
         );
         *t.per_conn.entry(conn).or_insert(0) += 1;
@@ -184,6 +200,20 @@ impl SnapshotTable {
             });
         }
         Ok(Arc::clone(&t.open[&id].snap))
+    }
+
+    /// Whether `owner` may use handle `id` (its opener, or any caller of a
+    /// handle opened without one); `SnapshotExpired` otherwise, exactly as
+    /// for a missing handle, so a caller cannot tell whether it exists.
+    pub fn check_owner(&self, id: u64, owner: Option<&str>) -> Result<(), StoreError> {
+        let t = self.lock();
+        match t.open.get(&id) {
+            Some(h) if h.owner.is_none() || h.owner.as_deref() == owner => Ok(()),
+            _ => Err(StoreError::SnapshotExpired {
+                age_secs: 0,
+                max_age_secs: self.max_age.as_secs(),
+            }),
+        }
     }
 
     /// The meta recorded when handle `id` opened, if any.
@@ -264,6 +294,18 @@ impl SnapshotTable {
             }
         }
     }
+}
+
+/// The owner of a handle opened by the running handler's caller: with
+/// auth on, its token id and connection; with auth off, none.
+pub fn owner_of_current() -> Option<String> {
+    crate::auth::current_caller().map(|c| {
+        format!(
+            "{}@{}",
+            c.token_id().unwrap_or_else(|| "anonymous".into()),
+            c.conn
+        )
+    })
 }
 
 #[cfg(test)]

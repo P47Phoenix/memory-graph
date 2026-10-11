@@ -429,7 +429,7 @@ pub struct Extraction {
 pub struct StoreErrorDetail {
     #[prost(
         oneof = "store_error_detail::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 19, 20"
     )]
     pub kind: ::core::option::Option<store_error_detail::Kind>,
 }
@@ -568,6 +568,23 @@ pub mod store_error_detail {
         #[prost(string, tag = "1")]
         pub msg: ::prost::alloc::string::String,
     }
+    /// ADR 0012 D7/D8: no valid credential (missing, malformed, unknown or
+    /// expired token; the server never says which).
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Unauthenticated {
+        #[prost(string, tag = "1")]
+        pub msg: ::prost::alloc::string::String,
+    }
+    /// ADR 0012 D5/D8: the credential is valid but its role is too low, or
+    /// the method is not in the server's role table. `required_role` is
+    /// `read`, `write`, `node` or empty (an unlisted method).
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct PermissionDenied {
+        #[prost(string, tag = "1")]
+        pub msg: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub required_role: ::prost::alloc::string::String,
+    }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
@@ -608,6 +625,10 @@ pub mod store_error_detail {
         StrictEncoding(StrictEncoding),
         #[prost(message, tag = "21")]
         DeadlineExceeded(DeadlineExceeded),
+        #[prost(message, tag = "19")]
+        Unauthenticated(Unauthenticated),
+        #[prost(message, tag = "20")]
+        PermissionDenied(PermissionDenied),
     }
 }
 /// The view every read request carries: a read mode, or a snapshot handle
@@ -865,6 +886,12 @@ pub struct HelloResponse {
     /// suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6).
     #[prost(string, repeated, tag = "9")]
     pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// ADR 0012 D7: the server checks bearer tokens. An unauthenticated
+    /// `Hello` to such a server answers only `protocol_version` and this
+    /// flag; every other field keeps its default. False (an older server, or
+    /// auth off) keeps the old meaning.
+    #[prost(bool, tag = "10")]
+    pub auth_required: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetRequest {
@@ -3497,6 +3524,14 @@ pub struct StatusResponse {
     /// node has no backup location.
     #[prost(message, optional, tag = "32")]
     pub backup: ::core::option::Option<BackupStatus>,
+    /// Story 67: what this node is retrying a full disk for, in place: `log`
+    /// (Raft log writes) and/or `apply` (the store); empty: not stalled
+    /// (or the server predates the field). Writes answer RESOURCE_EXHAUSTED
+    /// meanwhile, with `disk_stall_message`.
+    #[prost(string, repeated, tag = "34")]
+    pub disk_stalled: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "35")]
+    pub disk_stall_message: ::prost::alloc::string::String,
 }
 /// This node's snapshot backups since it started.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

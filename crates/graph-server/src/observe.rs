@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 36] = [
+pub const METRIC_NAMES: [&str; 38] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -48,9 +48,11 @@ pub const METRIC_NAMES: [&str; 36] = [
     "mg_store_bytes",
     "mg_log_bytes",
     "mg_snapshot_handles_open",
+    "mg_disk_stalled",
     "mg_rpc_duration_seconds",
     "mg_rpc_total",
     "mg_writes_forwarded_total",
+    "mg_auth_refusals_total",
     "mg_quorum_probes_total",
     "mg_apply_duration_seconds",
     "mg_build_info",
@@ -160,6 +162,11 @@ pub struct Observability {
     /// and a `LOCAL` read's `stale_possible` (D8, see
     /// [`crate::raft::node::RaftNode::read_meta`]) judge by.
     last_contact: Mutex<Option<(Instant, Option<u64>)>>,
+    /// The highest `(term, leader id)` any `AppendEntries` or `Vote`
+    /// carried, noted before Raft handles it: a node whose Raft core is
+    /// held by a stalled log append (story 67) learns of a newer leader
+    /// only here.
+    seen_leader: Mutex<Option<(u64, u64)>>,
     /// `(tool, outcome)` -> MCP `tools/call`s on `--mcp-listen`.
     mcp_calls: Mutex<BTreeMap<(String, String), u64>>,
     /// Read RPCs answered and their exact repeats (ADR 0008 phase 3 gate).
@@ -260,6 +267,26 @@ impl Observability {
         if let Some(c) = leader_commit {
             self.note_leader_commit(c);
         }
+    }
+
+    /// A peer's `AppendEntries` (as leader) arrived with `term`; kept if it
+    /// is the highest seen.
+    pub fn note_seen_leader(&self, term: u64, leader: u64) {
+        let mut g = self
+            .seen_leader
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if g.is_none_or(|(t, _)| term > t) {
+            *g = Some((term, leader));
+        }
+    }
+
+    /// The highest `(term, leader id)` seen in an `AppendEntries`.
+    pub fn seen_leader(&self) -> Option<(u64, u64)> {
+        *self
+            .seen_leader
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A leader's `InstallSnapshot` arrived just now (it carries no commit
@@ -605,8 +632,30 @@ fn storage_families(ctx: &Ctx) -> Vec<MetricFamily> {
             "Open snapshot handles held for paging clients.",
             ctx.slot.snapshots().len() as u64,
         ),
+        disk_stalled_family(&ctx.raft.disk_stall),
     ]
 }
+
+/// `mg_disk_stalled{source}`: 1 while this node's Raft log writes (`log`)
+/// or its apply (`apply`) retry a full disk in place (story 67).
+fn disk_stalled_family(stall: &crate::raft::disk_stall::DiskStall) -> MetricFamily {
+    use crate::raft::disk_stall::StallSource;
+    let mut f = MetricFamily::new("mg_disk_stalled", MetricKind::Gauge, DISK_STALLED_HELP);
+    let log = stall.is_stalled(StallSource::LogAppend) || stall.is_stalled(StallSource::LogMeta);
+    f.push(
+        vec![("source", "log".to_string())],
+        SampleValue::Int(u64::from(log)),
+    );
+    f.push(
+        vec![("source", "apply".to_string())],
+        SampleValue::Int(u64::from(stall.is_stalled(StallSource::Apply))),
+    );
+    f
+}
+
+/// The help text of `mg_disk_stalled` (shared with the golden renderer).
+pub(crate) const DISK_STALLED_HELP: &str =
+    "1 while this node retries a full disk in place, by source (log: Raft log writes, apply: the store); writes answer RESOURCE_EXHAUSTED meanwhile.";
 
 /// `mg_rpc_duration_seconds` and `mg_rpc_total`, read under one lock so the
 /// two always agree.
@@ -651,12 +700,21 @@ fn cluster_families(ctx: &Ctx) -> Vec<MetricFamily> {
             SampleValue::Int(n),
         );
     }
+    let mut refusals = MetricFamily::new(
+        "mg_auth_refusals_total",
+        MetricKind::Counter,
+        "Calls refused by authentication or the role table (ADR 0012), by reason; zero with auth off.",
+    );
+    for (reason, n) in ctx.auth.refusal_counts() {
+        refusals.push(vec![("reason", reason.into())], SampleValue::Int(n));
+    }
     vec![
         counter(
             "mg_writes_forwarded_total",
             "Writes and membership changes this node forwarded to the leader.",
             SampleValue::Int(ctx.fwd.forwarded_total()),
         ),
+        refusals,
         probes,
         mcp,
     ]
@@ -1013,6 +1071,8 @@ macro_rules! rpc_span {
             rpc.method = tracing::field::Empty,
             rpc.grpc.status_code = tracing::field::Empty,
             server.address = tracing::field::Empty,
+            auth.token_id = tracing::field::Empty,
+            auth.role = tracing::field::Empty,
         )
     };
 }

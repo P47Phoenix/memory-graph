@@ -69,6 +69,11 @@ message HelloResponse {
   // a request an older server would misread. `symbol_infix`: infix and
   // suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6).
   repeated string capabilities = 9;
+  // ADR 0012 D7: the server checks bearer tokens. An unauthenticated
+  // `Hello` to such a server answers only `protocol_version` and this
+  // flag; every other field keeps its default. False (an older server, or
+  // auth off) keeps the old meaning.
+  bool auth_required = 10;
 }
 
 message GetRequest {
