@@ -787,8 +787,8 @@ impl RaftNode {
         //
         // A partitioned leader holding such a write keeps a transfer from
         // starting, but cannot hang it: the transfer's drain is bounded by
-        // `RaftSettings::transfer_drain_bound` and then refuses ("writes in flight did not
-        // finish"), leadership staying here.
+        // `RaftSettings::transfer_drain_bound` and then refuses ("writes
+        // in flight did not finish"), leadership staying here.
         let mut write =
             self.spawn_holding(
                 in_flight,
@@ -1683,6 +1683,7 @@ mod tests {
     #[test]
     fn transfer_drain_bound_tracks_the_election_config() {
         let c = RaftSettings::cluster();
+        assert_eq!(c.transfer_drain_bound(), Duration::from_secs(30));
         assert_eq!(
             c.transfer_drain_bound(),
             Duration::from_millis(c.election_max_ms * TRANSFER_DRAIN_ELECTIONS)

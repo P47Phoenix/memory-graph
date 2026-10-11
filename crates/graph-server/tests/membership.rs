@@ -975,6 +975,22 @@ fn abandoned_change_holds_the_transfer_drain(change: AbandonedChange) {
     transfer_and_check(&tb, via, target);
 }
 
+/// Issue #260: a client's admin deadline (the CLI's `cluster
+/// transfer-leader` uses the default) outlasts the longest a transfer can
+/// take on the leader, with the cluster defaults and the testbed's.
+#[test]
+fn the_admin_deadline_outlasts_a_transfer() {
+    use graph_server::services::admin::transfer_worst_case;
+    let d = ClientConfig::new("unused").admin_deadline;
+    for s in [RaftSettings::cluster(), TEST_RAFT] {
+        assert!(
+            transfer_worst_case(&s) < d,
+            "{:?} >= {d:?}",
+            transfer_worst_case(&s)
+        );
+    }
+}
+
 /// The abandoned change is an `add_learner`.
 #[test]
 fn an_abandoned_add_learner_holds_a_transfer_drain_until_raft_answers_it() {
@@ -1220,6 +1236,12 @@ fn remove_needs_a_quorum_of_the_old_voter_set_too() {
         if m.contains("vote on the change") || Instant::now() >= deadline {
             break m;
         }
+        // Only the momentary new-voter-set refusal is asked again; any
+        // other answer fails at once.
+        assert!(
+            m.contains("below quorum") && m.contains("reachable now"),
+            "unexpected refusal: {m}"
+        );
         eprintln!("momentary refusal, asking again: {m}");
         std::thread::sleep(Duration::from_millis(200));
     };
