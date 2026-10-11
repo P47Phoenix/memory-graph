@@ -29,6 +29,9 @@ pub struct HelloInfo {
     pub leader_id: Option<u64>,
     pub leader_addr: Option<String>,
     pub cluster_id: String,
+    /// Optional features the server supports (ADR 0011 D6); empty for a
+    /// server older than the field.
+    pub capabilities: Vec<String>,
     /// The endpoint that answered.
     pub endpoint: String,
 }
@@ -44,6 +47,7 @@ impl From<(pb::HelloResponse, String)> for HelloInfo {
             leader_id: h.leader_id,
             leader_addr: h.leader_addr,
             cluster_id: h.cluster_id,
+            capabilities: h.capabilities,
             endpoint,
         }
     }

@@ -162,6 +162,9 @@ pub struct TestingHooks {
     pub withhold_leader: bool,
     /// Answer `Hello` with this protocol version instead of the real one.
     pub hello_protocol_version: Option<u32>,
+    /// Leave `symbol_infix` out of `Hello`'s capabilities, as a server
+    /// older than ADR 0011 would (the client then refuses infix patterns).
+    pub without_symbol_infix: bool,
     /// Let this many write proposals through, then park every later one
     /// forever (a future that never resolves), so a run cannot finish and a
     /// test can kill the server mid-write deterministically. The first
@@ -808,6 +811,11 @@ pub async fn start(
                 .testing
                 .hello_protocol_version
                 .unwrap_or(graph_proto::PROTOCOL_VERSION),
+            capabilities: if cfg.testing.without_symbol_infix {
+                Vec::new()
+            } else {
+                vec![graph_store::CAPABILITY_SYMBOL_INFIX.to_string()]
+            },
             data_dir: paths
                 .data_dir
                 .as_ref()

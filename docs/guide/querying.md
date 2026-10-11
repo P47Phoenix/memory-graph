@@ -34,13 +34,14 @@ A symbol's span covers everything that belongs to it, including attributes, deco
 
 A hit with no enclosing symbol of that grain is rolled up to its file with `no_matching_symbol`; a file with no symbols at all (a language without an extractor) with `no_symbols`.
 
-## What matches: whole tokens, prefixes, no infix
+## What matches: whole tokens, prefixes, infix
 
-Neither command matches part of a word in the middle of a name yet:
+`search` matches whole tokens only; `symbols` can also match inside a name:
 
 - `search <TEXT>` matches **whole tokens exactly**, case included. `search Gadget` finds the identifier `Gadget`; `search Gad`, `search gadget` and `search Gad*` do not (there is no wildcard on `search`).
 - `symbols <PATTERN>` matches a **whole name**, or a **prefix** with a trailing `*`. It is case-insensitive by default; `--exact-case` makes it case-sensitive ([case](#case)).
-- There is **no infix (substring) match** on either command: a leading `*` is not a wildcard (`*dget` looks for a symbol literally named `*dget`), and a fragment from inside a name finds nothing. Infix symbol search is planned as [story 68](../epic-code-memory-graph.md#story-68).
+- `symbols '*needle*'` matches a name that **contains** `needle` anywhere (infix), and `symbols '*needle'` a name that **ends** with it (suffix). Folded like every symbol lookup unless `--exact-case`. A bare fragment without the stars (`symbols Get`) is still an exact name and finds nothing inside `Gadget` ([ADR 0011](../adr/0011-infix-search.md)).
+- `search` has **no infix match**: a token-level substring index would not fit the size budget, so `search Gad` finds nothing.
 
 Worked example, a file `Gadget.cs` containing `public class Gadget { }`:
 
@@ -53,19 +54,42 @@ Worked example, a file `Gadget.cs` containing `public class Gadget { }`:
 | `symbols --exact-case Gad*` | yes | prefix, same case |
 | `symbols --exact-case gad*` | no | the case differs |
 | `symbols '*'` | yes | `*` alone lists every symbol |
-| `symbols Get` | no | `Get` is not the name and not a prefix of it (no infix match) |
+| `symbols Get` | no | `Get` is not the name and not a prefix of it; write `'*get*'` for an infix match |
+| `symbols '*get*'` | yes | infix: the name contains `get` (case-insensitive by default) |
+| `symbols --exact-case '*Get*'` | no | infix, but the case differs |
 | `symbols dget` | no | a fragment from inside the name |
-| `symbols '*dget'` | no | a leading `*` is not a wildcard |
+| `symbols '*dget'` | yes | suffix: the name ends with `dget` |
 | `search Gadget` | yes (the token) | whole token, exact text |
 | `search Gad` | no | part of a token |
 | `search gadget` | no | `search` is case-sensitive |
 | `search Gad*` | no | `search` has no wildcard |
 
-An empty answer therefore means "no name or prefix matched", not "not indexed": `describe` shows what a repo holds, and `symbols '*' --file <path>` lists every symbol in one file.
+An empty answer therefore means "no name, prefix or infix matched", not "not indexed": `describe` shows what a repo holds, and `symbols '*' --file <path>` lists every symbol in one file.
 
 ## Symbol patterns
 
-`symbols` patterns: `name` (exact), `prefix*`, `*` (all), `name\*` (a literal `*`). `**` is rejected as ambiguous.
+`symbols` patterns, parsed the same way by the embedded store, the server and the client:
+
+| Pattern | Meaning |
+|---|---|
+| `name` | exact name |
+| `prefix*` | names starting with `prefix` (no minimum length) |
+| `*` | every symbol |
+| `*needle*` | names containing `needle` (infix) |
+| `*needle` | names ending with `needle` (suffix) |
+| `name\*` | the name `name*` (a trailing `\*` is a literal `*`) |
+| `\*name*` | names starting with `*name` (a leading `\*` is a literal `*`, not a marker) |
+
+Quote any pattern with a `*` so the shell does not expand it. Rules for infix and suffix needles:
+
+- The needle is **2 to 256 bytes** (bytes, not characters: `*é*` is 2 bytes and accepted, `*g*` is refused). A longer or shorter needle is refused, never cut.
+- It may not contain an unescaped `*` (`*a*b*` is refused; there is no general globbing). `\*` inside it is a literal `*`. Whitespace is part of the needle.
+- ASCII letters fold unless `--exact-case`; other characters match exactly ([case](#case)).
+- Results come in the same order as any symbol query (org, repo, file, position), and `--limit`/`--offset` page them as usual.
+- The lookup walks every distinct symbol name, so a very common needle costs the most. Over `--server` a deadline the client sets (`grpc-timeout`) stops it with `DeadlineExceeded`, never a partial page.
+- An older server would read `*get*` as the prefix `*get` and answer nothing, so the client sends an infix or suffix pattern only to a server whose `Hello` lists the `symbol_infix` capability, and otherwise fails with "this server does not support infix symbol search; upgrade it".
+
+Refused: an empty pattern, any pattern ending in `**` (ambiguous; so `**`, `***` and `a\**`), and the infix/suffix cases above.
 
 ### Case
 

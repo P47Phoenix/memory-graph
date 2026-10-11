@@ -796,3 +796,54 @@ fn toks_parent(s: &dyn Store, path: &str) -> graph_core::NodeId {
         .parent
         .unwrap()
 }
+
+/// ADR 0011 D6: a server lists `symbol_infix` in `Hello`, and the client
+/// sends an infix or suffix pattern only to one that does; against an
+/// older server (simulated by a hook) it refuses with a clear error rather
+/// than the empty answer the old server would give. Prefix and exact
+/// lookups are unaffected.
+#[test]
+fn infix_needs_a_server_that_lists_the_capability() {
+    let d = tempfile::tempdir().unwrap();
+    let src = "struct Gadget;\nfn forget() {}\n";
+    {
+        let ts = TestServer::start(&d.path().join("g.redb"), rust());
+        let r = connect(&ts);
+        assert!(r
+            .hello()
+            .capabilities
+            .iter()
+            .any(|c| c == graph_store::CAPABILITY_SYMBOL_INFIX));
+        let ex = graph_lang_rust::RustExtractor.extract(src);
+        r.ingest_file("o", "r", "a.rs", "rust", &ex).unwrap();
+        let names = |p: &str| -> Vec<String> {
+            r.search_symbols(&graph_store::SymbolQuery::new(p))
+                .unwrap()
+                .into_iter()
+                .map(|h| h.name)
+                .collect()
+        };
+        assert_eq!(names("*get*"), ["Gadget", "forget"]);
+        assert_eq!(names("*GET"), ["Gadget", "forget"]);
+    }
+    let ts = TestServer::start_with(&d.path().join("g.redb"), rust(), |c| {
+        c.testing.without_symbol_infix = true;
+    });
+    let r = connect(&ts);
+    assert!(r.hello().capabilities.is_empty());
+    for p in ["*get*", "*get"] {
+        match r.search_symbols(&graph_store::SymbolQuery::new(p)) {
+            Err(StoreError::Rejected(m)) => assert_eq!(
+                m, "this server does not support infix symbol search; upgrade it",
+                "{p}"
+            ),
+            other => panic!("{p}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        r.search_symbols(&graph_store::SymbolQuery::new("gad*"))
+            .unwrap()
+            .len(),
+        1
+    );
+}

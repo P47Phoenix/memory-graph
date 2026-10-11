@@ -3212,12 +3212,12 @@ fn symbols_lookup_is_case_insensitive_by_default() {
     assert!(out.starts_with("o/r/Widget.cs:1:14\t"), "{out}");
 }
 
-/// Story 59 / issue #278: the documented matching rules on
+/// Stories 59 and 68 / issue #278: the documented matching rules on
 /// `public class Gadget { }` (docs/guide/querying.md, "What matches").
-/// Prefix and case-insensitive symbol lookups find it; an infix fragment,
-/// a leading `*` and a partial `search` token do not (infix is story 68).
+/// Prefix, case-insensitive, infix (`*get*`) and suffix (`*dget`) symbol
+/// lookups find it; a bare fragment and a partial `search` token do not.
 #[test]
-fn symbols_prefix_matches_but_infix_does_not() {
+fn symbols_prefix_and_infix_match_but_a_bare_fragment_does_not() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("src");
     std::fs::create_dir_all(&root).unwrap();
@@ -3244,7 +3244,12 @@ fn symbols_prefix_matches_but_infix_does_not() {
         (&["symbols", "*"][..], true),
         (&["symbols", "Get"][..], false),
         (&["symbols", "dget"][..], false),
-        (&["symbols", "*dget"][..], false),
+        (&["symbols", "*dget"][..], true),
+        (&["symbols", "*get*"][..], true),
+        (&["symbols", "*GET*"][..], true),
+        (&["symbols", "--exact-case", "*Get*"][..], false),
+        (&["symbols", "--exact-case", "*get*"][..], true),
+        (&["symbols", "*gad"][..], false),
         (&["search", "Gadget"][..], true),
         (&["search", "Gad"][..], false),
         (&["search", "gadget"][..], false),

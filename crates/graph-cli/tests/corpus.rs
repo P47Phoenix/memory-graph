@@ -1045,3 +1045,51 @@ fn non_aspx_corpus_symbols_are_unchanged() {
     }
     assert_eq!((n, syms, h), EXPECTED, "non-ASPX corpus symbols changed");
 }
+
+/// ADR 0011 D7 CI regression check: on the vendored corpus, the infix
+/// query `*get*` takes at most 10x as long as the prefix query `get*`
+/// (median of 20 runs each, limit 50). It catches an accidental quadratic
+/// path without depending on machine speed; the 50 ms p95 gate itself is
+/// measured by hand on the readbench index.
+#[test]
+fn infix_symbol_search_is_within_10x_of_prefix() {
+    let m = manifest();
+    let db = tempfile::tempdir().unwrap();
+    let dbp = db.path().join("corpus.redb");
+    let dbs = dbp.to_str().unwrap();
+    for app in m["applications"].as_array().unwrap() {
+        let org = app["name"].as_str().unwrap();
+        for repo in strings(&app["repos"]) {
+            let dir = corpus_dir().join(repo);
+            let o = std::process::Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+                .args(["--db", dbs, "index", "--org", org, "--repo", repo])
+                .arg(&dir)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        }
+    }
+    let s = V2Store::open(&dbp).unwrap();
+    let median = |pattern: &str| -> (std::time::Duration, usize) {
+        let mut q = graph_store::SymbolQuery::new(pattern);
+        q.limit = Some(50);
+        let n = s.search_symbols(&q).unwrap().len();
+        let mut t: Vec<_> = (0..20)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                std::hint::black_box(s.search_symbols(&q).unwrap());
+                start.elapsed()
+            })
+            .collect();
+        t.sort();
+        (t[10], n)
+    };
+    let (prefix, np) = median("get*");
+    let (infix, ni) = median("*get*");
+    assert!(np > 0 && ni >= np, "prefix {np} rows, infix {ni}");
+    eprintln!("corpus: get* {prefix:?} ({np} rows), *get* {infix:?} ({ni} rows)");
+    assert!(
+        infix <= prefix * 10,
+        "infix {infix:?} is more than 10x prefix {prefix:?}"
+    );
+}

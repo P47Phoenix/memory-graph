@@ -13,6 +13,7 @@
 //! | `Locked`, not-leader, no-leader                             | `UNAVAILABLE`         |
 //! | `SchemaMismatch`, `LegacyFormat`, `SnapshotExpired`, `WrongCluster`, protocol | `FAILED_PRECONDITION` |
 //! | `Corrupt`                                                   | `DATA_LOSS`           |
+//! | `DeadlineExceeded`                                          | `DEADLINE_EXCEEDED`   |
 //! | `Storage` (disk full)                                       | `RESOURCE_EXHAUSTED`  |
 //! | `Storage` (other), `OpenFailed`                             | `INTERNAL`            |
 //!
@@ -188,6 +189,7 @@ impl WireError {
                 StoreError::OpenFailed { .. } => Code::Internal,
                 StoreError::NotLeader { .. } | StoreError::NoLeader { .. } => Code::Unavailable,
                 StoreError::Protocol(_) => Code::FailedPrecondition,
+                StoreError::DeadlineExceeded(_) => Code::DeadlineExceeded,
             },
             WireError::NotLeader { .. } | WireError::NoLeader { .. } => Code::Unavailable,
             WireError::Protocol(_) => Code::FailedPrecondition,
@@ -262,6 +264,9 @@ impl WireError {
                     expected: expected.clone(),
                     found: found.clone(),
                 }),
+                StoreError::DeadlineExceeded(msg) => {
+                    K::DeadlineExceeded(d::DeadlineExceeded { msg: msg.clone() })
+                }
             },
             WireError::NotLeader {
                 leader_id,
@@ -367,6 +372,7 @@ impl TryFrom<pb::StoreErrorDetail> for WireError {
                 found: x.found,
             }
             .into(),
+            K::DeadlineExceeded(x) => StoreError::DeadlineExceeded(x.msg).into(),
         })
     }
 }
@@ -513,6 +519,7 @@ pub fn wire_view(e: &StoreError) -> WireError {
             }
         }
         StoreError::Protocol(m) => return WireError::Protocol(m.clone()),
+        StoreError::DeadlineExceeded(m) => StoreError::DeadlineExceeded(m.clone()),
     })
 }
 

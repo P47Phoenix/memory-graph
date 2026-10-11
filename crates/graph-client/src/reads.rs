@@ -267,6 +267,20 @@ async fn search_symbols_page(
     view: View,
     q: &SymbolQuery,
 ) -> Result<(Vec<SymbolHit>, bool)> {
+    // ADR 0011 D6: an older server reads `*get*` as the prefix `*get` and
+    // silently answers nothing, so an infix or suffix pattern goes only to
+    // a server that lists the capability.
+    if graph_store::parse_symbol_pattern(&q.pattern)?.needs_infix_capability()
+        && !c
+            .hello()
+            .capabilities
+            .iter()
+            .any(|k| k == graph_store::CAPABILITY_SYMBOL_INFIX)
+    {
+        return Err(StoreError::Rejected(
+            "this server does not support infix symbol search; upgrade it".into(),
+        ));
+    }
     let req = pb::SearchSymbolsRequest {
         view: view_of(view),
         query: Some(q.clone().into()),

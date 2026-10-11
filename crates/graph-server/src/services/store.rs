@@ -81,6 +81,7 @@ impl pb::store_server::Store for StoreService {
             leader_id: leader.id,
             leader_addr: leader.addr,
             cluster_id: self.ctx.info.cluster_id(),
+            capabilities: self.ctx.info.capabilities.clone(),
         }))
     }
 
@@ -328,6 +329,10 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::SearchSymbolsRequest>,
     ) -> Result<Response<pb::SearchSymbolsResponse>, Status> {
+        // ADR 0011 D3: the client's deadline bounds the scan; past it the
+        // store answers `DeadlineExceeded`, never a partial page.
+        let deadline = crate::forward::incoming_timeout(req.metadata())
+            .and_then(|t| std::time::Instant::now().checked_add(t));
         let mut r = req.into_inner();
         // The key sees the default limit applied, so an omitted limit and
         // the default one are the same query.
@@ -344,7 +349,12 @@ impl pb::store_server::Store for StoreService {
             .try_into()?;
         // Only a page the default limit filled is reported as defaulted, so a
         // small answer needs no paging round trips.
-        let (hits, meta) = self.ctx.read(r.view, move |s| s.search_symbols(&q)).await?;
+        let (hits, meta) = self
+            .ctx
+            .read(r.view, move |s| {
+                graph_store::with_query_deadline(deadline, || s.search_symbols(&q))
+            })
+            .await?;
         self.ctx.note_query(key, &meta);
         let hits_len = hits.len();
         let omit = self.ctx.omit_name_pos;

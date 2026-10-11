@@ -380,6 +380,9 @@ message StoreErrorDetail {
   // `encoding` (a WHATWG name other than UTF-8; UTF-8 is `NotUtf8`), ADR
   // 0007 C3/C8, #180.
   message StrictEncoding { string path = 1; string encoding = 2; }
+  // A read passed its deadline (the request's `grpc-timeout`) before it
+  // finished (ADR 0011 D3); no partial result was returned.
+  message DeadlineExceeded { string msg = 1; }
 
   oneof kind {
     Locked locked = 1;
@@ -400,6 +403,7 @@ message StoreErrorDetail {
     WrongCluster wrong_cluster = 16;
     Binary binary = 17;
     StrictEncoding strict_encoding = 18;
+    DeadlineExceeded deadline_exceeded = 19;
   }
 }
 

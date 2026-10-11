@@ -491,6 +491,7 @@ fn store_error() -> impl Strategy<Value = StoreError> {
         any::<u64>().prop_map(|retry_after_ms| StoreError::NoLeader { retry_after_ms }),
         text().prop_map(StoreError::Protocol),
         (text(), text()).prop_map(|(expected, found)| StoreError::WrongCluster { expected, found }),
+        text().prop_map(StoreError::DeadlineExceeded),
     ]
 }
 
@@ -840,6 +841,10 @@ fn code_table_matches_adr_0004() {
             }
             .into(),
             Code::FailedPrecondition,
+        ),
+        (
+            E::DeadlineExceeded("x".into()).into(),
+            Code::DeadlineExceeded,
         ),
     ];
     for (e, code) in cases {

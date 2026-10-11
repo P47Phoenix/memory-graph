@@ -65,6 +65,10 @@ message HelloResponse {
   optional uint64 leader_id = 6;
   optional string leader_addr = 7;
   string cluster_id = 8;
+  // Optional features this server supports, so a newer client can refuse
+  // a request an older server would misread. `symbol_infix`: infix and
+  // suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6).
+  repeated string capabilities = 9;
 }
 
 message GetRequest {
