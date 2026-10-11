@@ -2,6 +2,7 @@
 //! initialize a one-member cluster when asked (`--bootstrap`, or `--db`
 //! mode's first start), resume from the log after, run the snapshot policy,
 //! and answer the leader and membership questions the services ask.
+use super::disk_stall::DiskStall;
 use super::log_store::{AppendObserver, RedbLogStore};
 use super::network::{FaultPlan, FaultyNetwork, GrpcNetwork, NetStats, Prober};
 use super::snapshot_dir::SnapshotDir;
@@ -237,6 +238,10 @@ pub struct RaftNode {
     /// Linearizable reads on this node waiting to apply the leader's read
     /// index right now (a test observes a read parked there).
     pub read_index_waits: Arc<AtomicUsize>,
+    /// Disk-full stalls of this node's log append and apply (story 67):
+    /// retried in place, and a write waiting here meanwhile answers
+    /// `RESOURCE_EXHAUSTED`. Its failpoints are a ClusterTestbed's.
+    pub disk_stall: DiskStall,
     /// Whether openraft's tick is suspended because this node leads alone
     /// ([`TickControl`], issue #205), and what holds it on.
     pub ticks: Arc<TickControl>,
@@ -507,6 +512,10 @@ impl RaftNode {
             p.storage_backend.as_ref().map(|f| f(&p.log_path)),
         )?;
         log_store.set_observer(p.append_observer.clone());
+        let disk_stall = DiskStall::new();
+        disk_stall.set_guard(Some(p.disk.clone()));
+        log_store.set_disk_stall(disk_stall.clone());
+        log_store.set_reopen_backend(p.storage_backend.clone());
         {
             let (slot, snaps, log, disk) = (
                 Arc::clone(&p.slot),
@@ -533,6 +542,7 @@ impl RaftNode {
         }
         let sm = StoreStateMachine::new(Arc::clone(&p.slot), Arc::clone(&p.snapshots))
             .with_failpoints(p.failpoints)
+            .with_disk_stall(disk_stall.clone())
             .with_obs(Arc::clone(&p.obs))
             .with_testing_apply_gate(p.testing_apply_gate.clone());
         let net_stats = NetStats::default();
@@ -578,6 +588,7 @@ impl RaftNode {
             in_flight: Arc::new(AtomicUsize::new(0)),
             hold_proposal: None,
             read_index_waits: Arc::default(),
+            disk_stall: disk_stall.clone(),
             obs: p.obs,
             ticks: Arc::default(),
         };
@@ -741,6 +752,11 @@ impl RaftNode {
         // answers `NotLeader` naming the leader, whatever its disk.
         if self.metrics().state == ServerState::Leader {
             self.disk.check("write")?;
+            // A log append or apply of this node retrying a full disk
+            // (story 67): a new entry would only queue behind it.
+            if let Some(m) = self.disk_stall.current() {
+                return Err(self.stalled_answer(m));
+            }
         }
         // ADR 0009 D5: this node's apply of the entry links to the request's
         // `rpc` span (the apply runs on the state machine's task). Only
@@ -777,7 +793,49 @@ impl RaftNode {
                 Err(e) => Err(join_err(e)),
             },
             e = self.quorum_lost() => Err(e),
+            // This node's log append or apply met a full disk and retries
+            // in place: the write is not acknowledged (it may still land
+            // once space is freed; a retry is idempotent, D2/D7).
+            m = self.disk_stall.stalled() => Err(self.stalled_answer(m)),
         }
+    }
+
+    /// What a request waiting on this node gets while it retries a full
+    /// disk (story 67): the disk-full refusal (`RESOURCE_EXHAUSTED`), or,
+    /// when a stalled log append holds this node's Raft core and a peer
+    /// already leads in a higher term (seen in its `AppendEntries`, which
+    /// the held core cannot act on, so this node's own metrics still say
+    /// it leads), `NotLeader` naming that peer: the client follows it and
+    /// its write lands there.
+    pub fn stalled_answer(&self, msg: String) -> StoreError {
+        if self
+            .disk_stall
+            .is_stalled(super::disk_stall::StallSource::LogAppend)
+        {
+            if let Some((leader_id, leader_addr)) = self.newer_leader() {
+                return StoreError::NotLeader {
+                    leader_id: Some(leader_id),
+                    leader_addr,
+                };
+            }
+        }
+        StoreError::Storage(msg)
+    }
+
+    /// A peer that leads in a term above this node's own Raft term, as
+    /// seen in the `AppendEntries` it sent here.
+    pub fn newer_leader(&self) -> Option<(NodeId, Option<String>)> {
+        let m = self.metrics();
+        let (term, id) = self.obs.seen_leader()?;
+        if term <= m.current_term || id == self.node_id || id == 0 {
+            return None;
+        }
+        let addr = m
+            .membership_config
+            .membership()
+            .get_node(&id)
+            .map(|n| n.addr.clone());
+        Some((id, addr))
     }
 
     /// One shared probe round ([`Prober::round`]) over the voters that
@@ -987,7 +1045,17 @@ impl RaftNode {
     /// applied that index: `Admin.ReadIndex`).
     pub async fn ensure_linearizable(&self) -> Result<u64, StoreError> {
         self.no_leader_while_transferring()?;
-        match self.raft.ensure_linearizable().await {
+        // A disk-full stall of this node (story 67): its applied index
+        // cannot move (apply) or it cannot lead (append), so the barrier
+        // would only wait out the client's deadline; answer at once.
+        if let Some(m) = self.disk_stall.current() {
+            return Err(self.stalled_answer(m));
+        }
+        let barrier = tokio::select! {
+            r = self.raft.ensure_linearizable() => r,
+            m = self.disk_stall.stalled() => return Err(self.stalled_answer(m)),
+        };
+        match barrier {
             Ok(read) => Ok(read.map_or(0, |l| l.index)),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                 Err(StoreError::NotLeader {
@@ -1035,6 +1103,8 @@ impl RaftNode {
     }
 
     pub async fn shutdown(&self) {
+        // A disk-full retry gives up, so the Raft core it may hold can stop.
+        self.disk_stall.stop();
         if let Err(e) = self.raft.shutdown().await {
             tracing::warn!(error = %e, "raft shutdown");
         }

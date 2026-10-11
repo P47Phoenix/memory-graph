@@ -169,6 +169,7 @@ Exact pins in `[workspace.dependencies]`, as the workspace does for tonic and pr
 | `mg_store_bytes` | `memory_graph.store.size` | up-down counter | `By` | none |
 | `mg_log_bytes` | `memory_graph.log.size` | up-down counter | `By` | none |
 | `mg_snapshot_handles_open` | `memory_graph.snapshot_handles.open` | up-down counter | `{handle}` | none |
+| `mg_disk_stalled` | `memory_graph.disk.stalled` | gauge | `1` | `source` |
 | `mg_rpc_duration_seconds` | `rpc.server.call.duration` | histogram (synchronous) | `s` | `rpc.system`, `rpc.service`, `rpc.method`, `rpc.grpc.status_code` |
 | `mg_rpc_total` | none (the exception: the histogram's count) | none | none | none |
 | `mg_writes_forwarded_total` | `memory_graph.writes.forwarded` | counter | `{write}` | none |

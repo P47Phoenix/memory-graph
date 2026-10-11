@@ -890,6 +890,8 @@ impl pb::admin_server::Admin for AdminService {
             writes_forwarded_total: self.ctx.fwd.forwarded_total(),
             rpcs_total: self.ctx.raft.obs.rpc_total(),
             entries_applied_total: self.ctx.raft.obs.apply_total(),
+            disk_stalled: self.ctx.raft.disk_stall.sources(),
+            disk_stall_message: self.ctx.raft.disk_stall.current().unwrap_or_default(),
             mcp_addr: self
                 .ctx
                 .info

@@ -880,6 +880,13 @@ pub const METRIC_MAPPING: [MetricMapping; 37] = {
             &[],
         ),
         map(
+            "mg_disk_stalled",
+            "memory_graph.disk.stalled",
+            Gauge,
+            "1",
+            &["source"],
+        ),
+        map(
             "mg_rpc_duration_seconds",
             "rpc.server.call.duration",
             Histogram,

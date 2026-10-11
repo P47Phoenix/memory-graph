@@ -121,16 +121,55 @@ impl From<WireError> for StoreError {
     }
 }
 
-/// Whether a storage error message describes a full disk (Linux/macOS
-/// ENOSPC 28, Windows ERROR_DISK_FULL 112, or the words themselves).
+/// Whether a storage error message describes a full disk: ENOSPC (28),
+/// a quota (Linux EDQUOT 122, macOS EDQUOT 69), Windows ERROR_DISK_FULL
+/// (112) and ERROR_HANDLE_DISK_FULL (39), the `io::ErrorKind` texts of
+/// `StorageFull` and `QuotaExceeded`, or the words themselves. The OS
+/// codes that mean something else on another platform (39 is ENOTEMPTY on
+/// Linux) count only where they mean a full disk; a message is classified
+/// on the server that produced it.
 pub fn is_disk_full(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
+    let code =
+        |n: u32| m.contains(&format!("os error {n})")) || m.ends_with(&format!("os error {n}"));
     m.contains("no space left")
         || m.contains("disk full")
-        || m.contains("os error 28)")
-        || m.contains("os error 112)")
-        || m.ends_with("os error 28")
-        || m.ends_with("os error 112")
+        || m.contains("no storage space")
+        || m.contains("quota exceeded")
+        || code(28)
+        || code(112)
+        || (cfg!(windows) && code(39))
+        || (cfg!(target_os = "linux") && code(122))
+        || (cfg!(target_os = "macos") && code(69))
+}
+
+/// [`is_disk_full`] over an error and its whole `source()` chain: an
+/// `io::Error` of kind `StorageFull` or `QuotaExceeded` at any level, or
+/// a level whose text says so.
+pub fn error_is_disk_full(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            ) {
+                return true;
+            }
+        }
+        if is_disk_full(&e.to_string()) {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// Whether a storage error is redb's `PreviousIo`: an earlier I/O error
+/// (a full disk, say) poisoned the open database, and every later
+/// operation fails until it is closed and reopened.
+pub fn is_previous_io(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("previous i/o error")
 }
 
 /// Whether a status without a typed detail means the connection under a

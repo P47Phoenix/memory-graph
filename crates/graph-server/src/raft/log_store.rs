@@ -194,6 +194,13 @@ pub struct RedbLogStore {
     /// See [`COMPACT_MAX_LIVE`] (tests lower it).
     max_live: Arc<AtomicU64>,
     observer: Option<AppendObserver>,
+    /// Disk-full retries of the log's writes (story 67).
+    stall: super::disk_stall::DiskStall,
+    /// The database was closed for a reopen that has not succeeded yet:
+    /// every transaction fails with `PreviousIo` until it does.
+    closed: Arc<AtomicBool>,
+    /// Test-only: reopen over this storage backend, not the file.
+    reopen_backend: Option<crate::powercut::BackendFactory>,
     #[cfg(test)]
     compact_gate: Arc<std::sync::Mutex<Option<CompactGate>>>,
     /// Test-only: why the last `compact_if_sparse` returned before
@@ -325,6 +332,9 @@ impl RedbLogStore {
             closing,
             max_live: Arc::new(AtomicU64::new(COMPACT_MAX_LIVE)),
             observer: None,
+            stall: super::disk_stall::DiskStall::new(),
+            closed: Arc::new(AtomicBool::new(false)),
+            reopen_backend: None,
             #[cfg(test)]
             compact_gate: Arc::default(),
             #[cfg(test)]
@@ -390,6 +400,7 @@ impl RedbLogStore {
     /// transaction of ours being open while it holds the write side).
     pub(crate) fn read_txn(&self) -> Result<Guarded<'_, ReadTransaction>, redb::TransactionError> {
         let guard = self.guard();
+        self.check_open()?;
         let txn = guard.begin_read()?;
         Ok(Guarded { txn, _guard: guard })
     }
@@ -400,6 +411,7 @@ impl RedbLogStore {
         &self,
     ) -> Result<Guarded<'_, WriteTransaction>, redb::TransactionError> {
         let guard = self.guard();
+        self.check_open()?;
         let txn = guard.begin_write()?;
         Ok(Guarded { txn, _guard: guard })
     }
@@ -447,6 +459,9 @@ impl RedbLogStore {
         self.record_skip(None);
         if self.closing.load(Ordering::SeqCst) {
             return self.skip("closing");
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return self.skip("closed for a reopen");
         }
         let file = self.file_bytes();
         let floor = self.compacted_bytes.load(Ordering::Relaxed);
@@ -586,6 +601,82 @@ impl RedbLogStore {
     #[doc(hidden)]
     pub fn set_compact_max_live(&self, bytes: u64) {
         self.max_live.store(bytes, Ordering::Relaxed);
+    }
+
+    fn check_open(&self) -> Result<(), redb::TransactionError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(redb::TransactionError::Storage(
+                redb::StorageError::PreviousIo,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Close and reopen the log's redb database (story 67): after an I/O
+    /// error (a full disk) redb answers every later operation `PreviousIo`
+    /// until the database is reopened, and the reopen repairs the file if
+    /// the failed commit left it needing it. Holds the write side of the
+    /// lock throughout, so no transaction sees the database in between;
+    /// if the reopen fails, every transaction answers `PreviousIo` until a
+    /// later call succeeds.
+    pub fn reopen_db(&self) -> Result<(), StoreError> {
+        let mut g = self.db.write().unwrap_or_else(|p| p.into_inner());
+        self.closed.store(true, Ordering::SeqCst);
+        // The old database must be dropped (releasing its file lock)
+        // before the file is opened again: an empty in-memory one holds
+        // its place meanwhile, never used (`closed` is set).
+        let placeholder = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| open_err(&self.path, e))?;
+        drop(std::mem::replace(&mut *g, placeholder));
+        let db = match &self.reopen_backend {
+            Some(f) => {
+                Database::builder().create_with_backend(crate::powercut::DynBackend(f(&self.path)))
+            }
+            None => Database::create(&self.path),
+        }
+        .map_err(|e| open_err(&self.path, e))?;
+        *g = db;
+        self.closed.store(false, Ordering::SeqCst);
+        tracing::warn!(path = %self.path.display(), "raft log reopened after an I/O error");
+        Ok(())
+    }
+
+    /// Test-only: [`reopen_db`](Self::reopen_db) opens this backend.
+    pub fn set_reopen_backend(&mut self, f: Option<crate::powercut::BackendFactory>) {
+        self.reopen_backend = f;
+    }
+
+    /// `f`, retried in place on a full disk (and on `PreviousIo`, after a
+    /// reopen) through the node's [`DiskStall`](super::disk_stall::DiskStall).
+    fn retried<T>(
+        &self,
+        src: super::disk_stall::StallSource,
+        mut f: impl FnMut(&Self) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.stall.retry(
+            src,
+            || {
+                // A reopen that failed (redb's repair met the full disk)
+                // is tried again first, and its own error is the answer
+                // (a disk-full one keeps the retry going).
+                if self.closed.load(Ordering::SeqCst) {
+                    self.reopen_db().map_err(write_err)?;
+                }
+                f(self)
+            },
+            || {
+                if let Err(e) = self.reopen_db() {
+                    tracing::warn!(error = %e, "raft log: reopen failed; retrying");
+                }
+            },
+        )
+    }
+
+    /// The node's disk-full stall state: an append that fails with a
+    /// disk-full error is retried in place instead of stopping the node.
+    pub fn set_disk_stall(&mut self, stall: super::disk_stall::DiskStall) {
+        self.stall = stall;
     }
 
     /// Record every append's commit and flush callback (tests only).
@@ -730,8 +821,10 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError> {
         let vote = *vote;
         self.blocking(move |s| {
-            s.set_meta(K_VOTE, &vote)
-                .map_err(|e| StorageIOError::write_vote(AnyError::new(&e)).into())
+            s.retried(super::disk_stall::StallSource::LogMeta, |s| {
+                s.set_meta(K_VOTE, &vote)
+                    .map_err(|e| StorageIOError::write_vote(AnyError::new(&e)).into())
+            })
         })
         .await
     }
@@ -742,8 +835,12 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
     }
 
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), StorageError> {
-        self.blocking(move |s| s.set_meta(K_COMMITTED, &committed))
-            .await
+        self.blocking(move |s| {
+            s.retried(super::disk_stall::StallSource::LogMeta, |s| {
+                s.set_meta(K_COMMITTED, &committed)
+            })
+        })
+        .await
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId>, StorageError> {
@@ -764,25 +861,48 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         // this on its own task, so nothing else of the node waits on it).
         let written = self
             .blocking(move |s| {
-                let wt = s.write_txn().map_err(write_err)?;
-                let mut last = 0u64;
-                {
-                    let mut t = wt.open_table(LOG).map_err(write_err)?;
-                    for e in &entries {
-                        let enc = encode_entry(e);
-                        last = e.log_id.index;
-                        t.insert(e.log_id.index, enc.as_slice())
-                            .map_err(write_err)?;
+                // A disk-full error is retried in place (the transaction
+                // rolled back, so nothing of the entries is in the log);
+                // any other error stops the node (story 67, DiskStall).
+                let stall = s.stall.clone();
+                // Only entries a client wrote grow the log by much; the
+                // blank and membership entries of an election or a change
+                // are let through below the floor (a node short of space
+                // must still be able to elect and be elected).
+                let normal = entries
+                    .iter()
+                    .any(|e| matches!(e.payload, EntryPayload::Normal(_)));
+                s.retried(super::disk_stall::StallSource::LogAppend, |s| {
+                    if normal {
+                        // Below --min-free-disk: stall before redb meets
+                        // ENOSPC (which would poison the database).
+                        stall.precheck("raft log append").map_err(write_err)?;
                     }
-                }
-                // `Immediate` durability: the commit returns once the
-                // entries are fsynced, and only then is the flush reported
-                // (D7).
-                wt.commit().map_err(write_err)?;
-                if let Some(o) = &s.observer {
-                    o(AppendEvent::Committed { last_index: last });
-                }
-                Ok(last)
+                    let wt = s.write_txn().map_err(write_err)?;
+                    let mut last = 0u64;
+                    {
+                        let mut t = wt.open_table(LOG).map_err(write_err)?;
+                        for e in &entries {
+                            let enc = encode_entry(e);
+                            last = e.log_id.index;
+                            t.insert(e.log_id.index, enc.as_slice())
+                                .map_err(write_err)?;
+                        }
+                    }
+                    if let Some(e) = stall.injected(super::disk_stall::StallSource::LogAppend) {
+                        // Testing: the commit's fsync found the disk full.
+                        wt.abort().map_err(write_err)?;
+                        return Err(write_err(e));
+                    }
+                    // `Immediate` durability: the commit returns once the
+                    // entries are fsynced, and only then is the flush
+                    // reported (D7).
+                    wt.commit().map_err(write_err)?;
+                    if let Some(o) = &s.observer {
+                        o(AppendEvent::Committed { last_index: last });
+                    }
+                    Ok(last)
+                })
             })
             .await;
         match written {
@@ -803,30 +923,36 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError> {
-        self.blocking(move |s| s.delete_range(Bound::Included(log_id.index), Bound::Unbounded))
-            .await
+        self.blocking(move |s| {
+            s.retried(super::disk_stall::StallSource::LogMeta, |s| {
+                s.delete_range(Bound::Included(log_id.index), Bound::Unbounded)
+            })
+        })
+        .await
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError> {
         self.blocking(move |s| {
-            // The purge point and the deletion commit together.
-            let bytes = serde_json::to_vec(&log_id).map_err(write_err)?;
-            let wt = s.write_txn().map_err(write_err)?;
-            {
-                let mut meta = wt.open_table(META).map_err(write_err)?;
-                meta.insert(K_PURGED, bytes.as_slice()).map_err(write_err)?;
-                let mut t = wt.open_table(LOG).map_err(write_err)?;
-                let keys: Vec<u64> = t
-                    .range::<u64>(..=log_id.index)
-                    .map_err(write_err)?
-                    .map(|r| r.map(|(k, _)| k.value()))
-                    .collect::<Result<_, _>>()
-                    .map_err(write_err)?;
-                for k in keys {
-                    t.remove(k).map_err(write_err)?;
+            s.retried(super::disk_stall::StallSource::LogMeta, |s| {
+                // The purge point and the deletion commit together.
+                let bytes = serde_json::to_vec(&log_id).map_err(write_err)?;
+                let wt = s.write_txn().map_err(write_err)?;
+                {
+                    let mut meta = wt.open_table(META).map_err(write_err)?;
+                    meta.insert(K_PURGED, bytes.as_slice()).map_err(write_err)?;
+                    let mut t = wt.open_table(LOG).map_err(write_err)?;
+                    let keys: Vec<u64> = t
+                        .range::<u64>(..=log_id.index)
+                        .map_err(write_err)?
+                        .map(|r| r.map(|(k, _)| k.value()))
+                        .collect::<Result<_, _>>()
+                        .map_err(write_err)?;
+                    for k in keys {
+                        t.remove(k).map_err(write_err)?;
+                    }
                 }
-            }
-            wt.commit().map_err(write_err)
+                wt.commit().map_err(write_err)
+            })
         })
         .await?;
         // In the background: the Raft core awaits `purge`, and a

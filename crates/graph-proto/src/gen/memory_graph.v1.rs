@@ -3511,6 +3511,14 @@ pub struct StatusResponse {
     /// node has no backup location.
     #[prost(message, optional, tag = "32")]
     pub backup: ::core::option::Option<BackupStatus>,
+    /// Story 67: what this node is retrying a full disk for, in place: `log`
+    /// (Raft log writes) and/or `apply` (the store); empty: not stalled
+    /// (or the server predates the field). Writes answer RESOURCE_EXHAUSTED
+    /// meanwhile, with `disk_stall_message`.
+    #[prost(string, repeated, tag = "34")]
+    pub disk_stalled: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "35")]
+    pub disk_stall_message: ::prost::alloc::string::String,
 }
 /// This node's snapshot backups since it started.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
