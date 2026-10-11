@@ -142,6 +142,9 @@ pub struct ServeConfig {
     /// on a many-core host. [`start`] runs on the caller's runtime and
     /// ignores it.
     pub worker_threads: Option<std::num::NonZeroUsize>,
+    /// OTLP metrics (ADR 0009 D6): the node's snapshot and duration
+    /// histograms are exported through it once the node is up.
+    pub otlp_metrics: Option<crate::telemetry::OtlpMetrics>,
 }
 
 /// How long a restart whose `node.json` address differs from the one its
@@ -242,6 +245,7 @@ impl ServeConfig {
             restore_allow_extractor_mismatch: false,
             restore_s3: crate::backup::S3Options::default(),
             worker_threads: None,
+            otlp_metrics: None,
         }
     }
 
@@ -287,6 +291,7 @@ impl std::fmt::Debug for ServeConfig {
             )
             .field("restore_s3", &self.restore_s3)
             .field("worker_threads", &self.worker_threads)
+            .field("otlp_metrics", &self.otlp_metrics.is_some())
             .finish()
     }
 }
@@ -353,6 +358,12 @@ pub struct Running {
 impl Running {
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         self.shutdown.clone()
+    }
+
+    /// Every metric family this node exports, read now (what `/metrics`
+    /// and OTLP export).
+    pub fn metrics_snapshot(&self) -> crate::observe::MetricsSnapshot {
+        crate::observe::snapshot(&self.ctx)
     }
 
     /// The worker threads of the runtime the caller is on (what
@@ -817,6 +828,14 @@ pub async fn start(
         last_elect: std::sync::Mutex::new(None),
         backup: backup.clone(),
     });
+    if let Some(otlp) = &cfg.otlp_metrics {
+        // A weak link: the exporter must not keep a stopped node alive.
+        let node = Arc::downgrade(&ctx);
+        let recorders = otlp.attach(Box::new(move || {
+            node.upgrade().map(|ctx| crate::observe::snapshot(&ctx))
+        }));
+        ctx.raft.obs.set_otlp(recorders);
+    }
 
     // Health (D10): "" is SERVING once the store is open (now);
     // `memory-graph.ready` follows the known leader.

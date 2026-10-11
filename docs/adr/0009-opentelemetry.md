@@ -60,6 +60,10 @@ Exact pins in `[workspace.dependencies]`, as the workspace does for tonic and pr
   - `cargo tree -i ring` and `cargo tree -i aws-lc-sys` print nothing, and `check-no-c-deps.py` (all six targets), `test_gate.py` and the docker build pass.
 - The OTLP messages come as generated code inside `opentelemetry-proto`, so no protoc and no xtask change is needed.
 - Adding these dependencies needs the owner's approval, given in story 50's PR.
+- **Note (2026-10-11, story 52):** `experimental_metrics_custom_reader` is added to the `opentelemetry_sdk` feature list. The owner approved it on 2026-10-11.
+  - **Why:** building the metrics snapshot opens a redb read transaction, so it must never happen inside an SDK callback (D6). The experimental `MetricReader`/`ManualReader` is the only hook that lets us build the snapshot on our own thread before each collection.
+  - **Cost:** upstream may change this API in any minor release. The exact `=0.33.0` pin keeps it stable, but an OpenTelemetry upgrade may mean porting `telemetry/metrics.rs`. The feature adds no crates, and the pure-Rust gate is unaffected.
+  - **Fallback**, if upstream removes the feature: a `PeriodicReader` whose callbacks read an `Arc` snapshot that a ticker thread refreshes.
 
 ### D3. Configuration
 
@@ -228,6 +232,8 @@ Sizes that can shrink (`mg_store_bytes`, `mg_log_bytes`, open handles) are up-do
   - `mg_otel_dropped_total{signal}`: items (spans, log records or metric data points) carried by those failed or timed-out exports.
 
   **Known gap:** SDK 0.33 does not expose its batch processors' queue-full drops, so they are not counted. That gap goes to a follow-up issue, filed with story 50. The options there are a small custom bounded processor, or an SDK release that exposes the count.
+
+  **Closed (2026-10-11):** #250 is closed by story 52. A counting processor enforces the queue bound in front of the SDK's batch processor, so the SDK's channel never fills. Queue-full drops are counted in `mg_otel_dropped_total`, and once nothing is pending, queued = exported + dropped.
 
   Both counters sit on `/metrics`, because the collector is the thing that has failed. They stay 0 when OpenTelemetry is off.
 - **Export errors are logged** at most once per interval per signal, so a dead collector does not flood the log.

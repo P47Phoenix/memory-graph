@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 34] = [
+pub const METRIC_NAMES: [&str; 36] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -70,6 +70,8 @@ pub const METRIC_NAMES: [&str; 34] = [
     "mg_read_search_seconds_total",
     "mg_queries_total",
     "mg_query_exact_repeats_total",
+    "mg_otel_export_failures_total",
+    "mg_otel_dropped_total",
 ];
 
 /// The Prometheus text exposition format this module writes.
@@ -162,6 +164,8 @@ pub struct Observability {
     mcp_calls: Mutex<BTreeMap<(String, String), u64>>,
     /// Read RPCs answered and their exact repeats (ADR 0008 phase 3 gate).
     pub repeats: crate::repeats::RepeatLog,
+    /// The OTLP duration histograms, once OTLP metrics are attached.
+    otlp: std::sync::OnceLock<crate::telemetry::OtlpRecorders>,
 }
 
 impl Observability {
@@ -170,10 +174,21 @@ impl Observability {
     }
 
     pub fn observe_rpc(&self, rpc: &str, outcome: &str, secs: f64) {
-        let mut m = self.rpc.lock().unwrap_or_else(PoisonError::into_inner);
-        m.entry((rpc.to_string(), outcome.to_string()))
-            .or_default()
-            .observe(secs);
+        {
+            let mut m = self.rpc.lock().unwrap_or_else(PoisonError::into_inner);
+            m.entry((rpc.to_string(), outcome.to_string()))
+                .or_default()
+                .observe(secs);
+        }
+        if let Some(otlp) = self.otlp.get() {
+            otlp.record_rpc(rpc, outcome, secs);
+        }
+    }
+
+    /// Record the two duration histograms over OTLP too from now on (ADR
+    /// 0009 D6); the first call wins.
+    pub fn set_otlp(&self, recorders: crate::telemetry::OtlpRecorders) {
+        let _ = self.otlp.set(recorders);
     }
 
     /// One MCP `tools/call` of `tool` (a known tool name or `unknown`)
@@ -201,6 +216,9 @@ impl Observability {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .observe(secs);
+        if let Some(otlp) = self.otlp.get() {
+            otlp.record_apply(secs);
+        }
     }
 
     /// RPCs served since start, every method and outcome.
@@ -381,8 +399,8 @@ impl MetricFamily {
 }
 
 /// Every family a node exports at one moment, in [`METRIC_NAMES`] exposition
-/// order: the one source both the Prometheus text ([`render`]) and, later,
-/// OTLP instruments (ADR 0009) read, so the two can never disagree.
+/// order: the one source both the Prometheus text ([`render`]) and the
+/// OTLP instruments (ADR 0009 D6) read, so the two can never disagree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricsSnapshot {
     pub families: Vec<MetricFamily>,
@@ -469,7 +487,30 @@ fn snapshot_with(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats) -> 
     families.extend(backup_families(ctx));
     families.extend(read_stats_families(read_stats));
     families.extend(repeats_families(&ctx.raft.obs.repeats));
+    families.extend(otel_families());
     MetricsSnapshot { families }
+}
+
+/// `mg_otel_export_failures_total{signal}` and `mg_otel_dropped_total{signal}`
+/// (ADR 0009 D8): process-wide, one sample per signal, 0 with OTLP off.
+fn otel_families() -> Vec<MetricFamily> {
+    let counts = crate::telemetry::otel_counters();
+    let mut failures = MetricFamily::new(
+        "mg_otel_export_failures_total",
+        MetricKind::Counter,
+        crate::telemetry::EXPORT_FAILURES_HELP,
+    );
+    let mut dropped = MetricFamily::new(
+        "mg_otel_dropped_total",
+        MetricKind::Counter,
+        crate::telemetry::DROPPED_HELP,
+    );
+    for c in counts {
+        let labels = vec![("signal", c.signal.to_string())];
+        failures.push(labels.clone(), SampleValue::Int(c.failures));
+        dropped.push(labels, SampleValue::Int(c.dropped));
+    }
+    vec![failures, dropped]
 }
 
 /// `mg_raft_*`: term, leader, role, the log indices and replication lag.
@@ -833,8 +874,17 @@ fn outcome_of(headers: &http::HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<i32>().ok())
     {
-        None | Some(0) => "ok".into(),
-        Some(n) => snake(&format!("{:?}", tonic::Code::from_i32(n))),
+        None => "ok".into(),
+        Some(n) => outcome_label(tonic::Code::from_i32(n)),
+    }
+}
+
+/// The `outcome` label of a gRPC code: `ok`, else its snake-case name
+/// (`invalid_argument`).
+pub fn outcome_label(code: tonic::Code) -> String {
+    match code {
+        tonic::Code::Ok => "ok".into(),
+        c => snake(&format!("{c:?}")),
     }
 }
 

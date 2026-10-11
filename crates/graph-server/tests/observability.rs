@@ -405,3 +405,25 @@ fn idle_connections_do_not_block_a_metrics_scrape() {
     }
     drop(idle);
 }
+
+/// Story 52: with OpenTelemetry off (nothing in this binary turns it on),
+/// both `mg_otel_*` families show all three signals at 0.
+#[test]
+fn otel_counters_are_zero_with_opentelemetry_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&dir.path().join("otel-off.redb"), exts());
+    assert!(!graph_server::telemetry::is_active());
+    let client =
+        graph_client::RemoteStore::connect(graph_client::ClientConfig::new(server.endpoint()))
+            .unwrap();
+    let text = client.admin_metrics().unwrap();
+    let mut seen = 0;
+    for family in ["mg_otel_export_failures_total", "mg_otel_dropped_total"] {
+        for signal in ["traces", "metrics", "logs"] {
+            let line = format!("{family}{{signal=\"{signal}\"}} 0");
+            assert!(text.lines().any(|l| l == line), "{line} missing:\n{text}");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 6);
+}
