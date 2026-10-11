@@ -15,6 +15,8 @@
 //! | `Corrupt`                                                   | `DATA_LOSS`           |
 //! | `Storage` (disk full)                                       | `RESOURCE_EXHAUSTED`  |
 //! | `Storage` (other), `OpenFailed`                             | `INTERNAL`            |
+//! | `Unauthenticated` (ADR 0012)                                | `UNAUTHENTICATED`     |
+//! | `PermissionDenied` (ADR 0012)                               | `PERMISSION_DENIED`   |
 //!
 //! `NotLeader`, `NoLeader` and `Protocol` are the three cluster-level errors
 //! ADR 0004 adds; they are real `StoreError` variants. [`WireError`] keeps
@@ -227,6 +229,8 @@ impl WireError {
                 StoreError::OpenFailed { .. } => Code::Internal,
                 StoreError::NotLeader { .. } | StoreError::NoLeader { .. } => Code::Unavailable,
                 StoreError::Protocol(_) => Code::FailedPrecondition,
+                StoreError::Unauthenticated(_) => Code::Unauthenticated,
+                StoreError::PermissionDenied { .. } => Code::PermissionDenied,
             },
             WireError::NotLeader { .. } | WireError::NoLeader { .. } => Code::Unavailable,
             WireError::Protocol(_) => Code::FailedPrecondition,
@@ -301,6 +305,15 @@ impl WireError {
                     expected: expected.clone(),
                     found: found.clone(),
                 }),
+                StoreError::Unauthenticated(msg) => {
+                    K::Unauthenticated(d::Unauthenticated { msg: msg.clone() })
+                }
+                StoreError::PermissionDenied { msg, required_role } => {
+                    K::PermissionDenied(d::PermissionDenied {
+                        msg: msg.clone(),
+                        required_role: required_role.clone(),
+                    })
+                }
             },
             WireError::NotLeader {
                 leader_id,
@@ -336,6 +349,14 @@ impl WireError {
             Code::DataLoss => WireError::Store(StoreError::Corrupt(msg)),
             Code::ResourceExhausted | Code::Internal => WireError::Store(StoreError::Storage(msg)),
             Code::Unimplemented => WireError::Protocol(format!("{code:?}: {msg}")),
+            // ADR 0012 D8: a detail-less refusal (a proxy, an older client
+            // library's server) maps to the same variants, so the CLI's
+            // exit codes 8 and 9 do not depend on the detail.
+            Code::Unauthenticated => WireError::Store(StoreError::Unauthenticated(msg)),
+            Code::PermissionDenied => WireError::Store(StoreError::PermissionDenied {
+                msg,
+                required_role: String::new(),
+            }),
             other if is_transport_loss(other, &msg) => WireError::Store(StoreError::Storage(
                 format!("connection lost ({other:?}): {msg}"),
             )),
@@ -404,6 +425,12 @@ impl TryFrom<pb::StoreErrorDetail> for WireError {
             K::WrongCluster(x) => StoreError::WrongCluster {
                 expected: x.expected,
                 found: x.found,
+            }
+            .into(),
+            K::Unauthenticated(x) => StoreError::Unauthenticated(x.msg).into(),
+            K::PermissionDenied(x) => StoreError::PermissionDenied {
+                msg: x.msg,
+                required_role: x.required_role,
             }
             .into(),
         })
@@ -530,6 +557,11 @@ pub fn wire_view(e: &StoreError) -> WireError {
             expected: expected.clone(),
             found: found.clone(),
         },
+        StoreError::Unauthenticated(m) => StoreError::Unauthenticated(m.clone()),
+        StoreError::PermissionDenied { msg, required_role } => StoreError::PermissionDenied {
+            msg: msg.clone(),
+            required_role: required_role.clone(),
+        },
         StoreError::SnapshotExpired {
             age_secs,
             max_age_secs,
@@ -605,6 +637,36 @@ mod tests {
         ] {
             assert!(!is_transient_rejection(&other), "{other:?}");
         }
+    }
+
+    /// ADR 0012 D8: both auth refusals round-trip typed, and map by code
+    /// alone when a proxy strips the detail.
+    #[test]
+    fn auth_refusals_round_trip_and_map_by_code() {
+        let e = StoreError::Unauthenticated("missing or invalid credentials".into());
+        let st = store_error_to_status(&e);
+        assert_eq!(st.code(), Code::Unauthenticated);
+        assert!(
+            matches!(status_to_store_error(&st), StoreError::Unauthenticated(ref m) if m == "missing or invalid credentials")
+        );
+        let e = StoreError::PermissionDenied {
+            msg: "needs write".into(),
+            required_role: "write".into(),
+        };
+        let st = store_error_to_status(&e);
+        assert_eq!(st.code(), Code::PermissionDenied);
+        assert!(matches!(
+            status_to_store_error(&st),
+            StoreError::PermissionDenied { ref required_role, .. } if required_role == "write"
+        ));
+        assert!(matches!(
+            status_to_store_error(&Status::unauthenticated("proxy")),
+            StoreError::Unauthenticated(_)
+        ));
+        assert!(matches!(
+            status_to_store_error(&Status::permission_denied("proxy")),
+            StoreError::PermissionDenied { .. }
+        ));
     }
 
     #[test]

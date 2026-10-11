@@ -138,16 +138,19 @@ async fn probe_node(ctx: &Ctx, id: NodeId, addr: &str) -> Result<pb::StatusRespo
             .connect()
             .await
             .map_err(|e| Status::unavailable(format!("cannot reach node {id} at {addr}: {e}")))?;
-        pb::admin_client::AdminClient::with_interceptor(ch, graph_proto::SendVersion)
-            .status(pb::StatusRequest {})
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(|e| {
-                Status::unavailable(format!(
-                    "node {id} at {addr} did not answer Status: {}",
-                    e.message()
-                ))
-            })
+        pb::admin_client::AdminClient::with_interceptor(
+            ch,
+            crate::auth::NodeHeaders::new(&ctx.auth),
+        )
+        .status(pb::StatusRequest {})
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|e| {
+            Status::unavailable(format!(
+                "node {id} at {addr} did not answer Status: {}",
+                e.message()
+            ))
+        })
     };
     let st = tokio::time::timeout(PROBE_TIMEOUT, st)
         .await
@@ -520,7 +523,10 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
     ctx.raft.raft.runtime_config().heartbeat(false);
     let deadline = Instant::now() + TRANSFER_WAIT;
     loop {
-        let mut client = ctx.fwd.admin_client(&addr)?;
+        // The leader's own call to the transfer target.
+        let mut client = ctx
+            .fwd
+            .admin_client_as_node(&addr, crate::auth::Role::Write)?;
         match tokio::time::timeout(
             TRIGGER_TIMEOUT,
             client.trigger_elect(pb::TriggerElectRequest {}),

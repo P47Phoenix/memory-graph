@@ -60,6 +60,11 @@ pub fn apply(cmd: &Command, args: Vec<OsString>) -> Result<Vec<OsString>> {
 /// guidance, rather than as an unknown key (ADR 0006 E6).
 fn is_secret_key(long: &str) -> bool {
     let k = long.to_ascii_lowercase();
+    // A path to a file that holds a secret is not a secret
+    // (`cluster-secret-file`, `auth-tokens`, ADR 0012).
+    if k.ends_with("-file") {
+        return false;
+    }
     ["secret", "access-key", "session-token", "password"]
         .iter()
         .any(|s| k.contains(s))

@@ -21,12 +21,14 @@
 //!   `rejoin`: a leader that no longer lists the node (it was removed, and
 //!   a removed node may never see the entry that removed it) refuses it
 //!   rather than adding it back, and the joiner stops asking (a warning).
+use crate::auth::{Auth, NodeHeaders};
 use crate::paths::{ClusterIdentity, JoinSpec};
 use crate::raft::{NodeId, RaftNode};
 use crate::server::ShutdownHandle;
 use graph_proto::error::WireError;
-use graph_proto::{pb, SendVersion, PROTOCOL_VERSION};
+use graph_proto::{pb, PROTOCOL_VERSION};
 use graph_store::StoreError;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::Code;
 
@@ -48,12 +50,29 @@ pub(crate) fn uri(addr: &str) -> String {
     }
 }
 
+/// An `Admin` client of another node, carrying this node's cluster secret
+/// (ADR 0012 D3).
 pub(crate) async fn admin(
     addr: &str,
     connect_timeout: Duration,
+    auth: &Arc<Auth>,
 ) -> Result<
     pb::admin_client::AdminClient<
-        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, SendVersion>,
+        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, NodeHeaders>,
+    >,
+    tonic::Status,
+> {
+    admin_with(addr, connect_timeout, NodeHeaders::new(auth)).await
+}
+
+/// [`admin`] with these headers.
+pub(crate) async fn admin_with(
+    addr: &str,
+    connect_timeout: Duration,
+    headers: NodeHeaders,
+) -> Result<
+    pb::admin_client::AdminClient<
+        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, NodeHeaders>,
     >,
     tonic::Status,
 > {
@@ -63,18 +82,19 @@ pub(crate) async fn admin(
         .connect()
         .await
         .map_err(|e| tonic::Status::unavailable(format!("cannot reach {addr}: {e}")))?;
-    Ok(pb::admin_client::AdminClient::with_interceptor(
-        ch,
-        SendVersion,
-    ))
+    Ok(pb::admin_client::AdminClient::with_interceptor(ch, headers))
 }
 
 /// Restart with `--join`: refuse (`WrongCluster`) a peer of another
 /// cluster than `mine`, the one recorded in `node.json`. An unreachable
 /// peer (or one that has no cluster id yet) is not a refusal.
-pub async fn check_peer_cluster(peer: &str, mine: &str) -> Result<(), StoreError> {
+pub async fn check_peer_cluster(
+    peer: &str,
+    mine: &str,
+    auth: &Arc<Auth>,
+) -> Result<(), StoreError> {
     let asked = tokio::time::timeout(PEER_CHECK_TIMEOUT, async {
-        admin(peer, PEER_CHECK_TIMEOUT)
+        admin(peer, PEER_CHECK_TIMEOUT, auth)
             .await?
             .status(pb::StatusRequest {})
             .await
@@ -155,6 +175,7 @@ pub async fn join(
     spec: &JoinSpec,
     req: pb::JoinRequest,
     identity: &ClusterIdentity,
+    auth: &Arc<Auth>,
 ) -> Result<pb::JoinResponse, StoreError> {
     let deadline = Instant::now() + spec.timeout;
     let mut target = spec.peer.clone();
@@ -162,7 +183,7 @@ pub async fn join(
     let mut last: String;
     loop {
         let attempt = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
-            admin(&target, Duration::from_secs(5))
+            admin(&target, Duration::from_secs(5), auth)
                 .await?
                 .join(req.clone())
                 .await
@@ -242,6 +263,7 @@ pub fn spawn_rejoin(
     peer: String,
     mut req: pb::JoinRequest,
     shutdown: ShutdownHandle,
+    auth: Arc<Auth>,
 ) {
     let me = raft.node_id;
     // Never an add: a leader that no longer lists this node refuses it (it
@@ -266,7 +288,7 @@ pub fn spawn_rejoin(
             }
             let target = raft.leader().addr.unwrap_or_else(|| peer.clone());
             let r = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
-                admin(&target, Duration::from_secs(5))
+                admin(&target, Duration::from_secs(5), &auth)
                     .await?
                     .join(req.clone())
                     .await
@@ -338,7 +360,7 @@ enum Probe {
     Silent,
 }
 
-async fn probe(addr: &str) -> Probe {
+async fn probe(addr: &str, auth: &Arc<Auth>) -> Probe {
     // First the plain TCP connection, which separates "nothing there" from
     // "there but silent" (a process that accepts and never answers).
     let host_port = addr.split_once("://").map_or(addr, |(_, rest)| rest);
@@ -348,7 +370,7 @@ async fn probe(addr: &str) -> Probe {
         Ok(Err(_)) | Err(_) => return Probe::Unreachable,
     }
     let asked = tokio::time::timeout(PROBE_ATTEMPT, async {
-        admin(addr, PROBE_ATTEMPT)
+        admin(addr, PROBE_ATTEMPT, auth)
             .await?
             .status(pb::StatusRequest {})
             .await
@@ -361,8 +383,8 @@ async fn probe(addr: &str) -> Probe {
     }
 }
 
-async fn probe_status(addr: &str) -> Option<pb::StatusResponse> {
-    match probe(addr).await {
+async fn probe_status(addr: &str, auth: &Arc<Auth>) -> Option<pb::StatusResponse> {
+    match probe(addr, auth).await {
         Probe::Answered(st) => Some(*st),
         Probe::Unreachable | Probe::Silent => None,
     }
@@ -377,15 +399,22 @@ async fn probe_status(addr: &str) -> Option<pb::StatusResponse> {
 /// be a live member; otherwise (every silent sibling unreachable)
 /// [`Discovery::NoCluster`]. Siblings reporting two different cluster ids
 /// are refused.
-pub async fn discover(siblings: &[String], timeout: Duration) -> Result<Discovery, StoreError> {
+pub async fn discover(
+    siblings: &[String],
+    timeout: Duration,
+    auth: &Arc<Auth>,
+) -> Result<Discovery, StoreError> {
     let deadline = Instant::now() + timeout;
     let mut empty: std::collections::BTreeSet<String> = Default::default();
     // Siblings that, in the latest round, were reached but did not answer.
     let mut silent: std::collections::BTreeSet<String> = Default::default();
     loop {
-        let round = futures_join_all(siblings.iter().cloned().map(|s| async move {
-            let st = probe(&s).await;
-            (s, st)
+        let round = futures_join_all(siblings.iter().cloned().map(|s| {
+            let auth = Arc::clone(auth);
+            async move {
+                let st = probe(&s, &auth).await;
+                (s, st)
+            }
         }))
         .await;
         let mut found: Vec<(String, String)> = Vec::new();
@@ -413,7 +442,7 @@ pub async fn discover(siblings: &[String], timeout: Duration) -> Result<Discover
                 )));
             }
             let members = tokio::time::timeout(PROBE_ATTEMPT, async {
-                admin(&via, PROBE_ATTEMPT)
+                admin(&via, PROBE_ATTEMPT, auth)
                     .await?
                     .members(pb::MembersRequest {})
                     .await
@@ -516,6 +545,7 @@ pub async fn resolve_bootstrap_or_join(
     data_dir: &std::path::Path,
     node_id: Option<NodeId>,
     advertise: Option<&str>,
+    auth: &Arc<Auth>,
 ) -> Result<crate::InitMode, StoreError> {
     use crate::InitMode;
     if spec.ordinal != 0 {
@@ -534,14 +564,15 @@ pub async fn resolve_bootstrap_or_join(
         return Ok(bootstrap);
     }
     tracing::info!(siblings = ?spec.siblings, "--bootstrap-or-join: ordinal 0 on an empty data directory; asking the other members whether a cluster exists");
-    let (cluster_id, via, members) = match discover(&spec.siblings, spec.probe_timeout).await? {
-        Discovery::NoCluster => return Ok(bootstrap),
-        Discovery::Cluster {
-            cluster_id,
-            via,
-            members,
-        } => (cluster_id, via, members),
-    };
+    let (cluster_id, via, members) =
+        match discover(&spec.siblings, spec.probe_timeout, auth).await? {
+            Discovery::NoCluster => return Ok(bootstrap),
+            Discovery::Cluster {
+                cluster_id,
+                via,
+                members,
+            } => (cluster_id, via, members),
+        };
     let me = node_id.ok_or_else(|| {
         StoreError::Rejected(
             "--bootstrap-or-join needs a node id (--node-id or --node-id-from-hostname)".into(),
@@ -582,7 +613,7 @@ pub async fn resolve_bootstrap_or_join(
         // yet, so an answer carrying a cluster id is a live incarnation (a
         // duplicate pod, a stale process), never the lost one: removing it
         // would remove a healthy member.
-        if let Some(st) = probe_status(&m.addr).await {
+        if let Some(st) = probe_status(&m.addr, auth).await {
             if !st.cluster_id.is_empty() {
                 return Err(StoreError::Rejected(format!(
                     "--bootstrap-or-join: cluster {cluster_id} lists node {me} at {}, and a live \
@@ -606,7 +637,7 @@ pub async fn resolve_bootstrap_or_join(
             "--bootstrap-or-join: removing this node's lost incarnation from the cluster before \
              joining again"
         );
-        remove_lost_self(&via, me, spec.join.timeout)
+        remove_lost_self(&via, me, spec.join.timeout, auth)
             .await
             .map_err(|e| {
                 StoreError::Rejected(format!(
@@ -626,13 +657,27 @@ pub async fn resolve_bootstrap_or_join(
 /// retrying while no leader answers, or the leader refuses transiently,
 /// until `timeout`. Public only for the membership tests.
 #[doc(hidden)]
-pub async fn remove_lost_self(peer: &str, id: NodeId, timeout: Duration) -> Result<(), String> {
+pub async fn remove_lost_self(
+    peer: &str,
+    id: NodeId,
+    timeout: Duration,
+    auth: &Arc<Auth>,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut target = peer.to_string();
     let mut delay = Duration::from_millis(100);
     loop {
         let attempt = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
-            admin(&target, Duration::from_secs(5))
+            // A node-originated membership change. With auth on it is
+            // marked forwarded, so the cluster secret carries the `write`
+            // role (ADR 0012 D3), and a non-leader answers `NotLeader`,
+            // which is followed. With auth off the peer forwards it, as
+            // before (the leader it knows may be the lost node itself).
+            let headers = NodeHeaders {
+                auth: Arc::clone(auth),
+                forwarded_by: auth.enabled().then_some(id),
+            };
+            admin_with(&target, Duration::from_secs(5), headers)
                 .await?
                 .remove(pb::RemoveRequest {
                     node_id: id,

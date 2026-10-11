@@ -380,6 +380,13 @@ message StoreErrorDetail {
   // `encoding` (a WHATWG name other than UTF-8; UTF-8 is `NotUtf8`), ADR
   // 0007 C3/C8, #180.
   message StrictEncoding { string path = 1; string encoding = 2; }
+  // ADR 0012 D7/D8: no valid credential (missing, malformed, unknown or
+  // expired token; the server never says which).
+  message Unauthenticated { string msg = 1; }
+  // ADR 0012 D5/D8: the credential is valid but its role is too low, or
+  // the method is not in the server's role table. `required_role` is
+  // `read`, `write`, `node` or empty (an unlisted method).
+  message PermissionDenied { string msg = 1; string required_role = 2; }
 
   oneof kind {
     Locked locked = 1;
@@ -400,6 +407,8 @@ message StoreErrorDetail {
     WrongCluster wrong_cluster = 16;
     Binary binary = 17;
     StrictEncoding strict_encoding = 18;
+    Unauthenticated unauthenticated = 19;
+    PermissionDenied permission_denied = 20;
   }
 }
 

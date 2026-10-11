@@ -150,7 +150,7 @@ Out of v1. A scope check would have to look inside each request (an `Index` stre
 
 ### D8. Errors, exit codes and "token never logged"
 
-- **New CLI exit codes** in `target.rs`: **8** for `UNAUTHENTICATED` (missing or wrong token) and **9** for `PERMISSION_DENIED` (role too low). Code 7 is `TELEMETRY_CONFIG`; 1, 3-6 are unchanged.
+- **New CLI exit codes** in `target.rs`: **8** for `UNAUTHENTICATED` (missing or wrong token) and **9** for `PERMISSION_DENIED` (role too low). Code 7 is `TELEMETRY_CONFIG`; 1, 3-6 are unchanged. A malformed local credential (a `--token-file`, `MEMORY_GRAPH_TOKEN_FILE` or `MEMORY_GRAPH_TOKEN` that is not an `mgt_` token, or a file that cannot be read) is a local configuration error, refused before any call, and exits **1**, not 8 (note added 2026-10-11, story 69 QA review).
 - Messages never echo a credential. Examples: "server requires a token: set --token-file or MEMORY_GRAPH_TOKEN_FILE" (when `Hello.auth_required` is set and no credential was given), and "the token was refused".
 - `RemoteStore` never retries `UNAUTHENTICATED` or `PERMISSION_DENIED`; they are final, unlike `UNAVAILABLE`. A detail-less `UNAUTHENTICATED` or `PERMISSION_DENIED` from a proxy maps to the same exit code.
 - **Server logging:**

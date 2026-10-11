@@ -71,6 +71,18 @@ impl pb::store_server::Store for StoreService {
             .into());
         }
         tracing::debug!(client = %r.client_version, "hello");
+        // ADR 0012 D7: with auth on, a caller without a valid credential
+        // learns only the protocol version and that a token is required.
+        // (Every gRPC call runs with its caller set by the auth layer; a
+        // call with none is in-process, the MCP endpoint's.)
+        let auth_required = self.ctx.auth.enabled();
+        if auth_required && crate::auth::current_caller().is_some_and(|c| !c.authenticated()) {
+            return Ok(Response::new(pb::HelloResponse {
+                protocol_version: self.ctx.info.hello_protocol_version,
+                auth_required: true,
+                ..Default::default()
+            }));
+        }
         let leader = self.ctx.raft.leader();
         Ok(Response::new(pb::HelloResponse {
             protocol_version: self.ctx.info.hello_protocol_version,
@@ -81,6 +93,7 @@ impl pb::store_server::Store for StoreService {
             leader_id: leader.id,
             leader_addr: leader.addr,
             cluster_id: self.ctx.info.cluster_id(),
+            auth_required,
         }))
     }
 
@@ -411,6 +424,7 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::OpenSnapshotRequest>,
     ) -> Result<Response<pb::OpenSnapshotResponse>, Status> {
         let conn = conn_id(&req);
+        let owner = crate::snapshots::owner_of_current();
         // A linearizable handle (D8): the barrier runs first, so the frozen
         // view holds every write acknowledged before the open.
         let linearizable = req
@@ -426,7 +440,7 @@ impl pb::store_server::Store for StoreService {
         meta.stale_possible &= !linearizable;
         let slot = Arc::clone(&self.ctx.slot);
         let id = tokio::task::spawn_blocking(move || {
-            slot.with_store_read(|s| Ok(slot.snapshots().open_with_meta(conn, s, Some(meta))))
+            slot.with_store_read(|s| Ok(slot.snapshots().open_owned(conn, s, Some(meta), owner)))
                 .map_err(|e| graph_proto::store_error_to_status(&e))?
         })
         .await
@@ -438,10 +452,16 @@ impl pb::store_server::Store for StoreService {
         &self,
         req: Request<pb::CloseSnapshotRequest>,
     ) -> Result<Response<pb::CloseSnapshotResponse>, Status> {
-        self.ctx
-            .slot
-            .snapshots()
-            .close(req.into_inner().snapshot_id);
+        let id = req.into_inner().snapshot_id;
+        let table = self.ctx.slot.snapshots();
+        // Another caller's handle is left alone (a no-op, as for an
+        // unknown id: ADR 0012 D5).
+        if table
+            .check_owner(id, crate::snapshots::owner_of_current().as_deref())
+            .is_ok()
+        {
+            table.close(id);
+        }
         Ok(Response::new(pb::CloseSnapshotResponse {}))
     }
 

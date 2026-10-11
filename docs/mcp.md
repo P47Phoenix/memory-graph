@@ -8,9 +8,10 @@
 
 ```text
 +----------------------------------------------------------------------+
-| WARNING: The MCP endpoint has no authentication. Anyone who can      |
-| reach it can read every indexed source token. Keep it on loopback    |
-| or behind an authenticating proxy until #105.                        |
+| WARNING: Without serve --auth-tokens the MCP endpoint has no         |
+| authentication. Anyone who can reach it can read every indexed       |
+| source token. Keep it on loopback, behind an authenticating proxy,   |
+| or turn on --auth-tokens (ADR 0012).                                 |
 +----------------------------------------------------------------------+
 ```
 
@@ -93,9 +94,10 @@ Any MCP client with a stdio transport works: the command is `memory-graph`, the 
 
 ```text
 +----------------------------------------------------------------------+
-| WARNING: The MCP endpoint has no authentication. Anyone who can      |
-| reach it can read every indexed source token. Keep it on loopback    |
-| or behind an authenticating proxy until #105.                        |
+| WARNING: Without serve --auth-tokens the MCP endpoint has no         |
+| authentication. Anyone who can reach it can read every indexed       |
+| source token. Keep it on loopback, behind an authenticating proxy,   |
+| or turn on --auth-tokens (ADR 0012).                                 |
 +----------------------------------------------------------------------+
 ```
 

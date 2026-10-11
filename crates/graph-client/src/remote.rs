@@ -68,6 +68,45 @@ pub struct RemoteStore {
     warned_encoding: Arc<AtomicBool>,
 }
 
+/// `grpc.health.v1.Health/Check` of `service` at `addr`, without `Hello`
+/// and without credentials: the health service stays open with
+/// authentication on (ADR 0012 D9), so a probe needs no token. `Ok(true)`
+/// when SERVING; an unreachable server or no answer within `timeout` is an
+/// error.
+pub fn probe_health(addr: &str, service: &str, timeout: Duration) -> Result<bool> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| StoreError::Storage(format!("tokio runtime: {e}")))?;
+    let uri = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let service = service.to_string();
+    let addr = addr.to_string();
+    block_on(&rt, async move {
+        let ep = tonic::transport::Endpoint::from_shared(uri)
+            .map_err(|e| StoreError::Rejected(format!("bad endpoint `{addr}`: {e}")))?
+            .connect_timeout(timeout);
+        let check = async {
+            let ch = ep
+                .connect()
+                .await
+                .map_err(|e| StoreError::Storage(format!("server {addr} unavailable: {e}")))?;
+            tonic_health::pb::health_client::HealthClient::new(ch)
+                .check(tonic_health::pb::HealthCheckRequest { service })
+                .await
+                .map_err(|st| graph_proto::status_to_store_error(&st))
+        };
+        let r = tokio::time::timeout(timeout, check).await.map_err(|_| {
+            StoreError::Storage(format!("server {addr}: no answer within {timeout:?}"))
+        })??;
+        Ok(r.into_inner().status
+            == tonic_health::pb::health_check_response::ServingStatus::Serving as i32)
+    })
+}
+
 impl RemoteStore {
     /// Build the runtime, connect to the first endpoint that answers
     /// `Hello` (refusing another protocol version with `Protocol`).
@@ -439,7 +478,7 @@ impl RemoteStore {
 /// One `TriggerSnapshot` call: the info message, then (with `out`) the
 /// chunks into `<out>.part`, verified and renamed to `out`.
 async fn download_snapshot(
-    ch: tonic::transport::Channel,
+    ch: crate::AuthChannel,
     out: Option<std::path::PathBuf>,
 ) -> std::result::Result<pb::SnapshotInfo, tonic::Status> {
     use sha2::{Digest, Sha256};

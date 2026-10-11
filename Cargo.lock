@@ -86,6 +86,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -759,6 +768,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.59.0",
  "yaml-rust2",
+ "zeroize",
 ]
 
 [[package]]
@@ -780,8 +790,10 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-health",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -999,6 +1011,7 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "sha2",
  "tonic",
  "tonic-prost",
  "tracing",
@@ -1009,7 +1022,9 @@ dependencies = [
 name = "graph-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "graph-client",
  "graph-core",
@@ -1040,17 +1055,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tonic-health",
+ "tonic-prost",
  "tower-layer",
  "tower-service",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3209,6 +3228,12 @@ dependencies = [
  "syn 3.0.6",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zerotrie"

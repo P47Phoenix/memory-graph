@@ -429,7 +429,7 @@ pub struct Extraction {
 pub struct StoreErrorDetail {
     #[prost(
         oneof = "store_error_detail::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub kind: ::core::option::Option<store_error_detail::Kind>,
 }
@@ -561,6 +561,23 @@ pub mod store_error_detail {
         #[prost(string, tag = "2")]
         pub encoding: ::prost::alloc::string::String,
     }
+    /// ADR 0012 D7/D8: no valid credential (missing, malformed, unknown or
+    /// expired token; the server never says which).
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Unauthenticated {
+        #[prost(string, tag = "1")]
+        pub msg: ::prost::alloc::string::String,
+    }
+    /// ADR 0012 D5/D8: the credential is valid but its role is too low, or
+    /// the method is not in the server's role table. `required_role` is
+    /// `read`, `write`, `node` or empty (an unlisted method).
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct PermissionDenied {
+        #[prost(string, tag = "1")]
+        pub msg: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub required_role: ::prost::alloc::string::String,
+    }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
@@ -599,6 +616,10 @@ pub mod store_error_detail {
         Binary(Binary),
         #[prost(message, tag = "18")]
         StrictEncoding(StrictEncoding),
+        #[prost(message, tag = "19")]
+        Unauthenticated(Unauthenticated),
+        #[prost(message, tag = "20")]
+        PermissionDenied(PermissionDenied),
     }
 }
 /// The view every read request carries: a read mode, or a snapshot handle
@@ -851,6 +872,13 @@ pub struct HelloResponse {
     pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, tag = "8")]
     pub cluster_id: ::prost::alloc::string::String,
+    /// Field 9 is left for ADR 0011's `capabilities` (story 68).
+    /// ADR 0012 D7: the server checks bearer tokens. An unauthenticated
+    /// `Hello` to such a server answers only `protocol_version` and this
+    /// flag; every other field keeps its default. False (an older server, or
+    /// auth off) keeps the old meaning.
+    #[prost(bool, tag = "10")]
+    pub auth_required: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetRequest {

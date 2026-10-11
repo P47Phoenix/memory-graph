@@ -229,6 +229,8 @@ impl Drop for TestNode {
 pub struct ClusterTestbed {
     nodes: BTreeMap<NodeId, TestNode>,
     plan: FaultPlan,
+    /// What [`client`](Self::client) authenticates with (ADR 0012).
+    credentials: Option<graph_client::Credentials>,
     // Last: the directories outlive the nodes.
     _root: tempfile::TempDir,
 }
@@ -307,6 +309,7 @@ impl ClusterTestbed {
         Self {
             nodes,
             plan,
+            credentials: None,
             _root: root,
         }
     }
@@ -529,7 +532,14 @@ impl ClusterTestbed {
     pub fn client(&self, id: NodeId) -> RemoteStore {
         let mut cfg = ClientConfig::new(self.node(id).endpoint());
         cfg.write_deadline = Duration::from_secs(15);
+        cfg.credentials = self.credentials.clone();
         RemoteStore::connect(cfg).unwrap_or_else(|e| panic!("connect to node {id}: {e}"))
+    }
+
+    /// The token [`client`](Self::client) (and [`form`](Self::form)) send
+    /// from now on (a cluster with `--auth-tokens`).
+    pub fn set_client_credentials(&mut self, creds: Option<graph_client::Credentials>) {
+        self.credentials = creds;
     }
 
     /// Run `f` with a client of the current leader.

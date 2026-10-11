@@ -194,6 +194,8 @@ pub struct NodeStart {
     /// Testing only: see [`crate::raft::state_machine::TestingApplyGate`].
     #[doc(hidden)]
     pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
+    /// The cluster secret the node's Raft client sends (ADR 0012 D3).
+    pub auth: Arc<crate::auth::Auth>,
 }
 
 #[derive(Clone)]
@@ -548,7 +550,8 @@ impl RaftNode {
             Arc::clone(&p.identity),
             &p.extractors_hash,
             net_stats.clone(),
-        );
+        )
+        .with_auth(Arc::clone(&p.auth));
         let config = Arc::new(config);
         let raft = match p.faults.clone() {
             Some(plan) => {

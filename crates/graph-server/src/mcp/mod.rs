@@ -95,9 +95,26 @@ pub const SESSION_HEADER: &str = "mcp-session-id";
 /// The protocol version header of the streamable HTTP transport.
 pub const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 /// The warning `serve --help` and `docs/mcp.md` box (ADR 0005 D4 item 7).
-pub const NO_AUTH_WARNING: &str = "The MCP endpoint has no authentication. Anyone who can reach \
-     it can read every indexed source token. Keep it on loopback or behind an authenticating \
-     proxy until #105.";
+pub const NO_AUTH_WARNING: &str = "Without serve --auth-tokens the MCP endpoint has no \
+     authentication. Anyone who can reach it can read every indexed source token. Keep it on \
+     loopback, behind an authenticating proxy, or turn on --auth-tokens (ADR 0012).";
+
+/// The role a tool needs (ADR 0012 D9): every tool today reads. Story 33's
+/// write tools will need [`Role::Write`](crate::auth::Role::Write).
+pub fn tool_need(_name: &str) -> crate::auth::Role {
+    crate::auth::Role::Read
+}
+
+/// The 401 of a request without a valid token (ADR 0012 D9).
+fn unauthorized() -> Response {
+    let mut r = plain(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized: this endpoint needs `Authorization: Bearer <token>` (serve --auth-tokens)",
+    );
+    r.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    r
+}
 
 /// `--mcp-read`: how the endpoint's tools read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -697,6 +714,16 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     if let Some(refused) = st.guard(req.headers()) {
         return close_if_body_unread(req.headers(), refused);
     }
+    // ADR 0012 D9: with auth on, every request needs a client token (the
+    // Origin and Host checks above still apply first).
+    let role = if st.ctx.auth.enabled() {
+        match st.ctx.auth.mcp_role(req.headers()) {
+            Some(r) => Some(r),
+            None => return close_if_body_unread(req.headers(), unauthorized()),
+        }
+    } else {
+        None
+    };
     let session = req
         .headers()
         .get(SESSION_HEADER)
@@ -818,6 +845,25 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
             .unwrap_or("");
         tool_label(n)
     });
+    if let (Some(role), Some(n)) = (
+        role,
+        parsed
+            .as_ref()
+            .filter(|_| tool.is_some())
+            .and_then(|v| v.pointer("/params/name"))
+            .and_then(Value::as_str),
+    ) {
+        let need = tool_need(n);
+        if !role.covers(need) {
+            return plain(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "forbidden: this tool needs a token with the `{}` role",
+                    need.as_str()
+                ),
+            );
+        }
+    }
     // Taken only now: a request with a bad session gets its own error.
     let Ok(permit) = Arc::clone(&st.inflight).try_acquire_owned() else {
         if let Some(t) = &tool {

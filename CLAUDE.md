@@ -62,6 +62,7 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
     - `node.rs`: `RaftSettings`, the snapshot policy and membership.
   - `services/` holds the tonic services, including `raft.rs` (the peer side, with streamed `InstallSnapshot`) and the `Admin` membership (join, promote, remove, transfer-leader, with their guards) and snapshot RPCs.
   - `forward.rs`: a node that is not the leader forwards writes (`Index` as a bounded stream), membership changes and the linearizable read barrier (`Admin.ReadIndex`) to the leader; `mg-forwarded-by` stops loops. `join.rs`: the joiner's side of `serve --join` (join with retries, the `WrongCluster` restart check, the `--auto-promote` re-join).
+  - `auth.rs` (ADR 0012): the `AuthLayer` in front of every service (bearer tokens hashed with SHA-256 and compared in constant time, the deny-by-default role table `need()`, the cluster secret, `mg-forwarded-role`), and the token and secret files in an `ArcSwap`, reloaded by content hash. `server::check_transport` is the `--insecure-transport` guard. Every internal client sends the cluster secret (`NodeHeaders`, `stamp_secret`); `tests/auth.rs` lists them.
   - `disk.rs` is the `--min-free-disk` guard, and `lock.rs` the LOCK sidecar.
   - Also: snapshot handles per connection and `grpc.health.v1`.
   - `testing::TestServer` is an in-process server for other crates' tests, and `testing::ClusterTestbed` is n in-process nodes with stop, kill, restart and fault injection.
@@ -71,7 +72,8 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
   - `serve`: `--db`, or `--data-dir` with `--bootstrap`, `--restore`, `--join <peer>` (`--auto-promote` / `--standby`, `--accept-snapshot-overwrite`, `--join-timeout`), `--node-id`, `--advertise`, the snapshot, log and election knobs, and `--min-free-disk`;
   - `health`;
   - `cluster status/leader/snapshot/members/add-learner/promote/remove/transfer-leader` (membership changes are forwarded to the leader by any node; the guards live on the leader, `services/admin.rs`);
-  - exit codes in `target.rs`: 3 no leader (`cluster leader`), 4 write deadline (`NoLeader`), 5 protocol/format, 6 `WrongCluster`, 7 `TELEMETRY_CONFIG` (`serve` refused its OpenTelemetry settings or could not build the exporters, ADR 0009).
+  - `auth new-token` / `auth new-secret` and the global `--token-file` (then `MEMORY_GRAPH_TOKEN_FILE`, `MEMORY_GRAPH_TOKEN`), ADR 0012;
+  - exit codes in `target.rs`: 3 no leader (`cluster leader`), 4 write deadline (`NoLeader`), 5 protocol/format, 6 `WrongCluster`, 7 `TELEMETRY_CONFIG` (`serve` refused its OpenTelemetry settings or could not build the exporters, ADR 0009), 8 `UNAUTHENTICATED`, 9 `PERMISSION_DENIED` (ADR 0012).
 
   Depends on the `graph-store` traits, not on redb directly.
 - **xtask** (not a workspace member; own `Cargo.toml` and lockfile): dev tooling, today only `proto` (`protox` + `tonic-prost-build`). Never shipped and not seen by the pure-Rust gate.

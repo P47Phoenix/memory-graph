@@ -173,6 +173,7 @@ Exact pins in `[workspace.dependencies]`, as the workspace does for tonic and pr
 | `mg_rpc_duration_seconds` | `rpc.server.call.duration` | histogram (synchronous) | `s` | `rpc.system`, `rpc.service`, `rpc.method`, `rpc.grpc.status_code` |
 | `mg_rpc_total` | none (the exception: the histogram's count) | none | none | none |
 | `mg_writes_forwarded_total` | `memory_graph.writes.forwarded` | counter | `{write}` | none |
+| `mg_auth_refusals_total` | `memory_graph.auth.refusals` | counter | `{call}` | `reason` |
 | `mg_quorum_probes_total` | `memory_graph.quorum.probes` | counter | `{probe}` | `outcome` |
 | `mg_apply_duration_seconds` | `memory_graph.raft.apply.duration` | histogram (synchronous) | `s` | none |
 | `mg_build_info` | `memory_graph.build.info` | gauge (always 1) | `1` | `version`, `protocol`, `store_format` |

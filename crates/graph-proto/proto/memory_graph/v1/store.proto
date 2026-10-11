@@ -65,6 +65,12 @@ message HelloResponse {
   optional uint64 leader_id = 6;
   optional string leader_addr = 7;
   string cluster_id = 8;
+  // Field 9 is left for ADR 0011's `capabilities` (story 68).
+  // ADR 0012 D7: the server checks bearer tokens. An unauthenticated
+  // `Hello` to such a server answers only `protocol_version` and this
+  // flag; every other field keeps its default. False (an older server, or
+  // auth off) keeps the old meaning.
+  bool auth_required = 10;
 }
 
 message GetRequest {

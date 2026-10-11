@@ -17,6 +17,7 @@
 //! This crate contains no server or client logic; `graph-server` and
 //! `graph-client` (stage A package 3) build on it.
 
+pub mod auth;
 pub mod convert;
 pub mod error;
 pub mod read_meta;

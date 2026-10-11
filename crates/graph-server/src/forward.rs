@@ -114,10 +114,20 @@ pub async fn within<T>(
 }
 
 /// Stamps the protocol version and [`FORWARDED_BY_HEADER`] on a forwarded
-/// request.
-#[derive(Debug, Clone, Copy)]
+/// request; with auth on also the cluster secret, the role the caller was
+/// granted here and its token id (ADR 0012 D3). The caller's own bearer
+/// token is never copied.
+#[derive(Debug, Clone)]
 pub struct ForwardHeaders {
     pub me: NodeId,
+    pub auth: std::sync::Arc<crate::auth::Auth>,
+    /// The role a call made by this node itself (no client caller: the
+    /// linearizable read barrier of an in-process read, the leader's
+    /// `TriggerElect` during a transfer) is sent with. `None`, the default
+    /// of every client forward: a forward whose caller is unknown carries
+    /// no role, so the receiving node refuses it (fail closed, ADR 0012
+    /// D3). A known caller's own role always wins.
+    pub node_role: Option<crate::auth::Role>,
 }
 
 impl Interceptor for ForwardHeaders {
@@ -138,6 +148,32 @@ impl Interceptor for ForwardHeaders {
                 .parse()
                 .expect("a number is valid ASCII metadata"),
         );
+        if self.auth.secret_header().is_some() {
+            crate::auth::stamp_secret(&self.auth, md);
+            // The caller this handler serves (authorized here already).
+            // Without one, only a client built for a node-originated call
+            // (`node_role`) carries a role; any other forward carries none
+            // and is refused by the receiver.
+            let caller = crate::auth::current_caller();
+            let role = match &caller {
+                Some(c) => c.role(),
+                None => self.node_role,
+            };
+            if let Some(role) = role {
+                md.insert(
+                    graph_proto::auth::FORWARDED_ROLE_HEADER,
+                    tonic::metadata::MetadataValue::from_static(role.as_str()),
+                );
+            }
+            if let Some(id) = caller.and_then(|c| match c.kind {
+                crate::auth::CallerKind::Token { id, .. } => Some(id),
+                _ => None,
+            }) {
+                if let Ok(v) = id.parse() {
+                    md.insert(graph_proto::auth::FORWARDED_TOKEN_ID_HEADER, v);
+                }
+            }
+        }
         Ok(req)
     }
 }
@@ -162,6 +198,7 @@ pub struct Forwarder {
     channels: Mutex<HashMap<String, Channel>>,
     forwarded: AtomicU64,
     default_timeout: Option<Duration>,
+    auth: std::sync::Arc<crate::auth::Auth>,
 }
 
 /// Whether `req` was forwarded by another node.
@@ -212,7 +249,14 @@ impl Forwarder {
             channels: Mutex::new(HashMap::new()),
             forwarded: AtomicU64::new(0),
             default_timeout: None,
+            auth: crate::auth::Auth::disabled(),
         }
+    }
+
+    /// Forward with this node's cluster secret (ADR 0012 D3).
+    pub fn with_auth(mut self, auth: std::sync::Arc<crate::auth::Auth>) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Test hook: every forward's default deadline is this instead.
@@ -303,23 +347,31 @@ impl Forwarder {
         Ok(ch)
     }
 
-    fn intercepted(&self, addr: &str) -> Result<ForwardChannel, Status> {
+    fn intercepted(
+        &self,
+        addr: &str,
+        node_role: Option<crate::auth::Role>,
+    ) -> Result<ForwardChannel, Status> {
         Ok(InterceptedService::new(
             self.channel(addr)?,
-            ForwardHeaders { me: self.me },
+            ForwardHeaders {
+                me: self.me,
+                auth: std::sync::Arc::clone(&self.auth),
+                node_role,
+            },
         ))
     }
 
     /// A `Write` client of the leader at `addr`.
     pub fn write_client(&self, addr: &str) -> Result<WriteClient<ForwardChannel>, Status> {
-        Ok(WriteClient::new(self.intercepted(addr)?)
+        Ok(WriteClient::new(self.intercepted(addr, None)?)
             .max_decoding_message_size(NO_LIMIT)
             .max_encoding_message_size(NO_LIMIT))
     }
 
     /// A `Store` client of the leader at `addr` (`ExtractorGaps`, #165).
     pub fn store_client(&self, addr: &str) -> Result<StoreClient<ForwardChannel>, Status> {
-        Ok(StoreClient::new(self.intercepted(addr)?)
+        Ok(StoreClient::new(self.intercepted(addr, None)?)
             .max_decoding_message_size(NO_LIMIT)
             .max_encoding_message_size(NO_LIMIT))
     }
@@ -327,7 +379,20 @@ impl Forwarder {
     /// An `Admin` client of the node at `addr` (the leader, or a transfer
     /// target).
     pub fn admin_client(&self, addr: &str) -> Result<AdminClient<ForwardChannel>, Status> {
-        Ok(AdminClient::new(self.intercepted(addr)?)
+        Ok(AdminClient::new(self.intercepted(addr, None)?)
+            .max_decoding_message_size(NO_LIMIT)
+            .max_encoding_message_size(NO_LIMIT))
+    }
+
+    /// An `Admin` client for a call this node makes on its own behalf with
+    /// `role` when no client caller is in scope (an explicit opt-in: see
+    /// [`ForwardHeaders::node_role`]).
+    pub fn admin_client_as_node(
+        &self,
+        addr: &str,
+        role: crate::auth::Role,
+    ) -> Result<AdminClient<ForwardChannel>, Status> {
+        Ok(AdminClient::new(self.intercepted(addr, Some(role))?)
             .max_decoding_message_size(NO_LIMIT)
             .max_encoding_message_size(NO_LIMIT))
     }
@@ -436,7 +501,13 @@ mod tests {
 
     #[test]
     fn forwarded_requests_are_marked() {
-        let req = ForwardHeaders { me: 3 }.call(Request::new(())).unwrap();
+        let req = ForwardHeaders {
+            me: 3,
+            auth: crate::auth::Auth::disabled(),
+            node_role: None,
+        }
+        .call(Request::new(()))
+        .unwrap();
         assert!(was_forwarded(&req));
         assert_eq!(
             req.metadata().get(FORWARDED_BY_HEADER).unwrap(),
@@ -445,5 +516,58 @@ mod tests {
         );
         assert!(req.metadata().get(PROTOCOL_VERSION_HEADER).is_some());
         assert!(!was_forwarded(&Request::new(())));
+    }
+
+    /// Review of PR #299: a forward never defaults to `write`. Under a read
+    /// token it carries `read`, also from a task spawned off the handler
+    /// (no caller there: no role at all, so the leader refuses it); only an
+    /// explicit node-originated client carries its own role.
+    #[tokio::test]
+    async fn a_forward_is_never_stamped_write_by_default() {
+        use crate::auth::{Auth, Caller, CallerKind, Role, CALLER};
+        let f = crate::testing::auth::AuthFixture::new();
+        let auth = Auth::load(&f.config(), true).unwrap();
+        let headers = |node_role| ForwardHeaders {
+            me: 2,
+            auth: std::sync::Arc::clone(&auth),
+            node_role,
+        };
+        let role_of = |mut h: ForwardHeaders| {
+            h.call(Request::new(()))
+                .unwrap()
+                .metadata()
+                .get(graph_proto::auth::FORWARDED_ROLE_HEADER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        let reader = Caller {
+            kind: CallerKind::Token {
+                id: "r".into(),
+                role: Role::Read,
+            },
+            conn: 1,
+        };
+        let h = headers(None);
+        let (inside, spawned) = CALLER
+            .scope(reader, async move {
+                let inside = role_of(h.clone());
+                let spawned = tokio::spawn(async move { role_of(h) }).await.unwrap();
+                (inside, spawned)
+            })
+            .await;
+        assert_eq!(inside.as_deref(), Some("read"));
+        assert_eq!(spawned, None, "no caller: no role, never write");
+        assert_eq!(role_of(headers(None)), None);
+        assert_eq!(role_of(headers(Some(Role::Read))).as_deref(), Some("read"));
+        // A known caller's role wins over a node client's own.
+        let reader = Caller {
+            kind: CallerKind::Token {
+                id: "r".into(),
+                role: Role::Read,
+            },
+            conn: 1,
+        };
+        let h = headers(Some(Role::Write));
+        let r = CALLER.scope(reader, async move { role_of(h) }).await;
+        assert_eq!(r.as_deref(), Some("read"));
     }
 }

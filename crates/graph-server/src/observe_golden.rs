@@ -181,6 +181,15 @@ pub(super) fn render(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats)
     );
     head(
         &mut out,
+        "mg_auth_refusals_total",
+        "counter",
+        "Calls refused by authentication or the role table (ADR 0012), by reason; zero with auth off.",
+    );
+    for (reason, n) in ctx.auth.refusal_counts() {
+        let _ = writeln!(out, "mg_auth_refusals_total{{reason=\"{reason}\"}} {n}");
+    }
+    head(
+        &mut out,
         "mg_quorum_probes_total",
         "counter",
         "Leader liveness probes of silent voters while a write waited (quorum-loss check), by outcome.",

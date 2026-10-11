@@ -491,6 +491,9 @@ fn store_error() -> impl Strategy<Value = StoreError> {
         any::<u64>().prop_map(|retry_after_ms| StoreError::NoLeader { retry_after_ms }),
         text().prop_map(StoreError::Protocol),
         (text(), text()).prop_map(|(expected, found)| StoreError::WrongCluster { expected, found }),
+        text().prop_map(StoreError::Unauthenticated),
+        (text(), text())
+            .prop_map(|(msg, required_role)| StoreError::PermissionDenied { msg, required_role }),
     ]
 }
 
@@ -840,6 +843,15 @@ fn code_table_matches_adr_0004() {
             }
             .into(),
             Code::FailedPrecondition,
+        ),
+        (E::Unauthenticated("x".into()).into(), Code::Unauthenticated),
+        (
+            E::PermissionDenied {
+                msg: "x".into(),
+                required_role: "write".into(),
+            }
+            .into(),
+            Code::PermissionDenied,
         ),
     ];
     for (e, code) in cases {

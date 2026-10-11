@@ -14,7 +14,7 @@ MEMORY_GRAPH_LOG=debug memory-graph serve ...                     # RPC and appl
 Logs go to stderr. Stdout carries only the `listening on` start line, and `metrics on` before it; under `--log-format json` these are JSON objects too, with `event` (`metrics`/`listening`) and `addr`, and their `message` keeps the text form, so a container runtime that merges stdout into the log stream sees only JSON.
 
 - `--log-format text` (default) or `json`: one object per line with `timestamp`, `level`, `target`, `message`, the event's fields beside it, and `span` (the innermost span and its fields).
-- `--log-level <filter>` (or `MEMORY_GRAPH_LOG`; default `info`) takes `tracing` EnvFilter syntax, e.g. `info,graph_server=debug`.
+- `--log-level <filter>` (or `MEMORY_GRAPH_LOG`; default `info`) takes `tracing` EnvFilter syntax, e.g. `info,graph_server=debug`. `serve` does not read `RUST_LOG`: use `--log-level trace` (or `MEMORY_GRAPH_LOG=trace`) for trace output.
 - At `debug`, every gRPC call logs `rpc finished` inside an `rpc` span (`method`, `peer`, `outcome`, `duration_ms`) and every applied log entry `applied` inside an `apply` span (`index`, `kind`, `files`, `duration_ms`).
 
 ## Metrics
@@ -35,6 +35,7 @@ Logs go to stderr. Stdout carries only the `listening on` start line, and `metri
 | `mg_rpc_duration_seconds{rpc,outcome}` | histogram | gRPC call duration until the response headers (buckets 0.5 ms to 10 s); `rpc` like `Store/Search` (`unknown` for any path that is not one of the server's methods, so a client cannot create label values), `outcome` `ok` or the gRPC code (`unavailable`, `failed_precondition`, ...) |
 | `mg_rpc_total{rpc,outcome}` | counter | gRPC calls served |
 | `mg_writes_forwarded_total` | counter | Writes and membership changes forwarded to the leader |
+| `mg_auth_refusals_total` | counter | Calls refused by authentication or the role table (ADR 0012), by `reason` |
 | `mg_quorum_probes_total{outcome}` | counter | Leader only: health probes of voters that went silent while a write waited (`--quorum-loss-timeout`); `outcome` `alive` (answered `SERVING`) or `dead` |
 | `mg_apply_duration_seconds` | histogram | Time to apply one committed log entry |
 | `mg_build_info{version,protocol,store_format}` | gauge | Always 1 |

@@ -4,6 +4,7 @@ use graph_store::{IndexOptions, PreparedFile, Store, ORIGIN_DIRECTORY};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
+pub mod auth_cmd;
 pub mod dataflow;
 pub mod diskinfo;
 pub mod encoding_config;
