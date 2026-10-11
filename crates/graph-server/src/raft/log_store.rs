@@ -194,6 +194,8 @@ pub struct RedbLogStore {
     /// See [`COMPACT_MAX_LIVE`] (tests lower it).
     max_live: Arc<AtomicU64>,
     observer: Option<AppendObserver>,
+    /// Disk-full retries of `append` (story 67).
+    stall: super::disk_stall::DiskStall,
     #[cfg(test)]
     compact_gate: Arc<std::sync::Mutex<Option<CompactGate>>>,
     /// Test-only: why the last `compact_if_sparse` returned before
@@ -325,6 +327,7 @@ impl RedbLogStore {
             closing,
             max_live: Arc::new(AtomicU64::new(COMPACT_MAX_LIVE)),
             observer: None,
+            stall: super::disk_stall::DiskStall::new(),
             #[cfg(test)]
             compact_gate: Arc::default(),
             #[cfg(test)]
@@ -588,6 +591,12 @@ impl RedbLogStore {
         self.max_live.store(bytes, Ordering::Relaxed);
     }
 
+    /// The node's disk-full stall state: an append that fails with a
+    /// disk-full error is retried in place instead of stopping the node.
+    pub fn set_disk_stall(&mut self, stall: super::disk_stall::DiskStall) {
+        self.stall = stall;
+    }
+
     /// Record every append's commit and flush callback (tests only).
     pub fn set_observer(&mut self, observer: Option<AppendObserver>) {
         self.observer = observer;
@@ -764,25 +773,36 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         // this on its own task, so nothing else of the node waits on it).
         let written = self
             .blocking(move |s| {
-                let wt = s.write_txn().map_err(write_err)?;
-                let mut last = 0u64;
-                {
-                    let mut t = wt.open_table(LOG).map_err(write_err)?;
-                    for e in &entries {
-                        let enc = encode_entry(e);
-                        last = e.log_id.index;
-                        t.insert(e.log_id.index, enc.as_slice())
-                            .map_err(write_err)?;
+                // A disk-full error is retried in place (the transaction
+                // rolled back, so nothing of the entries is in the log);
+                // any other error stops the node (story 67, DiskStall).
+                let stall = s.stall.clone();
+                stall.retry(super::disk_stall::StallSource::LogAppend, || {
+                    let wt = s.write_txn().map_err(write_err)?;
+                    let mut last = 0u64;
+                    {
+                        let mut t = wt.open_table(LOG).map_err(write_err)?;
+                        for e in &entries {
+                            let enc = encode_entry(e);
+                            last = e.log_id.index;
+                            t.insert(e.log_id.index, enc.as_slice())
+                                .map_err(write_err)?;
+                        }
                     }
-                }
-                // `Immediate` durability: the commit returns once the
-                // entries are fsynced, and only then is the flush reported
-                // (D7).
-                wt.commit().map_err(write_err)?;
-                if let Some(o) = &s.observer {
-                    o(AppendEvent::Committed { last_index: last });
-                }
-                Ok(last)
+                    if let Some(e) = stall.injected(super::disk_stall::StallSource::LogAppend) {
+                        // Testing: the commit's fsync found the disk full.
+                        wt.abort().map_err(write_err)?;
+                        return Err(write_err(e));
+                    }
+                    // `Immediate` durability: the commit returns once the
+                    // entries are fsynced, and only then is the flush
+                    // reported (D7).
+                    wt.commit().map_err(write_err)?;
+                    if let Some(o) = &s.observer {
+                        o(AppendEvent::Committed { last_index: last });
+                    }
+                    Ok(last)
+                })
             })
             .await;
         match written {

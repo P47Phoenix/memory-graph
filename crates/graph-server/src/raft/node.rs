@@ -2,6 +2,7 @@
 //! initialize a one-member cluster when asked (`--bootstrap`, or `--db`
 //! mode's first start), resume from the log after, run the snapshot policy,
 //! and answer the leader and membership questions the services ask.
+use super::disk_stall::DiskStall;
 use super::log_store::{AppendObserver, RedbLogStore};
 use super::network::{FaultPlan, FaultyNetwork, GrpcNetwork, NetStats, Prober};
 use super::snapshot_dir::SnapshotDir;
@@ -235,6 +236,10 @@ pub struct RaftNode {
     /// Linearizable reads on this node waiting to apply the leader's read
     /// index right now (a test observes a read parked there).
     pub read_index_waits: Arc<AtomicUsize>,
+    /// Disk-full stalls of this node's log append and apply (story 67):
+    /// retried in place, and a write waiting here meanwhile answers
+    /// `RESOURCE_EXHAUSTED`. Its failpoints are a ClusterTestbed's.
+    pub disk_stall: DiskStall,
     /// Whether openraft's tick is suspended because this node leads alone
     /// ([`TickControl`], issue #205), and what holds it on.
     pub ticks: Arc<TickControl>,
@@ -505,6 +510,8 @@ impl RaftNode {
             p.storage_backend.as_ref().map(|f| f(&p.log_path)),
         )?;
         log_store.set_observer(p.append_observer.clone());
+        let disk_stall = DiskStall::new();
+        log_store.set_disk_stall(disk_stall.clone());
         {
             let (slot, snaps, log, disk) = (
                 Arc::clone(&p.slot),
@@ -531,6 +538,7 @@ impl RaftNode {
         }
         let sm = StoreStateMachine::new(Arc::clone(&p.slot), Arc::clone(&p.snapshots))
             .with_failpoints(p.failpoints)
+            .with_disk_stall(disk_stall.clone())
             .with_obs(Arc::clone(&p.obs))
             .with_testing_apply_gate(p.testing_apply_gate.clone());
         let net_stats = NetStats::default();
@@ -575,6 +583,7 @@ impl RaftNode {
             in_flight: Arc::new(AtomicUsize::new(0)),
             hold_proposal: None,
             read_index_waits: Arc::default(),
+            disk_stall: disk_stall.clone(),
             obs: p.obs,
             ticks: Arc::default(),
         };
@@ -738,6 +747,11 @@ impl RaftNode {
         // answers `NotLeader` naming the leader, whatever its disk.
         if self.metrics().state == ServerState::Leader {
             self.disk.check("write")?;
+            // A log append or apply of this node retrying a full disk
+            // (story 67): a new entry would only queue behind it.
+            if let Some(m) = self.disk_stall.current() {
+                return Err(StoreError::Storage(m));
+            }
         }
         // ADR 0009 D5: this node's apply of the entry links to the request's
         // `rpc` span (the apply runs on the state machine's task). Only
@@ -774,6 +788,10 @@ impl RaftNode {
                 Err(e) => Err(join_err(e)),
             },
             e = self.quorum_lost() => Err(e),
+            // This node's log append or apply met a full disk and retries
+            // in place: the write is not acknowledged (it may still land
+            // once space is freed; a retry is idempotent, D2/D7).
+            m = self.disk_stall.stalled() => Err(StoreError::Storage(m)),
         }
     }
 
@@ -1032,6 +1050,8 @@ impl RaftNode {
     }
 
     pub async fn shutdown(&self) {
+        // A disk-full retry gives up, so the Raft core it may hold can stop.
+        self.disk_stall.stop();
         if let Err(e) = self.raft.shutdown().await {
             tracing::warn!(error = %e, "raft shutdown");
         }

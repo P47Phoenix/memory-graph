@@ -19,8 +19,9 @@
 //! room for two copies of the snapshot (the received file and the staged
 //! store) on top of `--min-free-disk`, and is refused the same way before
 //! receiving. (A leader's own disk is checked before it proposes a write;
-//! an I/O error while appending or applying anyway stops the node, see
-//! the state machine.)
+//! a disk-full error while appending or applying anyway is retried in
+//! place and answers the write `RESOURCE_EXHAUSTED`, see
+//! `raft::disk_stall`; any other I/O error there stops the node.)
 //!
 //! `InstallSnapshot` writes the streamed chunks to a temp file under the
 //! snapshots directory, checks size and SHA-256 against the header, refuses

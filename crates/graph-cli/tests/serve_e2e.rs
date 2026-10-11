@@ -812,6 +812,48 @@ fn exit_codes_3_4_5_end_to_end() {
     assert!(stderr(&o).contains("protocol version 99"), "{}", stderr(&o));
 }
 
+/// Story 67 (#115): a write the server refuses with `RESOURCE_EXHAUSTED`
+/// because its apply met a full disk exits 1 with a message that says the
+/// disk is full; the server keeps running, and once space is freed the
+/// same command succeeds.
+#[test]
+fn disk_full_on_the_server_exits_1_and_says_so() {
+    use graph_server::testing::TestServer;
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("g.redb"), vec![]);
+    let addr = server.endpoint();
+    let src = d.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), "alpha beta").unwrap();
+    let index = [
+        "--server",
+        &addr,
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--no-progress",
+        src.to_str().unwrap(),
+    ];
+    let stall = server.running().unwrap().raft.disk_stall.clone();
+    stall.fail_apply(true);
+    let o = run(&index);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("disk full"), "{}", stderr(&o));
+    // Still serving reads.
+    ok(&["--server", &addr, "describe"]);
+    stall.fail_apply(false);
+    // The node's own retry notices the space within its backoff.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while stall.current().is_some() {
+        assert!(Instant::now() < deadline, "the stall did not clear");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    ok(&index);
+    assert!(server.is_running());
+}
+
 /// The server dies in the middle of an index run: the client does not
 /// call that a protocol error (exit 5); it retries the write until its
 /// deadline and then fails naming the server and the lost connection.
