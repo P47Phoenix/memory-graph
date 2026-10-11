@@ -130,6 +130,14 @@ impl pb::raft_server::Raft for RaftService {
             }
         }
         let rpc = wire::append_from_pb(req).map_err(bad)?;
+        // Before Raft sees it: a core held by a stalled append (story 67)
+        // cannot, and the write path asks here for a newer leader.
+        if rpc.vote.is_committed() {
+            self.obs.note_seen_leader(
+                rpc.vote.leader_id().term,
+                rpc.vote.leader_id().voted_for().unwrap_or(0),
+            );
+        }
         let leader_commit = rpc.leader_commit.map(|l| l.index);
         let resp = self.raft.append_entries(rpc).await.map_err(raft_status)?;
         // Any answer but a higher vote means a live leader of this term

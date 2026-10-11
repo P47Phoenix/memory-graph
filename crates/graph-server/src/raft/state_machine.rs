@@ -205,15 +205,40 @@ impl StoreStateMachine {
             }
             let _enter = span.enter();
             let started = std::time::Instant::now();
-            let r = stall.retry(StallSource::Apply, || {
-                slot.with_store(|s| {
-                    if let Some(io) = stall.injected(StallSource::Apply) {
-                        // Testing: the entry's transaction met a full disk.
-                        return Err(StoreError::Storage(io.to_string()));
+            // A client's write grows the store; blank and membership
+            // entries only move the marker (and must not block an
+            // election's entry on a node short of space).
+            let normal = matches!(e.payload, EntryPayload::Normal(_));
+            // Set when a reopen after an I/O error failed: the store is
+            // closed, and the next try reopens it first.
+            let reopen = std::cell::Cell::new(false);
+            let r = stall.retry(
+                StallSource::Apply,
+                || {
+                    if reopen.get() {
+                        slot.reopen_after_io_error()?;
+                        reopen.set(false);
                     }
-                    Self::apply_one(s, &e)
-                })
-            });
+                    if normal {
+                        // Below --min-free-disk: stall before redb meets
+                        // ENOSPC (which would poison the database).
+                        stall.precheck("apply")?;
+                    }
+                    slot.with_store(|s| {
+                        if let Some(io) = stall.injected(StallSource::Apply) {
+                            // Testing: the entry's transaction met a full disk.
+                            return Err(StoreError::Storage(io.to_string()));
+                        }
+                        Self::apply_one(s, &e)
+                    })
+                },
+                || {
+                    if let Err(err) = slot.reopen_after_io_error() {
+                        tracing::warn!(error = %err, "store: reopen failed; retrying");
+                        reopen.set(true);
+                    }
+                },
+            );
             let secs = started.elapsed().as_secs_f64();
             span.record("duration_ms", secs * 1000.0);
             obs.observe_apply(secs);
@@ -489,6 +514,52 @@ mod tests {
     #[test]
     fn openraft_storage_suite() {
         Suite::test_all(Builder).unwrap();
+    }
+
+    /// Story 67: a disk-full stall in the middle of a batch is retried in
+    /// place; the entries before it stay applied (their responses are
+    /// kept), the marker stops before the stalled one, and once space is
+    /// back every entry is answered, in order.
+    #[test]
+    fn a_mid_batch_disk_full_stall_keeps_the_earlier_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, _) = sm_at(d.path());
+        let stall = DiskStall::new();
+        let s2 = stall.clone();
+        let gate: TestingApplyGate = Arc::new(move |i| {
+            if i == 2 {
+                s2.fail_apply(true);
+            }
+        });
+        let (s3, slot3) = (stall.clone(), Arc::clone(&slot));
+        let clearer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !s3.is_stalled(StallSource::Apply) {
+                assert!(std::time::Instant::now() < deadline, "no stall");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let marker = slot3.with_store(|s| s.raft_marker()).unwrap().unwrap();
+            s3.fail_apply(false);
+            marker.index
+        });
+        let out = StoreStateMachine::apply_all_with(
+            &slot,
+            vec![blank(1), blank(2), blank(3)],
+            NO_FP,
+            &Default::default(),
+            Some(&gate),
+            &stall,
+        )
+        .unwrap();
+        assert_eq!(clearer.join().unwrap(), 1, "stalled before entry 2");
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter().all(|r| matches!(r, LogResponse::Marked)),
+            "{out:?}"
+        );
+        let marker = slot.with_store(|s| s.raft_marker()).unwrap().unwrap();
+        assert_eq!(marker.index, 3);
+        assert_eq!(stall.current(), None);
     }
 
     #[test]

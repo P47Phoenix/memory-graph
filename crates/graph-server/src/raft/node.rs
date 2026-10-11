@@ -511,7 +511,9 @@ impl RaftNode {
         )?;
         log_store.set_observer(p.append_observer.clone());
         let disk_stall = DiskStall::new();
+        disk_stall.set_guard(Some(p.disk.clone()));
         log_store.set_disk_stall(disk_stall.clone());
+        log_store.set_reopen_backend(p.storage_backend.clone());
         {
             let (slot, snaps, log, disk) = (
                 Arc::clone(&p.slot),
@@ -750,7 +752,7 @@ impl RaftNode {
             // A log append or apply of this node retrying a full disk
             // (story 67): a new entry would only queue behind it.
             if let Some(m) = self.disk_stall.current() {
-                return Err(StoreError::Storage(m));
+                return Err(self.stalled_answer(m));
             }
         }
         // ADR 0009 D5: this node's apply of the entry links to the request's
@@ -791,8 +793,46 @@ impl RaftNode {
             // This node's log append or apply met a full disk and retries
             // in place: the write is not acknowledged (it may still land
             // once space is freed; a retry is idempotent, D2/D7).
-            m = self.disk_stall.stalled() => Err(StoreError::Storage(m)),
+            m = self.disk_stall.stalled() => Err(self.stalled_answer(m)),
         }
+    }
+
+    /// What a request waiting on this node gets while it retries a full
+    /// disk (story 67): the disk-full refusal (`RESOURCE_EXHAUSTED`), or,
+    /// when a stalled log append holds this node's Raft core and a peer
+    /// already leads in a higher term (seen in its `AppendEntries`, which
+    /// the held core cannot act on, so this node's own metrics still say
+    /// it leads), `NotLeader` naming that peer: the client follows it and
+    /// its write lands there.
+    pub fn stalled_answer(&self, msg: String) -> StoreError {
+        if self
+            .disk_stall
+            .is_stalled(super::disk_stall::StallSource::LogAppend)
+        {
+            if let Some((leader_id, leader_addr)) = self.newer_leader() {
+                return StoreError::NotLeader {
+                    leader_id: Some(leader_id),
+                    leader_addr,
+                };
+            }
+        }
+        StoreError::Storage(msg)
+    }
+
+    /// A peer that leads in a term above this node's own Raft term, as
+    /// seen in the `AppendEntries` it sent here.
+    pub fn newer_leader(&self) -> Option<(NodeId, Option<String>)> {
+        let m = self.metrics();
+        let (term, id) = self.obs.seen_leader()?;
+        if term <= m.current_term || id == self.node_id || id == 0 {
+            return None;
+        }
+        let addr = m
+            .membership_config
+            .membership()
+            .get_node(&id)
+            .map(|n| n.addr.clone());
+        Some((id, addr))
     }
 
     /// One shared probe round ([`Prober::round`]) over the voters that
@@ -1002,7 +1042,17 @@ impl RaftNode {
     /// applied that index: `Admin.ReadIndex`).
     pub async fn ensure_linearizable(&self) -> Result<u64, StoreError> {
         self.no_leader_while_transferring()?;
-        match self.raft.ensure_linearizable().await {
+        // A disk-full stall of this node (story 67): its applied index
+        // cannot move (apply) or it cannot lead (append), so the barrier
+        // would only wait out the client's deadline; answer at once.
+        if let Some(m) = self.disk_stall.current() {
+            return Err(self.stalled_answer(m));
+        }
+        let barrier = tokio::select! {
+            r = self.raft.ensure_linearizable() => r,
+            m = self.disk_stall.stalled() => return Err(self.stalled_answer(m)),
+        };
+        match barrier {
             Ok(read) => Ok(read.map_or(0, |l| l.index)),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                 Err(StoreError::NotLeader {

@@ -1736,6 +1736,8 @@ fn run() -> Result<i32> {
                                 "rpcs_total": st.rpcs_total,
                                 "entries_applied_total": st.entries_applied_total,
                                 "mcp_addr": st.mcp_addr,
+                                "disk_stalled": st.disk_stalled,
+                                "disk_stall_message": st.disk_stall_message,
                                 "members": st.members.iter().map(|m| serde_json::json!({
                                     "node_id": m.node_id,
                                     "addr": m.addr,
@@ -1779,6 +1781,13 @@ fn run() -> Result<i32> {
                             st.current_term
                         );
                         out!("  mcp       {}", mcp_url(&st.mcp_addr));
+                        if !st.disk_stalled.is_empty() {
+                            out!(
+                                "  DISK FULL {} stalled: {}",
+                                st.disk_stalled.join(", "),
+                                st.disk_stall_message
+                            );
+                        }
                         for m in &st.members {
                             let lag = st
                                 .replication

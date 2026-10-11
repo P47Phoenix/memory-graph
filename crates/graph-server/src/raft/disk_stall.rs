@@ -2,31 +2,39 @@
 //! an entry to the store does not stop the node (ADR 0004 D7, note of
 //! 2026-10-11, story 67 / #115).
 //!
-//! openraft 0.9 treats every error of `append` and `apply` as fatal (the
-//! node stops), and `apply` must answer every entry it is given, so an
-//! entry cannot be skipped and answered later. Instead, an I/O error that
-//! says the disk is full (`graph_proto::error::is_disk_full`) is retried in
-//! place, with a capped backoff, on the blocking thread that met it:
+//! openraft 0.9 treats every error of `append`, `apply` and the log's
+//! other writes as fatal (the node stops), and `apply` must answer every
+//! entry it is given, so an entry cannot be skipped and answered later.
+//! Instead:
 //!
-//! * the failed redb transaction rolled back, so a retry starts clean: the
-//!   log holds no part of the entries and the store's `RAFT_SM` marker has
-//!   not moved;
+//! * before appending or applying a client write, [`DiskStall::precheck`]
+//!   compares the volume with `--min-free-disk` and stalls below it, so
+//!   redb does not meet ENOSPC in the common case;
+//! * an I/O error that is a full disk (`graph_proto::error::error_is_disk_full`)
+//!   is retried in place, with a capped backoff, on the blocking thread
+//!   that met it. Before each retry the redb database is closed and
+//!   reopened (redb answers `PreviousIo` to everything after an I/O error
+//!   until then; the reopen repairs the file if needed). The failed
+//!   transaction rolled back: the log holds no part of the entries and the
+//!   store's `RAFT_SM` marker has not moved;
 //! * while it retries, the stall is visible here: a write waiting on this
-//!   node ([`super::RaftNode::propose`]) and every new one answer
-//!   `StoreError::Storage("disk full: ...")`, which the wire maps to
-//!   `RESOURCE_EXHAUSTED`. The write is not acknowledged; its entry may
-//!   still land once space is freed, and a retry is idempotent (D2/D7);
-//! * the node keeps serving `LOCAL` reads from its store. A stalled apply
-//!   runs on openraft's state-machine task, so the Raft core goes on
-//!   (heartbeats, replication, a follower's log keeps growing and it
-//!   catches up once space is freed). A stalled log append runs inside the
-//!   Raft core, so that node sends no heartbeats meanwhile: a leader loses
-//!   leadership to a peer with a disk, and rejoins as a follower;
-//! * once the retry succeeds the stall clears by itself;
-//! * shutting the node down ([`DiskStall::stop`]) ends the retries with the
-//!   original error.
+//!   node ([`super::RaftNode::propose`]), every new one and a linearizable
+//!   read barrier answer `StoreError::Storage("disk full: ...")`
+//!   (`RESOURCE_EXHAUSTED`), or `NotLeader` when a stalled log write holds
+//!   the Raft core and a peer already leads in a higher term. The write is
+//!   not acknowledged; it may still land once space is freed, and a retry
+//!   is idempotent (D2/D7);
+//! * the node keeps serving `LOCAL` reads. A stalled apply runs on
+//!   openraft's state-machine task, so the Raft core goes on. A stalled log
+//!   write runs inside the Raft core, so that node sends no heartbeats
+//!   meanwhile: a leader loses leadership to a peer with a disk and
+//!   rejoins as a follower;
+//! * once a retry succeeds the stall clears by itself; shutting the node
+//!   down ([`DiskStall::stop`]) ends the retries with the original error.
 //!
-//! Any other I/O-class error is still fatal, as before.
+//! Any other I/O-class error is still fatal.
+use crate::disk::DiskGuard;
+use graph_store::StoreError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +47,8 @@ pub enum StallSource {
     LogAppend,
     /// Applying a committed entry to the store.
     Apply,
+    /// The Raft log's small writes: vote, committed index, truncate, purge.
+    LogMeta,
 }
 
 impl StallSource {
@@ -46,6 +56,7 @@ impl StallSource {
         match self {
             StallSource::LogAppend => "append the write to its Raft log",
             StallSource::Apply => "apply the write to its store",
+            StallSource::LogMeta => "write its Raft state (vote, commit index, truncate, purge)",
         }
     }
 }
@@ -54,6 +65,7 @@ impl StallSource {
 struct State {
     log: Option<String>,
     apply: Option<String>,
+    meta: Option<String>,
 }
 
 impl State {
@@ -61,11 +73,15 @@ impl State {
         match src {
             StallSource::LogAppend => &mut self.log,
             StallSource::Apply => &mut self.apply,
+            StallSource::LogMeta => &mut self.meta,
         }
     }
 
     fn first(&self) -> Option<String> {
-        self.log.clone().or_else(|| self.apply.clone())
+        self.log
+            .clone()
+            .or_else(|| self.apply.clone())
+            .or_else(|| self.meta.clone())
     }
 }
 
@@ -74,6 +90,7 @@ struct Inner {
     stopping: AtomicBool,
     fail_log_append: AtomicBool,
     fail_apply: AtomicBool,
+    guard: std::sync::Mutex<Option<DiskGuard>>,
 }
 
 /// The node's disk-full stall state, shared by the log store, the state
@@ -102,6 +119,9 @@ impl std::fmt::Debug for DiskStall {
 const FIRST_BACKOFF: Duration = Duration::from_millis(20);
 /// The longest wait between two retries.
 const MAX_BACKOFF: Duration = Duration::from_millis(500);
+/// How many reopenings in a row may still meet `PreviousIo` (with no
+/// disk-full error in between) before the error is returned.
+pub const MAX_PREVIOUS_IO: u32 = 5;
 
 impl DiskStall {
     pub fn new() -> Self {
@@ -111,6 +131,7 @@ impl DiskStall {
                 stopping: AtomicBool::new(false),
                 fail_log_append: AtomicBool::new(false),
                 fail_apply: AtomicBool::new(false),
+                guard: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -127,7 +148,21 @@ impl DiskStall {
         match src {
             StallSource::LogAppend => s.log.is_some(),
             StallSource::Apply => s.apply.is_some(),
+            StallSource::LogMeta => s.meta.is_some(),
         }
+    }
+
+    /// The stalled sources, as `Admin.Status` and `mg_disk_stalled` name
+    /// them: `log` (the Raft log's writes) and `apply` (the store).
+    pub fn sources(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.is_stalled(StallSource::LogAppend) || self.is_stalled(StallSource::LogMeta) {
+            out.push("log".to_string());
+        }
+        if self.is_stalled(StallSource::Apply) {
+            out.push("apply".to_string());
+        }
+        out
     }
 
     /// Resolves with the refusal once the node is stalled (at once if it
@@ -177,16 +212,24 @@ impl DiskStall {
     }
 
     /// Run `f` until it succeeds, retrying in place while it fails with a
-    /// disk-full error (see the module docs). Any other error, or any error
-    /// once [`stop`](Self::stop) was called, is returned as is. Blocks the
+    /// disk-full error, or with redb's `PreviousIo` (the database was
+    /// poisoned by an earlier I/O error), see the module docs. After each
+    /// such failure `recover` runs before the next try: it closes and
+    /// reopens the redb database, which clears `PreviousIo` (and repairs
+    /// the file if needed). Any other error, or any error once
+    /// [`stop`](Self::stop) was called, is returned as is, as is a
+    /// `PreviousIo` that persists over [`MAX_PREVIOUS_IO`] reopenings with
+    /// no disk-full error seen (a fault a reopen does not cure). Blocks the
     /// calling thread between retries: call it on the blocking pool.
-    pub fn retry<T, E: std::fmt::Display>(
+    pub fn retry<T, E: std::error::Error + 'static>(
         &self,
         src: StallSource,
         mut f: impl FnMut() -> Result<T, E>,
+        mut recover: impl FnMut(),
     ) -> Result<T, E> {
         let mut backoff = FIRST_BACKOFF;
         let mut retries = 0u64;
+        let mut previous_io = 0u32;
         loop {
             match f() {
                 Ok(v) => {
@@ -202,23 +245,62 @@ impl DiskStall {
                 }
                 Err(e) => {
                     let cause = e.to_string();
-                    if !graph_proto::error::is_disk_full(&cause) || self.stopping() {
+                    let full = graph_proto::error::error_is_disk_full(&e);
+                    let poisoned = !full && graph_proto::error::is_previous_io(&cause);
+                    if poisoned {
+                        previous_io += 1;
+                    } else if full {
+                        previous_io = 0;
+                    }
+                    if !(full || poisoned) || previous_io > MAX_PREVIOUS_IO || self.stopping() {
                         return Err(e);
                     }
-                    if self.set(src, &cause) {
+                    if full && self.set(src, &cause) {
                         tracing::error!(
                             source = ?src,
                             error = %cause,
-                            "disk full: retrying in place until space is freed; writes \
-                             answer RESOURCE_EXHAUSTED meanwhile"
+                            "disk full: retrying in place until space is freed; writes                              answer RESOURCE_EXHAUSTED meanwhile"
                         );
+                    }
+                    if poisoned {
+                        tracing::warn!(source = ?src, error = %cause, "reopening the database");
                     }
                     retries += 1;
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(MAX_BACKOFF);
+                    if self.stopping() {
+                        return Err(e);
+                    }
+                    recover();
                 }
             }
         }
+    }
+
+    /// The disk guard's floor for a write that grows the files: `Ok` while
+    /// the volume has at least `--min-free-disk` free, otherwise a
+    /// disk-full error, so [`retry`](Self::retry) stalls before redb meets
+    /// ENOSPC (which poisons an open database). No guard: always `Ok`.
+    pub fn precheck(&self, what: &str) -> Result<(), StoreError> {
+        let g = self
+            .inner
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match g {
+            Some(g) => g.check_extra(what, 0),
+            None => Ok(()),
+        }
+    }
+
+    /// The node's disk guard, for [`precheck`](Self::precheck).
+    pub fn set_guard(&self, guard: Option<DiskGuard>) {
+        *self
+            .inner
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = guard;
     }
 
     /// Testing only (a ClusterTestbed failpoint): while on, every log
@@ -242,6 +324,7 @@ impl DiskStall {
         let on = match src {
             StallSource::LogAppend => &self.inner.fail_log_append,
             StallSource::Apply => &self.inner.fail_apply,
+            StallSource::LogMeta => return None,
         };
         on.load(Ordering::SeqCst).then(|| {
             std::io::Error::new(
@@ -253,72 +336,5 @@ impl DiskStall {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicU32;
-
-    #[test]
-    fn a_disk_full_error_is_retried_until_it_succeeds_and_then_clears() {
-        let s = DiskStall::new();
-        let calls = AtomicU32::new(0);
-        let seen = std::thread::scope(|sc| {
-            let h = sc.spawn(|| {
-                s.retry(StallSource::Apply, || {
-                    if calls.fetch_add(1, Ordering::SeqCst) < 3 {
-                        Err("No space left on device (os error 28)".to_string())
-                    } else {
-                        Ok(7)
-                    }
-                })
-            });
-            h.join().unwrap()
-        });
-        assert_eq!(seen, Ok(7));
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
-        assert_eq!(s.current(), None, "cleared once it succeeded");
-    }
-
-    #[test]
-    fn other_errors_are_returned_at_once() {
-        let s = DiskStall::new();
-        let r: Result<(), String> = s.retry(StallSource::LogAppend, || Err("corrupt".into()));
-        assert_eq!(r, Err("corrupt".into()));
-        assert_eq!(s.current(), None);
-    }
-
-    #[test]
-    fn a_stall_is_visible_and_stop_ends_the_retries() {
-        let s = DiskStall::new();
-        let s2 = s.clone();
-        let h = std::thread::spawn(move || {
-            s2.retry(StallSource::LogAppend, || {
-                Err::<(), _>("disk full".to_string())
-            })
-        });
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let msg = rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(10), s.stalled())
-                .await
-                .unwrap()
-        });
-        assert!(graph_proto::error::is_disk_full(&msg), "{msg}");
-        assert!(msg.contains("Raft log"), "{msg}");
-        assert!(s.is_stalled(StallSource::LogAppend));
-        assert!(!s.is_stalled(StallSource::Apply));
-        s.stop();
-        assert_eq!(h.join().unwrap(), Err("disk full".into()));
-    }
-
-    #[test]
-    fn the_failpoint_error_reads_as_disk_full() {
-        let s = DiskStall::new();
-        assert!(s.injected(StallSource::Apply).is_none());
-        s.fail_apply(true);
-        let e = s.injected(StallSource::Apply).unwrap();
-        assert!(graph_proto::error::is_disk_full(&e.to_string()), "{e}");
-        assert!(s.injected(StallSource::LogAppend).is_none());
-    }
-}
+#[path = "disk_stall_tests.rs"]
+mod tests;
