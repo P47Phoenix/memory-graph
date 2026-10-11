@@ -739,6 +739,13 @@ impl RaftNode {
         if self.metrics().state == ServerState::Leader {
             self.disk.check("write")?;
         }
+        // ADR 0009 D5: this node's apply of the entry links to the request's
+        // `rpc` span (the apply runs on the state machine's task). Only
+        // with traces on; the link is dropped once the proposal answers.
+        let _link = self
+            .obs
+            .apply_links
+            .register(&req.command, crate::telemetry::current_rpc_context());
         // Once handed to openraft the entry is appended whether or not
         // anyone still waits for it: dropping `client_write` does not
         // withdraw it. So the write runs in its own task, which holds the

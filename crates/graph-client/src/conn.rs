@@ -49,6 +49,17 @@ impl From<(pb::HelloResponse, String)> for HelloInfo {
     }
 }
 
+/// One synchronous call as a `client` span (ADR 0009 D5), a child of the
+/// caller's current span. The future runs instrumented with it, so the
+/// `SendVersion` interceptor sees it as current and injects its W3C
+/// context even though the call runs on the store's own runtime. Without
+/// a `tracing-opentelemetry` layer in the process the span exports
+/// nothing and nothing is injected.
+pub fn traced<F: Future>(fut: F) -> tracing::instrument::Instrumented<F> {
+    use tracing::Instrument;
+    fut.instrument(tracing::info_span!("client"))
+}
+
 /// Drive `fut` to completion on `rt` from synchronous code. Panics when
 /// called from inside any tokio runtime: the caller would block a runtime
 /// worker (or deadlock a current-thread runtime) waiting on another.

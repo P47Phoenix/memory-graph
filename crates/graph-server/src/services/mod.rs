@@ -129,6 +129,7 @@ impl Ctx {
             .deadline(&tonic::metadata::MetadataMap::new(), FORWARD_UNARY_TIMEOUT);
         let mut client = self.fwd.admin_client(&addr)?;
         let index = within(
+            self.fwd.me(),
             deadline,
             client.read_index(Forwarder::request(
                 graph_proto::pb::ReadIndexRequest {},

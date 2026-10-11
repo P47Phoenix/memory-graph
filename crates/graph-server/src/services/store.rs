@@ -301,6 +301,7 @@ impl pb::store_server::Store for StoreService {
             let deadline = self.ctx.fwd.deadline(req.metadata(), FORWARD_UNARY_TIMEOUT);
             let mut client = self.ctx.fwd.store_client(&addr)?;
             let resp = within(
+                self.ctx.fwd.me(),
                 deadline,
                 client.extractor_gaps(Forwarder::request(req.into_inner(), deadline)),
             )

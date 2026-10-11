@@ -12,6 +12,11 @@
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
+/// An extra layer for the global subscriber: OpenTelemetry's, when traces
+/// are exported (ADR 0009 D5, `graph_server::telemetry::tracing_layer`).
+pub type ExtraLayer =
+    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
+
 /// The environment variable `--log-level` reads.
 pub const ENV_LOG: &str = "MEMORY_GRAPH_LOG";
 
@@ -32,8 +37,34 @@ pub fn filter(spec: &str) -> Result<EnvFilter> {
 }
 
 /// Install the global subscriber (once per process; a second call fails).
-pub fn init(format: LogFormat, spec: &str) -> Result<()> {
+/// With `otel` (traces on) it is a `Registry` with the fmt layer behind
+/// the `--log-level` filter and the OpenTelemetry layer behind its own;
+/// without, the fmt subscriber exactly as before (ADR 0009 D1).
+pub fn init(format: LogFormat, spec: &str, otel: Option<ExtraLayer>) -> Result<()> {
     let f = filter(spec)?;
+    if let Some(otel) = otel {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+        let fmt = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(false);
+        let fmt = match format {
+            LogFormat::Text => fmt.with_filter(f).boxed(),
+            LogFormat::Json => fmt
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_filter(f)
+                .boxed(),
+        };
+        return tracing_subscriber::registry()
+            .with(otel)
+            .with(fmt)
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("installing the log subscriber: {e}"));
+    }
     let b = tracing_subscriber::fmt()
         .with_env_filter(f)
         .with_writer(std::io::stderr)

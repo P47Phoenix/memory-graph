@@ -1,4 +1,5 @@
-//! OpenTelemetry over OTLP/gRPC (ADR 0009, Proposed; plan item O1).
+//! OpenTelemetry over OTLP/gRPC (ADR 0009; groundwork in story 50, traces
+//! in story 51: see [`traces`]).
 //!
 //! Off by default: with no endpoint configured, [`init`] returns `None` and
 //! no provider, exporter, thread or runtime exists. With one, it builds the
@@ -8,8 +9,9 @@
 //! [`TelemetryGuard::metrics`], and every `/metrics` family is exported
 //! under the [`METRIC_MAPPING`] names. Exports are counted per signal
 //! (`counting`: `mg_otel_export_failures_total`, `mg_otel_dropped_total`).
-//! No `tracing` layer or global provider is registered here: O2 and O4
-//! attach those to the providers this guard holds.
+//! Traces (story 51, [`traces`]): `serve` installs [`tracing_layer`] in
+//! its subscriber; the span exporter keeps the node's identity current and
+//! reports to the same accounting. No global provider is registered here.
 //!
 //! Configuration precedence, highest first: a `serve` flag, its key in the
 //! `serve --config` file (graph-cli merges those two before calling here,
@@ -46,6 +48,11 @@ pub use metrics::{
     rpc_attributes, status_code, CollectionCounts, OtlpMetrics, OtlpRecorders, SnapshotSource,
     APPLY_DURATION, RPC_DURATION,
 };
+mod traces;
+pub use traces::{
+    current_rpc_context, dropped, export_failures, exported, hold_until_identity,
+    set_node_identity, traces_on, tracing_layer, ApplyLinks, LinkGuard, RAFT_RPC_TARGET, RPC_SPAN,
+};
 
 /// `service.name` when nothing else names the service.
 pub const DEFAULT_SERVICE_NAME: &str = "memory-graph";
@@ -64,6 +71,9 @@ const ENV_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 const ENV_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
 const ENV_RESOURCE_ATTRIBUTES: &str = "OTEL_RESOURCE_ATTRIBUTES";
 const ENV_SDK_DISABLED: &str = "OTEL_SDK_DISABLED";
+const ENV_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
+/// The OTLP exporters' default export timeout (the SDK's).
+const DEFAULT_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Live [`TelemetryGuard`]s in this process: the structural "is anything
 /// exporting" check tests use ([`is_active`]).
@@ -200,6 +210,10 @@ pub struct TelemetryConfig {
     /// Every resource attribute, `service.name` included, sorted by key.
     pub resource: Vec<(String, String)>,
     pub batch: BatchTuning,
+    /// An environment setting that turned OTLP off, logged by
+    /// [`log_problems`](Self::log_problems) once logging is up (resolving
+    /// comes first: the tracing layer needs the providers).
+    pub env_problem: Option<String>,
 }
 
 /// Resource keys only this process may set: whatever
@@ -229,7 +243,8 @@ impl TelemetryConfig {
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<TelemetryConfig, TelemetryError> {
         let env = |var: &str| env(var).filter(|v| !v.trim().is_empty());
-        let endpoint = resolve_endpoint(options, &env)?;
+        let mut env_problem = None;
+        let endpoint = resolve_endpoint(options, &env, &mut env_problem)?;
         let signals = match &options.signals {
             Some(list) => Signals::parse(list)?,
             None => Signals::ALL,
@@ -266,6 +281,7 @@ impl TelemetryConfig {
             metrics_interval,
             resource: resource.into_iter().collect(),
             batch: BatchTuning::default(),
+            env_problem,
         };
         cfg.apply_identity(identity);
         Ok(cfg)
@@ -292,6 +308,13 @@ impl TelemetryConfig {
     pub fn is_enabled(&self) -> bool {
         self.endpoint.is_some()
     }
+
+    /// Log the environment problem that turned OTLP off, if any (one error).
+    pub fn log_problems(&self) {
+        if let Some(problem) = &self.env_problem {
+            tracing::error!("{problem}; OpenTelemetry export is off");
+        }
+    }
 }
 
 /// The endpoint. `OTEL_SDK_DISABLED=true` turns everything off, the flag
@@ -304,7 +327,9 @@ impl TelemetryConfig {
 fn resolve_endpoint(
     options: &TelemetryOptions,
     env: &impl Fn(&str) -> Option<String>,
+    problem_out: &mut Option<String>,
 ) -> Result<Option<String>, TelemetryError> {
+    let mut disabled_by_env = |problem: &str| *problem_out = Some(problem.to_string());
     if env(ENV_SDK_DISABLED).is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
         return Ok(None);
     }
@@ -336,10 +361,6 @@ fn resolve_endpoint(
             Ok(None)
         }
     }
-}
-
-fn disabled_by_env(problem: &str) {
-    tracing::error!("{problem}; OpenTelemetry export is off");
 }
 
 fn check_unsupported_env(env: &impl Fn(&str) -> Option<String>) -> Result<(), String> {
@@ -472,10 +493,18 @@ impl Providers {
             );
             let acct = Accounting::new(0, bound);
             accounting[0] = Some(Arc::clone(&acct));
-            let exporter = counting::CountingSpanExporter {
-                inner: exporter,
-                acct: Arc::clone(&acct),
-            };
+            // CountingSpanProcessor (the queue bound) -> the SDK's batch
+            // processor -> TraceExporter (identity hold, deadline, and the
+            // export accounting) -> OTLP. TraceExporter does the exporter
+            // half of the accounting itself: a held batch is not handed
+            // over yet, and a deadline drops the inner future before an
+            // inner decorator could count it.
+            let exporter = traces::TraceExporter::new(
+                exporter,
+                export_timeout(cfg.batch.export_timeout),
+                tokio::runtime::Handle::current(),
+                Arc::clone(&acct),
+            );
             let processor = counting::CountingSpanProcessor {
                 inner: opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter)
                     .with_batch_config(span_batch_config(&cfg.batch, bound))
@@ -582,6 +611,20 @@ impl Providers {
     }
 }
 
+/// One export's bound: the test seam, else `OTEL_EXPORTER_OTLP_TIMEOUT`
+/// (milliseconds), else the SDK's 10 s.
+fn export_timeout(tuned: Option<Duration>) -> Duration {
+    tuned
+        .or_else(|| {
+            std::env::var(ENV_TIMEOUT)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .map(Duration::from_millis)
+        })
+        .unwrap_or(DEFAULT_EXPORT_TIMEOUT)
+}
+
 fn span_batch_config(t: &BatchTuning, bound: usize) -> opentelemetry_sdk::trace::BatchConfig {
     let mut b = opentelemetry_sdk::trace::BatchConfigBuilder::default().with_max_queue_size(bound);
     if let Some(d) = t.schedule_delay {
@@ -606,6 +649,9 @@ struct GuardInner {
 impl GuardInner {
     /// The blocking part of a shutdown: never on a runtime worker.
     fn finish(self, timeout: Duration) {
+        // Must stay before the providers shut down: the span exporter's
+        // shutdown drains what it held only once the hold is released.
+        traces::release_hold();
         self.providers.shutdown(timeout);
         self.runtime.shutdown_background();
     }
@@ -1339,6 +1385,67 @@ mod tests {
             .as_ref()
             .is_some_and(|r| r.attributes.iter().any(|kv| kv.key == "service.name"));
         assert!(has_service, "resource carries service.name");
+    }
+
+    fn tuned(collector: &crate::testing::FakeCollector, delay: Duration) -> TelemetryConfig {
+        let options = TelemetryOptions {
+            signals: Some("traces".into()),
+            ..with_endpoint(&collector.endpoint())
+        };
+        let mut cfg = resolve(&options, &[]).unwrap();
+        cfg.batch = BatchTuning {
+            schedule_delay: Some(delay),
+            max_queue_size: Some(4096),
+            export_timeout: Some(Duration::from_secs(1)),
+        };
+        cfg
+    }
+
+    /// D8 shutdown under load, responsive collector: spans still queued
+    /// (the batch delay is an hour) arrive.
+    #[test]
+    fn shutdown_flushes_what_is_queued() {
+        use crate::testing::FakeCollector;
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        let collector = FakeCollector::start();
+        let guard = init(&tuned(&collector, Duration::from_secs(3600)))
+            .unwrap()
+            .unwrap();
+        let tracer = guard.tracer_provider().unwrap().tracer("load");
+        for _ in 0..200 {
+            tracer.in_span("queued", |_| {});
+        }
+        assert!(collector.received().spans().is_empty(), "still queued");
+        guard.shutdown_blocking();
+        let spans = collector.wait_spans(Duration::from_secs(10), |s| {
+            s.iter().filter(|x| x.name == "queued").count() >= 200
+        });
+        assert_eq!(spans.iter().filter(|x| x.name == "queued").count(), 200);
+    }
+
+    /// D8 shutdown under load, stalled collector: shutdown returns within
+    /// its bound (twice SHUTDOWN_TIMEOUT), whatever the collector does.
+    #[test]
+    fn shutdown_with_a_stalled_collector_is_bounded() {
+        use crate::testing::{FakeCollector, FakeSignal};
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        let collector = FakeCollector::start();
+        collector.stall();
+        let guard = init(&tuned(&collector, Duration::from_millis(10)))
+            .unwrap()
+            .unwrap();
+        let tracer = guard.tracer_provider().unwrap().tracer("load");
+        for _ in 0..200 {
+            tracer.in_span("held", |_| {});
+        }
+        assert!(collector.wait_for(FakeSignal::Stalled, 1, Duration::from_secs(10)));
+        let t = std::time::Instant::now();
+        guard.shutdown_blocking();
+        assert!(
+            t.elapsed() <= SHUTDOWN_TIMEOUT * 2 + Duration::from_secs(1),
+            "shutdown took {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

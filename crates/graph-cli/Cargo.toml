@@ -99,6 +99,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+# cluster_e2e's trace test (ADR 0009 D5): the test's own span ids.
+opentelemetry.workspace = true
+tracing-opentelemetry.workspace = true
 encoding_rs.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

@@ -141,7 +141,7 @@ impl Accounting {
         }
     }
 
-    fn drop_items(&self, n: u64) {
+    pub(super) fn drop_items(&self, n: u64) {
         self.dropped.fetch_add(n, Ordering::SeqCst);
         if self.global {
             GLOBAL[self.signal].dropped.fetch_add(n, Ordering::Relaxed);
@@ -149,7 +149,7 @@ impl Accounting {
     }
 
     /// One item offered: whether it may go on to the batch processor.
-    fn admit(&self) -> bool {
+    pub(super) fn admit(&self) -> bool {
         self.queued.fetch_add(1, Ordering::SeqCst);
         if self.closed.load(Ordering::SeqCst) {
             self.drop_items(1);
@@ -178,8 +178,23 @@ impl Accounting {
     }
 
     /// `n` admitted items were handed to the exporter.
-    fn handed(&self, n: u64) {
+    pub(super) fn handed(&self, n: u64) {
         update(&self.pending, |p| Some(p.saturating_sub(n)));
+    }
+
+    /// `n` admitted items left the pipeline without an export call (the
+    /// trace exporter's identity hold overflowed): dropped, no failure.
+    pub(super) fn lost(&self, n: u64) {
+        self.handed(n);
+        self.drop_items(n);
+    }
+
+    /// A pipeline for unit tests: not reflected in the process counters.
+    #[cfg(test)]
+    pub(super) fn local(signal: usize, cap: usize) -> Arc<Self> {
+        let mut a = Self::new(signal, cap);
+        Arc::get_mut(&mut a).expect("unshared").global = false;
+        a
     }
 
     /// `n` items were collected straight into an export (metrics: no
@@ -261,42 +276,8 @@ impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanP
     }
 }
 
-/// A span exporter that counts each export's outcome.
-#[derive(Debug)]
-pub(crate) struct CountingSpanExporter<E> {
-    pub(crate) inner: E,
-    pub(crate) acct: Arc<Accounting>,
-}
-
-impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
-    for CountingSpanExporter<E>
-{
-    fn export(
-        &self,
-        batch: Vec<opentelemetry_sdk::trace::SpanData>,
-    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
-        let n = batch.len() as u64;
-        self.acct.handed(n);
-        let fut = self.inner.export(batch);
-        async move {
-            let r = fut.await;
-            self.acct.finished(n, &r);
-            r
-        }
-    }
-
-    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        self.inner.shutdown_with_timeout(timeout)
-    }
-
-    fn force_flush(&self) -> OTelSdkResult {
-        self.inner.force_flush()
-    }
-
-    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
-        self.inner.set_resource(resource);
-    }
-}
+// The span exporter half lives in `traces::TraceExporter`, which also
+// holds spans for the node's identity (story 51) and bounds each export.
 
 /// A log processor that enforces the queue bound and counts drops.
 #[derive(Debug)]

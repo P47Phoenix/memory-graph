@@ -12,6 +12,13 @@ prost.workspace = true
 prost-types.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+# W3C trace context in gRPC metadata (ADR 0009 D5, `trace_context`): the
+# current `tracing` span's OpenTelemetry context, injected and extracted
+# with the SDK's TraceContextPropagator. No exporter here.
+tracing.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

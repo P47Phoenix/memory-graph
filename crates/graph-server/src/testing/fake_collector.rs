@@ -54,7 +54,101 @@ pub enum Signal {
     Stalled,
 }
 
+/// One received span, flattened for assertions (ids in lowercase hex,
+/// attribute values as text).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectedSpan {
+    pub name: String,
+    pub trace_id: String,
+    pub span_id: String,
+    /// Empty for a root.
+    pub parent_span_id: String,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    /// The resource of the batch it came in.
+    pub resource: std::collections::BTreeMap<String, String>,
+    /// `(trace id, span id, attributes)` of each link.
+    pub links: Vec<(String, String, std::collections::BTreeMap<String, String>)>,
+    /// Every string anywhere in the span: name, attribute and event values,
+    /// event names, status message (the privacy sentinel test).
+    pub all_text: Vec<String>,
+}
+
+impl CollectedSpan {
+    pub fn attr(&self, key: &str) -> Option<&str> {
+        self.attributes.get(key).map(String::as_str)
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn any_text(v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>) -> String {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    match v.as_ref().and_then(|v| v.value.as_ref()) {
+        Some(Value::StringValue(s)) => s.clone(),
+        Some(Value::BoolValue(b)) => b.to_string(),
+        Some(Value::IntValue(i)) => i.to_string(),
+        Some(Value::DoubleValue(d)) => d.to_string(),
+        Some(other) => format!("{other:?}"),
+        None => String::new(),
+    }
+}
+
+fn attr_map(
+    kvs: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+) -> std::collections::BTreeMap<String, String> {
+    kvs.iter()
+        .map(|kv| (kv.key.clone(), any_text(&kv.value)))
+        .collect()
+}
+
 impl Received {
+    /// Every span received, in arrival order.
+    pub fn spans(&self) -> Vec<CollectedSpan> {
+        let mut out = Vec::new();
+        for req in &self.traces {
+            for rs in &req.resource_spans {
+                let resource = rs
+                    .resource
+                    .as_ref()
+                    .map(|r| attr_map(&r.attributes))
+                    .unwrap_or_default();
+                for ss in &rs.scope_spans {
+                    for sp in &ss.spans {
+                        let attributes = attr_map(&sp.attributes);
+                        let mut all_text = vec![sp.name.clone()];
+                        all_text.extend(attributes.values().cloned());
+                        for ev in &sp.events {
+                            all_text.push(ev.name.clone());
+                            all_text.extend(attr_map(&ev.attributes).into_values());
+                        }
+                        if let Some(st) = &sp.status {
+                            all_text.push(st.message.clone());
+                        }
+                        out.push(CollectedSpan {
+                            name: sp.name.clone(),
+                            trace_id: hex(&sp.trace_id),
+                            span_id: hex(&sp.span_id),
+                            parent_span_id: hex(&sp.parent_span_id),
+                            attributes,
+                            resource: resource.clone(),
+                            links: sp
+                                .links
+                                .iter()
+                                .map(|l| {
+                                    (hex(&l.trace_id), hex(&l.span_id), attr_map(&l.attributes))
+                                })
+                                .collect(),
+                            all_text,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn count(&self, signal: Signal) -> usize {
         match signal {
             Signal::Traces => self.traces.len(),
@@ -242,6 +336,36 @@ impl FakeCollector {
             }
         };
         self.serving = Some(serve(runtime, listener, &self.shared));
+    }
+
+    /// Wait until the spans received satisfy `done`, or `deadline` passes;
+    /// the spans either way (wakes on every export, no fixed sleep).
+    pub fn wait_spans(
+        &self,
+        deadline: Duration,
+        mut done: impl FnMut(&[CollectedSpan]) -> bool,
+    ) -> Vec<CollectedSpan> {
+        let until = Instant::now() + deadline;
+        let mut received = self
+            .shared
+            .received
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let spans = received.spans();
+            if done(&spans) {
+                return spans;
+            }
+            let Some(left) = until.checked_duration_since(Instant::now()) else {
+                return spans;
+            };
+            received = self
+                .shared
+                .changed
+                .wait_timeout(received, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 
     /// Wait until at least `count` of `signal` arrived or `deadline`

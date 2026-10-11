@@ -147,7 +147,7 @@ impl RemoteStore {
     }
 
     fn run<F: std::future::Future>(&self, f: F) -> F::Output {
-        block_on(&self.rt, f)
+        block_on(&self.rt, crate::conn::traced(f))
     }
 
     fn view(&self) -> graph_proto::View {

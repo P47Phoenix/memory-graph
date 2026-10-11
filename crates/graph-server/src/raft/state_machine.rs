@@ -170,6 +170,9 @@ impl StoreStateMachine {
                 files = tracing::field::Empty,
                 duration_ms = tracing::field::Empty,
             );
+            if let EntryPayload::Normal(req) = &e.payload {
+                obs.apply_links.link(&span, &req.command, e.log_id.index);
+            }
             let _enter = span.enter();
             let started = std::time::Instant::now();
             let r = slot.with_store(|s| Self::apply_one(s, &e));

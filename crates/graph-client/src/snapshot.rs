@@ -33,7 +33,7 @@ impl RemoteSnapshot {
     }
 
     fn run<F: std::future::Future>(&self, f: F) -> F::Output {
-        block_on(&self.rt, f)
+        block_on(&self.rt, crate::conn::traced(f))
     }
 }
 

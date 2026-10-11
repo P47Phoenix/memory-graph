@@ -19,6 +19,8 @@ sha2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# rpc_bench --otlp: the OpenTelemetry layer in the bench's subscriber.
+tracing-subscriber.workspace = true
 graph-server = { path = "../graph-server" }
 graph-lang-rust = { path = "../graph-lang-rust" }
 tempfile.workspace = true
