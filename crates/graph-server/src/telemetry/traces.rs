@@ -292,6 +292,11 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
             if let Some(r) = &resource {
                 inner.set_resource(r);
             }
+            // `handed` ran before the send and `finished` runs after it: were
+            // this future dropped from outside mid-export, the batch would
+            // stay uncounted. SDK 0.33's batch processor blocks on each
+            // export until it completes, so that cannot happen today; the
+            // deadline below is what ends a stalled export, and it counts.
             tokio::select! {
                 r = inner.export(batch) => r,
                 () = deadline => Err(OTelSdkError::Timeout(self.timeout)),

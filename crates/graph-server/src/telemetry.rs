@@ -649,6 +649,8 @@ struct GuardInner {
 impl GuardInner {
     /// The blocking part of a shutdown: never on a runtime worker.
     fn finish(self, timeout: Duration) {
+        // Must stay before the providers shut down: the span exporter's
+        // shutdown drains what it held only once the hold is released.
         traces::release_hold();
         self.providers.shutdown(timeout);
         self.runtime.shutdown_background();
