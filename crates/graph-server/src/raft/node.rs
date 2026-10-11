@@ -99,7 +99,24 @@ impl RaftSettings {
     }
 }
 
+/// A leader transfer's in-flight drain waits at most this many
+/// `election_timeout_max` ([`RaftSettings::transfer_drain_bound`]; issue
+/// #260): tied to the election config, so a cluster with longer timings
+/// gets a proportionally longer drain instead of a fixed 10 s that a
+/// starved 1-CPU host could exceed.
+pub const TRANSFER_DRAIN_ELECTIONS: u64 = 15;
+
 impl RaftSettings {
+    /// How long `TransferLeader` waits for the writes and membership
+    /// changes in flight to be answered by Raft before it refuses:
+    /// [`TRANSFER_DRAIN_ELECTIONS`] times `election_max_ms`.
+    pub fn transfer_drain_bound(&self) -> Duration {
+        Duration::from_millis(
+            self.election_max_ms
+                .saturating_mul(TRANSFER_DRAIN_ELECTIONS),
+        )
+    }
+
     /// The quorum-loss window (see [`RaftSettings::quorum_loss_ms`]).
     pub fn quorum_loss_window(&self) -> Duration {
         Duration::from_millis(self.quorum_loss_ms.unwrap_or_else(|| {
@@ -685,6 +702,19 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Wait until no proposal is in flight (each leaves once openraft has
+    /// answered it), for at most `bound`. Returns whether it drained.
+    pub async fn drain_in_flight(&self, bound: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        while self.in_flight.load(Ordering::SeqCst) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
     /// Enter a proposal: counted in [`in_flight`](Self::in_flight) first,
     /// then refused (`NoLeader`) while a transfer runs. The count drops
     /// when the returned guard does.
@@ -757,7 +787,7 @@ impl RaftNode {
         //
         // A partitioned leader holding such a write keeps a transfer from
         // starting, but cannot hang it: the transfer's drain is bounded by
-        // `TRANSFER_CATCH_UP` and then refuses ("writes in flight did not
+        // `RaftSettings::transfer_drain_bound` and then refuses ("writes in flight did not
         // finish"), leadership staying here.
         let mut write =
             self.spawn_holding(
@@ -1646,5 +1676,31 @@ mod tests {
         );
         assert!(follower_stale(true, false, 5, Some(5)), "no recent contact");
         assert!(follower_stale(false, true, 5, Some(5)), "no known leader");
+    }
+
+    /// Issue #260: the transfer drain's bound is a fixed multiple of
+    /// `election_max_ms`, so it moves with the election config.
+    #[test]
+    fn transfer_drain_bound_tracks_the_election_config() {
+        let c = RaftSettings::cluster();
+        assert_eq!(
+            c.transfer_drain_bound(),
+            Duration::from_millis(c.election_max_ms * TRANSFER_DRAIN_ELECTIONS)
+        );
+        let slow = RaftSettings {
+            election_min_ms: 3000,
+            election_max_ms: 6000,
+            ..c
+        };
+        assert_eq!(slow.transfer_drain_bound(), 3 * c.transfer_drain_bound());
+        assert_ne!(
+            RaftSettings::standalone().transfer_drain_bound(),
+            c.transfer_drain_bound()
+        );
+        let huge = RaftSettings {
+            election_max_ms: u64::MAX,
+            ..c
+        };
+        assert_eq!(huge.transfer_drain_bound(), Duration::from_millis(u64::MAX));
     }
 }

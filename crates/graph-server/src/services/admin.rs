@@ -459,15 +459,12 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
     // A proposal that passed its check before the flag went up may still
     // append: wait until none is in flight (each ends once applied), so
     // the lag check below sees every entry this leader will append.
-    let drained = Instant::now() + TRANSFER_CATCH_UP;
-    while ctx.raft.in_flight.load(Ordering::SeqCst) > 0 {
-        if Instant::now() >= drained {
-            return Err(rejected(format!(
-                "writes in flight did not finish within {TRANSFER_CATCH_UP:?}; leadership \
-                 stays here"
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // Bounded by the election config (issue #260), not a fixed time.
+    let bound = ctx.raft.settings.transfer_drain_bound();
+    if !ctx.raft.drain_in_flight(bound).await {
+        return Err(rejected(format!(
+            "writes in flight did not finish within {bound:?}; leadership stays here"
+        )));
     }
     // Re-check under the guard: no new write is accepted now, so what was
     // in flight when the first check passed must reach the target too.
