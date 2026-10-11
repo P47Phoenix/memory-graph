@@ -651,7 +651,8 @@ enum Cmd {
         /// Cap on source bytes read but not yet committed: a fixed size (2G), or the share of the free
         /// memory this process may grow into (70%, the default), divided by the measured growth per source
         /// byte, re-sampled during the run and lowered under memory pressure; at least 20% of RAM is always
-        /// left for the OS. Also read from MEMORY_GRAPH_MEMORY
+        /// left for the OS. Rust parse stacks count against it too: when the budget is smaller than a
+        /// stack, the Rust parses that need a big stack run one at a time. Also read from MEMORY_GRAPH_MEMORY
         #[arg(long, env = "MEMORY_GRAPH_MEMORY", value_parser = graph_cli::sysinfo::parse_memory_spec)]
         memory: Option<graph_cli::sysinfo::MemorySpec>,
         /// Commit fixed batches (256 files / 32 MiB; a file that does not fit is a batch of its own) instead

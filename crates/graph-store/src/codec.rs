@@ -957,6 +957,63 @@ pub fn dict_block_first_id(b: &[u8]) -> Result<Option<u64>, StoreError> {
     Ok(Some(r.varint()?))
 }
 
+/// A file's sort key (epic story 61, #262): the fields `search` filters and
+/// sorts candidate files on, kept in the derived `file_keys` table so a hot
+/// term does not decode thousands of JSON file rows. Borrowed from the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileKey<'a> {
+    /// The repo node id (the file row's `parent`).
+    pub parent: u64,
+    /// The file's lowercased language, as on its row.
+    pub language: Option<&'a str>,
+    /// The file's stored path (the row's `name`).
+    pub name: &'a str,
+}
+
+/// Encode a [`FileKey`]: `varint(parent)`, then `varint(0)` for no language
+/// or `varint(len + 1)` and the language bytes, then the path bytes to the
+/// end of the row. Pinned by `file_key_golden_bytes`.
+pub fn encode_file_key(k: &FileKey<'_>) -> Vec<u8> {
+    let lang = k.language.map_or(0, str::len);
+    let mut out = Vec::with_capacity(varint_len(k.parent) + 2 + lang + k.name.len());
+    put_varint(&mut out, k.parent);
+    match k.language {
+        None => out.push(0),
+        Some(l) => {
+            put_varint(&mut out, l.len() as u64 + 1);
+            out.extend_from_slice(l.as_bytes());
+        }
+    }
+    out.extend_from_slice(k.name.as_bytes());
+    out
+}
+
+/// Decode a row written by [`encode_file_key`].
+pub fn decode_file_key(b: &[u8]) -> Result<FileKey<'_>, StoreError> {
+    let bad = |what: &str| StoreError::Corrupt(format!("file key: {what}"));
+    let mut r = Reader { b, at: 0 };
+    let parent = r.varint()?;
+    let language = match r.varint()? {
+        0 => None,
+        n => {
+            let len = usize::try_from(n - 1).map_err(|_| bad("language length"))?;
+            let end =
+                r.at.checked_add(len)
+                    .filter(|&e| e <= b.len())
+                    .ok_or_else(|| bad("truncated language"))?;
+            let l = std::str::from_utf8(&b[r.at..end]).map_err(|_| bad("language not UTF-8"))?;
+            r.at = end;
+            Some(l)
+        }
+    };
+    let name = std::str::from_utf8(&b[r.at..]).map_err(|_| bad("path not UTF-8"))?;
+    Ok(FileKey {
+        parent,
+        language,
+        name,
+    })
+}
+
 /// Decode a whole stream (counted in [`crate::read_stats`] as one full
 /// decode, not also as a lazy and a symbol-section decode).
 pub fn decode(b: &[u8]) -> Result<Stream, StoreError> {
@@ -1913,6 +1970,42 @@ mod tests {
     /// exact `(id, text)` pairs, in order, and the byte layout is pinned so a
     /// future accidental format change is caught here rather than only as a
     /// v2 differential failure.
+    /// Golden bytes for the `file_keys` row (epic story 61): a change here
+    /// is a format change and needs a bumped `FILE_KEYS_DERIVED_VERSION`.
+    #[test]
+    fn file_key_golden_bytes() {
+        let k = FileKey {
+            parent: 300,
+            language: Some("rust"),
+            name: "src/a.rs",
+        };
+        let b = encode_file_key(&k);
+        let mut want = vec![0xac, 0x02, 5];
+        want.extend_from_slice(b"rust");
+        want.extend_from_slice(b"src/a.rs");
+        assert_eq!(b, want);
+        assert_eq!(decode_file_key(&b).unwrap(), k);
+
+        let none = FileKey {
+            parent: 7,
+            language: None,
+            name: "",
+        };
+        let b = encode_file_key(&none);
+        assert_eq!(b, vec![7, 0]);
+        assert_eq!(decode_file_key(&b).unwrap(), none);
+    }
+
+    #[test]
+    fn file_key_rejects_corrupt_rows() {
+        for b in [&[][..], &[1][..], &[1, 9, b'x'][..], &[1, 0, 0xff][..]] {
+            assert!(
+                matches!(decode_file_key(b), Err(StoreError::Corrupt(_))),
+                "{b:?}"
+            );
+        }
+    }
+
     #[test]
     fn dict_block_format_is_pinned_and_round_trips() {
         let entries: Vec<(u64, &str)> = vec![(0, "alpha"), (1, "b"), (1000, "gamma_delta")];

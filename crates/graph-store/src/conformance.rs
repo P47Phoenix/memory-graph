@@ -123,6 +123,11 @@ pub const CASES: &[(&str, Case)] = &[
     ("name_positions", name_positions),
     ("case_insensitive_symbols", case_insensitive_symbols),
     ("sym_fold_follows_writes", sym_fold_follows_writes),
+    ("file_keys_follow_writes", file_keys_follow_writes),
+    (
+        "many_candidates_keep_full_order",
+        many_candidates_keep_full_order,
+    ),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -4673,6 +4678,131 @@ fn sym_fold_follows_writes(h: &Harness) {
     s.vacuum().unwrap();
     assert_eq!(symbol_rows(&*s, "sprocket", false).len(), 1);
     assert_fold_agrees(&*s, "vacuum");
+}
+
+/// Epic story 61: the per-file sort key `search` filters and sorts on stays
+/// in step with the File rows through ingest, re-index with a new
+/// language, prune and vacuum, checked by query results (order, language,
+/// org and repo filters).
+fn file_keys_follow_writes(h: &Harness) {
+    let s = open(h);
+    type Row = (String, Option<String>, Option<String>, Option<String>);
+    let files = |q: &Query| -> Vec<Row> {
+        s.search(q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.org, h.repo, h.file, h.language))
+            .collect()
+    };
+    let row = |o: &str, r: &str, f: &str, l: &str| -> Row {
+        (
+            o.to_string(),
+            Some(r.to_string()),
+            Some(f.to_string()),
+            Some(l.to_string()),
+        )
+    };
+    s.ingest_file("o2", "r", "b.zig", "zig", &plain("hot x"))
+        .unwrap();
+    s.ingest_file("o1", "r2", "a.zig", "ZIG", &plain("hot y"))
+        .unwrap();
+    s.ingest_file("o1", "r1", "z/c.zig", "zig", &plain("hot z"))
+        .unwrap();
+    let mut q = Query::new("hot");
+    q.grain = Grain::File;
+    assert_eq!(
+        files(&q),
+        [
+            row("o1", "r1", "z/c.zig", "zig"),
+            row("o1", "r2", "a.zig", "zig"),
+            row("o2", "r", "b.zig", "zig"),
+        ]
+    );
+    // Re-index with another language: the language filter follows.
+    s.ingest_file("o1", "r2", "a.zig", "odin", &plain("hot y"))
+        .unwrap();
+    q.language = Some("ODIN".into());
+    assert_eq!(files(&q), [row("o1", "r2", "a.zig", "odin")]);
+    q.language = Some("zig".into());
+    q.org = Some("o1".into());
+    assert_eq!(files(&q), [row("o1", "r1", "z/c.zig", "zig")]);
+    // Prune: a directory-origin file leaves the candidates.
+    s.ingest_file_with_origin(
+        "o2",
+        "r",
+        "a.zig",
+        "zig",
+        &plain("hot"),
+        Some(ORIGIN_DIRECTORY),
+    )
+    .unwrap();
+    q.org = Some("o2".into());
+    q.repo = Some("r".into());
+    assert_eq!(
+        files(&q),
+        [
+            row("o2", "r", "a.zig", "zig"),
+            row("o2", "r", "b.zig", "zig")
+        ]
+    );
+    let keep: HashSet<String> = HashSet::new();
+    assert_eq!(s.prune_files("o2", "r", &keep, false).unwrap(), ["a.zig"]);
+    assert_eq!(files(&q), [row("o2", "r", "b.zig", "zig")]);
+    s.vacuum().unwrap();
+    let mut all = Query::new("hot");
+    all.grain = Grain::File;
+    assert_eq!(
+        files(&all),
+        [
+            row("o1", "r1", "z/c.zig", "zig"),
+            row("o1", "r2", "a.zig", "odin"),
+            row("o2", "r", "b.zig", "zig"),
+        ]
+    );
+}
+
+/// Epic story 61: with many more candidate files than the lazy sort's first
+/// chunk (64), across orgs, repos and directories ingested out of order, an
+/// unlimited or large-limit search returns every file in full (org, repo,
+/// path) order, as do pages that cross chunk boundaries.
+fn many_candidates_keep_full_order(h: &Harness) {
+    let s = open(h);
+    let mut want: Vec<(String, String, String)> = Vec::new();
+    // 210 files, in a scrambled ingest order (i * 97 mod 210).
+    for k in 0..210u32 {
+        let i = (k * 97) % 210;
+        let org = ["ob", "oa"][(i % 2) as usize];
+        let repo = ["r3", "r1", "r2"][(i % 3) as usize];
+        let path = format!("d{}/f{:03}.zig", i % 5, (i * 37) % 211);
+        s.ingest_file(org, repo, &path, "zig", &plain("hot"))
+            .unwrap();
+        want.push((org.into(), repo.into(), path));
+    }
+    want.sort();
+    let got = |q: &Query| -> Vec<(String, String, String)> {
+        s.search(q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.org, h.repo.unwrap(), h.file.unwrap()))
+            .collect()
+    };
+    for grain in [Grain::Token, Grain::File] {
+        let mut q = Query::new("hot");
+        q.grain = grain;
+        assert_eq!(got(&q), want, "{grain:?}, no limit");
+        q.limit = Some(1000);
+        assert_eq!(got(&q), want, "{grain:?}, limit 1000");
+        for (off, lim) in [(0, 65), (60, 10), (63, 2), (100, 100), (190, 50)] {
+            q.offset = Some(off);
+            q.limit = Some(lim);
+            let end = (off + lim).min(want.len());
+            assert_eq!(
+                got(&q),
+                want[off..end],
+                "{grain:?} offset {off} limit {lim}"
+            );
+        }
+    }
 }
 
 /// The folded lookup agrees with a brute-force fold-and-filter over every

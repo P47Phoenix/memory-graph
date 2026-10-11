@@ -416,3 +416,53 @@ The search breakdown per query (warm, timing on):
   - × 11 variants: no limit; limit 1, 7 or 100; offset 3 limit 5; offset 50 limit 20; offset 1000; an identifier filter with limit 30; a keyword filter; a language filter with limit 40; an org filter with limit 25.
 
   The `--json` output is byte-identical: 77.9 MB.
+
+## Compact per-file sort key (epic story 61, #262, 2026-10-10)
+
+### What changed
+
+- **New derived table `file_keys`**: file id to a compact row, `varint(repo id)`, then `varint(0)` or `varint(len + 1)` plus the lowercased language, then the path bytes (`codec::encode_file_key`, pinned by `file_key_golden_bytes`). `search` filters and sorts candidates on it instead of on each candidate's JSON `nodes` row. It falls back to that row if a file has no key.
+- **Upgrade path: a `derived_version`, not a `V2_SCHEMA_VERSION` bump.** `FILE_KEYS_DERIVED_VERSION = 1` is stored in `meta` under `derived_version_file_keys`. A file without the stamp or the table gets the table built on open, from the File nodes, in one transaction, with a one-line notice on stderr; after that a reopen writes nothing.
+  - Older binaries still open the file and ignore the table.
+  - If one of them writes, story 58's writer mark (or, for a removal, `file_keys` rows != `stream` rows) makes this binary rebuild the table on the next open.
+- **Repos resolved once per query.** Each candidate's repo is resolved and filtered by org and repo once, and the sort compares a repo rank (repos ordered by org name, repo name) and then the path, not three strings for every pair.
+- **The sort is lazy.** `LazySorted` selects and sorts only the prefix the walk reaches: chunks of 64, doubling. The first chunk is sorted inside the ctx phase, and later chunks count in the walk phase. The order is total (no two candidates share repo and path), so the output is exactly what a full sort gives.
+- **Tried and dropped:** a sequential range scan of `file_keys` over the candidates' id range. At about 18% density it cost about 0.52 µs per candidate, against 0.37 µs for point lookups.
+
+### Numbers (A5, 877M tokens, same host as #246)
+
+Setup:
+- `MG_READBENCH_REUSE=1` and `MG_READBENCH_REPS=5`: 5 reps per pass instead of 20, to keep 12 runs to a few hours.
+- Per binary: one warm-up run discarded, then 5 measured runs; each figure is the median of the 5.
+- "Before" is origin/main at 15f3a90 on `D:\tmp\a5-readbench2`. "After" is this branch on a copy of that file, upgraded on its first open.
+- Other agents' builds shared the machine during both series.
+
+| metric | before (main) | after | change |
+|---|---|---|---|
+| warm p95 ms (median of 5) | 106.7 | 45.8 | -57% |
+| ctx ms/q (warm, timing on) | 13.44 | 4.83 | -64% (-59% against #246's 11.9) |
+| walk ms/q | 0.71 | 0.79 | +0.08 (the lazy sort's later chunks) |
+
+Spread (min to max of the 5 measured runs): warm p95 99.1 to 108.2 ms before and 45.0 to 46.5 ms after; ctx 12.65 to 13.86 ms/q before and 4.77 to 4.94 ms/q after. The five p95 values were 107.8, 106.7, 108.2, 99.1 and 101.6 before, and 46.0, 46.5, 45.8, 45.2 and 45.0 after. The ctx values were 13.85, 13.44, 13.86, 12.65 and 13.01 before, and 4.94, 4.83, 4.83, 4.77 and 4.77 after.
+
+One run per binary (the third measured run):
+
+| phase | p95 ms before | p95 ms after | qps before | qps after | store ms/q before | store ms/q after |
+|---|---|---|---|---|---|---|
+| cold redb cache (1 MiB, fresh process) | 390.6 | 196.5 | 17 | 30 | 59.4 | 33.2 |
+| warm x5, timing on | 106.7 | 46.5 | 62 | 129 | 16.0 | 7.8 |
+| 8 threads x5 | 162.2 | 78.8 | 323 | 638 | 24.5 | 12.0 |
+| 16 threads x5 | 235.9 | 154.5 | 443 | 673 | 35.5 | 23.5 |
+| 32 threads x5 | 369.3 | 247.8 | 554 | 817 | 54.0 | 38.3 |
+
+### Equivalence evidence
+
+- **Conformance:** a new case, `file_keys_follow_writes`, covers ingest, re-index with a new language, prune and vacuum, through the language, org and repo filters and the order. `run_all`, `run_differential` and `run_crash_rerun_differential` pass.
+- **Other tests:**
+  - `check_consistency` now requires `file_keys` to equal what the File nodes imply.
+  - The story-58 old-writer tests now also require one `file_keys` rebuild and none on a later reopen.
+  - New tests cover the upgrade of a file from before this story (built once, answers unchanged, no write on the next reopen), a stale stamp, a short table, the golden values, and `LazySorted` against a full sort.
+- **Corpus differential:** the #246 recipe. testdata/corpus was indexed as 31 repos in two orgs, then the same 924 searches ran: the same 12 terms × 7 grains × 11 limit, offset and filter variants, with the language filter on `csharp`. The `--json` output was byte-identical in three ways, 82.7 MB each, with the same SHA-256:
+  - origin/main;
+  - this branch, on its own fresh index;
+  - this branch, on the main-built file upgraded on open. The only extra bytes are the one-line upgrade notice on stderr.
