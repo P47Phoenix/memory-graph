@@ -130,7 +130,11 @@ impl Ctx {
         let deadline = self
             .fwd
             .deadline(&tonic::metadata::MetadataMap::new(), FORWARD_UNARY_TIMEOUT);
-        let mut client = self.fwd.admin_client(&addr)?;
+        // An in-process read (the MCP endpoint) has no client caller: the
+        // barrier asks for `read` only, explicitly.
+        let mut client = self
+            .fwd
+            .admin_client_as_node(&addr, crate::auth::Role::Read)?;
         let index = within(
             self.fwd.me(),
             deadline,

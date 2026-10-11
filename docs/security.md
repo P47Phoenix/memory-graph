@@ -64,7 +64,7 @@ memory-graph serve --data-dir /data --bootstrap --auth-tokens tokens.toml \
 
 - Every node-to-node call carries the secret: Raft, `Join` and its probes, `UpdateAdvertise`, the leader's probe of a joiner, and forwarded writes, membership changes and read barriers.
 - A follower checks the client's token and role itself, then forwards with the secret and the role it granted (`mg-forwarded-role`). The client's token never travels between nodes, so forwarding keeps working while the nodes' token files differ during a rotation.
-- The secret is the most powerful credential: whoever holds it can append Raft entries and install snapshots. Keep it as tightly as the data itself.
+- The secret is the most powerful credential: whoever holds it can append Raft entries and install snapshots. It is at least a `write` token plus node authority. A direct `Store` or `Write` call with only the secret is refused (`PERMISSION_DENIED`), but that is defence in depth, not an isolation boundary: the holder can add `mg-forwarded-by` and `mg-forwarded-role: write` and read or write anything. Keep the secret as tightly as the data itself.
 - Rotating the secret: the file may hold two lines, the current one first. Add the new secret as a second line on every node, swap the two lines on every node, then remove the old line. Each step is reloaded like the token file, and the cluster stays available throughout.
 
 ## The transport guard

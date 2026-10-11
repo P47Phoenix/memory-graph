@@ -217,7 +217,13 @@ fn read_tokens_read_and_every_write_method_is_permission_denied() {
     // Through the client: exit code 9's error, never retried.
     let r = client(&ts, Some(&f.read), &f).unwrap();
     let auth = ts.running().unwrap().auth();
-    let refused = || auth.refusal_counts().iter().map(|(_, n)| n).sum::<u64>();
+    let refused = || {
+        auth.refusal_counts()
+            .iter()
+            .filter(|(r, _)| *r != "invalid_on_open")
+            .map(|(_, n)| n)
+            .sum::<u64>()
+    };
     let before = refused();
     let e = r.vacuum().unwrap_err();
     assert!(matches!(e, StoreError::PermissionDenied { .. }), "{e:?}");
@@ -236,6 +242,13 @@ fn read_tokens_read_and_every_write_method_is_permission_denied() {
     .unwrap();
     assert!(matches!(e, StoreError::Unauthenticated(_)), "{e:?}");
     assert_eq!(refused(), before, "Hello is open: nothing refused");
+    let open_bad = auth
+        .refusal_counts()
+        .into_iter()
+        .find(|(r, _)| *r == "invalid_on_open")
+        .unwrap()
+        .1;
+    assert!(open_bad >= 1, "an invalid token on Hello leaves a signal");
     drop(w);
     assert!(!is_write("/memory_graph.v1.Store/Get"));
 }

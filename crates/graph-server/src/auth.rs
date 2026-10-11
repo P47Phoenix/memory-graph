@@ -669,7 +669,7 @@ pub struct AuthConfig {
 }
 
 /// Refusal classes, as `mg_auth_refusals_total{reason}` labels.
-pub const REASONS: [&str; 8] = [
+pub const REASONS: [&str; 9] = [
     "missing",
     "malformed",
     "unknown",
@@ -678,6 +678,10 @@ pub const REASONS: [&str; 8] = [
     "node_only",
     "secret_direct",
     "unlisted",
+    // Not a refusal: an invalid credential on an open method (`Hello`,
+    // health), which is answered anyway; counted so a client's typo
+    // leaves a signal.
+    "invalid_on_open",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -690,6 +694,7 @@ enum Reason {
     NodeOnly,
     SecretDirect,
     Unlisted,
+    InvalidOnOpen,
 }
 
 impl Reason {
@@ -739,7 +744,7 @@ impl Refusal {
                 msg: "the cluster secret is accepted here only on a forwarded call".into(),
                 required_role: self.required.as_str().into(),
             },
-            Reason::Unlisted => StoreError::PermissionDenied {
+            Reason::Unlisted | Reason::InvalidOnOpen => StoreError::PermissionDenied {
                 msg: "this method is not in the server's role table".into(),
                 required_role: String::new(),
             },
@@ -963,6 +968,14 @@ impl Auth {
         };
         match need {
             Need::Open => Ok(caller(match cred {
+                Cred::Malformed | Cred::Unknown | Cred::Expired => {
+                    self.refusals[Reason::InvalidOnOpen.index()].fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        method = path,
+                        "auth: an invalid credential on an open method; answered as anonymous"
+                    );
+                    CallerKind::Anonymous
+                }
                 Cred::Token(e) => CallerKind::Token {
                     id: Arc::clone(&e.id),
                     role: e.role,

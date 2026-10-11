@@ -523,7 +523,10 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
     ctx.raft.raft.runtime_config().heartbeat(false);
     let deadline = Instant::now() + TRANSFER_WAIT;
     loop {
-        let mut client = ctx.fwd.admin_client(&addr)?;
+        // The leader's own call to the transfer target.
+        let mut client = ctx
+            .fwd
+            .admin_client_as_node(&addr, crate::auth::Role::Write)?;
         match tokio::time::timeout(
             TRIGGER_TIMEOUT,
             client.trigger_elect(pb::TriggerElectRequest {}),
