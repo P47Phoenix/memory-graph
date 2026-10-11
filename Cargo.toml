@@ -61,7 +61,10 @@ chardetng = "=1.0.0"
 # pure-Rust gate refuses ring/aws-lc. `internal-logs` stays off so the SDK
 # never feeds its own diagnostics back into the tracing pipeline it exports.
 opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace", "metrics", "logs"] }
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace", "metrics", "logs"] }
+# `experimental_metrics_custom_reader` (a cfg gate, no extra crates) exposes
+# `MetricReader`/`ManualReader`: story 52 builds the metrics snapshot on its
+# own reader thread before each collection, never inside a callback.
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace", "metrics", "logs", "experimental_metrics_custom_reader"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs"] }
 # 0.34 is the release that targets opentelemetry 0.33.
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }

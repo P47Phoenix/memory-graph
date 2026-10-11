@@ -21,9 +21,9 @@ use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use opentelemetry_sdk::Resource;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{Level, Metadata, Subscriber};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
@@ -32,15 +32,7 @@ use tracing_subscriber::Layer;
 /// rpc span, never exported (an idle cluster would flood the collector).
 pub const RAFT_RPC_TARGET: &str = "memory_graph::raft_rpc";
 
-/// The signals the failure counters are kept for (the `signal` label).
-pub const SIGNALS: [&str; 3] = ["traces", "metrics", "logs"];
-
 static TRACES_ON: AtomicBool = AtomicBool::new(false);
-static FAILURES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static DROPPED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static LAST_WARNED: Mutex<[Option<Instant>; 3]> = Mutex::new([None, None, None]);
-/// Export errors are logged at most once per this per signal (D8).
-const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Whether this process installed the OpenTelemetry tracing layer: the
 /// cheap check before any trace-only work (hashing a proposal for
@@ -50,37 +42,21 @@ pub fn traces_on() -> bool {
 }
 
 /// Export calls for `signal` (`traces`, `metrics`, `logs`) that failed or
-/// timed out since the process started (`mg_otel_export_failures_total`).
+/// timed out since the process started: `mg_otel_export_failures_total`
+/// (one source, `counting`).
 pub fn export_failures(signal: &str) -> u64 {
-    index_of(signal).map_or(0, |i| FAILURES[i].load(Ordering::Relaxed))
+    super::otel_counters()
+        .iter()
+        .find(|c| c.signal == signal)
+        .map_or(0, |c| c.failures)
 }
 
-/// Items carried by those failed exports (`mg_otel_dropped_total`). Items
-/// the SDK's batch queue drops when full are not seen here (#250).
+/// Items never exported for `signal`: `mg_otel_dropped_total`.
 pub fn dropped(signal: &str) -> u64 {
-    index_of(signal).map_or(0, |i| DROPPED[i].load(Ordering::Relaxed))
-}
-
-fn index_of(signal: &str) -> Option<usize> {
-    SIGNALS.iter().position(|s| *s == signal)
-}
-
-fn count_export(signal: usize, items: usize, r: &OTelSdkResult) {
-    let Err(e) = r else { return };
-    FAILURES[signal].fetch_add(1, Ordering::Relaxed);
-    DROPPED[signal].fetch_add(items as u64, Ordering::Relaxed);
-    let mut last = LAST_WARNED.lock().unwrap_or_else(PoisonError::into_inner);
-    let now = Instant::now();
-    if last[signal].is_none_or(|t| now.duration_since(t) >= WARN_EVERY) {
-        last[signal] = Some(now);
-        drop(last);
-        tracing::warn!(
-            signal = SIGNALS[signal],
-            items,
-            error = %e,
-            "OpenTelemetry export failed; dropped (logged at most once a minute)"
-        );
-    }
+    super::otel_counters()
+        .iter()
+        .find(|c| c.signal == signal)
+        .map_or(0, |c| c.dropped)
 }
 
 /// Whether the OpenTelemetry layer exports this span: spans only, from the
@@ -186,11 +162,19 @@ pub(super) struct TraceExporter<E> {
     pending: Mutex<Vec<SpanData>>,
     /// Tests: hold as if `serve` had asked to, until [`release`].
     force_hold: AtomicBool,
+    /// The trace pipeline's accounting (`counting`): this is its exporter
+    /// half. Held spans stay pending there (they still use queue room).
+    acct: Arc<super::counting::Accounting>,
 }
 
 impl<E: SpanExporter> TraceExporter<E> {
     /// `runtime` is the exporter's own; the timeout's timer lives there.
-    pub(super) fn new(inner: E, timeout: Duration, runtime: tokio::runtime::Handle) -> Self {
+    pub(super) fn new(
+        inner: E,
+        timeout: Duration,
+        runtime: tokio::runtime::Handle,
+        acct: Arc<super::counting::Accounting>,
+    ) -> Self {
         Self {
             inner: tokio::sync::Mutex::new(inner),
             base: Mutex::new(None),
@@ -199,6 +183,7 @@ impl<E: SpanExporter> TraceExporter<E> {
             runtime,
             pending: Mutex::new(Vec::new()),
             force_hold: AtomicBool::new(false),
+            acct,
         }
     }
 
@@ -217,13 +202,13 @@ impl<E: SpanExporter> TraceExporter<E> {
         if batch.is_empty() {
             return;
         }
-        let items = batch.len();
+        let items = batch.len() as u64;
+        self.acct.handed(items);
         // Blocking on our runtime is only allowed off its workers.
         let inner = match (tokio::runtime::Handle::try_current(), self.inner.try_lock()) {
             (Err(_), Ok(inner)) => inner,
             _ => {
-                count_export(
-                    0,
+                self.acct.finished(
                     items,
                     &Err(OTelSdkError::InternalFailure(
                         "held spans not sent at shutdown".into(),
@@ -243,7 +228,7 @@ impl<E: SpanExporter> TraceExporter<E> {
                 Err(_) => Err(OTelSdkError::Timeout(timeout)),
             }
         });
-        count_export(0, items, &r);
+        self.acct.finished(items, &r);
     }
 
     /// The resource to switch to, when the identity changed since the last
@@ -282,7 +267,7 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
             if self.held() {
                 let room = HELD_MAX.saturating_sub(pending.len());
                 if batch.len() > room {
-                    DROPPED[0].fetch_add((batch.len() - room) as u64, Ordering::Relaxed);
+                    self.acct.lost((batch.len() - room) as u64);
                     batch.truncate(room);
                 }
                 pending.append(&mut batch);
@@ -293,7 +278,8 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
                 batch = std::mem::take(&mut *pending);
             }
         }
-        let items = batch.len();
+        let items = batch.len() as u64;
+        self.acct.handed(items);
         let resource = self.refreshed();
         // Created on the exporter's runtime (the batch processor polls this
         // on a thread of its own, outside any runtime).
@@ -311,7 +297,7 @@ impl<E: SpanExporter> SpanExporter for TraceExporter<E> {
                 () = deadline => Err(OTelSdkError::Timeout(self.timeout)),
             }
         };
-        count_export(0, items, &r);
+        self.acct.finished(items, &r);
         r
     }
 
@@ -477,16 +463,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_exports_are_counted_by_signal() {
-        let (f, d) = (export_failures("traces"), dropped("traces"));
-        count_export(0, 7, &Ok(()));
-        assert_eq!((export_failures("traces"), dropped("traces")), (f, d));
-        count_export(0, 7, &Err(OTelSdkError::Timeout(Duration::from_secs(1))));
-        assert!(export_failures("traces") > f && dropped("traces") >= d + 7);
-        assert_eq!(export_failures("nonsense"), 0);
-    }
-
-    #[test]
     fn links_need_traces_on_and_are_dropped_with_their_guard() {
         let links = ApplyLinks::default();
         assert!(links.register(b"x", SpanContext::empty_context()).is_none());
@@ -557,58 +533,78 @@ mod tests {
     /// are dropped and counted.
     #[test]
     fn a_hold_overflow_is_counted_as_dropped() {
+        use super::super::counting::Accounting;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
         let wire = Arc::new(Mutex::new(Vec::new()));
+        let acct = Accounting::local(0, 1 << 20);
         let e = TraceExporter::new(
             Sink(Arc::clone(&wire)),
             Duration::from_secs(5),
             rt.handle().clone(),
+            Arc::clone(&acct),
         );
         e.force_hold.store(true, Ordering::SeqCst);
-        let before = dropped("traces");
         for _ in 0..3 {
-            let batch = (0..3000).map(|_| span("x")).collect();
+            // Admitted by the counting processor, as in the pipeline.
+            let batch: Vec<_> = (0..3000)
+                .map(|_| {
+                    assert!(acct.admit());
+                    span("x")
+                })
+                .collect();
             assert!(rt.block_on(e.export(batch)).is_ok());
         }
-        assert!(dropped("traces") >= before + (9000 - HELD_MAX) as u64);
+        let c = acct.counts();
+        assert_eq!(c.dropped, (9000 - HELD_MAX) as u64, "the overflow");
+        assert_eq!(c.pending, HELD_MAX as u64, "held spans stay pending");
+        assert_eq!(c.failures, 0);
         e.shutdown_with_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             wire.lock().unwrap().len(),
             HELD_MAX,
             "what was held is sent"
         );
+        let c = acct.counts();
+        assert_eq!((c.pending, c.exported), (0, HELD_MAX as u64));
+        assert_eq!(c.queued, c.exported + c.dropped, "{c:?}");
     }
 
     /// Review finding: spans held for the identity reach the collector at
     /// shutdown even when nothing else is exported after the hold ends (a
-    /// start that failed before its on-ready hook).
+    /// start that failed before its on-ready hook), and the pipeline's
+    /// equality holds throughout.
     #[test]
     fn held_spans_are_sent_at_shutdown() {
+        use super::super::counting::Accounting;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
         let wire = Arc::new(Mutex::new(Vec::new()));
+        let acct = Accounting::local(0, 1 << 20);
         let e = TraceExporter::new(
             Sink(Arc::clone(&wire)),
             Duration::from_secs(5),
             rt.handle().clone(),
+            Arc::clone(&acct),
         );
         e.force_hold.store(true, Ordering::SeqCst);
+        assert!(acct.admit() && acct.admit());
         let r = rt.block_on(e.export(vec![span("a"), span("b")]));
         assert!(r.is_ok());
         assert!(wire.lock().unwrap().is_empty(), "held");
+        assert_eq!(acct.counts().pending, 2);
         // A flush while still held sends nothing.
         e.force_flush().unwrap();
         assert!(wire.lock().unwrap().is_empty());
-        let failures = export_failures("traces");
         e.shutdown_with_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(*wire.lock().unwrap(), ["a", "b"]);
-        assert_eq!(export_failures("traces"), failures, "sent, not dropped");
+        let c = acct.counts();
+        assert_eq!((c.exported, c.dropped, c.failures, c.pending), (2, 0, 0, 0));
     }
 }

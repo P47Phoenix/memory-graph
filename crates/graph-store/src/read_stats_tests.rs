@@ -36,6 +36,10 @@ fn counts(s: ReadStats) -> ReadStats {
         full_decode_nanos: 0,
         query_nanos: 0,
         symbol_decode_nanos: 0,
+        // Timers too: another test may switch timing on in parallel.
+        search_posting_nanos: 0,
+        search_ctx_nanos: 0,
+        search_walk_nanos: 0,
         ..s
     }
 }
