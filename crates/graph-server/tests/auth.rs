@@ -155,6 +155,32 @@ fn every_rpc_is_refused_without_a_valid_credential() {
     assert!(n("unlisted") > 0);
 }
 
+/// A ~20 KB `authorization` header never reaches the auth layer: the HTTP
+/// layer refuses the oversized header block (431 under hyper's limits),
+/// which a gRPC client sees as `UNKNOWN`. Never an answer with data.
+#[test]
+fn a_huge_authorization_header_is_refused_by_the_transport() {
+    let f = AuthFixture::new();
+    let d = tempfile::tempdir().unwrap();
+    let ts = start(&f, &d.path().join("g.redb"));
+    let huge = format!("Bearer {}", "A".repeat(20 * 1024));
+    let code = raw(
+        &ts.endpoint(),
+        "/memory_graph.v1.Store/CountNodes",
+        &[("authorization", huge)],
+    );
+    assert_eq!(code, Code::Unknown);
+    // The server is still fine afterwards.
+    assert_eq!(
+        raw(
+            &ts.endpoint(),
+            "/memory_graph.v1.Admin/Status",
+            &[bearer(&f.read)]
+        ),
+        Code::Ok
+    );
+}
+
 #[test]
 fn read_tokens_read_and_every_write_method_is_permission_denied() {
     let f = AuthFixture::new();

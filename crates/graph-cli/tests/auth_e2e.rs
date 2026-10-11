@@ -124,8 +124,20 @@ fn tokens_roles_and_exit_codes() {
     let index = ["index", "--org", "o", "--repo", "r", src_s];
 
     // No token: exit 8 with a hint.
+    let first = |o: &Output| {
+        String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
     let o = run(&["describe"], &[]);
     assert_eq!(o.status.code(), Some(8), "{}", text(&o));
+    assert!(
+        first(&o).contains("authentication required or token refused"),
+        "{}",
+        text(&o)
+    );
     assert!(text(&o).contains("--token-file"), "{}", text(&o));
     // A token the server does not know: 8.
     let o = run(
@@ -138,6 +150,11 @@ fn tokens_roles_and_exit_codes() {
     a.extend_from_slice(&index);
     let o = run(&a, &[]);
     assert_eq!(o.status.code(), Some(9), "{}", text(&o));
+    assert!(
+        first(&o).contains("permission denied: needs the `write` role"),
+        "{}",
+        text(&o)
+    );
     // A write token from MEMORY_GRAPH_TOKEN_FILE indexes; a read token from
     // MEMORY_GRAPH_TOKEN reads.
     let o = run(

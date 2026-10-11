@@ -132,6 +132,7 @@ memory-graph --server mg:7000 --token-file ci.token index --org o --repo r .
 - The token comes from `--token-file`, then `MEMORY_GRAPH_TOKEN_FILE`, then `MEMORY_GRAPH_TOKEN`. There is no flag that takes the token itself, because command lines show in `ps` and shell history.
 - `MEMORY_GRAPH_TOKEN` is convenient but visible to the process's environment (`/proc/<pid>/environ`), crash dumps and CI logs that print the environment. Prefer a file with mode 0600; the client warns on Unix when the file is readable by group or others.
 - Exit codes: **8** when the server requires a token and none was given, or it refused the one given; **9** when the token's role may not do this. Neither is retried. Messages never contain a token or an environment variable's value.
+- A malformed local credential (a token file or `MEMORY_GRAPH_TOKEN` that does not hold an `mgt_` token, or a file that cannot be read) is a local configuration error: the client refuses it before calling the server, and exits **1**, not 8.
 - `memory-graph mcp` over stdio uses the same credentials.
 
 ## Health, metrics and MCP
@@ -143,4 +144,6 @@ memory-graph --server mg:7000 --token-file ci.token index --org o --repo r .
 
 ## What is logged
 
-Refusals are logged at `warn` with the peer address, the method and a reason class (missing, malformed, unknown, expired, role, node_only, secret_direct, unlisted), at most one line per peer per 10 s with a count of the suppressed ones. Accepted calls log the token id at `debug`, and OpenTelemetry spans carry `auth.token_id` and `auth.role`. No log line, error, status, span or metric ever contains a token, the cluster secret, their SHA-256 or the `authorization` header; a test at `trace` level checks it.
+Refusals are logged at `warn` with the peer address, the method and a reason class (missing, malformed, unknown, expired, role, node_only, secret_direct, unlisted), at most one line per peer per 10 s with a count of the suppressed ones. Accepted calls log the token id at `debug`, and OpenTelemetry spans carry `auth.token_id` and `auth.role`. No log line, error, status, span or metric ever contains a token, the cluster secret, their SHA-256 or the `authorization` header; a test at `trace` level checks it. `serve` takes its log filter from `--log-level` (or `MEMORY_GRAPH_LOG`), not `RUST_LOG`: `--log-level trace` is the trace level.
+
+An `authorization` header longer than 128 bytes is refused as malformed. One so large that the request's header block exceeds the HTTP/2 limits (about 16 KB) is refused by the HTTP layer before authentication runs (431); a gRPC client sees `UNKNOWN`, and nothing is answered or logged as an auth refusal.

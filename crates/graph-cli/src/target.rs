@@ -144,6 +144,30 @@ pub fn explain_remote_failure(
     code: i32,
     read: bool,
 ) -> anyhow::Error {
+    // ADR 0012 D8: the first line names the auth failure, not the step
+    // that met it ("cannot connect", "database error while indexing").
+    if code == exit::UNAUTHENTICATED {
+        return e.context(format!(
+            "server {addr}: authentication required or token refused (set --token-file or \
+             MEMORY_GRAPH_TOKEN_FILE to a token the server accepts)"
+        ));
+    }
+    if code == exit::PERMISSION_DENIED {
+        let role = e
+            .chain()
+            .find_map(|c| match c.downcast_ref::<StoreError>() {
+                Some(StoreError::PermissionDenied { required_role, .. })
+                    if !required_role.is_empty() =>
+                {
+                    Some(required_role.clone())
+                }
+                _ => None,
+            });
+        return e.context(match role {
+            Some(r) => format!("server {addr}: permission denied: needs the `{r}` role"),
+            None => format!("server {addr}: permission denied"),
+        });
+    }
     if code != exit::WRITE_DEADLINE {
         return e;
     }
