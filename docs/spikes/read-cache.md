@@ -478,7 +478,7 @@ One run per binary (the third measured run):
   - **symbolic** (`MG_READBENCH_OPS=symbolic`): `search_symbols` plus the symbol, method and class searches;
   - **symbols** (`MG_READBENCH_OPS=symbols`): `search_symbols` only.
 - Two idle `memory-graph` processes belonging to other sessions were alive on the machine. This session ran no other build or benchmark at the same time.
-- Timing overhead (warm, timing on vs off, 5 trials): -0.4% to +0.7%, median +0.3%.
+- Timing overhead (warm, timing on vs off, 5 trials): -0.4% to +0.7% (median +0.3%) for all, -1.0% to +1.5% for symbolic, and -0.3% to +4.3% for symbols.
 
 ### Numbers
 
