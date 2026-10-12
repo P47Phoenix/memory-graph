@@ -912,15 +912,20 @@ fn an_abandoned_write_stays_in_flight_until_raft_answers_it() {
     });
 }
 
-/// Issue #232, for a membership change: an `add_learner` whose caller
-/// drops it (a cancelled RPC or forward) while the leader is cut off
-/// stays in flight until openraft answers, after the partition heals.
-#[test]
-fn an_abandoned_membership_change_stays_in_flight_until_raft_answers_it() {
-    let _w = watchdog(
-        "an_abandoned_membership_change_stays_in_flight_until_raft_answers_it",
-        TEST_LIMIT,
-    );
+/// Which membership change [`abandoned_change_holds_the_transfer_drain`]
+/// abandons.
+#[derive(Debug, Clone, Copy)]
+enum AbandonedChange {
+    AddLearner,
+    ChangeMembership,
+}
+
+/// Issues #232 and #260, for a membership change: one whose caller drops
+/// it (a cancelled RPC or forward) while the leader is cut off stays in
+/// flight until openraft answers, after the partition heals. Meanwhile a
+/// leader transfer's drain waits for it (and times out at its bound); once
+/// openraft has answered, a transfer drains and the target takes over.
+fn abandoned_change_holds_the_transfer_drain(change: AbandonedChange) {
     let mut tb = ClusterTestbed::new(3, exts());
     tb.form();
     let leader = tb.leader();
@@ -936,22 +941,84 @@ fn an_abandoned_membership_change_stays_in_flight_until_raft_answers_it() {
         .build()
         .unwrap();
     let dropped = caller.block_on(async {
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            node.add_learner(4, "127.0.0.1:1", false),
-        )
-        .await
+        let wait = Duration::from_secs(1);
+        match change {
+            AbandonedChange::AddLearner => {
+                tokio::time::timeout(wait, node.add_learner(4, "127.0.0.1:1", false))
+                    .await
+                    .map(|r| r.map(|_| ()))
+            }
+            // Drop a voter: joint consensus, which needs the cut-off
+            // followers, so it cannot commit either.
+            AbandonedChange::ChangeMembership => tokio::time::timeout(
+                wait,
+                node.change_membership(std::collections::BTreeSet::from([leader, others[0]])),
+            )
+            .await
+            .map(|r| r.map(|_| ())),
+        }
     });
-    assert!(dropped.is_err(), "the change cannot commit: {dropped:?}");
+    assert!(
+        dropped.is_err(),
+        "{change:?} cannot commit cut off: {dropped:?}"
+    );
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         node.in_flight.load(Ordering::SeqCst) > 0,
-        "a membership change openraft has not answered left the in-flight count"
+        "an abandoned {change:?} openraft has not answered left the in-flight count"
+    );
+    // The transfer drain waits for it: it does not pass while the entry is
+    // unanswered (here bounded short; the real bound is many elections).
+    assert!(
+        !caller.block_on(node.drain_in_flight(Duration::from_millis(500))),
+        "a transfer drain passed an abandoned {change:?} still in flight"
     );
     tb.heal();
-    wait_until("openraft answers the abandoned change", || {
-        node.in_flight.load(Ordering::SeqCst) == 0
-    });
+    let bound = node.settings.transfer_drain_bound();
+    assert!(
+        caller.block_on(node.drain_in_flight(bound)),
+        "openraft did not answer the abandoned {change:?} within the drain bound {bound:?}"
+    );
+    // A transfer that follows drains and moves leadership.
+    let target = others[0];
+    let via = tb.leader();
+    transfer_and_check(&tb, via, target);
+}
+
+/// Issue #260: a client's admin deadline (the CLI's `cluster
+/// transfer-leader` uses the default) outlasts the longest a transfer can
+/// take on the leader, with the cluster defaults and the testbed's.
+#[test]
+fn the_admin_deadline_outlasts_a_transfer() {
+    use graph_server::services::admin::transfer_worst_case;
+    let d = ClientConfig::new("unused").admin_deadline;
+    for s in [RaftSettings::cluster(), TEST_RAFT] {
+        assert!(
+            transfer_worst_case(&s) < d,
+            "{:?} >= {d:?}",
+            transfer_worst_case(&s)
+        );
+    }
+}
+
+/// The abandoned change is an `add_learner`.
+#[test]
+fn an_abandoned_add_learner_holds_a_transfer_drain_until_raft_answers_it() {
+    let _w = watchdog(
+        "an_abandoned_add_learner_holds_a_transfer_drain_until_raft_answers_it",
+        TEST_LIMIT,
+    );
+    abandoned_change_holds_the_transfer_drain(AbandonedChange::AddLearner);
+}
+
+/// The abandoned change is a `change_membership`.
+#[test]
+fn an_abandoned_change_membership_holds_a_transfer_drain_until_raft_answers_it() {
+    let _w = watchdog(
+        "an_abandoned_change_membership_holds_a_transfer_drain_until_raft_answers_it",
+        TEST_LIMIT,
+    );
+    abandoned_change_holds_the_transfer_drain(AbandonedChange::ChangeMembership);
 }
 
 /// A partition isolating one follower: `LOCAL` reads on it keep working,
@@ -1164,10 +1231,30 @@ fn remove_needs_a_quorum_of_the_old_voter_set_too() {
             !p.last_error.is_empty()
         });
     }
-    let e = short_client(&tb, leader, Duration::from_secs(1))
-        .admin_remove(d, true)
-        .unwrap_err();
-    let m = e.to_string();
+    // Issue #260: on a starved host (1 core, 8 CPU burners) the live
+    // follower's appends can time out too, so the leader momentarily counts
+    // it unreachable and refuses on the NEW voter set first ("only 1 of
+    // them are reachable"). That refusal is the documented momentary one
+    // (test timing, not a bug): ask again until the leader hears from it
+    // and refuses on the old voter set, which is what this test pins.
+    let deadline = Instant::now() + CLUSTER_WAIT;
+    let m = loop {
+        let e = short_client(&tb, leader, Duration::from_secs(1))
+            .admin_remove(d, true)
+            .unwrap_err();
+        let m = e.to_string();
+        if m.contains("vote on the change") || Instant::now() >= deadline {
+            break m;
+        }
+        // Only the momentary new-voter-set refusal is asked again; any
+        // other answer fails at once.
+        assert!(
+            m.contains("below quorum") && m.contains("reachable now"),
+            "unexpected refusal: {m}"
+        );
+        eprintln!("momentary refusal, asking again: {m}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
     assert!(
         m.contains("below quorum") && m.contains("vote on the change"),
         "{m}"

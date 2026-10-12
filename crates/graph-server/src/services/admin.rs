@@ -51,7 +51,7 @@
 //! the outcome (a guard).
 use super::{status, Ctx};
 use crate::forward::{forward_error, Route};
-use crate::raft::NodeId;
+use crate::raft::{NodeId, RaftSettings};
 use crate::SERVER_VERSION;
 use graph_proto::{pb, PROTOCOL_VERSION};
 use graph_store::StoreError;
@@ -75,9 +75,34 @@ const SNAPSHOT_WAIT: Duration = Duration::from_secs(600);
 /// `Status`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `TransferLeader`'s target catch-up wait is this many
+/// `election_timeout_max` ([`transfer_catch_up`]; issue #260)...
+pub const TRANSFER_CATCH_UP_ELECTIONS: u64 = 5;
+
+/// ... but never under this floor (the former fixed bound), so a test
+/// cluster with short elections keeps its slack on a starved host.
+pub const TRANSFER_CATCH_UP_FLOOR: Duration = Duration::from_secs(10);
+
 /// How long `TransferLeader` waits for the target to catch up before it
-/// refuses.
-pub const TRANSFER_CATCH_UP: Duration = Duration::from_secs(10);
+/// refuses: [`TRANSFER_CATCH_UP_ELECTIONS`] times `election_max_ms`, at
+/// least [`TRANSFER_CATCH_UP_FLOOR`] (10 s with the cluster defaults).
+pub fn transfer_catch_up(s: &RaftSettings) -> Duration {
+    Duration::from_millis(
+        s.election_max_ms
+            .saturating_mul(TRANSFER_CATCH_UP_ELECTIONS),
+    )
+    .max(TRANSFER_CATCH_UP_FLOOR)
+}
+
+/// The longest a `TransferLeader` can take on the leader before it
+/// answers: two catch-up waits, the in-flight drain, the settle wait and
+/// the campaign wait (75 s with the cluster defaults). A client's admin
+/// deadline (`graph_client::ClientConfig::admin_deadline`, default 180 s)
+/// must exceed it, or the client gives up on a transfer still in progress;
+/// `membership.rs` pins that.
+pub fn transfer_worst_case(s: &RaftSettings) -> Duration {
+    2 * transfer_catch_up(s) + s.transfer_drain_bound() + TRANSFER_SETTLE + TRANSFER_WAIT
+}
 
 /// How long `TransferLeader` keeps asking the target to campaign.
 pub const TRANSFER_WAIT: Duration = Duration::from_secs(20);
@@ -414,11 +439,12 @@ pub const TRIGGER_UNANSWERED: &str = "did not answer TriggerElect";
 pub const TRANSFER_POLL: Duration = Duration::from_millis(50);
 
 /// Wait until `to` matched this leader's last log index (lag zero), or
-/// refuse after [`TRANSFER_CATCH_UP`].
+/// refuse after [`transfer_catch_up`].
 async fn wait_caught_up(ctx: &Ctx, to: NodeId) -> Result<(), Status> {
+    let bound = transfer_catch_up(&ctx.raft.settings);
     ctx.raft
         .raft
-        .wait(Some(TRANSFER_CATCH_UP))
+        .wait(Some(bound))
         .metrics(
             |m| {
                 let last = m.last_log_index;
@@ -433,7 +459,7 @@ async fn wait_caught_up(ctx: &Ctx, to: NodeId) -> Result<(), Status> {
         .map(|_| ())
         .map_err(|_| {
             rejected(format!(
-                "node {to} did not catch up with the leader within {TRANSFER_CATCH_UP:?}; \
+                "node {to} did not catch up with the leader within {bound:?}; \
                  leadership stays here"
             ))
         })
@@ -462,15 +488,12 @@ async fn transfer_guarded(ctx: &Ctx, to: NodeId) -> Result<u64, Status> {
     // A proposal that passed its check before the flag went up may still
     // append: wait until none is in flight (each ends once applied), so
     // the lag check below sees every entry this leader will append.
-    let drained = Instant::now() + TRANSFER_CATCH_UP;
-    while ctx.raft.in_flight.load(Ordering::SeqCst) > 0 {
-        if Instant::now() >= drained {
-            return Err(rejected(format!(
-                "writes in flight did not finish within {TRANSFER_CATCH_UP:?}; leadership \
-                 stays here"
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // Bounded by the election config (issue #260), not a fixed time.
+    let bound = ctx.raft.settings.transfer_drain_bound();
+    if !ctx.raft.drain_in_flight(bound).await {
+        return Err(rejected(format!(
+            "writes in flight did not finish within {bound:?}; leadership stays here"
+        )));
     }
     // Re-check under the guard: no new write is accepted now, so what was
     // in flight when the first check passed must reach the target too.
@@ -1338,6 +1361,30 @@ impl pb::admin_server::Admin for AdminService {
 #[cfg(test)]
 mod tests {
     use super::check_moved_member_cluster;
+
+    /// Issue #260: the transfer catch-up wait tracks the election config,
+    /// with the old 10 s as its floor; the worst case is pinned.
+    #[test]
+    fn transfer_catch_up_tracks_the_election_config() {
+        use super::{transfer_catch_up, transfer_worst_case};
+        use crate::raft::RaftSettings;
+        use std::time::Duration;
+        let c = RaftSettings::cluster();
+        assert_eq!(transfer_catch_up(&c), Duration::from_secs(10));
+        let slow = RaftSettings {
+            election_min_ms: 3000,
+            election_max_ms: 6000,
+            ..c
+        };
+        assert_eq!(transfer_catch_up(&slow), Duration::from_secs(30));
+        let fast = RaftSettings {
+            election_min_ms: 100,
+            election_max_ms: 200,
+            ..c
+        };
+        assert_eq!(transfer_catch_up(&fast), Duration::from_secs(10), "floor");
+        assert_eq!(transfer_worst_case(&c), Duration::from_secs(75));
+    }
 
     /// The upload answers before the caller's deadline.
     #[test]
