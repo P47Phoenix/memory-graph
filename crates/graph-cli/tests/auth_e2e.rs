@@ -374,8 +374,8 @@ fn a_proxy_refusal_without_details_maps_to_exit_8_and_9() {
                 assert_no_token(&o, &[&token]);
                 let calls = stub.calls() - before;
                 assert!(
-                    (1..=3).contains(&calls),
-                    "{code:?} {args:?}: {calls} calls (never retried)"
+                    calls == 1,
+                    "{code:?} {args:?}: {calls} calls (one call, never retried)"
                 );
             }
         }

@@ -781,6 +781,6 @@ mod tests {
             "a hint naming the lost node itself is never followed"
         );
         let leader = "10.0.0.3:7000";
-        assert_eq!(next_target(peer, lost, leader.into(), false), leader);
+        assert_eq!(next_target(peer, other, leader.into(), false), leader);
     }
 }

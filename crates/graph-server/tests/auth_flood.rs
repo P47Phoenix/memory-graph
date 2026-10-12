@@ -2,8 +2,9 @@
 //! token produce a bounded number of log lines (the per-peer rate limit)
 //! and exactly 10,000 more `mg_auth_refusals_total`, and a valid caller's
 //! p99 latency while the flood runs stays within 2x of its unloaded
-//! baseline (plus a small absolute allowance: the baseline on loopback is
-//! well under a millisecond, where scheduler noise alone is 2x).
+//! baseline. Deviation from ADR 0012's strict 2x: the bound is
+//! max(2 x baseline, baseline + 3 ms), because the loopback baseline is
+//! under a millisecond, where scheduler noise alone can double a p99.
 //!
 //! Its own test binary: it installs the process-wide subscriber.
 use graph_core::Extractor;
@@ -17,7 +18,7 @@ const FLOOD: u64 = 10_000;
 /// Calls the flood keeps in flight at once.
 const FLOOD_CONCURRENCY: usize = 8;
 /// Absorbs scheduler noise at sub-millisecond baselines.
-const SLACK: Duration = Duration::from_millis(25);
+const SLACK: Duration = Duration::from_millis(3);
 
 fn rust() -> Vec<Box<dyn Extractor>> {
     vec![Box::new(graph_lang_rust::RustExtractor)]
@@ -158,7 +159,7 @@ fn a_flood_of_bad_tokens_is_counted_logs_little_and_does_not_starve_valid_caller
     );
     assert!(during.len() >= 20, "the valid caller ran during the flood");
     assert!(
-        loaded <= baseline * 2 + SLACK,
+        loaded <= (baseline * 2).max(baseline + SLACK),
         "valid p99 {loaded:?} during the flood vs {baseline:?} unloaded"
     );
 }
