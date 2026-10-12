@@ -33,9 +33,15 @@
 //! free format when first on their line and not a lone verb (`EXIT.`,
 //! `GOBACK.`, `END-IF.`). Names may be all digits (`100 SECTION.`, `100.`
 //! in the PROCEDURE DIVISION). A word continued on a `-` indicator line is
-//! one name (the indicator itself is a Comment token). A line with a tab in
-//! the sequence area is tab-indented: the tab advances to the next multiple
-//! of 8 columns, and Area A is judged by those visual columns. Known limits: a picture string with an inner
+//! one name (the indicator itself is a Comment token), including a split
+//! after a hyphen (`MAIN-` / `SEC`). A line with a tab in the sequence area
+//! is tab-indented: the tab advances to the next multiple of 8 columns, and
+//! Area A is judged by those visual columns. Such a line's code is lexed
+//! with the free-format tokenizer (with `*>` comments and column 72 still
+//! honoured), so it never has an indicator column of its own.
+//!
+//! Known limits: all-digit hyphenated names (`1000-2000.`) are not one
+//! word; a picture string with an inner
 //! period (`PIC ZZ9.99`) is read as a sentence end, which is harmless unless
 //! a level number `01`/`77` follows it; `COPY` members are not expanded; a
 //! `>>SOURCE FORMAT` switch after the first line is not followed; unnamed
@@ -296,6 +302,11 @@ fn tokenize_fixed(src: &str) -> Vec<TokenDecl> {
         if a < b {
             for mut t in tokenize_with(&src[a..b], COBOL_TOKENIZER) {
                 shift(&mut t, a, line - 1, 0);
+                // Only reference-format lines have an indicator column;
+                // tab lines (lexed apart) never do.
+                if t.text == "-" && t.span.start_col == 7 {
+                    t.class = TokenClass::Comment;
+                }
                 out.push(t);
             }
         }
@@ -312,11 +323,6 @@ fn tokenize_fixed(src: &str) -> Vec<TokenDecl> {
         line += 1;
     }
     flush(&mut out, chunk, src.len(), chunk_line);
-    for t in &mut out {
-        if t.text == "-" && t.span.start_col == 7 {
-            t.class = TokenClass::Comment;
-        }
-    }
     out
 }
 
@@ -723,12 +729,27 @@ fn join_continued(tokens: &[TokenDecl]) -> Vec<TokenDecl> {
     };
     let mut out: Vec<TokenDecl> = Vec::new();
     for t in tokens.iter().filter(|t| t.class != TokenClass::Comment) {
-        if let Some(p) = out.last_mut() {
-            if p.span.end_line < t.span.start_line
-                && continued.binary_search(&t.span.start_line).is_ok()
-                && word(p)
-                && word(t)
+        let cont = continued.binary_search(&t.span.start_line).is_ok();
+        // `MAIN-` / `-    SEC`: a hyphen touching the word before the break.
+        if cont && word(t) && out.len() >= 2 {
+            let (d, w) = (&out[out.len() - 1], &out[out.len() - 2]);
+            if d.text == "-"
+                && d.span.start == w.span.end
+                && w.span.end_line == d.span.end_line
+                && d.span.end_line < t.span.start_line
+                && word(w)
             {
+                out.pop();
+                let p = out.last_mut().unwrap();
+                p.text.push('-');
+                p.text.push_str(&t.text);
+                p.span = span_between(&p.span, &t.span);
+                p.class = TokenClass::Identifier;
+                continue;
+            }
+        }
+        if let Some(p) = out.last_mut() {
+            if p.span.end_line < t.span.start_line && cont && word(p) && word(t) {
                 p.text.push_str(&t.text);
                 p.span = span_between(&p.span, &t.span);
                 p.class = TokenClass::Identifier;

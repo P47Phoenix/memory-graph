@@ -800,6 +800,31 @@ fn tab_indented_area_a() {
         .any(|t| t.text == "000100" && t.class == TokenClass::Comment));
 }
 
+#[test]
+fn continuation_after_trailing_hyphen() {
+    let src = "       PROCEDURE DIVISION.\n       MAIN-\n      -    SEC SECTION.\n       P.\n           STOP RUN.\n";
+    let s = syms(src);
+    assert_eq!(find(&s, "MAIN-SEC").2, "section");
+    assert!(contains(&s, "MAIN-SEC", "P"));
+}
+
+#[test]
+fn minus_at_char_col_7_on_a_tab_line_is_not_an_indicator() {
+    // `\t     - B`: the `-` is at char column 7 but visual column 14.
+    let src =
+        "       PROCEDURE DIVISION.\n       P.\n           COMPUTE X = A\n\t     - B.\n       Q.\n";
+    let toks = tokenize(src, false);
+    let minus = toks
+        .iter()
+        .find(|t| t.text == "-" && t.span.start_line == 4)
+        .unwrap();
+    assert_eq!(minus.span.start_col, 7);
+    assert_ne!(minus.class, TokenClass::Comment);
+    let s = syms(src);
+    assert!(!names(&s).contains(&"AB"), "{s:?}");
+    assert_eq!(find(&s, "Q").2, "paragraph");
+}
+
 /// Line and column (1-based, a BOM taking none) of byte `p`.
 fn line_col(src: &str, p: usize) -> (u32, u32) {
     let before = &src[..p];
