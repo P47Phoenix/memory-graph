@@ -257,46 +257,66 @@ fn snapshot_install_is_one_span_each_side_and_raft_rpcs_are_not_exported() {
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
     assert!(tb.node(laggard).raft().unwrap().snapshots_installed() >= 1);
 
-    // Both sides' spans end once the install answered.
-    setup().collector.wait_spans(WAIT, |all| {
-        let n = |root: bool| {
-            all.iter()
-                .filter(|s| s.name == "install_snapshot" && s.parent_span_id.is_empty() == root)
-                .count()
+    // Both sides' spans end once the install answered, but each side
+    // exports on its own schedule, and a busy host can retry an install (a
+    // sender whose receiver never ran). So pair them per install, by trace
+    // id: wait until some install has both sides and no receiver is waiting
+    // on its sender's export.
+    let paired = |all: &[CollectedSpan]| {
+        let installs: Vec<_> = all
+            .iter()
+            .filter(|s| s.name == "install_snapshot")
+            .collect();
+        let has_root = |trace: &str| {
+            installs
+                .iter()
+                .any(|s| s.trace_id == trace && s.parent_span_id.is_empty())
         };
-        n(true) >= 1 && n(false) >= n(true)
-    });
+        let receivers: Vec<_> = installs
+            .iter()
+            .filter(|s| !s.parent_span_id.is_empty())
+            .collect();
+        !receivers.is_empty() && receivers.iter().all(|r| has_root(&r.trace_id))
+    };
+    let waited = setup().collector.wait_spans(WAIT, paired);
     let spans = flushed();
     let installs: Vec<_> = spans
         .iter()
         .filter(|s| s.name == "install_snapshot")
         .collect();
-    let senders: Vec<_> = installs
-        .iter()
-        .filter(|s| s.parent_span_id.is_empty())
-        .collect();
-    let receivers: Vec<_> = installs
-        .iter()
-        .filter(|s| !s.parent_span_id.is_empty())
-        .collect();
     let mut names: Vec<_> = spans.iter().map(|s| s.name.clone()).collect();
     names.sort();
     names.dedup();
     assert!(
-        !senders.is_empty(),
-        "the leader's span: {installs:#?} among {names:?}"
+        paired(&waited),
+        "a sender/receiver pair per install: {installs:#?} among {names:?}"
     );
-    assert_eq!(
-        senders.len(),
-        receivers.len(),
-        "one span on each side per install: {installs:#?}"
-    );
-    for r in &receivers {
-        let s = senders
-            .iter()
-            .find(|s| s.span_id == r.parent_span_id)
-            .expect("the receiver's parent is the sender's span");
-        assert_eq!(s.trace_id, r.trace_id);
+    // Only the installs the wait accepted (their sender exported then): a
+    // later install's receiver may export after the wait, before its sender.
+    let mut traces: Vec<_> = waited
+        .iter()
+        .filter(|s| s.name == "install_snapshot" && s.parent_span_id.is_empty())
+        .map(|s| s.trace_id.clone())
+        .collect();
+    traces.sort();
+    traces.dedup();
+    for trace in &traces {
+        let t: Vec<_> = installs.iter().filter(|s| &s.trace_id == trace).collect();
+        let senders: Vec<_> = t.iter().filter(|s| s.parent_span_id.is_empty()).collect();
+        let receivers: Vec<_> = t.iter().filter(|s| !s.parent_span_id.is_empty()).collect();
+        assert_eq!(senders.len(), 1, "one sender span per install: {t:#?}");
+        assert!(
+            receivers.len() <= 1,
+            "at most one receiver span per install: {t:#?}"
+        );
+        let s = senders[0];
+        let Some(r) = receivers.first() else {
+            continue;
+        };
+        assert_eq!(
+            r.parent_span_id, s.span_id,
+            "the receiver's parent is the sender's span"
+        );
         assert_eq!(
             s.attr("memory_graph.snapshot_bytes"),
             r.attr("memory_graph.snapshot_bytes")

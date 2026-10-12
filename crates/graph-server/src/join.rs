@@ -628,7 +628,7 @@ pub async fn resolve_bootstrap_or_join(
             tracing::warn!(
                 node_id = me,
                 "--bootstrap-or-join: removing a voter without --auto-promote; the cluster runs \
-                 with one voter fewer until this node is promoted again (`cluster promote {me}`)"
+                 with one voter fewer until this node is promoted again (`cluster promote <node_id>`)"
             );
         }
         tracing::warn!(

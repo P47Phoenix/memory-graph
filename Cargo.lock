@@ -763,6 +763,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tonic",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

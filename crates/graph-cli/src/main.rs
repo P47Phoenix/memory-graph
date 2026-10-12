@@ -1433,7 +1433,18 @@ fn run() -> Result<i32> {
             // Spans wait for the node's identity (set on ready, below).
             graph_server::telemetry::hold_until_identity();
         }
-        graph_cli::logging::init(*log_format, log_level, otel_layer)?;
+        // Logs (story 53): the OTLP bridge, behind the same --log-level.
+        let log_layer = telemetry
+            .as_ref()
+            .and_then(graph_server::telemetry::log_layer);
+        graph_cli::logging::init(
+            *log_format,
+            log_level,
+            graph_cli::logging::OtelLayers {
+                traces: otel_layer,
+                logs: log_layer,
+            },
+        )?;
         let _ = JSON_LOGS.set(*log_format == graph_cli::logging::LogFormat::Json);
         telemetry_cfg.log_problems();
         if let (Some(_), Some(endpoint)) = (&telemetry, &telemetry_cfg.endpoint) {

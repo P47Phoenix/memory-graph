@@ -596,8 +596,8 @@ impl<T> Source<T> {
                     tracing::error!(
                         file = %self.path.display(),
                         error = %e,
-                        "{}: cannot read the file; keeping the loaded set",
-                        self.what
+                        what = self.what,
+                        "cannot read the file; keeping the loaded set"
                     );
                 }
                 st.read_failed = true;
@@ -618,7 +618,7 @@ impl<T> Source<T> {
                 self.cur.store(Arc::new(set));
                 st.loaded = h;
                 st.failed = None;
-                tracing::info!(file = %self.path.display(), "{}: reloaded", self.what);
+                tracing::info!(file = %self.path.display(), what = self.what, "reloaded");
                 Reload::Reloaded
             }
             Err(e) => {
@@ -626,8 +626,8 @@ impl<T> Source<T> {
                     tracing::error!(
                         file = %self.path.display(),
                         error = %e,
-                        "{}: the file failed validation; keeping the loaded set",
-                        self.what
+                        what = self.what,
+                        "the file failed validation; keeping the loaded set"
                     );
                 }
                 st.failed = Some(h);
@@ -647,7 +647,11 @@ fn warn_if_readable_by_others(what: &str, path: &Path) {
                  restrict it (chmod 600)",
                 path.display()
             );
-            tracing::warn!(file = %path.display(), "{what}: readable by group or others; restrict it (chmod 600)");
+            tracing::warn!(
+                file = %path.display(),
+                what,
+                "readable by group or others; restrict it (chmod 600)"
+            );
         }
     }
 }
