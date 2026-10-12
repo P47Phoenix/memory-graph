@@ -254,6 +254,10 @@ impl NameCaches {
         }
     }
 
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes.load(SeqCst)
+    }
+
     pub(crate) fn set_max_bytes(&self, n: usize) {
         self.max_bytes.store(n, SeqCst);
         for slot in [&self.fold, &self.exact] {

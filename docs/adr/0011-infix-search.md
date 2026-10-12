@@ -258,7 +258,7 @@ The remaining cost of the common needle is ordering its candidate files (one `fi
 ### Deviations accepted
 
 - **`*` alone still lists every symbol.** The D2 table's "rejected" row for `*` is withdrawn.
-- **The name cache of D4 step 1 is deferred.** The ADR 0008 pool it would be charged to does not exist yet. Story 70 may add the cache or `sym_tri`.
+- **The name cache of D4 step 1 is not charged to the ADR 0008 pool.** That pool does not exist yet. Story 70 added the cache with its own bound and chose it over `sym_tri` (see [Result of story 70](#result-of-story-70-against-the-amended-gate)).
 - **No audit of which extractors emit `*` in names.** The `\*` escape works either way.
 - **Kept, as documented in `docs/guide/querying.md`:**
   - patterns ending in `**` keep the "ambiguous" message;

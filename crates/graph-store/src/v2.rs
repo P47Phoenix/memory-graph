@@ -590,7 +590,7 @@ pub struct V2Store {
     pub(crate) db: GenDb,
     /// Epic story 70: the in-memory symbol name caches, shared with this
     /// store's snapshots.
-    names: Arc<NameCaches>,
+    pub(crate) names: Arc<NameCaches>,
     registry: Registry,
     pub(crate) chunk_bytes: usize,
     /// Test-only (#154): skip the open-batch marker writes, so a timing test
@@ -624,7 +624,7 @@ pub type MarkedCommitHook = Arc<dyn Fn(&RaftMarker) -> Result<()> + Send + Sync>
 pub struct V2Snapshot {
     rt: ReadTransaction,
     /// The store's name caches and the write generation `rt` sees.
-    names: Arc<NameCaches>,
+    pub(crate) names: Arc<NameCaches>,
     generation: Option<u64>,
     tracker: SharedSnapshotTracker,
     tracker_id: u64,
@@ -4046,7 +4046,7 @@ impl V2Store {
 
         let V2Store {
             db,
-            names: _,
+            names,
             registry,
             chunk_bytes,
             cache_bytes,
@@ -4069,6 +4069,7 @@ impl V2Store {
 
         let mut reopened = Self::open_with_cache_bytes(&path, cache_bytes)?;
         reopened.chunk_bytes = chunk_bytes;
+        reopened.names.set_max_bytes(names.max_bytes());
         reopened.registry = registry;
         // Any snapshot handles taken on the pre-compaction store are already
         // invalidated by construction (`compact` consumes `self`, so no

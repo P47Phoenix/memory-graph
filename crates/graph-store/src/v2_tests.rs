@@ -2179,3 +2179,40 @@ fn name_cache_answers_equal_the_walk() {
     check("evicted");
     assert_eq!(on.name_cache_bytes(), (0, 0));
 }
+
+/// Epic story 70: a read begun while a write transaction is open, or after
+/// it committed but before it was counted, sees no known generation, so it
+/// never uses a name cache.
+#[test]
+fn begin_read_gen_is_unknown_around_a_write() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g.redb")).unwrap();
+    let (_, before) = s.db.begin_read_gen().unwrap();
+    let before = before.expect("no write in flight");
+    let wt = s.db.begin_write().unwrap();
+    assert_eq!(s.db.begin_read_gen().unwrap().1, None, "write open");
+    // `raw_write` counts its write only after the closure returns: a read
+    // inside it is in the window between a commit and the count.
+    s.db.raw_write(|db| {
+        assert_eq!(s.db.begin_read_gen().unwrap().1, None, "uncounted write");
+        let _ = db;
+    });
+    wt.commit().unwrap();
+    let (_, after) = s.db.begin_read_gen().unwrap();
+    assert_eq!(after, Some(before + 2), "two writes finished");
+}
+
+/// Epic story 70: `compact` keeps the name-cache bound, as it keeps the
+/// other settings.
+#[test]
+fn compact_keeps_the_name_cache_bound() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g.redb")).unwrap();
+    s.set_name_cache_max_bytes(0);
+    let ext = span_ext(&[("Gadget", SymbolKind::Function, 0, 1)], &[]);
+    s.ingest_file("o", "r", "a.x", "text", &ext).unwrap();
+    let (s, _) = s.compact().unwrap();
+    assert_eq!(s.names.max_bytes(), 0);
+    assert_eq!(hit_names(&s, "*dge*"), ["Gadget"]);
+    assert_eq!(s.name_cache_bytes(), (0, 0), "still off after compact");
+}
