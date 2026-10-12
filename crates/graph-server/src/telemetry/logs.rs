@@ -113,8 +113,8 @@ where
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(provider)
             // Asked per event: `bridged` depends on the emitting thread,
             // which a cached callsite interest would freeze at the first
-            // thread to log there (and see `traces::AskEachTime`).
-            .with_filter(super::traces::AskEachTime {
+            // thread to log there (and see `AskEachTime`).
+            .with_filter(super::AskEachTime {
                 callsite: bridged_callsite,
                 enabled: bridged,
             })
@@ -245,6 +245,40 @@ mod tests {
         fn shutdown_with_timeout(&self, _: Duration) -> OTelSdkResult {
             Ok(())
         }
+    }
+
+    /// #309, #310, event side: an `enabled` call with nothing emitted after
+    /// it must not hide the next bridged event on that thread.
+    #[test]
+    fn a_leftover_enabled_call_does_not_hide_the_next_bridged_event() {
+        use tracing_subscriber::layer::SubscriberExt;
+        // A callsite the bridge rejects (a span, not an event).
+        let hint = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            tracing::debug_span!(target: "openraft::raft", "hint")
+                .metadata()
+                .expect("a plain registry enables everything")
+        });
+        let keep = Keep::default();
+        let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_log_processor(keep.clone())
+            .build();
+        let layer =
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider)
+                .with_filter(crate::telemetry::AskEachTime {
+                    callsite: bridged_callsite,
+                    enabled: bridged,
+                });
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            for i in 0..3 {
+                tracing::dispatcher::get_default(|d| d.enabled(hint));
+                tracing::warn!(target: "graph_server::test", "bridged");
+                assert_eq!(
+                    keep.0.lock().unwrap().len(),
+                    i + 1,
+                    "event {i} never reached the bridge"
+                );
+            }
+        });
     }
 
     #[test]
