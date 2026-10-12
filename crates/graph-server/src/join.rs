@@ -671,8 +671,12 @@ pub async fn remove_lost_self(
             // A node-originated membership change. With auth on it is
             // marked forwarded, so the cluster secret carries the `write`
             // role (ADR 0012 D3), and a non-leader answers `NotLeader`,
-            // which is followed. With auth off the peer forwards it, as
-            // before (the leader it knows may be the lost node itself).
+            // which is followed once (`next_target`: the hint may name the
+            // lost node itself, which is this node and does not serve yet,
+            // so an unreachable hint falls back to `peer`). The identity is
+            // this node's own id (issue #301): the lost incarnation is
+            // removed by its successor, and the leader logs that id. With
+            // auth off the peer forwards it, as before.
             let headers = NodeHeaders {
                 auth: Arc::clone(auth),
                 forwarded_by: auth.enabled().then_some(id),
@@ -710,12 +714,22 @@ pub async fn remove_lost_self(
                         st.message().to_string()
                     }
                     Next::Retry(next) => {
-                        target = next;
+                        // A hint naming the lost node (this node, by id)
+                        // is never followed: its address is this process,
+                        // which may hold the port without answering yet.
+                        let names_me = matches!(
+                            WireError::from(&st),
+                            WireError::NotLeader { leader_id: Some(l), .. } if l == id
+                        );
+                        target = next_target(peer, &target, next, names_me);
                         st.message().to_string()
                     }
                 }
             }
-            Err(_) => format!("no answer within {ATTEMPT_TIMEOUT:?}"),
+            Err(_) => {
+                target = peer.to_string();
+                format!("no answer within {ATTEMPT_TIMEOUT:?}")
+            }
         };
         if Instant::now() + delay > deadline {
             return Err(format!(
@@ -724,5 +738,49 @@ pub async fn remove_lost_self(
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(2));
+    }
+}
+
+/// Where [`remove_lost_self`] sends its next attempt (issue #301): a new
+/// leader hint is followed once, and anything else (the hinted address is
+/// unreachable, or answers `NoLeader`) goes back to `peer`. A hint that
+/// names the lost node itself (`names_me`) is never followed: a peer that
+/// has not yet noticed the lost leader is gone still names it, and that
+/// address is this very process, which does not answer yet (it may hold
+/// the port, so a call there hangs rather than failing). Following it,
+/// every retry went there until the timeout while the peer had long since
+/// elected a new leader.
+#[doc(hidden)]
+pub fn next_target(peer: &str, current: &str, hint: String, names_me: bool) -> String {
+    if !names_me && hint != current {
+        hint
+    } else {
+        peer.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_target;
+
+    /// Issue #301: a hint is followed once; an unreachable hint (the lost
+    /// node's own address) or `NoLeader` there goes back to the peer.
+    #[test]
+    fn a_hint_is_followed_once_then_the_peer_again() {
+        let peer = "10.0.0.2:7000";
+        let lost = "10.0.0.1:7000";
+        let other = "10.0.0.4:7000";
+        let t = next_target(peer, peer, other.into(), false);
+        assert_eq!(t, other, "a new hint is followed");
+        let t = next_target(peer, &t, t.clone(), false);
+        assert_eq!(t, peer, "no new hint there (unreachable): back to the peer");
+        assert_eq!(next_target(peer, peer, peer.into(), false), peer);
+        assert_eq!(
+            next_target(peer, peer, lost.into(), true),
+            peer,
+            "a hint naming the lost node itself is never followed"
+        );
+        let leader = "10.0.0.3:7000";
+        assert_eq!(next_target(peer, lost, leader.into(), false), leader);
     }
 }

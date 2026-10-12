@@ -702,6 +702,70 @@ fn remove_lost_self_retries_only_the_transient_refusal() {
     check_two_voters_left(&tb, target, slow);
 }
 
+/// Issue #301: with auth on, `remove_lost_self` is a node-originated,
+/// forwarded-marked `Remove` (the cluster secret with role `write`), so a
+/// follower answers `NotLeader` instead of forwarding. Sent the moment the
+/// leader dies, the follower still names the dead leader, whose address
+/// does not answer: the removal must go back to the follower and succeed
+/// once a new leader is elected, not chase the dead address until its
+/// timeout. A client token cannot do the same thing (`Remove` with the
+/// cluster secret needs the forwarded marker; without the secret, a
+/// forwarded-marked call is unauthenticated).
+#[test]
+fn remove_lost_self_with_auth_on_removes_a_dead_leader() {
+    let _w = watchdog(
+        "remove_lost_self_with_auth_on_removes_a_dead_leader",
+        TEST_LIMIT,
+    );
+    let f = graph_server::testing::auth::AuthFixture::new();
+    let mut tb = ClusterTestbed::with_config(3, rust_only(), |_, c| c.auth = f.config());
+    tb.set_client_credentials(Some(f.creds(&f.write)));
+    tb.form();
+    let (p, bytes) = small_file(0);
+    tb.client(tb.leader())
+        .index_bytes("o", "r", &p, &bytes, None)
+        .unwrap();
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let lost = tb.leader();
+    let others = node_ids_other_than(&tb, &[lost]);
+    let via = tb.node(others[0]).endpoint();
+    // The lost node's successor holds the same auth files.
+    let auth = graph_server::auth::Auth::load(&f.config(), true).unwrap();
+    // A node without the cluster secret is refused, and nothing changes.
+    let no_secret = graph_server::auth::Auth::disabled();
+    let e = rt()
+        .block_on(graph_server::join::remove_lost_self(
+            &via,
+            lost,
+            Duration::from_secs(3),
+            &no_secret,
+        ))
+        .unwrap_err();
+    assert!(
+        e.to_lowercase().contains("credential") || e.to_lowercase().contains("auth"),
+        "{e}"
+    );
+    assert_eq!(tb.membership(others[0]).0.len(), 3);
+
+    tb.node_mut(lost).kill();
+    let t0 = Instant::now();
+    rt().block_on(graph_server::join::remove_lost_self(
+        &via,
+        lost,
+        Duration::from_secs(60),
+        &auth,
+    ))
+    .unwrap_or_else(|e| panic!("remove_lost_self with auth on: {e}"));
+    eprintln!("removed the dead leader after {:?}", t0.elapsed());
+    tb.wait_voters(&others, CLUSTER_WAIT);
+    let new = tb.wait_leader(CLUSTER_WAIT);
+    assert!(others.contains(&new));
+    let (p, bytes) = small_file(1);
+    tb.client(new)
+        .index_bytes("o", "r", &p, &bytes, None)
+        .unwrap();
+}
+
 /// A raw `Admin` client of `endpoint` (no retries, no leader following).
 async fn admin_client(
     endpoint: &str,

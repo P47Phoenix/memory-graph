@@ -984,3 +984,287 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Issue #300: the remaining D10 items.
+
+/// Every file under `dir` (relative path and size), recursively.
+fn tree(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    if dir.exists() {
+        for p in walk_all(dir) {
+            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            out.push((
+                p.strip_prefix(dir).unwrap().to_string_lossy().into_owned(),
+                len,
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+fn walk_all(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.push(p.clone());
+            out.extend(walk_all(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// D10: `Raft.InstallSnapshot` without the cluster secret is refused
+/// before any chunk is written: a streamed header and 1 MiB of chunks with
+/// no credential, a client `write` token, a `read` token and another
+/// cluster's secret each get `UNAUTHENTICATED`, and nothing appears or
+/// changes under the follower's `snapshots/` (or its data directory).
+#[test]
+fn a_refused_install_snapshot_writes_nothing() {
+    let f = AuthFixture::new();
+    let tb = auth_cluster(&f, |_| f.tokens.clone());
+    let w = client_of(&tb, tb.leader(), &f.write, &f);
+    w.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
+    tb.wait_applied(tb.leader_last_log_index(), Duration::from_secs(20));
+    let follower = tb.ids().into_iter().find(|i| *i != tb.leader()).unwrap();
+    let dir = tb.node(follower).data_dir().to_path_buf();
+    let snaps = dir.join("snapshots");
+    let names = |d: &std::path::Path| {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let (before_snaps, before_root) = (tree(&snaps), names(&dir));
+    let rogue = graph_server::auth::new_credential("mgc_").to_string();
+    let creds: Vec<(&str, Option<String>)> = vec![
+        ("none", None),
+        ("write token", Some(f.write.clone())),
+        ("read token", Some(f.read.clone())),
+        ("another cluster's secret", Some(rogue)),
+    ];
+    let ep = tb.node(follower).endpoint();
+    for (what, cred) in creds {
+        let ep = ep.clone();
+        let code = rt().block_on(async move {
+            let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut g = tonic::client::Grpc::new(ch);
+            g.ready().await.unwrap();
+            let header = pb::InstallSnapshotRequest {
+                msg: Some(pb::install_snapshot_request::Msg::Header(
+                    pb::InstallSnapshotHeader::default(),
+                )),
+            };
+            let chunks = (0..16).map(|i| pb::InstallSnapshotRequest {
+                msg: Some(pb::install_snapshot_request::Msg::Chunk(vec![
+                    i as u8;
+                    64 << 10
+                ])),
+            });
+            let msgs: Vec<_> = std::iter::once(header).chain(chunks).collect();
+            let mut req = tonic::Request::new(tokio_stream::iter(msgs));
+            req.metadata_mut().insert(
+                "mg-protocol-version",
+                graph_proto::PROTOCOL_VERSION.to_string().parse().unwrap(),
+            );
+            if let Some(c) = cred {
+                req.metadata_mut()
+                    .insert("authorization", format!("Bearer {c}").parse().unwrap());
+            }
+            let codec: tonic_prost::ProstCodec<
+                pb::InstallSnapshotRequest,
+                pb::InstallSnapshotResponse,
+            > = Default::default();
+            let p = tonic::codegen::http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Raft/InstallSnapshot",
+            );
+            match tokio::time::timeout(Duration::from_secs(10), g.client_streaming(req, p, codec))
+                .await
+            {
+                Ok(Ok(_)) => Code::Ok,
+                Ok(Err(st)) => st.code(),
+                Err(_) => Code::DeadlineExceeded,
+            }
+        });
+        assert_eq!(code, Code::Unauthenticated, "{what}");
+    }
+    assert_eq!(tree(&snaps), before_snaps, "nothing under snapshots/");
+    assert_eq!(names(&dir), before_root, "no new file in the data dir");
+    // The node still replicates.
+    w.index_bytes("o", "r", "b.rs", b"fn b() {}", None).unwrap();
+    tb.wait_applied(tb.leader_last_log_index(), Duration::from_secs(20));
+}
+
+/// D2: an in-flight streaming request keeps the credential check it
+/// started with across a reload. An `Index` stream authenticated by a
+/// token that a reload removes half-way finishes (both files indexed); the
+/// token's next call is refused.
+#[test]
+fn an_in_flight_index_stream_survives_a_reload_that_removes_its_token() {
+    let f = AuthFixture::new();
+    let d = tempfile::tempdir().unwrap();
+    let ts = start(&f, &d.path().join("g.redb"));
+    let auth = ts.running().unwrap().auth();
+    let ep = ts.endpoint();
+    let token = f.write.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<pb::IndexRequest>(4);
+    let file = |p: &str, src: &str| pb::IndexRequest {
+        msg: Some(pb::index_request::Msg::File(pb::FileBytes {
+            path: p.into(),
+            bytes: src.as_bytes().to_vec(),
+            ..Default::default()
+        })),
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let call = runtime.spawn(async move {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut c = pb::write_client::WriteClient::with_interceptor(ch, graph_proto::SendVersion);
+        let mut req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        c.index(req).await.map(|r| r.into_inner())
+    });
+    runtime.block_on(async {
+        tx.send(pb::IndexRequest {
+            msg: Some(pb::index_request::Msg::Header(pb::IndexHeader {
+                org: "o".into(),
+                repo: "r".into(),
+                options: None,
+            })),
+        })
+        .await
+        .unwrap();
+        tx.send(file("a.rs", "fn a() {}")).await.unwrap();
+    });
+    // The stream is open and accepted; now the token goes away.
+    std::thread::sleep(Duration::from_millis(300));
+    f.write_tokens(
+        &[
+            stanza("w2", "write", &f.write2, None),
+            stanza("r", "read", &f.read, None),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(
+        auth.reload_now().0,
+        Some(graph_server::auth::Reload::Reloaded)
+    );
+    assert_eq!(
+        raw(
+            &ts.endpoint(),
+            "/memory_graph.v1.Admin/Status",
+            &[bearer(&f.write)]
+        ),
+        Code::Unauthenticated,
+        "the next call with the removed token is refused"
+    );
+    runtime.block_on(async {
+        tx.send(file("b.rs", "fn b() {}")).await.unwrap();
+    });
+    drop(tx);
+    let resp = runtime
+        .block_on(call)
+        .unwrap()
+        .expect("the in-flight stream finishes");
+    assert_eq!(resp.results.len(), 2, "{resp:?}");
+    let r = client(&ts, Some(&f.read), &f).unwrap();
+    assert_eq!(r.count_nodes(NodeKind::File).unwrap(), 2);
+}
+
+/// D2: reloads that collide (a SIGHUP landing on the 5 s poll, here
+/// modelled by eight threads calling `reload_now` at once while the file
+/// is swapped atomically between two token sets) always leave exactly one
+/// of the sets loaded, never a mix or an empty set, and the last content
+/// written wins once the swaps stop. The poll-driven reloader of the
+/// running server takes part too. (The Unix signal path itself:
+/// `sighup_reloads`.)
+#[test]
+fn colliding_reloads_leave_one_consistent_set() {
+    let f = AuthFixture::new();
+    let d = tempfile::tempdir().unwrap();
+    let ts = start(&f, &d.path().join("g.redb"));
+    let auth = ts.running().unwrap().auth();
+    let t = |_: u8| graph_server::auth::new_credential("mgt_").to_string();
+    let (a1, a2, b1) = (t(0), t(1), t(2));
+    let set_a = [
+        stanza("a1", "write", &a1, None),
+        stanza("a2", "read", &a2, None),
+    ]
+    .join("\n");
+    let set_b = stanza("b1", "read", &b1, None);
+    let swap = |text: &str| {
+        let tmp = f.dir.path().join("tokens.toml.new");
+        std::fs::write(&tmp, text).unwrap();
+        // Retry: a concurrent reader may briefly hold the file on Windows.
+        let mut n = 0;
+        while let Err(e) = std::fs::rename(&tmp, &f.tokens) {
+            n += 1;
+            assert!(n < 1000, "rename: {e}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    swap(&set_a);
+    auth.reload_now();
+    let ids = || {
+        let mut v: Vec<String> = auth
+            .tokens()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.id.to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let (ida, idb) = (
+        vec!["a1".to_string(), "a2".to_string()],
+        vec!["b1".to_string()],
+    );
+    assert_eq!(ids(), ida);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    auth.reload_now();
+                    let now = ids();
+                    assert!(now == ida || now == idb, "a mixed set: {now:?}");
+                }
+            });
+        }
+        for i in 0..200 {
+            swap(if i % 2 == 0 { &set_b } else { &set_a });
+        }
+        swap(&set_b);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    auth.reload_now();
+    assert_eq!(ids(), idb, "the last content written wins");
+    let ep = ts.endpoint();
+    assert_eq!(
+        raw(&ep, "/memory_graph.v1.Admin/Status", &[bearer(&b1)]),
+        Code::Ok
+    );
+    assert_eq!(
+        raw(&ep, "/memory_graph.v1.Admin/Status", &[bearer(&a1)]),
+        Code::Unauthenticated
+    );
+}

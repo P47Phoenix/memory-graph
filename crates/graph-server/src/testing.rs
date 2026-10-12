@@ -14,11 +14,13 @@ pub mod cluster;
 pub mod fake_collector;
 pub mod fake_s3;
 pub mod mcp_http;
+pub mod stub_proxy;
 pub use cluster::{ClusterTestbed, TestNode, CLUSTER_WAIT, TEST_RAFT};
 pub use fake_collector::{
     CollectedLog, CollectedSpan, FakeCollector, Received as FakeReceived, Signal as FakeSignal,
 };
 pub use fake_s3::{FakeS3, Faults};
+pub use stub_proxy::StubProxy;
 
 /// Make the snapshot pair at `data` (a `snap-*.redb` with its `.meta`)
 /// look like one an older build made (#151): stamp the store file's schema
