@@ -47,9 +47,15 @@ struct Mcp {
 
 impl Mcp {
     fn start(target: &[&str]) -> Mcp {
+        Self::start_with(target, &[])
+    }
+
+    /// `memory-graph <target> mcp <mcp_args>`.
+    fn start_with(target: &[&str], mcp_args: &[&str]) -> Mcp {
         let mut child = cmd()
             .args(target)
             .arg("mcp")
+            .args(mcp_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -284,4 +290,78 @@ fn without_name_fields(rows: &serde_json::Value) -> serde_json::Value {
         o.remove("name_col");
     }
     rows
+}
+
+/// Story 33: `mcp --allow-writes --index-root` adds index_path and prune;
+/// indexing the corpus through MCP stores what `memory-graph index` stores.
+#[test]
+fn mcp_write_tools_over_stdio_equal_the_index_command() {
+    let d = tempfile::tempdir().unwrap();
+    let via_mcp = d.path().join("mcp.redb");
+    let via_cli = d.path().join("cli.redb");
+    let corpus = corpus_repo();
+    let root = corpus.parent().unwrap().to_str().unwrap().to_string();
+    // --allow-writes needs --index-root.
+    let o = cmd()
+        .args(["--db", via_mcp.to_str().unwrap(), "mcp", "--allow-writes"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let mut m = Mcp::start_with(
+        &["--db", via_mcp.to_str().unwrap()],
+        &["--allow-writes", "--index-root", &root],
+    );
+    m.request(
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "mcp_e2e", "version": "0"}}),
+    );
+    m.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let tools = m.request("tools/list", json!({}));
+    assert_eq!(tools["tools"].as_array().unwrap().len(), 9);
+    let v = m.tool(
+        "index_path",
+        json!({"org": "corpus", "repo": "anyhow", "path": "anyhow"}),
+    );
+    assert!(v["indexed"].as_u64().unwrap() > 10, "{v}");
+    let p = m.tool(
+        "prune",
+        json!({"org": "corpus", "repo": "anyhow", "path": "anyhow"}),
+    );
+    assert_eq!(p["removed_count"], 0, "{p}");
+    let r = m.request(
+        "tools/call",
+        json!({"name": "index_path", "arguments": {"org": "corpus", "repo": "x", "path": ".."}}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    let logs = m.finish();
+    assert!(logs.contains("write tools"), "{logs}");
+    ok(&[
+        "--db",
+        via_cli.to_str().unwrap(),
+        "index",
+        "--org",
+        "corpus",
+        "--repo",
+        "anyhow",
+        corpus.to_str().unwrap(),
+    ]);
+    let describe = |db: &Path| -> Value {
+        serde_json::from_str(&ok(&["--db", db.to_str().unwrap(), "describe", "--json"])).unwrap()
+    };
+    assert_eq!(describe(&via_mcp), describe(&via_cli));
+    let search = |db: &Path| -> Value {
+        serde_json::from_str(&ok(&[
+            "--db",
+            db.to_str().unwrap(),
+            "search",
+            "Error",
+            "--limit",
+            "500",
+            "--json",
+        ]))
+        .unwrap()
+    };
+    assert_eq!(search(&via_mcp), search(&via_cli));
 }

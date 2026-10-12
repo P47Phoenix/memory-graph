@@ -2,7 +2,7 @@
 
 `memory-graph mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so an assistant (Claude Code, Claude Desktop, or any MCP client) can search the graph, find symbols, describe repos and outline files. A running `memory-graph serve` can also serve the same tools over streamable HTTP (`--mcp-listen`, [below](#http-inside-serve)). The design is [ADR 0005](adr/0005-mcp.md).
 
-- **Read-only.** There are no tools that write.
+- **Read-only by default.** Two write tools, `index_path` and `prune`, exist only when turned on (`mcp --allow-writes`, `serve --mcp-allow-writes`), confined to an index root ([Write tools](#write-tools)).
 - **stdio is the default and the recommended way.** The client starts `memory-graph mcp` itself; no port is opened. The HTTP endpoint inside `serve` is opt-in, off by default and loopback only.
 - **No MCP SDK.** The protocol code is hand-written (`crates/graph-mcp`), so the pure-Rust gate stays clean.
 
@@ -111,6 +111,8 @@ Any MCP client with a stdio transport works: the command is `memory-graph`, the 
 | `--mcp-max-connections N` (`mcp-max-connections`) | 256 | Open connections at once; a connection past it is closed as soon as it is accepted. |
 | `--mcp-header-timeout DURATION` (`mcp-header-timeout`) | 20s | How long a client may take to send a request's headers before its connection is closed. It also bounds the wait for the next request on a keep-alive connection (hyper arms the same timer there). |
 | `--mcp-idle-timeout DURATION` (`mcp-idle-timeout`) | the header timeout | A keep-alive connection with no request in flight for this long is closed. A value above `--mcp-header-timeout` is refused at start, since it could never take effect. |
+| `--mcp-allow-writes` (`mcp-allow-writes`) | off | Add the [write tools](#write-tools). Needs `--mcp-index-root`. |
+| `--mcp-index-root DIR` (`mcp-index-root`) | none | The directory (on the server's file system) the write tools are confined to. Must exist when `serve` starts. Needs `--mcp-allow-writes`. |
 
 Guards (ADR 0005 D4), in the order they apply:
 - **Host.** On a loopback address, a `Host` header other than `localhost` or the bound address (with the bound port, if it names a port) gets **403**. This stops DNS rebinding: a web page cannot reach the endpoint through a name of its own.
@@ -119,12 +121,13 @@ Guards (ADR 0005 D4), in the order they apply:
 - **Size.** A body over 1 MiB gets **413** (with `Connection: close`). A 429 and the session and JSON answers are sent after the whole body was read. An answer sent before the body was read (413, and the 403/404/405 refusals of a request with a body) carries `Connection: close` and is followed by a staged close (RFC 9112 section 9.6): the server stops sending, then reads and discards what the client still sends (for up to 30 s or 64 MiB, until 5 s pass with nothing) before it closes. Either way the client that is still sending gets the answer instead of a connection reset. An answer is at most about 4 MiB: a longer list is cut short with `next_offset`.
 - **Load.** Past `--mcp-max-inflight` requests at once: **429** (checked after the session, so a bad session still gets its 400/404). A call that runs past 30 s is answered with JSON-RPC error `-32001` (its read finishes in the background and still holds its slot until then).
 - **Connections (#234).** At most `--mcp-max-connections` (256) are open at once. A connection past the cap is closed as soon as it is accepted, before anything is read, so the client sees a bare TCP close with no HTTP answer and should back off and retry. These connections do not count against `--mcp-max-inflight`. A client that has not sent a whole request's headers within `--mcp-header-timeout` (20 s) is disconnected (slowloris); its staged close is cut to 2 s, since no answer of ours needs protecting. A keep-alive connection with no request in flight for `--mcp-idle-timeout` (the header timeout by default) is closed gracefully; a request in flight, including one whose body is still arriving, is never cut. A connection keeps its slot through its staged close, so a connection closed after a refusal can hold one for up to the linger bounds (5 s idle, 30 s in all). The cap is global, so on a non-loopback bind one host can take every slot. Before exposing the endpoint with `--mcp-allow-remote`, put it behind a proxy that authenticates and limits connections per client.
-- **Read-only.** There are no write tools.
+- **Tokens.** With `--auth-tokens` (ADR 0012 D9) every request needs `Authorization: Bearer <token>`: none or a wrong one gets **401** with `WWW-Authenticate: Bearer`. The read tools need a `read` or `write` token; the write tools need a `write` token, and a `read` token calling one gets **403** (nothing is written).
+- **Read-only unless `--mcp-allow-writes`.** Without it there are no write tools.
 - **No TLS.** As for gRPC (ADR 0004): put a TLS-terminating, authenticating proxy in front if the endpoint must leave the host.
 
 The transport: `POST /mcp` with one JSON-RPC message. `initialize` (sent without a session) answers with an `Mcp-Session-Id` header; every later message carries it (**400** without it, **404** for an unknown or ended session: initialize again). A session holds only the negotiated protocol version; a request whose `MCP-Protocol-Version` header names another gets **400**. A request without that header is accepted and served with the session's version (lenient, for clients of revisions that did not send it). A request is answered with `application/json`; a notification gets **202** with no body. `GET /mcp` is **405**: this version opens no server-to-client stream (no SSE). `DELETE /mcp` with the session header ends the session. At most 1024 sessions are kept: when a new one would pass that, the least recently used is ended. A session unused for 30 minutes ends too. An ended session's next request gets 404; initialize again.
 
-Every tool reads through the node's own gRPC Store service in process, so answers, `stale_possible`, linearizable reads and errors (for example `unavailable` while a snapshot is installed) are the same as a gRPC client's on that node.
+A write tool writes through the node's own gRPC Write service in process: proposed through Raft on the leader, forwarded to the leader from a follower, exactly like a gRPC client's write. Its per-call deadline is 600 s instead of 30 s. Every tool reads through the node's own gRPC Store service in process, so answers, `stale_possible`, linearizable reads and errors (for example `unavailable` while a snapshot is installed) are the same as a gRPC client's on that node.
 
 `memory-graph --server <node> cluster status` shows an `mcp` line (`http://<addr>/mcp`, `off`, or, for a wildcard bind such as `0.0.0.0`, "bound on all interfaces" with the port, since `0.0.0.0` is not an address a client can use); `cluster status --json` has `mcp_addr` (the bound address, empty when off). `serve` prints the same on start. `health` is unchanged (one `SERVING` line). `/metrics` counts calls as `mg_mcp_tool_calls_total{tool, outcome}`, where `outcome` is `ok`, `error` (an `isError` result), `rejected` (a JSON-RPC error, such as an unknown tool or invalid arguments), `timeout` (past the 30 s per-call deadline), `refused` (a 429 past `--mcp-max-inflight`) or `internal` (the call itself failed). A tool name the server does not know is counted as `tool="unknown"`, so a client cannot grow the label set.
 
@@ -176,3 +179,25 @@ A span is `{start, end, start_line, start_col, end_line, end_col}`: byte offsets
 - A store error has its kind as the code (`no_leader`, `locked`, `corrupt`, `rejected`, ...). `unavailable` is a lost connection to the server (a transport error, a deadline, the server unreachable). `no_leader`, `not_leader` and `unavailable` are retryable; `no_leader` carries `retry_after_ms`.
 
 An unknown tool name and a malformed request (bad JSON, a batch, a bad id, a non-object `arguments`) are JSON-RPC errors instead.
+
+## Write tools
+
+Off by default (epic story 33, ADR 0005 D2). Turned on, `tools/list` adds them after the read tools and `initialize`'s instructions mention them; turned off, they are not listed and a call is JSON-RPC error `-32602` (an unknown tool), exactly as before they existed.
+
+```sh
+memory-graph --db graph.redb mcp --allow-writes --index-root ~/src          # stdio
+memory-graph serve --data-dir /data --mcp-listen 127.0.0.1:7071 \
+  --mcp-allow-writes --mcp-index-root /srv/src                               # HTTP
+```
+
+| Tool | Arguments | Answer |
+|---|---|---|
+| `index_path` | `org`, `repo`, `path`, `reindex?` (default `false`) | `{org, repo, path, indexed, unchanged, symbols, tokens, failed_count, failed, skipped_count, skipped, truncated}` |
+| `prune` | `org`, `repo`, `path`, `dry_run?` (default `true`) | `{org, repo, path, dry_run, removed_count, removed, truncated}` |
+
+- **`index_path`** indexes every file under the directory as one repo, like `memory-graph index`: `.gitignore` honoured, `.git` and symlinks skipped, files whose content is unchanged skipped by fingerprint (`unchanged`; `reindex: true` parses them again). Paths are stored relative to the directory, with origin `directory`. `failed` lists the files the store refused (`{path, code, message}`, for example `binary`); `skipped` the ones never sent (`{path, reason}`: `symlink`, `too large`, `unreadable`, ...). Each list holds at most 200 entries (`truncated` says when it was cut; the counts are whole). It removes nothing.
+- **`prune`** removes the repo's directory-indexed files that are no longer under the directory, like `index --prune`. It is a **dry run unless `dry_run` is `false`**: `removed` then names what would go. It is refused (`invalid_argument`, nothing removed) when part of the directory cannot be read, or when the directory has no files while the repo has some.
+- **Confinement.** `path` is a directory under the index root: relative to it (`.` is the root) or absolute inside it. It is resolved first (`..` and symlinks included), then refused with `invalid_argument` unless the result is a directory inside the root. The walk never follows a symlink.
+- **Where the writes go.** With `--db` into that file (`mcp --allow-writes` opens it with the extractors, and creates it if needed); with `--server` through the server's Write service, as `memory-graph --server ... index` would; inside `serve` through the node's own Write service (see above). The paths are read on the machine running the MCP server.
+- **Roles.** Over HTTP with `--auth-tokens`, both tools need a `write` token: a `read` token gets HTTP **403**. Over stdio, `--server` uses the CLI's credentials (`--token-file`), and the server checks them as for any write.
+- **Annotations.** `readOnlyHint: false`, `idempotentHint: true`; `prune` has `destructiveHint: true`.

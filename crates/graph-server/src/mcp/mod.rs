@@ -26,8 +26,12 @@
 //!   decided after the session checks;
 //! - a call past [`CALL_DEADLINE`] answers a JSON-RPC error
 //!   ([`REQUEST_TIMEOUT`]);
-//! - results are cut at 4 MiB with `next_offset` and tools are read-only
-//!   (both in `graph-mcp`).
+//! - results are cut at 4 MiB with `next_offset` (in `graph-mcp`);
+//! - tools are read-only unless `--mcp-allow-writes` (story 33) turns on
+//!   `index_path` and `prune`, confined to `--mcp-index-root`; with
+//!   `--auth-tokens` they need a `write` token ([`tool_need`]; a `read`
+//!   token gets 403), and a write call's deadline is
+//!   [`WRITE_CALL_DEADLINE`].
 //!
 //! Transport: HTTP/1.1 (hyper, with axum's router), one task per
 //! connection. `POST /mcp` carries one JSON-RPC message. `initialize`
@@ -43,9 +47,11 @@
 //! session.
 //!
 //! Every tool read goes through this node's own Store service in process
-//! ([`backend::InProcessStore`]), on the blocking pool.
+//! ([`backend::InProcessStore`]), and every write through its Write service
+//! ([`backend::InProcessWriter`]), on the blocking pool.
 use crate::server::ShutdownHandle;
 use crate::services::store::StoreService;
+use crate::services::write::WriteService;
 use crate::services::Ctx;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
@@ -99,11 +105,21 @@ pub const NO_AUTH_WARNING: &str = "Without serve --auth-tokens the MCP endpoint 
      authentication. Anyone who can reach it can read every indexed source token. Keep it on \
      loopback, behind an authenticating proxy, or turn on --auth-tokens (ADR 0012).";
 
-/// The role a tool needs (ADR 0012 D9): every tool today reads. Story 33's
-/// write tools will need [`Role::Write`](crate::auth::Role::Write).
-pub fn tool_need(_name: &str) -> crate::auth::Role {
-    crate::auth::Role::Read
+/// The role a tool needs (ADR 0012 D9): the write tools (`index_path`,
+/// `prune`; story 33) need [`Role::Write`](crate::auth::Role::Write), every
+/// other tool [`Role::Read`](crate::auth::Role::Read). A `read` token on a
+/// write tool gets HTTP 403.
+pub fn tool_need(name: &str) -> crate::auth::Role {
+    if graph_mcp::is_write_tool(name) {
+        crate::auth::Role::Write
+    } else {
+        crate::auth::Role::Read
+    }
 }
+
+/// The per-call deadline of a write tool (`--mcp-allow-writes`): indexing
+/// a directory takes longer than a read.
+pub const WRITE_CALL_DEADLINE: Duration = Duration::from_secs(600);
 
 /// The 401 of a request without a valid token (ADR 0012 D9).
 fn unauthorized() -> Response {
@@ -154,6 +170,12 @@ pub struct McpConfig {
     pub idle_timeout: Option<Duration>,
     /// The per-call deadline ([`CALL_DEADLINE`]; tests shorten it).
     pub call_timeout: Duration,
+    /// `--mcp-allow-writes --mcp-index-root <dir>`: the write tools
+    /// (story 33), confined to this directory. `None` (the default): the
+    /// endpoint is read-only and the write tools do not exist.
+    pub index_root: Option<std::path::PathBuf>,
+    /// A write tool's per-call deadline ([`WRITE_CALL_DEADLINE`]).
+    pub write_call_timeout: Duration,
     /// Testing only: every call sleeps this long on the blocking pool
     /// first, so a test can hold requests in flight or pass the deadline.
     #[doc(hidden)]
@@ -178,6 +200,8 @@ impl McpConfig {
             header_timeout: DEFAULT_HEADER_TIMEOUT,
             idle_timeout: None,
             call_timeout: CALL_DEADLINE,
+            index_root: None,
+            write_call_timeout: WRITE_CALL_DEADLINE,
             testing_call_delay: None,
             session_idle: SESSION_IDLE,
             testing_linger: Linger::DEFAULT,
@@ -231,6 +255,10 @@ pub fn check_bind(cfg: &McpConfig) -> Result<(), StoreError> {
             cfg.header_timeout
         )));
     }
+    if let Some(root) = &cfg.index_root {
+        graph_mcp::write::check_index_root(root)
+            .map_err(|e| StoreError::Rejected(format!("--mcp-index-root: {e}")))?;
+    }
     if !cfg.listen.ip().is_loopback() && !cfg.allow_remote {
         return Err(StoreError::Rejected(format!(
             "--mcp-listen {} is not a loopback address; the MCP endpoint has no authentication \
@@ -272,6 +300,11 @@ struct Sessions {
 struct McpState {
     ctx: Arc<Ctx>,
     svc: Arc<StoreService>,
+    /// The Write service, for the write tools.
+    write_svc: Arc<WriteService>,
+    /// `Some` when the write tools are on (`--mcp-allow-writes`).
+    index_root: Option<std::path::PathBuf>,
+    write_call_timeout: Duration,
     view: View,
     bound: SocketAddr,
     allow_origins: Vec<String>,
@@ -295,6 +328,11 @@ pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdow
         svc: Arc::new(StoreService {
             ctx: Arc::clone(&ctx),
         }),
+        write_svc: Arc::new(WriteService {
+            ctx: Arc::clone(&ctx),
+        }),
+        index_root: cfg.index_root.clone(),
+        write_call_timeout: cfg.write_call_timeout,
         ctx,
         view: match cfg.read {
             McpRead::Local => View::Local,
@@ -887,8 +925,21 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         ),
         None => tracing::Span::none(),
     };
+    let is_write = parsed
+        .as_ref()
+        .filter(|_| tool.is_some())
+        .and_then(|v| v.pointer("/params/name"))
+        .and_then(Value::as_str)
+        .is_some_and(graph_mcp::is_write_tool);
+    let call_timeout = if is_write {
+        st.write_call_timeout
+    } else {
+        st.call_timeout
+    };
     let rt = tokio::runtime::Handle::current();
     let svc = Arc::clone(&st.svc);
+    let write_svc = Arc::clone(&st.write_svc);
+    let index_root = st.index_root.clone();
     let view = st.view;
     let delay = st.delay;
     let work = tokio::task::spawn_blocking(move || {
@@ -898,19 +949,28 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         if let Some(d) = delay {
             std::thread::sleep(d);
         }
-        let store = backend::InProcessStore::new(svc, rt, view);
+        let store = backend::InProcessStore::new(svc, rt.clone(), view);
         let stale = store.stale_counter();
-        let backend = StoreBackend::remote(
+        let mut backend = StoreBackend::remote(
             Box::new(store),
             Box::new(move || stale.load(Ordering::SeqCst)),
         );
+        if let Some(root) = index_root {
+            let writer = backend::InProcessWriter::new(write_svc, rt);
+            match graph_mcp::WriteAccess::new(&root, Box::new(writer)) {
+                Ok(w) => backend = backend.with_writes(w),
+                // The root was checked at start; if it is gone now, the
+                // write tools are left out of this call (an unknown tool).
+                Err(e) => tracing::warn!(error = %e, "MCP index root"),
+            }
+        }
         let mut server = McpServer::resumed(backend, name, version, protocol)
             .expect("a session holds a supported version");
         server.handle_bytes(&bytes)
     });
     let outcome = {
         use tracing::Instrument;
-        tokio::time::timeout(st.call_timeout, work)
+        tokio::time::timeout(call_timeout, work)
             .instrument(span.clone())
             .await
     };
@@ -944,7 +1004,7 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
                     REQUEST_TIMEOUT,
                     &format!(
                         "the call did not finish within {} s (the endpoint's per-call deadline)",
-                        st.call_timeout.as_secs_f64()
+                        call_timeout.as_secs_f64()
                     ),
                 ),
             );
@@ -973,7 +1033,7 @@ fn rpc_error(id: Option<Value>, code: i64, message: &str) -> String {
 /// The metrics label of a tool name: a known tool, or `unknown` (a client
 /// cannot grow the label set).
 fn tool_label(name: &str) -> String {
-    let known = graph_mcp::tool_definitions()
+    let known = graph_mcp::listed_tools(true)
         .iter()
         .any(|t| t["name"] == name);
     if known {

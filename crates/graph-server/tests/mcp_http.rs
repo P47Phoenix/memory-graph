@@ -910,3 +910,128 @@ fn zero_or_inconsistent_timeouts_are_refused() {
         assert!(e.to_string().contains(want), "{e}");
     }
 }
+
+#[test]
+fn write_tools_are_off_unless_allowed_and_then_index_through_the_write_path() {
+    let d = tempfile::tempdir().unwrap();
+    // Off (the default): not listed, an unknown tool.
+    let (_srv, addr) = server(&d, loopback());
+    let mut c = McpHttpClient::new(addr);
+    let tools = c.request("tools/list", json!({}));
+    assert!(!tools.to_string().contains("index_path"), "{tools}");
+    let r = c.request(
+        "tools/call",
+        json!({"name": "index_path", "arguments": {"org": "o", "repo": "r", "path": "."}}),
+    );
+    assert_eq!(r["error"]["code"], graph_mcp::INVALID_PARAMS, "{r}");
+    drop(_srv);
+
+    // On: confined to the index root, written through Raft.
+    let d2 = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("proj/src")).unwrap();
+    std::fs::write(
+        root.path().join("proj/src/lib.rs"),
+        b"pub fn written_by_mcp() {}\n",
+    )
+    .unwrap();
+    let mut m = loopback();
+    m.index_root = Some(root.path().to_path_buf());
+    let (srv, addr) = server(&d2, m);
+    let mut c = McpHttpClient::new(addr);
+    let tools = c.request("tools/list", json!({}));
+    assert!(tools.to_string().contains("\"prune\""), "{tools}");
+    let r = c.request(
+        "tools/call",
+        json!({"name": "index_path", "arguments": {"org": "acme", "repo": "proj", "path": "proj"}}),
+    );
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(r["result"]["structuredContent"]["indexed"], 1, "{r}");
+    let r = c.request(
+        "tools/call",
+        json!({"name": "index_path", "arguments": {"org": "acme", "repo": "proj", "path": ".."}}),
+    );
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r.to_string().contains("outside the index root"), "{r}");
+    // The write went through the server's store: a gRPC client sees it.
+    let store = RemoteStore::connect(ClientConfig::new(srv.endpoint())).unwrap();
+    let hits = graph_store::StoreRead::search_symbols(
+        &store,
+        &graph_store::SymbolQuery::new("written_by_mcp"),
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].file, "src/lib.rs");
+    // prune: a dry run by default.
+    std::fs::remove_file(root.path().join("proj/src/lib.rs")).unwrap();
+    std::fs::write(root.path().join("proj/keep.txt"), b"x").unwrap();
+    let r = c.request(
+        "tools/call",
+        json!({"name": "prune", "arguments": {"org": "acme", "repo": "proj", "path": "proj"}}),
+    );
+    assert_eq!(
+        r["result"]["structuredContent"]["removed"],
+        json!(["src/lib.rs"]),
+        "{r}"
+    );
+    let r = c.request(
+        "tools/call",
+        json!({"name": "prune", "arguments": {"org": "acme", "repo": "proj", "path": "proj", "dry_run": false}}),
+    );
+    assert_eq!(r["result"]["structuredContent"]["removed_count"], 1, "{r}");
+    let hits = graph_store::StoreRead::search_symbols(
+        &store,
+        &graph_store::SymbolQuery::new("written_by_mcp"),
+    )
+    .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn a_missing_index_root_is_refused_at_start() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let mut m = loopback();
+    m.index_root = Some(d.path().join("no-such-dir"));
+    let e = TestServer::try_start_with(&db, rust(), |c| c.mcp = Some(m))
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("--mcp-index-root"), "{e}");
+}
+
+/// A write tool on a follower's endpoint is forwarded to the leader (the
+/// in-process Write service routes it, as for a gRPC client), and every
+/// node then has it.
+#[test]
+fn a_write_tool_on_a_follower_reaches_the_leader() {
+    use graph_server::testing::ClusterTestbed;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("proj")).unwrap();
+    std::fs::write(root.path().join("proj/f.rs"), b"fn via_follower() {}\n").unwrap();
+    let r = root.path().to_path_buf();
+    let mut tb = ClusterTestbed::with_config(3, rust(), move |_, c| {
+        let mut m = loopback();
+        m.index_root = Some(r.clone());
+        c.mcp = Some(m);
+    });
+    tb.form();
+    let leader = tb.leader();
+    let follower = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    let addr = tb.node(follower).running().unwrap().mcp_addr.unwrap();
+    let mut c = McpHttpClient::new(addr);
+    let v = c.request(
+        "tools/call",
+        json!({"name": "index_path", "arguments": {"org": "o", "repo": "proj", "path": "proj"}}),
+    );
+    assert_eq!(v["result"]["structuredContent"]["indexed"], 1, "{v}");
+    let applied = tb.leader_last_log_index();
+    tb.wait_applied(applied, Duration::from_secs(20));
+    for id in tb.ids() {
+        let hits = graph_store::StoreRead::search_symbols(
+            &tb.client(id),
+            &graph_store::SymbolQuery::new("via_follower"),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "node {id}");
+    }
+}
