@@ -69,7 +69,8 @@ fn warn_extractor_gaps(store: &V2Store) {
                     repo = %g.repo,
                     language = %g.language,
                     stored_extractor = %g.stored_version,
-                    "{g}"
+                    detail = %g,
+                    "stored symbols came from an extractor this server lacks"
                 );
             }
         }
