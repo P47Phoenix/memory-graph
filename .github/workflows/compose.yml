@@ -5,7 +5,9 @@ name: Compose
 # through a follower, diff a follower's answers against an embedded run,
 # stop and restart the first node while writes go on, wait until all three
 # applied the same index, `down -v`. The steps live in
-# deploy/compose/check.sh, which runs the same way on a workstation.
+# deploy/compose/check.sh, which runs the same way on a workstation. The
+# `otel` job runs the OpenTelemetry profile (deploy/compose/check-otel.sh,
+# epic story 54).
 on:
   push:
     branches: [main]
@@ -49,3 +51,37 @@ jobs:
           COMPOSE_UP_ARGS: --no-build
           WAIT_SECS: "240"
         run: bash deploy/compose/check.sh
+
+  otel:
+    # The `otel` profile of the same file (ADR 0009, epic story 54): the
+    # cluster exporting to an OpenTelemetry Collector and Jaeger; the
+    # collector's debug log must show traces, metrics and logs from all
+    # three nodes and Jaeger must list the service. Every wait is bounded
+    # (deploy/compose/check-otel.sh).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build the CLI (the client side of the check)
+        run: cargo build --release --locked -p graph-cli
+
+      - name: Build the image once (layer cache shared with the Docker workflow)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: memory-graph:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: OpenTelemetry profile end to end
+        env:
+          MG: target/release/memory-graph
+          COMPOSE_UP_ARGS: --no-build
+          WAIT_SECS: "180"
+        run: bash deploy/compose/check-otel.sh

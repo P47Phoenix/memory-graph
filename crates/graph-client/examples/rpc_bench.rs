@@ -10,13 +10,16 @@
 //!   target/release/memory-graph --db /tmp/corpus.redb index --org corpus --repo "$(basename "$r")" "$r"
 //! done
 //! cargo run --release -p graph-client --example rpc_bench -- /tmp/corpus.redb \
-//!   [--iters 500] [--rare TEXT] [--common TEXT] [--otlp] [--writes N]
+//!   [--iters 500] [--rare TEXT] [--common TEXT] [--otlp] [--otlp-signals LIST] [--writes N]
 //! ```
 //!
 //! `--otlp` (ADR 0009 D5): the in-process server runs with OpenTelemetry
 //! traces on, exporting to an in-process `FakeCollector` (this process's
 //! global subscriber gets the OpenTelemetry layer, so the client spans and
 //! W3C propagation are on too). Compare with a run without it.
+//! `--otlp-signals traces,metrics,logs` (story 54; default `traces`, which
+//! implies `--otlp`) also exports metrics every 5 s from the server's
+//! snapshot and every INFO log event through the OTLP log bridge.
 //! `--writes N` also times N single-file writes (`index_bytes`, a new file
 //! each), which with `--otlp` pay the leader's `ApplyLinks` hashing; the
 //! writes change the database, so run on a copy. A line also times the
@@ -37,6 +40,7 @@ struct Args {
     rare: String,
     common: String,
     otlp: bool,
+    otlp_signals: String,
     writes: usize,
 }
 
@@ -48,6 +52,7 @@ fn args() -> Args {
         rare: "Ensure".into(),
         common: "return".into(),
         otlp: false,
+        otlp_signals: "traces".into(),
         writes: 0,
     };
     while let Some(x) = a.next() {
@@ -56,6 +61,10 @@ fn args() -> Args {
             "--rare" => out.rare = a.next().expect("--rare TEXT"),
             "--common" => out.common = a.next().expect("--common TEXT"),
             "--otlp" => out.otlp = true,
+            "--otlp-signals" => {
+                out.otlp = true;
+                out.otlp_signals = a.next().expect("--otlp-signals LIST");
+            }
             "--writes" => out.writes = a.next().and_then(|v| v.parse().ok()).expect("--writes N"),
             p => out.db = PathBuf::from(p),
         }
@@ -136,26 +145,32 @@ fn main() {
     drop(embedded);
 
     // OpenTelemetry on for the remote half only (the embedded half never
-    // exports): a collector in this process, traces only.
+    // exports): a collector in this process, `--otlp-signals` (traces by
+    // default).
     let telemetry = a.otlp.then(|| {
         use graph_server::telemetry::{self, NodeIdentity, TelemetryConfig, TelemetryOptions};
-        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
         use tracing_subscriber::util::SubscriberInitExt;
         let collector = graph_server::testing::FakeCollector::start();
         let options = TelemetryOptions {
             endpoint: Some(collector.endpoint()),
-            signals: Some("traces".into()),
+            signals: Some(a.otlp_signals.clone()),
+            metrics_interval: Some(Duration::from_secs(5)),
             ..Default::default()
         };
         let cfg = TelemetryConfig::resolve_with_env(&options, &NodeIdentity::default(), |_| None)
             .expect("telemetry config");
         let guard = telemetry::init(&cfg).expect("telemetry").expect("on");
+        // Logs as `serve` exports them by default: INFO and up.
+        let info = tracing_subscriber::filter::LevelFilter::INFO;
         tracing_subscriber::registry()
-            .with(telemetry::tracing_layer(&guard).expect("traces"))
+            .with(telemetry::tracing_layer(&guard))
+            .with(telemetry::log_layer(&guard).with_filter(info))
             .init();
         (collector, guard)
     });
-    let server = TestServer::start(&a.db, vec![]);
+    let metrics = telemetry.as_ref().and_then(|(_, g)| g.metrics());
+    let server = TestServer::start_with(&a.db, vec![], |cfg| cfg.otlp_metrics = metrics);
     let remote = RemoteStore::connect(ClientConfig::new(server.endpoint())).expect("connect");
     let ping = measure(a.iters, || {
         remote.health("").unwrap();
@@ -178,7 +193,21 @@ fn main() {
     drop(server);
     let spans = telemetry.map(|(collector, guard)| {
         guard.shutdown_blocking();
-        collector.received().spans().len()
+        let got = collector.received();
+        let names: std::collections::BTreeSet<&str> = got
+            .metrics
+            .iter()
+            .flat_map(|r| &r.resource_metrics)
+            .flat_map(|r| &r.scope_metrics)
+            .flat_map(|s| &s.metrics)
+            .map(|m| m.name.as_str())
+            .collect();
+        (
+            got.spans().len(),
+            got.log_records().len(),
+            got.metrics.len(),
+            names.len(),
+        )
     });
 
     println!(
@@ -222,7 +251,10 @@ fn main() {
     println!(
         "otlp: {}",
         match spans {
-            Some(n) => format!("on, {n} spans exported"),
+            Some((s, l, m, n)) => format!(
+                "on ({}): {s} spans, {l} log records, {m} metric exports ({n} metrics)",
+                a.otlp_signals
+            ),
             None => "off".into(),
         }
     );
