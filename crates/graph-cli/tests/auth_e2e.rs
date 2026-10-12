@@ -332,3 +332,52 @@ fn auth_needs_loopback_unless_insecure_transport() {
     let _ = child.wait();
     assert!(line.is_ok(), "--insecure-transport did not start");
 }
+
+/// ADR 0012 D8 (issue #300): a proxy in front of the server that refuses
+/// with a detail-less `UNAUTHENTICATED` / `PERMISSION_DENIED` (no
+/// `StoreErrorDetail`) maps to exit 8 / 9 end to end, for a read and a
+/// write, with and without a token, and is never retried into a storm.
+#[test]
+fn a_proxy_refusal_without_details_maps_to_exit_8_and_9() {
+    use graph_server::testing::StubProxy;
+    let d = tempfile::tempdir().unwrap();
+    let token = graph_server::auth::new_credential("mgt_").to_string();
+    let token_file = d.path().join("t.token");
+    write_private(&token_file, &format!("{token}\n"));
+    let src = d.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.rs"), "fn alpha() {}\n").unwrap();
+    let src_s = src.to_str().unwrap();
+    for (code, exit) in [
+        (tonic::Code::Unauthenticated, 8),
+        (tonic::Code::PermissionDenied, 9),
+    ] {
+        let stub = StubProxy::start(code, "refused by the proxy");
+        for with_token in [false, true] {
+            for args in [
+                vec!["describe"],
+                vec!["index", "--org", "o", "--repo", "r", src_s],
+            ] {
+                let before = stub.calls();
+                let mut c = cmd();
+                c.args(["--server", &stub.endpoint()]);
+                if with_token {
+                    c.arg("--token-file").arg(&token_file);
+                }
+                let o = c.args(&args).output().unwrap();
+                assert_eq!(
+                    o.status.code(),
+                    Some(exit),
+                    "{code:?} token={with_token} {args:?}: {}",
+                    text(&o)
+                );
+                assert_no_token(&o, &[&token]);
+                let calls = stub.calls() - before;
+                assert!(
+                    calls == 1,
+                    "{code:?} {args:?}: {calls} calls (one call, never retried)"
+                );
+            }
+        }
+    }
+}

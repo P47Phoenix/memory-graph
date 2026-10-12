@@ -33,7 +33,32 @@ fn a_pod_0_that_lost_its_volume_rejoins_the_existing_cluster() {
         "a_pod_0_that_lost_its_volume_rejoins_the_existing_cluster",
         TEST_LIMIT,
     );
-    let mut tb = ClusterTestbed::new(3, exts());
+    lost_volume_rejoin(None);
+}
+
+/// Issue #301: the same with auth on. The lost node's removal is a
+/// node-originated `Remove` with the cluster secret (marked forwarded, role
+/// `write`), and the old pod 0 was the leader, so a sibling may still name
+/// it (this very node, not serving yet) as the leader.
+#[test]
+fn a_pod_0_that_lost_its_volume_rejoins_with_auth_on() {
+    let _w = watchdog(
+        "a_pod_0_that_lost_its_volume_rejoins_with_auth_on",
+        TEST_LIMIT,
+    );
+    let f = graph_server::testing::auth::AuthFixture::new();
+    lost_volume_rejoin(Some(&f));
+}
+
+fn lost_volume_rejoin(auth: Option<&graph_server::testing::auth::AuthFixture>) {
+    let mut tb = match auth {
+        Some(f) => {
+            let mut tb = ClusterTestbed::with_config(3, exts(), |_, c| c.auth = f.config());
+            tb.set_client_credentials(Some(f.creds(&f.write)));
+            tb
+        }
+        None => ClusterTestbed::new(3, exts()),
+    };
     tb.form();
     tb.write_via_leader(|c| index_files(c, "o", "r", &[small_file(0), small_file(1)]));
     tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
