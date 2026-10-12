@@ -1624,6 +1624,9 @@ fn a_write_to_a_follower_is_one_trace_across_three_processes() {
             .unwrap();
         (sc.trace_id().to_string(), sc.span_id().to_string())
     });
+    // This process's spans (the caller's and the client's) ended above:
+    // send them now rather than on the batch schedule.
+    guard.tracer_provider().unwrap().force_flush().unwrap();
     // A call on node 3 too, so its own spans are exported.
     assert!(n3.status().is_some());
 

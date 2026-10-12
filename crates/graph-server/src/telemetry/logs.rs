@@ -81,6 +81,13 @@ pub fn bridged(m: &Metadata<'_>) -> bool {
     )
 }
 
+/// The part of [`bridged`] that depends on the callsite only.
+fn bridged_callsite(m: &Metadata<'_>) -> bool {
+    m.is_event()
+        && !m.target().starts_with("opentelemetry")
+        && !m.target().starts_with("tracing_opentelemetry")
+}
+
 fn bridged_parts(is_event: bool, target: &str, thread: &str) -> bool {
     is_event
         && !target.starts_with("opentelemetry")
@@ -104,7 +111,13 @@ where
     let provider = guard.logger_provider()?;
     Some(
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(provider)
-            .with_filter(tracing_subscriber::filter::filter_fn(bridged))
+            // Asked per event: `bridged` depends on the emitting thread,
+            // which a cached callsite interest would freeze at the first
+            // thread to log there (and see `traces::AskEachTime`).
+            .with_filter(super::traces::AskEachTime {
+                callsite: bridged_callsite,
+                enabled: bridged,
+            })
             .boxed(),
     )
 }
