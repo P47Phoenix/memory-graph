@@ -1,7 +1,9 @@
 //! Traces (ADR 0009 D5, D9; epic story 51) in process: one global
 //! subscriber with the OpenTelemetry layer exporting to a `FakeCollector`,
 //! shared by every test here. Each test finds its own spans by trace id or
-//! by name; nothing waits a fixed time (the collector wakes `wait_spans`).
+//! by name; nothing waits a fixed time (the collector wakes `wait_spans`),
+//! each wait starts with a flush of what this process queued, and each
+//! test asserts on the spans its wait accepted.
 //!
 //! The three-process trace (client, follower, forward, leader, apply) is in
 //! `graph-cli/tests/cluster_e2e.rs`; failures and recovery of the
@@ -58,11 +60,21 @@ fn setup() -> &'static Setup {
     })
 }
 
+/// Push out what this process has queued (the spans of calls that already
+/// returned), so a wait does not depend on the batch schedule.
+fn flush() {
+    setup()
+        .guard
+        .tracer_provider()
+        .unwrap()
+        .force_flush()
+        .unwrap();
+}
+
 /// Every span exported so far, after pushing out what is queued.
 fn flushed() -> Vec<CollectedSpan> {
-    let s = setup();
-    s.guard.tracer_provider().unwrap().force_flush().unwrap();
-    s.collector.received().spans()
+    flush();
+    setup().collector.received().spans()
 }
 
 fn in_trace<'a>(spans: &'a [CollectedSpan], trace: &str) -> Vec<&'a CollectedSpan> {
@@ -109,6 +121,7 @@ fn an_incoming_traceparent_parents_the_rpc_span_with_rpc_attributes() {
         );
         c.hello(req).await.unwrap();
     });
+    flush();
     let spans = s.collector.wait_spans(WAIT, |all| {
         all.iter().any(|x| x.trace_id == trace && x.name == "rpc")
     });
@@ -160,6 +173,7 @@ fn client_index_batch_and_mcp_spans_and_no_query_text() {
     );
     assert_eq!(r["result"]["isError"], false, "{r}");
 
+    flush();
     let spans = s.collector.wait_spans(WAIT, |all| {
         let t = in_trace(all, &trace);
         t.iter().any(|x| x.name == "index_batch")
@@ -278,6 +292,7 @@ fn snapshot_install_is_one_span_each_side_and_raft_rpcs_are_not_exported() {
             .collect();
         !receivers.is_empty() && receivers.iter().all(|r| has_root(&r.trace_id))
     };
+    flush();
     let waited = setup().collector.wait_spans(WAIT, paired);
     let spans = flushed();
     let installs: Vec<_> = spans
@@ -350,23 +365,26 @@ fn a_remote_store_call_without_a_caller_span_is_a_root() {
     let c = RemoteStore::connect(ClientConfig::new(srv.endpoint())).unwrap();
     let before = s.collector.received().spans().len();
     c.count_nodes(graph_core::NodeKind::File).unwrap();
-    let spans = s.collector.wait_spans(WAIT, |all| {
-        all[before.min(all.len())..].iter().any(|x| {
-            x.name == "rpc"
-                && x.attr("rpc.method") == Some("CountNodes")
-                && all
-                    .iter()
-                    .any(|p| p.span_id == x.parent_span_id && p.name == "client")
-        })
+    // The pair the wait accepted, not a later lookup that could pick another.
+    let pair = |all: &[CollectedSpan]| {
+        all[before.min(all.len())..]
+            .iter()
+            .filter(|x| x.name == "rpc" && x.attr("rpc.method") == Some("CountNodes"))
+            .find_map(|rpc| {
+                all.iter()
+                    .find(|p| p.span_id == rpc.parent_span_id && p.name == "client")
+                    .map(|client| (rpc.clone(), client.clone()))
+            })
+    };
+    flush();
+    let spans = s.collector.wait_spans(WAIT, |all| pair(all).is_some());
+    let (rpc, client) = pair(&spans).unwrap_or_else(|| {
+        let ours: Vec<_> = spans[before.min(spans.len())..]
+            .iter()
+            .filter(|x| x.name == "rpc" || x.name == "client")
+            .collect();
+        panic!("a CountNodes rpc under a client span: {ours:#?}")
     });
-    let rpc = spans
-        .iter()
-        .find(|x| x.name == "rpc" && x.attr("rpc.method") == Some("CountNodes"))
-        .unwrap();
-    let client = spans
-        .iter()
-        .find(|p| p.span_id == rpc.parent_span_id)
-        .expect("the client span");
-    assert_eq!(client.name, "client");
+    assert_eq!(rpc.trace_id, client.trace_id);
     assert!(client.parent_span_id.is_empty(), "a root");
 }
