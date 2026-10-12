@@ -747,16 +747,26 @@ fn remove_lost_self_with_auth_on_removes_a_dead_leader() {
     );
     assert_eq!(tb.membership(others[0]).0.len(), 3);
 
+    let lost_addr = tb.node(lost).addr();
     tb.node_mut(lost).kill();
+    // The successor process holds the lost node's port without answering
+    // yet (as `serve` does while it rejoins): a call there connects, then
+    // hangs. A hint naming the lost node must never be followed.
+    let _held = std::net::TcpListener::bind(lost_addr).unwrap();
     let t0 = Instant::now();
     rt().block_on(graph_server::join::remove_lost_self(
         &via,
         lost,
-        Duration::from_secs(60),
+        Duration::from_secs(25),
         &auth,
     ))
     .unwrap_or_else(|e| panic!("remove_lost_self with auth on: {e}"));
     eprintln!("removed the dead leader after {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(15),
+        "the hint naming the lost node was followed: {:?}",
+        t0.elapsed()
+    );
     tb.wait_voters(&others, CLUSTER_WAIT);
     let new = tb.wait_leader(CLUSTER_WAIT);
     assert!(others.contains(&new));

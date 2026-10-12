@@ -1019,10 +1019,14 @@ fn walk_all(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 /// D10: `Raft.InstallSnapshot` without the cluster secret is refused
-/// before any chunk is written: a streamed header and 1 MiB of chunks with
-/// no credential, a client `write` token, a `read` token and another
-/// cluster's secret each get `UNAUTHENTICATED`, and nothing appears or
-/// changes under the follower's `snapshots/` (or its data directory).
+/// before any chunk is written. The stream is otherwise one the follower
+/// would stage: its real cluster id and extractors hash in the metadata,
+/// and a header with this build's store format, that hash, a vote and a
+/// membership. The control (the cluster secret) shows the same stream
+/// does create a staging file under `snapshots/`; no credential, a client
+/// `write` or `read` token, and another cluster's secret each get
+/// `UNAUTHENTICATED`, and while their chunks stream nothing appears under
+/// `snapshots/` (polled between chunks) or in the data directory.
 #[test]
 fn a_refused_install_snapshot_writes_nothing() {
     let f = AuthFixture::new();
@@ -1030,9 +1034,36 @@ fn a_refused_install_snapshot_writes_nothing() {
     let w = client_of(&tb, tb.leader(), &f.write, &f);
     w.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
     tb.wait_applied(tb.leader_last_log_index(), Duration::from_secs(20));
-    let follower = tb.ids().into_iter().find(|i| *i != tb.leader()).unwrap();
+    let leader = tb.leader();
+    let follower = tb.ids().into_iter().find(|i| *i != leader).unwrap();
     let dir = tb.node(follower).data_dir().to_path_buf();
     let snaps = dir.join("snapshots");
+    let ep = tb.node(follower).endpoint();
+    let cluster_id = w.admin_status().unwrap().cluster_id;
+    let extractors_hash = {
+        let (ep, secret) = (ep.clone(), f.secret.clone());
+        rt().block_on(async move {
+            let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut c =
+                pb::admin_client::AdminClient::with_interceptor(ch, graph_proto::SendVersion);
+            let r = c
+                .members(with(Some(&secret), pb::MembersRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+            r.members
+                .iter()
+                .find(|m| m.node_id == follower)
+                .unwrap()
+                .extractors_hash
+                .clone()
+        })
+    };
+    assert!(!extractors_hash.is_empty());
     let names = |d: &std::path::Path| {
         let mut v: Vec<String> = std::fs::read_dir(d)
             .unwrap()
@@ -1041,18 +1072,20 @@ fn a_refused_install_snapshot_writes_nothing() {
         v.sort();
         v
     };
-    let (before_snaps, before_root) = (tree(&snaps), names(&dir));
-    let rogue = graph_server::auth::new_credential("mgc_").to_string();
-    let creds: Vec<(&str, Option<String>)> = vec![
-        ("none", None),
-        ("write token", Some(f.write.clone())),
-        ("read token", Some(f.read.clone())),
-        ("another cluster's secret", Some(rogue)),
-    ];
-    let ep = tb.node(follower).endpoint();
-    for (what, cred) in creds {
-        let ep = ep.clone();
-        let code = rt().block_on(async move {
+    const CHUNKS: u64 = 8;
+    const CHUNK: usize = 64 << 10;
+    // Streams a header and chunks with `cred`, polling `snapshots/` after
+    // each chunk; returns the status code and whether a new file showed up.
+    let stream = |cred: Option<String>, stop_when_staged: bool| -> (Code, bool) {
+        let before = tree(&snaps);
+        let (ep, cid, hash) = (ep.clone(), cluster_id.clone(), extractors_hash.clone());
+        let snaps = snaps.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
             let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
                 .unwrap()
                 .connect()
@@ -1060,26 +1093,20 @@ fn a_refused_install_snapshot_writes_nothing() {
                 .unwrap();
             let mut g = tonic::client::Grpc::new(ch);
             g.ready().await.unwrap();
-            let header = pb::InstallSnapshotRequest {
-                msg: Some(pb::install_snapshot_request::Msg::Header(
-                    pb::InstallSnapshotHeader::default(),
-                )),
-            };
-            let chunks = (0..16).map(|i| pb::InstallSnapshotRequest {
-                msg: Some(pb::install_snapshot_request::Msg::Chunk(vec![
-                    i as u8;
-                    64 << 10
-                ])),
-            });
-            let msgs: Vec<_> = std::iter::once(header).chain(chunks).collect();
-            let mut req = tonic::Request::new(tokio_stream::iter(msgs));
-            req.metadata_mut().insert(
+            let (tx, rx) = tokio::sync::mpsc::channel::<pb::InstallSnapshotRequest>(1);
+            let mut req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+            let md = req.metadata_mut();
+            md.insert(
                 "mg-protocol-version",
                 graph_proto::PROTOCOL_VERSION.to_string().parse().unwrap(),
             );
+            md.insert(graph_server::paths::CLUSTER_ID_HEADER, cid.parse().unwrap());
+            md.insert(
+                graph_server::paths::EXTRACTORS_HASH_HEADER,
+                hash.parse().unwrap(),
+            );
             if let Some(c) = cred {
-                req.metadata_mut()
-                    .insert("authorization", format!("Bearer {c}").parse().unwrap());
+                md.insert("authorization", format!("Bearer {c}").parse().unwrap());
             }
             let codec: tonic_prost::ProstCodec<
                 pb::InstallSnapshotRequest,
@@ -1088,23 +1115,88 @@ fn a_refused_install_snapshot_writes_nothing() {
             let p = tonic::codegen::http::uri::PathAndQuery::from_static(
                 "/memory_graph.v1.Raft/InstallSnapshot",
             );
-            match tokio::time::timeout(Duration::from_secs(10), g.client_streaming(req, p, codec))
-                .await
-            {
-                Ok(Ok(_)) => Code::Ok,
-                Ok(Err(st)) => st.code(),
-                Err(_) => Code::DeadlineExceeded,
+            let call = tokio::spawn(async move { g.client_streaming(req, p, codec).await });
+            let membership = graph_server::raft::wire::membership_to_json(
+                &graph_server::raft::types::StoredMembership::default(),
+            );
+            let header = pb::InstallSnapshotHeader {
+                vote: Some(pb::RaftVote {
+                    term: 1_000,
+                    node_id: leader,
+                    committed: true,
+                }),
+                last_log_id: None,
+                membership_json: membership,
+                snapshot_id: "auth-test".into(),
+                store_format_version: graph_store::SCHEMA_VERSION,
+                extractors_hash: hash,
+                size: CHUNKS * CHUNK as u64,
+                sha256: "0".repeat(64),
+            };
+            let mut staged = false;
+            let _ = tx
+                .send(pb::InstallSnapshotRequest {
+                    msg: Some(pb::install_snapshot_request::Msg::Header(header)),
+                })
+                .await;
+            for i in 0..CHUNKS {
+                let sent = tx
+                    .send(pb::InstallSnapshotRequest {
+                        msg: Some(pb::install_snapshot_request::Msg::Chunk(vec![
+                            i as u8;
+                            CHUNK
+                        ])),
+                    })
+                    .await;
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if tree(&snaps) != before {
+                        staged = true;
+                    }
+                }
+                if sent.is_err() || (staged && stop_when_staged) {
+                    break;
+                }
             }
-        });
+            drop(tx);
+            let code = match tokio::time::timeout(Duration::from_secs(10), call).await {
+                Ok(Ok(Ok(_))) => Code::Ok,
+                Ok(Ok(Err(st))) => st.code(),
+                _ => Code::DeadlineExceeded,
+            };
+            (code, staged)
+        })
+    };
+    // The control: with the cluster secret the stream reaches staging.
+    let (_, staged) = stream(Some(f.secret.clone()), true);
+    assert!(staged, "the control stream wrote a staging file");
+    // The control's half stream is dropped; its staging file is removed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let settled = loop {
+        let t = tree(&snaps);
+        if t.iter().all(|(p, _)| !p.contains("incoming")) || std::time::Instant::now() > deadline {
+            break t;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let before_root = names(&dir);
+    let rogue = graph_server::auth::new_credential("mgc_").to_string();
+    for (what, cred) in [
+        ("none", None),
+        ("write token", Some(f.write.clone())),
+        ("read token", Some(f.read.clone())),
+        ("another cluster's secret", Some(rogue)),
+    ] {
+        let (code, staged) = stream(cred, false);
         assert_eq!(code, Code::Unauthenticated, "{what}");
+        assert!(!staged, "{what}: a file appeared under snapshots/");
     }
-    assert_eq!(tree(&snaps), before_snaps, "nothing under snapshots/");
+    assert_eq!(tree(&snaps), settled, "nothing under snapshots/");
     assert_eq!(names(&dir), before_root, "no new file in the data dir");
     // The node still replicates.
     w.index_bytes("o", "r", "b.rs", b"fn b() {}", None).unwrap();
     tb.wait_applied(tb.leader_last_log_index(), Duration::from_secs(20));
 }
-
 /// D2: an in-flight streaming request keeps the credential check it
 /// started with across a reload. An `Index` stream authenticated by a
 /// token that a reload removes half-way finishes (both files indexed); the
@@ -1190,7 +1282,8 @@ fn an_in_flight_index_stream_survives_a_reload_that_removes_its_token() {
 }
 
 /// D2: reloads that collide (a SIGHUP landing on the 5 s poll, here
-/// modelled by eight threads calling `reload_now` at once while the file
+/// modelled by eight threads calling `reload_now` at once, and four that
+/// only read the loaded set, while for 1.5 s the file
 /// is swapped atomically between two token sets) always leave exactly one
 /// of the sets loaded, never a mix or an empty set, and the last content
 /// written wins once the swaps stop. The poll-driven reloader of the
@@ -1250,8 +1343,23 @@ fn colliding_reloads_leave_one_consistent_set() {
                 }
             });
         }
-        for i in 0..200 {
-            swap(if i % 2 == 0 { &set_b } else { &set_a });
+        // Readers that never reload: they see every swap from outside.
+        for _ in 0..4 {
+            s.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let now = ids();
+                    assert!(
+                        now == ida || now == idb,
+                        "a reader saw a mixed set: {now:?}"
+                    );
+                }
+            });
+        }
+        let until = std::time::Instant::now() + Duration::from_millis(1500);
+        let mut i = 0u64;
+        while std::time::Instant::now() < until {
+            swap(if i.is_multiple_of(2) { &set_b } else { &set_a });
+            i += 1;
         }
         swap(&set_b);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
