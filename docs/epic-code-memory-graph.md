@@ -65,9 +65,9 @@
 | 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, gated) | High | 8 | P3 | 45 (gate), 46 |
 | 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, gated) | High | 5 | P3 | 47 |
 | 49 | Optional query-result cache (ADR 0008 phase 3, optional) | Low | 3 | P4 | 45, 48 |
-| 50 | OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot`, test seams (ADR 0009; groundwork in #248) | Medium | 8 | P3 | 24 |
-| 51 | Traces and W3C propagation across client, forward and leader apply (ADR 0009) | High | 8 | P3 | 50 |
-| 52 | Metrics over OTLP with the name mapping (ADR 0009) | Medium | 5 | P3 | 50 |
+| 50 | OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot`, test seams (ADR 0009; delivered in #248) | Medium | 8 | P3 | 24 |
+| 51 | Traces and W3C propagation across client, forward and leader apply (ADR 0009; delivered in #292) | High | 8 | P3 | 50 |
+| 52 | Metrics over OTLP with the name mapping (ADR 0009; delivered in #291) | Medium | 5 | P3 | 50 |
 | 53 | Logs over OTLP; trace ids in JSON logs when traces are on (ADR 0009) | Medium | 3 | P3 | 51 |
 | 54 | OpenTelemetry compose demo, CI, overhead numbers and docs (ADR 0009) | Low | 3 | P3 | 52, 53 |
 | 55 | Enum members as `Constant` symbols in C#, Java, TypeScript, C/C++ and Rust (ADR 0010, delivered; #271-#273) | High | 5 | P2 | 27, 28 |
@@ -76,15 +76,15 @@
 | 58 | Derived tables self-heal after an older binary writes to the file (#276; delivered in #286) | High | 3 | P2 | 57 |
 | 59 | Document today's substring matching and answer #278 (delivered in #282) | Medium | 1 | P2 | none |
 | 60 | Rust extractor: exact spans on shebang and raw-string files (#253; delivered in #287) | High | 3 | P2 | 9 |
-| 61 | Compact per-file sort key on the read path (#262; format change, approved 2026-10-09) | High | 5 | P2 | 58 (preferably) |
-| 62 | Membership changes keep in-flight tracking until Raft answers (#260) | Medium | 3 | P3 | 22 |
-| 63 | Rust parse stack counted in the ingest memory budget (#254) | Medium | 3 | P3 | 60 (preferably) |
+| 61 | Compact per-file sort key on the read path (#262; format change, approved 2026-10-09; delivered in #294) | High | 5 | P2 | 58 (preferably) |
+| 62 | Membership changes keep in-flight tracking until Raft answers (#260; delivered in #296) | Medium | 3 | P3 | 22 |
+| 63 | Rust parse stack counted in the ingest memory budget (#254; delivered in #293) | Medium | 3 | P3 | 60 (preferably) |
 | 64 | TypeScript decorated methods are found (#266; delivered in #283) | Medium | 2 | P2 | 27 |
-| 65 | asm extractor: exact spans on libunwind `UnwindRegistersSave.S` (#252) | Low | 2 | P3 | 30 |
+| 65 | asm extractor: exact spans on libunwind `UnwindRegistersSave.S` (#252; delivered in #290) | Low | 2 | P3 | 30 |
 | 66 | COBOL digit-led `SECTION` names such as `100A SECTION.` (#268; delivered in #284) | Low | 1 | P3 | 30 |
-| 67 | Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (#115) | Medium | 5 | P3 | 22 |
+| 67 | Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (#115; delivered in #295) | Medium | 5 | P3 | 22 |
 | 68 | Infix (substring) symbol search (#278; [ADR 0011](adr/0011-infix-search.md), Accepted 2026-10-10) | High | 5 | P3 | 61 (preferably) |
-| 69 | Authentication for `serve` (#105; [ADR 0012](adr/0012-authentication.md), Accepted 2026-10-10) | High | 8 | P3 | 20 |
+| 69 | Authentication for `serve` (#105; [ADR 0012](adr/0012-authentication.md), Accepted 2026-10-10; delivered in #299) | High | 8 | P3 | 20 |
 | 70 | Faster symbol queries: lazy file-context loading and no full name walk (after #298; [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner)) | High | 5 | P3 | 68 |
 
 Total: 70 stories, 333 pts (average about 4.8); 325 pts excluding the deferred stories 33 and 39. (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each needed an ADR before any code: [ADR 0011](adr/0011-infix-search.md) and [ADR 0012](adr/0012-authentication.md), both Accepted by the owner on 2026-10-10. Story 70 (5 pts) was added on 2026-10-12 at the owner's request, with the [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner), after story 68 measured infix p95 on the A5 index.
@@ -656,7 +656,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 3.
 
 <a id="story-50"></a>
 **50. OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot`, test seams (8 pts)**
-Status: Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals. The groundwork (no export) shipped early in PR #248; the new dependencies need the owner's approval in the PR that adds them.
+Status: Delivered in PR #248. Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals. The groundwork (no export) shipped early in PR #248; the new dependencies need the owner's approval in the PR that adds them.
 As a maintainer adding OpenTelemetry
 I want the pinned crates, a telemetry module, one metrics snapshot and a fake collector in place, with no change in behaviour
 So that traces, metrics and logs can be added and tested without touching the Prometheus contract.
@@ -688,7 +688,7 @@ Design: [ADR 0009](adr/0009-opentelemetry.md) D2, D3, D4, D6, D8 and D10.
 
 <a id="story-51"></a>
 **51. Traces and W3C propagation across client, forward and leader apply (8 pts)**
-Status: Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals.
+Status: Delivered in PR #292. Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals.
 As an operator debugging a slow or failed request
 I want one trace from the client through the follower and the forward to the leader and its apply
 So that I can see where the time went across nodes.
@@ -715,7 +715,7 @@ Design: [ADR 0009](adr/0009-opentelemetry.md) D5, D8 and D9.
 
 <a id="story-52"></a>
 **52. Metrics over OTLP with the name mapping (5 pts)**
-Status: Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals. Depends only on story 50, and can run in parallel with 51.
+Status: Delivered in PR #291. Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals. Depends only on story 50, and can run in parallel with 51.
 As an operator whose metrics pipeline is OpenTelemetry
 I want every `/metrics` family exported over OTLP under an OTel-style name
 So that I get the same numbers without scraping.
@@ -875,7 +875,7 @@ The six file paths were not recorded in #253 or PR #251. The first task is to li
 
 <a id="story-61"></a>
 **61. Compact per-file sort key on the read path (5 pts)**
-Status: Added 2026-10-09 (#262). Counted in the totals. The on-disk format change was approved by the owner on 2026-10-09. Preferably after story 58: both touch the derived-version self-heal on open, and 58 changes how its stamps are trusted, so landing 61 first would mean reworking its upgrade path.
+Status: Delivered in PR #294. Added 2026-10-09 (#262). Counted in the totals. The on-disk format change was approved by the owner on 2026-10-09. Preferably after story 58: both touch the derived-version self-heal on open, and 58 changes how its stamps are trusted, so landing 61 first would mean reworking its upgrade path.
 As a user of a large (about 1B-token) index
 I want hot-term queries to answer fast
 So that common words like `return` do not stall an agent.
@@ -890,7 +890,7 @@ So that common words like `return` do not stall an agent.
 
 <a id="story-62"></a>
 **62. Membership changes keep in-flight tracking until Raft answers (3 pts)**
-Status: Added 2026-10-09 (#260). Counted in the totals.
+Status: Delivered in PR #296. Added 2026-10-09 (#260). Counted in the totals.
 As an operator transferring leadership during a membership change
 I want the drain to wait for every appended entry
 So that the target never has a shorter log.
@@ -901,7 +901,7 @@ So that the target never has a shorter log.
 
 <a id="story-63"></a>
 **63. Rust parse stack counted in the ingest memory budget (3 pts)**
-Status: Added 2026-10-09 (#254). Counted in the totals. Preferably after story 60: both change the Rust extractor and its pinned version, so landing them in order avoids two version bumps racing.
+Status: Delivered in PR #293. Added 2026-10-09 (#254). Counted in the totals. Preferably after story 60: both change the Rust extractor and its pinned version, so landing them in order avoids two version bumps racing.
 As an operator indexing untrusted repos
 I want the Rust parse stack counted against `--memory`
 So that parallel adversarial files cannot exceed the budget.
@@ -922,7 +922,7 @@ So that `symbols` finds them after a field without a semicolon or after a method
 
 <a id="story-65"></a>
 **65. asm extractor: exact spans on libunwind `UnwindRegistersSave.S` (2 pts)**
-Status: Added 2026-10-09 (#252). Counted in the totals.
+Status: Delivered in PR #290. Added 2026-10-09 (#252). Counted in the totals.
 As a C and assembly user
 I want `UnwindRegistersSave.S` indexed with symbols
 So that its functions are found by `symbols`.
@@ -942,7 +942,7 @@ So that `100A SECTION.` is a section symbol.
 
 <a id="story-67"></a>
 **67. Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (5 pts)**
-Status: Added 2026-10-09 (#115). Counted in the totals.
+Status: Delivered in PR #295. Added 2026-10-09 (#115). Counted in the totals.
 As an operator
 I want a full disk during append or apply to refuse the write without stopping the node
 So that the cluster keeps serving and recovers when space is freed.
@@ -969,7 +969,7 @@ Resolved by ADR 0011 (originally an open question): the developer recommended sy
 
 <a id="story-69"></a>
 **69. Authentication for `serve` (8 pts)**
-Status: Added 2026-10-09 (#105). Counted in the totals. Design: [ADR 0012](adr/0012-authentication.md), Accepted by the owner on 2026-10-10. In progress (2026-10-11): the criteria below are ADR 0012's test plan (D10), which replaced the story's placeholder criteria when it started. Per-org and per-repo scopes are not part of it: they are [#289](https://github.com/P47Phoenix/memory-graph/issues/289). Unblocks story 33.
+Status: Delivered in PR #299. Added 2026-10-09 (#105). Counted in the totals. Design: [ADR 0012](adr/0012-authentication.md), Accepted by the owner on 2026-10-10. In progress (2026-10-11): the criteria below are ADR 0012's test plan (D10), which replaced the story's placeholder criteria when it started. Per-org and per-repo scopes are not part of it: they are [#289](https://github.com/P47Phoenix/memory-graph/issues/289). Unblocks story 33.
 As an operator running a shared server
 I want clients to authenticate before they read or write
 So that only trusted callers can reach the data.
