@@ -318,7 +318,7 @@ impl TelemetryConfig {
     /// Log the environment problem that turned OTLP off, if any (one error).
     pub fn log_problems(&self) {
         if let Some(problem) = &self.env_problem {
-            tracing::error!("{problem}; OpenTelemetry export is off");
+            tracing::error!(problem = %problem, "OpenTelemetry export is off");
         }
     }
 }

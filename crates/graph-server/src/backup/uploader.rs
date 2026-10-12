@@ -391,13 +391,13 @@ impl Inner {
                 Err(Outcome::Committed(done)) => {
                     tracing::info!(
                         index = job.side.index,
-                        "backup: skipped: `{}` is already committed",
-                        done.key
+                        key = %done.key,
+                        "backup: skipped: already committed"
                     );
                     return JobEnd::Done(done);
                 }
                 Err(Outcome::Skipped(why)) => {
-                    tracing::info!(index = job.side.index, "backup: skipped: {why}");
+                    tracing::info!(index = job.side.index, why = %why, "backup: skipped");
                     return JobEnd::Failed(why);
                 }
                 Err(o) => {
@@ -425,7 +425,7 @@ impl Inner {
                             job.side.term,
                             self.sink.describe()
                         );
-                        tracing::error!("backup failed after {} attempts: {msg}", attempt + 1);
+                        tracing::error!(attempts = attempt + 1, error = %msg, "backup failed");
                         let mut s = lock(&self.stats);
                         s.failures_total += 1;
                         s.last_error = msg.clone();

@@ -257,7 +257,8 @@ impl DiskStall {
                             source = ?src,
                             reopens = previous_io - 1,
                             error = %cause,
-                            "redb still answers PreviousIo after {MAX_PREVIOUS_IO} reopenings \
+                            limit = MAX_PREVIOUS_IO,
+                            "redb still answers PreviousIo after `limit` reopenings \
                              with no disk-full error: giving up (the node stops)"
                         );
                     }

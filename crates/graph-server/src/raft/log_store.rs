@@ -170,7 +170,8 @@ impl Drop for Owner {
         self.closing.store(true, Ordering::SeqCst);
         if !self.busy.wait_idle(COMPACT_DRAIN) {
             tracing::warn!(
-                "raft log: a compaction still runs {COMPACT_DRAIN:?} after the log was closed"
+                drain_ms = COMPACT_DRAIN.as_millis() as u64,
+                "raft log: a compaction still runs after the log was closed"
             );
         }
     }
