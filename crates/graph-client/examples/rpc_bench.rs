@@ -170,7 +170,7 @@ fn main() {
         (collector, guard)
     });
     let metrics = telemetry.as_ref().and_then(|(_, g)| g.metrics());
-    let server = TestServer::start_with(&a.db, vec![], |cfg| cfg.otlp_metrics = metrics);
+    let server = TestServer::start_with(&a.db, vec![], |cfg| cfg.otlp_metrics = metrics.clone());
     let remote = RemoteStore::connect(ClientConfig::new(server.endpoint())).expect("connect");
     let ping = measure(a.iters, || {
         remote.health("").unwrap();
@@ -190,6 +190,12 @@ fn main() {
         })
     });
     drop(remote);
+    // One last collection while the node is alive: after `drop(server)`
+    // its snapshot source is gone and only the synchronous histograms
+    // would be exported at shutdown.
+    if let Some(m) = &metrics {
+        m.collect_now().expect("metrics export");
+    }
     drop(server);
     let spans = telemetry.map(|(collector, guard)| {
         guard.shutdown_blocking();

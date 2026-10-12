@@ -26,7 +26,8 @@
 # OpenTelemetry Collector (debug exporter: traces, metrics and logs in its
 # log) and Jaeger (traces, UI on 16686). The nodes export only when
 # MG_OTLP_ENDPOINT is set:
-#   MG_OTLP_ENDPOINT=http://otel-collector:4317 MG_OTLP_METRICS_INTERVAL=10s #     docker compose -f deploy/compose/cluster.yml --profile otel up -d --wait
+#   MG_OTLP_ENDPOINT=http://otel-collector:4317 MG_OTLP_METRICS_INTERVAL=10s \
+#     docker compose -f deploy/compose/cluster.yml --profile otel up -d --wait
 #   docker compose -f deploy/compose/cluster.yml logs -f otel-collector
 # deploy/compose/check-otel.sh is the CI check of this profile.
 name: memory-graph

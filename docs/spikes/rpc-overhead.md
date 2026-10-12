@@ -86,15 +86,17 @@ Remote latency in milliseconds. [M]
 
 | operation | off p50 | off p95 | traces p50 | traces p95 | all three p50 | all three p95 | all - off p50 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| ping (Health.Check) | 0.064 | 0.098 | 0.083 | 0.127 | 0.085 | 0.121 | 0.021 |
-| describe | 0.466 | 0.538 | 0.477 | 0.591 | 0.477 | 0.549 | 0.011 |
-| search rare (19 hits) | 0.251 | 0.335 | 0.263 | 0.331 | 0.281 | 0.352 | 0.030 |
-| search rare, limit 1000 | 0.245 | 0.298 | 0.275 | 0.342 | 0.268 | 0.327 | 0.023 |
-| search common, limit 100 | 0.837 | 0.952 | 0.859 | 0.966 | 0.849 | 0.953 | 0.012 |
-| write (index_bytes) | 4.351 | 17.160 | 4.239 | 4.681 | 4.214 | 4.579 | -0.137 |
+| ping (Health.Check) | 0.066 | 0.101 | 0.082 | 0.125 | 0.084 | 0.121 | 0.018 |
+| describe | 0.487 | 0.687 | 0.515 | 0.690 | 0.515 | 0.684 | 0.028 |
+| search rare (19 hits) | 0.265 | 0.387 | 0.306 | 0.473 | 0.279 | 0.338 | 0.014 |
+| search rare, limit 1000 | 0.266 | 0.376 | 0.291 | 0.401 | 0.308 | 0.481 | 0.042 |
+| search common, limit 100 | 0.969 | 1.509 | 0.882 | 1.369 | 0.926 | 1.361 | -0.043 |
+| write (index_bytes) | 4.461 | 6.292 | 4.419 | 5.113 | 4.856 | 6.796 | 0.395 |
 
-- Each "on" run exported 11,663 spans; the "all three" runs also exported 61 log records. Their remote phase lasts about 6 s, so metrics were exported about once (at shutdown) and the per-interval snapshot collection is not in these numbers; it runs once per interval (60 s by default) off the request path, and opens no redb transaction (story 52). [M]
+- Each "on" run exported 11,663 spans; the "all three" runs also exported 61 log records and 35 metrics in 2 metric exports (one on the 5 s interval, one forced while the server was still up; `rpc_bench` collects before it stops the server, otherwise only the two synchronous histograms would get out). The remote phase lasts about 6 s, so the per-interval snapshot collection ran about twice per run; in `serve` it runs once per interval (60 s by default), off the request path, and opens no redb transaction (story 52). [M]
+- An earlier set of the same nine runs, before the forced collection (so with only the two histograms exported), measured all - off at p50: ping +0.021, describe +0.011, rare +0.030, rare limit 1000 +0.023, common +0.012, write -0.137 ms. The set above ran with more load on the machine (look at its p95s); the two sets differ by about as much as the configurations do. [M]
 - **Verdict.**
-  - Reads: all three signals cost 0.01 to 0.03 ms at p50 over off, the same as traces alone. Logs add nothing measurable: `serve` logs RPCs at DEBUG, so at the INFO default a read emits no log record. [M]
-  - Writes: no difference above noise this time (story 51's single run measured +0.5 ms for traces). The off runs' p95 of 17 ms comes from two of three runs with a slow tail while other programs were running, not from OpenTelemetry. [M]
+  - Reads: all three signals cost about 0.01 to 0.04 ms at p50 over off, the same as traces alone, and within the noise between runs. Logs add nothing measurable to reads: `serve` logs RPCs at DEBUG, so at the INFO default a read emits no log record (61 records over 6,000 reads and 200 writes). [M]
+  - Writes: between -0.14 and +0.4 ms at p50 across the two sets, that is, within run-to-run noise on this machine (story 51's single run measured +0.5 ms for traces). Treat 0.5 ms (about 10%) as the upper estimate for a small write. [M]
   - With OpenTelemetry off nothing is built (story 50), so "off" is the cost of the code paths that check it. [E: from the code]
+- **CI cost of the compose demo.** `deploy/compose/check-otel.sh`, run after `check.sh` on the same image: 45 s wall time on this machine, including `up --wait` and `down -v`. [M]

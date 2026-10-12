@@ -76,7 +76,8 @@ OpenTelemetry only when `MG_OTLP_ENDPOINT` is set; without it they pass an empty
 `--otlp-endpoint`, which is the same as none ([ADR 0009](../adr/0009-opentelemetry.md)):
 
 ```sh
-MG_OTLP_ENDPOINT=http://otel-collector:4317 MG_OTLP_METRICS_INTERVAL=10s   docker compose -f deploy/compose/cluster.yml --profile otel up -d --wait
+MG_OTLP_ENDPOINT=http://otel-collector:4317 MG_OTLP_METRICS_INTERVAL=10s \
+  docker compose -f deploy/compose/cluster.yml --profile otel up -d --wait
 memory-graph --server 127.0.0.1:7002 index --org acme --repo api ./api   # some traffic
 docker compose -f deploy/compose/cluster.yml logs -f otel-collector      # traces, metrics, logs
 # Jaeger UI: http://127.0.0.1:16686 (service memory-graph; MG_JAEGER_UI_PORT overrides the port)
@@ -90,8 +91,8 @@ verbosity (each resource's `service.instance.id` is the node id) and forwards tr
 sends on to a backend over TLS, see
 [observability.md](../guide/observability.md#a-collector-with-tls).
 
-`deploy/compose/check-otel.sh` is the CI check of this profile (the `otel` job of
-`.github/workflows/compose.yml`): it starts the profile, sends a write through node2 and a
+`deploy/compose/check-otel.sh` is the CI check of this profile (the last step of the `compose`
+CI job, after `check.sh`, on the same image and CLI; about 45 s including `up` and `down`): it starts the profile, sends a write through node2 and a
 search to every node until the collector's debug log shows traces, metrics and logs from nodes
 1, 2 and 3 and Jaeger lists the `memory-graph` service, each wait bounded by `WAIT_SECS`, then
 `down -v`. It uses its own project name and host ports (`CHECK_PORT_BASE`, default 27000; Jaeger

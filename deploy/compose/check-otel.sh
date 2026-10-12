@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end check of the `otel` profile of deploy/compose/cluster.yml
-# (ADR 0009, epic story 54): the `otel` job of the Compose CI workflow
-# (.github/workflows/compose.yml) runs it, and it runs the same locally:
+# (ADR 0009, epic story 54): the Compose CI job runs it after check.sh, on
+# the same image (.github/workflows/compose.yml), and it runs the same locally:
 #
 #   cargo build --release -p graph-cli
 #   deploy/compose/check-otel.sh       # MG=path/to/memory-graph to override
