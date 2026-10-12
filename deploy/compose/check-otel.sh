@@ -60,18 +60,27 @@ log "starting the cluster with the otel profile"
 
 # Which nodes (service.instance.id) the collector's debug log shows, per
 # signal. The debug exporter (verbosity detailed) prints a
-# `ResourceSpans #n` / `ResourceMetrics #n` / `ResourceLog #n` header, then
+# `ResourceSpans #n` / `ResourceMetrics #n` / `ResourceLog #n` header (the
+# first one of an export on the exporter's own `info` log line), then
 # that resource's attributes, one `-> key: Type(value)` line each.
 seen() {
   "${COMPOSE[@]}" logs --no-color --no-log-prefix otel-collector 2>/dev/null >"$WORK/collector.log"
   "$PY" - "$WORK/collector.log" <<'EOF'
 import re, sys
 signal, seen = None, {"traces": set(), "metrics": set(), "logs": set()}
-heads = {"ResourceSpans #": "traces", "ResourceMetrics #": "metrics", "ResourceLog #": "logs"}
+# A header starts a line, or follows the zap prefix of the exporter's own
+# log line (`<time>\tinfo\tResourceLog #0`), so it is searched for. Any
+# other zap line (a new export) ends the current resource, so an id is only
+# ever credited to the signal of its own enclosing header.
+head = re.compile(r"\b(ResourceSpans|ResourceMetrics|ResourceLog) #\d+")
+zap = re.compile(r"\t(debug|info|warn|error)\t")
+names = {"ResourceSpans": "traces", "ResourceMetrics": "metrics", "ResourceLog": "logs"}
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
-    for head, name in heads.items():
-        if line.startswith(head):
-            signal = name
+    h = head.search(line)
+    if h:
+        signal = names[h.group(1)]
+    elif zap.search(line):
+        signal = None
     m = re.search(r"-> service\.instance\.id: \w+\((\w+)\)", line)
     if m and signal:
         seen[signal].add(m.group(1))
