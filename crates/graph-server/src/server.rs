@@ -962,7 +962,19 @@ pub async fn start(
         ));
     }
 
-    if let (Some((l, _)), Some(m)) = (mcp_listener, cfg.mcp.clone()) {
+    if let (Some((l, _)), Some(mut m)) = (mcp_listener, cfg.mcp.clone()) {
+        // The write tools never index this node's own files.
+        m.excluded = [
+            paths.data_dir.clone(),
+            Some(paths.store.clone()),
+            Some(paths.log.clone()),
+            Some(paths.snapshots_dir.clone()),
+            paths.node_json.clone(),
+            Some(paths.lock.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         tokio::spawn(crate::mcp::serve(l, m, Arc::clone(&ctx), shutdown.clone()));
     }
 

@@ -91,7 +91,10 @@ where
             .with_location(false)
             .with_threads(false)
             .with_tracked_inactivity(false)
-            .with_filter(tracing_subscriber::filter::filter_fn(exported))
+            .with_filter(super::AskEachTime {
+                callsite: exported,
+                enabled: exported,
+            })
             .boxed(),
     )
 }
@@ -450,6 +453,40 @@ pub fn current_rpc_context() -> SpanContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #309, #310: an `enabled` call with nothing created after it (what
+    /// `tracing::enabled!` does, in `openraft` on the caller's thread) must
+    /// not hide the next exported span on that thread from the layer.
+    #[test]
+    fn a_leftover_enabled_call_does_not_hide_the_next_exported_span() {
+        use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::layer::SubscriberExt;
+        // A callsite the filter rejects (any non-workspace target).
+        let hint = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            tracing::debug_span!(target: "openraft::raft", "hint")
+                .metadata()
+                .expect("a plain registry enables everything")
+        });
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("test"))
+            .with_filter(crate::telemetry::AskEachTime {
+                callsite: exported,
+                enabled: exported,
+            });
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            for i in 0..3 {
+                tracing::dispatcher::get_default(|d| d.enabled(hint));
+                let span = tracing::info_span!(target: "graph_server::test", "exported");
+                assert!(!span.is_disabled());
+                assert!(
+                    span.context().span().span_context().is_valid(),
+                    "span {i} is invisible to the OpenTelemetry layer"
+                );
+            }
+        });
+    }
 
     #[test]
     fn only_workspace_spans_outside_the_raft_service_are_exported() {

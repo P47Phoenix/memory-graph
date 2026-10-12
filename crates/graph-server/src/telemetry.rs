@@ -52,6 +52,52 @@ pub use metrics::{
     rpc_attributes, status_code, CollectionCounts, OtlpMetrics, OtlpRecorders, SnapshotSource,
     APPLY_DURATION, RPC_DURATION,
 };
+/// A per-layer filter that is asked again for every span and event it may
+/// want, instead of caching `Interest::always` for the callsite (#309,
+/// #310).
+///
+/// `filter_fn` caches `always`, and a callsite with that interest is never
+/// asked `enabled` again: `tracing-subscriber` (0.3.23) then decides the
+/// span from this thread's per-layer filter state as the *previous*
+/// `enabled` call left it. A call that leaves it set with no span or event
+/// after it (a `tracing::enabled!` hint, which `openraft` evaluates on the
+/// caller's thread in every `Raft` call, while its callsite interest is
+/// still `sometimes` or the first registration races) makes the next such
+/// span on that thread silently invisible to this layer: it exists, but it
+/// has no OpenTelemetry context, so it is not exported, and neither is the
+/// `traceparent` of any call under it. Answering `sometimes` makes every
+/// span and event that could pass run `enabled` first, which sets this
+/// filter's state for exactly that span or event. `never` stays cached
+/// for what `callsite` rules out (`callsite` must be true wherever
+/// `enabled` can be, and may only depend on the metadata).
+pub(crate) struct AskEachTime {
+    /// Whether anything from this callsite can pass: false is cached.
+    pub(crate) callsite: fn(&tracing::Metadata<'_>) -> bool,
+    /// Whether this span or event passes, asked every time.
+    pub(crate) enabled: fn(&tracing::Metadata<'_>) -> bool,
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for AskEachTime {
+    fn enabled(
+        &self,
+        m: &tracing::Metadata<'_>,
+        _: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        (self.enabled)(m)
+    }
+
+    fn callsite_enabled(
+        &self,
+        m: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if (self.callsite)(m) {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+}
+
 mod logs;
 pub use logs::{allowed_log_field, bridged, current_trace_ids, log_layer, ALLOWED_LOG_FIELDS};
 mod traces;

@@ -175,6 +175,57 @@ impl WriteService {
         }))
     }
 
+    /// Index `files` into `org`/`repo` from inside this process (the MCP
+    /// write tools, story 33): on the leader, cut into entries and
+    /// proposed as an `Index` stream would be; elsewhere, sent to the
+    /// leader as one forwarded `Index` stream. One result per file, in
+    /// order.
+    pub async fn index_files(
+        &self,
+        org: &str,
+        repo: &str,
+        reindex: bool,
+        files: Vec<pb::FileBytes>,
+    ) -> Result<Vec<pb::FileResult>, Status> {
+        for f in &files {
+            f.resolved_encoding_hint()?;
+        }
+        if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &Request::new(()))? {
+            let deadline = self.ctx.fwd.deadline(
+                &tonic::metadata::MetadataMap::new(),
+                crate::forward::FORWARD_INDEX_TIMEOUT,
+            );
+            let mut client = self.ctx.fwd.write_client(&addr)?;
+            let header = pb::IndexRequest {
+                msg: Some(pb::index_request::Msg::Header(pb::IndexHeader {
+                    org: org.into(),
+                    repo: repo.into(),
+                    options: Some(pb::IndexOptions { reindex }),
+                })),
+            };
+            let msgs: Vec<pb::IndexRequest> = std::iter::once(header)
+                .chain(files.into_iter().map(|f| pb::IndexRequest {
+                    msg: Some(pb::index_request::Msg::File(f)),
+                }))
+                .collect();
+            let resp = crate::forward::within(
+                self.ctx.fwd.me(),
+                deadline,
+                client.index(Forwarder::request(tokio_stream::iter(msgs), deadline)),
+            )
+            .await
+            .map_err(forward_error)?;
+            self.ctx.fwd.count();
+            return Ok(resp.into_inner().results);
+        }
+        let mut results = Vec::new();
+        for chunk in cut_chunks(files) {
+            let (r, _) = self.index_chunk(org, repo, reindex, chunk).await?;
+            results.extend(r);
+        }
+        Ok(results)
+    }
+
     async fn propose(&self, cmd: Cmd) -> Result<(LogResponse, u64), Status> {
         if let Some(after) = self.ctx.stall_writes_after {
             let seen = self

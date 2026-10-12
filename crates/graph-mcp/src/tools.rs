@@ -15,6 +15,12 @@
 //! - a [`StoreError`] has its own code.
 //!
 //! Only an unknown tool ([`ToolError::UnknownTool`]) is a JSON-RPC `-32602`.
+//!
+//! The write tools (`index_path`, `prune`; story 33) are defined here too
+//! ([`write_tool_definitions`]) but answered by [`crate::write`], and only
+//! when the host turned them on ([`StoreBackend::with_writes`]); otherwise
+//! they are not listed and a call is an unknown tool.
+use crate::write::{WriteAccess, WRITE_TOOL_NAMES};
 use graph_core::{NodeKind, SymbolKind, TokenClass};
 use graph_store::{Grain, Query, StoreError, StoreRead, SymbolQuery};
 use serde_json::{json, Map, Value};
@@ -85,6 +91,33 @@ pub enum ToolCall {
         prefix: Option<String>,
         page: PageArgs,
     },
+    /// A write tool (story 33): index a directory under the index root.
+    IndexPath {
+        org: String,
+        repo: String,
+        path: String,
+        reindex: bool,
+    },
+    /// A write tool (story 33): remove directory-indexed files no longer
+    /// under a directory. `dry_run` defaults to true.
+    Prune {
+        org: String,
+        repo: String,
+        path: String,
+        dry_run: bool,
+    },
+}
+
+impl ToolCall {
+    /// Whether this is one of the write tools ([`WRITE_TOOL_NAMES`]).
+    pub fn is_write(&self) -> bool {
+        matches!(self, ToolCall::IndexPath { .. } | ToolCall::Prune { .. })
+    }
+}
+
+/// Whether `name` is one of the write tools.
+pub fn is_write_tool(name: &str) -> bool {
+    WRITE_TOOL_NAMES.contains(&name)
 }
 
 /// Why a tool call did not produce a normal result.
@@ -109,9 +142,15 @@ impl From<StoreError> for ToolError {
 }
 
 /// What answers tool calls (ADR 0005 D1). `read` returns the tool's
-/// `structuredContent`.
+/// `structuredContent` (a write tool's too, when writes are on).
 pub trait McpBackend {
     fn read(&self, call: &ToolCall) -> Result<Value, ToolError>;
+
+    /// Whether the write tools are on (story 33): listed by `tools/list`
+    /// and callable. Off unless the host turned them on.
+    fn writes_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// The typed code of a store error in an `isError` result: the
@@ -511,17 +550,115 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-/// The `outputSchema` of `tool`, if it exists.
+/// The write tools' definitions (story 33), listed after the read tools
+/// only when writes are on.
+pub fn write_tool_definitions() -> Vec<Value> {
+    let org = s("Organisation name to index into (exact)");
+    let repo = s("Repository name to index into (exact)");
+    let path = s("A directory under the server's index root: relative to it, or absolute inside it (`.` is the root itself). Resolved (symlinks and `..` included) before it is checked against the root");
+    let count = json!({"type": "integer", "minimum": 0});
+    let index_in = input(
+        json!({
+            "org": org, "repo": repo, "path": path,
+            "reindex": {"type": "boolean", "default": false, "description": "Re-index files whose content is unchanged too (default false: they are skipped by fingerprint)"}
+        }),
+        &["org", "repo", "path"],
+    );
+    let index_out = json!({
+        "type": "object",
+        "properties": {
+            "org": {"type": "string"},
+            "repo": {"type": "string"},
+            "path": {"type": "string", "description": "The directory indexed, relative to the index root"},
+            "indexed": count, "unchanged": count, "symbols": count, "tokens": count,
+            "failed_count": count,
+            "failed": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "code": {"type": "string"}, "message": {"type": "string"}},
+                "required": ["path", "code", "message"],
+                "additionalProperties": false
+            }},
+            "skipped_count": count,
+            "skipped": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "reason": {"type": "string"}},
+                "required": ["path", "reason"],
+                "additionalProperties": false
+            }},
+            "truncated": {"type": "boolean", "description": "failed or skipped lists only their first 200 entries; the counts are whole"}
+        },
+        "required": ["org", "repo", "path", "indexed", "unchanged", "symbols", "tokens",
+                     "failed_count", "failed", "skipped_count", "skipped", "truncated"],
+        "additionalProperties": false
+    });
+    let prune_in = input(
+        json!({
+            "org": org, "repo": repo, "path": path,
+            "dry_run": {"type": "boolean", "default": true, "description": "Only report what would be removed (the default); pass false to remove"}
+        }),
+        &["org", "repo", "path"],
+    );
+    let prune_out = json!({
+        "type": "object",
+        "properties": {
+            "org": {"type": "string"},
+            "repo": {"type": "string"},
+            "path": {"type": "string"},
+            "dry_run": {"type": "boolean"},
+            "removed_count": count,
+            "removed": {"type": "array", "items": {"type": "string"}},
+            "truncated": {"type": "boolean", "description": "removed lists only its first 200 paths; removed_count is whole"}
+        },
+        "required": ["org", "repo", "path", "dry_run", "removed_count", "removed", "truncated"],
+        "additionalProperties": false
+    });
+    let def = |name: &str, title: &str, desc: &str, i: Value, o: Value, destructive: bool| {
+        json!({
+            "name": name,
+            "title": title,
+            "description": desc,
+            "inputSchema": i,
+            "outputSchema": o,
+            "annotations": {
+                "title": title,
+                "readOnlyHint": false,
+                "destructiveHint": destructive,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        })
+    };
+    vec![
+        def("index_path", "Index a directory",
+            "Index every file under a directory of the server's index root as one repository, like `memory-graph index`: .gitignore is honoured, .git and symlinks are skipped, and files whose content is unchanged are skipped by fingerprint. Paths are stored relative to the directory. Files no longer there are not removed: use prune.",
+            index_in, index_out, false),
+        def("prune", "Prune removed files",
+            "Remove the files of a repository, indexed from a directory, that are no longer under that directory (like `memory-graph index --prune`). Dry run by default: pass dry_run false to remove. Refused if part of the directory cannot be read, or if it has no files while the repository has some.",
+            prune_in, prune_out, true),
+    ]
+}
+
+/// What `tools/list` returns: the read tools, plus the write tools when
+/// `writes` is on.
+pub fn listed_tools(writes: bool) -> Vec<Value> {
+    let mut v = tool_definitions();
+    if writes {
+        v.extend(write_tool_definitions());
+    }
+    v
+}
+
+/// The `outputSchema` of `tool` (a read or a write tool), if it exists.
 pub fn output_schema(tool: &str) -> Option<Value> {
-    tool_definitions()
+    listed_tools(true)
         .into_iter()
         .find(|d| d["name"] == tool)
         .map(|d| d["outputSchema"].clone())
 }
 
-/// The `inputSchema` of `tool`, if it exists.
+/// The `inputSchema` of `tool` (a read or a write tool), if it exists.
 pub fn input_schema(tool: &str) -> Option<Value> {
-    tool_definitions()
+    listed_tools(true)
         .into_iter()
         .find(|d| d["name"] == tool)
         .map(|d| d["inputSchema"].clone())
@@ -771,6 +908,24 @@ pub fn parse_call(name: &str, arguments: &Map<String, Value>) -> Result<ToolCall
                 page: a.page(MAX_LIMIT)?,
             }
         }
+        "index_path" => {
+            a.only(&["org", "repo", "path", "reindex"])?;
+            ToolCall::IndexPath {
+                org: a.str("org")?,
+                repo: a.str("repo")?,
+                path: a.str("path")?,
+                reindex: a.opt_bool("reindex")?.unwrap_or(false),
+            }
+        }
+        "prune" => {
+            a.only(&["org", "repo", "path", "dry_run"])?;
+            ToolCall::Prune {
+                org: a.str("org")?,
+                repo: a.str("repo")?,
+                path: a.str("path")?,
+                dry_run: a.opt_bool("dry_run")?.unwrap_or(true),
+            }
+        }
         other => {
             return Err(ToolError::UnknownTool(format!(
                 "unknown tool `{other}`; tools: {}",
@@ -814,6 +969,8 @@ pub type StaleCounter = Box<dyn Fn() -> u64 + Send + Sync>;
 pub struct StoreBackend {
     store: Box<dyn StoreRead + Send>,
     stale_reads: Option<StaleCounter>,
+    /// The write tools, when on (story 33).
+    writes: Option<WriteAccess>,
 }
 
 impl StoreBackend {
@@ -822,7 +979,15 @@ impl StoreBackend {
         Self {
             store,
             stale_reads: None,
+            writes: None,
         }
+    }
+
+    /// Turn the write tools on (story 33): `index_path` and `prune`, confined
+    /// to `access`'s index root. Off by default.
+    pub fn with_writes(mut self, access: WriteAccess) -> Self {
+        self.writes = Some(access);
+        self
     }
 
     /// A store behind a server: a call is `stale_possible` when the counter
@@ -831,6 +996,7 @@ impl StoreBackend {
         Self {
             store,
             stale_reads: Some(stale_reads),
+            writes: None,
         }
     }
 
@@ -1051,12 +1217,48 @@ impl StoreBackend {
                     .collect();
                 page_of(items, *page)
             }
+            ToolCall::IndexPath { .. } | ToolCall::Prune { .. } => {
+                unreachable!("write calls do not come here")
+            }
         })
     }
 }
 
+impl StoreBackend {
+    fn write(&self, call: &ToolCall) -> Result<Value, ToolError> {
+        let Some(w) = &self.writes else {
+            return Err(ToolError::UnknownTool(format!(
+                "the write tools are off on this server; tools: {}",
+                TOOL_NAMES.join(", ")
+            )));
+        };
+        match call {
+            ToolCall::IndexPath {
+                org,
+                repo,
+                path,
+                reindex,
+            } => w.index_path(org, repo, path, *reindex),
+            ToolCall::Prune {
+                org,
+                repo,
+                path,
+                dry_run,
+            } => w.prune(org, repo, path, *dry_run),
+            _ => unreachable!("only write calls come here"),
+        }
+    }
+}
+
 impl McpBackend for StoreBackend {
+    fn writes_enabled(&self) -> bool {
+        self.writes.is_some()
+    }
+
     fn read(&self, call: &ToolCall) -> Result<Value, ToolError> {
+        if call.is_write() {
+            return self.write(call);
+        }
         let before = self.stale_reads.as_ref().map(|c| c());
         let mut out = self.answer(call)?;
         let stale = match (&self.stale_reads, before) {
@@ -1366,6 +1568,47 @@ mod tests {
             (b["code"].as_str(), b["retryable"].as_bool()),
             (Some("storage"), Some(false))
         );
+    }
+
+    #[test]
+    fn write_tools_are_separate_opt_in_definitions() {
+        let defs = write_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert_eq!(names, WRITE_TOOL_NAMES);
+        for d in &defs {
+            assert_eq!(d["annotations"]["readOnlyHint"], false, "{}", d["name"]);
+            assert!(crate::schema::validate(&d["inputSchema"], &json!({})).is_err());
+            crate::schema::validate(&json!({"type": "object"}), &d["outputSchema"]).unwrap();
+        }
+        assert_eq!(listed_tools(false), tool_definitions());
+        assert_eq!(listed_tools(true).len(), TOOL_NAMES.len() + 2);
+        // prune is a dry run unless told otherwise; reindex is off.
+        match call("prune", json!({"org": "o", "repo": "r", "path": "."})).unwrap() {
+            ToolCall::Prune { dry_run, .. } => assert!(dry_run),
+            other => panic!("{other:?}"),
+        }
+        match call(
+            "index_path",
+            json!({"org": "o", "repo": "r", "path": ".", "reindex": null}),
+        )
+        .unwrap()
+        {
+            ToolCall::IndexPath { reindex, .. } => assert!(!reindex),
+            other => panic!("{other:?}"),
+        }
+        invalid(call("index_path", json!({"org": "o", "repo": "r"})));
+        invalid(call(
+            "index_path",
+            json!({"org": "o", "repo": "", "path": "."}),
+        ));
+        invalid(call(
+            "prune",
+            json!({"org": "o", "repo": "r", "path": ".", "dry_run": "no"}),
+        ));
+        invalid(call(
+            "prune",
+            json!({"org": "o", "repo": "r", "path": ".", "force": true}),
+        ));
     }
 
     #[test]

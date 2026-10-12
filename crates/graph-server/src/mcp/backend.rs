@@ -10,11 +10,17 @@
 //! drives the async service with [`Handle::block_on`] (allowed there; never
 //! from a runtime worker). `RemoteStore` is not used inside `serve`.
 use crate::services::store::StoreService;
+use crate::services::write::WriteService;
 use graph_core::{Node, NodeId, NodeKind};
+use graph_mcp::{McpWriter, WriteFile};
 use graph_proto::convert::enum_i32;
 use graph_proto::pb::store_server::Store as StoreRpc;
+use graph_proto::pb::write_server::Write as WriteRpc;
 use graph_proto::{pb, status_to_store_error, ConvertError, ReadMeta, View};
-use graph_store::{Hit, Page, Query, RepoInfo, StoreError, StoreRead, SymbolHit, SymbolQuery};
+use graph_store::{
+    Hit, IngestStats, Page, Query, RepoInfo, StoreError, StoreRead, SymbolHit, SymbolQuery,
+};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -309,5 +315,69 @@ impl StoreRead for InProcessStore {
             pq.offset = Some(at);
             self.search_page(view, &pq).map(|(h, _)| h)
         })
+    }
+}
+
+/// The MCP write tools' writer inside `serve` (story 33): every write goes
+/// through this node's own `memory_graph.v1.Write` service in process, so
+/// it is proposed through Raft on the leader, or forwarded to the leader
+/// from a follower, exactly as a gRPC client's write is.
+pub struct InProcessWriter {
+    svc: Arc<WriteService>,
+    rt: Handle,
+}
+
+impl InProcessWriter {
+    pub fn new(svc: Arc<WriteService>, rt: Handle) -> Self {
+        Self { svc, rt }
+    }
+}
+
+impl McpWriter for InProcessWriter {
+    fn index_files(
+        &self,
+        org: &str,
+        repo: &str,
+        files: Vec<WriteFile>,
+        reindex: bool,
+    ) -> Result<Vec<Result<IngestStats>>> {
+        let files: Vec<pb::FileBytes> = files
+            .into_iter()
+            .map(|f| pb::FileBytes {
+                path: f.path,
+                bytes: f.bytes,
+                origin: Some(graph_mcp::write::DIRECTORY_ORIGIN.into()),
+                ..Default::default()
+            })
+            .collect();
+        let results = self
+            .rt
+            .block_on(self.svc.index_files(org, repo, reindex, files))
+            .map_err(err)?;
+        results.into_iter().map(conv).collect()
+    }
+
+    fn prune(
+        &self,
+        org: &str,
+        repo: &str,
+        keep: &HashSet<String>,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        let mut keep: Vec<String> = keep.iter().cloned().collect();
+        keep.sort();
+        let r = self
+            .rt
+            .block_on(WriteRpc::prune(
+                &*self.svc,
+                Request::new(pb::PruneRequest {
+                    org: org.into(),
+                    repo: repo.into(),
+                    keep,
+                    dry_run,
+                }),
+            ))
+            .map_err(err)?;
+        Ok(r.into_inner().removed)
     }
 }
