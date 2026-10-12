@@ -1832,7 +1832,12 @@ fn run() -> Result<i32> {
                         "memory-graph mcp: write tools confined to {}",
                         access.root().display()
                     );
-                    backend.with_writes(access)
+                    // Never index the database's own files.
+                    let own = match &target {
+                        Target::Embedded(db) => vec![db.clone()],
+                        _ => Vec::new(),
+                    };
+                    backend.with_writes(access.with_excluded(own))
                 }
                 _ => backend,
             };

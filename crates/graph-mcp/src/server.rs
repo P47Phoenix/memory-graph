@@ -40,7 +40,7 @@ pub const NOT_INITIALIZED: i64 = -32002;
 const READ_INSTRUCTIONS: &str = "Read-only access to a code memory graph (org -> repo -> file -> symbol -> token). Call describe first to learn the orgs, repos, languages and symbol kinds present; then search (token text rolled up to symbols), find_symbols (definitions by name), file_outline, file_tokens and list_files. List tools page with limit/offset; pass next_offset to continue.";
 
 /// `instructions` when the write tools are on (story 33).
-const WRITE_INSTRUCTIONS: &str = "Access to a code memory graph (org -> repo -> file -> symbol -> token). Call describe first to learn the orgs, repos, languages and symbol kinds present; then search (token text rolled up to symbols), find_symbols (definitions by name), file_outline, file_tokens and list_files. List tools page with limit/offset; pass next_offset to continue. Writes are on: index_path indexes a directory under the server's index root as a repo, and prune (a dry run unless dry_run is false) removes that repo's files no longer there.";
+const WRITE_INSTRUCTIONS: &str = "Access to a code memory graph (org -> repo -> file -> symbol -> token). Call describe first to learn the orgs, repos, languages and symbol kinds present; then search (token text rolled up to symbols), find_symbols (definitions by name), file_outline, file_tokens and list_files. List tools page with limit/offset; pass next_offset to continue. Writes are on: index_path indexes a directory as a repo; its path is relative to the server's index root (on the server's file system, not the client's), and and prune (a dry run unless dry_run is false) removes that repo's files no longer there.";
 
 /// The protocol state machine over one backend.
 pub struct McpServer<B> {

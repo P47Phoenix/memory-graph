@@ -121,6 +121,10 @@ pub fn tool_need(name: &str) -> crate::auth::Role {
 /// a directory takes longer than a read.
 pub const WRITE_CALL_DEADLINE: Duration = Duration::from_secs(600);
 
+/// Write tool calls running at once on one endpoint; more get 429, so a
+/// few long writes cannot take every `--mcp-max-inflight` slot.
+pub const MAX_INFLIGHT_WRITES: usize = 2;
+
 /// The 401 of a request without a valid token (ADR 0012 D9).
 fn unauthorized() -> Response {
     let mut r = plain(
@@ -176,6 +180,9 @@ pub struct McpConfig {
     pub index_root: Option<std::path::PathBuf>,
     /// A write tool's per-call deadline ([`WRITE_CALL_DEADLINE`]).
     pub write_call_timeout: Duration,
+    /// The node's own files (its `NodePaths`), which the write tools
+    /// never index; `serve` fills it in.
+    pub excluded: Vec<std::path::PathBuf>,
     /// Testing only: every call sleeps this long on the blocking pool
     /// first, so a test can hold requests in flight or pass the deadline.
     #[doc(hidden)]
@@ -202,6 +209,7 @@ impl McpConfig {
             call_timeout: CALL_DEADLINE,
             index_root: None,
             write_call_timeout: WRITE_CALL_DEADLINE,
+            excluded: Vec::new(),
             testing_call_delay: None,
             session_idle: SESSION_IDLE,
             testing_linger: Linger::DEFAULT,
@@ -305,6 +313,9 @@ struct McpState {
     /// `Some` when the write tools are on (`--mcp-allow-writes`).
     index_root: Option<std::path::PathBuf>,
     write_call_timeout: Duration,
+    excluded: Vec<std::path::PathBuf>,
+    /// [`MAX_INFLIGHT_WRITES`].
+    writes_inflight: Arc<Semaphore>,
     view: View,
     bound: SocketAddr,
     allow_origins: Vec<String>,
@@ -333,6 +344,8 @@ pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdow
         }),
         index_root: cfg.index_root.clone(),
         write_call_timeout: cfg.write_call_timeout,
+        excluded: cfg.excluded.clone(),
+        writes_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_WRITES)),
         ctx,
         view: match cfg.read {
             McpRead::Local => View::Local,
@@ -931,6 +944,26 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         .and_then(|v| v.pointer("/params/name"))
         .and_then(Value::as_str)
         .is_some_and(graph_mcp::is_write_tool);
+    let write_permit = if is_write && st.index_root.is_some() {
+        match Arc::clone(&st.writes_inflight).try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                drop(permit);
+                if let Some(t) = &tool {
+                    st.ctx.raft.obs.observe_mcp_call(t, "refused");
+                }
+                let mut r = plain(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many MCP write calls in flight; retry",
+                );
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+                return r;
+            }
+        }
+    } else {
+        None
+    };
     let call_timeout = if is_write {
         st.write_call_timeout
     } else {
@@ -940,12 +973,14 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     let svc = Arc::clone(&st.svc);
     let write_svc = Arc::clone(&st.write_svc);
     let index_root = st.index_root.clone();
+    let excluded = st.excluded.clone();
     let view = st.view;
     let delay = st.delay;
     let work = tokio::task::spawn_blocking(move || {
         // Held until the read really ends, past a timed-out answer too, so
         // `--mcp-max-inflight` bounds the blocking work.
         let _permit = permit;
+        let _write_permit = write_permit;
         if let Some(d) = delay {
             std::thread::sleep(d);
         }
@@ -958,7 +993,7 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         if let Some(root) = index_root {
             let writer = backend::InProcessWriter::new(write_svc, rt);
             match graph_mcp::WriteAccess::new(&root, Box::new(writer)) {
-                Ok(w) => backend = backend.with_writes(w),
+                Ok(w) => backend = backend.with_writes(w.with_excluded(excluded)),
                 // The root was checked at start; if it is gone now, the
                 // write tools are left out of this call (an unknown tool).
                 Err(e) => tracing::warn!(error = %e, "MCP index root"),

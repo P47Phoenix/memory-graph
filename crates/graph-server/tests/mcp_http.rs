@@ -952,7 +952,7 @@ fn write_tools_are_off_unless_allowed_and_then_index_through_the_write_path() {
         json!({"name": "index_path", "arguments": {"org": "acme", "repo": "proj", "path": ".."}}),
     );
     assert_eq!(r["result"]["isError"], true, "{r}");
-    assert!(r.to_string().contains("outside the index root"), "{r}");
+    assert!(r.to_string().contains("inside the index root"), "{r}");
     // The write went through the server's store: a gRPC client sees it.
     let store = RemoteStore::connect(ClientConfig::new(srv.endpoint())).unwrap();
     let hits = graph_store::StoreRead::search_symbols(

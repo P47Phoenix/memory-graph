@@ -29,6 +29,9 @@ pub const WRITE_TOOL_NAMES: [&str; 2] = ["index_path", "prune"];
 /// Source bytes read before one batch is handed to the writer.
 pub const WRITE_BATCH_BYTES: usize = 32 << 20;
 
+/// The skip reason of a file over the store's span limit (the CLI's).
+pub const TOO_LARGE: &str = "larger than 4 GiB (span limit)";
+
 /// At most this many entries in each list of a write tool's answer
 /// (`failed`, `skipped`, `removed`); `truncated` says when one was cut.
 pub const MAX_LISTED: usize = 200;
@@ -113,6 +116,37 @@ impl McpWriter for StoreWriter {
 pub struct WriteAccess {
     root: PathBuf,
     writer: Box<dyn McpWriter>,
+    /// The database's own files, never indexed ([`Self::with_excluded`]).
+    excluded: Vec<PathBuf>,
+}
+
+/// The uniform refusal of a path that is not a directory inside the root:
+/// the same words whether it is outside, missing or a file, so the tool is
+/// no oracle for what exists outside the root.
+fn not_inside(tool: &str, path: &str) -> ToolError {
+    ToolError::InvalidArgument(format!(
+        "{tool}: `{path}` is not a directory inside the index root (serve --mcp-index-root / mcp --index-root); give a path relative to the root, or an absolute one inside it"
+    ))
+}
+
+/// `p` canonicalised, or, when it does not exist (yet), its canonical
+/// parent joined with its name.
+fn canonical_or_parent(p: &Path) -> Option<PathBuf> {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return Some(c);
+    }
+    let parent = std::fs::canonicalize(p.parent()?).ok()?;
+    Some(parent.join(p.file_name()?))
+}
+
+/// `root` without a `\\?\` disk prefix (Windows canonical paths carry one;
+/// a path a user types does not).
+fn plain(root: &Path) -> PathBuf {
+    let s = root.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => root.to_path_buf(),
+    }
 }
 
 /// A file the walk found, or why it was left out.
@@ -132,7 +166,39 @@ impl WriteAccess {
     /// directory; it is canonicalised here.
     pub fn new(index_root: &Path, writer: Box<dyn McpWriter>) -> Result<Self, StoreError> {
         let root = check_index_root(index_root)?;
-        Ok(Self { root, writer })
+        Ok(Self {
+            root,
+            writer,
+            excluded: Vec::new(),
+        })
+    }
+
+    /// Never index these paths (the database's own files: the store file,
+    /// a data directory, the Raft log, snapshots, the LOCK sidecar). A file
+    /// or directory listed here is skipped as `database file`, and so is a
+    /// sibling whose name extends it (`<db>.raft.redb`, `<db>.LOCK`).
+    pub fn with_excluded(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.excluded = paths
+            .into_iter()
+            .filter_map(|p| canonical_or_parent(&p))
+            .collect();
+        self
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        self.excluded.iter().any(|x| {
+            if path.starts_with(x) {
+                return true;
+            }
+            match (path.parent(), x.parent(), path.file_name(), x.file_name()) {
+                (Some(pp), Some(xp), Some(pn), Some(xn)) if pp == xp => {
+                    let (pn, xn) = (pn.to_string_lossy(), xn.to_string_lossy());
+                    pn.strip_prefix(xn.as_ref())
+                        .is_some_and(|rest| rest.starts_with('.'))
+                }
+                _ => false,
+            }
+        })
     }
 
     /// The canonical index root.
@@ -143,25 +209,79 @@ impl WriteAccess {
     /// `path` (relative to the root, or absolute) as a canonical directory
     /// inside the root, and how it reads relative to the root.
     fn resolve(&self, tool: &str, path: &str) -> Result<(PathBuf, String), ToolError> {
-        let joined = self.root.join(path);
-        let canon = std::fs::canonicalize(&joined).map_err(|e| {
-            ToolError::InvalidArgument(format!(
-                "{tool}: `{path}` cannot be resolved under the index root: {e}"
-            ))
-        })?;
+        let joined = self.lexical(path).ok_or_else(|| not_inside(tool, path))?;
+        // Only now touch the file system, for a path that is lexically
+        // inside the root; canonicalising resolves symlinks, so check again.
+        let canon = std::fs::canonicalize(&joined).map_err(|_| not_inside(tool, path))?;
         let Ok(rel) = canon.strip_prefix(&self.root) else {
-            return Err(ToolError::InvalidArgument(format!(
-                "{tool}: `{path}` is outside the index root (serve --mcp-index-root / mcp --index-root); paths are resolved, symlinks included, before the check"
-            )));
+            return Err(not_inside(tool, path));
         };
         if !canon.is_dir() {
-            return Err(ToolError::InvalidArgument(format!(
-                "{tool}: `{path}` is not a directory; index_path and prune take a directory"
-            )));
+            return Err(not_inside(tool, path));
         }
         let rel = graph_core::normalize_path(&rel.to_string_lossy());
         let shown = if rel.is_empty() { ".".to_string() } else { rel };
         Ok((canon, shown))
+    }
+
+    /// `path` joined to the root, if it is lexically inside it: no UNC,
+    /// device or drive-relative prefix, an absolute path only under the
+    /// root, and no `..` climbing above it. Nothing is opened here (a UNC
+    /// path canonicalised would reach out to its host).
+    fn lexical(&self, path: &str) -> Option<PathBuf> {
+        use std::path::{Component, Prefix};
+        let p = Path::new(path);
+        let rel: PathBuf = if p.is_absolute() || p.has_root() {
+            if let Some(Component::Prefix(pre)) = p.components().next() {
+                if !matches!(pre.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) {
+                    return None;
+                }
+            }
+            let plain_root = plain(&self.root);
+            let plain_p = plain(p);
+            plain_p
+                .strip_prefix(&plain_root)
+                .or_else(|_| plain_p.strip_prefix(&self.root))
+                .ok()?
+                .to_path_buf()
+        } else {
+            p.to_path_buf()
+        };
+        let mut depth = 0usize;
+        for c in rel.components() {
+            match c {
+                Component::Prefix(_) | Component::RootDir => return None,
+                Component::CurDir => {}
+                Component::ParentDir => depth = depth.checked_sub(1)?,
+                Component::Normal(_) => depth += 1,
+            }
+        }
+        Some(self.root.join(rel))
+    }
+
+    /// The bytes of a walked file, read only when it is still inside the
+    /// root (a symlink swapped in since the walk is not followed out) and
+    /// its length is within the store's limit; `Err` is the skip reason.
+    fn read_file(&self, path: &Path) -> Result<Vec<u8>, &'static str> {
+        use std::io::Read;
+        let canon = std::fs::canonicalize(path).map_err(|_| "unreadable")?;
+        if !canon.starts_with(&self.root) {
+            return Err("outside the index root");
+        }
+        let cap = graph_store::MAX_SOURCE_BYTES as u64;
+        let f = std::fs::File::open(&canon).map_err(|_| "unreadable")?;
+        let len = f.metadata().map_err(|_| "unreadable")?.len();
+        if len > cap {
+            return Err(TOO_LARGE);
+        }
+        let mut bytes = Vec::with_capacity(len as usize);
+        f.take(cap + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "unreadable")?;
+        if bytes.len() as u64 > cap {
+            return Err(TOO_LARGE);
+        }
+        Ok(bytes)
     }
 
     /// The `index_path` tool.
@@ -173,7 +293,7 @@ impl WriteAccess {
         reindex: bool,
     ) -> Result<Value, ToolError> {
         let (dir, shown) = self.resolve("index_path", path)?;
-        let walk = walk(&dir);
+        let walk = walk(&dir, &|p: &Path| self.is_excluded(p));
         let mut indexed = 0usize;
         let mut unchanged = 0usize;
         let mut symbols = 0usize;
@@ -219,11 +339,8 @@ impl WriteAccess {
         for item in walk.items {
             match item {
                 Walked::Skip { rel, reason } => note_skip(rel, reason),
-                Walked::File { rel, path } => match std::fs::read(&path) {
-                    Err(_) => note_skip(rel, "unreadable"),
-                    Ok(bytes) if bytes.len() > graph_store::MAX_SOURCE_BYTES => {
-                        note_skip(rel, "too large")
-                    }
+                Walked::File { rel, path } => match self.read_file(&path) {
+                    Err(reason) => note_skip(rel, reason),
                     Ok(bytes) => {
                         if !batch.is_empty() && batch_bytes + bytes.len() > WRITE_BATCH_BYTES {
                             flush(std::mem::take(&mut batch))?;
@@ -264,7 +381,7 @@ impl WriteAccess {
         dry_run: bool,
     ) -> Result<Value, ToolError> {
         let (dir, shown) = self.resolve("prune", path)?;
-        let walk = walk(&dir);
+        let walk = walk(&dir, &|p: &Path| self.is_excluded(p));
         if !walk.errors.is_empty() {
             return Err(ToolError::InvalidArgument(format!(
                 "prune: {} path(s) under `{shown}` could not be read (first: {}), so what is still there is not known; nothing was removed",
@@ -325,7 +442,7 @@ pub fn check_index_root(index_root: &Path) -> Result<PathBuf, StoreError> {
 
 /// The files under `dir`, in path order, as `memory-graph index` walks
 /// them: `.gitignore` honoured, `.git` skipped, symlinks never followed.
-fn walk(dir: &Path) -> Walk {
+fn walk(dir: &Path, excluded: &dyn Fn(&Path) -> bool) -> Walk {
     let mut items = Vec::new();
     let mut errors = Vec::new();
     let walker = ignore::WalkBuilder::new(dir)
@@ -356,34 +473,33 @@ fn walk(dir: &Path) -> Walk {
             continue;
         }
         let rel_path = entry.path().strip_prefix(dir).unwrap_or(entry.path());
-        let Some(rel_s) = rel_path.to_str() else {
-            errors.push(format!("{} (not UTF-8)", rel_path.to_string_lossy()));
-            continue;
-        };
-        if !cfg!(windows) && rel_s.contains('\\') {
-            items.push(Walked::Skip {
-                rel: rel_s.to_string(),
-                reason: "`\\` in file name (a path separator in stored paths)",
-            });
-            continue;
-        }
-        let rel = graph_core::normalize_path(rel_s);
-        if ft.is_symlink() {
-            items.push(Walked::Skip {
-                rel,
-                reason: "symlink",
-            });
+        // The classification order of `memory-graph index` (graph-cli
+        // `index_dir`), so both skip the same files for the same reasons.
+        let lossy = graph_core::normalize_path(&rel_path.to_string_lossy());
+        let skip = |rel: String, reason: &'static str| Walked::Skip { rel, reason };
+        let item = if ft.is_symlink() {
+            skip(lossy, "symlink")
         } else if !ft.is_file() {
-            items.push(Walked::Skip {
-                rel,
-                reason: "not a regular file",
-            });
+            skip(lossy, "not a regular file")
+        } else if !cfg!(windows) && rel_path.to_str().is_some_and(|s| s.contains('\\')) {
+            skip(
+                rel_path.to_string_lossy().into_owned(),
+                "`\\` in file name (a path separator in stored paths)",
+            )
+        } else if let Some(rel) = rel_path.to_str().map(graph_core::normalize_path) {
+            if excluded(entry.path()) {
+                skip(rel, "database file")
+            } else {
+                Walked::File {
+                    rel,
+                    path: entry.into_path(),
+                }
+            }
         } else {
-            items.push(Walked::File {
-                rel,
-                path: entry.into_path(),
-            });
-        }
+            // A skip, not an error, so prune still runs.
+            skip(lossy, "non-UTF-8 path")
+        };
+        items.push(item);
     }
     Walk { items, errors }
 }
@@ -426,12 +542,35 @@ mod tests {
             Err(ToolError::InvalidArgument(m)) => m,
             other => panic!("{p}: {other:?}"),
         };
-        assert!(bad("../secret").contains("outside the index root"));
-        assert!(bad("sub/../../secret").contains("outside the index root"));
+        // One uniform refusal, whatever the reason: no existence oracle.
         let abs = outer.path().join("secret");
-        assert!(bad(abs.to_str().unwrap()).contains("outside the index root"));
-        assert!(bad("missing").contains("cannot be resolved"));
-        assert!(bad("sub/a.txt").contains("not a directory"));
+        let uniform = bad("../secret");
+        assert!(uniform.contains("not a directory inside the index root"));
+        for p in [
+            "sub/../../secret",
+            abs.to_str().unwrap(),
+            "missing",
+            "sub/a.txt",
+            "../nope-at-all",
+        ] {
+            assert_eq!(bad(p), uniform.replace("../secret", p), "{p}");
+        }
+        // Lexical refusals happen before anything is opened.
+        assert!(w.lexical("../x").is_none());
+        assert!(w.lexical("sub/../../x").is_none());
+        assert!(w.lexical("sub/../sub").is_some());
+        assert!(w.lexical(abs.to_str().unwrap()).is_none());
+        if cfg!(windows) {
+            for p in [
+                r"\\host\share\x",
+                r"\\?\UNC\host\share",
+                r"\\.\pipe\x",
+                r"C:foo",
+                r"\x",
+            ] {
+                assert!(w.lexical(p).is_none(), "{p}");
+            }
+        }
         assert_eq!(w.resolve("index_path", ".").unwrap().1, ".");
         assert_eq!(w.resolve("index_path", "sub").unwrap().1, "sub");
         assert_eq!(w.resolve("index_path", "sub/../sub").unwrap().1, "sub");
@@ -461,5 +600,70 @@ mod tests {
         let v = w.index_path("o", "r", ".", false).unwrap();
         assert_eq!(v["indexed"], 0, "{v}");
         assert_eq!(v["skipped"][0]["reason"], "symlink", "{v}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_out_of_the_root_is_refused_and_never_walked() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outer.path().join("secret")).unwrap();
+        std::fs::write(outer.path().join("secret/k.txt"), "k").unwrap();
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("link"))
+            .arg(outer.path().join("secret"))
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{st:?}");
+        let w = WriteAccess::new(&root, Box::new(Nothing)).unwrap();
+        assert!(matches!(
+            w.resolve("index_path", "link"),
+            Err(ToolError::InvalidArgument(_))
+        ));
+        let v = w.index_path("o", "r", ".", false).unwrap();
+        assert_eq!(v["indexed"], 0, "{v}");
+        assert!(!v.to_string().contains("k.txt"), "{v}");
+    }
+    #[test]
+    fn database_files_are_never_indexed() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("data/snapshots")).unwrap();
+        for f in [
+            "g.redb",
+            "g.redb.raft.redb",
+            "g.redb.LOCK",
+            "g.redbx",
+            "data/graph.redb",
+            "data/snapshots/s",
+            "keep.rs",
+        ] {
+            std::fs::write(r.join(f), b"x").unwrap();
+        }
+        let w = WriteAccess::new(r, Box::new(Nothing))
+            .unwrap()
+            .with_excluded([r.join("g.redb"), r.join("data")]);
+        let v = w.index_path("o", "r", ".", false).unwrap();
+        let mut db: Vec<&str> = v["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["reason"] == "database file")
+            .map(|s| s["path"].as_str().unwrap())
+            .collect();
+        db.sort();
+        assert_eq!(
+            db,
+            [
+                "data/graph.redb",
+                "data/snapshots/s",
+                "g.redb",
+                "g.redb.LOCK",
+                "g.redb.raft.redb"
+            ]
+        );
+        assert_eq!(v["indexed"], 2, "keep.rs and g.redbx: {v}");
     }
 }

@@ -365,3 +365,89 @@ fn mcp_write_tools_over_stdio_equal_the_index_command() {
     };
     assert_eq!(search(&via_mcp), search(&via_cli));
 }
+
+/// Review of #306: the MCP walk and `memory-graph index` agree on what is
+/// stored and on what is skipped, and why (gitignore, `.git`, the database
+/// file, a symlink and a non-UTF-8 name on Unix).
+#[test]
+fn index_path_skips_what_the_index_command_skips() {
+    let d = tempfile::tempdir().unwrap();
+    let tree = d.path().join("tree");
+    std::fs::create_dir_all(tree.join("src")).unwrap();
+    std::fs::create_dir_all(tree.join(".git")).unwrap();
+    std::fs::write(tree.join(".gitignore"), "ignored.rs\n").unwrap();
+    std::fs::write(tree.join("ignored.rs"), "fn x() {}\n").unwrap();
+    std::fs::write(tree.join(".git/HEAD"), "ref\n").unwrap();
+    std::fs::write(tree.join("src/a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(tree.join("b.txt"), "b\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::os::unix::fs::symlink(tree.join("b.txt"), tree.join("link.txt")).unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        std::fs::write(tree.join(bad), "x\n").unwrap();
+    }
+    // The database lives inside the tree for both runs.
+    let cli_db = tree.join("cli.redb");
+    let out = ok(&[
+        "--db",
+        cli_db.to_str().unwrap(),
+        "index",
+        "--org",
+        "o",
+        "--repo",
+        "r",
+        "--json",
+        tree.to_str().unwrap(),
+    ]);
+    let cli: Value = serde_json::from_str(&out).unwrap();
+    std::fs::remove_file(&cli_db).unwrap();
+    let _ = std::fs::remove_file(tree.join("cli.redb.LOCK"));
+    let mcp_db = tree.join("cli.redb");
+    let mut m = Mcp::start_with(
+        &["--db", mcp_db.to_str().unwrap()],
+        &["--allow-writes", "--index-root", tree.to_str().unwrap()],
+    );
+    m.request(
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "mcp_e2e", "version": "0"}}),
+    );
+    m.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let v = m.tool("index_path", json!({"org": "o", "repo": "r", "path": "."}));
+    // prune without dry_run is a dry run: it names the file and keeps it.
+    std::fs::remove_file(tree.join("src/a.rs")).unwrap();
+    let p = m.tool("prune", json!({"org": "o", "repo": "r", "path": "."}));
+    assert_eq!(p["dry_run"], true, "{p}");
+    assert_eq!(p["removed"], json!(["src/a.rs"]), "{p}");
+    let files = m.tool("list_files", json!({"org": "o", "repo": "r"}));
+    assert!(
+        files.to_string().contains("src/a.rs"),
+        "nothing removed: {files}"
+    );
+    m.finish();
+    let mut cli_skips: Vec<(String, String)> = Vec::new();
+    for (reason, paths) in cli["skipped_by_reason"].as_object().unwrap() {
+        for p in paths.as_array().unwrap() {
+            cli_skips.push((p.as_str().unwrap().to_string(), reason.clone()));
+        }
+    }
+    let mut mcp_skips: Vec<(String, String)> = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["path"].as_str().unwrap().into(),
+                s["reason"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    cli_skips.sort();
+    mcp_skips.sort();
+    // The CLI's LOCK sidecar may not exist by the time the walk runs.
+    mcp_skips.retain(|(p, _)| !p.ends_with(".LOCK"));
+    cli_skips.retain(|(p, _)| !p.ends_with(".LOCK"));
+    assert_eq!(mcp_skips, cli_skips, "{v}\n{cli}");
+    assert_eq!(v["indexed"], cli["files"], "{v}\n{cli}");
+}
