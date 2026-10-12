@@ -21,6 +21,7 @@
 //! [`StoreError::LegacyFormat`], anything else with `SchemaMismatch`).
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
 use crate::read_stats::{self, Counter, PhaseTimer};
+use crate::SymbolPattern;
 use crate::{check_unchanged, dec, describe_in, enc, SnapshotStats, Store, StoreRead};
 use crate::{
     commit_prepared, prepare_file, stored_fingerprint_matches, stored_fingerprints, PreparedFile,
@@ -210,8 +211,15 @@ pub(crate) fn fold_symbol_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// The infix walk checks the query deadline once per this many names.
+const INFIX_DEADLINE_EVERY: usize = 1024;
+
 #[cfg(test)]
 thread_local! {
+    /// Test failpoint (ADR 0011 D3): sleep this long per name in the infix
+    /// walk, so a deadline test can outrun it.
+    pub(crate) static INFIX_KEY_DELAY: Cell<Option<std::time::Duration>> =
+        const { Cell::new(None) };
     /// Test failpoint: when set to `Some(n)`, the `sym_fold` rebuild fails
     /// (without committing) after inserting `n` rows, simulating a crash.
     pub(crate) static SYM_FOLD_REBUILD_FAIL_AFTER: Cell<Option<usize>> =
@@ -1860,20 +1868,12 @@ impl R {
                 return Err(StoreError::Rejected(format!("empty {what} filter")));
             }
         }
-        if q.pattern.is_empty() {
-            return Err(StoreError::Rejected(
-                "empty symbol pattern (use `*` to list all symbols)".into(),
-            ));
-        }
-        if q.pattern.ends_with("**") {
-            return Err(StoreError::Rejected(
-                "pattern ending in `**` is ambiguous: use `prefix*` for a prefix or `name\\*` for a literal `*`".into(),
-            ));
-        }
+        // ADR 0011 D2: the one shared parser.
+        let parsed = crate::parse_symbol_pattern(&q.pattern)?;
         // ADR 0010 D4: the default goes through `sym_fold` with the pattern
         // folded the same way; `exact_case` keeps the `sym_idx` path.
         let (index, pattern) = if q.exact_case {
-            (&self.sym_idx, q.pattern.clone())
+            (&self.sym_idx, parsed)
         } else {
             let Some(fold) = self.sym_fold.as_ref() else {
                 return Err(StoreError::Rejected(
@@ -1882,32 +1882,50 @@ impl R {
                         .into(),
                 ));
             };
-            (fold, fold_symbol_name(&q.pattern))
+            (fold, parsed.folded())
         };
         let mut ids: Vec<u64> = Vec::new();
-        if let Some(lit) = pattern.strip_suffix("\\*") {
-            let name = format!("{lit}*");
-            for v in index.get(name.as_str())? {
-                ids.push(v?.value());
+        match &pattern {
+            SymbolPattern::Exact(name) => {
+                for v in index.get(name.as_str())? {
+                    ids.push(v?.value());
+                }
             }
-        } else {
-            match pattern.strip_suffix('*') {
-                Some(prefix) => {
-                    for r in index.range(prefix..)? {
-                        let (k, vals) = r?;
-                        if !k.value().starts_with(prefix) {
-                            break;
+            SymbolPattern::Prefix(prefix) => {
+                for r in index.range(prefix.as_str()..)? {
+                    let (k, vals) = r?;
+                    if !k.value().starts_with(prefix.as_str()) {
+                        break;
+                    }
+                    for v in vals {
+                        ids.push(v?.value());
+                    }
+                }
+            }
+            // ADR 0011 D4 step 1: walk every distinct name (the keys of
+            // `sym_fold`, or of `sym_idx` with `exact_case`) and keep the
+            // ids of the ones that contain (or end with) the needle. No
+            // early stop: the result order stays the prefix query's.
+            SymbolPattern::Infix(_) | SymbolPattern::Suffix(_) => {
+                crate::deadline::check_query_deadline()?;
+                for (n, r) in index.iter()?.enumerate() {
+                    if n % INFIX_DEADLINE_EVERY == INFIX_DEADLINE_EVERY - 1 {
+                        crate::deadline::check_query_deadline()?;
+                    }
+                    #[cfg(test)]
+                    INFIX_KEY_DELAY.with(|d| {
+                        if let Some(d) = d.get() {
+                            std::thread::sleep(d);
                         }
+                    });
+                    let (k, vals) = r?;
+                    if pattern.matches(k.value()) {
                         for v in vals {
                             ids.push(v?.value());
                         }
                     }
                 }
-                None => {
-                    for v in index.get(pattern.as_str())? {
-                        ids.push(v?.value());
-                    }
-                }
+                crate::deadline::check_query_deadline()?;
             }
         }
         // One symbol per sub-id, however many keys reached it.
@@ -1927,7 +1945,11 @@ impl R {
         }
         let mut files: HashMap<u64, FileCtx> = HashMap::new();
         let mut order: Vec<u64> = Vec::new();
-        for &fid in by_file.keys() {
+        for (k, &fid) in by_file.keys().enumerate() {
+            // ADR 0011 D3: the deadline also bounds collecting the hits.
+            if k % 256 == 255 {
+                crate::deadline::check_query_deadline()?;
+            }
             if self.node(fid)?.is_none_or(|n| n.kind != NodeKind::File) {
                 continue;
             }
@@ -1965,6 +1987,7 @@ impl R {
             if out.len() >= want {
                 break;
             }
+            crate::deadline::check_query_deadline()?;
             let Some(raw) = self.streams.get(fid)? else {
                 continue;
             };

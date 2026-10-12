@@ -13,6 +13,7 @@
 //! | `Locked`, not-leader, no-leader                             | `UNAVAILABLE`         |
 //! | `SchemaMismatch`, `LegacyFormat`, `SnapshotExpired`, `WrongCluster`, protocol | `FAILED_PRECONDITION` |
 //! | `Corrupt`                                                   | `DATA_LOSS`           |
+//! | `DeadlineExceeded`                                          | `DEADLINE_EXCEEDED`   |
 //! | `Storage` (disk full)                                       | `RESOURCE_EXHAUSTED`  |
 //! | `Storage` (other), `OpenFailed`                             | `INTERNAL`            |
 //! | `Unauthenticated` (ADR 0012)                                | `UNAUTHENTICATED`     |
@@ -229,6 +230,7 @@ impl WireError {
                 StoreError::OpenFailed { .. } => Code::Internal,
                 StoreError::NotLeader { .. } | StoreError::NoLeader { .. } => Code::Unavailable,
                 StoreError::Protocol(_) => Code::FailedPrecondition,
+                StoreError::DeadlineExceeded(_) => Code::DeadlineExceeded,
                 StoreError::Unauthenticated(_) => Code::Unauthenticated,
                 StoreError::PermissionDenied { .. } => Code::PermissionDenied,
             },
@@ -305,6 +307,9 @@ impl WireError {
                     expected: expected.clone(),
                     found: found.clone(),
                 }),
+                StoreError::DeadlineExceeded(msg) => {
+                    K::DeadlineExceeded(d::DeadlineExceeded { msg: msg.clone() })
+                }
                 StoreError::Unauthenticated(msg) => {
                     K::Unauthenticated(d::Unauthenticated { msg: msg.clone() })
                 }
@@ -427,6 +432,7 @@ impl TryFrom<pb::StoreErrorDetail> for WireError {
                 found: x.found,
             }
             .into(),
+            K::DeadlineExceeded(x) => StoreError::DeadlineExceeded(x.msg).into(),
             K::Unauthenticated(x) => StoreError::Unauthenticated(x.msg).into(),
             K::PermissionDenied(x) => StoreError::PermissionDenied {
                 msg: x.msg,
@@ -584,6 +590,7 @@ pub fn wire_view(e: &StoreError) -> WireError {
             }
         }
         StoreError::Protocol(m) => return WireError::Protocol(m.clone()),
+        StoreError::DeadlineExceeded(m) => StoreError::DeadlineExceeded(m.clone()),
     })
 }
 

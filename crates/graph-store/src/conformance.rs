@@ -123,6 +123,8 @@ pub const CASES: &[(&str, Case)] = &[
     ("name_positions", name_positions),
     ("case_insensitive_symbols", case_insensitive_symbols),
     ("sym_fold_follows_writes", sym_fold_follows_writes),
+    ("infix_symbols", infix_symbols),
+    ("infix_follows_writes", infix_follows_writes),
     ("file_keys_follow_writes", file_keys_follow_writes),
     (
         "many_candidates_keep_full_order",
@@ -1736,6 +1738,8 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
     for pat in [
         "*", "a", "S", "m*", "nope", "dup", "dup*", "z", "q", "b", "T", "Shape", "Big", "Red",
         "Color", "Missing", "s", "SHAPE", "sh*", "RED", "DUP*",
+        // ADR 0011: infix and suffix, folded and exact below.
+        "*ha*", "*HA*", "*up*", "*ap*", "*ed", "*ape", "*zz*", "*\u{e9}*",
     ] {
         let mut q = SymbolQuery::new(pat);
         let mut variants = vec![q.clone()];
@@ -4645,6 +4649,240 @@ fn case_insensitive_symbols(h: &Harness) {
     // `*` alone is unchanged.
     assert_eq!(symbol_rows(&*s, "*", false), symbol_rows(&*s, "*", true));
     assert_fold_agrees(&*s, "fixture");
+}
+
+/// The brute-force answer to `pattern` (ADR 0011 tests): every symbol
+/// (`*`, in the store's own order) whose name matches, ASCII-folded on
+/// both sides unless `exact_case`.
+fn infix_oracle(s: &dyn StoreRead, pattern: &str, exact_case: bool) -> Vec<(String, String)> {
+    let parsed = crate::parse_symbol_pattern(pattern).expect("a valid pattern");
+    let parsed = if exact_case { parsed } else { parsed.folded() };
+    let mut all = SymbolQuery::new("*");
+    all.exact_case = true;
+    s.search_symbols(&all)
+        .unwrap()
+        .into_iter()
+        .filter(|h| {
+            if exact_case {
+                parsed.matches(&h.name)
+            } else {
+                parsed.matches(&h.name.to_ascii_lowercase())
+            }
+        })
+        .map(|h| (h.file, h.name))
+        .collect()
+}
+
+/// Every infix and suffix answer below equals the brute-force oracle.
+fn assert_infix_agrees(s: &dyn Store, what: &str) {
+    for p in [
+        "*ge*",
+        "*GE*",
+        "*get*",
+        "*Get*",
+        "*dget*",
+        "*et",
+        "*ET",
+        "*ab*",
+        "*b*c*",
+        "*\u{e9}t*",
+        "*\u{4e2d}*",
+        "*r\\**",
+        "*r\\*",
+    ] {
+        let Ok(parsed) = crate::parse_symbol_pattern(p) else {
+            continue;
+        };
+        assert!(parsed.needs_infix_capability(), "{p}");
+        for exact in [false, true] {
+            assert_eq!(
+                symbol_rows(s, p, exact),
+                infix_oracle(s, p, exact),
+                "{what}: {p} exact_case={exact}"
+            );
+        }
+    }
+}
+
+/// ADR 0011 / story 68 (#278): `*needle*` matches inside a name, `*needle`
+/// at its end; folded by default, exact with `exact_case`; same order and
+/// paging as a prefix query; every refusal of the D2 table.
+fn infix_symbols(h: &Harness) {
+    let s = open(h);
+    // #278's example.
+    ingest_names(&*s, "o", "r", "Gadget.cs", &["Gadget"]);
+    let gadget = vec![("Gadget.cs".to_string(), "Gadget".to_string())];
+    assert_eq!(symbol_rows(&*s, "*get*", false), gadget);
+    assert_eq!(symbol_rows(&*s, "*GET*", false), gadget);
+    assert!(symbol_rows(&*s, "*Get*", true).is_empty());
+    assert_eq!(symbol_rows(&*s, "*get*", true), gadget);
+    assert!(symbol_rows(&*s, "Get", false).is_empty());
+    assert!(symbol_rows(&*s, "Get", true).is_empty());
+    assert_eq!(symbol_rows(&*s, "*dget", false), gadget);
+    assert!(symbol_rows(&*s, "*adg", false).is_empty());
+    assert_eq!(symbol_rows(&*s, "*adg*", false), gadget);
+    // More names: case variants, escapes, non-ASCII, spread over files in
+    // an order that differs from name order.
+    ingest_names(&*s, "o", "r", "z.cs", &["ab", "getter", "Ptr*", "*star"]);
+    ingest_names(
+        &*s,
+        "o",
+        "r",
+        "a.cs",
+        &["aB", "Ab", "caf\u{e9}t", "\u{4e2d}\u{6587}"],
+    );
+    ingest_names(&*s, "n", "r", "m.cs", &["forget", "GetX"]);
+    // Order is (org, repo, path, position) whatever the names.
+    let rows = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(f, n)| (f.to_string(), n.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        symbol_rows(&*s, "*get*", false),
+        rows(&[
+            ("m.cs", "forget"),
+            ("m.cs", "GetX"),
+            ("Gadget.cs", "Gadget"),
+            ("z.cs", "getter"),
+        ])
+    );
+    // Exact-case ordering: `aB`, `Ab`, `ab` in stream order, the same as
+    // the folded prefix query's order; exact case keeps one of them.
+    assert_eq!(
+        symbol_rows(&*s, "*ab*", false),
+        rows(&[("a.cs", "aB"), ("a.cs", "Ab"), ("z.cs", "ab")])
+    );
+    assert_eq!(
+        symbol_rows(&*s, "*ab*", false),
+        symbol_rows(&*s, "ab*", false)
+    );
+    assert_eq!(symbol_rows(&*s, "*Ab*", true), rows(&[("a.cs", "Ab")]));
+    // Exact-case filling: exact case drops folded candidates and a limit
+    // is still filled by the exact matches that remain.
+    let mut q = SymbolQuery::new("*et*");
+    q.exact_case = true;
+    q.limit = Some(2);
+    let page: Vec<_> = s
+        .search_symbols(&q)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.name)
+        .collect();
+    assert_eq!(page, ["forget", "GetX"]);
+    // Limits 0 (refused, like every query), 1, N and N+1, and an offset.
+    let all = symbol_rows(&*s, "*get*", false);
+    let n = all.len();
+    let mut q = SymbolQuery::new("*get*");
+    q.limit = Some(0);
+    assert!(s.search_symbols(&q).is_err() || s.search_symbols(&q).unwrap().is_empty());
+    for limit in [1, n, n + 1] {
+        q.limit = Some(limit);
+        let got: Vec<_> = s
+            .search_symbols(&q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.file, h.name))
+            .collect();
+        assert_eq!(got, all[..limit.min(n)].to_vec(), "limit {limit}");
+    }
+    q.limit = Some(2);
+    q.offset = Some(1);
+    let got: Vec<_> = s
+        .search_symbols(&q)
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.file, h.name))
+        .collect();
+    assert_eq!(got, all[1..3].to_vec());
+    // Prefix equality: every name containing `getter` starts with it.
+    assert_eq!(
+        symbol_rows(&*s, "*getter*", false),
+        symbol_rows(&*s, "getter*", false)
+    );
+    // Infix is a superset of prefix.
+    let infix = symbol_rows(&*s, "*ge*", false);
+    for r in symbol_rows(&*s, "ge*", false) {
+        assert!(infix.contains(&r), "{r:?}");
+    }
+    // Escapes: `\*` at either end is a literal star.
+    assert_eq!(symbol_rows(&*s, "*tr\\*", false), rows(&[("z.cs", "Ptr*")]));
+    assert_eq!(symbol_rows(&*s, "*Ptr\\*", true), rows(&[("z.cs", "Ptr*")]));
+    assert!(symbol_rows(&*s, "*ptr\\*", true).is_empty());
+    // A needle cannot end in a literal star inside an infix: `*r\**` ends
+    // in `**` and is refused as ambiguous, as `foo\**` always was.
+    assert!(s.search_symbols(&SymbolQuery::new("*r\\**")).is_err());
+    assert_eq!(
+        symbol_rows(&*s, "\\*st*", false),
+        rows(&[("z.cs", "*star")])
+    );
+    assert_eq!(
+        symbol_rows(&*s, "\\*star", false),
+        rows(&[("z.cs", "*star")])
+    );
+    // Non-ASCII needles (2 and 3 bytes) match exactly.
+    assert_eq!(
+        symbol_rows(&*s, "*\u{e9}*", false),
+        rows(&[("a.cs", "caf\u{e9}t")])
+    );
+    assert!(symbol_rows(&*s, "*\u{c9}*", false).is_empty());
+    assert_eq!(
+        symbol_rows(&*s, "*\u{4e2d}*", true),
+        rows(&[("a.cs", "\u{4e2d}\u{6587}")])
+    );
+    // Whitespace is part of the needle.
+    assert!(symbol_rows(&*s, "* get *", false).is_empty());
+    // Refusals (ADR 0011 D2/D3), in both modes.
+    let long = format!("*{}*", "a".repeat(257));
+    for (bad, msg) in [
+        ("", "empty"),
+        ("**", "ambiguous"),
+        ("***", "ambiguous"),
+        ("**get**", "ambiguous"),
+        ("*a*b*", "unescaped"),
+        ("*g*", "at least 2 bytes"),
+        ("*g", "at least 2 bytes"),
+        (long.as_str(), "longer than 256 bytes"),
+    ] {
+        for exact in [false, true] {
+            let mut q = SymbolQuery::new(bad);
+            q.exact_case = exact;
+            match s.search_symbols(&q) {
+                Err(StoreError::Rejected(m)) => assert!(m.contains(msg), "{bad}: {m}"),
+                other => panic!("{bad}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+    let ok256 = format!("*{}*", "a".repeat(256));
+    assert!(symbol_rows(&*s, &ok256, false).is_empty());
+    assert_infix_agrees(&*s, "fixture");
+}
+
+/// ADR 0011 tests (cache staleness): infix answers follow every write --
+/// ingest, replace, prune, re-index and vacuum -- checked against the
+/// brute-force oracle after each.
+fn infix_follows_writes(h: &Harness) {
+    let s = open(h);
+    ingest_names(&*s, "o", "r", "a.cs", &["Gadget", "Widget"]);
+    assert_eq!(symbol_rows(&*s, "*dget*", false).len(), 2);
+    assert_infix_agrees(&*s, "ingest");
+    ingest_names(&*s, "o", "r", "a.cs", &["Sprocket"]);
+    assert!(symbol_rows(&*s, "*dget*", false).is_empty());
+    assert_eq!(symbol_rows(&*s, "*ROCK*", false).len(), 1);
+    assert_infix_agrees(&*s, "replace");
+    let (_, ex) = line_symbols(&["Budget"]);
+    s.ingest_file_with_origin("o", "r", "c.cs", "casetoy", &ex, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+    assert_eq!(symbol_rows(&*s, "*dget", false).len(), 1);
+    let keep: HashSet<String> = HashSet::new();
+    assert_eq!(s.prune_files("o", "r", &keep, false).unwrap(), ["c.cs"]);
+    assert!(symbol_rows(&*s, "*dget", false).is_empty());
+    assert_infix_agrees(&*s, "prune");
+    ingest_names(&*s, "o", "r", "c.cs", &["Budget", "getBudget"]);
+    assert_eq!(symbol_rows(&*s, "*dget", false).len(), 2);
+    s.vacuum().unwrap();
+    assert_eq!(symbol_rows(&*s, "*dget", false).len(), 2);
+    assert_infix_agrees(&*s, "vacuum");
 }
 
 /// ADR 0010 D4: `sym_fold` stays in step with `sym_idx` through re-index,

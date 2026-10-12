@@ -429,7 +429,7 @@ pub struct Extraction {
 pub struct StoreErrorDetail {
     #[prost(
         oneof = "store_error_detail::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 19, 20"
     )]
     pub kind: ::core::option::Option<store_error_detail::Kind>,
 }
@@ -561,6 +561,13 @@ pub mod store_error_detail {
         #[prost(string, tag = "2")]
         pub encoding: ::prost::alloc::string::String,
     }
+    /// A read passed its deadline (the request's `grpc-timeout`) before it
+    /// finished (ADR 0011 D3); no partial result was returned.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct DeadlineExceeded {
+        #[prost(string, tag = "1")]
+        pub msg: ::prost::alloc::string::String,
+    }
     /// ADR 0012 D7/D8: no valid credential (missing, malformed, unknown or
     /// expired token; the server never says which).
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -616,6 +623,8 @@ pub mod store_error_detail {
         Binary(Binary),
         #[prost(message, tag = "18")]
         StrictEncoding(StrictEncoding),
+        #[prost(message, tag = "21")]
+        DeadlineExceeded(DeadlineExceeded),
         #[prost(message, tag = "19")]
         Unauthenticated(Unauthenticated),
         #[prost(message, tag = "20")]
@@ -872,7 +881,11 @@ pub struct HelloResponse {
     pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, tag = "8")]
     pub cluster_id: ::prost::alloc::string::String,
-    /// Field 9 is left for ADR 0011's `capabilities` (story 68).
+    /// Optional features this server supports, so a newer client can refuse
+    /// a request an older server would misread. `symbol_infix`: infix and
+    /// suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6).
+    #[prost(string, repeated, tag = "9")]
+    pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// ADR 0012 D7: the server checks bearer tokens. An unauthenticated
     /// `Hello` to such a server answers only `protocol_version` and this
     /// flag; every other field keeps its default. False (an older server, or

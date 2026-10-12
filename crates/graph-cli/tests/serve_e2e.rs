@@ -1178,3 +1178,48 @@ mod idle {
         check("serve --data-dir", server, 8.0);
     }
 }
+
+/// ADR 0011 D3 / story 68: `--read-deadline` travels to the server as the
+/// request's deadline, so an infix scan that cannot finish in it fails
+/// (exit 1) and prints no rows, never a partial page. Without the small
+/// deadline the same query answers.
+#[test]
+fn a_small_read_deadline_stops_an_infix_query_with_no_rows() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    let db_s = db.to_str().unwrap();
+    for repo in corpus_repos() {
+        let dir = corpus().join(&repo);
+        ok(&[
+            "--db",
+            db_s,
+            "index",
+            "--org",
+            "o",
+            "--repo",
+            &repo,
+            dir.to_str().unwrap(),
+        ]);
+    }
+    let server = Server::start(&db);
+    let all = ok(&["--server", &server.addr, "symbols", "*er*", "--limit", "5"]);
+    assert_eq!(all.lines().count(), 5, "{all}");
+    let o = run(&[
+        "--server",
+        &server.addr,
+        "--read-deadline",
+        "1ms",
+        "symbols",
+        "*er*",
+    ]);
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(stdout(&o).is_empty(), "no partial rows: {}", stdout(&o));
+    // With 1 ms the client's own timeout can fire before the server's typed
+    // `DeadlineExceeded` (at 95% of it) arrives; either way it is an error.
+    let lower = err.to_ascii_lowercase();
+    assert!(
+        lower.contains("deadline") || lower.contains("timeout expired"),
+        "{err}"
+    );
+}

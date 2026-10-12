@@ -28,6 +28,8 @@ pub struct ServerInfo {
     pub started: Instant,
     /// The protocol version `Hello` reports (the real one outside tests).
     pub hello_protocol_version: u32,
+    /// What `Hello` lists in `capabilities` (ADR 0011 D6).
+    pub capabilities: Vec<String>,
     /// `serve --data-dir` (empty in `--db` mode).
     pub data_dir: String,
     /// This node's advertised address.

@@ -30,6 +30,9 @@ pub struct HelloInfo {
     pub leader_id: Option<u64>,
     pub leader_addr: Option<String>,
     pub cluster_id: String,
+    /// Optional features the server supports (ADR 0011 D6); empty for a
+    /// server older than the field.
+    pub capabilities: Vec<String>,
     /// The server checks bearer tokens (ADR 0012).
     pub auth_required: bool,
     /// The endpoint that answered.
@@ -47,6 +50,7 @@ impl From<(pb::HelloResponse, String)> for HelloInfo {
             leader_id: h.leader_id,
             leader_addr: h.leader_addr,
             cluster_id: h.cluster_id,
+            capabilities: h.capabilities,
             auth_required: h.auth_required,
             endpoint,
         }
@@ -513,6 +517,13 @@ impl Conn {
             View::Local | View::Linearizable => None,
         };
         self.call_at(Kind::Read, pin, f).await.map(|(v, _)| v)
+    }
+
+    /// The read deadline (the retry budget, `--read-deadline`), sent as a
+    /// read's `grpc-timeout` where the server bounds its work by it
+    /// (`SearchSymbols`, ADR 0011 D3).
+    pub fn read_deadline(&self) -> Duration {
+        self.cfg.retry.budget
     }
 
     /// The read view for this connection's configured mode.

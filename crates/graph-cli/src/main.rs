@@ -834,12 +834,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Find symbols (definitions) by name; a trailing `*` matches a prefix. There is no infix
-    /// match: `Gad*` finds `Gadget`, `Get` and `*dget` do not
+    /// Find symbols (definitions) by name; a trailing `*` matches a prefix, `*needle*` a name
+    /// containing `needle` and `*needle` a name ending in it: `Gad*`, `'*get*'` and `'*dget'` find
+    /// `Gadget`, a bare `Get` does not. Quote a pattern with `*` so the shell does not expand it
     Symbols {
-        /// Exact name, `prefix*` (a prefix), `*` (everything) or `name\*` (a name ending in a literal `*`).
-        /// Edges: `**` at the end is rejected as ambiguous (so `a\**` is too), and a trailing backslash not
-        /// followed by `*` is an ordinary character (`a\` matches the name `a\` exactly)
+        /// Exact name, `prefix*` (a prefix), `*` (everything), `*needle*` (infix), `*needle` (suffix) or
+        /// `name\*` (a name ending in a literal `*`; `\*` at the start is a literal `*` too). An infix or
+        /// suffix needle is 2 to 256 bytes with no `*` inside. Edges: `**` at the end is rejected as
+        /// ambiguous (so `a\**` is too), and a trailing backslash not followed by `*` is an ordinary
+        /// character (`a\` matches the name `a\` exactly)
         pattern: String,
         /// Only symbols of this symbol kind (case-insensitive): generic (module, type, function, method,
         /// variable, constant, other) or language-specific (struct, trait, impl, ...). `describe` lists the

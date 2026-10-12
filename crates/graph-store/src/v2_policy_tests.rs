@@ -3846,3 +3846,154 @@ mod sym_fold_props {
         }
     }
 }
+
+// --- ADR 0011 / story 68: infix and suffix symbol search ---
+
+mod infix_props {
+    use super::*;
+    use crate::SymbolPattern;
+    use proptest::prelude::*;
+
+    fn alphabet() -> Vec<char> {
+        vec![
+            'a', 'A', 'b', 'B', '\u{e9}', '\u{c9}', '\u{4e2d}', '*', '\\', '_', ' ',
+        ]
+    }
+
+    fn name() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop::sample::select(alphabet()), 1..6)
+            .prop_map(|v| v.into_iter().collect())
+    }
+
+    /// Every symbol of the store in its own `*` order, as `(file, name, start)`.
+    fn all(s: &V2Store) -> Vec<(String, String, u32)> {
+        let mut q = SymbolQuery::new("*");
+        q.exact_case = true;
+        s.search_symbols(&q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.file, h.name, h.span.unwrap().start))
+            .collect()
+    }
+
+    fn run(s: &V2Store, pattern: &str, exact: bool) -> Result<Vec<(String, String, u32)>> {
+        let mut q = SymbolQuery::new(pattern);
+        q.exact_case = exact;
+        Ok(s.search_symbols(&q)?
+            .into_iter()
+            .map(|h| (h.file, h.name, h.span.unwrap().start))
+            .collect())
+    }
+
+    proptest! {
+        /// The brute-force oracle (ADR 0011 tests): fold ASCII only, filter
+        /// every name by substring or `ends_with`, in both case modes; the
+        /// store's answer is that list in the same (org, repo, path,
+        /// position) order. Infix is a superset of prefix.
+        #[test]
+        fn infix_and_suffix_equal_a_brute_force_filter(
+            files in prop::collection::vec(prop::collection::vec(name(), 1..5), 1..4),
+            needles in prop::collection::vec(name(), 1..4),
+        ) {
+            let d = tempfile::tempdir().unwrap();
+            let s = V2Store::open(d.path().join("p.redb")).unwrap();
+            for (f, names) in files.iter().enumerate() {
+                let syms: Vec<(&str, SymbolKind, u32, u32)> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.as_str(), SymbolKind::Function, i as u32 * 2, i as u32 * 2 + 1))
+                    .collect();
+                s.ingest_file("o", "r", &format!("f{f}.x"), "text", &span_ext(&syms, &[])).unwrap();
+            }
+            let everything = all(&s);
+            let mut probes: Vec<String> = needles;
+            probes.extend(files.iter().flatten().cloned());
+            for needle in probes {
+                for pattern in [format!("*{needle}*"), format!("*{needle}")] {
+                    let parsed = crate::parse_symbol_pattern(&pattern);
+                    for exact in [false, true] {
+                        let got = run(&s, &pattern, exact);
+                        let Ok(p) = &parsed else {
+                            prop_assert!(matches!(got, Err(StoreError::Rejected(_))));
+                            continue;
+                        };
+                        prop_assert!(p.needs_infix_capability());
+                        let p = if exact { p.clone() } else { p.folded() };
+                        let want: Vec<_> = everything
+                            .iter()
+                            .filter(|(_, n, _)| {
+                                if exact { p.matches(n) } else { p.matches(&n.to_ascii_lowercase()) }
+                            })
+                            .cloned()
+                            .collect();
+                        let got = got.unwrap();
+                        prop_assert_eq!(&got, &want, "{} exact={}", pattern, exact);
+                        if let SymbolPattern::Infix(n) = &p {
+                            let pre = format!("{n}*");
+                            if crate::parse_symbol_pattern(&pre).ok() == Some(SymbolPattern::Prefix(n.clone())) {
+                                let prefix = run(&s, &pre, exact).unwrap();
+                                for r in prefix {
+                                    prop_assert!(got.contains(&r));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Arbitrary input to the parser, run against a small store: a
+        /// refusal is `Rejected`, and every accepted pattern answers.
+        #[test]
+        fn any_pattern_is_refused_or_answered(pattern in "(\\PC|[*\\\\])*") {
+            let d = tempfile::tempdir().unwrap();
+            let s = V2Store::open(d.path().join("p.redb")).unwrap();
+            s.ingest_file("o", "r", "a.x", "text", &span_ext(&[("Gadget", SymbolKind::Function, 0, 1)], &[])).unwrap();
+            let parsed = crate::parse_symbol_pattern(&pattern);
+            for exact in [false, true] {
+                match (&parsed, run(&s, &pattern, exact)) {
+                    (Ok(_), Ok(_)) => {}
+                    (Err(_), Err(StoreError::Rejected(_))) => {}
+                    (p, r) => prop_assert!(false, "{:?}: parsed {:?}, ran {:?}", pattern, p, r),
+                }
+            }
+        }
+    }
+}
+
+/// ADR 0011 D3: a scan that passes the query deadline answers
+/// `DeadlineExceeded` and no rows; without a deadline it answers.
+#[test]
+fn an_infix_scan_past_its_deadline_returns_no_rows() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("p.redb")).unwrap();
+    let names: Vec<String> = (0..64).map(|i| format!("getter{i}")).collect();
+    let syms: Vec<(&str, SymbolKind, u32, u32)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                n.as_str(),
+                SymbolKind::Function,
+                i as u32 * 2,
+                i as u32 * 2 + 1,
+            )
+        })
+        .collect();
+    s.ingest_file("o", "r", "a.x", "text", &span_ext(&syms, &[]))
+        .unwrap();
+    let q = SymbolQuery::new("*ett*");
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 64);
+    crate::v2::INFIX_KEY_DELAY.with(|c| c.set(Some(std::time::Duration::from_millis(2))));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let r = crate::with_query_deadline(Some(deadline), || s.search_symbols(&q));
+    crate::v2::INFIX_KEY_DELAY.with(|c| c.set(None));
+    assert!(matches!(r, Err(StoreError::DeadlineExceeded(_))), "{r:?}");
+    // The deadline is scoped to the call: the next query answers in full.
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 64);
+    // A prefix lookup is not a scan and ignores an expired deadline only
+    // because it never checks; an infix one checks before it starts.
+    let past = std::time::Instant::now();
+    let r = crate::with_query_deadline(Some(past), || s.search_symbols(&q));
+    assert!(matches!(r, Err(StoreError::DeadlineExceeded(_))), "{r:?}");
+}

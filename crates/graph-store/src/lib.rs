@@ -33,7 +33,10 @@ mod cache_size;
 pub use cache_size::{
     derive_cache_bytes, FALLBACK_CACHE_BYTES, MAX_DERIVED_CACHE_BYTES, MIN_DERIVED_CACHE_BYTES,
 };
+mod deadline;
 mod v2;
+pub use deadline::with_query_deadline;
+mod pattern;
 pub use api::{
     detect_format, open_store, FingerprintSnapshot, Page, PreparedFile, RemoteParts, SnapshotStats,
     Store, StoreRead,
@@ -46,6 +49,10 @@ pub(crate) use common::{
     SYMBOLS,
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
+pub use pattern::{
+    parse_symbol_pattern, SymbolPattern, CAPABILITY_SYMBOL_INFIX, MAX_NEEDLE_BYTES,
+    MIN_NEEDLE_BYTES,
+};
 /// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
 #[doc(hidden)]
 pub use v2::precheck_reads;
@@ -169,6 +176,11 @@ pub enum StoreError {
     /// skip); it never reaches a client.
     #[error("raft marker {index} already applied")]
     AlreadyApplied { index: u64 },
+    /// A read passed the deadline set with [`with_query_deadline`] (the
+    /// server sets the client's `grpc-timeout`; ADR 0011 D3). No partial
+    /// result is returned.
+    #[error("deadline exceeded: {0}")]
+    DeadlineExceeded(String),
     /// The server requires a credential and this call had none that it
     /// accepts (ADR 0012 D1/D8: missing, malformed, unknown or expired; the
     /// server never says which). Never produced by the embedded store. The
@@ -298,9 +310,11 @@ impl Query {
     }
 }
 
-/// Symbol lookup by name: exact, or a prefix with a trailing `*` (`*` alone
-/// lists everything). A trailing `\*` is a literal star (exact match on a name
-/// ending in `*`). Empty patterns and `**` are rejected as ambiguous.
+/// Symbol lookup by name: exact, a prefix with a trailing `*` (`*` alone
+/// lists everything), an infix `*needle*` or a suffix `*needle` (ADR 0011;
+/// the needle is 2-256 bytes). A `\*` at either end is a literal star.
+/// Empty patterns and `**` are rejected as ambiguous. See
+/// [`parse_symbol_pattern`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolQuery {
     pub pattern: String,
