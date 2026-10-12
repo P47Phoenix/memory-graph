@@ -11,7 +11,11 @@
 //! (`counting`: `mg_otel_export_failures_total`, `mg_otel_dropped_total`).
 //! Traces (story 51, [`traces`]): `serve` installs [`tracing_layer`] in
 //! its subscriber; the span exporter keeps the node's identity current and
-//! reports to the same accounting. No global provider is registered here.
+//! reports to the same accounting. Logs (story 53, `logs`): `serve`
+//! installs [`log_layer`] behind its `--log-level` filter; records keep
+//! only [`ALLOWED_LOG_FIELDS`] and carry the active span's ids, which
+//! [`current_trace_ids`] gives the JSON log lines too. No global provider
+//! is registered here.
 //!
 //! Configuration precedence, highest first: a `serve` flag, its key in the
 //! `serve --config` file (graph-cli merges those two before calling here,
@@ -48,6 +52,8 @@ pub use metrics::{
     rpc_attributes, status_code, CollectionCounts, OtlpMetrics, OtlpRecorders, SnapshotSource,
     APPLY_DURATION, RPC_DURATION,
 };
+mod logs;
+pub use logs::{allowed_log_field, bridged, current_trace_ids, log_layer, ALLOWED_LOG_FIELDS};
 mod traces;
 pub use traces::{
     current_rpc_context, dropped, export_failures, exported, hold_until_identity,
@@ -429,7 +435,7 @@ pub fn init(cfg: &TelemetryConfig) -> Result<Option<TelemetryGuard>, TelemetryEr
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        .thread_name("mg-otel")
+        .thread_name(logs::EXPORTER_THREAD)
         .enable_all()
         .build()
         .map_err(|e| TelemetryError::Build(format!("exporter runtime: {e}")))?;
@@ -568,12 +574,15 @@ impl Providers {
                 inner: exporter,
                 acct: Arc::clone(&acct),
             };
-            let processor = counting::CountingLogProcessor {
+            // AllowListLogProcessor (D9: only allow-listed fields) ->
+            // CountingLogProcessor (the queue bound) -> the SDK's batch
+            // processor -> CountingLogExporter -> OTLP.
+            let processor = logs::AllowListLogProcessor::new(counting::CountingLogProcessor {
                 inner: opentelemetry_sdk::logs::BatchLogProcessor::builder(exporter)
                     .with_batch_config(log_batch_config(&cfg.batch, bound))
                     .build(),
                 acct,
-            };
+            });
             Some(
                 SdkLoggerProvider::builder()
                     .with_log_processor(processor)

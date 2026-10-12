@@ -79,6 +79,24 @@ impl CollectedSpan {
     }
 }
 
+/// One received log record, flattened for assertions (ids in lowercase
+/// hex, empty when the record has none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectedLog {
+    pub severity_number: i32,
+    pub severity_text: String,
+    /// The message.
+    pub body: String,
+    pub trace_id: String,
+    pub span_id: String,
+    /// The instrumentation scope's name: the event's target.
+    pub scope: String,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    /// Every string in the record: body, severity text, attribute keys and
+    /// values (the privacy sentinel test).
+    pub all_text: Vec<String>,
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -140,6 +158,39 @@ impl Received {
                                     (hex(&l.trace_id), hex(&l.span_id), attr_map(&l.attributes))
                                 })
                                 .collect(),
+                            all_text,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every log record received, in arrival order.
+    pub fn log_records(&self) -> Vec<CollectedLog> {
+        let mut out = Vec::new();
+        for req in &self.logs {
+            for rl in &req.resource_logs {
+                for sl in &rl.scope_logs {
+                    for r in &sl.log_records {
+                        let attributes = attr_map(&r.attributes);
+                        let body = any_text(&r.body);
+                        let mut all_text = vec![body.clone(), r.severity_text.clone()];
+                        all_text.extend(attributes.keys().cloned());
+                        all_text.extend(attributes.values().cloned());
+                        out.push(CollectedLog {
+                            severity_number: r.severity_number,
+                            severity_text: r.severity_text.clone(),
+                            body,
+                            trace_id: hex(&r.trace_id),
+                            span_id: hex(&r.span_id),
+                            scope: sl
+                                .scope
+                                .as_ref()
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default(),
+                            attributes,
                             all_text,
                         });
                     }
