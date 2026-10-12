@@ -70,7 +70,7 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 | `sysinfo` | What `index` sizes itself from on this machine: CPUs, memory and its source, the starting budget, free disk on the database's volume. |
 | `vacuum [--compact]` | Drop dictionary terms no file uses; `--compact` rebuilds the file to give the space back. |
 | `export [--out FILE]` | Dump every node (org, repo, file, symbol, token, with spans) as newline-delimited JSON. An escape hatch; there is no importer yet. |
-| `mcp` | Serve the queries as read-only MCP tools over stdio for AI assistants ([docs/mcp.md](docs/mcp.md)). |
+| `mcp` | Serve the queries as read-only MCP tools over stdio for AI assistants, plus opt-in `index_path`/`prune` write tools with `--allow-writes` ([docs/mcp.md](docs/mcp.md)). |
 | `serve --db FILE` / `serve --data-dir DIR [--bootstrap \| --join PEER [--auto-promote \| --standby]]` `[--listen HOST:PORT]` | Serve a database file, or a cluster node's data directory, over gRPC for `--server` clients ([server](docs/guide/server.md), [cluster](docs/guide/cluster.md)). |
 | `health [--ready]` | With `--server`: exit 0 when the server is serving (`--ready`: and has a leader), 1 when not. |
 | `cluster status` / `cluster leader` / `cluster snapshot [--out FILE]` | With `--server`: the node's role, term, leader, log indexes, members and replication lag; `leader` exits 3 when there is none; `snapshot` builds a Raft snapshot and can download it. |
