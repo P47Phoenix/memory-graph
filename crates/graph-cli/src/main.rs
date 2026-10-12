@@ -1834,7 +1834,12 @@ fn run() -> Result<i32> {
                     );
                     // Never index the database's own files.
                     let own = match &target {
-                        Target::Embedded(db) => vec![db.clone()],
+                        Target::Embedded(db) => {
+                            // Its whole NodePaths layout: the sidecars
+                            // (`<db>.*`, snapshots included) by name.
+                            let p = graph_server::paths::NodePaths::for_db(db);
+                            vec![p.store, p.log, p.snapshots_dir, p.lock]
+                        }
                         _ => Vec::new(),
                     };
                     backend.with_writes(access.with_excluded(own))

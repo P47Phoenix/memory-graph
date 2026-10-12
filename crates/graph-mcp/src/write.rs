@@ -190,14 +190,17 @@ impl WriteAccess {
             if path.starts_with(x) {
                 return true;
             }
-            match (path.parent(), x.parent(), path.file_name(), x.file_name()) {
-                (Some(pp), Some(xp), Some(pn), Some(xn)) if pp == xp => {
-                    let (pn, xn) = (pn.to_string_lossy(), xn.to_string_lossy());
-                    pn.strip_prefix(xn.as_ref())
-                        .is_some_and(|rest| rest.starts_with('.'))
-                }
-                _ => false,
-            }
+            // A sibling `<name>.*`, or anything under one (`<db>.snapshots/`).
+            path.ancestors().any(
+                |a| match (a.parent(), x.parent(), a.file_name(), x.file_name()) {
+                    (Some(ap), Some(xp), Some(an), Some(xn)) if ap == xp => {
+                        let (an, xn) = (an.to_string_lossy(), xn.to_string_lossy());
+                        an.strip_prefix(xn.as_ref())
+                            .is_some_and(|rest| rest.starts_with('.'))
+                    }
+                    _ => false,
+                },
+            )
         })
     }
 
@@ -212,6 +215,8 @@ impl WriteAccess {
         let joined = self.lexical(path).ok_or_else(|| not_inside(tool, path))?;
         // Only now touch the file system, for a path that is lexically
         // inside the root; canonicalising resolves symlinks, so check again.
+        #[cfg(test)]
+        tests::CANONICALIZED.with(|c| c.set(c.get() + 1));
         let canon = std::fs::canonicalize(&joined).map_err(|_| not_inside(tool, path))?;
         let Ok(rel) = canon.strip_prefix(&self.root) else {
             return Err(not_inside(tool, path));
@@ -508,6 +513,47 @@ fn walk(dir: &Path, excluded: &dyn Fn(&Path) -> bool) -> Walk {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// How many times `resolve` reached the file system.
+        pub(super) static CANONICALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn lexical_refusals_never_touch_the_file_system() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let w = WriteAccess::new(&root, Box::new(Nothing)).unwrap();
+        let abs_out = outer.path().join("elsewhere");
+        let mut bad = vec![
+            "..".to_string(),
+            "../x".into(),
+            "sub/../../x".into(),
+            abs_out.to_string_lossy().into_owned(),
+        ];
+        if cfg!(windows) {
+            bad.extend([
+                r"\\host\share\x".to_string(),
+                r"\\?\UNC\host\share\x".into(),
+                r"\\.\pipe\x".into(),
+                r"C:foo".into(),
+            ]);
+        }
+        for p in &bad {
+            let before = CANONICALIZED.with(|c| c.get());
+            assert!(w.resolve("index_path", p).is_err(), "{p}");
+            assert_eq!(
+                CANONICALIZED.with(|c| c.get()),
+                before,
+                "{p}: refused lexically, before canonicalize"
+            );
+        }
+        // A good path does reach it.
+        let before = CANONICALIZED.with(|c| c.get());
+        w.resolve("index_path", "sub").unwrap();
+        assert_eq!(CANONICALIZED.with(|c| c.get()), before + 1);
+    }
+
     struct Nothing;
     impl McpWriter for Nothing {
         fn index_files(
@@ -631,6 +677,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
         std::fs::create_dir_all(r.join("data/snapshots")).unwrap();
+        std::fs::create_dir_all(r.join("g.redb.snapshots")).unwrap();
         for f in [
             "g.redb",
             "g.redb.raft.redb",
@@ -638,6 +685,7 @@ mod tests {
             "g.redbx",
             "data/graph.redb",
             "data/snapshots/s",
+            "g.redb.snapshots/s1",
             "keep.rs",
         ] {
             std::fs::write(r.join(f), b"x").unwrap();
@@ -661,7 +709,8 @@ mod tests {
                 "data/snapshots/s",
                 "g.redb",
                 "g.redb.LOCK",
-                "g.redb.raft.redb"
+                "g.redb.raft.redb",
+                "g.redb.snapshots/s1"
             ]
         );
         assert_eq!(v["indexed"], 2, "keep.rs and g.redbx: {v}");
