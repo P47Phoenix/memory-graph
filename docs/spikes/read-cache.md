@@ -466,3 +466,40 @@ One run per binary (the third measured run):
   - origin/main;
   - this branch, on its own fresh index;
   - this branch, on the main-built file upgraded on open. The only extra bytes are the one-line upgrade notice on stderr.
+
+## Decode share re-run after story 61 (#233, 2026-10-12)
+
+### Setup
+
+- origin/main at 0e66092, release build. It includes stories 61 and 68. Story 70 (PR #307) was still open, so it is **not** included.
+- The run used a copy of the A5 index (`D:\tmp\a5-readbench2\readbench.redb`, 877M tokens) in `D:\tmp\a233-work`, so an upgrade on open could not touch the original. The workload file was the same (153 queries per pass).
+- Settings were `MG_READBENCH_REUSE=1` and `MG_READBENCH_REPS=5`, with one run per query class:
+  - **all**: the full agent-like mix (token, symbol, method, class and file grain searches over hot and cold terms, plus `search_symbols`, `file_tokens` and `describe`);
+  - **symbolic** (`MG_READBENCH_OPS=symbolic`): `search_symbols` plus the symbol, method and class searches;
+  - **symbols** (`MG_READBENCH_OPS=symbols`): `search_symbols` only.
+- Two idle `memory-graph` processes belonging to other sessions were alive on the machine. This session ran no other build or benchmark at the same time.
+- Timing overhead (warm, timing on vs off, 5 trials): -0.4% to +0.7% (median +0.3%) for all, -1.0% to +1.5% for symbolic, and -0.3% to +4.3% for symbols.
+
+### Numbers
+
+Decode share is the median over readers of each reader's decode nanoseconds divided by its query wall time, as ADR 0008 defines it.
+
+| class | cold (informational) | warm, 1 reader | 8 readers | 16 readers | 32 readers | warm store ms/q | warm p95 ms |
+|---|---|---|---|---|---|---|---|
+| all | 0.2% | 1.0% | 0.7% | 0.5% | 0.5% | 7.87 | 46.3 |
+| symbolic | 0.3% | 1.1% | 0.8% | 0.6% | 0.6% | 8.30 | 46.9 |
+| symbols | 0.8% | 2.4% | 1.9% | 1.7% | 1.6% | 2.98 | 22.0 |
+
+The warm single-reader share splits as follows (dict / lazy / sym / full):
+- all: 0.5 / 0.3 / 0.2 / 0.0%;
+- symbolic: 0.4 / 0.4 / 0.3 / 0.0%;
+- symbols: 1.6 / 0.2 / 0.6 / 0.0%.
+
+For the full mix, a warm query spends 7.9 ms in the store: 1.1 ms in posting reads, 4.9 ms in ctx (resolving candidate files) and 0.8 ms in the walk. That time goes to posting and file-key reads from redb, not to decoding stream chunks.
+
+### Decision
+
+- Story 61 cut store time per query from 30 ms (A5) to about 8 ms. That raised the decode share from 0.2% to 1.0%, but every class at every reader count is still far below the 25% gate. The highest share is 2.4%, for `search_symbols` alone with one warm reader.
+- **Phase 2 (stories 47 and 48): closed by measurement.** A decoded-object cache could save at most about 2% of query time.
+- Phase 3 (story 49) has its own gate, the repeat share (see "Scripted-session repeats" above), and this measurement does not decide it.
+- Re-open phase 2 only if a later change (for example story 70) pushes some class's decode share to 25% or more.

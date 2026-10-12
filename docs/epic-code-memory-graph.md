@@ -613,7 +613,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 1.
 
 <a id="story-47"></a>
 **47. Decoded-object cache core and MVCC-safe invalidation (8 pts)**
-Status: Not started; gated. The gate was not met after phase 1 (story 46). Start only if the large-index re-run (#233) shows a decode share of 25% or more.
+Status: Closed by measurement (2026-10-12). After story 61, the large-index re-run on A5 (#233) measured a decode share of 0.5-2.4% across query classes and reader counts, far below the 25% gate; see [the spike](spikes/read-cache.md#decode-share-re-run-after-story-61-233-2026-10-12). Re-open only if a later re-run shows 25% or more.
 As an agent sending many queries to `serve`
 I want decoded dictionary blocks, symbol sections and file context reused across queries
 So that warm queries skip repeated decoding without ever seeing stale data.
@@ -630,7 +630,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 2 (generations).
 
 <a id="story-48"></a>
 **48. Read-cache tests, metrics and flags (5 pts)**
-Status: Not started; gated with story 47.
+Status: Closed by measurement with story 47 (2026-10-12).
 As an operator and a maintainer
 I want the read cache sized, observable, switchable and proven equivalent
 So that it can be tuned or turned off and never changes an answer.
@@ -645,7 +645,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 2 (sizing, tests).
 
 <a id="story-49"></a>
 **49. Optional query-result cache (3 pts)**
-Status: Not started; optional. Start only if a request log shows at least 20% of queries are exact repeats within 60 seconds at an unchanged generation. That log is tracked in #233.
+Status: Not started; optional. Start only if a request log shows at least 20% of queries are exact repeats within 60 seconds at an unchanged generation. That log is tracked in #233. The decode-share re-run that closed stories 47 and 48 does not affect this story; it measures only phase 2's gate.
 As an agent that repeats the same query
 I want the server to return a cached result when nothing has changed
 So that repeated queries cost almost nothing.
