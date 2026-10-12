@@ -860,10 +860,14 @@ impl Auth {
             return;
         }
         let me = Arc::clone(self);
+        // Registered here, before the task is spawned, so the listener
+        // exists by the time `serve` reports it is running. Registered
+        // inside the task it could lag behind: a SIGHUP sent in that gap is
+        // taken by tokio's process-wide handler (installed by any earlier
+        // listener) and broadcast before this one subscribed, so it was lost.
+        #[cfg(unix)]
+        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
         tokio::spawn(async move {
-            #[cfg(unix)]
-            let mut hup =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
             loop {
                 #[cfg(unix)]
                 let sighup = async {
