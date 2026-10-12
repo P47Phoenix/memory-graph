@@ -992,6 +992,7 @@ dependencies = [
  "graph-lang-rust",
  "graph-server",
  "graph-store",
+ "ignore",
  "proptest",
  "serde",
  "serde_json",
