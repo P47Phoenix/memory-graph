@@ -83,7 +83,7 @@
 | 65 | asm extractor: exact spans on libunwind `UnwindRegistersSave.S` (#252; delivered in #290) | Low | 2 | P3 | 30 |
 | 66 | COBOL digit-led `SECTION` names such as `100A SECTION.` (#268; delivered in #284) | Low | 1 | P3 | 30 |
 | 67 | Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (#115; delivered in #295) | Medium | 5 | P3 | 22 |
-| 68 | Infix (substring) symbol search (#278; [ADR 0011](adr/0011-infix-search.md), Accepted 2026-10-10) | High | 5 | P3 | 61 (preferably) |
+| 68 | Infix (substring) symbol search (#278; [ADR 0011](adr/0011-infix-search.md), Accepted 2026-10-10; delivered in #298) | High | 5 | P3 | 61 (preferably) |
 | 69 | Authentication for `serve` (#105; [ADR 0012](adr/0012-authentication.md), Accepted 2026-10-10; delivered in #299) | High | 8 | P3 | 20 |
 | 70 | Faster symbol queries: lazy file-context loading and no full name walk (after #298; [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner)) | High | 5 | P3 | 68 |
 
@@ -969,7 +969,7 @@ Resolved by ADR 0011 (originally an open question): the developer recommended sy
 
 <a id="story-69"></a>
 **69. Authentication for `serve` (8 pts)**
-Status: Delivered in PR #299. Added 2026-10-09 (#105). Counted in the totals. Design: [ADR 0012](adr/0012-authentication.md), Accepted by the owner on 2026-10-10. In progress (2026-10-11): the criteria below are ADR 0012's test plan (D10), which replaced the story's placeholder criteria when it started. Per-org and per-repo scopes are not part of it: they are [#289](https://github.com/P47Phoenix/memory-graph/issues/289). Unblocks story 33.
+Status: Delivered in PR #299. Added 2026-10-09 (#105). Counted in the totals. Design: [ADR 0012](adr/0012-authentication.md), Accepted by the owner on 2026-10-10. The criteria below are ADR 0012's test plan (D10), which replaced the story's placeholder criteria when it started. Per-org and per-repo scopes are not part of it: they are [#289](https://github.com/P47Phoenix/memory-graph/issues/289). Unblocks story 33.
 As an operator running a shared server
 I want clients to authenticate before they read or write
 So that only trusted callers can reach the data.
