@@ -94,6 +94,14 @@ where
                 .with_filter(f)
                 .boxed(),
         };
+        // The `EnvFilter`s here are per-layer filters that may cache
+        // `Interest::always`, and a callsite with that interest is decided
+        // from the thread's per-layer filter state as the last `enabled`
+        // call left it (#309, #310). That is safe here: the OpenTelemetry
+        // layers filter with `AskEachTime`, which answers `sometimes` or
+        // `never` but never `always`, so the combined interest of any
+        // callsite fmt logs is `sometimes` and every span and event runs
+        // `enabled` on all filters first (tests/log_fmt_stale_hint.rs).
         let mut layers: Vec<ExtraLayer> = Vec::with_capacity(3);
         layers.extend(otel.traces);
         if let Some(l) = otel.logs {

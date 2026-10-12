@@ -9,6 +9,7 @@ use graph_core::{Extractor, TokenClass};
 use graph_store::{Grain, IndexOptions, Query, Store, StoreError, SymbolQuery, V2Store};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Write a line to stdout, propagating errors (a closed pipe is handled in `main`).
 macro_rules! out {
@@ -534,7 +535,7 @@ enum Cmd {
         /// How often OpenTelemetry metrics are exported
         #[arg(long, value_parser = parse_duration, default_value = "60s")]
         otlp_metrics_interval: std::time::Duration,
-        /// Serve MCP (Model Context Protocol, streamable HTTP; read-only tools) at
+        /// Serve MCP (Model Context Protocol, streamable HTTP; read-only tools unless --mcp-allow-writes) at
         /// http://<HOST:PORT>/mcp, on a port of its own. Off unless given. Loopback only
         /// (127.0.0.1, ::1) unless --mcp-allow-remote. See docs/mcp.md.
         /// +----------------------------------------------------------------------+
@@ -601,6 +602,15 @@ enum Cmd {
         /// most --mcp-header-timeout, which is the default
         #[arg(long, value_name = "DURATION", requires = "mcp_listen", value_parser = parse_duration)]
         mcp_idle_timeout: Option<std::time::Duration>,
+        /// Add the MCP write tools index_path and prune (story 33), confined to
+        /// --mcp-index-root. With --auth-tokens they need a `write` token (a `read` token gets
+        /// 403). Off by default: the endpoint is read-only
+        #[arg(long, requires_all = ["mcp_listen", "mcp_index_root"])]
+        mcp_allow_writes: bool,
+        /// The directory the MCP write tools may index: every path they take must resolve
+        /// inside it, on this server's file system
+        #[arg(long, value_name = "DIR", requires = "mcp_allow_writes")]
+        mcp_index_root: Option<PathBuf>,
         /// The memory-graph.ready health service is SERVING only while a leader is known and
         /// this node's applied index is within this many entries of the leader's commit index
         #[arg(long, value_name = "N", default_value_t = graph_server::DEFAULT_READY_MAX_LAG)]
@@ -927,6 +937,10 @@ enum Cmd {
     /// file_tokens, list_files). Reads --db, or --server / MEMORY_GRAPH_SERVER with --read. Stdout
     /// carries only protocol messages; logs go to stderr. Client configuration: docs/mcp.md
     ///
+    /// --allow-writes --index-root <DIR> adds two write tools (story 33): index_path (index a
+    /// directory under DIR as a repo) and prune (remove a repo's files no longer there; a dry
+    /// run unless told otherwise). Off by default.
+    ///
     /// Over stdio no port is opened: only the client that started the process can talk to it.
     /// The HTTP endpoint (`serve --mcp-listen`) is another matter:
     /// +----------------------------------------------------------------------+
@@ -936,7 +950,14 @@ enum Cmd {
     /// | or turn on --auth-tokens (ADR 0012).                                 |
     /// +----------------------------------------------------------------------+
     #[command(verbatim_doc_comment)]
-    Mcp,
+    Mcp {
+        /// Add the write tools index_path and prune (story 33), confined to --index-root
+        #[arg(long, requires = "index_root")]
+        allow_writes: bool,
+        /// The directory the write tools may read: every path they take must resolve inside it
+        #[arg(long, value_name = "DIR", requires = "allow_writes")]
+        index_root: Option<PathBuf>,
+    },
 }
 
 /// Store settings taken from CLI flags (`None` when the flag is unset):
@@ -1282,7 +1303,10 @@ fn run() -> Result<i32> {
             | Cmd::Symbols { .. }
             | Cmd::Search { .. }
             | Cmd::Export { .. }
-            | Cmd::Mcp
+            | Cmd::Mcp {
+                allow_writes: false,
+                ..
+            }
     ));
     reject_legacy_backend(cli.backend)?;
     let overrides = cli.overrides();
@@ -1336,6 +1360,8 @@ fn run() -> Result<i32> {
         mcp_max_connections,
         mcp_header_timeout,
         mcp_idle_timeout,
+        mcp_allow_writes: _,
+        mcp_index_root,
         ready_max_lag,
         snapshot_log_entries,
         snapshot_log_bytes,
@@ -1627,6 +1653,8 @@ fn run() -> Result<i32> {
             if let Some(t) = mcp_idle_timeout {
                 mc.idle_timeout = Some(*t);
             }
+            // --mcp-index-root requires --mcp-allow-writes (and back).
+            mc.index_root = mcp_index_root.clone();
             cfg.mcp = Some(mc);
         }
         cfg.auth = graph_server::AuthConfig {
@@ -1763,28 +1791,71 @@ fn run() -> Result<i32> {
     };
     match cli.cmd {
         Cmd::Serve { .. } | Cmd::Auth { .. } => unreachable!("handled above"),
-        Cmd::Mcp => {
+        Cmd::Mcp {
+            allow_writes,
+            index_root,
+        } => {
             // Stdout is the protocol channel: everything else goes to stderr.
-            let backend = match &remote_addr {
-                Some((addr, read)) => {
-                    let store = remote(addr, *read, overrides)?;
-                    let log = store.read_log();
-                    eprintln!("memory-graph mcp: serving server {addr} (read {read:?}) over stdio");
-                    graph_mcp::StoreBackend::remote(
-                        Box::new(store),
-                        Box::new(move || log.stale_reads()),
-                    )
-                }
-                None => {
-                    let store = open_existing(&target, overrides)?;
-                    if let Target::Embedded(db) = &target {
+            let mode = if allow_writes {
+                "write tools on"
+            } else {
+                "read-only"
+            };
+            let (backend, writer): (graph_mcp::StoreBackend, Option<Arc<dyn Store>>) =
+                match &remote_addr {
+                    Some((addr, read)) => {
+                        let store = Arc::new(remote(addr, *read, overrides)?);
+                        let log = store.read_log();
                         eprintln!(
-                            "memory-graph mcp: serving {} over stdio (read-only)",
-                            db.display()
+                            "memory-graph mcp: serving server {addr} (read {read:?}, {mode}) over stdio"
                         );
+                        let backend = graph_mcp::StoreBackend::remote(
+                            Box::new(Arc::clone(&store)),
+                            Box::new(move || log.stale_reads()),
+                        );
+                        (backend, Some(store as Arc<dyn Store>))
                     }
-                    graph_mcp::StoreBackend::embedded(store)
+                    None => {
+                        // The write tools parse, so they need the
+                        // extractors (and may create the file).
+                        let store: Arc<dyn Store> = Arc::from(if allow_writes {
+                            open_for_indexing(&target, overrides)?
+                        } else {
+                            open_existing(&target, overrides)?
+                        });
+                        if let Target::Embedded(db) = &target {
+                            eprintln!(
+                                "memory-graph mcp: serving {} over stdio ({mode})",
+                                db.display()
+                            );
+                        }
+                        let backend =
+                            graph_mcp::StoreBackend::embedded(Box::new(Arc::clone(&store)));
+                        (backend, Some(store))
+                    }
+                };
+            let backend = match (allow_writes, index_root, writer) {
+                (true, Some(root), Some(store)) => {
+                    let access =
+                        graph_mcp::WriteAccess::new(&root, Box::new(graph_mcp::StoreWriter(store)))
+                            .map_err(|e| anyhow::anyhow!("--index-root: {e}"))?;
+                    eprintln!(
+                        "memory-graph mcp: write tools confined to {}",
+                        access.root().display()
+                    );
+                    // Never index the database's own files.
+                    let own = match &target {
+                        Target::Embedded(db) => {
+                            // Its whole NodePaths layout: the sidecars
+                            // (`<db>.*`, snapshots included) by name.
+                            let p = graph_server::paths::NodePaths::for_db(db);
+                            vec![p.store, p.log, p.snapshots_dir, p.lock]
+                        }
+                        _ => Vec::new(),
+                    };
+                    backend.with_writes(access.with_excluded(own))
                 }
+                _ => backend,
             };
             let mut server =
                 graph_mcp::McpServer::new(backend, "memory-graph", env!("CARGO_PKG_VERSION"));

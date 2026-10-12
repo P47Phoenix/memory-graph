@@ -12,7 +12,7 @@
 //!   cancellation can be read (the spec lets a server ignore it).
 //! - Messages from the client that are responses (we send no requests) and
 //!   unknown notifications are ignored.
-use crate::tools::{error_body, parse_call, tool_definitions, McpBackend, ToolError};
+use crate::tools::{error_body, is_write_tool, listed_tools, parse_call, McpBackend, ToolError};
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Write};
 
@@ -35,6 +35,12 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 /// A request other than `initialize` or `ping` before `initialize`.
 pub const NOT_INITIALIZED: i64 = -32002;
+
+/// `initialize`'s `instructions` with the read tools only (the default).
+const READ_INSTRUCTIONS: &str = "Read-only access to a code memory graph (org -> repo -> file -> symbol -> token). Call describe first to learn the orgs, repos, languages and symbol kinds present; then search (token text rolled up to symbols), find_symbols (definitions by name), file_outline, file_tokens and list_files. List tools page with limit/offset; pass next_offset to continue.";
+
+/// `instructions` when the write tools are on (story 33).
+const WRITE_INSTRUCTIONS: &str = "Access to a code memory graph (org -> repo -> file -> symbol -> token). Call describe first to learn the orgs, repos, languages and symbol kinds present; then search (token text rolled up to symbols), find_symbols (definitions by name), file_outline, file_tokens and list_files. List tools page with limit/offset; pass next_offset to continue. Writes are on: index_path indexes a directory as a repo; its path is relative to the server's index root (on the server's file system, not the client's), and and prune (a dry run unless dry_run is false) removes that repo's files no longer there.";
 
 /// The protocol state machine over one backend.
 pub struct McpServer<B> {
@@ -213,7 +219,7 @@ impl<B: McpBackend> McpServer<B> {
                 format!("`{method}` before `initialize`: send initialize first"),
                 None,
             )),
-            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+            "tools/list" => Ok(json!({ "tools": listed_tools(self.backend.writes_enabled()) })),
             "tools/call" => self.call(params),
             other => Err((
                 METHOD_NOT_FOUND,
@@ -253,7 +259,7 @@ impl<B: McpBackend> McpServer<B> {
             "protocolVersion": v,
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": self.name, "title": "memory-graph", "version": self.version },
-            "instructions": "Read-only access to a code memory graph (org -> repo -> file -> symbol -> token). Call describe first to learn the orgs, repos, languages and symbol kinds present; then search (token text rolled up to symbols), find_symbols (definitions by name), file_outline, file_tokens and list_files. List tools page with limit/offset; pass next_offset to continue."
+            "instructions": if self.backend.writes_enabled() { WRITE_INSTRUCTIONS } else { READ_INSTRUCTIONS }
         }))
     }
 
@@ -280,6 +286,15 @@ impl<B: McpBackend> McpServer<B> {
                 ))
             }
         };
+        // The write tools (story 33) do not exist unless the host turned
+        // them on: an unknown tool, as before they were added.
+        if is_write_tool(name) && !self.backend.writes_enabled() {
+            return Err((
+                INVALID_PARAMS,
+                format!("unknown tool `{name}`; the write tools are off on this server (serve --mcp-allow-writes, mcp --allow-writes)"),
+                None,
+            ));
+        }
         let outcome = parse_call(name, args).and_then(|c| self.backend.read(&c));
         match outcome {
             Ok(structured) => {
