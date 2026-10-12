@@ -31,7 +31,17 @@
 //! Paragraph names are recognised at the start of a sentence (after a `.`)
 //! when followed by `.`: in fixed format only in Area A (columns 8-11); in
 //! free format when first on their line and not a lone verb (`EXIT.`,
-//! `GOBACK.`, `END-IF.`). Known limits: a picture string with an inner
+//! `GOBACK.`, `END-IF.`). Names may be all digits (`100 SECTION.`, `100.`
+//! in the PROCEDURE DIVISION). A word continued on a `-` indicator line is
+//! one name (the indicator itself is a Comment token), including a split
+//! after a hyphen (`MAIN-` / `SEC`). A line with a tab in the sequence area
+//! is tab-indented: the tab advances to the next multiple of 8 columns, and
+//! Area A is judged by those visual columns. Such a line's code is lexed
+//! with the free-format tokenizer (with `*>` comments and column 72 still
+//! honoured), so it never has an indicator column of its own.
+//!
+//! Known limits: all-digit hyphenated names (`1000-2000.`) are not one
+//! word; a picture string with an inner
 //! period (`PIC ZZ9.99`) is read as a sentence end, which is harmless unless
 //! a level number `01`/`77` follows it; `COPY` members are not expanded; a
 //! `>>SOURCE FORMAT` switch after the first line is not followed; unnamed
@@ -163,13 +173,15 @@ impl Extractor for CobolExtractor {
         // `dw1`: digit-led words (`1000-READ-NEXT`) are one identifier (#196).
         // `dw2`: a lone digit-led paragraph header (`100A.`) is too (#209).
         // `dw3`: and a digit-led section header (`100A SECTION.`, #268).
-        format!("cobol-scan-1+kw1+dw3+tok{TOKENIZER_VERSION}")
+        // `dw4`: all-digit headers (`100 SECTION.`, `100.`), words continued
+        // across a `-` indicator line, tab-indented lines (#285).
+        format!("cobol-scan-1+kw1+dw4+tok{TOKENIZER_VERSION}")
     }
 
     fn extract(&self, source: &str) -> Extraction {
         let free = is_free_format(source);
         let mut tokens = tokenize(source, free);
-        let symbols = symbols(&tokens, free);
+        let symbols = symbols(source, &tokens, free);
         // After the symbol scan, which reads identifiers as it always has.
         // Reserved words cannot be user names, and hyphenated names
         // (`END-OF-FILE`) are whole tokens, so nothing is escaped.
@@ -228,7 +240,7 @@ pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
     let raw = if free {
         tokenize_with(src, COBOL_FREE_TOKENIZER)
     } else {
-        tokenize_with(src, COBOL_TOKENIZER)
+        tokenize_fixed(src)
     };
     let mut out: Vec<TokenDecl> = Vec::with_capacity(raw.len());
     let mut i = 0;
@@ -274,8 +286,165 @@ pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
         }
     }
     let mut out = join_digit_led_words(src, out);
-    reclass_digit_led_headers(&mut out, free);
+    reclass_digit_led_headers(src, &mut out, free);
     out
+}
+
+/// Fixed-format tokens. Lines with a tab in the sequence area (columns 1-6)
+/// are tab-indented: as compilers do, the tab advances to the next multiple
+/// of 8 columns, so the code after it starts in Area A or B, never in the
+/// sequence area. Every other line is lexed by the shared tokenizer's COBOL
+/// layout. A continuation indicator (`-` in column 7) is a Comment: it is
+/// layout, not code.
+fn tokenize_fixed(src: &str) -> Vec<TokenDecl> {
+    let mut out: Vec<TokenDecl> = Vec::new();
+    let flush = |out: &mut Vec<TokenDecl>, a: usize, b: usize, line: u32| {
+        if a < b {
+            for mut t in tokenize_with(&src[a..b], COBOL_TOKENIZER) {
+                shift(&mut t, a, line - 1, 0);
+                // Only reference-format lines have an indicator column;
+                // tab lines (lexed apart) never do.
+                if t.text == "-" && t.span.start_col == 7 {
+                    t.class = TokenClass::Comment;
+                }
+                out.push(t);
+            }
+        }
+    };
+    let (mut chunk, mut chunk_line) = (0usize, 1u32);
+    let (mut off, mut line) = (0usize, 1u32);
+    for l in src.split_inclusive('\n') {
+        if let Some(tab) = sequence_area_tab(l) {
+            flush(&mut out, chunk, off, chunk_line);
+            tab_line(src, off, off + tab, off + l.len(), line, &mut out);
+            (chunk, chunk_line) = (off + l.len(), line + 1);
+        }
+        off += l.len();
+        line += 1;
+    }
+    flush(&mut out, chunk, src.len(), chunk_line);
+    out
+}
+
+/// Byte offset (in `line`) of a tab within columns 1-6, if any.
+fn sequence_area_tab(line: &str) -> Option<usize> {
+    line.char_indices()
+        .filter(|&(_, c)| c != '\u{feff}')
+        .take(6)
+        .find(|&(_, c)| c == '\t')
+        .map(|(p, _)| p)
+}
+
+/// Move a token lexed from a slice to its place in the file: `bytes` and
+/// `lines` are added, and `cols` to columns on its first line.
+fn shift(t: &mut TokenDecl, bytes: usize, lines: u32, cols: u32) {
+    let s = &mut t.span;
+    if s.end_line == s.start_line {
+        s.end_col += cols;
+    }
+    s.start_col += cols;
+    s.start += bytes as u32;
+    s.end += bytes as u32;
+    s.start_line += lines;
+    s.end_line += lines;
+}
+
+/// Characters (columns) in `src[ls..p]`, a BOM taking none.
+fn cols_between(src: &str, ls: usize, p: usize) -> u32 {
+    src[ls..p].chars().filter(|&c| c != '\u{feff}').count() as u32
+}
+
+/// Visual column (1-based) of a token: tabs advance to the next multiple of
+/// 8 columns, a BOM takes none.
+fn visual_col(src: &str, span: &Span) -> u32 {
+    let start = span.start as usize;
+    let ls = src[..start].rfind('\n').map_or(0, |p| p + 1);
+    visual_col_at(src, ls, start)
+}
+
+/// One tab-indented line `src[ls..le]` whose sequence area holds a tab at
+/// `tab`: the text before the tab is the sequence area (a Comment when not
+/// blank), code runs to column 72 or a `*>` comment, and the rest is one
+/// Comment each.
+fn tab_line(src: &str, ls: usize, tab: usize, le: usize, line: u32, out: &mut Vec<TokenDecl>) {
+    let body_end = if src[ls..le].ends_with("\r\n") {
+        le - 2
+    } else if src[ls..le].ends_with('\n') {
+        le - 1
+    } else {
+        le
+    };
+    let comment = |out: &mut Vec<TokenDecl>, a: usize, b: usize| {
+        let t = src[a..b].trim_start();
+        let a = b - t.len();
+        let b = a + t.trim_end().len();
+        if a < b {
+            let col = 1 + cols_between(src, ls, a);
+            out.push(TokenDecl {
+                text: src[a..b].to_string(),
+                class: TokenClass::Comment,
+                span: Span {
+                    start: a as u32,
+                    end: b as u32,
+                    start_line: line,
+                    start_col: col,
+                    end_line: line,
+                    end_col: col + cols_between(src, a, b),
+                },
+            });
+        }
+    };
+    comment(out, ls, tab);
+    let code_start = tab + 1;
+    // Column 73 onwards is the identification area.
+    let mut col = visual_col_at(src, ls, code_start);
+    let mut area_end = body_end;
+    for (p, c) in src[code_start..body_end].char_indices() {
+        if col > 72 {
+            area_end = code_start + p;
+            break;
+        }
+        col = if c == '\t' {
+            (col - 1) / 8 * 8 + 9
+        } else {
+            col + 1
+        };
+    }
+    // A `*>` outside a literal starts a comment.
+    let mut quote: Option<char> = None;
+    let mut code_end = area_end;
+    for (p, c) in src[code_start..area_end].char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if src[code_start + p..area_end].starts_with("*>") => {
+                code_end = code_start + p;
+                break;
+            }
+            None => {}
+        }
+    }
+    let cols = cols_between(src, ls, code_start);
+    for mut t in tokenize_with(&src[code_start..code_end], COBOL_FREE_TOKENIZER) {
+        shift(&mut t, code_start, line - 1, cols);
+        out.push(t);
+    }
+    comment(out, code_end, area_end);
+    comment(out, area_end, body_end);
+}
+
+/// [`visual_col`] of byte `p` on the line starting at `ls`.
+fn visual_col_at(src: &str, ls: usize, p: usize) -> u32 {
+    let mut col = 1;
+    for c in src[ls..p].chars() {
+        match c {
+            '\t' => col = (col - 1) / 8 * 8 + 9,
+            '\u{feff}' => {}
+            _ => col += 1,
+        }
+    }
+    col
 }
 
 /// A lone digit-led word with a letter (`100A`, `9X`) lexes as a number
@@ -285,17 +454,29 @@ pub fn tokenize(src: &str, free: bool) -> Vec<TokenDecl> {
 /// or a section header, followed by `SECTION` and `.`.
 /// Exponent literals (`1E5`, `1.5E3`) are never reclassed, and a PIC
 /// string or level-number operand is never at a sentence start.
-fn reclass_digit_led_headers(tokens: &mut [TokenDecl], free: bool) {
+fn reclass_digit_led_headers(src: &str, tokens: &mut [TokenDecl], free: bool) {
     let code: Vec<usize> = (0..tokens.len())
         .filter(|&i| tokens[i].class != TokenClass::Comment)
         .collect();
+    // In a PROCEDURE DIVISION (or a copybook, which has no DIVISION header).
+    let mut in_procedure = !code.windows(2).any(|w| {
+        tokens[w[0]].class == TokenClass::Identifier
+            && tokens[w[1]].text.eq_ignore_ascii_case("DIVISION")
+    });
     for (k, &i) in code.iter().enumerate() {
         let t = &tokens[i];
-        let candidate = t.class == TokenClass::Literal
+        if k > 0 && t.text.eq_ignore_ascii_case("DIVISION") {
+            let p = &tokens[code[k - 1]];
+            if p.class == TokenClass::Identifier {
+                in_procedure = p.text.eq_ignore_ascii_case("PROCEDURE");
+            }
+        }
+        let alnum = t.class == TokenClass::Literal
             && t.text.starts_with(|c: char| c.is_ascii_digit())
-            && t.text.bytes().all(|b| b.is_ascii_alphanumeric())
-            && t.text.bytes().any(|b| b.is_ascii_alphabetic())
-            && !is_exponent_literal(&t.text);
+            && t.text.bytes().all(|b| b.is_ascii_alphanumeric());
+        // All-digit names (`100 SECTION.`, `100.`, #285) are legal too.
+        let all_digit = alnum && t.text.bytes().all(|b| b.is_ascii_digit());
+        let candidate = alnum && (all_digit || !is_exponent_literal(&t.text));
         if !candidate {
             continue;
         }
@@ -307,8 +488,10 @@ fn reclass_digit_led_headers(tokens: &mut [TokenDecl], free: bool) {
                 tokens[n].text == "." && tokens[n].class == TokenClass::Punctuation
             })
         };
-        // `100A.` (paragraph) or `100A SECTION [50].` (section, #268).
-        let next_is_period = is_period(k + 1)
+        // `100A.` (paragraph) or `100A SECTION [50].` (section, #268). An
+        // all-digit paragraph only in the PROCEDURE DIVISION: elsewhere a
+        // number before a period is data (`PIC 9.99`).
+        let next_is_period = (is_period(k + 1) && (!all_digit || in_procedure))
             || (code
                 .get(k + 1)
                 .is_some_and(|&n| tokens[n].text.eq_ignore_ascii_case("SECTION"))
@@ -321,7 +504,7 @@ fn reclass_digit_led_headers(tokens: &mut [TokenDecl], free: bool) {
         let area_a = if free {
             prev.is_none_or(|p| p.span.end_line < t.span.start_line)
         } else {
-            (8..=11).contains(&t.span.start_col)
+            (8..=11).contains(&visual_col(src, &t.span))
         };
         if sentence_start && next_is_period && area_a {
             tokens[i].class = TokenClass::Identifier;
@@ -438,12 +621,10 @@ struct E {
 const VERBS: &[&str] = &["EXIT", "GOBACK", "CONTINUE", "ELSE", "STOP", "RUN"];
 
 /// Symbols in COBOL tokens (as produced by [`tokenize`]).
-pub fn symbols(tokens: &[TokenDecl], free: bool) -> Vec<SymbolDecl> {
-    let code: Vec<&TokenDecl> = tokens
-        .iter()
-        .filter(|t| t.class != TokenClass::Comment)
-        .collect();
-    let evs = events(&code, free);
+pub fn symbols(src: &str, tokens: &[TokenDecl], free: bool) -> Vec<SymbolDecl> {
+    let code = join_continued(tokens);
+    let code: Vec<&TokenDecl> = code.iter().collect();
+    let evs = events(src, &code, free);
     let span = |a: usize, b: usize| span_between(&code[a].span, &code[b].span);
     let mut out = Vec::new();
     let sym = |name: &str, kind, lk: &str, span: Span| SymbolDecl {
@@ -529,7 +710,58 @@ pub fn symbols(tokens: &[TokenDecl], free: bool) -> Vec<SymbolDecl> {
     no_partial_overlap(out)
 }
 
-fn events(code: &[&TokenDecl], free: bool) -> Vec<E> {
+/// Code tokens, with a word continued on a `-` indicator line (fixed
+/// format) joined to the word it continues: `MAIN-SEC` / `TION` is one
+/// `MAIN-SECTION` (its span covers both pieces and the line break).
+/// Literals in quotes are not joined.
+fn join_continued(tokens: &[TokenDecl]) -> Vec<TokenDecl> {
+    let continued: Vec<u32> = tokens
+        .iter()
+        .filter(|t| t.class == TokenClass::Comment && t.text == "-" && t.span.start_col == 7)
+        .map(|t| t.span.start_line)
+        .collect();
+    let word = |t: &TokenDecl| {
+        matches!(t.class, TokenClass::Identifier | TokenClass::Literal)
+            && !t.text.is_empty()
+            && t.text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let mut out: Vec<TokenDecl> = Vec::new();
+    for t in tokens.iter().filter(|t| t.class != TokenClass::Comment) {
+        let cont = continued.binary_search(&t.span.start_line).is_ok();
+        // `MAIN-` / `-    SEC`: a hyphen touching the word before the break.
+        if cont && word(t) && out.len() >= 2 {
+            let (d, w) = (&out[out.len() - 1], &out[out.len() - 2]);
+            if d.text == "-"
+                && d.span.start == w.span.end
+                && w.span.end_line == d.span.end_line
+                && d.span.end_line < t.span.start_line
+                && word(w)
+            {
+                out.pop();
+                let p = out.last_mut().unwrap();
+                p.text.push('-');
+                p.text.push_str(&t.text);
+                p.span = span_between(&p.span, &t.span);
+                p.class = TokenClass::Identifier;
+                continue;
+            }
+        }
+        if let Some(p) = out.last_mut() {
+            if p.span.end_line < t.span.start_line && cont && word(p) && word(t) {
+                p.text.push_str(&t.text);
+                p.span = span_between(&p.span, &t.span);
+                p.class = TokenClass::Identifier;
+                continue;
+            }
+        }
+        out.push(t.clone());
+    }
+    out
+}
+
+fn events(src: &str, code: &[&TokenDecl], free: bool) -> Vec<E> {
     let mut out: Vec<E> = Vec::new();
     let text = |c: usize| code.get(c).map_or("", |t| t.text.as_str());
     let is = |c: usize, s: &str| text(c).eq_ignore_ascii_case(s);
@@ -615,7 +847,7 @@ fn events(code: &[&TokenDecl], free: bool) -> Vec<E> {
             push(&mut out, Ev::ProgEnd(name));
         } else if is_word(c) && is(c + 1, "SECTION") {
             push(&mut out, Ev::Section(text(c).to_string()));
-        } else if in_procedure && is_word(c) && period(c + 1) && paragraph_ok(code, c, free) {
+        } else if in_procedure && is_word(c) && period(c + 1) && paragraph_ok(src, code, c, free) {
             push(&mut out, Ev::Paragraph(text(c).to_string()));
         } else if in_data {
             let t = code[c];
@@ -645,7 +877,7 @@ fn events(code: &[&TokenDecl], free: bool) -> Vec<E> {
     out
 }
 
-fn paragraph_ok(code: &[&TokenDecl], c: usize, free: bool) -> bool {
+fn paragraph_ok(src: &str, code: &[&TokenDecl], c: usize, free: bool) -> bool {
     let t = code[c];
     let upper = t.text.to_ascii_uppercase();
     if upper.starts_with("END-") || VERBS.contains(&upper.as_str()) {
@@ -654,7 +886,7 @@ fn paragraph_ok(code: &[&TokenDecl], c: usize, free: bool) -> bool {
     if free {
         c == 0 || code[c - 1].span.end_line < t.span.start_line
     } else {
-        (8..=11).contains(&t.span.start_col)
+        (8..=11).contains(&visual_col(src, &t.span))
     }
 }
 

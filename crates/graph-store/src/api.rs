@@ -402,6 +402,55 @@ pub trait StoreRead {
     fn search(&self, q: &Query) -> Result<Vec<Hit>>;
 }
 
+/// A shared store reads like the store itself: every method, defaults
+/// included, goes to `T`, so a backend's overrides still apply. Lets one
+/// `Arc<dyn Store>` serve readers and a writer at once (MCP write tools,
+/// story 33).
+impl<T: StoreRead + ?Sized> StoreRead for std::sync::Arc<T> {
+    fn get(&self, id: NodeId) -> Result<Option<Node>> {
+        (**self).get(id)
+    }
+    fn parent(&self, id: NodeId) -> Result<Option<Node>> {
+        (**self).parent(id)
+    }
+    fn count_nodes(&self, kind: NodeKind) -> Result<usize> {
+        (**self).count_nodes(kind)
+    }
+    fn roots(&self) -> Result<Vec<Node>> {
+        (**self).roots()
+    }
+    fn children(&self, id: NodeId) -> Result<Vec<Node>> {
+        (**self).children(id)
+    }
+    fn descendants(&self, id: NodeId) -> Result<Vec<Node>> {
+        (**self).descendants(id)
+    }
+    fn ancestors(&self, id: NodeId) -> Result<Vec<Node>> {
+        (**self).ancestors(id)
+    }
+    fn children_page(&self, id: NodeId, offset: usize, limit: usize) -> Result<Page<Node>> {
+        (**self).children_page(id, offset, limit)
+    }
+    fn descendants_page(&self, id: NodeId, offset: usize, limit: usize) -> Result<Page<Node>> {
+        (**self).descendants_page(id, offset, limit)
+    }
+    fn file_tokens(&self, org: &str, repo: &str, path: &str) -> Result<Option<Vec<Node>>> {
+        (**self).file_tokens(org, repo, path)
+    }
+    fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
+        (**self).describe(org, repo)
+    }
+    fn describe_by_scan(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
+        (**self).describe_by_scan(org, repo)
+    }
+    fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
+        (**self).search_symbols(q)
+    }
+    fn search(&self, q: &Query) -> Result<Vec<Hit>> {
+        (**self).search(q)
+    }
+}
+
 /// Snapshot observability (ADR 0003 story 10, [`Store::snapshot_stats`]):
 /// how many snapshot handles this store currently has alive, and the age of
 /// the oldest one. `store_size_bytes` is the backing store's on-disk size,

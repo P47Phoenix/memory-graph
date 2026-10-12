@@ -771,13 +771,70 @@ fn mcp_over_http_needs_a_token() {
     );
     assert!(v["result"].is_object(), "{v}");
     assert!(v.to_string().contains("alpha"), "{v}");
-    // Every tool today needs `read`; story 33's write tools will need
-    // `write` (and a read token then gets 403).
+    // The read tools need `read`; the write tools (story 33) need `write`.
     assert_eq!(
         graph_server::mcp::tool_need("search"),
         graph_server::Role::Read
     );
+    for w in graph_mcp::WRITE_TOOL_NAMES {
+        assert_eq!(graph_server::mcp::tool_need(w), graph_server::Role::Write);
+    }
     assert!(!graph_server::Role::Read.covers(graph_server::Role::Write));
+}
+
+/// ADR 0012 D9/D10 (issue #300): with auth on and the write tools on, a
+/// `read` token calling a write tool gets HTTP 403 and writes nothing; a
+/// `write` token indexes.
+#[test]
+fn mcp_write_tools_need_a_write_token() {
+    use graph_server::testing::mcp_http::McpHttpClient;
+    let f = AuthFixture::new();
+    let d = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("proj")).unwrap();
+    std::fs::write(root.path().join("proj/a.rs"), b"fn beta_from_mcp() {}\n").unwrap();
+    let ts = TestServer::start_with(&d.path().join("g.redb"), rust(), |c| {
+        c.auth = f.config();
+        let mut m = graph_server::mcp::McpConfig::new("127.0.0.1:0".parse().unwrap());
+        m.index_root = Some(root.path().to_path_buf());
+        c.mcp = Some(m);
+    });
+    let addr = ts.running().unwrap().mcp_addr.unwrap();
+    let call = |name: &str, args: serde_json::Value| {
+        serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                           "params": {"name": name, "arguments": args}})
+    };
+    let index = serde_json::json!({"org": "o", "repo": "proj", "path": "proj"});
+    let prune = serde_json::json!({"org": "o", "repo": "proj", "path": "proj", "dry_run": false});
+    let reader = McpHttpClient::with_token(addr, Some(&f.read));
+    for (name, args) in [("index_path", &index), ("prune", &prune)] {
+        let r = reader.post(&call(name, args.clone()));
+        assert_eq!(r.status, 403, "{name}: {r:?}");
+        assert!(r.body.contains("`write` role"), "{name}: {r:?}");
+    }
+    let w = client(&ts, Some(&f.write), &f).unwrap();
+    assert!(
+        w.describe(None, None).unwrap().is_empty(),
+        "a refused write tool wrote nothing"
+    );
+    // A read token still reads on the same endpoint.
+    let mut reader = McpHttpClient::with_token(addr, Some(&f.read));
+    let v = reader.request(
+        "tools/call",
+        serde_json::json!({"name": "describe", "arguments": {}}),
+    );
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    // A write token indexes.
+    let mut writer = McpHttpClient::with_token(addr, Some(&f.write));
+    let v = writer.request(
+        "tools/call",
+        serde_json::json!({"name": "index_path", "arguments": index}),
+    );
+    assert_eq!(v["result"]["structuredContent"]["indexed"], 1, "{v}");
+    let hits = w
+        .search_symbols(&graph_store::SymbolQuery::new("beta_from_mcp"))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
 }
 
 // ---------------------------------------------------------------------------

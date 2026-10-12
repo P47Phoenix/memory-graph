@@ -48,7 +48,7 @@
 | 30 | COBOL, RPG and assembly symbol extractors | Medium | 8 | P3 | 26 |
 | 31 | `graph-mcp` core and `memory-graph mcp` over stdio, read-only | High | 5 | P2 | 20 |
 | 32 | Streamable HTTP MCP endpoint in `serve` with security guards | High | 5 | P2 | 31, 24 |
-| 33 | Opt-in MCP write tools (**Deferred** until auth, #105; unblocked by story 69) | Medium | 3 | P4 | 32, 69 |
+| 33 | Opt-in MCP write tools (unblocked by story 69; in progress 2026-10-12: `index_path` and `prune`, docs/mcp.md) | Medium | 3 | P4 | 32, 69 |
 | 34 | MCP real-client e2e and hardening | Medium | 3 | P3 | 31, 32 |
 | 35 | Snapshot backups: `file://` sink and verified restore | High | 5 | P2 | 22 |
 | 36 | S3 client over plain HTTP (SigV4, multipart) | High | 8 | P2 | 35 |

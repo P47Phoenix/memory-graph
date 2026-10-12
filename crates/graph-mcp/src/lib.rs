@@ -2,7 +2,8 @@
 //! core. [`McpServer`] is JSON-RPC 2.0 plus the MCP lifecycle
 //! (`initialize` with version negotiation, `notifications/initialized`,
 //! `ping`, `tools/list`, `tools/call`, cancellation); [`tools`] holds the
-//! seven read-only tools and [`StoreBackend`], which answers them from any
+//! seven read-only tools, the opt-in write tools of [`write`] (story 33),
+//! and [`StoreBackend`], which answers them from any
 //! [`graph_store::StoreRead`]; [`serve_stdio`] is the stdio transport
 //! behind `memory-graph mcp`.
 //!
@@ -12,12 +13,14 @@
 pub mod schema;
 mod server;
 pub mod tools;
+pub mod write;
 
 pub use server::{
     serve_stdio, supported_version, McpServer, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
     METHOD_NOT_FOUND, NOT_INITIALIZED, PARSE_ERROR, SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use tools::{
-    tool_definitions, McpBackend, PageArgs, StaleCounter, StoreBackend, ToolCall, ToolError,
-    DEFAULT_LIMIT, MAX_LIMIT,
+    is_write_tool, listed_tools, tool_definitions, write_tool_definitions, McpBackend, PageArgs,
+    StaleCounter, StoreBackend, ToolCall, ToolError, DEFAULT_LIMIT, MAX_LIMIT,
 };
+pub use write::{McpWriter, StoreWriter, WriteAccess, WriteFile, WRITE_TOOL_NAMES};
