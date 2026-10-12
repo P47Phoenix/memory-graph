@@ -4638,7 +4638,7 @@ fn symbol_pages_equal_slices(h: &Harness) {
                         let want: Vec<_> = all.iter().skip(offset).take(limit).cloned().collect();
                         assert_eq!(
                             got, want,
-                            "{pattern} exact={exact_case} {org:?}/{repo:?}/{file:?}                              offset={offset} limit={limit}"
+                            "{pattern} exact={exact_case} {org:?}/{repo:?}/{file:?} offset={offset} limit={limit}"
                         );
                     }
                 }

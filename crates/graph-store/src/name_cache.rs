@@ -14,7 +14,7 @@
 //!   cache pool does not exist yet; when it does, this budget moves there.
 use redb::{Database, ReadTransaction, WriteTransaction};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
 /// The default bound on one name cache (names, offsets and ids), per case
@@ -172,12 +172,22 @@ impl NameCache {
 
 /// Collects a [`NameCache`] during a full walk, giving up once it passes
 /// the size bound.
-pub(crate) struct NameCacheBuilder {
+/// At most one builder per case mode exists at a time (single flight): it
+/// holds that mode's `building` flag until it is dropped, so concurrent
+/// cold queries walk instead of each building a copy.
+pub(crate) struct NameCacheBuilder<'a> {
     cache: Option<NameCache>,
     max_bytes: usize,
+    building: &'a AtomicBool,
 }
 
-impl NameCacheBuilder {
+impl Drop for NameCacheBuilder<'_> {
+    fn drop(&mut self) {
+        self.building.store(false, SeqCst);
+    }
+}
+
+impl NameCacheBuilder<'_> {
     pub(crate) fn push_name(&mut self, name: &str) {
         let Some(c) = self.cache.as_mut() else {
             return;
@@ -217,6 +227,9 @@ impl NameCacheBuilder {
 pub(crate) struct NameCaches {
     fold: Mutex<Option<Arc<NameCache>>>,
     exact: Mutex<Option<Arc<NameCache>>>,
+    /// Whether a build is under way, per case mode (single flight).
+    building_fold: AtomicBool,
+    building_exact: AtomicBool,
     max_bytes: AtomicUsize,
 }
 
@@ -225,6 +238,8 @@ impl Default for NameCaches {
         Self {
             fold: Mutex::new(None),
             exact: Mutex::new(None),
+            building_fold: AtomicBool::new(false),
+            building_exact: AtomicBool::new(false),
             max_bytes: AtomicUsize::new(DEFAULT_NAME_CACHE_MAX_BYTES),
         }
     }
@@ -262,10 +277,29 @@ impl NameCaches {
             .map(Arc::clone)
     }
 
-    /// A builder for `generation`, or `None` when caching is off.
-    pub(crate) fn builder(&self, generation: u64) -> Option<NameCacheBuilder> {
+    /// A builder for `generation`, or `None` when caching is off or
+    /// another build for this case mode is under way.
+    pub(crate) fn builder(
+        &self,
+        exact_case: bool,
+        generation: u64,
+    ) -> Option<NameCacheBuilder<'_>> {
         let max_bytes = self.max_bytes.load(SeqCst);
-        (max_bytes > 0).then(|| NameCacheBuilder {
+        if max_bytes == 0 {
+            return None;
+        }
+        let building = if exact_case {
+            &self.building_exact
+        } else {
+            &self.building_fold
+        };
+        if building
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some(NameCacheBuilder {
             cache: Some(NameCache {
                 generation,
                 names: String::new(),
@@ -274,12 +308,13 @@ impl NameCaches {
                 ids: Vec::new(),
             }),
             max_bytes,
+            building,
         })
     }
 
     /// Keep a finished build, unless the slot already holds a newer one.
-    pub(crate) fn put(&self, exact_case: bool, b: NameCacheBuilder) {
-        let Some(mut c) = b.cache else {
+    pub(crate) fn put(&self, exact_case: bool, mut b: NameCacheBuilder<'_>) {
+        let Some(mut c) = b.cache.take() else {
             return;
         };
         c.names.shrink_to_fit();
@@ -313,7 +348,7 @@ mod tests {
 
     fn cache(names: &[(&str, &[u64])]) -> NameCache {
         let caches = NameCaches::default();
-        let mut b = caches.builder(0).unwrap();
+        let mut b = caches.builder(false, 0).unwrap();
         for (n, ids) in names {
             b.push_name(n);
             for &id in *ids {
@@ -321,7 +356,7 @@ mod tests {
             }
             b.end_name();
         }
-        b.cache.unwrap()
+        b.cache.take().unwrap()
     }
 
     #[test]
@@ -353,7 +388,7 @@ mod tests {
     fn a_build_past_the_bound_is_dropped() {
         let caches = NameCaches::default();
         caches.set_max_bytes(16);
-        let mut b = caches.builder(7).unwrap();
+        let mut b = caches.builder(false, 7).unwrap();
         for i in 0..10 {
             b.push_name(&format!("name{i}"));
             b.push_id(i);
@@ -362,6 +397,27 @@ mod tests {
         caches.put(false, b);
         assert!(caches.get(false, 7).is_none());
         caches.set_max_bytes(0);
-        assert!(caches.builder(7).is_none());
+        assert!(caches.builder(false, 7).is_none());
+    }
+
+    #[test]
+    fn only_one_build_per_case_mode_at_a_time() {
+        let caches = NameCaches::default();
+        let first = caches.builder(false, 1).expect("first build");
+        assert!(
+            caches.builder(false, 1).is_none(),
+            "a second folded build walks"
+        );
+        let exact = caches.builder(true, 1).expect("exact case builds apart");
+        drop(exact);
+        caches.put(false, first);
+        let again = caches
+            .builder(false, 2)
+            .expect("free once the first is done");
+        drop(again);
+        assert!(
+            caches.builder(false, 3).is_some(),
+            "a dropped build frees the slot"
+        );
     }
 }

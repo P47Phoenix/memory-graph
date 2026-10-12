@@ -1930,7 +1930,7 @@ impl R {
                     cache.collect(needle, |n| pattern.matches(n), &mut ids);
                     crate::deadline::check_query_deadline()?;
                 } else {
-                    let mut build = names.and_then(|(c, g)| c.builder(g));
+                    let mut build = names.and_then(|(c, g)| c.builder(q.exact_case, g));
                     for (n, r) in index.iter()?.enumerate() {
                         if n % INFIX_DEADLINE_EVERY == INFIX_DEADLINE_EVERY - 1 {
                             crate::deadline::check_query_deadline()?;
