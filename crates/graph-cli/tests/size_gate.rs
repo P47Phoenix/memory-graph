@@ -179,8 +179,8 @@ const SYM_FOLD_SHARE_MAX: f64 = 0.02;
 /// #90: a full `--reindex` leaves the file about twice its live data (every
 /// replacement is written before the old pages can be reused, and redb grows
 /// a file under 4 GiB by doubling it). The run says so and names
-/// `vacuum --compact`, which brings the file back within 1.2x of a fresh
-/// index; an unchanged re-run (nothing replaced) prints no hint.
+/// `vacuum --compact`, which brings the file back within 1.2x of a fresh,
+/// compacted index; an unchanged re-run (nothing replaced) prints no hint.
 #[test]
 fn reindex_hints_at_compact_and_compact_restores_the_size() {
     let d = tempfile::tempdir().unwrap();
@@ -205,13 +205,18 @@ fn reindex_hints_at_compact_and_compact_restores_the_size() {
         assert!(ok, "{out}{err}");
         err
     };
-    // `--reindex` into an empty database replaces nothing: no hint, though
-    // the file measures ~1.65x its live data (compact cannot beat that).
+    // `--reindex` into an empty database replaces nothing: no hint (the
+    // file's size here depends on redb's growth, so it is not the baseline).
     let err = index(&["--reindex"]);
     assert!(!err.contains("vacuum --compact"), "fresh --reindex: {err}");
-    let fresh = std::fs::metadata(db).unwrap().len();
     let err = index(&[]);
     assert!(!err.contains("vacuum --compact"), "unchanged rerun: {err}");
+    // #302: how far redb grew the fresh file depends on commit timing (it
+    // can already come out doubled, leaving the re-index room to fit), so
+    // the baseline is the fresh index compacted down to its live data.
+    let (ok, out, err) = run(&["--db", db, "vacuum", "--compact"]);
+    assert!(ok, "{out}{err}");
+    let fresh = std::fs::metadata(db).unwrap().len();
     let err = index(&["--reindex"]);
     let reindexed = std::fs::metadata(db).unwrap().len();
     println!("reindex: fresh={fresh} B, after --reindex={reindexed} B");

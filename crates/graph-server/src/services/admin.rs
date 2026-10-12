@@ -276,7 +276,7 @@ async fn promote_guarded(ctx: &Ctx, id: NodeId) -> Result<u64, Status> {
     if mem.voter_ids().any(|v| v == id) {
         // Idempotent: a retried promote whose first attempt committed, or
         // two concurrent promotes of one node, both succeed.
-        tracing::info!(node = id, "promote: node {id} is already a voter");
+        tracing::info!(node = id, "promote: the node is already a voter");
         return Ok(membership_index(&m));
     }
     let addr = node.addr.clone();
@@ -339,7 +339,7 @@ async fn remove_guarded(ctx: &Ctx, id: NodeId, force: bool) -> Result<(u64, bool
         // Idempotent: a retried remove whose first attempt committed.
         tracing::info!(
             node = id,
-            "remove: node {id} is not a member; nothing to remove"
+            "remove: the node is not a member; nothing to remove"
         );
         return Ok((membership_index(&m), true));
     }
@@ -1276,7 +1276,7 @@ impl pb::admin_server::Admin for AdminService {
             match r {
                 Ok(up) => break up,
                 Err(crate::backup::UploadError::Replaced(why)) if attempts < 3 => {
-                    tracing::info!("cluster snapshot --upload: {why}; uploading the current one");
+                    tracing::info!(why = %why, "cluster snapshot --upload: replaced; uploading the current one");
                 }
                 Err(e @ crate::backup::UploadError::NoClusterId) => {
                     return Err(Status::failed_precondition(format!("--upload: {e}")))
