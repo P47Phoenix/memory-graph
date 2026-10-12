@@ -205,8 +205,8 @@ fn reindex_hints_at_compact_and_compact_restores_the_size() {
         assert!(ok, "{out}{err}");
         err
     };
-    // `--reindex` into an empty database replaces nothing: no hint, though
-    // the file measures ~1.65x its live data (compact cannot beat that).
+    // `--reindex` into an empty database replaces nothing: no hint (the
+    // file's size here depends on redb's growth, so it is not the baseline).
     let err = index(&["--reindex"]);
     assert!(!err.contains("vacuum --compact"), "fresh --reindex: {err}");
     let err = index(&[]);

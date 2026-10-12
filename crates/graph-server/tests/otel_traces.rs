@@ -278,7 +278,7 @@ fn snapshot_install_is_one_span_each_side_and_raft_rpcs_are_not_exported() {
             .collect();
         !receivers.is_empty() && receivers.iter().all(|r| has_root(&r.trace_id))
     };
-    setup().collector.wait_spans(WAIT, paired);
+    let waited = setup().collector.wait_spans(WAIT, paired);
     let spans = flushed();
     let installs: Vec<_> = spans
         .iter()
@@ -288,10 +288,16 @@ fn snapshot_install_is_one_span_each_side_and_raft_rpcs_are_not_exported() {
     names.sort();
     names.dedup();
     assert!(
-        paired(&spans),
+        paired(&waited),
         "a sender/receiver pair per install: {installs:#?} among {names:?}"
     );
-    let mut traces: Vec<_> = installs.iter().map(|s| s.trace_id.clone()).collect();
+    // Only the installs the wait accepted (their sender exported then): a
+    // later install's receiver may export after the wait, before its sender.
+    let mut traces: Vec<_> = waited
+        .iter()
+        .filter(|s| s.name == "install_snapshot" && s.parent_span_id.is_empty())
+        .map(|s| s.trace_id.clone())
+        .collect();
     traces.sort();
     traces.dedup();
     for trace in &traces {
