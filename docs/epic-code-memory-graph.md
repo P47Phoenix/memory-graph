@@ -48,7 +48,7 @@
 | 30 | COBOL, RPG and assembly symbol extractors | Medium | 8 | P3 | 26 |
 | 31 | `graph-mcp` core and `memory-graph mcp` over stdio, read-only | High | 5 | P2 | 20 |
 | 32 | Streamable HTTP MCP endpoint in `serve` with security guards | High | 5 | P2 | 31, 24 |
-| 33 | Opt-in MCP write tools (unblocked by story 69; in progress 2026-10-12: `index_path` and `prune`, docs/mcp.md) | Medium | 3 | P4 | 32, 69 |
+| 33 | Opt-in MCP write tools (`index_path` and `prune`, docs/mcp.md; delivered in #306) | Medium | 3 | P4 | 32, 69 |
 | 34 | MCP real-client e2e and hardening | Medium | 3 | P3 | 31, 32 |
 | 35 | Snapshot backups: `file://` sink and verified restore | High | 5 | P2 | 22 |
 | 36 | S3 client over plain HTTP (SigV4, multipart) | High | 8 | P2 | 35 |
@@ -62,14 +62,14 @@
 | 44 | Encoding fixtures, cross-encoding search tests and docs | Medium | 3 | P3 | 42, 43 |
 | 45 | Read-path measurement and benchmark (ADR 0008 phase 0, partly delivered; #233) | Risk reduction | 3 | P3 | 24 |
 | 46 | Dict lookup without full decode; page-cache sizing (ADR 0008 phase 1, delivered) | Medium | 3 | P3 | 45 |
-| 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, gated) | High | 8 | P3 | 45 (gate), 46 |
-| 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, gated) | High | 5 | P3 | 47 |
+| 47 | Decoded-object cache core and MVCC-safe invalidation (ADR 0008 phase 2, gated; closed by measurement in #317) | High | 8 | P3 | 45 (gate), 46 |
+| 48 | Read-cache tests, metrics and flags (ADR 0008 phase 2, gated; closed by measurement in #317) | High | 5 | P3 | 47 |
 | 49 | Optional query-result cache (ADR 0008 phase 3, optional) | Low | 3 | P4 | 45, 48 |
 | 50 | OpenTelemetry groundwork: dependencies, telemetry module, `MetricsSnapshot`, test seams (ADR 0009; delivered in #248) | Medium | 8 | P3 | 24 |
 | 51 | Traces and W3C propagation across client, forward and leader apply (ADR 0009; delivered in #292) | High | 8 | P3 | 50 |
 | 52 | Metrics over OTLP with the name mapping (ADR 0009; delivered in #291) | Medium | 5 | P3 | 50 |
-| 53 | Logs over OTLP; trace ids in JSON logs when traces are on (ADR 0009) | Medium | 3 | P3 | 51 |
-| 54 | OpenTelemetry compose demo, CI, overhead numbers and docs (ADR 0009) | Low | 3 | P3 | 52, 53 |
+| 53 | Logs over OTLP; trace ids in JSON logs when traces are on (ADR 0009; delivered in #305) | Medium | 3 | P3 | 51 |
+| 54 | OpenTelemetry compose demo, CI, overhead numbers and docs (ADR 0009; delivered in #314) | Low | 3 | P3 | 52, 53 |
 | 55 | Enum members as `Constant` symbols in C#, Java, TypeScript, C/C++ and Rust (ADR 0010, delivered; #271-#273) | High | 5 | P2 | 27, 28 |
 | 56 | Declaration (name) position on symbol hits, computed at query time (ADR 0010, delivered; #274) | High | 3 | P2 | 16 |
 | 57 | Case-insensitive symbol lookup by default: `sym_fold` index, self-heal, `--exact-case` (ADR 0010, delivered; #275) | High | 5 | P2 | 16 |
@@ -85,15 +85,16 @@
 | 67 | Leader or apply-time disk full answers RESOURCE_EXHAUSTED without stopping the node (#115; delivered in #295) | Medium | 5 | P3 | 22 |
 | 68 | Infix (substring) symbol search (#278; [ADR 0011](adr/0011-infix-search.md), Accepted 2026-10-10; delivered in #298) | High | 5 | P3 | 61 (preferably) |
 | 69 | Authentication for `serve` (#105; [ADR 0012](adr/0012-authentication.md), Accepted 2026-10-10; delivered in #299) | High | 8 | P3 | 20 |
-| 70 | Faster symbol queries: lazy file-context loading and no full name walk (after #298; [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner)) | High | 5 | P3 | 68 |
+| 70 | Faster symbol queries: lazy file-context loading and no full name walk (after #298; [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner); delivered in #307) | High | 5 | P3 | 68 |
 
-Total: 70 stories, 333 pts (average about 4.8); 325 pts excluding the deferred stories 33 and 39. (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each needed an ADR before any code: [ADR 0011](adr/0011-infix-search.md) and [ADR 0012](adr/0012-authentication.md), both Accepted by the owner on 2026-10-10. Story 70 (5 pts) was added on 2026-10-12 at the owner's request, with the [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner), after story 68 measured infix p95 on the A5 index.
+Total: 70 stories, 333 pts (average about 4.8); 328 pts excluding the deferred story 39 (333 - 5; story 33, 3 pts, was deferred until it was delivered in #306, so the old 325 = 333 - 3 - 5 now becomes 325 + 3 = 328). (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each needed an ADR before any code: [ADR 0011](adr/0011-infix-search.md) and [ADR 0012](adr/0012-authentication.md), both Accepted by the owner on 2026-10-10. Story 70 (5 pts) was added on 2026-10-12 at the owner's request, with the [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner), after story 68 measured infix p95 on the A5 index.
 
 **Next phase (2026-10-09).** Waves, from [plan-next-phase.md](plan-next-phase.md):
 - **W1:** stories 58, 59, 60, 64 and 66, plus drafting ADRs 0011 (infix search) and 0012 (authentication). Delivered: #282-#287; ADRs 0011 and 0012 accepted on 2026-10-10.
 - **W2:** story 61 after 58, then 63 and 65; OpenTelemetry stories 51-54 in parallel.
 - **W3:** stories 62 and 67.
 - **W4:** story 68 after ADR 0011 and story 61; story 69 after ADR 0012; then story 33.
+- **W5-W7:** delivered: #303-#307 and #312-#318.
 
 ### MVP Slice
 Stories 1–8 (33 pts). Any file in any language goes into a persisted graph as File and Token nodes under org/repo, and is searchable by token text with a language filter, through the library and the CLI. The C-dependency gate is active from the start.
@@ -446,7 +447,7 @@ Design: [ADR 0005](adr/0005-mcp.md) D1, D3, D4 (Accepted).
 - Given the three backends (embedded, `RemoteStore` over `TestServer`, the in-serve adapter over a 3-node `ClusterTestbed`), When the tool conformance suite runs, Then all three must pass.
 
 **33. Opt-in MCP write tools (3 pts)**
-Status: **Deferred** until authentication (#105); the owner decided on 2026-09-29 that an unauthenticated endpoint stays read-only. Depends on story 69 (authentication, scheduled 2026-10-09), which delivers #105.
+Status: Delivered in PR #306.
 As an AI-agent integrator
 I want `index_path` and `prune` tools
 So that an assistant can keep the graph current without a separate CLI call.
@@ -613,7 +614,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 1.
 
 <a id="story-47"></a>
 **47. Decoded-object cache core and MVCC-safe invalidation (8 pts)**
-Status: Closed by measurement (2026-10-12). After story 61, the large-index re-run on A5 (#233) measured a decode share of 0.5-2.4% across query classes and reader counts, far below the 25% gate; see [the spike](spikes/read-cache.md#decode-share-re-run-after-story-61-233-2026-10-12). Re-open only if a later re-run shows 25% or more.
+Status: Closed by measurement in #317 (2026-10-12). After story 61, the large-index re-run on A5 (#233) measured a decode share of 0.5-2.4% across query classes and reader counts, far below the 25% gate; see [the spike](spikes/read-cache.md#decode-share-re-run-after-story-61-233-2026-10-12). Re-open only if a later re-run shows 25% or more.
 As an agent sending many queries to `serve`
 I want decoded dictionary blocks, symbol sections and file context reused across queries
 So that warm queries skip repeated decoding without ever seeing stale data.
@@ -630,7 +631,7 @@ Design: [ADR 0008](adr/0008-read-cache.md) phase 2 (generations).
 
 <a id="story-48"></a>
 **48. Read-cache tests, metrics and flags (5 pts)**
-Status: Closed by measurement with story 47 (2026-10-12).
+Status: Closed by measurement in #317, with story 47 (2026-10-12).
 As an operator and a maintainer
 I want the read cache sized, observable, switchable and proven equivalent
 So that it can be tuned or turned off and never changes an answer.
@@ -739,7 +740,7 @@ Design: [ADR 0009](adr/0009-opentelemetry.md) D6 and D8.
 
 <a id="story-53"></a>
 **53. Logs over OTLP; trace ids in JSON logs when traces are on (3 pts)**
-Status: Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals.
+Status: Delivered in PR #305. Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals.
 As an operator reading logs next to traces
 I want `serve`'s log events exported over OTLP and tagged with trace ids
 So that a log line leads to its trace and back.
@@ -988,7 +989,7 @@ Resolved by ADR 0012 (originally an open question): bearer tokens checked by a t
 
 <a id="story-70"></a>
 **70. Faster symbol queries (5 pts)**
-Status: Added 2026-10-12 at the owner's request, after story 68 (#298) measured infix p95 on the A5 index (877M tokens): 406-507 ms for rare, mid-frequency and absent needles and 696 ms for `*get*`, against the 50 ms gate. Even the prefix `get*` took 269 ms. Counted in the totals. Design: the [ADR 0011 amendment of 2026-10-12](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner).
+Status: Delivered in PR #307. Added 2026-10-12 at the owner's request, after story 68 (#298) measured infix p95 on the A5 index (877M tokens): 406-507 ms for rare, mid-frequency and absent needles and 696 ms for `*get*`, against the 50 ms gate. Even the prefix `get*` took 269 ms. Counted in the totals. Design: the [ADR 0011 amendment of 2026-10-12](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner).
 As a developer or agent searching a large index
 I want symbol queries to cost about what they return, not what the index holds
 So that `symbols '*handler*'` and `symbols 'get*'` answer interactively.
