@@ -141,7 +141,7 @@ MG_SCALE_TOKENS=10000000 cargo test --release -p graph-cli --test cluster_e2e me
 
 ### Re-run on a mostly idle machine (issue #123) [M]
 
-Date 2026-10-12. Same machine, `origin/main` at `0e66092`, `MG_SCALE_TOKENS=10000000`, three back-to-back runs. No `cargo` build or other benchmark ran alongside. The generated tree is unchanged (41,728,360 B, 10,811 files), and the store indexes it as 9,877,116 tokens in 539,504,640 B.
+Date 2026-10-12. Same machine, `origin/main` at `0e66092`, `MG_SCALE_TOKENS=10000000`, three back-to-back runs. No `cargo` build or other benchmark ran alongside. The generated tree is unchanged (41,728,360 B, 10,811 files), and the store indexes it as 9,877,116 tokens in 539,504,640 B. Both this count and the 10,006,836 above are the stored token count that the harness reads back from the index, not a count from the generator. The bytes and files match exactly, so the tree is the same. The 1.3% difference comes from tokenizer and extractor changes merged between the two runs. I did not bisect which change caused it.
 
 | run | embedded ingest | 1-node (share) | 3-node via the leader (share; trigger < 50%) |
 |---|---:|---:|---:|
@@ -151,7 +151,7 @@ Date 2026-10-12. Same machine, `origin/main` at `0e66092`, `MG_SCALE_TOKENS=1000
 
 The share is computed by the harness against the same run's embedded ingest. For runs 1 and 2, only the summary line was kept. Run 3 also measured: snapshot build 4.6 s, learner install 1.1 s, and a worst RPC overhead p50 of 0.36 ms.
 
-The result is 72-74% on three nodes and 78% on one, which matches the 71-81% measured on an idle machine on 2026-09-28. The 43% run did not reproduce. D5 is not tripped. The trigger is judged on an idle, dedicated machine, which is the spike's method. A run that shares its one disk with a concurrent build measures that contention, not replication. No code change was made. Measuring on separate disks or machines is still worth doing when that hardware is available. It would remove the shared-disk worst case, but it is not needed to clear the trigger.
+The result is 72-74% on three nodes and 78% on one, which matches the 71-81% measured on an idle machine on 2026-09-28. The 43% run did not reproduce. D5 is not tripped. The trigger is judged on an idle, dedicated machine, which is the spike's method. A run that shares its one disk with a concurrent build measures that contention, not replication. No code change was made. Measuring on separate disks or machines, and profiling where the three-node gap grows with size, are tracked in issue #319. They are still worth doing when that hardware is available. It would remove the shared-disk worst case, but it is not needed to clear the trigger.
 
 ### Soak (60 minutes) [M]
 
