@@ -118,3 +118,5 @@ yaml-rust2 = "0.10"
 # (scripts/check-no-c-deps.py) stays clean; test_gate.py checks ring.
 rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 tokio.workspace = true
+# otel_logs: a raw call without a token, to drive an auth refusal.
+tonic.workspace = true

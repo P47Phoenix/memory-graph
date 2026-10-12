@@ -122,6 +122,26 @@ fn failures_are_counted_never_block_and_never_export_themselves() {
         log_burst("restarted", 1);
         bodies(&collector).iter().any(|b| b == "restarted")
     });
+    // The exporter's own transport (its gRPC client, on the exporter's
+    // threads) never feeds back. (The fake collector's server-side h2
+    // events, on its own threads, may legitimately be exported.)
+    const CLIENT_TRANSPORT: [&str; 4] = [
+        "hyper_util::client",
+        "tower::buffer",
+        "tonic::transport::channel",
+        "h2::client",
+    ];
+    let records = collector.received().log_records();
+    assert!(
+        records
+            .iter()
+            .all(|r| !CLIENT_TRANSPORT.iter().any(|p| r.scope.starts_with(p))),
+        "{:#?}",
+        records
+            .iter()
+            .filter(|r| CLIENT_TRANSPORT.iter().any(|p| r.scope.starts_with(p)))
+            .collect::<Vec<_>>()
+    );
     g.shutdown_blocking();
 
     // Shutdown flushes what is queued to a responsive collector (a long

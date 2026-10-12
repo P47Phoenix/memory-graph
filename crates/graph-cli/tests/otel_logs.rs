@@ -124,13 +124,45 @@ fn records_carry_mapped_severity_allowed_fields_and_the_spans_ids() {
             .unwrap();
         let _ = c.search(&graph_store::Query::new(SENTINEL));
     }
+    // A real auth refusal: its event carries the client's address (`peer`),
+    // which must stay local (D9).
+    let fixture = graph_server::testing::auth::AuthFixture::new();
+    let d2 = tempfile::tempdir().unwrap();
+    let auth_srv = TestServer::start_with(
+        &d2.path().join("g.redb"),
+        graph_cli::shipped_extractors(),
+        |c| c.auth = fixture.config(),
+    );
+    {
+        // A raw call without a token (the client would stop at Hello).
+        let ep = format!("http://{}", auth_srv.endpoint());
+        let code = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let ch = tonic::transport::Endpoint::from_shared(ep)
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+                graph_proto::pb::store_client::StoreClient::new(ch)
+                    .count_nodes(graph_proto::pb::CountNodesRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code()
+            });
+        assert_eq!(code, tonic::Code::Unauthenticated);
+    }
     tracing::info!(target: "graph_server::t53", "last");
 
     let until = Instant::now() + WAIT;
     let logs = loop {
         guard.logger_provider().unwrap().force_flush().unwrap();
         let logs = collector.received().log_records();
-        if logs.iter().any(|r| r.body == "last") {
+        if logs.iter().any(|r| r.body == "last")
+            && logs.iter().any(|r| r.body == "auth: call refused")
+        {
             break logs;
         }
         assert!(Instant::now() < until, "records never arrived");
@@ -152,7 +184,25 @@ fn records_carry_mapped_severity_allowed_fields_and_the_spans_ids() {
     let o = record(&logs, "outside");
     assert_eq!((o.severity_number, o.severity_text.as_str()), (9, "INFO"));
     assert_eq!(o.attributes.keys().collect::<Vec<_>>(), ["count"]);
+    let refusal = logs
+        .iter()
+        .find(|r| r.body == "auth: call refused")
+        .expect("the refusal was exported");
+    assert!(!refusal.attributes.contains_key("peer"), "{refusal:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["message"] == "auth: call refused" && l.get("peer").is_some()),
+        "the address stays in the local log"
+    );
     for r in &logs {
+        // No address (the client's, or a server's) and no path.
+        assert!(
+            !r.all_text
+                .iter()
+                .any(|t| t.contains("127.0.0.1") || t.contains(&*d.path().to_string_lossy())),
+            "{r:?}"
+        );
         assert!(
             r.attributes
                 .keys()

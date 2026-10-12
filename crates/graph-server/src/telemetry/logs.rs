@@ -27,8 +27,11 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 /// Event fields exported as OTLP log attributes: operational values only
-/// (names, outcomes, ids, counts, sizes, durations, log indexes). Anything
-/// else (errors, paths, queries, addresses) stays in local logs.
+/// (names, outcomes, numeric ids, counts, sizes, durations, log indexes).
+/// Anything else (errors, paths, queries, addresses) stays in local logs.
+/// `peer`, `from`, `to` and `leader` are deliberately absent: call sites
+/// use them for client addresses, member addresses and paths (D9). A field
+/// added here must carry only such values at every call site.
 pub const ALLOWED_LOG_FIELDS: &[&str] = &[
     "method",
     "rpc",
@@ -40,12 +43,8 @@ pub const ALLOWED_LOG_FIELDS: &[&str] = &[
     "role",
     "node",
     "node_id",
-    "peer",
     "peer_id",
-    "leader",
     "leader_id",
-    "from",
-    "to",
     "term",
     "index",
     "last",
@@ -85,7 +84,11 @@ pub fn bridged(m: &Metadata<'_>) -> bool {
 fn bridged_parts(is_event: bool, target: &str, thread: &str) -> bool {
     is_event
         && !target.starts_with("opentelemetry")
+        && !target.starts_with("tracing_opentelemetry")
         && !thread.starts_with(EXPORTER_THREAD)
+        // The SDK 0.33 batch processors' thread names
+        // ("OpenTelemetry.Logs.BatchProcessor", ".Traces."); re-check on an
+        // SDK upgrade (the test below pins the name).
         && !thread.starts_with("OpenTelemetry")
 }
 
@@ -121,7 +124,10 @@ pub fn current_trace_ids() -> Option<(String, String)> {
 
 /// Drops every attribute not in [`ALLOWED_LOG_FIELDS`] before the record
 /// goes further (D9). The SDK record has no way to remove an attribute,
-/// so a filtered record is rebuilt from a blank one.
+/// so a filtered record is rebuilt from a blank one. The rebuild copies
+/// every field `SdkLogRecord` has in SDK 0.33 (pinned exactly); a new
+/// field in a later SDK must be added here, which the unit test below
+/// checks field by field.
 #[derive(Debug)]
 pub(crate) struct AllowListLogProcessor<P> {
     pub(crate) inner: P,
@@ -271,6 +277,33 @@ mod tests {
         );
     }
 
+    /// The rebuild loses nothing but the stripped attributes: compared with
+    /// `PartialEq`, which covers every field of the SDK's record, so a
+    /// field a later SDK adds and the rebuild misses fails here.
+    #[test]
+    fn the_rebuild_equals_the_record_without_the_stripped_fields() {
+        let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder().build();
+        let mut want = provider.logger("t").create_log_record();
+        want.set_target("graph_server::x");
+        want.set_event_name("ev");
+        want.set_timestamp(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(5));
+        want.set_observed_timestamp(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(6));
+        want.set_severity_number(Severity::Info);
+        want.set_severity_text("INFO");
+        want.set_body(AnyValue::from("m"));
+        want.set_trace_context(
+            opentelemetry::trace::TraceId::from_bytes(1u128.to_be_bytes()),
+            opentelemetry::trace::SpanId::from_bytes(2u64.to_be_bytes()),
+            Some(opentelemetry::trace::TraceFlags::SAMPLED),
+        );
+        want.add_attribute("count", 1i64);
+        let mut got = want.clone();
+        got.add_attribute("peer", "10.0.0.1:5");
+        let p = AllowListLogProcessor::new(Keep::default());
+        p.filter(&mut got);
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn the_bridge_skips_opentelemetry_targets_and_exporter_threads() {
         assert!(bridged_parts(true, "graph_server::raft", "main"));
@@ -283,6 +316,7 @@ mod tests {
             "h2::proto",
             "OpenTelemetry.Logs.BatchProcessor"
         ));
+        assert!(!bridged_parts(true, "tracing_opentelemetry::layer", "main"));
         assert!(!bridged_parts(false, "graph_server::raft", "main"));
     }
 
