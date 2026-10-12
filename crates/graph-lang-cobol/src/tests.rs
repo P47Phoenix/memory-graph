@@ -677,7 +677,7 @@ fn keywords_in_a_fixed_format_program() {
     );
     assert!(CobolExtractor
         .version()
-        .starts_with("cobol-scan-1+kw1+dw3+tok"));
+        .starts_with("cobol-scan-1+kw1+dw4+tok"));
 }
 
 /// A fixed sample of the list (so dropping a word from `KEYWORDS` fails).
@@ -697,4 +697,147 @@ fn sample_keywords_are_listed_and_classed() {
         assert_eq!(classes_of(&toks, w), [TokenClass::Keyword], "{w}");
     }
     assert_eq!(KEYWORDS.len(), 89);
+}
+
+// Issue #285: all-digit names, continuation lines, tab-indented Area A.
+
+#[test]
+fn all_digit_sections_and_paragraphs() {
+    let src = "       PROCEDURE DIVISION.\n       100 SECTION.\n       200.\n           DISPLAY 1.\n       300 SECTION 50.\n       400.\n           STOP RUN.\n";
+    let s = syms(src);
+    for n in ["100", "200", "300", "400"] {
+        find(&s, n);
+    }
+    assert_eq!(find(&s, "100").2, "section");
+    assert_eq!(find(&s, "200").2, "paragraph");
+    assert!(contains(&s, "100", "200"));
+    assert!(contains(&s, "300", "400"));
+    let t = token_texts(src);
+    assert!(
+        t.contains(&("200".to_string(), TokenClass::Identifier)),
+        "{t:?}"
+    );
+    // Free format.
+    let free = ">>SOURCE FREE\nPROCEDURE DIVISION.\n100 SECTION.\n200.\n  DISPLAY 1.\n";
+    let s = syms(free);
+    assert_eq!(find(&s, "100").2, "section");
+    assert_eq!(find(&s, "200").2, "paragraph");
+}
+
+#[test]
+fn all_digit_numbers_outside_headers_stay_literals() {
+    for (src, word) in [
+        // Area B.
+        (
+            "       PROCEDURE DIVISION.\n       P.\n           100.\n",
+            "100",
+        ),
+        // Not at a sentence start.
+        (
+            "       PROCEDURE DIVISION.\n       P. MOVE 1 TO X\n       200.\n",
+            "200",
+        ),
+        // Data division: a PIC with an inner period.
+        (
+            "       DATA DIVISION.\n       01 A PIC 9.\n       99.\n",
+            "99",
+        ),
+    ] {
+        let t = token_texts(src);
+        let class = t.iter().find(|(s, _)| s == word).map(|(_, c)| *c);
+        assert_eq!(class, Some(TokenClass::Literal), "{src:?}: {t:?}");
+        assert!(!names(&syms(src)).contains(&word), "{src:?}");
+    }
+}
+
+#[test]
+fn continued_words_are_joined() {
+    // A section name and the SECTION keyword continued on `-` lines.
+    let src = "       PROCEDURE DIVISION.\n       MAIN-SEC\n      -    TION SEC\n      -    TION.\n       PARA-ON\n      -    E.\n           DISPLAY 'A'.\n";
+    let ex = CobolExtractor.extract(src);
+    assert_nested(&ex);
+    let s = syms(src);
+    let sec = find(&s, "MAIN-SECTION");
+    assert_eq!(sec.2, "section");
+    assert!(sec.3.starts_with("MAIN-SEC\n      -    TION SEC"));
+    assert_eq!(find(&s, "PARA-ONE").2, "paragraph");
+    assert!(contains(&s, "MAIN-SECTION", "PARA-ONE"));
+    // The indicator is layout (a Comment); every token is exact.
+    let toks = tokenize(src, false);
+    let dash: Vec<_> = toks.iter().filter(|t| t.span.start_col == 7).collect();
+    assert_eq!(dash.len(), 3);
+    assert!(dash
+        .iter()
+        .all(|t| t.text == "-" && t.class == TokenClass::Comment));
+    // A continued literal is not a name.
+    let lit = "       PROCEDURE DIVISION.\n       P.\n           DISPLAY 'AB\n      -    'CD'.\n";
+    assert_eq!(names(&syms(lit)), ["PROCEDURE", "P"]);
+}
+
+#[test]
+fn tab_indented_area_a() {
+    // A tab in the sequence area runs to column 9 (Area A), two to 17 (Area B).
+    let src = "\tIDENTIFICATION DIVISION.\n\tPROGRAM-ID. T.\n\tPROCEDURE DIVISION.\n\tMAIN SECTION.\n\tPARA.\n\t\tDISPLAY 'x'. *> note\n\t\tNOT-A-PARA.\n000100\tP2.\n\t100.\n\t\tSTOP RUN.\n";
+    let ex = CobolExtractor.extract(src);
+    assert_nested(&ex);
+    let s = syms(src);
+    assert_eq!(find(&s, "T").2, "program");
+    assert_eq!(find(&s, "MAIN").2, "section");
+    assert_eq!(find(&s, "PARA").2, "paragraph");
+    assert_eq!(find(&s, "P2").2, "paragraph");
+    assert_eq!(find(&s, "100").2, "paragraph");
+    assert!(!names(&s).contains(&"NOT-A-PARA"));
+    assert!(contains(&s, "MAIN", "PARA"));
+    let toks = tokenize(src, false);
+    let main = toks.iter().find(|t| t.text == "MAIN").unwrap();
+    assert_eq!((main.span.start_line, main.span.start_col), (4, 2));
+    assert_eq!(main.class, TokenClass::Identifier);
+    assert!(toks
+        .iter()
+        .any(|t| t.text == "*> note" && t.class == TokenClass::Comment));
+    assert!(toks
+        .iter()
+        .any(|t| t.text == "000100" && t.class == TokenClass::Comment));
+}
+
+/// Line and column (1-based, a BOM taking none) of byte `p`.
+fn line_col(src: &str, p: usize) -> (u32, u32) {
+    let before = &src[..p];
+    let line = before.matches('\n').count() as u32 + 1;
+    let ls = before.rfind('\n').map_or(0, |i| i + 1);
+    let col = 1 + src[ls..p].chars().filter(|&c| c != '\u{feff}').count() as u32;
+    (line, col)
+}
+
+proptest! {
+    /// Tabs, continuation lines and all-digit words keep every token exact:
+    /// text, byte range, line and column, in order and disjoint.
+    #[test]
+    fn tabs_and_continuations_keep_exact_spans(
+        parts in proptest::collection::vec(prop_oneof![
+            Just("\t"), Just("      -    "), Just("100"), Just(" SECTION"), Just("."),
+            Just("A-B"), Just("\n"), Just("\r\n"), Just("       "), Just("000100"),
+            Just("'x"), Just("*> c"), Just("é"), Just("\u{feff}"), Just(" "),
+            Just("PROCEDURE DIVISION"),
+            Just("                                                  "),
+        ], 0..40),
+        free in any::<bool>(),
+    ) {
+        let src: String = parts.concat();
+        let mut prev_end = 0;
+        for t in tokenize(&src, free) {
+            let (a, b) = (t.span.start as usize, t.span.end as usize);
+            prop_assert_eq!(&src[a..b], t.text.as_str());
+            prop_assert!(a >= prev_end, "overlap at {:?}", t.span);
+            prop_assert_eq!((t.span.start_line, t.span.start_col), line_col(&src, a));
+            prop_assert_eq!((t.span.end_line, t.span.end_col), line_col(&src, b));
+            prev_end = b;
+        }
+        let ex = CobolExtractor.extract(&src);
+        assert_nested(&ex);
+        for s in &ex.symbols {
+            prop_assert!(src.is_char_boundary(s.span.start as usize));
+            prop_assert!(src.is_char_boundary(s.span.end as usize));
+        }
+    }
 }
