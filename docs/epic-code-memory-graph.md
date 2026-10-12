@@ -759,7 +759,7 @@ Design: [ADR 0009](adr/0009-opentelemetry.md) D7, D8 and D9.
 
 <a id="story-54"></a>
 **54. OpenTelemetry compose demo, CI, overhead numbers and docs (3 pts)**
-Status: Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals.
+Status: Delivered in PR #314 (the otel profile has a CI step, `deploy/compose/check-otel.sh` as the last step of the Compose CI job on its already-built image and CLI; it measured 45 s locally including `up` and `down`, under the 2-minute bound of ADR 0009 open question 7). Accepted ([ADR 0009](adr/0009-opentelemetry.md), Accepted by the owner on 2026-10-09). Counted in the totals.
 As an operator trying OpenTelemetry for the first time
 I want a working compose recipe, measured overhead and a guide
 So that I can see traces, metrics and logs in minutes and know what they cost and how to run a collector with TLS.

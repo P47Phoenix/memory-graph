@@ -1,0 +1,39 @@
+# The OpenTelemetry Collector of the `otel` compose profile (ADR 0009,
+# epic story 54). The nodes export OTLP/gRPC in plain text to :4317 on the
+# compose network; the collector prints every signal with the debug
+# exporter (`docker compose ... logs otel-collector`) and forwards traces to
+# Jaeger. A collector that talks to a backend over TLS is in
+# docs/guide/observability.md ("A collector with TLS").
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  # `detailed` prints each resource's attributes (service.instance.id is
+  # the node id), which is what check-otel.sh reads.
+  debug:
+    verbosity: detailed
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

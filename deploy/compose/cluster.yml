@@ -21,6 +21,15 @@
 # network (published on 9101-9103). Host ports: MG_GRPC_PORT_<n> and
 # MG_METRICS_PORT_<n> override 700<n> / 910<n>; check.sh uses its own project
 # name and ports, so it never touches a cluster started from this file.
+#
+# OpenTelemetry demo (ADR 0009, epic story 54): the `otel` profile adds an
+# OpenTelemetry Collector (debug exporter: traces, metrics and logs in its
+# log) and Jaeger (traces, UI on 16686). The nodes export only when
+# MG_OTLP_ENDPOINT is set:
+#   MG_OTLP_ENDPOINT=http://otel-collector:4317 MG_OTLP_METRICS_INTERVAL=10s \
+#     docker compose -f deploy/compose/cluster.yml --profile otel up -d --wait
+#   docker compose -f deploy/compose/cluster.yml logs -f otel-collector
+# deploy/compose/check-otel.sh is the CI check of this profile.
 name: memory-graph
 
 x-node: &node
@@ -62,6 +71,12 @@ services:
       # the volume, at least 2 GiB.
       - --min-free-disk
       - 512M
+      # OpenTelemetry: off unless MG_OTLP_ENDPOINT is set (an empty endpoint
+      # is the same as none); see the `otel` profile below.
+      - --otlp-endpoint
+      - ${MG_OTLP_ENDPOINT:-}
+      - --otlp-metrics-interval
+      - ${MG_OTLP_METRICS_INTERVAL:-60s}
     ports:
       - "${MG_GRPC_PORT_1:-7001}:7000"
       - "${MG_METRICS_PORT_1:-9101}:9100"
@@ -90,6 +105,12 @@ services:
       - json
       - --min-free-disk
       - 512M
+      # OpenTelemetry: off unless MG_OTLP_ENDPOINT is set (an empty endpoint
+      # is the same as none); see the `otel` profile below.
+      - --otlp-endpoint
+      - ${MG_OTLP_ENDPOINT:-}
+      - --otlp-metrics-interval
+      - ${MG_OTLP_METRICS_INTERVAL:-60s}
     ports:
       - "${MG_GRPC_PORT_2:-7002}:7000"
       - "${MG_METRICS_PORT_2:-9102}:9100"
@@ -121,6 +142,12 @@ services:
       - json
       - --min-free-disk
       - 512M
+      # OpenTelemetry: off unless MG_OTLP_ENDPOINT is set (an empty endpoint
+      # is the same as none); see the `otel` profile below.
+      - --otlp-endpoint
+      - ${MG_OTLP_ENDPOINT:-}
+      - --otlp-metrics-interval
+      - ${MG_OTLP_METRICS_INTERVAL:-60s}
     ports:
       - "${MG_GRPC_PORT_3:-7003}:7000"
       - "${MG_METRICS_PORT_3:-9103}:9100"
@@ -129,6 +156,23 @@ services:
     depends_on:
       node1:
         condition: service_healthy
+
+  # The `otel` profile (see the header). Pinned images; the collector's
+  # config is otel-collector.yaml next to this file.
+  otel-collector:
+    image: otel/opentelemetry-collector:0.120.0
+    profiles: [otel]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/jaeger:2.3.0
+    profiles: [otel]
+    ports:
+      - "${MG_JAEGER_UI_PORT:-16686}:16686"
 
 volumes:
   node1-data:

@@ -69,3 +69,34 @@ Remote latency in milliseconds; the embedded columns of the same runs agree with
   - A small write costs about 0.5 ms more at p50 (about 11%). That covers more spans per write (`client`, `rpc`, `apply`, the link), not hashing. This is a single run with the processes sharing one machine, so treat it as an upper estimate. [M]
   - With traces off, `ApplyLinks` costs one atomic load per apply and nothing at propose. [E: from the code]
   - A 4 MiB index chunk pays about 1.1 ms of hashing on the leader with traces on. That is small next to the chunk's own apply. [E: hash time times two]
+
+## OpenTelemetry: all three signals on versus off (epic story 54)
+
+Date 2026-10-12, the same machine as above (AMD Ryzen 9 7950X, 63 GB RAM, NVMe, Windows 11 Pro 10.0.26200), `--release`, other programs running, warm page cache. [M]
+
+- **Method.** The story 51 harness with one addition: `--otlp-signals traces,metrics,logs` (implies `--otlp`) also gives the in-process server the OTLP metrics pipeline (`--otlp-metrics-interval` 5 s) and puts the OTLP log bridge, at INFO like `serve`'s default, in the bench's subscriber. Three configurations, each run three times, interleaved (off, traces, all; off, traces, all; ...), each on a fresh copy of the same corpus database (16 MB) with its Raft sidecars removed. The table gives the median of the three runs' p50 and p95. Total wall time: about 2 minutes.
+
+```sh
+cargo run --release -p graph-client --example rpc_bench -- x.redb --iters 1000 --rare Subscribe --common public --writes 200
+cargo run --release -p graph-client --example rpc_bench -- x.redb --iters 1000 --rare Subscribe --common public --writes 200 --otlp
+cargo run --release -p graph-client --example rpc_bench -- x.redb --iters 1000 --rare Subscribe --common public --writes 200 --otlp-signals traces,metrics,logs
+```
+
+Remote latency in milliseconds. [M]
+
+| operation | off p50 | off p95 | traces p50 | traces p95 | all three p50 | all three p95 | all - off p50 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ping (Health.Check) | 0.066 | 0.101 | 0.082 | 0.125 | 0.084 | 0.121 | 0.018 |
+| describe | 0.487 | 0.687 | 0.515 | 0.690 | 0.515 | 0.684 | 0.028 |
+| search rare (19 hits) | 0.265 | 0.387 | 0.306 | 0.473 | 0.279 | 0.338 | 0.014 |
+| search rare, limit 1000 | 0.266 | 0.376 | 0.291 | 0.401 | 0.308 | 0.481 | 0.042 |
+| search common, limit 100 | 0.969 | 1.509 | 0.882 | 1.369 | 0.926 | 1.361 | -0.043 |
+| write (index_bytes) | 4.461 | 6.292 | 4.419 | 5.113 | 4.856 | 6.796 | 0.395 |
+
+- Each "on" run exported 11,663 spans; the "all three" runs also exported 61 log records and 35 metrics in 2 metric exports (one on the 5 s interval, one forced while the server was still up; `rpc_bench` collects before it stops the server, otherwise only the two synchronous histograms would get out). The remote phase lasts about 6 s, so the per-interval snapshot collection ran about twice per run; in `serve` it runs once per interval (60 s by default), off the request path, and opens no redb transaction (story 52). [M]
+- An earlier set of the same nine runs, before the forced collection (so with only the two histograms exported), measured all - off at p50: ping +0.021, describe +0.011, rare +0.030, rare limit 1000 +0.023, common +0.012, write -0.137 ms. The set above ran with more load on the machine (look at its p95s); the two sets differ by about as much as the configurations do. [M]
+- **Verdict.**
+  - Reads: all three signals cost about 0.01 to 0.04 ms at p50 over off, the same as traces alone, and within the noise between runs. Logs add nothing measurable to reads: `serve` logs RPCs at DEBUG, so at the INFO default a read emits no log record (61 records over 6,000 reads and 200 writes). [M]
+  - Writes: between -0.14 and +0.4 ms at p50 across the two sets, that is, within run-to-run noise on this machine (story 51's single run measured +0.5 ms for traces). Treat 0.5 ms (about 10%) as the upper estimate for a small write. [M]
+  - With OpenTelemetry off nothing is built (story 50), so "off" is the cost of the code paths that check it. [E: from the code]
+- **CI cost of the compose demo.** `deploy/compose/check-otel.sh`, run after `check.sh` on the same image: 45 s wall time on this machine, including `up --wait` and `down -v`. [M]

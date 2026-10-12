@@ -65,6 +65,63 @@ With `--otlp-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) and `metrics` among `-
 
 Spans and log records wait in a bounded batch queue (2,048 by default, `OTEL_BSP_MAX_QUEUE_SIZE` / `OTEL_BLRP_MAX_QUEUE_SIZE`). When it is full, new items are dropped and counted in `mg_otel_dropped_total`, never waited for. Items still queued when a shutdown times out are counted as dropped too. Both `mg_otel_*` counters are **process-wide**, like the `mg_read_*` ones: several servers sharing one process (as in tests) report the same totals.
 
+## OpenTelemetry
+
+`serve` can export traces, metrics and logs over OTLP/gRPC to an OpenTelemetry Collector ([ADR 0009](../adr/0009-opentelemetry.md)). It is off by default and costs nothing when off. To try it in minutes, run the Compose demo ([`otel` profile](../deploy/compose.md#opentelemetry-demo-the-otel-profile)): a three-node cluster, a collector printing all three signals, and Jaeger.
+
+**Enabling.** An endpoint from any source turns it on: `serve --otlp-endpoint http://collector:4317`. `--otlp-signals` only narrows what is sent (default `traces,metrics,logs`). An empty endpoint is the same as none. An endpoint that is valid but unreachable is not an error: `serve` starts, and the failed exports are counted (below). Only `serve` exports; other commands never do.
+
+| Flag (`serve`) | Config key | Environment | Default |
+|---|---|---|---|
+| `--otlp-endpoint <url>` | `otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset: off |
+| `--otlp-signals <list>` | `otlp-signals` | none | all three |
+| `--otel-service-name <name>` | `otel-service-name` | `OTEL_SERVICE_NAME` | `memory-graph` |
+| `--otlp-metrics-interval <duration>` | `otlp-metrics-interval` | none | `60s` |
+| none | none | `OTEL_EXPORTER_OTLP_TIMEOUT` | 10 s |
+| none | none | `OTEL_EXPORTER_OTLP_HEADERS` (auth headers; never logged or exported) | none |
+| none | none | `OTEL_RESOURCE_ATTRIBUTES` | none |
+| none | none | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | parent-based, always on |
+| none | none | `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_QUEUE_SIZE` | 2,048 |
+| none | none | `OTEL_SDK_DISABLED=true` | false |
+
+- **Precedence:** the flag, then the config key, then the environment. `OTEL_SDK_DISABLED=true` turns everything off, whatever else is set.
+- **Not supported:** an `https://` endpoint, per-signal endpoints (`OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT`), and `OTEL_EXPORTER_OTLP_PROTOCOL` other than `grpc` (no OTLP over HTTP). An `https://` endpoint from the flag or config key refuses to start with exit code 7 (`TELEMETRY_CONFIG`). Any of them from the environment logs one error and starts with OpenTelemetry off, so an injected variable cannot crash-loop `serve`.
+- **Resource attributes:** `service.name` (the precedence above, then `service.name` in `OTEL_RESOURCE_ATTRIBUTES`), `service.version`, `host.name`, `service.instance.id` (the Raft node id) and `memory_graph.cluster` (the cluster id). `OTEL_RESOURCE_ATTRIBUTES` can add attributes but cannot override the node id, the cluster id or the version.
+- **Signals and trace scope:** see [Traces](#traces-opentelemetry) (one trace per request across nodes; Raft heartbeats, AppendEntries and follower applies are not traced), [Metrics over OTLP](#metrics-over-otlp) and [Logs](#logs-opentelemetry).
+- **Metric names:** every `/metrics` family has one OTel-named twin (`mg_raft_term` is `memory_graph.raft.term`, `mg_rpc_duration_seconds` is `rpc.server.call.duration`, and so on), except `mg_rpc_total`, which is the count of `rpc.server.call.duration`. The full table is [ADR 0009 D6](../adr/0009-opentelemetry.md#d6-metrics).
+- **Privacy:** span attributes and log fields come from an allow-list of operational values (rpc and method names, outcomes, status codes, node ids, counts, sizes, durations, log indexes). Query text, MCP tool arguments, source and token text, repo and file paths and header values are never exported. The one client-identifying value is the `peer` attribute on `rpc` spans (the client's address); drop or hash it in the collector if it must not be stored.
+- **Failure behaviour:** a collector that is down, slow or stalled never blocks or fails an RPC, a Raft step or an index batch. Spans and log records wait in a bounded queue; when it is full, new items are dropped, never waited for. Failed or timed-out exports count in `mg_otel_export_failures_total{signal}` and their items, plus the queue-full drops (the gap ADR 0009 D8 first left open, closed by story 52), in `mg_otel_dropped_total{signal}`, both on `/metrics`. Export errors are logged at most once a minute per signal, export resumes by itself when the collector is back, and shutdown flushes what is queued within a bound whether or not the collector answers.
+- **Cost:** traces on add about 0.01 to 0.03 ms to a read at p50 on loopback, all three signals about 0.01 to 0.04 ms, within run-to-run noise; see [rpc-overhead.md](../spikes/rpc-overhead.md#opentelemetry-all-three-signals-on-versus-off-epic-story-54).
+
+### A collector with TLS
+
+`serve` exports plain-text gRPC only, so TLS and auth belong to a collector next to the node (a sidecar, or one per host) that receives on a local port and sends on over TLS (#104):
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317     # local only: the node exports here in plain text
+processors:
+  batch: {}
+exporters:
+  otlp:
+    endpoint: otel.example.com:4317  # the backend, over TLS
+    tls:
+      ca_file: /etc/otelcol/ca.pem   # omit to use the system roots
+      # cert_file / key_file for mutual TLS
+    headers:
+      authorization: ${env:OTLP_AUTH} # the secret stays in the collector's environment
+service:
+  pipelines:
+    traces:  { receivers: [otlp], processors: [batch], exporters: [otlp] }
+    metrics: { receivers: [otlp], processors: [batch], exporters: [otlp] }
+    logs:    { receivers: [otlp], processors: [batch], exporters: [otlp] }
+```
+
+and `serve --otlp-endpoint http://127.0.0.1:4317`. On Kubernetes, put the collector in the pod as a sidecar and keep the receiver on `127.0.0.1`.
+
 ## Traces (OpenTelemetry)
 
 Off by default ([ADR 0009](../adr/0009-opentelemetry.md)). `serve --otlp-endpoint http://HOST:4317` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) exports spans over OTLP/gRPC, without TLS, to a collector next to the node; `--otlp-signals traces` narrows the export to traces. Sampling is parent-based, always on, unless `OTEL_TRACES_SAMPLER` says otherwise.
