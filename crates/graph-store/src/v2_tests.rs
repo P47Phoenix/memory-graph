@@ -95,13 +95,16 @@ pub(crate) fn span_ext(
 }
 
 /// Two empty stores in different configurations: `a` with the defaults,
-/// `b` committing one file per chunk with a small cache. Query-visible
+/// `b` committing one file per chunk with a small cache and no symbol name
+/// cache. Query-visible
 /// behaviour must not depend on either setting (`run_differential`).
 pub(crate) fn two_configs() -> (tempfile::TempDir, Box<dyn Store>, Box<dyn Store>) {
     let d = tempfile::tempdir().unwrap();
     let a = open_store(&d.path().join("a.redb"), vec![]).unwrap();
     let mut b = V2Store::open_with_cache_bytes(d.path().join("b.redb"), Some(1 << 20)).unwrap();
     b.set_chunk_bytes(1);
+    // Epic story 70: `b` never caches symbol names, `a` does.
+    b.set_name_cache_max_bytes(0);
     (d, a, Box::new(b))
 }
 
@@ -2095,4 +2098,84 @@ fn token_grain_limit_stops_the_walk_early() {
     assert_eq!(walked(Grain::Token, Some(2), Some(3)), (3, 5));
     assert_eq!(walked(Grain::Token, None, None), (50, 50));
     assert_eq!(walked(Grain::Symbol, None, Some(1)), (1, 50));
+}
+
+/// Epic story 70: infix and suffix answers are the same with the name
+/// cache on, off and evicted, in both case modes, before and after writes,
+/// and from a snapshot taken before a write (which must not see the
+/// cache built after it).
+#[test]
+fn name_cache_answers_equal_the_walk() {
+    let d = tempfile::tempdir().unwrap();
+    let on = V2Store::open(d.path().join("on.redb")).unwrap();
+    let off = V2Store::open(d.path().join("off.redb")).unwrap();
+    off.set_name_cache_max_bytes(0);
+    let ingest = |s: &V2Store, path: &str, names: &[&str]| {
+        let syms: Vec<(&str, SymbolKind, u32, u32)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, SymbolKind::Function, i as u32 * 2, i as u32 * 2 + 1))
+            .collect();
+        s.ingest_file("o", "r", path, "text", &span_ext(&syms, &[]))
+            .unwrap();
+    };
+    let rows = |s: &dyn StoreRead, p: &str, exact: bool| {
+        let mut q = SymbolQuery::new(p);
+        q.exact_case = exact;
+        s.search_symbols(&q)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.file, h.name, h.span))
+            .collect::<Vec<_>>()
+    };
+    let patterns = ["*get*", "*Get*", "*dget", "*é*", "*ab*", "*zz*", "*et"];
+    let check = |what: &str| {
+        for p in patterns {
+            for exact in [false, true] {
+                // Twice: the first may build the cache, the second uses it.
+                let want = rows(&off, p, exact);
+                assert_eq!(rows(&on, p, exact), want, "{what}: {p} exact={exact}");
+                assert_eq!(rows(&on, p, exact), want, "{what}: {p} exact={exact}");
+            }
+        }
+    };
+    for s in [&on, &off] {
+        ingest(s, "a.x", &["Gadget", "getWidget", "abab", "éclair", "Get"]);
+        ingest(s, "b.x", &["budget", "ab", "GETTER"]);
+    }
+    check("ingest");
+    let (fold, exact) = on.name_cache_bytes();
+    assert!(fold > 0 && exact > 0, "the cache was built: {fold} {exact}");
+    assert_eq!(off.name_cache_bytes(), (0, 0));
+
+    // A snapshot before a write keeps its own view, cached or not.
+    let snap = on.snapshot_owned().unwrap();
+    let before = rows(&snap, "*get*", false);
+    for s in [&on, &off] {
+        ingest(s, "a.x", &["Sprocket", "zzTop"]);
+        ingest(s, "c.x", &["forget"]);
+    }
+    check("replace");
+    assert_eq!(rows(&snap, "*get*", false), before);
+    assert_eq!(rows(&snap, "*get*", false), before);
+    assert_ne!(rows(&on, "*get*", false), before);
+    drop(snap);
+
+    for s in [&on, &off] {
+        let ext = span_ext(&[("tmpBudget", SymbolKind::Function, 0, 1)], &[]);
+        s.ingest_file_with_origin("o", "r", "d.x", "text", &ext, Some(crate::ORIGIN_DIRECTORY))
+            .unwrap();
+    }
+    check("directory file");
+    for s in [&on, &off] {
+        let keep = std::collections::HashSet::new();
+        assert_eq!(s.prune_files("o", "r", &keep, false).unwrap(), ["d.x"]);
+        s.vacuum().unwrap();
+    }
+    check("prune and vacuum");
+    // A bound below the cache's size evicts it; answers stay the same.
+    on.set_name_cache_max_bytes(1);
+    assert_eq!(on.name_cache_bytes(), (0, 0));
+    check("evicted");
+    assert_eq!(on.name_cache_bytes(), (0, 0));
 }

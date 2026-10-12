@@ -211,7 +211,7 @@ The setup is unchanged: embedded, limit 50, offset 0, 10 warm-ups, 200 timed run
 - **Rare** (1-5 matching names), **mid-frequency** (about 100 to a few thousand matching names) and **absent** needles: p95 <= 50 ms.
   - Pinned mid needles: `handler` and `serializ`.
   - Pinned absent needle: `xyzzyq`.
-  - The rare needle was not measured in #298. Story 70 picks one with 1-5 matching names on A5 and pins it here.
+  - Pinned rare needle (story 70): `dijkstra`, 4 matching folded names on A5 (`dijkstra`, `dijkstraall`, `priorityqueue_dijkstrasmoketest`, `rundijkstra`).
 - **Common** needles: p95 <= 3x the matching prefix query (`*get*` against `get*`), in the same case mode.
   - Pinned common needle: `get`.
 - The CI regression check (`*get*` within 10x of `get*` on the vendored corpus) is unchanged.
@@ -223,6 +223,37 @@ The setup is unchanged: embedded, limit 50, offset 0, 10 warm-ups, 200 timed run
 - **Common, exact case: not met.** 579 ms > 3 x 147 ms = 441 ms.
 
 [Story 70](../epic-code-memory-graph.md#story-70) owns closing all of these. Its first step is lazy file-context loading: a path-rank key, and loading only the files before `offset + limit`. That step also lowers the prefix baseline, so the 3x target tightens with it.
+
+### Result of story 70 against the amended gate
+
+Story 70 made two changes, both with byte-identical output:
+
+- **Lazy file context.** A symbol query filters and orders its candidate files on their compact `file_keys` rows (story 61), by (repo rank, path, file id), with `LazySorted`. It loads the full file context and the stream only of the files the walk reaches, up to the one that fills `offset + limit`.
+- **No full name walk: the in-memory name cache (D4 step 1), not `sym_tri`.** Both were measured on A5 before choosing:
+  - A5 has 2,022,313 distinct folded names (42.6 MB of name bytes, 5,487,589 symbol ids). A substring scan over them in memory takes 1.2-2.3 ms; the redb walk takes about 400 ms warm.
+  - A `sym_tri` table would hold 35.5M (trigram, name) postings over 44,892 trigrams (the longest list, `est`, has 327,432 names). It would need a new derived table, write-path maintenance with removal when a name's last symbol goes, self-heal and the story 58 harness, and it adds bytes per token. The cache needs none of that and is faster once warm.
+  - **Cost of the choice:** the first infix or suffix query after an open or a write pays the walk plus building the cache (about 1.0-1.1 s on A5 with the file in the OS cache; 13.5 s on the very first touch of the file). A one-shot CLI command always pays the walk, as before story 70; `serve` and `mcp` keep the cache.
+  - **Mechanism:** the cache is keyed by the store's write generation, a count of write transactions kept in memory by a wrapper around the redb `Database`. A read uses the cache only when its read transaction saw exactly that generation with no write in flight, otherwise it walks. Snapshots carry the generation of their read transaction, so a snapshot never sees a cache built after a later write. It is never persisted, so there is no format change, no `derived_version` and nothing for an older writer to miss (an older binary cannot write while the file is open).
+  - **Bound:** at most 256 MiB per case mode (`DEFAULT_NAME_CACHE_MAX_BYTES`; about 100 MB on A5), settable with `V2Store::set_name_cache_max_bytes` (0 turns it off). A store whose names do not fit walks. The ADR 0008 pool does not exist yet; when it does, this budget moves there.
+
+Measured on A5 (`readbench.redb`, 23.6 GB, 877M tokens), embedded, limit 50, offset 0, 10 warm-ups then 200 timed runs, `crates/graph-cli/tests/infix_bench.rs`. Machine: AMD Ryzen 9 7950X (16 cores), 64 GB RAM, NVMe SSD (Crucial T700). The machine was shared and noisy; the common and prefix rows were run three times and all three are shown.
+
+| Class | Pattern | Case | Hits | p50 | p95 | Gate | Met |
+|---|---|---|---|---|---|---|---|
+| rare | `*dijkstra*` | folded | 8 | 21.1 ms | 28.0 ms | 50 ms | yes |
+| rare | `*dijkstra*` | exact | 4 | 16.9 ms | 18.5 ms | 50 ms | yes |
+| mid | `*handler*` | folded | 16,378 | 32.4 ms | 40.8 ms | 50 ms | yes |
+| mid | `*handler*` | exact | 1,943 | 22.2 ms | 23.8 ms | 50 ms | yes |
+| mid | `*serializ*` | folded | 14,719 | 24.9 ms | 27.3 ms | 50 ms | yes |
+| mid | `*serializ*` | exact | 6,707 | 19.2 ms | 20.4 ms | 50 ms | yes |
+| absent | `*xyzzyq*` | folded | 0 | 3.6 ms | 3.7 ms | 50 ms | yes |
+| absent | `*xyzzyq*` | exact | 0 | 3.5 ms | 3.5 ms | 50 ms | yes |
+| prefix baseline | `get*` | folded | 244,071 | 95 / 67 / 69 ms | 140 / 72 / 95 ms | well below 269 ms | yes |
+| prefix baseline | `get*` | exact | 145,772 | 144 / 41 / 41 ms | 325 / 50 / 45 ms | well below 147 ms (#298) | runs 2-3 yes; run 1 noisy (max 1,165 ms) |
+| common | `*get*` | folded | 321,401 | 87 / 104 / 85 ms | 125 / 216 / 97 ms | 3x `get*` | yes in each run (run 2 at the limit: 216 vs 3 x 72) |
+| common | `*get*` | exact | 181,855 | 62 / 62 / 61 ms | 70 / 64 / 69 ms | 3x `get*` | yes |
+
+The remaining cost of the common needle is ordering its candidate files (one `file_keys` read per candidate file); it is about what the prefix query pays. The CI regression check (`*get*` within 10x of `get*` on the vendored corpus) is unchanged.
 
 ### Deviations accepted
 

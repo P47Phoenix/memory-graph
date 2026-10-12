@@ -20,6 +20,7 @@
 //! is refused before anything is written (a retired v1 file with
 //! [`StoreError::LegacyFormat`], anything else with `SchemaMismatch`).
 use crate::codec::{self, Lazy, Stream, SymRec, TokRec, STREAM_FORMAT};
+use crate::name_cache::{GenDb, NameCaches};
 use crate::read_stats::{self, Counter, PhaseTimer};
 use crate::SymbolPattern;
 use crate::{check_unchanged, dec, describe_in, enc, SnapshotStats, Store, StoreRead};
@@ -586,7 +587,10 @@ type SharedSnapshotTracker = Arc<Mutex<SnapshotTracker>>;
 
 /// The v2 backend: one redb file.
 pub struct V2Store {
-    pub(crate) db: Database,
+    pub(crate) db: GenDb,
+    /// Epic story 70: the in-memory symbol name caches, shared with this
+    /// store's snapshots.
+    names: Arc<NameCaches>,
     registry: Registry,
     pub(crate) chunk_bytes: usize,
     /// Test-only (#154): skip the open-batch marker writes, so a timing test
@@ -619,6 +623,9 @@ pub type MarkedCommitHook = Arc<dyn Fn(&RaftMarker) -> Result<()> + Send + Sync>
 
 pub struct V2Snapshot {
     rt: ReadTransaction,
+    /// The store's name caches and the write generation `rt` sees.
+    names: Arc<NameCaches>,
+    generation: Option<u64>,
     tracker: SharedSnapshotTracker,
     tracker_id: u64,
     created_at: Instant,
@@ -1856,7 +1863,13 @@ impl R {
             .collect())
     }
 
-    fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
+    /// `names`: the store's name caches and the write generation this read
+    /// transaction sees (`None` when it is not known: no cache is used).
+    fn search_symbols(
+        &self,
+        q: &SymbolQuery,
+        names: Option<(&NameCaches, u64)>,
+    ) -> Result<Vec<SymbolHit>> {
         for (what, v) in [
             ("org", &q.org),
             ("repo", &q.repo),
@@ -1906,26 +1919,52 @@ impl R {
             // `sym_fold`, or of `sym_idx` with `exact_case`) and keep the
             // ids of the ones that contain (or end with) the needle. No
             // early stop: the result order stays the prefix query's.
-            SymbolPattern::Infix(_) | SymbolPattern::Suffix(_) => {
+            SymbolPattern::Infix(needle) | SymbolPattern::Suffix(needle) => {
                 crate::deadline::check_query_deadline()?;
-                for (n, r) in index.iter()?.enumerate() {
-                    if n % INFIX_DEADLINE_EVERY == INFIX_DEADLINE_EVERY - 1 {
-                        crate::deadline::check_query_deadline()?;
+                // Epic story 70: the in-memory name cache, when it holds
+                // this read's generation, gives the same ids as the walk.
+                #[cfg(test)]
+                let names = names.filter(|_| INFIX_KEY_DELAY.with(|d| d.get().is_none()));
+                let names = names.filter(|_| !needle.is_empty());
+                if let Some(cache) = names.and_then(|(c, g)| c.get(q.exact_case, g)) {
+                    cache.collect(needle, |n| pattern.matches(n), &mut ids);
+                    crate::deadline::check_query_deadline()?;
+                } else {
+                    let mut build = names.and_then(|(c, g)| c.builder(g));
+                    for (n, r) in index.iter()?.enumerate() {
+                        if n % INFIX_DEADLINE_EVERY == INFIX_DEADLINE_EVERY - 1 {
+                            crate::deadline::check_query_deadline()?;
+                        }
+                        #[cfg(test)]
+                        INFIX_KEY_DELAY.with(|d| {
+                            if let Some(d) = d.get() {
+                                std::thread::sleep(d);
+                            }
+                        });
+                        let (k, vals) = r?;
+                        let name = k.value();
+                        let hit = pattern.matches(name);
+                        if let Some(b) = build.as_mut() {
+                            b.push_name(name);
+                            for v in vals {
+                                let id = v?.value();
+                                b.push_id(id);
+                                if hit {
+                                    ids.push(id);
+                                }
+                            }
+                            b.end_name();
+                        } else if hit {
+                            for v in vals {
+                                ids.push(v?.value());
+                            }
+                        }
                     }
-                    #[cfg(test)]
-                    INFIX_KEY_DELAY.with(|d| {
-                        if let Some(d) = d.get() {
-                            std::thread::sleep(d);
-                        }
-                    });
-                    let (k, vals) = r?;
-                    if pattern.matches(k.value()) {
-                        for v in vals {
-                            ids.push(v?.value());
-                        }
+                    crate::deadline::check_query_deadline()?;
+                    if let (Some((c, _)), Some(b)) = (names, build) {
+                        c.put(q.exact_case, b);
                     }
                 }
-                crate::deadline::check_query_deadline()?;
             }
         }
         // One symbol per sub-id, however many keys reached it.
@@ -1943,38 +1982,90 @@ impl R {
                 by_file.entry(file).or_default().push(i);
             }
         }
-        let mut files: HashMap<u64, FileCtx> = HashMap::new();
-        let mut order: Vec<u64> = Vec::new();
+        // Epic story 70: filter and order the candidate files on their
+        // compact `file_keys` rows (the JSON row only as a fallback), each
+        // repo resolved and filtered once, and sort on (repo rank, path),
+        // where the rank orders the repos by (org name, repo name): the
+        // same order as sorting on the three names. The full file context
+        // is loaded only for the files the walk below reaches, and the
+        // order is built lazily, so a page costs about what it returns.
+        let mut repos: HashMap<u64, Option<usize>> = HashMap::new();
+        let mut repo_names: Vec<(Rc<Node>, Rc<Node>)> = Vec::new();
+        let mut keyed: Vec<(usize, String, u64)> = Vec::with_capacity(by_file.len());
         for (k, &fid) in by_file.keys().enumerate() {
             // ADR 0011 D3: the deadline also bounds collecting the hits.
             if k % 256 == 255 {
                 crate::deadline::check_query_deadline()?;
             }
-            if self.node(fid)?.is_none_or(|n| n.kind != NodeKind::File) {
+            let row = match &self.file_keys {
+                Some(keys) => keys.get(fid)?,
+                None => None,
+            };
+            let (parent, lang_ok, name) = match row {
+                Some(v) => {
+                    let key = codec::decode_file_key(v.value())?;
+                    let lang_ok = want_lang.as_deref().is_none_or(|l| key.language == Some(l));
+                    (key.parent, lang_ok, key.name.to_owned())
+                }
+                // No compact row: a dangling index entry (or a file not yet
+                // healed). Skipped unless the node is a File, as before.
+                None => match self.node(fid)? {
+                    Some(n) if n.kind == NodeKind::File => {
+                        let parent = n
+                            .parent
+                            .ok_or_else(|| StoreError::Corrupt("file without repo".into()))?;
+                        let lang_ok = want_lang
+                            .as_deref()
+                            .is_none_or(|l| n.language.as_deref() == Some(l));
+                        (parent, lang_ok, n.name)
+                    }
+                    _ => continue,
+                },
+            };
+            let slot = match repos.get(&parent) {
+                Some(s) => *s,
+                None => {
+                    let repo = self.entity(parent)?;
+                    let org = self.entity(
+                        repo.parent
+                            .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
+                    )?;
+                    let s = if q.org.as_deref().is_some_and(|o| org.name != o)
+                        || q.repo.as_deref().is_some_and(|r| repo.name != r)
+                    {
+                        None
+                    } else {
+                        repo_names.push((org, repo));
+                        Some(repo_names.len() - 1)
+                    };
+                    repos.insert(parent, s);
+                    s
+                }
+            };
+            let Some(slot) = slot else {
+                continue;
+            };
+            if !lang_ok || want_file.as_ref().is_some_and(|f| &name != f) {
                 continue;
             }
-            self.ctx(fid, &mut files)?;
-            let c = &files[&fid];
-            if want_lang
-                .as_ref()
-                .is_some_and(|l| c.file.language.as_ref() != Some(l))
-                || q.org.as_ref().is_some_and(|o| &c.org.name != o)
-                || q.repo.as_ref().is_some_and(|r| &c.repo.name != r)
-                || want_file.as_ref().is_some_and(|f| &c.file.name != f)
-            {
-                continue;
-            }
-            order.push(fid);
+            keyed.push((slot, name, fid));
+        }
+        let mut by_name: Vec<usize> = (0..repo_names.len()).collect();
+        by_name.sort_by(|&a, &b| {
+            let (x, y) = (&repo_names[a], &repo_names[b]);
+            (&x.0.name, &x.1.name).cmp(&(&y.0.name, &y.1.name))
+        });
+        let mut rank = vec![0usize; repo_names.len()];
+        for (r, &slot) in by_name.iter().enumerate() {
+            rank[slot] = r;
         }
         // Files in sorted-by-path order, so the limit can stop the walk.
-        order.sort_by(|a, b| {
-            let (a, b) = (&files[a], &files[b]);
-            (&a.org.name, &a.repo.name, &a.file.name).cmp(&(
-                &b.org.name,
-                &b.repo.name,
-                &b.file.name,
-            ))
+        // The file id breaks a tie (none on a healthy store), as the
+        // stable sort over ascending ids did before.
+        let mut order = LazySorted::new(keyed, move |a: &(usize, String, u64), b| {
+            (rank[a.0], &a.1, a.2).cmp(&(rank[b.0], &b.1, b.2))
         });
+        let mut files: HashMap<u64, FileCtx> = HashMap::new();
         // `want` is offset+limit: the early-termination threshold below must
         // account for rows that will be skipped as `offset` at the end, or a
         // page beyond the first would come back short/empty.
@@ -1983,11 +2074,12 @@ impl R {
             .unwrap_or(0)
             .saturating_add(q.limit.unwrap_or(usize::MAX));
         let mut out: Vec<SymbolHit> = Vec::new();
-        for fid in order {
-            if out.len() >= want {
+        while out.len() < want {
+            let Some((_, _, fid)) = order.next() else {
                 break;
-            }
+            };
             crate::deadline::check_query_deadline()?;
+            self.ctx(fid, &mut files)?;
             let Some(raw) = self.streams.get(fid)? else {
                 continue;
             };
@@ -3018,7 +3110,22 @@ impl V2Store {
     /// part of the supported API.
     #[doc(hidden)]
     pub fn rebuild_sym_fold(&self) -> Result<()> {
-        rebuild_sym_fold_in(&self.db)
+        self.db.raw_write(rebuild_sym_fold_in)
+    }
+
+    /// Bound each in-memory symbol name cache (epic story 70) to `bytes`;
+    /// 0 turns the caches off, so infix and suffix queries walk redb. The
+    /// answers are the same either way. Default
+    /// [`DEFAULT_NAME_CACHE_MAX_BYTES`](crate::DEFAULT_NAME_CACHE_MAX_BYTES).
+    pub fn set_name_cache_max_bytes(&self, bytes: usize) {
+        self.names.set_max_bytes(bytes);
+    }
+
+    /// Bytes held by the name caches, `(folded, exact case)`. For
+    /// diagnostics and tests only; not part of the supported API.
+    #[doc(hidden)]
+    pub fn name_cache_bytes(&self) -> (usize, usize) {
+        self.names.held_bytes()
     }
 
     /// Bytes held by the two symbol indexes, `(sym_idx, sym_fold)`: stored,
@@ -3529,7 +3636,8 @@ impl V2Store {
         }
 
         Ok(Self {
-            db,
+            db: GenDb::new(db),
+            names: Arc::new(NameCaches::default()),
             registry: Registry::default(),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             #[cfg(test)]
@@ -3858,7 +3966,7 @@ impl V2Store {
     /// automatically on open, so calling this method by hand is normally
     /// only needed for diagnostics or a manual repair.
     pub fn rebuild_refs(&self) -> Result<()> {
-        rebuild_refs_in(&self.db)
+        self.db.raw_write(rebuild_refs_in)
     }
 
     /// Rebuild the store into a brand-new file by copying every row of every
@@ -3938,6 +4046,7 @@ impl V2Store {
 
         let V2Store {
             db,
+            names: _,
             registry,
             chunk_bytes,
             cache_bytes,
@@ -4352,7 +4461,7 @@ impl V2Store {
             chunk_bytes
         };
         #[cfg(test)]
-        let begin = || -> Result<redb::WriteTransaction> {
+        let begin = || -> Result<crate::name_cache::GenWt<'_>> {
             let mut wt = self.db.begin_write()?;
             if self.non_durable_commits {
                 wt.set_durability(redb::Durability::None);
@@ -4360,7 +4469,7 @@ impl V2Store {
             Ok(wt)
         };
         #[cfg(not(test))]
-        let begin = || -> Result<redb::WriteTransaction> { Ok(self.db.begin_write()?) };
+        let begin = || -> Result<crate::name_cache::GenWt<'_>> { self.db.begin_write() };
         let mut wt = begin()?;
         if let Some((marker, membership)) = marker {
             Self::stamp_marker(&wt, marker, membership)?;
@@ -4755,7 +4864,7 @@ impl V2Store {
 }
 
 macro_rules! store_read {
-    ($ty:ty, |$s:ident| $rt:expr) => {
+    ($ty:ty, |$s:ident| $rt:expr, names: |$sn:ident| $names:expr) => {
         impl StoreRead for $ty {
             fn get(&self, id: NodeId) -> Result<Option<Node>> {
                 read_stats::timed_query(|| {
@@ -4843,10 +4952,10 @@ macro_rules! store_read {
             }
             fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
                 read_stats::timed_query(|| {
-                    let $s = self;
-                    $s.check_not_expired()?;
-                    let g = $rt;
-                    R::new(&g)?.search_symbols(q)
+                    let $sn = self;
+                    $sn.check_not_expired()?;
+                    let (g, names) = $names;
+                    R::new(&g)?.search_symbols(q, names)
                 })
             }
             fn search(&self, q: &Query) -> Result<Vec<Hit>> {
@@ -4864,8 +4973,15 @@ macro_rules! store_read {
 store_read!(V2Store, |s| {
     read_stats::bump(Counter::ReadTxns);
     s.db.begin_read()?
+}, names: |s| {
+    read_stats::bump(Counter::ReadTxns);
+    let (rt, generation) = s.db.begin_read_gen()?;
+    (rt, generation.map(|g| (&*s.names, g)))
 });
-store_read!(V2Snapshot, |s| &s.rt);
+store_read!(V2Snapshot, |s| &s.rt, names: |s| (
+    &s.rt,
+    s.generation.map(|g| (&*s.names, g))
+));
 
 impl V2Store {
     /// [`Store::snapshot`] as an owned handle with no borrow of the store
@@ -4875,7 +4991,7 @@ impl V2Store {
     /// trait method only ties the lifetime for object safety. Same max age,
     /// same accounting in [`Store::snapshot_stats`].
     pub fn snapshot_owned(&self) -> Result<V2Snapshot> {
-        let rt = self.db.begin_read()?;
+        let (rt, generation) = self.db.begin_read_gen()?;
         let created_at = Instant::now();
         let tracker_id = {
             let mut t = self
@@ -4889,6 +5005,8 @@ impl V2Store {
         };
         Ok(V2Snapshot {
             rt,
+            names: Arc::clone(&self.names),
+            generation,
             tracker: Arc::clone(&self.snapshot_tracker),
             tracker_id,
             created_at,
@@ -4910,7 +5028,7 @@ impl V2Store {
 
 impl Store for V2Store {
     fn snapshot(&self) -> Result<Box<dyn StoreRead + Send + '_>> {
-        let rt = self.db.begin_read()?;
+        let (rt, generation) = self.db.begin_read_gen()?;
         let created_at = Instant::now();
         let tracker_id = {
             let mut t = self
@@ -4924,6 +5042,8 @@ impl Store for V2Store {
         };
         Ok(Box::new(V2Snapshot {
             rt,
+            names: Arc::clone(&self.names),
+            generation,
             tracker: Arc::clone(&self.snapshot_tracker),
             tracker_id,
             created_at,
