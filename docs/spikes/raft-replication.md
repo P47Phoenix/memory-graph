@@ -139,6 +139,20 @@ MG_SCALE_TOKENS=10000000 cargo test --release -p graph-cli --test cluster_e2e me
 - **RPC overhead** stays at 0.2-0.4 ms on the corpus and 0.4-1.6 ms at 10 M, where answers are 100 hits with spans. That is well under the 5 ms D1 trigger.
 - **The D7 trigger (install slower than replaying the retained log):** a new learner installs the 540 MB store in 1.2 s, while the same log took 11 s to apply on the leader. The trigger is not tripped.
 
+### Re-run on a mostly idle machine (issue #123) [M]
+
+Date 2026-10-12. Same machine, `origin/main` at `0e66092`, `MG_SCALE_TOKENS=10000000`, three back-to-back runs. No `cargo` build or other benchmark ran alongside. The generated tree is unchanged (41,728,360 B, 10,811 files), and the store indexes it as 9,877,116 tokens in 539,504,640 B.
+
+| run | embedded ingest | 1-node (share) | 3-node via the leader (share; trigger < 50%) |
+|---|---:|---:|---:|
+| 1 | not captured | not captured | 14.722 s (74%) |
+| 2 | not captured | not captured | 14.741 s (73%) |
+| 3 | 10.488 s | 13.500 s (78%) | 14.469 s (72%) |
+
+The share is computed by the harness against the same run's embedded ingest. For runs 1 and 2, only the summary line was kept. Run 3 also measured: snapshot build 4.6 s, learner install 1.1 s, and a worst RPC overhead p50 of 0.36 ms.
+
+The result is 72-74% on three nodes and 78% on one, which matches the 71-81% measured on an idle machine on 2026-09-28. The 43% run did not reproduce. D5 is not tripped. The trigger is judged on an idle, dedicated machine, which is the spike's method. A run that shares its one disk with a concurrent build measures that contention, not replication. No code change was made. Measuring on separate disks or machines is still worth doing when that hardware is available. It would remove the shared-disk worst case, but it is not needed to clear the trigger.
+
 ### Soak (60 minutes) [M]
 
 Script: `scripts/cluster_soak.py` (see [testing.md](../testing.md)). It ran in release on the machine above, from `stage-f` at `ccbdff1` (which includes Stage D, PR #119):
@@ -177,6 +191,6 @@ Peaks over the run: 2.83 MB (node 1), 3.87 MB (node 2), 3.93 MB (node 3). The CI
 ### Stage F verdict
 
 - **D1 (RPC overhead > 5 ms p50 at 10 M tokens):** not tripped. The worst p50 was 1.6 ms.
-- **D5 (replicated ingest < 50% of embedded):** not tripped on an idle machine, which measured 71-81%. One run under load measured 43%, which is issue #123.
+- **D5 (replicated ingest < 50% of embedded):** not tripped on an idle machine, which measured 71-81%. One run under load measured 43%. The 2026-10-12 re-run for issue #123 measured 72-74% on three nodes, so the 43% did not reproduce.
 - **D7 (snapshot install slower than log replay):** not tripped. Install took 1.2 s, against 11 s to apply the log.
 - **Soak:** no acknowledged write was lost in 62 minutes with 12 restarts, and the log stayed bounded (under 4 MB) with the purged index advancing on every node.
