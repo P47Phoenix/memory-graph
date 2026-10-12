@@ -1,6 +1,6 @@
 # ADR 0011: Infix (substring) symbol search
 
-**Status:** Accepted by the owner on 2026-10-10 (proposed on 2026-10-09), as proposed; the open questions are resolved in [Owner decisions (2026-10-10)](#owner-decisions-2026-10-10). Answers issue [#278](https://github.com/P47Phoenix/memory-graph/issues/278). Builds on [ADR 0003](0003-data-model.md) (the v2 store, the interned dictionary, `derived_version` self-heal) and [ADR 0010](0010-symbol-lookup-and-positions.md) D4 (case-insensitive lookup, `sym_fold`, `--exact-case`). Epic: story [68](../epic-code-memory-graph.md#story-68), preferably after story 61, and after story 58 (derived-table self-heal), which is a hard prerequisite of step 2.
+**Status:** Accepted by the owner on 2026-10-10 (proposed on 2026-10-09), as proposed; the open questions are resolved in [Owner decisions (2026-10-10)](#owner-decisions-2026-10-10). Amended by the owner on 2026-10-12: D7 is now a per-class gate, and story 68's deviations are accepted ([Amendment](#amendment-2026-10-12-approved-by-the-owner)). Step 1 was delivered in #298; the speedup is story [70](../epic-code-memory-graph.md#story-70). Answers issue [#278](https://github.com/P47Phoenix/memory-graph/issues/278). Builds on [ADR 0003](0003-data-model.md) (the v2 store, the interned dictionary, `derived_version` self-heal) and [ADR 0010](0010-symbol-lookup-and-positions.md) D4 (case-insensitive lookup, `sym_fold`, `--exact-case`). Epic: story [68](../epic-code-memory-graph.md#story-68), preferably after story 61, and after story 58 (derived-table self-heal), which is a hard prerequisite of step 2.
 
 ## In plain words
 
@@ -175,3 +175,61 @@ The owner accepted this ADR as proposed. Each open question is resolved with the
 2. Is the 2-byte minimum right, or should 1-byte infix be allowed? **Kept:** the 2-byte minimum stays.
 3. Is the in-memory name cache (step 1), charged to the ADR 0008 pool, acceptable before considering `sym_tri`? **Allowed.**
 4. Accept the `capabilities` field in `HelloResponse` (D6, a proto change), or accept the silent empty result from older servers? **The `capabilities` field is used:** the client refuses an infix query against a server that does not advertise `symbol_infix`.
+
+## Amendment (2026-10-12, approved by the owner)
+
+Story 68 (#298) delivered step 1 and measured it. Measured p95 values are over 200 warm runs. Setup:
+
+- **Index:** the A5 readbench index (`readbench.redb`, 23.6 GB, 877M tokens), embedded.
+- **Query:** limit 50, offset 0.
+- **Runs:** 10 warm-ups, then 200 timed runs.
+- **Bench:** `crates/graph-cli/tests/infix_bench.rs`.
+- **Hits:** symbol rows with no limit.
+
+| Class | Pattern | Case | Hits | p50 | p95 |
+|---|---|---|---|---|---|
+| common | `*get*` | folded | 321,401 | 613 ms | 696 ms |
+| common | `*get*` | exact | 181,855 | 550 ms | 579 ms |
+| common, prefix baseline | `get*` | folded | 244,071 | 188 ms | 269 ms |
+| common, prefix baseline | `get*` | exact | 145,772 | 123 ms | 147 ms |
+| mid | `*handler*` | folded | 16,378 | 452 ms | 507 ms |
+| mid | `*handler*` | exact | 1,943 | 416 ms | 469 ms |
+| mid | `*serializ*` | folded | 14,719 | 427 ms | 469 ms |
+| mid | `*serializ*` | exact | 6,707 | 410 ms | 455 ms |
+| absent | `*xyzzyq*` | folded | 0 | 386 ms | 406 ms |
+| absent | `*xyzzyq*` | exact | 0 | 455 ms | 626 ms |
+
+### Root cause
+
+- **The name walk.** An infix query walks every distinct name, which costs about 400 ms. The absent needle measures exactly this cost.
+- **Loading and sorting every match.** Every query loads the file context of every match and sorts all matches before the limit applies, whatever the pattern. That is why even the prefix query `get*` takes 269 ms with no name walk at all. No name index can remove that cost.
+
+### D7, amended: a per-class gate on the A5 index
+
+The setup is unchanged: embedded, limit 50, offset 0, 10 warm-ups, 200 timed runs, both case modes. The classes and needles are pinned as follows.
+
+- **Rare** (1-5 matching names), **mid-frequency** (about 100 to a few thousand matching names) and **absent** needles: p95 <= 50 ms.
+  - Pinned mid needles: `handler` and `serializ`.
+  - Pinned absent needle: `xyzzyq`.
+  - The rare needle was not measured in #298. Story 70 picks one with 1-5 matching names on A5 and pins it here.
+- **Common** needles: p95 <= 3x the matching prefix query (`*get*` against `get*`), in the same case mode.
+  - Pinned common needle: `get`.
+- The CI regression check (`*get*` within 10x of `get*` on the vendored corpus) is unchanged.
+
+### Result of step 1 against the amended gate
+
+- **Rare, mid and absent: not met.** p95 is 406-626 ms, against 50 ms. Removing the name walk is still required for them. It is done by the step 2 `sym_tri` table or by a name cache, and is part of [story 70](../epic-code-memory-graph.md#story-70).
+- **Common, folded: met.** 696 ms <= 3 x 269 ms = 807 ms.
+- **Common, exact case: not met.** 579 ms > 3 x 147 ms = 441 ms.
+
+[Story 70](../epic-code-memory-graph.md#story-70) owns closing all of these. Its first step is lazy file-context loading: a path-rank key, and loading only the files before `offset + limit`. That step also lowers the prefix baseline, so the 3x target tightens with it.
+
+### Deviations accepted
+
+- **`*` alone still lists every symbol.** The D2 table's "rejected" row for `*` is withdrawn.
+- **The name cache of D4 step 1 is deferred.** The ADR 0008 pool it would be charged to does not exist yet. Story 70 may add the cache or `sym_tri`.
+- **No audit of which extractors emit `*` in names.** The `\*` escape works either way.
+- **Kept, as documented in `docs/guide/querying.md`:**
+  - patterns ending in `**` keep the "ambiguous" message;
+  - a `\*` inside an infix or suffix needle is a literal `*`;
+  - the deadline error is `StoreError::DeadlineExceeded`, carried in `StoreErrorDetail` field 21.
