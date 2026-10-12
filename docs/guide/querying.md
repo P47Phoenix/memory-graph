@@ -86,7 +86,7 @@ Quote any pattern with a `*` so the shell does not expand it. Rules for infix an
 - It may not contain an unescaped `*` (`*a*b*` is refused; there is no general globbing). `\*` inside it is a literal `*`. Whitespace is part of the needle.
 - ASCII letters fold unless `--exact-case`; other characters match exactly ([case](#case)).
 - Results come in the same order as any symbol query (org, repo, file, position), and `--limit`/`--offset` page them as usual.
-- The lookup walks every distinct symbol name, so a very common needle costs the most. Over `--server` a deadline the client sets (`grpc-timeout`) stops it with `DeadlineExceeded`, never a partial page.
+- The first infix or suffix query on an open store walks every distinct symbol name and keeps them in memory (story 70); later queries, until the next write, scan that copy instead, which takes a few milliseconds. A one-shot CLI command pays the walk every time; `memory-graph serve` and `memory-graph mcp` keep the copy. It is bounded at 256 MiB per case mode (about 100 MB on an 877M-token index), and a store whose names do not fit always walks. A page decodes only the files it returns (the other candidate files are only sorted on a compact key), so a very common needle costs about what a prefix query costs. Over `--server` a deadline the client sets (`grpc-timeout`) stops it with `DeadlineExceeded`, never a partial page.
 - An older server would read `*get*` as the prefix `*get` and answer nothing, so the client sends an infix or suffix pattern only to a server whose `Hello` lists the `symbol_infix` capability, and otherwise fails with "this server does not support infix symbol search; upgrade it".
 
 **Changed with infix search (story 68).** Patterns that meant something else before:

@@ -34,6 +34,8 @@ pub use cache_size::{
     derive_cache_bytes, FALLBACK_CACHE_BYTES, MAX_DERIVED_CACHE_BYTES, MIN_DERIVED_CACHE_BYTES,
 };
 mod deadline;
+mod name_cache;
+pub use name_cache::DEFAULT_NAME_CACHE_MAX_BYTES;
 mod v2;
 pub use deadline::with_query_deadline;
 mod pattern;

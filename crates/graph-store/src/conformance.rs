@@ -130,6 +130,7 @@ pub const CASES: &[(&str, Case)] = &[
         "many_candidates_keep_full_order",
         many_candidates_keep_full_order,
     ),
+    ("symbol_pages_equal_slices", symbol_pages_equal_slices),
 ];
 
 /// Run every case; `make` builds a fresh harness (empty data) per case.
@@ -4573,6 +4574,77 @@ fn symbol_rows(s: &dyn Store, pattern: &str, exact_case: bool) -> Vec<(String, S
         .into_iter()
         .map(|h| (h.file, h.name))
         .collect()
+}
+
+/// Epic story 70: a symbol query loads file context only up to the file
+/// that fills `offset + limit`. Every page, with or without org, repo and
+/// file filters, must still equal the same slice of the unpaged answer,
+/// which is in (org, repo, path, position) order whatever the ingest order,
+/// for exact, prefix, infix and suffix patterns in both case modes.
+fn symbol_pages_equal_slices(h: &Harness) {
+    let s = open(h);
+    // Ingested out of path order, across orgs and repos whose names sort
+    // differently from their ingest order.
+    for (org, repo, path) in [
+        ("zorg", "b", "m/z.cs"),
+        ("aorg", "zz", "b.cs"),
+        ("aorg", "a", "z.cs"),
+        ("zorg", "b", "a.cs"),
+        ("aorg", "a", "a/b.cs"),
+        ("aorg", "a", "a.cs"),
+        ("morg", "a", "q.cs"),
+    ] {
+        ingest_names(
+            &*s,
+            org,
+            repo,
+            path,
+            &["getWidget", "Handler", "GetHandler", "get"],
+        );
+    }
+    let row = |h: crate::SymbolHit| (h.org, h.repo, h.file, h.name, h.span);
+    for pattern in ["get", "get*", "*get*", "*handler", "*Handler*", "*"] {
+        for exact_case in [false, true] {
+            for (org, repo, file) in [
+                (None, None, None),
+                (Some("aorg"), None, None),
+                (Some("aorg"), Some("a"), None),
+                (None, Some("b"), None),
+                (None, None, Some("a.cs")),
+            ] {
+                let mut q = SymbolQuery::new(pattern);
+                q.exact_case = exact_case;
+                q.org = org.map(Into::into);
+                q.repo = repo.map(Into::into);
+                q.file = file.map(Into::into);
+                let all: Vec<_> = s.search_symbols(&q).unwrap().into_iter().map(row).collect();
+                let mut sorted = all.clone();
+                sorted.sort_by(|a, b| {
+                    (&a.0, &a.1, &a.2, a.4.map(|s| s.start)).cmp(&(
+                        &b.0,
+                        &b.1,
+                        &b.2,
+                        b.4.map(|s| s.start),
+                    ))
+                });
+                assert_eq!(all, sorted, "{pattern} exact={exact_case} order");
+                for offset in 0..=all.len() + 1 {
+                    for limit in [0, 1, 2, 3, 5, all.len() + 1] {
+                        let mut p = q.clone();
+                        p.offset = Some(offset);
+                        p.limit = Some(limit);
+                        let got: Vec<_> =
+                            s.search_symbols(&p).unwrap().into_iter().map(row).collect();
+                        let want: Vec<_> = all.iter().skip(offset).take(limit).cloned().collect();
+                        assert_eq!(
+                            got, want,
+                            "{pattern} exact={exact_case} {org:?}/{repo:?}/{file:?} offset={offset} limit={limit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// ADR 0010 D4 / story 57: case-insensitive lookup by default (ASCII only),
