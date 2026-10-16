@@ -127,7 +127,7 @@ See the [server](server.md) and [cluster](cluster.md) guides for what these flag
 
 ## Idle CPU on macOS (Docker Desktop)
 
-On a Mac, containers run in a Linux VM. Each time a thread in the VM wakes (a timer, a futex), the hypervisor exits to macOS, and that time is billed to the `com.docker.virtualization` process, not to the container. So an idle `serve` can show next to nothing in `docker stats` and still keep the Mac's CPU busy. An idle server now wakes about once every 10 seconds, in both `serve --db` and a one-node `--data-dir`, and that is the image's own 30 s health check. Before issue #205 it was about 40 times a second, and before issue #226 about 3-6. The [idle CPU spike](../spikes/idle-cpu.md) has the numbers and causes. To keep the cost down:
+On a Mac, containers run in a Linux VM. Each time a thread in the VM wakes (a timer, a futex), the hypervisor exits to macOS, and that time is billed to the `com.docker.virtualization` process, not to the container. So an idle `serve` can show next to nothing in `docker stats` and still keep the Mac's CPU busy. An idle server, `serve --db` or a one-node `--data-dir`, now wakes only for the image's own health check: a handful of wakeups every 30 s, 0.1/s on average. Before issue #205 it was about 40 times a second, and before issue #226 about 3-6. The [idle CPU spike](../spikes/idle-cpu.md) has the numbers and causes. To keep the cost down:
 
 - **Run the image for your Mac's architecture.** The image is multi-arch (`linux/amd64` and `linux/arm64`), so on Apple silicon Docker pulls the arm64 one. If you forced `--platform linux/amd64`, it runs under Rosetta or QEMU, which costs much more for every wakeup. Check:
 

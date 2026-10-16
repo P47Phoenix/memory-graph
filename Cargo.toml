@@ -35,7 +35,8 @@ tonic-prost = "=0.14.6"
 # Server and client runtime (ADR 0004 D2/D5), pinned exactly. openraft 0.9
 # with storage-v2 (RaftLogStorage/RaftStateMachine), serde (its metadata
 # types on disk) and generic-snapshot-data (a snapshot is a store file, not
-# an AsyncRead). rand 0.8 is the line openraft already pulls.
+# an AsyncRead). rand 0.8 is the line openraft already pulls. openraft
+# itself comes from a pinned git commit: see [patch.crates-io] below.
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util"] }
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "generic-snapshot-data"] }
@@ -77,7 +78,8 @@ opentelemetry-proto = { version = "=0.33.0", default-features = false, features 
 # idle `serve` still did. The change is upstream as databendlabs/openraft#2150
 # but released only on the 0.10 alpha line; this is its backport to
 # `release-0.9`, pinned by commit in P47Phoenix/openraft (branch
-# backport-0.9-tick-park, keep it). Drop this patch when a 0.9.26 with the fix
+# backport-0.9-tick-park and tag mg-pin-ad4f6b3; keep both, or a fresh
+# `cargo build --locked` can no longer fetch it). Drop this patch when a 0.9.26 with the fix
 # ships, or on the move to 0.10.
 [patch.crates-io]
 openraft = { git = "https://github.com/P47Phoenix/openraft", rev = "ad4f6b33c1917711fcb3495d89cbd1e41684113e" }

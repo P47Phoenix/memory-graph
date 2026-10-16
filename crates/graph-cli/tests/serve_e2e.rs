@@ -1155,8 +1155,10 @@ mod idle {
     /// timer is gone too: this test measures 0.0/s (and the image 0.1/s,
     /// its 30 s HEALTHCHECK). The limit is now 1/s. openraft 0.9.25's
     /// polling tick loop alone fails it (3.0/s), and so should each partial
-    /// revert above: less that 3/s floor, they still come to about 2.6-3.9/s
-    /// (estimated, not re-measured on the patched openraft).
+    /// revert above. With ticks never suspended (S1) the patch does nothing,
+    /// so that stays near 5.6/s. With the event-driven loops reverted (S2),
+    /// minus the 3/s floor, it comes to about 3.9/s. Both are estimates,
+    /// not re-measured on the patched openraft.
     #[test]
     fn idle_serve_db_barely_wakes() {
         let d = tempfile::tempdir().unwrap();

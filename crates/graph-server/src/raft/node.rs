@@ -87,9 +87,10 @@ impl RaftSettings {
     /// `--db` (stage A) defaults. The sole voter campaigns at once on
     /// start (not at its first tick) and suspends its ticks while
     /// it leads alone ([`TickControl`]), so the timings do not shape
-    /// start-up; they only pace openraft's tick timer, which still wakes
-    /// every 1.5 heartbeats while suspended: a long heartbeat keeps an idle
-    /// server quiet (issue #205; it was 50 ms, a tick every 75 ms).
+    /// start-up. They paced openraft 0.9.25's tick timer, which woke every
+    /// 1.5 heartbeats while suspended (issue #205; it was 50 ms, a tick
+    /// every 75 ms). With the patched openraft (issue #226) the suspended
+    /// tick loop parks, so they no longer affect an idle server either.
     pub const fn standalone() -> Self {
         Self {
             heartbeat_ms: 500,
@@ -268,8 +269,10 @@ pub struct RaftNode {
 /// leader and the only member, voter or learner (issue #205): it has nobody
 /// to heartbeat and nobody to lose an election to, and every tick publishes
 /// the Raft metrics, which wakes the readiness and snapshot-policy loops.
-/// An idle sole voter then wakes only for openraft's tick timer itself,
-/// which checks the flag and goes back to sleep. Ticks resume the moment
+/// With the patched openraft (issue #226) the suspended tick loop parks
+/// until `tick(true)` wakes it, so an idle sole voter does not wake at all;
+/// on openraft 0.9.25 the loop still woke every 1.5 heartbeats to check the
+/// flag. Ticks resume the moment
 /// the membership grows (the metrics show it) and are held on for the
 /// whole of any membership change ([`TickHold`]), so a new learner is
 /// heartbeated from its first entry and a leader that removed itself still

@@ -148,7 +148,7 @@ jobs:
           # Let the image's HEALTHCHECK leave its 1 s start interval (10 s
           # start period) so the window sees only the 30 s probe, then
           # measure 20 s: about 40 wakeups/s before #205, about 3 after it,
-          # 0.1 since #226 (only the HEALTHCHECK probe is left).
+          # 0.1/s since #226 (only the HEALTHCHECK probe is left).
           sleep 12
           sh scripts/idle-cpu.sh mg-idle 20 1
 
