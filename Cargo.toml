@@ -71,6 +71,17 @@ tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 opentelemetry-appender-tracing = { version = "=0.33.0", default-features = false }
 opentelemetry-proto = { version = "=0.33.0", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"] }
 
+# openraft 0.9.25 plus one commit: the tick loop parks while tick is
+# disabled instead of waking every 1.5 heartbeats to re-check the flag
+# (issue #226). A sole voter suspends ticks (#205), so that timer was all an
+# idle `serve` still did. The change is upstream as databendlabs/openraft#2150
+# but released only on the 0.10 alpha line; this is its backport to
+# `release-0.9`, pinned by commit in P47Phoenix/openraft (branch
+# backport-0.9-tick-park, keep it). Drop this patch when a 0.9.26 with the fix
+# ships, or on the move to 0.10.
+[patch.crates-io]
+openraft = { git = "https://github.com/P47Phoenix/openraft", rev = "ad4f6b33c1917711fcb3495d89cbd1e41684113e" }
+
 # Optimise dependencies (redb, serde_json, ...) in dev/test builds so the
 # corpus test does not spend ~20s in unoptimised storage code.
 [profile.dev.package."*"]
