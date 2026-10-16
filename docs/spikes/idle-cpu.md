@@ -8,7 +8,8 @@ Status: evidence for issue #205 (stories S1-S3 fixed it, S5 guards it). Date 202
 - **Before: an idle `serve --db` woke 39.6 times a second** (0.17 % of one core, 34 threads on a 32-vCPU VM). With longer Raft timings by hand it was 8.3/s. [M]
 - **The cause was Raft's timers, not the database.** A 50 ms heartbeat made openraft tick every 75 ms; every tick published new Raft metrics, which woke the readiness loop (it re-sent the gRPC health status every pass) and the snapshot-policy loop. A one-node "cluster" ticked although it has nobody to heartbeat. [M]
 - **After the fix (PR #208): `serve --db` wakes 3.0 times a second (13x fewer), a one-node `--data-dir` 5.7.** All of it is one thread: openraft 0.9's tick timer, which still wakes every 1.5 heartbeats to see that ticks are off. That is the floor without changing openraft. [M]
-- **A regression guard keeps it there:** a Linux test in `serve_e2e` (`--db` under 5/s, `--data-dir` under 8/s) and a step in the Docker workflow (`scripts/idle-cpu.sh`, under 5/s). [M]
+- **Issue #226 removed that floor (2026-10-15): both modes now wake 0.0 times a second, and 0.1-0.2 in the image** (its 30 s HEALTHCHECK probe). openraft's tick loop now parks while ticks are off, via a one-commit backport of the upstream fix pinned in the workspace `Cargo.toml` (see [The remaining floor](#the-remaining-floor)). [M]
+- **A regression guard keeps it there:** a Linux test in `serve_e2e` (both modes under 1/s since #226; 5/s and 8/s before) and a step in the Docker workflow (`scripts/idle-cpu.sh`, under 1/s; 5/s before). [M]
 
 **Labels.** [M] measured, [E] estimated or inferred (reason stated). Machine: AMD Ryzen 9 7950X (16 cores, 32 threads), 63 GB RAM, Windows 11 Pro (10.0.26200), Docker Desktop 29.6 with the WSL2 backend (a Linux VM with 32 vCPUs). Not measured on a Mac: the macOS cost model is Docker's documented VM design and the user report, not a measurement here. Other programs were running.
 
@@ -75,7 +76,30 @@ The whole remaining rate is on one tokio worker. The `serve_e2e` guard (debug bu
 
 ## The remaining floor
 
-openraft 0.9's tick timer is a task of its own that wakes every 1.5 heartbeats, checks whether ticks are enabled, and goes back to sleep: every 750 ms for `--db`'s 500 ms heartbeat, every 375 ms for the cluster default of 250 ms. Each wake costs about two context switches, which matches the rates above (1.3 and 2.7 timer wakes a second, so about 2.7 and 5.3 switches a second). Removing it would need openraft to stop its timer while ticks are off (or a much longer heartbeat while alone, which openraft cannot change at runtime). It is not worth a fork for a few wakeups a second. [E]
+openraft 0.9's tick timer is a task of its own that wakes every 1.5 heartbeats, checks whether ticks are enabled, and goes back to sleep: every 750 ms for `--db`'s 500 ms heartbeat, every 375 ms for the cluster default of 250 ms. Each wake costs about two context switches, which matches the rates above (1.3 and 2.7 timer wakes a second, so about 2.7 and 5.3 switches a second). Removing it would need openraft to stop its timer while ticks are off (or a much longer heartbeat while alone, which openraft cannot change at runtime). In October 2026 we judged a fork not worth a few wakeups a second. [E]
+
+**Removed by issue #226 (2026-10-15).** The fix went upstream instead: databendlabs/openraft#2150 parks the tick loop while ticks are off, and a re-enable wakes it. It is released only on the 0.10 alpha line (0.10.0-alpha.37), and 0.10 is a large migration that also ticks far more often (every `heartbeat * 13/64`). So the workspace `Cargo.toml` pins the same change backported to 0.9.25: `[patch.crates-io]` points openraft at one commit, `ad4f6b3` on `P47Phoenix/openraft` (branch `backport-0.9-tick-park`, on top of upstream `release-0.9`). The commit is pinned by hash, and the branch must be kept. It passes openraft's 191 lib tests, including new tick tests. The patch comes out when a 0.9.26 with the fix is released, or on a move to 0.10.
+
+Measured on the same machine, with the same tools and windows as above: [M]
+
+| | openraft 0.9.25 | patched |
+|---|---|---|
+| `serve_e2e` idle test, `--db` / `--data-dir` (10 s) | 3.0 / 5.7 | **0.0 / 0.0** |
+| image (`scripts/idle-cpu.sh`, 60 s), `--db` / `--data-dir --bootstrap` | 2.9 / 5.6 | **0.1 / 0.1** |
+
+The 0.1/s left in the image is its HEALTHCHECK. Every 30 s a probe process connects and asks for the health status, and the server's threads wake to answer. A 20 s window that catches one probe reads 0.2/s, as the workflow step usually does. Without the probe nothing wakes at all. [M]
+
+The QA review of PR #324 mutation-tested the new 1/s limit on the patched openraft (`serve_e2e`, release build, `--db` / `--data-dir`). [M]
+
+| mutant | `--db` | `--data-dir` | result |
+|---|---|---|---|
+| ticks never suspended | 4.3/s | 8.2/s | caught |
+| readiness re-check timer re-armed on a leader | 2.2/s | 2.2/s | caught |
+| snapshot policy back on its 1 s timer | 2.2/s | 2.1/s | caught |
+| both timers | 3.4/s | 3.6/s | caught |
+| the patch removed (openraft 0.9.25) | 2.9/s | 5.5/s | caught |
+
+Two mutants now cost nothing at idle, so no wakeup limit can catch them: an unconditional `set_service_status`, and a 50 ms heartbeat. With ticks parked, nothing publishes metrics and nothing is paced by the heartbeat. The result was 0.0/s in every run, including 5 runs under `--cpus=2` with CPU hogs.
 
 ## Why Mac users feel it
 
@@ -85,7 +109,7 @@ The [Docker guide](../guide/docker.md#idle-cpu-on-macos-docker-desktop) has the 
 
 ## Regression guard (S5)
 
-- `crates/graph-cli/tests/serve_e2e.rs`, module `idle` (Linux only): starts the real binary as `serve --db` and as a one-node `serve --data-dir --bootstrap`, lets it settle for 2 s, then sums the context switches of all its threads over 10 s (sampled every 200 ms so a thread that exits mid-window still counts). Limits: `--db` under 5/s, `--data-dir` under 8/s. The rate is driven by timers, so it barely moves: across repeated runs, a CPU-starved `--cpus=2` with CPU hogs, and the whole test binary in parallel, `--db` stayed at 2.9-3.0/s and `--data-dir` at 5.2-5.8/s. Partial reverts measured in review all fail at least the `--db` limit:
+- `crates/graph-cli/tests/serve_e2e.rs`, module `idle` (Linux only): starts the real binary as `serve --db` and as a one-node `serve --data-dir --bootstrap`, lets it settle for 2 s, then sums the context switches of all its threads over 10 s (sampled every 200 ms so a thread that exits mid-window still counts). Limits: both under 1/s since issue #226 (0.0/s measured). Before #226 they were `--db` under 5/s and `--data-dir` under 8/s, and the numbers below are from that time, on openraft 0.9.25. The rate is driven by timers, so it barely moves: across repeated runs, a CPU-starved `--cpus=2` with CPU hogs, and the whole test binary in parallel, `--db` stayed at 2.9-3.0/s and `--data-dir` at 5.2-5.8/s. Partial reverts measured in review all fail at least the `--db` limit:
 
   | revert | `--db` | `--data-dir` |
   |---|---|---|
@@ -94,4 +118,4 @@ The [Docker guide](../guide/docker.md#idle-cpu-on-macos-docker-desktop) has the 
   | S1 and S2 | 6.7/s | 11.4/s |
   | 50 ms `--db` heartbeat (S3) | 26.3/s | (unchanged) |
   | before the fix (f04084d) | 50.5/s | 10.6/s |
-- `.github/workflows/docker.yml`, build job: runs the freshly built image as `serve --db /data/g.redb` on a named volume, waits for it to listen and for the health check's start period to pass, then `scripts/idle-cpu.sh <container> 20 5` (3.1/s measured; 5.6/s with S1 and S2 reverted, 39.8/s for the image before the fix).
+- `.github/workflows/docker.yml`, build job: runs the freshly built image as `serve --db /data/g.redb` on a named volume, waits for it to listen and for the health check's start period to pass, then `scripts/idle-cpu.sh <container> 20 1`: 0.1-0.2/s measured since #226 (0.2 when the window catches a health probe). Before #226 the limit was 5 (3.1/s measured; 5.6/s with S1 and S2 reverted, 39.8/s for the image before the fix).

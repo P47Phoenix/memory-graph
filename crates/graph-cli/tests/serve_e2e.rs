@@ -1149,11 +1149,26 @@ mod idle {
     /// room yet fails each partial revert measured in review: ticks never
     /// suspended (5.6/s), event-driven loops reverted (6.9/s), both (6.7/s),
     /// a 50 ms heartbeat (26/s).
+    ///
+    /// Since issue #226 openraft's tick loop parks while ticks are off
+    /// (the patched openraft in the workspace `Cargo.toml`), so that last
+    /// timer is gone too: this test measures 0.0/s (and the image 0.1/s,
+    /// its 30 s HEALTHCHECK). The limit is now 1/s. openraft 0.9.25's
+    /// polling tick loop alone fails it (3.0/s), and so should each partial
+    /// revert above. Measured on the patched openraft in review (#324),
+    /// `--db` / `--data-dir`:
+    /// - ticks never suspended: 4.3 / 8.2
+    /// - readiness re-check timer re-armed on a leader: 2.2 / 2.2
+    /// - snapshot policy back on its 1 s timer: 2.2 / 2.1
+    /// - both timers: 3.4 / 3.6
+    ///
+    /// An unconditional `set_service_status` and a 50 ms heartbeat now cost
+    /// nothing at idle: with ticks parked, nothing runs either.
     #[test]
     fn idle_serve_db_barely_wakes() {
         let d = tempfile::tempdir().unwrap();
         let server = Server::start(&d.path().join("g.redb"));
-        check("serve --db", server, 5.0);
+        check("serve --db", server, 1.0);
     }
 
     /// `serve --data-dir --bootstrap`, one node. Measured as above: 8.3/s
@@ -1163,6 +1178,10 @@ mod idle {
     /// as above, so 8/s (1.45x of room) fails ticks never suspended
     /// (11.0/s) and both S1 and S2 reverted (11.4/s); the event-driven loops
     /// alone (8.8/s) sit just over it.
+    ///
+    /// Since issue #226 (openraft's tick loop parks while ticks are off)
+    /// this measures 0.0/s, so the limit is 1/s, which also fails openraft
+    /// 0.9.25's polling tick loop (5.7/s).
     #[test]
     fn idle_serve_data_dir_barely_wakes() {
         let d = tempfile::tempdir().unwrap();
@@ -1175,7 +1194,7 @@ mod idle {
             // The test machine's free space is not what is being tested.
             .args(["--min-free-disk", "1"]);
         let server = Server::spawn(c, &dir.join("graph.redb"));
-        check("serve --data-dir", server, 8.0);
+        check("serve --data-dir", server, 1.0);
     }
 }
 

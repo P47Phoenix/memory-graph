@@ -147,9 +147,11 @@ jobs:
           [ "$ok" = 1 ]
           # Let the image's HEALTHCHECK leave its 1 s start interval (10 s
           # start period) so the window sees only the 30 s probe, then
-          # measure 20 s: about 3 wakeups/s after #205, about 40 before.
+          # measure 20 s: about 40 wakeups/s before #205, about 3 after it,
+          # 0.1-0.2/s since #226 (only the HEALTHCHECK probe is left; a 20 s
+          # window that catches one probe reads 0.2).
           sleep 12
-          sh scripts/idle-cpu.sh mg-idle 20 5
+          sh scripts/idle-cpu.sh mg-idle 20 1
 
   publish:
     # Both architectures, pushed to ghcr.io. Only this job may write packages,
