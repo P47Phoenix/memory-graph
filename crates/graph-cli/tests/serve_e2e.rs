@@ -1155,10 +1155,15 @@ mod idle {
     /// timer is gone too: this test measures 0.0/s (and the image 0.1/s,
     /// its 30 s HEALTHCHECK). The limit is now 1/s. openraft 0.9.25's
     /// polling tick loop alone fails it (3.0/s), and so should each partial
-    /// revert above. With ticks never suspended (S1) the patch does nothing,
-    /// so that stays near 5.6/s. With the event-driven loops reverted (S2),
-    /// minus the 3/s floor, it comes to about 3.9/s. Both are estimates,
-    /// not re-measured on the patched openraft.
+    /// revert above. Measured on the patched openraft in review (#324),
+    /// `--db` / `--data-dir`:
+    /// - ticks never suspended: 4.3 / 8.2
+    /// - readiness re-check timer re-armed on a leader: 2.2 / 2.2
+    /// - snapshot policy back on its 1 s timer: 2.2 / 2.1
+    /// - both timers: 3.4 / 3.6
+    ///
+    /// An unconditional `set_service_status` and a 50 ms heartbeat now cost
+    /// nothing at idle: with ticks parked, nothing runs either.
     #[test]
     fn idle_serve_db_barely_wakes() {
         let d = tempfile::tempdir().unwrap();
