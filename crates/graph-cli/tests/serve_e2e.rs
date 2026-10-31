@@ -1196,6 +1196,109 @@ mod idle {
         let server = Server::spawn(c, &dir.join("graph.redb"));
         check("serve --data-dir", server, 1.0);
     }
+
+    /// Voter ids of the cluster as `server` reports them.
+    fn voters(server: &str) -> Vec<u64> {
+        let o = run(&["--server", server, "cluster", "members", "--json"]);
+        if !o.status.success() {
+            return Vec::new();
+        }
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+        let mut ids: Vec<u64> = v["members"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|m| m["role"] == "voter")
+                    .filter_map(|m| m["node_id"].as_u64())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Issue #325: a node that grew to two voters and shrank back to a
+    /// sole voter gets back to (near) 0 wakeups/s, like one that has
+    /// always been alone. A stale `TickHold`, or a loop left on a timer
+    /// by the membership change, would show up only here. Ticks
+    /// suspending is read from node 1's own debug log (`raft ticks`,
+    /// `suspended: true`), the line `TickControl` prints on each change.
+    #[test]
+    fn idle_after_shrinking_back_to_a_sole_voter_barely_wakes() {
+        let d = tempfile::tempdir().unwrap();
+        let dir1 = d.path().join("n1");
+        let mut c = cmd();
+        c.arg("serve")
+            .arg("--data-dir")
+            .arg(&dir1)
+            .args(["--bootstrap", "--node-id", "1", "--min-free-disk", "1"])
+            .args(["--log-format", "json"])
+            .args(["--log-level", "info,graph_server::raft::node=debug"])
+            .arg("--listen")
+            .arg("127.0.0.1:0");
+        let s = start_serve(
+            c,
+            StartOptions {
+                echo_stderr: false,
+                ..StartOptions::default()
+            },
+        );
+        let log = s.stderr;
+        let n1 = Server {
+            child: s.child,
+            addr: s.addr,
+            db: dir1.join("graph.redb"),
+            start_line: s.start_lines.last().cloned().unwrap_or_default(),
+            lines: s.stdout,
+        };
+        let suspended = |l: &str| l.contains("raft ticks") && l.contains("\"suspended\":true");
+
+        let dir2 = d.path().join("n2");
+        let mut c = cmd();
+        c.arg("serve")
+            .arg("--data-dir")
+            .arg(&dir2)
+            .args(["--join", &n1.addr, "--auto-promote", "--node-id", "2"])
+            .args(["--min-free-disk", "1"]);
+        let n2 = Server::spawn(c, &dir2.join("graph.redb"));
+        wait_for("node 2 to become a voter", || voters(&n1.addr) == [1, 2]);
+        // Drop every line up to the growth; the suspension looked for is
+        // the one after the shrink.
+        while log.try_recv().is_ok() {}
+
+        let o = run(&[
+            "--server",
+            &n1.addr,
+            "--write-deadline",
+            "60s",
+            "cluster",
+            "remove",
+            "2",
+        ]);
+        assert!(o.status.success(), "cluster remove 2: {}", stderr(&o));
+        wait_for("node 1 to be the sole voter", || voters(&n1.addr) == [1]);
+        n2.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match log.recv_timeout(left) {
+                Ok(l) if suspended(&l) => break,
+                Ok(_) => {}
+                Err(e) => panic!("node 1 never suspended its ticks after the shrink: {e:?}"),
+            }
+        }
+        // The reader thread keeps draining node 1's stderr meanwhile.
+        check("serve --data-dir after a shrink", n1, 1.0);
+        drop(log);
+    }
 }
 
 /// ADR 0011 D3 / story 68: `--read-deadline` travels to the server as the

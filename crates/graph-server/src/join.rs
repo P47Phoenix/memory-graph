@@ -667,7 +667,10 @@ pub async fn remove_lost_self(
     let mut target = peer.to_string();
     let mut delay = Duration::from_millis(100);
     loop {
-        let attempt = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
+        // Each attempt is capped by the time left (issue #320), so a hung
+        // attempt never runs past the caller's deadline.
+        let per_attempt = ATTEMPT_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        let attempt = tokio::time::timeout(per_attempt, async {
             // A node-originated membership change. With auth on it is
             // marked forwarded, so the cluster secret carries the `write`
             // role (ADR 0012 D3), and a non-leader answers `NotLeader`,
@@ -728,7 +731,7 @@ pub async fn remove_lost_self(
             }
             Err(_) => {
                 target = peer.to_string();
-                format!("no answer within {ATTEMPT_TIMEOUT:?}")
+                format!("no answer within {per_attempt:?}")
             }
         };
         if Instant::now() + delay > deadline {
