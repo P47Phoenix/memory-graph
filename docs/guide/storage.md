@@ -24,7 +24,7 @@ memory-graph delete --org event-2026 --yes --compact          # a whole org, the
 - **Missing is a no-op.** Deleting an org or repo that does not exist changes nothing, prints `nothing to delete: ... not found` and exits 0, so a retry after a lost reply is safe. Deleting an empty repo (one pruned to 0 files, which `describe` lists as `0 files`) removes it.
 - **One transaction.** The delete is all or nothing; a crash leaves either the old state or the new one.
 - **Space.** Like a prune, a delete frees pages and dictionary terms but does not shrink the file. `--compact` then runs `vacuum` and rebuilds the file, as `vacuum --compact` does (needs free space for a full copy); on `--server` it runs the server's vacuum and `Admin.Compact`. `--compact` cannot be combined with `--dry-run`.
-- **Server and cluster.** `Write.Delete` needs the `write` role under auth, dry run included. Any node accepts it: a follower forwards it to the leader, and it replicates as one Raft entry that every node applies exactly once. A dry run is answered by the node it reaches. An older node would refuse the new entry and keep data the others deleted, so upgrade every node of a cluster before using `delete`.
+- **Server and cluster.** `Write.Delete` needs the `write` role under auth, dry run included. Any node accepts it: a follower forwards it to the leader, and it replicates as one Raft entry that every node applies exactly once. A dry run is answered by the node it reaches. The new entry raised the wire `PROTOCOL_VERSION` to 2: an older node would refuse the entry and keep data the others deleted, so a mixed cluster is refused instead. Upgrade every node, and the clients that talk to them, together.
 
 ## Schema 12: source encodings (upgrade notes)
 

@@ -1011,7 +1011,7 @@ So that orgs added by mistake or no longer useful stop showing in `describe` and
 - Given `--dry-run`, Then the repos, files, symbols and tokens that would go must be printed and nothing changed; given neither `--dry-run` nor `--yes`, Then the command must refuse with exit 1.
 - Given an org or repo that does not exist, Then the delete must be a no-op with empty stats and exit 0 (conformance `delete_missing`).
 - Given `--compact`, Then the space must be reclaimed as `vacuum --compact` does.
-- Given a cluster, When the delete is sent to a follower, Then it must be forwarded to the leader, replicate as one `LogCommand.Delete` applied exactly once on every node, and need the `write` role under auth (dry run included). A mixed-version cluster must not silently diverge on the new entry.
+- Given a cluster, When the delete is sent to a follower, Then it must be forwarded to the leader, replicate as one `LogCommand.Delete` applied exactly once on every node, and need the `write` role under auth (dry run included). The new entry bumps `PROTOCOL_VERSION` to 2, so a mixed-version cluster is refused rather than diverging.
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
 - **Language-agnostic by construction:** the schema uses a language tag plus a generic kind vocabulary with an optional language-specific kind string. Only extractors know about a language, and story 16 checks this by requiring zero schema, storage or query changes.

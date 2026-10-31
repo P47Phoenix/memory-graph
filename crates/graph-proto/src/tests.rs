@@ -1205,8 +1205,8 @@ proptest! {
 }
 
 #[test]
-fn protocol_version_is_one() {
-    assert_eq!(crate::PROTOCOL_VERSION, 1);
+fn protocol_version_is_two() {
+    assert_eq!(crate::PROTOCOL_VERSION, 2);
     assert_eq!(crate::STREAM_BATCH_NODES, 4096);
     assert_eq!(crate::RAFT_ENTRY_MAX_BYTES, 8 << 20);
 }
