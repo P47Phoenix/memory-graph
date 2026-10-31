@@ -29,9 +29,9 @@ use crate::{
 };
 use crate::{
     grain_accepts, kind_label, kind_matches, name_key, open_failed, validate_spans, BatchFile,
-    Grain, Hit, IndexOptions, IngestStats, Position, Query, RepoInfo, Scope, StoreError, SymbolHit,
-    SymbolQuery, Tally, CATALOG, CATALOG_VERSION, CHILDREN, META, NAMES, NODES, ORIGIN_DIRECTORY,
-    SYMBOLS,
+    DeleteStats, Grain, Hit, IndexOptions, IngestStats, Position, Query, RepoInfo, Scope,
+    StoreError, SymbolHit, SymbolQuery, Tally, CATALOG, CATALOG_VERSION, CHILDREN, META, NAMES,
+    NODES, ORIGIN_DIRECTORY, SYMBOLS,
 };
 use graph_core::{
     normalize_path, Extraction, Extractor, Node, NodeId, NodeKind, Registry, SymbolKind, TokenClass,
@@ -4637,22 +4637,7 @@ impl V2Store {
                         removed.push(f.name);
                         continue;
                     }
-                    let scope = Scope {
-                        org,
-                        repo,
-                        lang: f.language.as_deref().unwrap_or("unknown"),
-                        encoding: f.encoding.as_deref(),
-                        lossy: f.lossy,
-                    };
-                    w.remove_content(fid, &scope, &mut tally)?;
-                    tally.file(&scope, -1);
-                    w.nodes.remove(fid)?;
-                    if !legacy_writer() {
-                        w.file_keys.remove(fid)?;
-                    }
-                    w.names
-                        .remove(name_key(Some(repo_id), NodeKind::File, &f.name).as_str())?;
-                    w.children.remove(repo_id, fid)?;
+                    Self::remove_file_in(&mut w, &mut tally, org, repo, repo_id, fid, &f)?;
                     removed.push(f.name);
                 }
             }
@@ -4660,6 +4645,176 @@ impl V2Store {
         }
         removed.sort();
         Ok(removed)
+    }
+
+    /// Remove file `fid` (decoded as `f`) of repo `repo_id` (`org/repo`):
+    /// its content, entity row, compact keys row, name and containment
+    /// edge, with its catalog deltas into `tally`.
+    #[allow(clippy::too_many_arguments)]
+    fn remove_file_in(
+        w: &mut W<'_>,
+        tally: &mut Tally,
+        org: &str,
+        repo: &str,
+        repo_id: NodeId,
+        fid: NodeId,
+        f: &Node,
+    ) -> Result<()> {
+        let scope = Scope {
+            org,
+            repo,
+            lang: f.language.as_deref().unwrap_or("unknown"),
+            encoding: f.encoding.as_deref(),
+            lossy: f.lossy,
+        };
+        w.remove_content(fid, &scope, tally)?;
+        tally.file(&scope, -1);
+        w.nodes.remove(fid)?;
+        if !legacy_writer() {
+            w.file_keys.remove(fid)?;
+        }
+        w.names
+            .remove(name_key(Some(repo_id), NodeKind::File, &f.name).as_str())?;
+        w.children.remove(repo_id, fid)?;
+        Ok(())
+    }
+
+    /// [`Store::delete_scope`] plus the marker, in one transaction (which
+    /// commits even when there was nothing to delete, so the marker moves);
+    /// same marker rule as [`index_prepared_marked`](Self::index_prepared_marked).
+    pub fn delete_scope_marked(
+        &self,
+        org: &str,
+        repo: Option<&str>,
+        marker: RaftMarker,
+        membership: Option<&[u8]>,
+    ) -> Result<DeleteStats> {
+        let wt = self.db.begin_write()?;
+        Self::stamp_marker(&wt, marker, membership)?;
+        let stats = Self::delete_in(&wt, org, repo, false)?;
+        self.before_marked_commit(&marker)?;
+        wt.commit()?;
+        Ok(stats)
+    }
+
+    /// The body of [`Store::delete_scope`] inside the caller's transaction
+    /// (which the caller aborts for a dry run; nothing is written then).
+    fn delete_in(
+        wt: &redb::WriteTransaction,
+        org: &str,
+        repo: Option<&str>,
+        dry_run: bool,
+    ) -> Result<DeleteStats> {
+        if org.is_empty() || repo == Some("") {
+            return Err(StoreError::Rejected(
+                "org and repo must not be empty".into(),
+            ));
+        }
+        let mut stats = DeleteStats::default();
+        let mut w = W::new(wt)?;
+        let org_key = name_key(None, NodeKind::Org, org);
+        let Some(org_id) = w.names.get(org_key.as_str())?.map(|v| v.value()) else {
+            return Ok(stats);
+        };
+        let mut all: Vec<(NodeId, String)> = Vec::new();
+        let kids: Vec<NodeId> = w
+            .children
+            .get(org_id)?
+            .map(|v| v.map(|g| g.value()))
+            .collect::<std::result::Result<_, _>>()?;
+        for id in kids {
+            let n = dec(w
+                .nodes
+                .get(id)?
+                .ok_or_else(|| StoreError::Corrupt("dangling repo".into()))?
+                .value())?;
+            if n.kind == NodeKind::Repo {
+                all.push((id, n.name));
+            }
+        }
+        let targets: Vec<(NodeId, String)> = match repo {
+            Some(r) => all.iter().filter(|(_, n)| n == r).cloned().collect(),
+            None => all.clone(),
+        };
+        if repo.is_some() && targets.is_empty() {
+            return Ok(stats);
+        }
+        for (_, name) in &targets {
+            for (prefix, slot) in [
+                ("f", &mut stats.files),
+                ("s", &mut stats.symbols),
+                ("t", &mut stats.tokens),
+            ] {
+                let lo = format!("{prefix}\0{org}\0{name}\0");
+                let hi = format!("{prefix}\0{org}\0{name}\u{1}");
+                for row in w.cat.range(lo.as_str()..hi.as_str())? {
+                    *slot += row?.1.value();
+                }
+            }
+            stats.repos.push(name.clone());
+        }
+        stats.repos.sort();
+        stats.org_removed = targets.len() == all.len();
+        if dry_run {
+            return Ok(stats);
+        }
+        // The catalog rows of a deleted repo are swept below as a whole, so
+        // the per-file deltas are not needed.
+        let mut tally = Tally::default();
+        for (repo_id, name) in &targets {
+            let files: Vec<NodeId> = w
+                .children
+                .get(*repo_id)?
+                .map(|v| v.map(|g| g.value()))
+                .collect::<std::result::Result<_, _>>()?;
+            for fid in files {
+                let f = dec(w
+                    .nodes
+                    .get(fid)?
+                    .ok_or_else(|| StoreError::Corrupt("dangling file".into()))?
+                    .value())?;
+                Self::remove_file_in(&mut w, &mut tally, org, name, *repo_id, fid, &f)?;
+            }
+            w.nodes.remove(*repo_id)?;
+            w.names
+                .remove(name_key(Some(org_id), NodeKind::Repo, name).as_str())?;
+            w.children.remove(org_id, *repo_id)?;
+            // Every catalog row of the repo: `<x>\0org\0repo\0...` counters
+            // and the exact `r`/`l` rows.
+            let mut dead: Vec<String> = Vec::new();
+            for prefix in ["f", "e", "c", "s", "t", "k"] {
+                let lo = format!("{prefix}\0{org}\0{name}\0");
+                let hi = format!("{prefix}\0{org}\0{name}\u{1}");
+                for row in w.cat.range(lo.as_str()..hi.as_str())? {
+                    dead.push(row?.0.value().to_string());
+                }
+            }
+            dead.push(format!("r\0{org}\0{name}"));
+            dead.push(format!("l\0{org}\0{name}"));
+            for k in dead {
+                w.cat.remove(k.as_str())?;
+            }
+        }
+        drop(tally);
+        if stats.org_removed {
+            w.nodes.remove(org_id)?;
+            w.names.remove(org_key.as_str())?;
+        }
+        drop(w);
+        // An unfinished-batch marker for a deleted repo goes too, or a later
+        // index of the same repo would describe a stale open batch.
+        let open: Option<(String, String)> = {
+            let ob = wt.open_table(OPEN_BATCH)?;
+            let o = ob.get("org")?.map(|v| v.value().to_string());
+            let r = ob.get("repo")?.map(|v| v.value().to_string());
+            o.zip(r)
+        };
+        if let Some((o, r)) = open {
+            if o == org && stats.repos.contains(&r) {
+                Self::clear_open_batch(wt)?;
+            }
+        }
+        Ok(stats)
     }
 
     /// Write an extraction whose spans `validate_spans` accepted.
@@ -5144,6 +5299,16 @@ impl Store for V2Store {
         dry_run: bool,
     ) -> Result<Vec<String>> {
         V2Store::prune_files(self, org, repo, keep, dry_run)
+    }
+    fn delete_scope(&self, org: &str, repo: Option<&str>, dry_run: bool) -> Result<DeleteStats> {
+        let wt = self.db.begin_write()?;
+        let stats = Self::delete_in(&wt, org, repo, dry_run)?;
+        if dry_run {
+            wt.abort()?;
+        } else {
+            wt.commit()?;
+        }
+        Ok(stats)
     }
     fn vacuum(&self) -> Result<VacuumStats> {
         V2Store::vacuum(self)

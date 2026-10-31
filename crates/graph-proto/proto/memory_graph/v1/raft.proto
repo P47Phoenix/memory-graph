@@ -135,6 +135,13 @@ message LogCommand {
   message Vacuum {}
   // Blank/membership entries: nothing to apply, only the marker moves.
   message Noop {}
+  // `Store::delete_scope` (never a dry run), issue #323. An older node
+  // decodes it as an empty command and refuses it, so every node of a
+  // cluster must understand it (see `graph_proto::PROTOCOL_VERSION`).
+  message Delete {
+    string org = 1;
+    optional string repo = 2;
+  }
 
   oneof cmd {
     IndexChunk index_chunk = 1;
@@ -142,5 +149,6 @@ message LogCommand {
     Prune prune = 3;
     Vacuum vacuum = 4;
     Noop noop = 5;
+    Delete delete = 6;
   }
 }

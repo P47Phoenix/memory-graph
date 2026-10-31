@@ -17,7 +17,7 @@ For a replicated cluster (`serve --data-dir`), see the [cluster guide](cluster.m
 
 Every command takes `--server` in place of `--db` and prints byte for byte what it prints on the file (tested on the vendored corpus). `index --server` reads and sends the files; the server parses and commits them (the progress view shows `send` and `replicate: acked by leader N (idx K)` stages, and `--stats` an `rpc` row). Reads run while an index writes.
 
-Also over `--server`: `sysinfo` prints the server machine's report under `server <addr> node N (leader: M)`; `vacuum --compact` compacts the server's file; `health [--ready]` and `cluster status [--json]` / `cluster leader` report on the node.
+Also over `--server`: `sysinfo` prints the server machine's report under `server <addr> node N (leader: M)`; `vacuum --compact` compacts the server's file; `delete --org O [--repo R] --yes [--compact]` removes an org or repo through the leader ([storage](storage.md#deleting-an-org-or-a-repo)); `health [--ready]` and `cluster status [--json]` / `cluster leader` report on the node.
 
 ## Choosing the target
 

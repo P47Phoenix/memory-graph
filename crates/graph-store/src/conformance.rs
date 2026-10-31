@@ -77,6 +77,9 @@ pub const CASES: &[(&str, Case)] = &[
     ("symbol_language_filter", symbol_language_filter),
     ("describe_repo_filter", describe_repo_filter),
     ("describe_unknown_vs_empty", describe_unknown_vs_empty),
+    ("delete_repo", delete_repo),
+    ("delete_org", delete_org),
+    ("delete_missing", delete_missing),
     ("default_origin", default_origin),
     ("order_and_limit_determinism", order_and_limit_determinism),
     ("prune_empty_keep", prune_empty_keep),
@@ -1332,6 +1335,188 @@ fn describe_unknown_vs_empty(h: &Harness) {
     );
 }
 
+/// Issue #323 fixture: `a/r1` (rust symbols + a directory-run file),
+/// `a/r2`, `b/r1` (same repo name in another org) and `b/r3`.
+fn delete_seed(s: &dyn Store) {
+    for (o, r) in [("a", "r1"), ("a", "r2"), ("b", "r1"), ("b", "r3")] {
+        s.ingest_file(o, r, "lib.rs", "rust", &rust_extraction(RUST))
+            .unwrap();
+    }
+    s.index_bytes_with_origin("a", "r1", "d.txt", b"foo x", None, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+}
+
+/// Nothing of `org` (or of `org/repo`) is visible through any read.
+fn assert_gone(s: &dyn Store, org: &str, repo: Option<&str>) {
+    assert!(s.describe(Some(org), repo).unwrap().is_empty(), "describe");
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        s.describe_by_scan(None, None).unwrap(),
+        "catalog vs scan"
+    );
+    let visible = |o: &str, r: &str| o == org && repo.is_none_or(|x| x == r);
+    for info in s.describe(None, None).unwrap() {
+        assert!(!visible(&info.org, &info.repo), "{info:?}");
+    }
+    for grain in [Grain::Token, Grain::File, Grain::Repo, Grain::Org] {
+        let mut q = Query::new("foo");
+        q.grain = grain;
+        if grain == Grain::Org && repo.is_some() {
+            continue; // the org's other repos still answer at org grain
+        }
+        for h in s.search(&q).unwrap() {
+            let gone = h.org == org && repo.is_none_or(|x| h.repo.as_deref() == Some(x));
+            assert!(!gone, "search {grain:?}: {h:?}");
+        }
+        q.org = Some(org.into());
+        q.repo = repo.map(Into::into);
+        assert!(
+            s.search(&q).unwrap().is_empty(),
+            "filtered search {grain:?}"
+        );
+    }
+    for h in s.search_symbols(&SymbolQuery::new("*")).unwrap() {
+        assert!(!visible(&h.org, &h.repo), "symbols: {h:?}");
+    }
+    assert_eq!(
+        s.file_tokens(org, repo.unwrap_or("r1"), "lib.rs").unwrap(),
+        None
+    );
+    let org_node = s.roots().unwrap().into_iter().find(|n| n.name == org);
+    match (repo, org_node) {
+        (None, n) => assert!(n.is_none(), "org node left: {n:?}"),
+        (Some(r), Some(n)) => assert!(
+            s.children(n.id).unwrap().iter().all(|c| c.name != r),
+            "repo node left"
+        ),
+        (Some(_), None) => {}
+    }
+}
+
+/// Deleting one repo removes it (files of every origin, the repo node and
+/// its catalog rows) and nothing else; a dry run first reports the same
+/// counts and changes nothing.
+fn delete_repo(h: &Harness) {
+    let s = open(h);
+    delete_seed(&*s);
+    let before = s.describe(None, None).unwrap();
+    let info = s.describe(Some("a"), Some("r1")).unwrap().remove(0);
+    let dry = s.delete_scope("a", Some("r1"), true).unwrap();
+    assert_eq!(dry.repos, ["r1"]);
+    assert_eq!(dry.files, info.files as u64);
+    let lang = |f: fn(&crate::LanguageInfo) -> usize| -> u64 {
+        info.languages.values().map(|l| f(l) as u64).sum()
+    };
+    assert_eq!(dry.symbols, lang(|l| l.symbols));
+    assert_eq!(dry.tokens, lang(|l| l.tokens));
+    assert!(dry.symbols > 0 && dry.tokens > 0);
+    assert!(!dry.org_removed);
+    assert_eq!(
+        s.describe(None, None).unwrap(),
+        before,
+        "dry run changed nothing"
+    );
+    let done = s.delete_scope("a", Some("r1"), false).unwrap();
+    assert_eq!(done, dry, "dry run == real run");
+    assert_gone(&*s, "a", Some("r1"));
+    let after = s.describe(None, None).unwrap();
+    let keep: Vec<_> = before
+        .into_iter()
+        .filter(|i| !(i.org == "a" && i.repo == "r1"))
+        .collect();
+    assert_eq!(after, keep, "other repos untouched");
+    // `b/r1` (same repo name) still answers.
+    assert!(s.file_tokens("b", "r1", "lib.rs").unwrap().is_some());
+    let mut q = SymbolQuery::new("a");
+    q.org = Some("b".into());
+    assert_eq!(s.search_symbols(&q).unwrap().len(), 2);
+    // Re-indexing the deleted repo starts from empty.
+    s.index_bytes("a", "r1", "n.txt", b"foo", None).unwrap();
+    let d = s.describe(Some("a"), Some("r1")).unwrap();
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].files, 1);
+    assert!(!d[0].open_batch, "no stale open batch after a delete");
+    assert_eq!(d, s.describe_by_scan(Some("a"), Some("r1")).unwrap());
+}
+
+/// Deleting an org removes all its repos and the org node; deleting an
+/// org's last repo removes the org node too.
+fn delete_org(h: &Harness) {
+    let s = open(h);
+    delete_seed(&*s);
+    let b_before = s.describe(Some("b"), None).unwrap();
+    let dry = s.delete_scope("a", None, true).unwrap();
+    assert_eq!(dry.repos, ["r1", "r2"]);
+    assert_eq!(dry.files, 3);
+    assert!(dry.org_removed);
+    assert_eq!(s.roots().unwrap().len(), 2, "dry run changed nothing");
+    assert_eq!(s.delete_scope("a", None, false).unwrap(), dry);
+    assert_gone(&*s, "a", None);
+    assert_eq!(s.describe(Some("b"), None).unwrap(), b_before);
+    assert_eq!(s.count_nodes(NodeKind::Org).unwrap(), 1);
+    assert_eq!(s.count_nodes(NodeKind::Repo).unwrap(), 2);
+    assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 2);
+    // The last repo of `b`, one at a time.
+    assert!(!s.delete_scope("b", Some("r1"), false).unwrap().org_removed);
+    let last = s.delete_scope("b", Some("r3"), false).unwrap();
+    assert!(last.org_removed);
+    assert_gone(&*s, "b", None);
+    assert!(s.roots().unwrap().is_empty());
+    assert!(s.describe(None, None).unwrap().is_empty());
+    assert_eq!(s.count_nodes(NodeKind::Symbol).unwrap(), 0);
+    assert_eq!(s.count_nodes(NodeKind::Token).unwrap(), 0);
+}
+
+/// Deleting an org or repo that does not exist is a no-op with empty
+/// stats, not an error (so a retry or replay answers alike), dry run or
+/// not; so is deleting the same thing twice. A repo emptied by prune is
+/// still a repo and is deleted.
+fn delete_missing(h: &Harness) {
+    let s = open(h);
+    let empty = crate::DeleteStats::default();
+    for dry in [true, false] {
+        for (o, r) in [("", None), ("", Some("r")), ("o", Some(""))] {
+            assert!(
+                matches!(s.delete_scope(o, r, dry), Err(StoreError::Rejected(_))),
+                "empty {o:?}/{r:?}"
+            );
+        }
+        assert_eq!(s.delete_scope("nope", None, dry).unwrap(), empty);
+        assert_eq!(s.delete_scope("nope", Some("r"), dry).unwrap(), empty);
+    }
+    delete_seed(&*s);
+    let before = s.describe(None, None).unwrap();
+    for dry in [true, false] {
+        assert_eq!(s.delete_scope("nope", None, dry).unwrap(), empty);
+        assert_eq!(s.delete_scope("a", Some("nope"), dry).unwrap(), empty);
+        assert_eq!(
+            s.delete_scope("A", None, dry).unwrap(),
+            empty,
+            "case-sensitive"
+        );
+    }
+    assert_eq!(s.describe(None, None).unwrap(), before);
+    assert!(!s
+        .delete_scope("a", Some("r2"), false)
+        .unwrap()
+        .repos
+        .is_empty());
+    assert_eq!(
+        s.delete_scope("a", Some("r2"), false).unwrap(),
+        empty,
+        "twice"
+    );
+    // The issue's empty shell: a repo pruned to 0 files.
+    s.index_bytes_with_origin("c", "shell", "d.txt", b"x", None, Some(ORIGIN_DIRECTORY))
+        .unwrap();
+    s.prune_files("c", "shell", &HashSet::new(), false).unwrap();
+    assert_eq!(s.describe(Some("c"), None).unwrap().len(), 1);
+    let d = s.delete_scope("c", Some("shell"), false).unwrap();
+    assert_eq!((d.repos.len(), d.files, d.org_removed), (1, 0, true));
+    assert_gone(&*s, "c", None);
+    assert_eq!(s.delete_scope("c", None, false).unwrap(), empty);
+}
+
 fn default_origin(h: &Harness) {
     let s = open(h);
     let file_origin = |s: &dyn Store, p: &str| {
@@ -1778,12 +1963,19 @@ pub fn run_differential(a: &dyn Store, b: &dyn Store) {
         (Some("o1"), Some("r1")),
         (None, Some("r2")),
         (Some("zz"), None),
+        (Some("gone"), None),
+        (Some("o1"), Some("doomed")),
     ] {
         assert_eq!(
             a.describe(o, r).unwrap(),
             b.describe(o, r).unwrap(),
             "describe {o:?}/{r:?}"
         );
+    }
+    for s in [a, b] {
+        assert!(s.describe(Some("gone"), None).unwrap().is_empty());
+        assert!(s.describe(Some("o1"), Some("doomed")).unwrap().is_empty());
+        assert!(s.roots().unwrap().iter().all(|n| n.name != "gone"));
     }
     for k in [
         NodeKind::Org,
@@ -2028,6 +2220,17 @@ pub fn run_crash_rerun_differential(fresh: &dyn Store, crashed: &dyn Store) {
         crashed.prune_files("o", "r", &keep, false).unwrap()
     );
     same("after prune");
+    // Issue #323: deleting a repo (and with it its org) after the rerun
+    // leaves the crashed store equal to the fresh one too.
+    for s in [fresh, crashed] {
+        s.index_batch("side", "s", &good[..2], IndexOptions::default())
+            .unwrap();
+    }
+    assert_eq!(
+        fresh.delete_scope("side", Some("s"), false).unwrap(),
+        crashed.delete_scope("side", Some("s"), false).unwrap()
+    );
+    same("after delete");
     run_differential(fresh, crashed);
 }
 
@@ -2082,6 +2285,20 @@ fn differential_seed(s: &dyn Store) {
         )
         .unwrap();
     assert!(st.lossy);
+    // Issue #323: an org and a repo that were indexed and then deleted
+    // leave nothing behind on any backend or configuration.
+    for (o, r) in [("gone", "g1"), ("gone", "g2"), ("o1", "doomed")] {
+        s.index_bytes(o, r, "x.rs", b"fn foo() { bar(); }\n", Some("rust"))
+            .unwrap();
+    }
+    s.ingest_file("o1", "doomed", "y.rs", "rust", &rust_extraction(RUST))
+        .unwrap();
+    let d = s.delete_scope("gone", None, false).unwrap();
+    assert_eq!(d.repos, ["g1", "g2"]);
+    assert!(d.org_removed);
+    let d = s.delete_scope("o1", Some("doomed"), false).unwrap();
+    assert_eq!(d.repos, ["doomed"]);
+    assert!(!d.org_removed);
 }
 
 /// A batch re-index of unchanged bytes still refreshes the file's origin, in

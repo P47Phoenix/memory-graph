@@ -778,6 +778,31 @@ impl Store for RemoteStore {
         Ok(r.into_inner().removed)
     }
 
+    /// `Write.Delete` (issue #323); a follower forwards it to the leader. A
+    /// dry run is answered by the node it reaches, like a dry-run prune.
+    fn delete_scope(
+        &self,
+        org: &str,
+        repo: Option<&str>,
+        dry_run: bool,
+    ) -> Result<graph_store::DeleteStats> {
+        let req = pb::DeleteRequest {
+            org: org.into(),
+            repo: repo.map(Into::into),
+            dry_run,
+        };
+        let kind = if dry_run { Kind::Read } else { Kind::Write };
+        let r = self.run(self.conn.call(kind, |ch| {
+            let req = req.clone();
+            async move { write_client(ch).delete(req).await }
+        }))?;
+        let stats = r
+            .into_inner()
+            .stats
+            .ok_or_else(|| StoreError::Protocol("DeleteResponse.stats is missing".into()))?;
+        Ok(stats.into())
+    }
+
     /// #165: the cluster leader's gaps (`Store.ExtractorGaps`; a follower
     /// forwards the call): writes go to the leader, so its registry is the
     /// one that decides. A server without the RPC answers `Protocol`

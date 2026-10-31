@@ -424,6 +424,53 @@ impl pb::write_server::Write for WriteService {
         }
     }
 
+    async fn delete(
+        &self,
+        req: Request<pb::DeleteRequest>,
+    ) -> Result<Response<pb::DeleteResponse>, Status> {
+        if !req.get_ref().dry_run {
+            if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
+                forward_unary!(self, addr, delete, req);
+            }
+        }
+        let r = req.into_inner();
+        if r.org.is_empty() || r.repo.as_deref() == Some("") {
+            // The store's own refusal, before anything is logged.
+            return Err(graph_proto::store_error_to_status(
+                &graph_store::StoreError::Rejected("org and repo must not be empty".into()),
+            ));
+        }
+        if r.dry_run {
+            let stats = self
+                .ctx
+                .blocking(move |slot| {
+                    slot.with_store(|s| {
+                        graph_store::Store::delete_scope(s, &r.org, r.repo.as_deref(), true)
+                    })
+                })
+                .await?;
+            return Ok(Response::new(pb::DeleteResponse {
+                stats: Some(stats.into()),
+                forwarded_to_leader: false,
+                applied_index: 0,
+            }));
+        }
+        let (resp, applied_index) = self
+            .propose(Cmd::Delete(pb::log_command::Delete {
+                org: r.org,
+                repo: r.repo,
+            }))
+            .await?;
+        match resp {
+            LogResponse::Delete(stats) => Ok(Response::new(pb::DeleteResponse {
+                stats: Some(stats.into()),
+                forwarded_to_leader: false,
+                applied_index,
+            })),
+            other => Err(Status::internal(format!("Delete applied as {other:?}"))),
+        }
+    }
+
     async fn vacuum(
         &self,
         req: Request<pb::VacuumRequest>,
