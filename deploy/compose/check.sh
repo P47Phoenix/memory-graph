@@ -125,8 +125,18 @@ for q in "${QUERIES[@]}"; do
 done
 
 log "/metrics on every node"
+# Issue #308: the server always emits mg_raft_applied_index (0 before the
+# first apply), so a miss here was the old `curl | grep -q` pipeline: grep
+# exits on the first match, curl then fails writing the rest of the
+# document (exit 23), and `pipefail` failed the step. Fetch the whole
+# document first, then search it, retrying a transient fetch failure
+# within WAIT_SECS.
+has_applied_index() {
+  body=$(curl -fsS "http://127.0.0.1:$1/metrics") &&
+    grep -q '^mg_raft_applied_index ' <<<"$body"
+}
 for port in "$MG_METRICS_PORT_1" "$MG_METRICS_PORT_2" "$MG_METRICS_PORT_3"; do
-  curl -fsS "http://127.0.0.1:$port/metrics" | grep -q '^mg_raft_applied_index ' ||
+  wait_for "mg_raft_applied_index on :$port" has_applied_index "$port" ||
     { log "no mg_raft_applied_index on :$port"; exit 1; }
 done
 
