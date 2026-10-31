@@ -2173,6 +2173,30 @@ fn name_cache_answers_equal_the_walk() {
         s.vacuum().unwrap();
     }
     check("prune and vacuum");
+    // Issue #323: a delete invalidates the cache too. Query (so the cache
+    // holds the doomed names), delete, query again on the same handle.
+    for s in [&on, &off] {
+        let ext = span_ext(&[("doomedGetter", SymbolKind::Function, 0, 1)], &[]);
+        s.ingest_file("gone", "r", "e.x", "text", &ext).unwrap();
+    }
+    check("before delete");
+    assert!(rows(&on, "*get*", false)
+        .iter()
+        .any(|(_, n, _)| n == "doomedGetter"));
+    for s in [&on, &off] {
+        assert!(s.delete_scope("gone", None, false).unwrap().org_removed);
+    }
+    check("after delete");
+    for exact in [false, true] {
+        for p in ["*get*", "*Getter", "doomed*", "doomedGetter"] {
+            assert!(
+                rows(&on, p, exact)
+                    .iter()
+                    .all(|(_, n, _)| n != "doomedGetter"),
+                "{p} exact={exact}: a deleted symbol came back from the cache"
+            );
+        }
+    }
     // A bound below the cache's size evicts it; answers stay the same.
     on.set_name_cache_max_bytes(1);
     assert_eq!(on.name_cache_bytes(), (0, 0));

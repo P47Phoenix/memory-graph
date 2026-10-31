@@ -36,7 +36,10 @@ fn a_mismatched_version_header_is_refused_and_a_matching_one_passes() {
             matches!(WireError::from(&st), WireError::Protocol(ref m) if m.contains("version 99")),
             "{st:?}"
         );
-        client.snapshot_stats(call(Some("1"))).await.unwrap();
+        client
+            .snapshot_stats(call(Some(&graph_proto::PROTOCOL_VERSION.to_string())))
+            .await
+            .unwrap();
         client.snapshot_stats(call(None)).await.unwrap();
     });
 }

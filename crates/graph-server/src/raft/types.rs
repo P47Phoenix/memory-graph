@@ -92,6 +92,8 @@ pub enum LogResponse {
     /// `Prune`: the removed paths.
     Prune(Vec<String>),
     Vacuum(VacuumOutcome),
+    /// `Delete` (issue #323).
+    Delete(graph_store::DeleteStats),
     /// The entry's write was refused as a whole by the store (a validation
     /// error such as a NUL in a language: deterministic, so every replica
     /// refuses it the same way); nothing was written but the marker, which

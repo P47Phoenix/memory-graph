@@ -30,8 +30,8 @@
 //! `StoreError` and `BatchFile` (borrows its input) do not yet; the daemon
 //! story will add a wire form for them.
 use crate::{
-    BatchFile, ExtractorGap, Hit, IndexOptions, IngestStats, Query, RepoInfo, SpaceUsage,
-    StoreError, SymbolHit, SymbolQuery, VacuumStats,
+    BatchFile, DeleteStats, ExtractorGap, Hit, IndexOptions, IngestStats, Query, RepoInfo,
+    SpaceUsage, StoreError, SymbolHit, SymbolQuery, VacuumStats,
 };
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind};
 use std::collections::HashSet;
@@ -618,6 +618,16 @@ pub trait Store: StoreRead + Send + Sync {
         keep: &HashSet<String>,
         dry_run: bool,
     ) -> Result<Vec<String>>;
+
+    /// Delete `org/repo`, or with `repo = None` the whole of `org` (issue
+    /// #323): every file of the repo(s), whatever its origin, plus the repo
+    /// nodes, and the org node when the org is deleted or its last repo is.
+    /// The catalog is kept in step, so `describe` no longer lists them. With
+    /// `dry_run` nothing changes and the result says what would go. Deleting
+    /// an org or repo that does not exist is a no-op returning empty stats
+    /// (not an error), so a retry or replay answers the same. One write
+    /// transaction: all of it lands or none.
+    fn delete_scope(&self, org: &str, repo: Option<&str>, dry_run: bool) -> Result<DeleteStats>;
 
     /// Reclaim space left behind by replaced and pruned files: removes the
     /// dictionary terms nothing refers to any more (it does not compact the

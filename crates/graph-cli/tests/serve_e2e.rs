@@ -520,6 +520,85 @@ fn health_cluster_and_sysinfo() {
     assert_eq!(o.status.code(), Some(1), "after shutdown: {}", stdout(&o));
 }
 
+/// `delete` (issue #323) through `--server`: dry run, refusal without
+/// --yes, a repo, then the org with the server's own compact; the other
+/// org stays.
+#[test]
+fn delete_over_server() {
+    let d = tempfile::tempdir().unwrap();
+    let server = Server::start(&d.path().join("g.redb"));
+    let addr = server.addr.clone();
+    for (org, repo) in [("acme", "a"), ("acme", "b"), ("keep", "a")] {
+        let src = d.path().join(format!("{org}-{repo}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), format!("fn {org}_{repo}() {{}}\n")).unwrap();
+        ok(&[
+            "--server",
+            &addr,
+            "index",
+            "--org",
+            org,
+            "--repo",
+            repo,
+            src.to_str().unwrap(),
+        ]);
+    }
+    let repos = || -> Vec<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(&ok(&["--server", &addr, "describe", "--json"])).unwrap();
+        v["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}/{}",
+                    r["org"].as_str().unwrap(),
+                    r["repo"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    assert_eq!(repos(), ["acme/a", "acme/b", "keep/a"]);
+    let o = run(&["--server", &addr, "delete", "--org", "acme"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("without --yes"), "{}", stderr(&o));
+    let dry = ok(&["--server", &addr, "delete", "--org", "acme", "--dry-run"]);
+    assert!(
+        dry.contains("would delete org acme: 2 repos (a, b), 2 files, 2 symbols"),
+        "{dry}"
+    );
+    assert_eq!(repos(), ["acme/a", "acme/b", "keep/a"]);
+    let out = ok(&[
+        "--server", &addr, "delete", "--org", "acme", "--repo", "a", "--yes",
+    ]);
+    assert!(
+        out.contains("deleted acme/a: 1 repos (a), 1 files"),
+        "{out}"
+    );
+    assert_eq!(repos(), ["acme/b", "keep/a"]);
+    let out = ok(&[
+        "--server",
+        &addr,
+        "delete",
+        "--org",
+        "acme",
+        "--yes",
+        "--compact",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["deleted"]["repos"], serde_json::json!(["b"]));
+    assert_eq!(v["deleted"]["org_removed"], true);
+    assert!(v["compact"]["after_bytes"].is_u64(), "{out}");
+    assert_eq!(repos(), ["keep/a"]);
+    let sym = ok(&["--server", &addr, "symbols", "*", "--json"]);
+    assert!(!sym.contains("acme") && sym.contains("keep_a"), "{sym}");
+    let out = ok(&["--server", &addr, "delete", "--org", "acme", "--yes"]);
+    assert!(out.contains("nothing to delete"), "{out}");
+    server.shutdown();
+}
+
 /// `serve --worker-threads 2` (issue #205) starts and serves writes and
 /// reads; the env var works too; 0 is refused before anything opens.
 #[test]

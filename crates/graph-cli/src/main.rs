@@ -832,6 +832,32 @@ enum Cmd {
         #[arg(long)]
         compact: bool,
     },
+    /// Delete a repo (`--org O --repo R`) or a whole org and every repo in it (`--org O`): its files,
+    /// symbols and tokens, the repo node(s), and the org node when the org is deleted or its last repo
+    /// is. Needs `--yes` (or `--dry-run` to only print what would go). Deleting an org or repo that does
+    /// not exist changes nothing and exits 0. Works on --db and --server (a cluster follower forwards
+    /// it to the leader; `write` role under auth)
+    Delete {
+        /// The org to delete (or the org of `--repo`); names are case-sensitive, as indexed
+        #[arg(long)]
+        org: String,
+        /// Only this repo of the org; without it the whole org is deleted
+        #[arg(long)]
+        repo: Option<String>,
+        /// Print the repos, files, symbols and tokens that would be removed, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm the delete (required unless --dry-run)
+        #[arg(long)]
+        yes: bool,
+        /// Afterwards, reclaim the space as `vacuum --compact` does (on --server, the server's own
+        /// vacuum and `Admin.Compact`)
+        #[arg(long, conflicts_with = "dry_run")]
+        compact: bool,
+        /// Print JSON (the counts, `dry_run` and, with --compact, the file sizes) instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Show what is indexed: per repo, the languages present and each language's symbol kinds
     Describe {
         /// Only repos of this org
@@ -2550,6 +2576,91 @@ fn run() -> Result<i32> {
                     cst.before_bytes,
                     cst.after_bytes
                 );
+            }
+        }
+        Cmd::Delete {
+            org,
+            repo,
+            dry_run,
+            yes,
+            compact,
+            json,
+        } => {
+            let scope = match &repo {
+                Some(r) => format!("{org}/{r}"),
+                None => format!("org {org}"),
+            };
+            if !dry_run && !yes {
+                bail!(
+                    "refusing to delete {scope} without --yes (run with --dry-run to see what would be removed)"
+                );
+            }
+            let (st, cst) = match &target {
+                Target::Remote { addr, read } => {
+                    let s = remote(addr, *read, overrides)?;
+                    let st = s.delete_scope(&org, repo.as_deref(), dry_run)?;
+                    let cst = if compact {
+                        s.vacuum()?;
+                        Some(s.admin_compact()?)
+                    } else {
+                        None
+                    };
+                    (st, cst)
+                }
+                Target::Embedded(db) => {
+                    if !db.is_file() {
+                        bail!("database `{}` does not exist", db.display());
+                    }
+                    let s = graph_cli::target::open_embedded(db, || open_v2(db, overrides))
+                        .with_context(|| format!("opening database `{}`", db.display()))?;
+                    let st = s.delete_scope(&org, repo.as_deref(), dry_run)?;
+                    let cst = if compact {
+                        s.vacuum()?;
+                        Some(s.compact()?.1)
+                    } else {
+                        None
+                    };
+                    (st, cst)
+                }
+            };
+            if json {
+                let mut v = serde_json::json!({ "dry_run": dry_run, "deleted": st });
+                if let Some(c) = cst {
+                    v["compact"] = serde_json::json!({
+                        "before_bytes": c.before_bytes,
+                        "after_bytes": c.after_bytes,
+                    });
+                }
+                out!("{}", serde_json::to_string(&v)?);
+            } else if st.repos.is_empty() && !st.org_removed {
+                out!("nothing to delete: {scope} not found");
+            } else {
+                let verb = if dry_run { "would delete" } else { "deleted" };
+                out!(
+                    "{verb} {scope}: {} repos ({}), {} files, {} symbols, {} tokens",
+                    st.repos.len(),
+                    st.repos.join(", "),
+                    st.files,
+                    st.symbols,
+                    st.tokens
+                );
+                if st.org_removed {
+                    let verb = if dry_run {
+                        "would be removed"
+                    } else {
+                        "removed"
+                    };
+                    out!("org {org} {verb}");
+                }
+            }
+            if let Some(cst) = cst {
+                if !json {
+                    out!(
+                        "compact: {} bytes -> {} bytes",
+                        cst.before_bytes,
+                        cst.after_bytes
+                    );
+                }
             }
         }
         Cmd::Describe { org, repo, json } => {

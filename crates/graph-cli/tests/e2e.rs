@@ -1245,6 +1245,169 @@ fn cache_bytes_flag() {
     assert!(ok && out.contains("o/p"), "{out}{err}");
 }
 
+/// `delete` (issue #323) on --db: the refusal without --yes, --dry-run,
+/// a repo delete, an org delete with --compact, and a missing target.
+#[test]
+fn delete_org_and_repo() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g").to_string_lossy().into_owned();
+    for (org, repo) in [("acme", "a"), ("acme", "b"), ("other", "a")] {
+        let root = d.path().join(format!("{org}-{repo}"));
+        std::fs::create_dir_all(&root).unwrap();
+        // `other/a` is small and `acme` large (redb rebuilds a file to no less than a few MiB), so deleting `acme` frees most of the file.
+        let n = if org == "other" { 1 } else { 200 };
+        for i in 0..n {
+            let body: String = (0..30)
+                .map(|j| format!("fn {org}_{repo}_{i}_{j}_{}() {{}}\n", "y".repeat(20)))
+                .collect();
+            std::fs::write(root.join(format!("f{i}.rs")), body).unwrap();
+        }
+        let (ok, out, err) = run(&[
+            "--db",
+            &db,
+            "index",
+            "--org",
+            org,
+            "--repo",
+            repo,
+            root.to_str().unwrap(),
+        ]);
+        assert!(ok, "{out}{err}");
+    }
+    let describe = || {
+        let (ok, out, err) = run(&["--db", &db, "describe", "--json"]);
+        assert!(ok, "{err}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        v["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}/{}",
+                    r["org"].as_str().unwrap(),
+                    r["repo"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(describe(), ["acme/a", "acme/b", "other/a"]);
+
+    // No --yes: refused, nothing changes.
+    let (ok, out, err) = run(&["--db", &db, "delete", "--org", "acme", "--repo", "a"]);
+    assert!(!ok, "{out}");
+    assert!(err.contains("without --yes"), "{err}");
+    assert_eq!(describe(), ["acme/a", "acme/b", "other/a"]);
+    // --compact makes no sense with --dry-run (a usage error).
+    let (ok, _, _) = run(&[
+        "--db",
+        &db,
+        "delete",
+        "--org",
+        "acme",
+        "--dry-run",
+        "--compact",
+    ]);
+    assert!(!ok);
+
+    // --dry-run reports the counts and changes nothing.
+    let (ok, out, err) = run(&[
+        "--db",
+        &db,
+        "delete",
+        "--org",
+        "acme",
+        "--repo",
+        "a",
+        "--dry-run",
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("would delete acme/a: 1 repos (a), 200 files, 6000 symbols"),
+        "{out}"
+    );
+    let (ok, out, _) = run(&[
+        "--db",
+        &db,
+        "delete",
+        "--org",
+        "acme",
+        "--repo",
+        "a",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["deleted"]["files"], 200);
+    assert_eq!(v["deleted"]["org_removed"], false);
+    assert_eq!(describe(), ["acme/a", "acme/b", "other/a"]);
+
+    // A repo.
+    let (ok, out, err) = run(&[
+        "--db", &db, "delete", "--org", "acme", "--repo", "a", "--yes",
+    ]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("deleted acme/a: 1 repos (a), 200 files"),
+        "{out}"
+    );
+    assert!(!out.contains("org acme removed"), "{out}");
+    assert_eq!(describe(), ["acme/b", "other/a"]);
+
+    // The org, with --compact: the file shrinks.
+    let before = std::fs::metadata(&db).unwrap().len();
+    let (ok, out, err) = run(&["--db", &db, "delete", "--org", "acme", "--yes", "--compact"]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("deleted org acme: 1 repos (b), 200 files"),
+        "{out}"
+    );
+    assert!(out.contains("org acme removed"), "{out}");
+    assert!(out.contains("compact:"), "{out}");
+    let after = std::fs::metadata(&db).unwrap().len();
+    assert!(after < before, "before={before} after={after}");
+    assert_eq!(describe(), ["other/a"]);
+    for q in ["acme_a_0_0", "acme_b_0_0"] {
+        let tok = format!("{q}_{}", "y".repeat(20));
+        let (ok, out, _) = run(&["--db", &db, "search", &tok, "--json"]);
+        assert!(ok);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["results"].as_array().unwrap().is_empty(), "{out}");
+        let (ok, out, _) = run(&["--db", &db, "symbols", &tok, "--json"]);
+        assert!(ok, "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["results"].as_array().unwrap().is_empty(), "{out}");
+    }
+    let tok = format!("other_a_0_0_{}", "y".repeat(20));
+    let (ok, out, _) = run(&["--db", &db, "search", &tok, "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["results"].as_array().unwrap().len(),
+        1,
+        "other org untouched"
+    );
+
+    // Missing: a no-op, exit 0.
+    let (ok, out, err) = run(&["--db", &db, "delete", "--org", "acme", "--yes"]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("nothing to delete: org acme not found"),
+        "{out}"
+    );
+    let (ok, out, _) = run(&[
+        "--db", &db, "delete", "--org", "other", "--repo", "zz", "--yes",
+    ]);
+    assert!(ok);
+    assert!(
+        out.contains("nothing to delete: other/zz not found"),
+        "{out}"
+    );
+    assert_eq!(describe(), ["other/a"]);
+}
+
 /// `vacuum --compact` (ADR 0003 story 3, slice 3f): works end to end and
 /// does not change query results.
 #[test]

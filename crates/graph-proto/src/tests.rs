@@ -1205,8 +1205,8 @@ proptest! {
 }
 
 #[test]
-fn protocol_version_is_one() {
-    assert_eq!(crate::PROTOCOL_VERSION, 1);
+fn protocol_version_is_two() {
+    assert_eq!(crate::PROTOCOL_VERSION, 2);
     assert_eq!(crate::STREAM_BATCH_NODES, 4096);
     assert_eq!(crate::RAFT_ENTRY_MAX_BYTES, 8 << 20);
 }
@@ -1236,7 +1236,7 @@ fn rpc_paths_match_the_proto_files() {
     let got: std::collections::BTreeSet<String> =
         crate::rpc_paths().iter().map(|s| s.to_string()).collect();
     assert_eq!(got, want);
-    assert_eq!(got.len(), 45, "18 Admin + 3 Raft + 19 Store + 5 Write");
+    assert_eq!(got.len(), 46, "18 Admin + 3 Raft + 19 Store + 6 Write");
 }
 
 /// ADR 0007 C8: an encoding hint that is not a usable label is a protocol

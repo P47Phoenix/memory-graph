@@ -308,6 +308,15 @@ message VacuumStats {
   uint64 terms_kept = 2;
 }
 
+// graph_store::DeleteStats.
+message DeleteStats {
+  repeated string repos = 1;
+  uint64 files = 2;
+  uint64 symbols = 3;
+  uint64 tokens = 4;
+  bool org_removed = 5;
+}
+
 // graph_store::CompactStats.
 message CompactStats {
   uint64 before_bytes = 1;

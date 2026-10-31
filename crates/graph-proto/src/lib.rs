@@ -40,8 +40,16 @@ pub use version::{check_version, CheckVersion, SendVersion, PROTOCOL_VERSION_HEA
 
 /// The protocol version exchanged in `Store.Hello`. A server refuses any
 /// other value with `FAILED_PRECONDITION` and a `Protocol` detail (ADR 0004
-/// D1); a breaking change bumps this and the package (`v2`).
-pub const PROTOCOL_VERSION: u32 = 1;
+/// D1); a breaking change of the messages bumps this and the package
+/// (`v2`).
+///
+/// 2 (issue #323): the `LogCommand.Delete` entry and `Write.Delete`. The
+/// messages are unchanged, so the package stays `v1`, but a version-1 node
+/// would decode a `Delete` entry as an empty command and refuse it, keeping
+/// data every other replica deleted. The bump makes the peers' Raft RPCs,
+/// join and `Hello` refuse a mixed-version cluster instead: upgrade every
+/// node (and the clients that talk to it) together.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The number of nodes per `NodeBatch` on a server stream (`Descendants`,
 /// `FileTokens`).
