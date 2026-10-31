@@ -328,6 +328,6 @@ Acceptance per story:
 - **Q6.** For `Write.Index` streams, check each file as it arrives against the current policy set (recommended, D6; batches committed before a denied file stay), or require the stream to declare its `(org, repo)` up front and refuse any file outside it?
 - **Q7.** With `--auth-policies`, a token known only to the follower is refused at the leader (D7), which narrows ADR 0012's rotation-skew rule. Accept that (recommended), or keep honouring follower-only tokens?
 - **Q8.** Existing org names containing `/` can be granted only through `Org::` or wildcard policies (D1). Is a startup warning enough (recommended), or should the indexer refuse `/` in org names from now on?
-- **Q9.** Is the interim PR 1 rule (no resource-constrained read permits until PR 3) acceptable, or should PR 1 wait for PR 3?
+- **Q9.** Is the interim PR 1 rule (no resource-constrained read/search permits or forbids until PR 3, so reads are all-or-nothing per principal, and only the follower evaluates policies on forwarded writes until PR 2) acceptable, or should PR 1 wait for PR 3?
 - **Q10.** Approve stories 71, 71a, 72, 73a, 73b, 73c and 74, their points and acceptance lists, for the epic, and the PR breakdown?
 
