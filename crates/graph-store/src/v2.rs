@@ -628,7 +628,8 @@ pub struct V2Snapshot {
     generation: Option<u64>,
     tracker: SharedSnapshotTracker,
     tracker_id: u64,
-    created_at: Instant,
+    /// A `Cell` only so [`V2Snapshot::backdate_for_test`] can move it back.
+    created_at: Cell<Instant>,
     max_age: Duration,
     /// Set once the 50%-of-max-age warning has fired for this handle, so it
     /// logs at most once per snapshot rather than once per read.
@@ -649,6 +650,28 @@ impl Drop for V2Snapshot {
 }
 
 impl V2Snapshot {
+    /// Test-only (issue #322): makes this handle `by` older than it is, so a
+    /// test can put it past the 50%-age warning (or past expiry) without
+    /// sleeping on the wall clock, which a loaded runner can overshoot. Also
+    /// moves its entry in the store's tracker, so `snapshot_stats` agrees.
+    /// Panics if the platform clock cannot represent the earlier instant.
+    #[doc(hidden)]
+    pub fn backdate_for_test(&self, by: Duration) {
+        let earlier = self
+            .created_at
+            .get()
+            .checked_sub(by)
+            .expect("backdate_for_test: instant underflow");
+        self.created_at.set(earlier);
+        let mut t = self
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = t.open.get_mut(&self.tracker_id) {
+            *at = earlier;
+        }
+    }
+
     /// Checked at the top of every `StoreRead` method (see the
     /// `store_read!` macro): a snapshot past `max_age` refuses the read with
     /// `SnapshotExpired` rather than only checking once, at `snapshot()`
@@ -659,7 +682,7 @@ impl V2Snapshot {
     /// having one. A snapshot that has passed 50% of its max age (but not
     /// yet expired) logs one warning, per ADR 0003 Q6.
     fn check_not_expired(&self) -> Result<()> {
-        let age = self.created_at.elapsed();
+        let age = self.created_at.get().elapsed();
         if age >= self.max_age {
             return Err(StoreError::SnapshotExpired {
                 age_secs: age.as_secs(),
@@ -5010,7 +5033,7 @@ impl V2Store {
             generation,
             tracker: Arc::clone(&self.snapshot_tracker),
             tracker_id,
-            created_at,
+            created_at: Cell::new(created_at),
             max_age: self.max_snapshot_age,
             warned: Cell::new(false),
         })
@@ -5047,7 +5070,7 @@ impl Store for V2Store {
             generation,
             tracker: Arc::clone(&self.snapshot_tracker),
             tracker_id,
-            created_at,
+            created_at: Cell::new(created_at),
             max_age: self.max_snapshot_age,
             warned: Cell::new(false),
         }))
