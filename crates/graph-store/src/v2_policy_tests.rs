@@ -752,6 +752,38 @@ fn batch_id_is_monotonic_and_does_not_collide_across_a_store_reopen() {
 /// `open_batch: true` for that org/repo, and self-heals -- a normal
 /// completing batch for the same org/repo afterward clears it again, with no
 /// repair command needed, matching the ADR's "self-healing" description.
+/// Issue #323: deleting a repo whose batch crashed clears the open-batch
+/// marker, so indexing the repo again does not report a stale open batch;
+/// deleting another repo leaves the marker alone.
+#[test]
+fn delete_clears_the_open_batch_marker_of_the_deleted_repo() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("s.redb");
+    let srcs: Vec<String> = ["aaaaaaaaaa", "bbbbbbbbbb", "BADcccccc!", "dddddddddd"]
+        .map(String::from)
+        .to_vec();
+    let ps = paths(4, "p");
+    let mut s = V2Store::open(&p).unwrap();
+    s.register(Box::new(Poison));
+    s.set_chunk_bytes(20);
+    s.index_bytes("o", "other", "x.txt", b"x", None).unwrap();
+    assert!(
+        V2Store::index_batch(&s, "o", "r", &batch(&srcs, &ps), IndexOptions::default()).is_err()
+    );
+    let open = |s: &V2Store| {
+        s.describe(Some("o"), Some("r"))
+            .unwrap()
+            .first()
+            .is_some_and(|i| i.open_batch)
+    };
+    assert!(open(&s), "the crash left the marker");
+    Store::delete_scope(&s, "o", Some("other"), false).unwrap();
+    assert!(open(&s), "another repo's delete keeps it");
+    Store::delete_scope(&s, "o", Some("r"), false).unwrap();
+    s.index_bytes("o", "r", "n.txt", b"foo", None).unwrap();
+    assert!(!open(&s), "no stale open batch after the delete");
+}
+
 #[test]
 fn describe_reports_open_batch_after_a_crash_and_clears_it_after_a_completed_batch() {
     let d = tempfile::tempdir().unwrap();

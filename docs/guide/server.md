@@ -17,7 +17,7 @@ For a replicated cluster (`serve --data-dir`), see the [cluster guide](cluster.m
 
 Every command takes `--server` in place of `--db` and prints byte for byte what it prints on the file (tested on the vendored corpus). `index --server` reads and sends the files; the server parses and commits them (the progress view shows `send` and `replicate: acked by leader N (idx K)` stages, and `--stats` an `rpc` row). Reads run while an index writes.
 
-Also over `--server`: `sysinfo` prints the server machine's report under `server <addr> node N (leader: M)`; `vacuum --compact` compacts the server's file; `health [--ready]` and `cluster status [--json]` / `cluster leader` report on the node.
+Also over `--server`: `sysinfo` prints the server machine's report under `server <addr> node N (leader: M)`; `vacuum --compact` compacts the server's file; `delete --org O [--repo R] --yes [--compact]` removes an org or repo through the leader ([storage](storage.md#deleting-an-org-or-a-repo)); `health [--ready]` and `cluster status [--json]` / `cluster leader` report on the node.
 
 ## Choosing the target
 
@@ -44,7 +44,7 @@ A served file opened directly waits up to 5 s for the lock (`MEMORY_GRAPH_LOCK_W
 | 1 | Failure (and `health`: not serving; a read whose server is unreachable or whose connection was lost) |
 | 3 | `cluster leader` found no leader |
 | 4 | A write was not acknowledged within its deadline (`--write-deadline`, default 10 s of retries): no leader, the server unreachable, or the connection lost mid-write; or a `--read linearizable` read that found no leader within `--read-deadline` |
-| 5 | The server speaks another protocol or store format version |
+| 5 | The server speaks another protocol or store format version, or lacks a capability the command needs (`delete` against a server older than issue #323) |
 | 6 | A data directory (or a node named in a membership change) belongs to another cluster (`WrongCluster`) |
 | 7 | `serve` refused its OpenTelemetry settings (an `https://` or malformed `--otlp-endpoint` / `otlp-endpoint`, a bad `--otlp-signals`) or could not build the exporters (`TELEMETRY_CONFIG`, [ADR 0009](../adr/0009-opentelemetry.md)). A problem in an `OTEL_*` environment variable is not fatal: it logs one error and `serve` runs with OpenTelemetry off |
 

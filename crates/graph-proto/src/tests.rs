@@ -1236,7 +1236,7 @@ fn rpc_paths_match_the_proto_files() {
     let got: std::collections::BTreeSet<String> =
         crate::rpc_paths().iter().map(|s| s.to_string()).collect();
     assert_eq!(got, want);
-    assert_eq!(got.len(), 45, "18 Admin + 3 Raft + 19 Store + 5 Write");
+    assert_eq!(got.len(), 46, "18 Admin + 3 Raft + 19 Store + 6 Write");
 }
 
 /// ADR 0007 C8: an encoding hint that is not a usable label is a protocol

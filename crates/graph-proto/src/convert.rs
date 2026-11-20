@@ -9,8 +9,9 @@
 use crate::pb;
 use graph_core::{Extraction, Node, NodeKind, Span, SymbolDecl, SymbolKind, TokenClass, TokenDecl};
 use graph_store::{
-    BatchFile, CompactStats, Grain, Hit, IndexOptions, IngestStats, LanguageInfo, Page, Position,
-    Query, RepoInfo, SnapshotStats, StoreError, SymbolHit, SymbolQuery, VacuumStats,
+    BatchFile, CompactStats, DeleteStats, Grain, Hit, IndexOptions, IngestStats, LanguageInfo,
+    Page, Position, Query, RepoInfo, SnapshotStats, StoreError, SymbolHit, SymbolQuery,
+    VacuumStats,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -649,6 +650,30 @@ impl TryFrom<pb::VacuumStats> for VacuumStats {
             terms_removed: to_usize("VacuumStats.terms_removed", s.terms_removed)?,
             terms_kept: to_usize("VacuumStats.terms_kept", s.terms_kept)?,
         })
+    }
+}
+
+impl From<DeleteStats> for pb::DeleteStats {
+    fn from(s: DeleteStats) -> Self {
+        pb::DeleteStats {
+            repos: s.repos,
+            files: s.files,
+            symbols: s.symbols,
+            tokens: s.tokens,
+            org_removed: s.org_removed,
+        }
+    }
+}
+
+impl From<pb::DeleteStats> for DeleteStats {
+    fn from(s: pb::DeleteStats) -> Self {
+        DeleteStats {
+            repos: s.repos,
+            files: s.files,
+            symbols: s.symbols,
+            tokens: s.tokens,
+            org_removed: s.org_removed,
+        }
     }
 }
 

@@ -67,7 +67,8 @@ message HelloResponse {
   string cluster_id = 8;
   // Optional features this server supports, so a newer client can refuse
   // a request an older server would misread. `symbol_infix`: infix and
-  // suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6).
+  // suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6). `delete`:
+  // `Write.Delete` (issue #323); a client refuses `delete` without it.
   repeated string capabilities = 9;
   // ADR 0012 D7: the server checks bearer tokens. An unauthenticated
   // `Hello` to such a server answers only `protocol_version` and this

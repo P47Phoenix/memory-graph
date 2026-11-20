@@ -52,8 +52,8 @@ pub(crate) use common::{
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
 pub use pattern::{
-    parse_symbol_pattern, SymbolPattern, CAPABILITY_SYMBOL_INFIX, MAX_NEEDLE_BYTES,
-    MIN_NEEDLE_BYTES,
+    parse_symbol_pattern, SymbolPattern, CAPABILITY_DELETE, CAPABILITY_SYMBOL_INFIX,
+    MAX_NEEDLE_BYTES, MIN_NEEDLE_BYTES,
 };
 /// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
 #[doc(hidden)]
@@ -588,6 +588,24 @@ pub struct IngestStats {
     /// span. Omitted from JSON when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_warning: Option<String>,
+}
+
+/// What [`Store::delete_scope`] removed (or, for a dry run, would remove;
+/// issue #323). All zero / empty when the org or repo does not exist: a
+/// delete of something absent is a no-op, not an error, so a retried or
+/// replayed delete answers the same way.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteStats {
+    /// The repos removed, sorted by name.
+    pub repos: Vec<String>,
+    /// Files, symbols and tokens removed across those repos (from the
+    /// catalog, the same counts `describe` reported for them).
+    pub files: u64,
+    pub symbols: u64,
+    pub tokens: u64,
+    /// The org node was removed: the whole org was deleted, or its last
+    /// repo was.
+    pub org_removed: bool,
 }
 
 /// What the test modules below reach through `use super::*`.

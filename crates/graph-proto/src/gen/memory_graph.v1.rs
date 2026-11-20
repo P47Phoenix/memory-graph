@@ -377,6 +377,20 @@ pub struct VacuumStats {
     #[prost(uint64, tag = "2")]
     pub terms_kept: u64,
 }
+/// graph_store::DeleteStats.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteStats {
+    #[prost(string, repeated, tag = "1")]
+    pub repos: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "2")]
+    pub files: u64,
+    #[prost(uint64, tag = "3")]
+    pub symbols: u64,
+    #[prost(uint64, tag = "4")]
+    pub tokens: u64,
+    #[prost(bool, tag = "5")]
+    pub org_removed: bool,
+}
 /// graph_store::CompactStats.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactStats {
@@ -883,7 +897,8 @@ pub struct HelloResponse {
     pub cluster_id: ::prost::alloc::string::String,
     /// Optional features this server supports, so a newer client can refuse
     /// a request an older server would misread. `symbol_infix`: infix and
-    /// suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6).
+    /// suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6). `delete`:
+    /// `Write.Delete` (issue #323); a client refuses `delete` without it.
     #[prost(string, repeated, tag = "9")]
     pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// ADR 0012 D7: the server checks bearer tokens. An unauthenticated
@@ -2832,6 +2847,25 @@ pub struct PruneResponse {
     #[prost(uint64, tag = "3")]
     pub applied_index: u64,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteRequest {
+    #[prost(string, tag = "1")]
+    pub org: ::prost::alloc::string::String,
+    /// Unset deletes the whole org.
+    #[prost(string, optional, tag = "2")]
+    pub repo: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "3")]
+    pub dry_run: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteResponse {
+    #[prost(message, optional, tag = "1")]
+    pub stats: ::core::option::Option<DeleteStats>,
+    #[prost(bool, tag = "2")]
+    pub forwarded_to_leader: bool,
+    #[prost(uint64, tag = "3")]
+    pub applied_index: u64,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VacuumRequest {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3042,6 +3076,30 @@ pub mod write_client {
                 .insert(GrpcMethod::new("memory_graph.v1.Write", "Vacuum"));
             self.inner.unary(req, path, codec).await
         }
+        /// Delete a repo, or a whole org (`Store::delete_scope`, issue #323).
+        /// `dry_run` is node-local and never logged. A missing org or repo is a
+        /// no-op with empty stats, not an error.
+        pub async fn delete(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/memory_graph.v1.Write/Delete",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("memory_graph.v1.Write", "Delete"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -3091,6 +3149,13 @@ pub mod write_server {
             &self,
             request: tonic::Request<super::VacuumRequest>,
         ) -> std::result::Result<tonic::Response<super::VacuumResponse>, tonic::Status>;
+        /// Delete a repo, or a whole org (`Store::delete_scope`, issue #323).
+        /// `dry_run` is node-local and never logged. A missing org or repo is a
+        /// no-op with empty stats, not an error.
+        async fn delete(
+            &self,
+            request: tonic::Request<super::DeleteRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct WriteServer<T> {
@@ -3374,6 +3439,49 @@ pub mod write_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = VacuumSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/memory_graph.v1.Write/Delete" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteSvc<T: Write>(pub Arc<T>);
+                    impl<T: Write> tonic::server::UnaryService<super::DeleteRequest>
+                    for DeleteSvc<T> {
+                        type Response = super::DeleteResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Write>::delete(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -5565,7 +5673,7 @@ pub struct InstallSnapshotResponse {
 /// one marked transaction (`V2Store::index_prepared_marked` and friends).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LogCommand {
-    #[prost(oneof = "log_command::Cmd", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "log_command::Cmd", tags = "1, 2, 3, 4, 5, 6")]
     pub cmd: ::core::option::Option<log_command::Cmd>,
 }
 /// Nested message and enum types in `LogCommand`.
@@ -5615,6 +5723,16 @@ pub mod log_command {
     /// Blank/membership entries: nothing to apply, only the marker moves.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Noop {}
+    /// `Store::delete_scope` (never a dry run), issue #323. An older node
+    /// decodes it as an empty command and refuses it, so every node of a
+    /// cluster must understand it (`LOG_COMMANDS_VERSION` in the extractors hash).
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Delete {
+        #[prost(string, tag = "1")]
+        pub org: ::prost::alloc::string::String,
+        #[prost(string, optional, tag = "2")]
+        pub repo: ::core::option::Option<::prost::alloc::string::String>,
+    }
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Cmd {
         #[prost(message, tag = "1")]
@@ -5627,6 +5745,8 @@ pub mod log_command {
         Vacuum(Vacuum),
         #[prost(message, tag = "5")]
         Noop(Noop),
+        #[prost(message, tag = "6")]
+        Delete(Delete),
     }
 }
 /// Generated client implementations.
