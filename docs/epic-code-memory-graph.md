@@ -1054,6 +1054,8 @@ So that out-of-scope data never shows up in results, counts, pages or limits.
 - Given `Query`, `SymbolQuery` and the describe family with a `ReadScope`, When a request names an existing hidden org or repo, Then it must return `PermissionDenied` (exit 9 from the CLI), and When it names one that does not exist, Then it must return today's answer.
 - Given store A with all repos and store B with only the visible repos indexed in A's relative order, When every aggregate query and every named query of a visible resource runs, Then `A.scoped(scope)` and B must answer identically on the stable key (no node ids), under the `run_differential` matrix and `run_crash_rerun_differential`, including the same-content case.
 - Given `search` and `search_symbols`, When the same inputs are indexed in two orders, Then the answers must be equal (or the case is dropped and recorded if their tie-break uses node ids; no query-visible order changes).
+- Given a repo-only filter (`org = None`) that matches visible and hidden repos, When it runs, Then it must return the visible matches, and be refused only when every existing match is hidden.
+- Given a principal granted the action on `Org::"x"` where `x` has no repos, When it runs `describe` on `x`, Then it must be answered, not refused.
 - Given a scoped token, When it reads with `--read linearizable`, directly and through a follower, Then the read must succeed.
 
 <a id="story-74b"></a>
@@ -1065,6 +1067,7 @@ So that I can navigate what I may see, and hidden data stays out of every count.
 - Given `StoreRead::scoped`, When a node id of a hidden repo is read through any node-id API, Then it must be `PermissionDenied`, and a never-existing id must return today's answer.
 - Given an org whose repos are all hidden, When `roots`, `describe` and `children` run, Then it must be absent from the aggregates and refused when named; children and describe aggregates must count only visible repos.
 - Given a scoped view, When `count_nodes`, page totals and `SnapshotStats` run, Then they must count visible repos only; a zero-grant principal must get empty aggregates.
+- Given a hidden repo that was deleted or pruned, When it is named, Then it must get today's answer; and Given a snapshot handle, When a resource is named through it, Then existence must be judged against the handle's snapshot.
 - Given a snapshot handle, When a narrowing or widening reload happens, Then the next call must follow ADR 0013 D8's intersection rule and re-check expiry.
 
 <a id="story-74c"></a>
