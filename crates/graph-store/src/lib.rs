@@ -52,8 +52,8 @@ pub(crate) use common::{
 };
 pub use common::{FINGERPRINT_FORMAT_VERSION, MAX_SOURCE_BYTES};
 pub use pattern::{
-    parse_symbol_pattern, SymbolPattern, CAPABILITY_SYMBOL_INFIX, MAX_NEEDLE_BYTES,
-    MIN_NEEDLE_BYTES,
+    parse_symbol_pattern, SymbolPattern, CAPABILITY_DELETE, CAPABILITY_SYMBOL_INFIX,
+    MAX_NEEDLE_BYTES, MIN_NEEDLE_BYTES,
 };
 /// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
 #[doc(hidden)]

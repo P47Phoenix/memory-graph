@@ -137,7 +137,7 @@ message LogCommand {
   message Noop {}
   // `Store::delete_scope` (never a dry run), issue #323. An older node
   // decodes it as an empty command and refuses it, so every node of a
-  // cluster must understand it (see `graph_proto::PROTOCOL_VERSION`).
+  // cluster must understand it (`LOG_COMMANDS_VERSION` in the extractors hash).
   message Delete {
     string org = 1;
     optional string repo = 2;

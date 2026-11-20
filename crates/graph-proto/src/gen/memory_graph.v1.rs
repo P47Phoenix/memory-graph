@@ -897,7 +897,8 @@ pub struct HelloResponse {
     pub cluster_id: ::prost::alloc::string::String,
     /// Optional features this server supports, so a newer client can refuse
     /// a request an older server would misread. `symbol_infix`: infix and
-    /// suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6).
+    /// suffix symbol patterns (`*needle*`, `*needle`; ADR 0011 D6). `delete`:
+    /// `Write.Delete` (issue #323); a client refuses `delete` without it.
     #[prost(string, repeated, tag = "9")]
     pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// ADR 0012 D7: the server checks bearer tokens. An unauthenticated
@@ -5724,7 +5725,7 @@ pub mod log_command {
     pub struct Noop {}
     /// `Store::delete_scope` (never a dry run), issue #323. An older node
     /// decodes it as an empty command and refuses it, so every node of a
-    /// cluster must understand it (see `graph_proto::PROTOCOL_VERSION`).
+    /// cluster must understand it (`LOG_COMMANDS_VERSION` in the extractors hash).
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Delete {
         #[prost(string, tag = "1")]

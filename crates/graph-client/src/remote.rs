@@ -780,12 +780,25 @@ impl Store for RemoteStore {
 
     /// `Write.Delete` (issue #323); a follower forwards it to the leader. A
     /// dry run is answered by the node it reaches, like a dry-run prune.
+    /// Sent only to a server whose `Hello` lists
+    /// [`graph_store::CAPABILITY_DELETE`]; an older server gets a
+    /// `Protocol` error (CLI exit 5) before anything is sent.
     fn delete_scope(
         &self,
         org: &str,
         repo: Option<&str>,
         dry_run: bool,
     ) -> Result<graph_store::DeleteStats> {
+        if !self
+            .hello()
+            .capabilities
+            .iter()
+            .any(|c| c == graph_store::CAPABILITY_DELETE)
+        {
+            return Err(StoreError::Protocol(
+                "this server does not support delete; upgrade it".into(),
+            ));
+        }
         let req = pb::DeleteRequest {
             org: org.into(),
             repo: repo.map(Into::into),
