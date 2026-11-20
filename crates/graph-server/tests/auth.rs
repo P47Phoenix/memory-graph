@@ -370,6 +370,37 @@ fn an_index_stream_without_a_write_token_changes_nothing() {
     assert_eq!(before, after);
 }
 
+/// Issue #323: `Write.Delete` needs the `write` role, dry run included; a
+/// read token is refused and deletes nothing, a write token deletes.
+#[test]
+fn delete_needs_a_write_token() {
+    let f = AuthFixture::new();
+    let d = tempfile::tempdir().unwrap();
+    let ts = start(&f, &d.path().join("g.redb"));
+    let w = client(&ts, Some(&f.write), &f).unwrap();
+    w.index_bytes("o", "r", "a.rs", b"fn a() {}", None).unwrap();
+    w.index_bytes("keep", "r", "a.rs", b"fn a() {}", None)
+        .unwrap();
+    let r = client(&ts, Some(&f.read), &f).unwrap();
+    for dry in [true, false] {
+        let e = r.delete_scope("o", None, dry).unwrap_err();
+        assert!(matches!(e, StoreError::PermissionDenied { .. }), "{e:?}");
+        let e = r.delete_scope("o", Some("r"), dry).unwrap_err();
+        assert!(matches!(e, StoreError::PermissionDenied { .. }), "{e:?}");
+    }
+    assert_eq!(
+        raw(&ts.endpoint(), "/memory_graph.v1.Write/Delete", &[]),
+        Code::Unauthenticated
+    );
+    assert_eq!(w.describe(None, None).unwrap().len(), 2, "nothing deleted");
+    let st = w.delete_scope("o", None, false).unwrap();
+    assert_eq!(st.repos, ["r"]);
+    assert!(st.org_removed);
+    let left = w.describe(None, None).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].org, "keep");
+}
+
 #[test]
 fn a_snapshot_handle_is_bound_to_the_token_that_opened_it() {
     let f = AuthFixture::new();

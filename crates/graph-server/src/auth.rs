@@ -123,7 +123,10 @@ pub fn need(path: &str) -> Option<Need> {
     }
     if let Some(m) = path.strip_prefix(WRITE) {
         return match m {
-            "Index" | "IndexFile" | "IngestExtraction" | "Prune" | "Vacuum" => Some(Need::Write),
+            // `Delete` (issue #323) needs `write` even for a dry run, like `Prune`.
+            "Index" | "IndexFile" | "IngestExtraction" | "Prune" | "Vacuum" | "Delete" => {
+                Some(Need::Write)
+            }
             _ => None,
         };
     }

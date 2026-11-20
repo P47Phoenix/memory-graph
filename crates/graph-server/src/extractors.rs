@@ -46,12 +46,25 @@ pub fn register_all(store: &mut graph_store::V2Store, extractors: &[Arc<dyn Extr
 /// the extractor set, plus the store format, fingerprint, tokenizer and
 /// source decoder versions: two nodes with the same hash decode and extract
 /// identically, so their stores stay query-identical (ADR 0004 D5, ADR 0007
-/// C10). Order-independent.
+/// C10), plus [`LOG_COMMANDS_VERSION`]: two nodes with the same hash also
+/// apply the same set of Raft log commands. Order-independent.
 pub fn extractors_hash(extractors: &[Arc<dyn Extractor>]) -> String {
-    hash_with(extractors, graph_core::encoding::DECODER_VERSION)
+    hash_with(
+        extractors,
+        graph_core::encoding::DECODER_VERSION,
+        LOG_COMMANDS_VERSION,
+    )
 }
 
-fn hash_with(extractors: &[Arc<dyn Extractor>], decoder_version: u32) -> String {
+/// The version of the set of `LogCommand`s this binary applies. Bump it
+/// whenever a command is added: it is part of [`extractors_hash`], which
+/// every peer Raft RPC (AppendEntries included), join and snapshot install
+/// compare, so a node that could not apply a command (it would refuse the
+/// entry and keep what the others changed) is refused instead of
+/// replicating. 2: `LogCommand.Delete` (issue #323).
+pub const LOG_COMMANDS_VERSION: u32 = 2;
+
+fn hash_with(extractors: &[Arc<dyn Extractor>], decoder_version: u32, log_commands: u32) -> String {
     let mut lines: Vec<String> = extractors
         .iter()
         .map(|e| {
@@ -63,7 +76,7 @@ fn hash_with(extractors: &[Arc<dyn Extractor>], decoder_version: u32) -> String 
     lines.sort_unstable();
     let mut h = Sha256::new();
     h.update(format!(
-        "format={}\0fingerprint={}\0tokenizer={}\0decoder={decoder_version}\n",
+        "format={}\0fingerprint={}\0tokenizer={}\0decoder={decoder_version}\0log_commands={log_commands}\n",
         graph_store::SCHEMA_VERSION,
         graph_store::FINGERPRINT_FORMAT_VERSION,
         graph_core::tokenizer::TOKENIZER_VERSION
@@ -109,7 +122,18 @@ mod tests {
         // a cluster.
         let a: Vec<Arc<dyn Extractor>> = vec![Arc::new(Toy("a", "1"))];
         let now = graph_core::encoding::DECODER_VERSION;
-        assert_eq!(extractors_hash(&a), hash_with(&a, now));
-        assert_ne!(hash_with(&a, now), hash_with(&a, now + 1));
+        let log = LOG_COMMANDS_VERSION;
+        assert_eq!(extractors_hash(&a), hash_with(&a, now, log));
+        assert_ne!(hash_with(&a, now, log), hash_with(&a, now + 1, log));
+    }
+
+    #[test]
+    fn hash_includes_the_log_command_set() {
+        // Issue #323: a binary without `LogCommand.Delete` (log commands 1)
+        // gets another hash, so its peers refuse it.
+        let a: Vec<Arc<dyn Extractor>> = vec![Arc::new(Toy("a", "1"))];
+        let now = graph_core::encoding::DECODER_VERSION;
+        assert_eq!(LOG_COMMANDS_VERSION, 2);
+        assert_ne!(hash_with(&a, now, 2), hash_with(&a, now, 1));
     }
 }

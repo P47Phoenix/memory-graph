@@ -520,6 +520,85 @@ fn health_cluster_and_sysinfo() {
     assert_eq!(o.status.code(), Some(1), "after shutdown: {}", stdout(&o));
 }
 
+/// `delete` (issue #323) through `--server`: dry run, refusal without
+/// --yes, a repo, then the org with the server's own compact; the other
+/// org stays.
+#[test]
+fn delete_over_server() {
+    let d = tempfile::tempdir().unwrap();
+    let server = Server::start(&d.path().join("g.redb"));
+    let addr = server.addr.clone();
+    for (org, repo) in [("acme", "a"), ("acme", "b"), ("keep", "a")] {
+        let src = d.path().join(format!("{org}-{repo}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), format!("fn {org}_{repo}() {{}}\n")).unwrap();
+        ok(&[
+            "--server",
+            &addr,
+            "index",
+            "--org",
+            org,
+            "--repo",
+            repo,
+            src.to_str().unwrap(),
+        ]);
+    }
+    let repos = || -> Vec<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(&ok(&["--server", &addr, "describe", "--json"])).unwrap();
+        v["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}/{}",
+                    r["org"].as_str().unwrap(),
+                    r["repo"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    assert_eq!(repos(), ["acme/a", "acme/b", "keep/a"]);
+    let o = run(&["--server", &addr, "delete", "--org", "acme"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("without --yes"), "{}", stderr(&o));
+    let dry = ok(&["--server", &addr, "delete", "--org", "acme", "--dry-run"]);
+    assert!(
+        dry.contains("would delete org acme: 2 repos (a, b), 2 files, 2 symbols"),
+        "{dry}"
+    );
+    assert_eq!(repos(), ["acme/a", "acme/b", "keep/a"]);
+    let out = ok(&[
+        "--server", &addr, "delete", "--org", "acme", "--repo", "a", "--yes",
+    ]);
+    assert!(
+        out.contains("deleted acme/a: 1 repos (a), 1 files"),
+        "{out}"
+    );
+    assert_eq!(repos(), ["acme/b", "keep/a"]);
+    let out = ok(&[
+        "--server",
+        &addr,
+        "delete",
+        "--org",
+        "acme",
+        "--yes",
+        "--compact",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["deleted"]["repos"], serde_json::json!(["b"]));
+    assert_eq!(v["deleted"]["org_removed"], true);
+    assert!(v["compact"]["after_bytes"].is_u64(), "{out}");
+    assert_eq!(repos(), ["keep/a"]);
+    let sym = ok(&["--server", &addr, "symbols", "*", "--json"]);
+    assert!(!sym.contains("acme") && sym.contains("keep_a"), "{sym}");
+    let out = ok(&["--server", &addr, "delete", "--org", "acme", "--yes"]);
+    assert!(out.contains("nothing to delete"), "{out}");
+    server.shutdown();
+}
+
 /// `serve --worker-threads 2` (issue #205) starts and serves writes and
 /// reads; the env var works too; 0 is refused before anything opens.
 #[test]
@@ -1195,6 +1274,109 @@ mod idle {
             .args(["--min-free-disk", "1"]);
         let server = Server::spawn(c, &dir.join("graph.redb"));
         check("serve --data-dir", server, 1.0);
+    }
+
+    /// Voter ids of the cluster as `server` reports them.
+    fn voters(server: &str) -> Vec<u64> {
+        let o = run(&["--server", server, "cluster", "members", "--json"]);
+        if !o.status.success() {
+            return Vec::new();
+        }
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+        let mut ids: Vec<u64> = v["members"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|m| m["role"] == "voter")
+                    .filter_map(|m| m["node_id"].as_u64())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Issue #325: a node that grew to two voters and shrank back to a
+    /// sole voter gets back to (near) 0 wakeups/s, like one that has
+    /// always been alone. A stale `TickHold`, or a loop left on a timer
+    /// by the membership change, would show up only here. Ticks
+    /// suspending is read from node 1's own debug log (`raft ticks`,
+    /// `suspended: true`), the line `TickControl` prints on each change.
+    #[test]
+    fn idle_after_shrinking_back_to_a_sole_voter_barely_wakes() {
+        let d = tempfile::tempdir().unwrap();
+        let dir1 = d.path().join("n1");
+        let mut c = cmd();
+        c.arg("serve")
+            .arg("--data-dir")
+            .arg(&dir1)
+            .args(["--bootstrap", "--node-id", "1", "--min-free-disk", "1"])
+            .args(["--log-format", "json"])
+            .args(["--log-level", "info,graph_server::raft::node=debug"])
+            .arg("--listen")
+            .arg("127.0.0.1:0");
+        let s = start_serve(
+            c,
+            StartOptions {
+                echo_stderr: false,
+                ..StartOptions::default()
+            },
+        );
+        let log = s.stderr;
+        let n1 = Server {
+            child: s.child,
+            addr: s.addr,
+            db: dir1.join("graph.redb"),
+            start_line: s.start_lines.last().cloned().unwrap_or_default(),
+            lines: s.stdout,
+        };
+        let suspended = |l: &str| l.contains("raft ticks") && l.contains("\"suspended\":true");
+
+        let dir2 = d.path().join("n2");
+        let mut c = cmd();
+        c.arg("serve")
+            .arg("--data-dir")
+            .arg(&dir2)
+            .args(["--join", &n1.addr, "--auto-promote", "--node-id", "2"])
+            .args(["--min-free-disk", "1"]);
+        let n2 = Server::spawn(c, &dir2.join("graph.redb"));
+        wait_for("node 2 to become a voter", || voters(&n1.addr) == [1, 2]);
+        // Drop every line up to the growth; the suspension looked for is
+        // the one after the shrink.
+        while log.try_recv().is_ok() {}
+
+        let o = run(&[
+            "--server",
+            &n1.addr,
+            "--write-deadline",
+            "60s",
+            "cluster",
+            "remove",
+            "2",
+        ]);
+        assert!(o.status.success(), "cluster remove 2: {}", stderr(&o));
+        wait_for("node 1 to be the sole voter", || voters(&n1.addr) == [1]);
+        n2.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match log.recv_timeout(left) {
+                Ok(l) if suspended(&l) => break,
+                Ok(_) => {}
+                Err(e) => panic!("node 1 never suspended its ticks after the shrink: {e:?}"),
+            }
+        }
+        // The reader thread keeps draining node 1's stderr meanwhile.
+        check("serve --data-dir after a shrink", n1, 1.0);
+        drop(log);
     }
 }
 

@@ -23,6 +23,13 @@ pub const MAX_NEEDLE_BYTES: usize = 256;
 /// understands infix and suffix patterns (ADR 0011 D6).
 pub const CAPABILITY_SYMBOL_INFIX: &str = "symbol_infix";
 
+/// The server capability that says it serves `Write.Delete`
+/// ([`Store::delete_scope`](crate::Store::delete_scope), issue #323). A
+/// client checks it before sending a delete, so an older server answers a
+/// clear error instead of `UNIMPLEMENTED` (and an older client, which never
+/// sends a delete, is unaffected).
+pub const CAPABILITY_DELETE: &str = "delete";
+
 /// A parsed symbol pattern. The strings are the name bytes to match, with
 /// markers and escapes removed.
 #[derive(Debug, Clone, PartialEq, Eq)]

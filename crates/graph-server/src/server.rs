@@ -172,6 +172,9 @@ pub struct TestingHooks {
     /// Leave `symbol_infix` out of `Hello`'s capabilities, as a server
     /// older than ADR 0011 would (the client then refuses infix patterns).
     pub without_symbol_infix: bool,
+    /// Leave `delete` out of `Hello`'s capabilities, as a server older than
+    /// issue #323 would (the client then refuses `delete_scope`).
+    pub without_delete: bool,
     /// Let this many write proposals through, then park every later one
     /// forever (a future that never resolves), so a run cannot finish and a
     /// test can kill the server mid-write deterministically. The first
@@ -836,11 +839,17 @@ pub async fn start(
                 .testing
                 .hello_protocol_version
                 .unwrap_or(graph_proto::PROTOCOL_VERSION),
-            capabilities: if cfg.testing.without_symbol_infix {
-                Vec::new()
-            } else {
-                vec![graph_store::CAPABILITY_SYMBOL_INFIX.to_string()]
-            },
+            capabilities: [
+                (
+                    graph_store::CAPABILITY_SYMBOL_INFIX,
+                    cfg.testing.without_symbol_infix,
+                ),
+                (graph_store::CAPABILITY_DELETE, cfg.testing.without_delete),
+            ]
+            .into_iter()
+            .filter(|(_, off)| !off)
+            .map(|(c, _)| c.to_string())
+            .collect(),
             data_dir: paths
                 .data_dir
                 .as_ref()

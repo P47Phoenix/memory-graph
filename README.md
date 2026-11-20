@@ -69,6 +69,7 @@ Run the same `index` again and every file is reported as `unchanged`: nothing is
 | `describe` | Per repo: files, languages, symbols, tokens and the symbol kinds present (`--org`/`--repo` to narrow). |
 | `sysinfo` | What `index` sizes itself from on this machine: CPUs, memory and its source, the starting budget, free disk on the database's volume. |
 | `vacuum [--compact]` | Drop dictionary terms no file uses; `--compact` rebuilds the file to give the space back. |
+| `delete --org O [--repo R] (--dry-run \| --yes) [--compact]` | Remove a repo, or a whole org with every repo in it, so `describe` and every query stop showing it. `--dry-run` prints what would go; without it `--yes` is required. `--compact` reclaims the space afterwards. A missing org or repo is a no-op (exit 0). On `--db` and `--server` ([details](docs/guide/storage.md#deleting-an-org-or-a-repo)). |
 | `export [--out FILE]` | Dump every node (org, repo, file, symbol, token, with spans) as newline-delimited JSON. An escape hatch; there is no importer yet. |
 | `mcp` | Serve the queries as read-only MCP tools over stdio for AI assistants, plus opt-in `index_path`/`prune` write tools with `--allow-writes` ([docs/mcp.md](docs/mcp.md)). |
 | `serve --db FILE` / `serve --data-dir DIR [--bootstrap \| --join PEER [--auto-promote \| --standby]]` `[--listen HOST:PORT]` | Serve a database file, or a cluster node's data directory, over gRPC for `--server` clients ([server](docs/guide/server.md), [cluster](docs/guide/cluster.md)). |

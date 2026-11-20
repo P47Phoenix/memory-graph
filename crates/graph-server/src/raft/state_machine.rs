@@ -37,8 +37,8 @@
 //! markers) are dropped. openraft stops the node; the clients of those
 //! entries see an error (UNAVAILABLE/INTERNAL) for a write that landed.
 //! That is safe to retry: `IndexChunk` is idempotent through file
-//! fingerprints (an unchanged file is a no-op), `Prune` and `Vacuum` by
-//! construction, and `IngestExtraction` when the extraction is identical,
+//! fingerprints (an unchanged file is a no-op), `Prune`, `Vacuum` and
+//! `Delete` by construction (a second delete finds nothing and is a no-op), and `IngestExtraction` when the extraction is identical,
 //! which a retry of the same request is (ADR 0004 D2/D7).
 use super::disk_stall::{DiskStall, StallSource};
 use super::snapshot_dir::SnapshotDir;
@@ -331,6 +331,7 @@ impl StoreStateMachine {
             Cmd::Prune(_) => ("prune", 0),
             Cmd::Vacuum(_) => ("vacuum", 0),
             Cmd::Noop(_) => ("noop", 0),
+            Cmd::Delete(_) => ("delete", 0),
         };
         span.record("kind", kind);
         span.record("files", files);
@@ -393,6 +394,10 @@ impl StoreStateMachine {
                 Ok(LogResponse::Vacuum(stats.into()))
             }
             Cmd::Noop(_) => store.mark_only(marker, None).map(|()| LogResponse::Marked),
+            Cmd::Delete(c) => {
+                let stats = store.delete_scope_marked(&c.org, c.repo.as_deref(), marker, None)?;
+                Ok(LogResponse::Delete(stats))
+            }
         }
     }
 }
