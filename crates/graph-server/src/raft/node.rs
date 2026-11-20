@@ -1208,6 +1208,8 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
     // No build before this (a back-off after a failure, or the duty floor
     // after a long build).
     let mut not_before: Option<std::time::Instant> = None;
+    // The build counters as last seen (the duty floor starts at an end).
+    let mut seen = node.snapshots.build_state();
     let mut disk_refused = false;
     loop {
         let (applied, snap, running) = {
@@ -1241,6 +1243,22 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
             });
         }
         let builds = node.snapshots.build_state();
+        if builds.finished > seen.finished {
+            // The duty floor, from the build's own end (not from openraft
+            // publishing the snapshot, which comes a moment later: a tick
+            // in between must not start the next build at once).
+            if builds.failed == seen.failed {
+                if let Some(d) = builds.last_duration.filter(|d| *d >= DUTY_FLOOR_MIN) {
+                    tracing::info!(
+                        took_s = d.as_secs(),
+                        "snapshot policy: the next build waits as long as this one took"
+                    );
+                    let until = std::time::Instant::now() + d;
+                    not_before = Some(not_before.map_or(until, |t| t.max(until)));
+                }
+            }
+            seen = builds.clone();
+        }
         if snap != last_snap {
             last_snap = snap;
             if pending
@@ -1248,16 +1266,9 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                 .is_some_and(|p| snap.unwrap_or(0) >= p.applied)
             {
                 pending = None;
-                if let Some(d) = builds.last_duration.filter(|d| *d >= DUTY_FLOOR_MIN) {
-                    tracing::info!(
-                        took_s = d.as_secs(),
-                        "snapshot policy: the next build waits as long as this one took"
-                    );
-                    not_before = Some(std::time::Instant::now() + d);
-                }
             }
         }
-        if let Some(p) = pending.take() {
+        if let Some(mut p) = pending.take() {
             if builds.failed > p.builds.failed {
                 let n = builds.consecutive_failures.max(1);
                 let wait = snapshot_backoff(retry, n);
@@ -1280,14 +1291,24 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                     );
                 }
                 not_before = Some(std::time::Instant::now() + wait);
-            } else if builds.running() || p.at.elapsed() < retry {
-                // Still building, however long it takes (or not started
-                // yet): keep waiting.
+            } else if builds.running() {
+                // Still building, however long it takes.
+                pending = Some(p);
+            } else if builds.finished > p.builds.finished {
+                // Built; openraft publishes the snapshot a moment later.
+                let done = *p.done.get_or_insert_with(std::time::Instant::now);
+                if done.elapsed() < retry {
+                    pending = Some(p);
+                } else {
+                    tracing::warn!(
+                        "a snapshot build ended without a newer snapshot; triggering again"
+                    );
+                }
+            } else if p.at.elapsed() < retry {
+                // Not started yet.
                 pending = Some(p);
             } else {
-                // Never started (openraft ignored the trigger), or ended
-                // without a newer snapshot.
-                tracing::warn!("a triggered snapshot build produced no snapshot; triggering again");
+                tracing::warn!("a triggered snapshot build never started; triggering again");
             }
         }
         if not_before.is_some_and(|t| std::time::Instant::now() >= t) {
@@ -1318,6 +1339,7 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                         applied,
                         at: std::time::Instant::now(),
                         builds,
+                        done: None,
                     });
                 }
                 Err(e) => {
@@ -1345,6 +1367,8 @@ struct Pending {
     at: std::time::Instant,
     /// The build counters when it was triggered.
     builds: super::snapshot_dir::BuildState,
+    /// When the policy first saw the build ended well.
+    done: Option<std::time::Instant>,
 }
 
 /// The wait after the `failures`th failed build in a row: `first`,
@@ -1567,6 +1591,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// Issues #330/#331: the back-off after failed builds doubles from the
+    /// first retry, is capped, and never overflows.
+    #[test]
+    fn the_snapshot_backoff_doubles_up_to_its_cap() {
+        let s = Duration::from_secs;
+        assert_eq!(snapshot_backoff(s(30), 0), s(30));
+        assert_eq!(snapshot_backoff(s(30), 1), s(30));
+        assert_eq!(snapshot_backoff(s(30), 2), s(60));
+        assert_eq!(snapshot_backoff(s(30), 3), s(120));
+        assert_eq!(snapshot_backoff(s(30), 6), s(960));
+        assert_eq!(snapshot_backoff(s(30), 7), SNAPSHOT_RETRY_MAX);
+        assert_eq!(snapshot_backoff(s(30), u32::MAX), SNAPSHOT_RETRY_MAX);
+        assert_eq!(
+            snapshot_backoff(Duration::MAX, u32::MAX),
+            Duration::MAX,
+            "a first retry above the cap is kept"
+        );
+        assert_eq!(
+            snapshot_backoff(Duration::from_millis(200), 3),
+            Duration::from_millis(800)
+        );
+    }
 
     /// Issue #211: the byte trigger counts every applied entry above the
     /// snapshot exactly once, whenever it was appended: a backlog applied

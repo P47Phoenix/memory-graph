@@ -539,6 +539,19 @@ impl RedbLogStore {
         if self.closing.load(Ordering::SeqCst) {
             return self.skip("closing");
         }
+        let when = if uncapped {
+            "at start-up"
+        } else {
+            "after a purge"
+        };
+        if uncapped {
+            // Start-up waits for it (the node serves once it is done).
+            tracing::info!(
+                file,
+                live,
+                "raft log: compacting a mostly empty log file at start-up"
+            );
+        }
         // `compact` itself loops until a pass makes no progress.
         let started = std::time::Instant::now();
         if let Err(e) = db.compact() {
@@ -552,7 +565,8 @@ impl RedbLogStore {
             after,
             live,
             took_ms = started.elapsed().as_millis() as u64,
-            "raft log compacted after a purge"
+            when,
+            "raft log compacted"
         );
         true
     }
