@@ -3126,6 +3126,7 @@ fn the_fifty_percent_age_warning_fires_exactly_once_per_snapshot() {
             "snapshot_warn_probe",
             "-p",
             "graph-store",
+            "--message-format=json",
         ])
         .current_dir(&workspace_root)
         .output()
@@ -3135,18 +3136,21 @@ fn the_fifty_percent_age_warning_fires_exactly_once_per_snapshot() {
         "failed to build snapshot_warn_probe example:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    // This test binary is `<target>/<profile>/deps/<name>`; the example lands
-    // in `<target>/<profile>/examples`, whatever CARGO_TARGET_DIR says.
-    let exe = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .and_then(|deps| deps.parent())
-        .expect("test binary lives under <target>/<profile>/deps")
-        .join("examples")
-        .join(format!(
-            "snapshot_warn_probe{}",
-            std::env::consts::EXE_SUFFIX
-        ));
+    // Ask cargo where it put the example rather than guessing from this test
+    // binary's path: Cargo's build-dir layout (e.g. build/<pkg>/<hash>/...)
+    // no longer guarantees `<target>/<profile>/examples`.
+    let exe = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|m| {
+            m["reason"] == "compiler-artifact"
+                && m["target"]["name"] == "snapshot_warn_probe"
+                && m["target"]["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|k| k == "example"))
+        })
+        .and_then(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+        .expect("cargo reported no executable for the snapshot_warn_probe example");
     assert!(exe.exists(), "expected probe binary at {exe:?}");
 
     let d = tempfile::tempdir().unwrap();

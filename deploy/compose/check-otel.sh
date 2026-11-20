@@ -114,7 +114,12 @@ log "collector: $(cat "$WORK/seen.txt")"
 
 log "waiting for Jaeger to list the memory-graph service"
 deadline=$((SECONDS + WAIT_SECS))
-until curl -fsS "http://127.0.0.1:$MG_JAEGER_UI_PORT/api/services" 2>/dev/null | grep -q '"memory-graph"'; do
+# Fetch, then match without a pipe (issue #308: `curl | grep -q` races).
+jaeger_lists_service() {
+  services=$(curl -fsS "http://127.0.0.1:$MG_JAEGER_UI_PORT/api/services" 2>/dev/null) &&
+    grep -q '"memory-graph"' <<<"$services"
+}
+until jaeger_lists_service; do
   if [ "$SECONDS" -ge "$deadline" ]; then
     log "timed out after ${WAIT_SECS}s waiting for Jaeger"
     curl -sS "http://127.0.0.1:$MG_JAEGER_UI_PORT/api/services" || true

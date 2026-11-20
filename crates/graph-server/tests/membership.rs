@@ -753,6 +753,24 @@ fn remove_lost_self_with_auth_on_removes_a_dead_leader() {
     // yet (as `serve` does while it rejoins): a call there connects, then
     // hangs. A hint naming the lost node must never be followed.
     let _held = std::net::TcpListener::bind(lost_addr).unwrap();
+    // Issue #320: an attempt that hangs is capped by the overall deadline,
+    // even one shorter than the per-attempt timeout (30 s): sent only to
+    // the held port, the call gives up within the deadline plus slack.
+    let short = Duration::from_secs(3);
+    let t0 = Instant::now();
+    let e = rt()
+        .block_on(graph_server::join::remove_lost_self(
+            &lost_addr.to_string(),
+            lost,
+            short,
+            &auth,
+        ))
+        .unwrap_err();
+    assert!(
+        t0.elapsed() < short + Duration::from_secs(1),
+        "an attempt ran past the deadline: {:?} ({e})",
+        t0.elapsed()
+    );
     let t0 = Instant::now();
     rt().block_on(graph_server::join::remove_lost_self(
         &via,
