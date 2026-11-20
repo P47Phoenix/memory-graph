@@ -646,7 +646,8 @@ enum Cmd {
         quorum_loss_timeout: Option<u64>,
         /// Refuse writes and snapshot builds (RESOURCE_EXHAUSTED) while the volume has less than
         /// this free plus one snapshot copy: a size (K/M/G) or a percentage of the volume such as
-        /// 5%. --data-dir default: 5% of the volume, clamped to 2-32 GiB. --db default: off
+        /// 5%. --data-dir default: 5% of the volume, clamped to 2-32 GiB. --db default: off (a
+        /// snapshot build still waits for room for one copy of the store)
         #[arg(long, value_parser = graph_cli::diskinfo::parse_min_free)]
         min_free_disk: Option<graph_cli::diskinfo::MinFree>,
         /// How long an open snapshot handle (a paging client's frozen view) may live: seconds, or with

@@ -140,6 +140,15 @@ pub struct SnapshotDir {
     promote_lock: std::sync::Mutex<()>,
     /// Makes temp names unique within this process.
     temp_seq: AtomicU64,
+    /// What the builds did so far (issues #330, #331): the snapshot policy
+    /// reads it to tell a build still running from one that failed.
+    state: std::sync::Mutex<BuildState>,
+    /// Test hook run inside a build ([`BuildHook`]).
+    build_hook: std::sync::RwLock<Option<BuildHook>>,
+    /// How often a running build logs its progress.
+    progress_every: std::sync::Mutex<std::time::Duration>,
+    /// Progress lines logged since start (tests).
+    progress_reports: AtomicU64,
 }
 
 /// A temp file removed when dropped (every error path); a no-op once the
@@ -149,6 +158,56 @@ struct TempFile(PathBuf);
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Test hook run by a build with its temp file, after the export and while
+/// the store's read lock is still held: an `Err` fails the build there (a
+/// failed or disk-full export, issues #330/#331), and a hook that blocks
+/// stands for a long export.
+pub type BuildHook = std::sync::Arc<dyn Fn(&Path) -> Result<(), StoreError> + Send + Sync>;
+
+/// A running build logs its progress this often by default.
+pub const BUILD_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What this node's snapshot builds did since start (issues #330, #331).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildState {
+    /// Builds started.
+    pub started: u64,
+    /// Builds ended, either way.
+    pub finished: u64,
+    /// Builds that failed.
+    pub failed: u64,
+    /// Failures since the last successful build.
+    pub consecutive_failures: u32,
+    /// The last failure's error.
+    pub last_error: Option<String>,
+    /// How long the last successful build took.
+    pub last_duration: Option<std::time::Duration>,
+}
+
+impl BuildState {
+    /// Whether a build is under way.
+    pub fn running(&self) -> bool {
+        self.started > self.finished
+    }
+}
+
+/// Stops a build's progress thread when dropped.
+struct Progress<'a> {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<u64>>,
+    total: &'a AtomicU64,
+}
+
+impl Drop for Progress<'_> {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(t) = self.thread.take() {
+            let n = t.join().unwrap_or(0);
+            self.total.fetch_add(n, Ordering::SeqCst);
+        }
     }
 }
 
@@ -190,6 +249,10 @@ impl SnapshotDir {
             fail_before_meta: Default::default(),
             promote_lock: std::sync::Mutex::new(()),
             temp_seq: AtomicU64::new(0),
+            state: Default::default(),
+            build_hook: std::sync::RwLock::new(None),
+            progress_every: std::sync::Mutex::new(BUILD_PROGRESS_EVERY),
+            progress_reports: AtomicU64::new(0),
         })
     }
 
@@ -215,6 +278,42 @@ impl SnapshotDir {
 
     pub fn built(&self) -> u64 {
         self.built.load(Ordering::SeqCst)
+    }
+
+    /// What the builds did so far.
+    pub fn build_state(&self) -> BuildState {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn with_state(&self, f: impl FnOnce(&mut BuildState)) {
+        f(&mut self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+
+    /// Set (or clear) the test hook run inside every build ([`BuildHook`]).
+    pub fn set_build_hook(&self, f: Option<BuildHook>) {
+        *self
+            .build_hook
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = f;
+    }
+
+    /// Set how often a running build logs its progress (tests shorten it).
+    pub fn set_progress_every(&self, every: std::time::Duration) {
+        *self
+            .progress_every
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = every;
+    }
+
+    /// Progress lines logged by builds since start.
+    pub fn progress_reports(&self) -> u64 {
+        self.progress_reports.load(Ordering::SeqCst)
     }
 
     /// A fresh temp path for a snapshot being received.
@@ -441,9 +540,110 @@ impl SnapshotDir {
     /// Build a snapshot of the store in `slot` (blocking): export in one
     /// read transaction, read the copy's own marker, and promote. A build at
     /// an index that already has a complete pair reuses it.
+    ///
+    /// Every build is counted in [`build_state`](Self::build_state) (started,
+    /// then finished, or failed with its error), logs its progress every
+    /// [`BUILD_PROGRESS_EVERY`] while it runs (bytes written against the
+    /// store's size), and removes its temp file on every error path.
     pub fn build(&self, slot: &StoreSlot) -> Result<Snapshot<TypeConfig>, StoreError> {
+        let started = std::time::Instant::now();
+        self.with_state(|st| st.started += 1);
+        let r = self.build_inner(slot, started);
+        let took = started.elapsed();
+        self.with_state(|st| {
+            st.finished += 1;
+            match &r {
+                Ok(_) => {
+                    st.consecutive_failures = 0;
+                    st.last_duration = Some(took);
+                }
+                Err(e) => {
+                    st.failed += 1;
+                    st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+                    st.last_error = Some(e.to_string());
+                }
+            }
+        });
+        match &r {
+            Ok(s) => tracing::info!(
+                index = s.meta.last_log_id.map_or(0, |l| l.index),
+                took_ms = took.as_millis() as u64,
+                "snapshot built"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                took_ms = took.as_millis() as u64,
+                "snapshot build failed; its temp file was removed"
+            ),
+        }
+        r
+    }
+
+    /// A thread logging a running build's progress every `progress_every`
+    /// until the returned guard is dropped.
+    fn progress(&self, tmp: &Path, store_bytes: u64, started: std::time::Instant) -> Progress<'_> {
+        let every = *self
+            .progress_every
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tmp = tmp.to_path_buf();
+        let thread = std::thread::Builder::new()
+            .name("snapshot-progress".into())
+            .spawn(move || {
+                let mut n = 0u64;
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(every) {
+                    let written = std::fs::metadata(&tmp).map_or(0, |m| m.len());
+                    let percent = written
+                        .saturating_mul(100)
+                        .checked_div(store_bytes)
+                        .unwrap_or(0);
+                    tracing::info!(
+                        written,
+                        store_bytes,
+                        percent,
+                        elapsed_s = started.elapsed().as_secs(),
+                        "snapshot build in progress (the copy is about as large as the store)"
+                    );
+                    n += 1;
+                }
+                n
+            })
+            .ok();
+        Progress {
+            stop: Some(tx),
+            thread,
+            total: &self.progress_reports,
+        }
+    }
+
+    fn build_inner(
+        &self,
+        slot: &StoreSlot,
+        started: std::time::Instant,
+    ) -> Result<Snapshot<TypeConfig>, StoreError> {
         let tmp = TempFile(self.temp_path("snap-build"));
-        slot.with_store(|s| s.export_snapshot(&tmp.0))?;
+        let store_bytes = std::fs::metadata(slot.path()).map_or(0, |m| m.len());
+        tracing::info!(
+            store_bytes,
+            temp = %tmp.0.display(),
+            "snapshot build started (a full copy of the store)"
+        );
+        {
+            let _progress = self.progress(&tmp.0, store_bytes, started);
+            let hook = self
+                .build_hook
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            slot.with_store(|s| {
+                s.export_snapshot(&tmp.0)?;
+                match &hook {
+                    Some(h) => h(&tmp.0),
+                    None => Ok(()),
+                }
+            })?;
+        }
         let (last, membership) = {
             let copy = V2Store::open(&tmp.0)?;
             super::state_machine::StoreStateMachine::read_applied(&copy)?

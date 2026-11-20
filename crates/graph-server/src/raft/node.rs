@@ -61,6 +61,10 @@ pub struct RaftSettings {
     /// affected: heartbeats keep the quorum acknowledgement fresh however
     /// long an entry takes (`--quorum-loss-timeout`).
     pub quorum_loss_ms: Option<u64>,
+    /// The first back-off after a failed snapshot build, ms (default 30 s);
+    /// it doubles with each failure in a row up to
+    /// [`SNAPSHOT_RETRY_MAX`] (issues #330, #331). Not a `serve` flag.
+    pub snapshot_retry_ms: u64,
 }
 
 impl RaftSettings {
@@ -81,6 +85,7 @@ impl RaftSettings {
             purge_batch_size: 1,
             max_payload_entries: 64,
             quorum_loss_ms: None,
+            snapshot_retry_ms: SNAPSHOT_RETRY.as_millis() as u64,
         }
     }
 
@@ -544,11 +549,15 @@ impl RaftNode {
                 p.disk.clone(),
             );
             tokio::task::spawn_blocking(move || {
+                // Before the Raft core runs (nothing to stall): shrink a log
+                // file a past purge left mostly empty, however large its
+                // live part (issues #330, #331).
+                log.compact_on_start();
                 repair_stale_snapshot(&slot, &snaps, &log)?;
                 // Best effort: an outdated snapshot only delays a laggard
                 // (the policy's next build replaces it), so a failed or
                 // disk-refused rebuild is logged and serve goes on.
-                if let Err(e) = repair_outdated_snapshot(&slot, &snaps, || disk.check("snapshot")) {
+                if let Err(e) = repair_outdated_snapshot(&slot, &snaps, || disk.check_snapshot()) {
                     tracing::warn!(
                         error = %e,
                         "could not replace a snapshot made by another build at start-up; \
@@ -1170,18 +1179,35 @@ impl RaftNode {
 /// It re-evaluates on every metrics change (an append, an apply, a new
 /// snapshot), and every [`POLICY_TICK`] only while it waits on something
 /// time can change: a build the disk guard refused is retried once space
-/// frees up even on an idle cluster, and a triggered build that never
-/// produced a snapshot (openraft logs a failed build and carries on) is
-/// retried after [`SNAPSHOT_RETRY`]. With neither, an idle node does not
-/// wake it (issue #205). The byte count covers the applied entries above
-/// the last snapshot whenever they were appended, so neither a restart, a
-/// build nor a lagging apply loses any of them.
+/// frees up even on an idle cluster, a running build is followed until it
+/// ends, and a back-off runs out. With none of these, an idle node does
+/// not wake it (issue #205). The byte count covers the applied entries
+/// above the last snapshot whenever they were appended, so neither a
+/// restart, a build nor a lagging apply loses any of them.
+///
+/// Builds are followed through [`SnapshotDir::build_state`] (issues #330,
+/// #331), not a timer: a build that runs for an hour on a large store is
+/// waited for, not reported as failed and re-triggered. A build that
+/// failed (the builder never fails openraft's command, which would stop
+/// the Raft core; see `SnapshotBuilder::build_snapshot`) is retried after
+/// [`snapshot_backoff`]: `snapshot_retry_ms`, doubling per failure in a
+/// row up to [`SNAPSHOT_RETRY_MAX`], logged at warn and, from the
+/// [`SNAPSHOT_FAILURES_LOUD`]th failure in a row, at error. After a
+/// successful build that took longer than [`DUTY_FLOOR_MIN`], the next one
+/// waits as long as that one took, so builds on a large store never run
+/// back to back (at most half the time is spent building). A build
+/// openraft never started (its trigger was ignored) is triggered again
+/// after `snapshot_retry_ms`.
 async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
     let mut rx = node.raft.metrics();
     let entries = s.snapshot_log_entries.max(1);
+    let retry = Duration::from_millis(s.snapshot_retry_ms.max(1));
     let mut last_snap = rx.borrow().snapshot.map(|l| l.index);
     let mut counted = AppliedBytes::new(last_snap.unwrap_or(0));
-    let mut pending: Option<(u64, std::time::Instant)> = None;
+    let mut pending: Option<Pending> = None;
+    // No build before this (a back-off after a failure, or the duty floor
+    // after a long build).
+    let mut not_before: Option<std::time::Instant> = None;
     let mut disk_refused = false;
     loop {
         let (applied, snap, running) = {
@@ -1214,15 +1240,58 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                 bytes: 0,
             });
         }
+        let builds = node.snapshots.build_state();
         if snap != last_snap {
             last_snap = snap;
-            if pending.is_some_and(|(p, _)| snap.unwrap_or(0) >= p) {
+            if pending
+                .as_ref()
+                .is_some_and(|p| snap.unwrap_or(0) >= p.applied)
+            {
                 pending = None;
+                if let Some(d) = builds.last_duration.filter(|d| *d >= DUTY_FLOOR_MIN) {
+                    tracing::info!(
+                        took_s = d.as_secs(),
+                        "snapshot policy: the next build waits as long as this one took"
+                    );
+                    not_before = Some(std::time::Instant::now() + d);
+                }
             }
         }
-        if pending.is_some_and(|(_, at)| at.elapsed() >= SNAPSHOT_RETRY) {
-            tracing::warn!("a triggered snapshot build produced no snapshot; retrying");
-            pending = None;
+        if let Some(p) = pending.take() {
+            if builds.failed > p.builds.failed {
+                let n = builds.consecutive_failures.max(1);
+                let wait = snapshot_backoff(retry, n);
+                let error = builds.last_error.as_deref().unwrap_or("unknown");
+                if n >= SNAPSHOT_FAILURES_LOUD {
+                    tracing::error!(
+                        failures = n,
+                        error,
+                        retry_in_s = wait.as_secs(),
+                        "snapshot builds keep failing, so the Raft log cannot be purged and \
+                         keeps growing; fix the cause (often disk space: a build needs room \
+                         for a full copy of the store)"
+                    );
+                } else {
+                    tracing::warn!(
+                        failures = n,
+                        error,
+                        retry_in_s = wait.as_secs(),
+                        "snapshot build failed; retrying after a back-off"
+                    );
+                }
+                not_before = Some(std::time::Instant::now() + wait);
+            } else if builds.running() || p.at.elapsed() < retry {
+                // Still building, however long it takes (or not started
+                // yet): keep waiting.
+                pending = Some(p);
+            } else {
+                // Never started (openraft ignored the trigger), or ended
+                // without a newer snapshot.
+                tracing::warn!("a triggered snapshot build produced no snapshot; triggering again");
+            }
+        }
+        if not_before.is_some_and(|t| std::time::Instant::now() >= t) {
+            not_before = None;
         }
         let since = applied.saturating_sub(snap.unwrap_or(0));
         let bytes = counted.bytes;
@@ -1236,15 +1305,20 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
             // Nothing to retry (a snapshot arrived some other way).
             disk_refused = false;
         }
-        if due && pending.is_none() {
-            match node.disk.check("snapshot") {
+        if due && pending.is_none() && not_before.is_none() {
+            match node.disk.check_snapshot() {
                 Ok(()) => {
                     disk_refused = false;
                     tracing::info!(applied, since, bytes, "building a snapshot");
+                    let builds = node.snapshots.build_state();
                     if node.raft.trigger().snapshot().await.is_err() {
                         return;
                     }
-                    pending = Some((applied, std::time::Instant::now()));
+                    pending = Some(Pending {
+                        applied,
+                        at: std::time::Instant::now(),
+                        builds,
+                    });
                 }
                 Err(e) => {
                     if !disk_refused {
@@ -1254,12 +1328,32 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                 }
             }
         }
-        let waiting = disk_refused || pending.is_some();
+        let waiting = disk_refused || pending.is_some() || not_before.is_some();
         tokio::select! {
             r = rx.changed() => if r.is_err() { return },
             _ = tokio::time::sleep(POLICY_TICK), if waiting => {}
         }
     }
+}
+
+/// A build the policy triggered and waits for.
+#[derive(Debug, Clone)]
+struct Pending {
+    /// The applied index when it was triggered: a snapshot at or above it
+    /// ends the wait.
+    applied: u64,
+    at: std::time::Instant,
+    /// The build counters when it was triggered.
+    builds: super::snapshot_dir::BuildState,
+}
+
+/// The wait after the `failures`th failed build in a row: `first`,
+/// doubling per failure, at most [`SNAPSHOT_RETRY_MAX`].
+pub fn snapshot_backoff(first: Duration, failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(20);
+    first
+        .saturating_mul(1u32 << shift)
+        .min(SNAPSHOT_RETRY_MAX.max(first))
 }
 
 /// The byte trigger's count: the encoded bytes of the applied log entries
@@ -1323,8 +1417,20 @@ impl AppliedBytes {
 /// refused or pending.
 pub const POLICY_TICK: Duration = Duration::from_secs(1);
 
-/// A triggered build that produced no snapshot is retried after this.
+/// The default first back-off after a failed build
+/// ([`RaftSettings::snapshot_retry_ms`]); also how long a trigger openraft
+/// never acted on is waited for.
 pub const SNAPSHOT_RETRY: Duration = Duration::from_secs(30);
+
+/// The longest back-off between failed builds.
+pub const SNAPSHOT_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// From this many failed builds in a row, each failure logs at error.
+pub const SNAPSHOT_FAILURES_LOUD: u32 = 3;
+
+/// A successful build that took at least this long makes the next one wait
+/// as long as it took (the duty floor; issue #331).
+pub const DUTY_FLOOR_MIN: Duration = Duration::from_secs(5);
 
 /// Start-up repair of a crash between a snapshot install's store swap and
 /// the promotion of the received file to the current snapshot (ADR 0004

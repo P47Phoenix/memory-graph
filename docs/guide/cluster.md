@@ -21,9 +21,10 @@ memory-graph serve --data-dir ./n1 --listen 127.0.0.1:7001   # later: a restart 
 
 ## Tuning: log, snapshots, timing, disk
 
-- **Log and snapshots.** A snapshot is built after `--snapshot-log-entries` (default 10000) applied entries or once the applied entries above the last snapshot hold `--snapshot-log-bytes` (default 1G) of log. The log below it is then purged, keeping `--log-keep-entries` (default 1000) so a briefly lagging follower catches up from the log, and `raft.redb` is compacted.
+- **Log and snapshots.** A snapshot is built after `--snapshot-log-entries` (default 10000) applied entries or once the applied entries above the last snapshot hold `--snapshot-log-bytes` (default 1G) of log. The log below it is then purged, keeping `--log-keep-entries` (default 1000) so a briefly lagging follower catches up from the log, and `raft.redb` is compacted (right after the purge when at most 64 MiB of log is left, otherwise at the next start, before the node takes part in Raft).
+- **Long and failed snapshot builds.** A build is a full copy of the store, so on a large store it can take many minutes. The node keeps answering while it runs, and it logs its progress every 10 s (bytes written against the store's size). A build that took more than 5 s makes the next one wait as long as it took, so builds never run back to back. A failed build (for example a full disk) does not stop the node: its temp file is removed, and it is retried after 30 s, doubling per failure in a row up to 30 minutes. From the third failure in a row each one is logged at error, with the cause.
 - **Timing.** `--heartbeat-interval` (ms, default 250), `--election-timeout-min` / `--election-timeout-max` (ms, default 1000 / 2000).
-- **Disk guard.** `--min-free-disk` (a size, or a percentage of the volume; the default for a data directory is 5% of it, between 2G and 32G, and off for `--db`). Writes and snapshot builds are refused with `RESOURCE_EXHAUSTED` while less than that plus one snapshot copy is free.
+- **Disk guard.** `--min-free-disk` (a size, or a percentage of the volume; the default for a data directory is 5% of it, between 2G and 32G, and off for `--db`). Writes and snapshot builds are refused with `RESOURCE_EXHAUSTED` while less than that plus one snapshot copy is free. With the guard off, a snapshot build still waits until the volume has room for one copy of the store (it is postponed, never started into a full disk); writes are not checked.
 
 ### Quorum loss
 

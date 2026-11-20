@@ -2019,3 +2019,215 @@ fn a_follower_installing_a_snapshot_answers_case_insensitive_lookups() {
     }
     graph_store::conformance::run_differential(&replica(&tb, laggard), &replica(&tb, leader));
 }
+
+/// Temp files left in a node's snapshot directory.
+fn snapshot_temps(node: &graph_server::raft::node::RaftNode) -> Vec<String> {
+    std::fs::read_dir(node.snapshots.dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect()
+}
+
+/// Settings for the snapshot-recovery tests (issues #330, #331): a build
+/// every 5 entries, a short back-off.
+fn recovery_raft() -> RaftSettings {
+    RaftSettings {
+        snapshot_log_entries: 5,
+        log_keep_entries: 1,
+        snapshot_retry_ms: 200,
+        ..TEST_RAFT
+    }
+}
+
+/// Issue #330: a snapshot build that fails (here ENOSPC in the middle of
+/// the export, after its temp file was written) used to end openraft's
+/// Raft core ("quit RaftCore::main on error ... os error 28"), leaving a
+/// node that answered nothing. Now the node keeps running and writing, the
+/// temp file is removed, the failure is counted and retried with a growing
+/// back-off (not every policy tick), and once the cause is gone the next
+/// build succeeds and the log is purged below it.
+#[test]
+fn a_failed_snapshot_build_keeps_the_node_running_and_backs_off() {
+    let _w = watchdog(
+        "a_failed_snapshot_build_keeps_the_node_running_and_backs_off",
+        TEST_LIMIT,
+    );
+    let tb = ClusterTestbed::with_config(1, exts(), |_, c| {
+        c.raft = Some(recovery_raft());
+    });
+    let node = tb.node(1).raft().unwrap().clone();
+    let saw_temp = Arc::new(AtomicBool::new(false));
+    let fail = Arc::new(AtomicBool::new(true));
+    let (s2, f2) = (Arc::clone(&saw_temp), Arc::clone(&fail));
+    node.snapshots
+        .set_build_hook(Some(Arc::new(move |tmp: &Path| {
+            if !f2.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if tmp.exists() {
+                s2.store(true, Ordering::SeqCst);
+            }
+            Err(StoreError::Storage(
+                std::io::Error::from_raw_os_error(28).to_string(),
+            ))
+        })));
+    let c = tb.client(1);
+    for i in 0..6 {
+        let f = small_file(i);
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    }
+    poll_until("two failed builds", || {
+        node.snapshots.build_state().failed >= 2
+    });
+    let first_two = Instant::now();
+    assert!(
+        saw_temp.load(Ordering::SeqCst),
+        "the export wrote its temp file"
+    );
+    assert!(
+        node.metrics().running_state.is_ok(),
+        "the Raft core runs on"
+    );
+    assert!(node.metrics().snapshot.is_none());
+    assert_eq!(snapshot_temps(&node), Vec::<String>::new(), "temp removed");
+    // Writes and reads still work.
+    let f = small_file(100);
+    c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 7);
+    // Backed off (200 ms, 400 ms, 800 ms, ...), not one build per tick.
+    std::thread::sleep(Duration::from_millis(1500));
+    let st = node.snapshots.build_state();
+    assert!(
+        st.failed <= 5,
+        "{} failures in {:?}: no back-off",
+        st.failed,
+        first_two.elapsed()
+    );
+    assert!(st.consecutive_failures >= 2, "{st:?}");
+    assert!(
+        st.last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("os error 28"),
+        "{st:?}"
+    );
+    // Space is back: the next retry builds, and the log is purged.
+    fail.store(false, Ordering::SeqCst);
+    poll_until("a snapshot after the failures", || {
+        let m = node.metrics();
+        m.snapshot.is_some() && m.purged.is_some()
+    });
+    assert_eq!(node.snapshots.build_state().consecutive_failures, 0);
+    assert!(node.metrics().running_state.is_ok());
+    assert_eq!(snapshot_temps(&node), Vec::<String>::new());
+    node.snapshots.set_build_hook(None);
+}
+
+/// Issue #331: a long snapshot build (parked inside the export, holding
+/// the store's read lock) does not stop the node answering: the health
+/// service, reads and writes all answer within 2 s while it runs. It logs
+/// its progress, and is neither reported as failed nor triggered again
+/// however long it runs (it used to be, every 30 s); once it ends the log
+/// is purged below it.
+#[test]
+fn a_long_snapshot_build_is_waited_for_and_the_node_keeps_answering() {
+    let _w = watchdog(
+        "a_long_snapshot_build_is_waited_for_and_the_node_keeps_answering",
+        TEST_LIMIT,
+    );
+    let tb = ClusterTestbed::with_config(1, exts(), |_, c| {
+        c.raft = Some(recovery_raft());
+    });
+    let node = tb.node(1).raft().unwrap().clone();
+    node.snapshots.set_progress_every(Duration::from_millis(50));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let release_rx = Mutex::new(Some(release_rx));
+    node.snapshots
+        .set_build_hook(Some(Arc::new(move |_: &Path| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+                if let Some(rx) = release_rx.lock().unwrap().take() {
+                    let _ = rx.recv_timeout(CLUSTER_WAIT * 3);
+                }
+            }
+            Ok(())
+        })));
+    let c = tb.client(1);
+    for i in 0..6 {
+        let f = small_file(i);
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    }
+    entered_rx
+        .recv_timeout(CLUSTER_WAIT)
+        .expect("a build reached the export");
+    // Several times the 200 ms retry interval.
+    std::thread::sleep(Duration::from_millis(1200));
+    let st = node.snapshots.build_state();
+    assert!(st.running(), "{st:?}");
+    assert_eq!((st.started, st.failed), (1, 0), "{st:?}");
+    for _ in 0..3 {
+        let t = Instant::now();
+        assert!(
+            graph_client::probe_health(&tb.node(1).endpoint(), "", Duration::from_secs(2)).unwrap(),
+            "health answers during the build"
+        );
+        assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 6);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+    let t = Instant::now();
+    let f = small_file(200);
+    c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "write took {:?}",
+        t.elapsed()
+    );
+    release_tx.send(()).unwrap();
+    poll_until("the long build's snapshot and purge", || {
+        let m = node.metrics();
+        m.snapshot.is_some() && m.purged.is_some()
+    });
+    assert!(
+        node.snapshots.progress_reports() >= 3,
+        "progress logged: {}",
+        node.snapshots.progress_reports()
+    );
+    assert_eq!(node.snapshots.build_state().failed, 0);
+    node.snapshots.set_build_hook(None);
+}
+
+/// Issue #330: with the disk guard off (the `--db` default) a build still
+/// needs room for a full copy of the store: without it, it is postponed
+/// (never started, so it cannot fill the disk), and built once space frees.
+#[test]
+fn a_snapshot_build_without_room_for_its_copy_is_postponed_with_the_guard_off() {
+    let _w = watchdog(
+        "a_snapshot_build_without_room_for_its_copy_is_postponed_with_the_guard_off",
+        TEST_LIMIT,
+    );
+    let free = Arc::new(AtomicU64::new(1));
+    let f2 = Arc::clone(&free);
+    let tb = ClusterTestbed::with_config(1, exts(), move |_, c| {
+        c.raft = Some(recovery_raft());
+        let f = Arc::clone(&f2);
+        c.min_free_disk = 0;
+        c.free_space_probe = Some(Arc::new(move |_| Some(f.load(Ordering::SeqCst))));
+    });
+    let node = tb.node(1).raft().unwrap().clone();
+    let c = tb.client(1);
+    for i in 0..6 {
+        let f = small_file(i);
+        c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(node.snapshots.build_state().started, 0, "postponed");
+    assert!(node.metrics().snapshot.is_none());
+    free.store(u64::MAX, Ordering::SeqCst);
+    poll_until("the postponed snapshot", || {
+        node.metrics().snapshot.is_some()
+    });
+}
