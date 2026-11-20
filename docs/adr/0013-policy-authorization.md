@@ -90,7 +90,7 @@ Notes:
 - `Cluster::"this"`: the one cluster-level resource (whole-store and node operations).
 - Org and repo names are compared byte for byte, exactly as the store stores them. A `Repo::` id is split at the **first** `/`: `Repo::"a/b/c"` is org `a`, repo `b/c`. An org name containing `/` cannot be addressed by a `Repo::` policy; it can be granted only through `Org::"..."` (which needs no split) or `resource` (any). At start, `serve` with `--auth-policies` logs a `warn` for every existing org whose name contains `/`, and `auth check` lists them; the indexer is not changed (owner decision Q8).
 
-**Visible and hidden.** For a principal and a read action (`read` or `search`), a repo is **visible** if the policy set allows that action on it, and **hidden** otherwise. An org is **visible** if it has at least one visible existing repo, and **hidden** otherwise. This one definition decides both what aggregate reads list and which named reads are refused (D5), so they always agree.
+**Visible and hidden.** For a principal and a read action (`read` or `search`), a repo is **visible** if the policy set allows that action on it, and **hidden** otherwise. An org is **visible** if it has at least one visible existing repo, and **hidden** otherwise. Under `ReadScope::All` (no policy file, or a principal allowed the action on any resource) every existing org is visible, including one with no repos, so v1 behaviour is unchanged. This one definition decides both what aggregate reads list and which named reads are refused (D5), so they always agree.
 
 **Admission for reads.** Every read method is admitted for any authenticated principal whose role covers `read`; the scope is applied inside the request (D5), never by refusing the method. A principal with zero read grants therefore gets empty answers from aggregate reads, and `PERMISSION_DENIED` only when it names an existing resource. `ReadIndex` sent as the barrier of a linearizable read is part of that read's action (`read`/`search`), not `status` (D7), so scoped readers keep `--read linearizable`.
 
@@ -149,7 +149,7 @@ Owner decision Q2 (2026-11-20) sets the rule. Every read is one of two kinds:
   - it exists and is visible: answered, with any hidden parts inside it filtered (below).
   - For a node id, "the named resource" is the repo the node belongs to; an org node is named by its org.
 - **Aggregate read:** the request names nothing: `roots`, `count_nodes`, `SnapshotStats`, unfiltered `describe`/`describe_by_scan`/`extractor_gaps`, unfiltered `search`/`search_symbols`; over MCP, `list_repos`, unfiltered `describe`, `search` and `find_symbols`. These are **filtered** to the visible repos inside the query and **never** refused.
-- **Partly visible targets filter, they do not refuse:** `children`, `describe` or a filtered search of a visible org that also holds hidden repos answer with the visible repos only.
+- **Partly visible targets filter, they do not refuse:** `children`, `descendants`, `describe` or a filtered search of a visible org that also holds hidden repos answer with the visible repos only.
 - **Writes never depend on existence** (D6): indexing a new repo, or pruning or deleting one that does not exist, is decided on policy alone.
 - **Accepted consequence (owner decision Q2):** a refused named read reveals that the named org, repo, path or node exists; a missing one answers as today. The two answers are deliberately **not** unified.
 
