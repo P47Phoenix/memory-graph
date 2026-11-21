@@ -149,6 +149,9 @@ pub struct SnapshotDir {
     progress_every: std::sync::Mutex<std::time::Duration>,
     /// Progress lines logged since start (tests).
     progress_reports: AtomicU64,
+    /// Why snapshots are blocked now (set by the snapshot policy; shown by
+    /// `cluster status`).
+    blocked: std::sync::Mutex<Option<String>>,
 }
 
 /// A temp file removed when dropped (every error path); a no-op once the
@@ -253,6 +256,7 @@ impl SnapshotDir {
             build_hook: std::sync::RwLock::new(None),
             progress_every: std::sync::Mutex::new(BUILD_PROGRESS_EVERY),
             progress_reports: AtomicU64::new(0),
+            blocked: std::sync::Mutex::new(None),
         })
     }
 
@@ -309,6 +313,22 @@ impl SnapshotDir {
             .progress_every
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = every;
+    }
+
+    /// Why snapshots are blocked now (`None`: they are not).
+    pub fn blocked(&self) -> Option<String> {
+        self.blocked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set (or clear) why snapshots are blocked.
+    pub fn set_blocked(&self, why: Option<String>) {
+        *self
+            .blocked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = why;
     }
 
     /// Progress lines logged by builds since start.
@@ -594,16 +614,20 @@ impl SnapshotDir {
                 let mut n = 0u64;
                 while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(every) {
                     let written = std::fs::metadata(&tmp).map_or(0, |m| m.len());
-                    let percent = written
+                    // Approximate: the copy leaves out the store's free
+                    // pages, so it ends below 100; clamped in case not.
+                    let approx_percent = written
                         .saturating_mul(100)
                         .checked_div(store_bytes)
-                        .unwrap_or(0);
+                        .unwrap_or(0)
+                        .min(100);
                     tracing::info!(
                         written,
                         store_bytes,
-                        percent,
+                        approx_percent,
                         elapsed_s = started.elapsed().as_secs(),
-                        "snapshot build in progress (the copy is about as large as the store)"
+                        "snapshot build in progress (the copy is at most about as large as \
+                         the store file)"
                     );
                     n += 1;
                 }

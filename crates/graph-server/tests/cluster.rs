@@ -2060,12 +2060,18 @@ fn a_failed_snapshot_build_keeps_the_node_running_and_backs_off() {
     let node = tb.node(1).raft().unwrap().clone();
     let saw_temp = Arc::new(AtomicBool::new(false));
     let fail = Arc::new(AtomicBool::new(true));
-    let (s2, f2) = (Arc::clone(&saw_temp), Arc::clone(&fail));
+    let failed_at: Arc<Mutex<Vec<Instant>>> = Arc::default();
+    let (s2, f2, t2) = (
+        Arc::clone(&saw_temp),
+        Arc::clone(&fail),
+        Arc::clone(&failed_at),
+    );
     node.snapshots
         .set_build_hook(Some(Arc::new(move |tmp: &Path| {
             if !f2.load(Ordering::SeqCst) {
                 return Ok(());
             }
+            t2.lock().unwrap().push(Instant::now());
             if tmp.exists() {
                 s2.store(true, Ordering::SeqCst);
             }
@@ -2096,13 +2102,18 @@ fn a_failed_snapshot_build_keeps_the_node_running_and_backs_off() {
     let f = small_file(100);
     c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
     assert_eq!(c.count_nodes(NodeKind::File).unwrap(), 7);
-    // Backed off (200 ms, 400 ms, 800 ms, ...), not one build per tick.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Backed off, doubling: 200, 400, 800, 1600 ms between failures. A
+    // constant delay (even woken only by the 1 s policy tick) leaves about
+    // 1 s before the fifth failure, so the last gap tells them apart.
+    poll_until("five failed builds", || {
+        node.snapshots.build_state().failed >= 5
+    });
     let st = node.snapshots.build_state();
+    let at = failed_at.lock().unwrap().clone();
+    let gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
     assert!(
-        st.failed <= 5,
-        "{} failures in {:?}: no back-off",
-        st.failed,
+        gaps.len() >= 4 && gaps[3] >= Duration::from_millis(1500),
+        "the back-off doubles: gaps {gaps:?} (since two: {:?})",
         first_two.elapsed()
     );
     assert!(st.consecutive_failures >= 2, "{st:?}");
@@ -2113,6 +2124,15 @@ fn a_failed_snapshot_build_keeps_the_node_running_and_backs_off() {
             .contains("os error 28"),
         "{st:?}"
     );
+    // `cluster status` says why snapshots are blocked, with the space a
+    // build needs and where.
+    let blocked = c.admin_status().unwrap().snapshot_blocked;
+    assert!(
+        blocked.contains("os error 28")
+            && blocked.contains("bytes free")
+            && blocked.contains("on the volume of"),
+        "{blocked}"
+    );
     // Space is back: the next retry builds, and the log is purged.
     fail.store(false, Ordering::SeqCst);
     poll_until("a snapshot after the failures", || {
@@ -2120,6 +2140,9 @@ fn a_failed_snapshot_build_keeps_the_node_running_and_backs_off() {
         m.snapshot.is_some() && m.purged.is_some()
     });
     assert_eq!(node.snapshots.build_state().consecutive_failures, 0);
+    poll_until("snapshots no longer blocked", || {
+        c.admin_status().unwrap().snapshot_blocked.is_empty()
+    });
     assert!(node.metrics().running_state.is_ok());
     assert_eq!(snapshot_temps(&node), Vec::<String>::new());
     node.snapshots.set_build_hook(None);
@@ -2226,8 +2249,161 @@ fn a_snapshot_build_without_room_for_its_copy_is_postponed_with_the_guard_off() 
     std::thread::sleep(Duration::from_millis(1000));
     assert_eq!(node.snapshots.build_state().started, 0, "postponed");
     assert!(node.metrics().snapshot.is_none());
+    let blocked = c.admin_status().unwrap().snapshot_blocked;
+    assert!(blocked.contains("snapshot postponed"), "{blocked}");
     free.store(u64::MAX, Ordering::SeqCst);
     poll_until("the postponed snapshot", || {
         node.metrics().snapshot.is_some()
     });
+}
+
+/// Review of #333: `cluster snapshot` (`snapshot_now`) checks for room for
+/// the copy, and a build that fails while it waits answers that failure at
+/// once (a full disk as `disk full`, RESOURCE_EXHAUSTED on the wire, with
+/// the space needed and the volume), not a timeout.
+#[test]
+fn snapshot_now_answers_a_failed_build_at_once() {
+    let _w = watchdog("snapshot_now_answers_a_failed_build_at_once", TEST_LIMIT);
+    let tb = ClusterTestbed::with_config(1, exts(), |_, c| {
+        c.raft = Some(RaftSettings {
+            snapshot_log_entries: u64::MAX,
+            ..recovery_raft()
+        });
+    });
+    let node = tb.node(1).raft().unwrap().clone();
+    node.snapshots.set_build_hook(Some(Arc::new(|_: &Path| {
+        Err(StoreError::Storage(
+            std::io::Error::from_raw_os_error(28).to_string(),
+        ))
+    })));
+    let c = tb.client(1);
+    let f = small_file(1);
+    c.index_bytes("o", "r", &f.0, &f.1, None).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let t = Instant::now();
+    let e = rt
+        .block_on(node.snapshot_now(CLUSTER_WAIT))
+        .expect_err("the build failed");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    let msg = e.to_string();
+    assert!(graph_proto::error::is_disk_full(&msg), "{msg}");
+    assert!(
+        msg.contains("bytes free") && msg.contains("on the volume of"),
+        "{msg}"
+    );
+    assert!(node.metrics().running_state.is_ok());
+    node.snapshots.set_build_hook(None);
+    let (index, _) = rt.block_on(node.snapshot_now(CLUSTER_WAIT)).unwrap();
+    assert!(index > 0);
+}
+
+/// Issues #330/#331 (QA on #333): a Raft log whose live part stays above
+/// the compaction cap is not compacted after its purge; a restart compacts
+/// it before the node joins Raft, and the node then serves.
+#[test]
+fn a_restart_compacts_a_raft_log_left_sparse_above_the_cap() {
+    let _w = watchdog(
+        "a_restart_compacts_a_raft_log_left_sparse_above_the_cap",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::with_config(1, exts(), |_, c| {
+        c.raft = Some(RaftSettings {
+            snapshot_log_entries: 4,
+            log_keep_entries: 0,
+            purge_batch_size: 1,
+            ..recovery_raft()
+        });
+    });
+    let node = tb.node(1).raft().unwrap().clone();
+    // No compaction after a purge, whatever is left live.
+    node.log_store.set_compact_max_live(0);
+    let c = tb.client(1);
+    for i in 0..6 {
+        let (path, bytes) = rust_file_of(i, 1 << 20);
+        c.index_bytes("o", "r", &path, &bytes, None).unwrap();
+    }
+    let applied = node.metrics().last_applied.map_or(0, |l| l.index);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (snap, _) = rt
+        .block_on(node.snapshot_now(CLUSTER_WAIT))
+        .expect("a snapshot covering the writes");
+    assert!(snap >= applied);
+    poll_until("the log purged to the snapshot", || {
+        node.metrics().purged.is_some_and(|p| p.index >= applied)
+    });
+    let log = tb.data_dir(1).join("raft.redb");
+    let before = std::fs::metadata(&log).unwrap().len();
+    assert!(
+        before > 6 << 20,
+        "not compacted after the purge: {before} B"
+    );
+    drop(c);
+    drop(node);
+    tb.node_mut(1).stop();
+    tb.node_mut(1).restart();
+    let after = std::fs::metadata(&log).unwrap().len();
+    assert!(
+        after < before / 2,
+        "compacted at start-up: {before} B -> {after} B"
+    );
+    assert_eq!(tb.client(1).count_nodes(NodeKind::File).unwrap(), 6);
+}
+
+/// The owner on #333: while the start-up compaction runs, health answers
+/// at once with NOT_SERVING (both names) instead of a probe hanging on a
+/// listener nobody accepts on; once it is done, the node serves.
+#[test]
+fn health_answers_not_serving_during_the_start_up_compaction() {
+    let _w = watchdog(
+        "health_answers_not_serving_during_the_start_up_compaction",
+        TEST_LIMIT,
+    );
+    let mut tb = ClusterTestbed::with_config(1, exts(), |_, c| {
+        c.raft = Some(recovery_raft());
+    });
+    let endpoint = tb.node(1).endpoint();
+    tb.node_mut(1).stop();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let release_rx = Mutex::new(Some(release_rx));
+    tb.node_mut(1).config_mut().testing_start_compaction_gate = Some(Arc::new(move || {
+        if let Some(tx) = entered_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+            if let Some(rx) = release_rx.lock().unwrap().take() {
+                let _ = rx.recv_timeout(CLUSTER_WAIT * 3);
+            }
+        }
+    }));
+    let prober = std::thread::spawn(move || {
+        entered_rx
+            .recv_timeout(CLUSTER_WAIT)
+            .expect("the start-up compaction began");
+        let mut answers = Vec::new();
+        for service in ["", graph_server::READY_SERVICE] {
+            let t = Instant::now();
+            let r = graph_client::probe_health(&endpoint, service, Duration::from_secs(2));
+            answers.push((service, r.map_err(|e| e.to_string()), t.elapsed()));
+        }
+        release_tx.send(()).unwrap();
+        answers
+    });
+    tb.node_mut(1).restart();
+    for (service, r, took) in prober.join().unwrap() {
+        assert_eq!(r, Ok(false), "{service:?}: NOT_SERVING");
+        assert!(took < Duration::from_secs(2), "{service:?} took {took:?}");
+    }
+    assert!(
+        graph_client::probe_health(&tb.node(1).endpoint(), "", Duration::from_secs(2)).unwrap()
+    );
+    let f = small_file(1);
+    tb.client(1)
+        .index_bytes("o", "r", &f.0, &f.1, None)
+        .unwrap();
 }

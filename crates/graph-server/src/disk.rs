@@ -103,6 +103,17 @@ impl DiskGuard {
     /// store; one started without that room fills the disk, fails with
     /// ENOSPC and leaves nothing behind but a log that cannot be purged
     /// (issue #330), so it is postponed instead.
+    /// What a snapshot build needs free, and the directory whose volume is
+    /// checked: one copy of the store, estimated from the store file's
+    /// length (an overestimate: the copy leaves out free pages), plus
+    /// `min_free`.
+    pub fn snapshot_need(&self) -> (u64, &Path) {
+        (
+            self.min_free.saturating_add(Self::size(&self.store)),
+            &self.dir,
+        )
+    }
+
     pub fn check_snapshot(&self) -> Result<(), StoreError> {
         let store = Self::size(&self.store);
         self.check_need_always(

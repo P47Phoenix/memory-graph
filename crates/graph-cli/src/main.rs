@@ -1944,6 +1944,7 @@ fn run() -> Result<i32> {
                                 "mcp_addr": st.mcp_addr,
                                 "disk_stalled": st.disk_stalled,
                                 "disk_stall_message": st.disk_stall_message,
+                                "snapshot_blocked": st.snapshot_blocked,
                                 "members": st.members.iter().map(|m| serde_json::json!({
                                     "node_id": m.node_id,
                                     "addr": m.addr,
@@ -1993,6 +1994,9 @@ fn run() -> Result<i32> {
                                 st.disk_stalled.join(", "),
                                 st.disk_stall_message
                             );
+                        }
+                        if !st.snapshot_blocked.is_empty() {
+                            out!("  SNAPSHOTS BLOCKED {}", st.snapshot_blocked);
                         }
                         for m in &st.members {
                             let lag = st

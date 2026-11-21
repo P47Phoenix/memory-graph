@@ -127,6 +127,11 @@ message StatusResponse {
   // meanwhile, with `disk_stall_message`.
   repeated string disk_stalled = 34;
   string disk_stall_message = 35;
+  // Issues #330/#331: why snapshots are blocked right now (the last build
+  // failed, or one is postponed for lack of disk space), with the space a
+  // build needs and the volume's path; empty: not blocked (or the server
+  // predates the field). The Raft log is not purged meanwhile.
+  string snapshot_blocked = 36;
 }
 
 // This node's snapshot backups since it started.

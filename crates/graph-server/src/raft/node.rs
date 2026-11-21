@@ -549,10 +549,6 @@ impl RaftNode {
                 p.disk.clone(),
             );
             tokio::task::spawn_blocking(move || {
-                // Before the Raft core runs (nothing to stall): shrink a log
-                // file a past purge left mostly empty, however large its
-                // live part (issues #330, #331).
-                log.compact_on_start();
                 repair_stale_snapshot(&slot, &snaps, &log)?;
                 // Best effort: an outdated snapshot only delays a laggard
                 // (the policy's next build replaces it), so a failed or
@@ -1064,21 +1060,35 @@ impl RaftNode {
     /// Build a snapshot now (after the disk guard) and wait until the
     /// current snapshot covers what was applied when asked; returns its
     /// `(index, term)`.
+    ///
+    /// A build that fails while this waits answers its error at once (a
+    /// full disk as `disk full ...`, `RESOURCE_EXHAUSTED` on the wire), not a
+    /// timeout (issues #330, #331).
     pub async fn snapshot_now(&self, timeout: Duration) -> Result<(u64, u64), StoreError> {
-        self.disk.check("snapshot")?;
+        self.disk.check_snapshot()?;
         let applied = self.metrics().last_applied.map_or(0, |l| l.index);
+        let before = self.snapshots.build_state();
         self.raft.trigger().snapshot().await.map_err(fatal)?;
-        let m = self
-            .raft
-            .wait(Some(timeout))
-            .metrics(
-                |m| m.snapshot.is_some_and(|s| s.index >= applied),
-                "snapshot covers the applied index",
-            )
-            .await
-            .map_err(|e| fatal(format!("waiting for the snapshot: {e}")))?;
-        let s = m.snapshot.unwrap_or_default();
-        Ok((s.index, s.leader_id.term))
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut rx = self.raft.metrics();
+        loop {
+            if let Some(s) = rx.borrow().snapshot.filter(|s| s.index >= applied) {
+                return Ok((s.index, s.leader_id.term));
+            }
+            let now = self.snapshots.build_state();
+            if now.failed > before.failed && !now.running() {
+                return Err(build_failed_error(&self.disk, &now));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(fatal(format!(
+                    "waiting for the snapshot: no snapshot at or above {applied} after {timeout:?}"
+                )));
+            }
+            tokio::select! {
+                r = rx.changed() => if r.is_err() { return Err(fatal("raft stopped")) },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
     }
 
     /// openraft's read barrier (ADR 0004 D8, `LINEARIZABLE`): confirms
@@ -1191,8 +1201,9 @@ impl RaftNode {
 /// failed (the builder never fails openraft's command, which would stop
 /// the Raft core; see `SnapshotBuilder::build_snapshot`) is retried after
 /// [`snapshot_backoff`]: `snapshot_retry_ms`, doubling per failure in a
-/// row up to [`SNAPSHOT_RETRY_MAX`], logged at warn and, from the
-/// [`SNAPSHOT_FAILURES_LOUD`]th failure in a row, at error. After a
+/// row up to [`SNAPSHOT_RETRY_MAX`], forever; each failure is logged at
+/// error with the space a build needs and the volume, and recorded as the
+/// reason `cluster status` shows ([`SnapshotDir::blocked`]). After a
 /// successful build that took longer than [`DUTY_FLOOR_MIN`], the next one
 /// waits as long as that one took, so builds on a large store never run
 /// back to back (at most half the time is spent building). A build
@@ -1267,29 +1278,30 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
             {
                 pending = None;
             }
+            if snap.is_some() && builds.consecutive_failures == 0 {
+                node.snapshots.set_blocked(None);
+            }
         }
+        // Only a build this policy triggered (and waits for) sets the
+        // back-off: a failed `cluster snapshot` (`snapshot_now`) or start-up
+        // repair answers its own caller and does not delay the policy.
         if let Some(mut p) = pending.take() {
             if builds.failed > p.builds.failed {
                 let n = builds.consecutive_failures.max(1);
                 let wait = snapshot_backoff(retry, n);
-                let error = builds.last_error.as_deref().unwrap_or("unknown");
-                if n >= SNAPSHOT_FAILURES_LOUD {
-                    tracing::error!(
-                        failures = n,
-                        error,
-                        retry_in_s = wait.as_secs(),
-                        "snapshot builds keep failing, so the Raft log cannot be purged and \
-                         keeps growing; fix the cause (often disk space: a build needs room \
-                         for a full copy of the store)"
-                    );
-                } else {
-                    tracing::warn!(
-                        failures = n,
-                        error,
-                        retry_in_s = wait.as_secs(),
-                        "snapshot build failed; retrying after a back-off"
-                    );
-                }
+                let why = build_failed_message(&node.disk, &builds);
+                let (need, dir) = node.disk.snapshot_need();
+                // Every failure is an error: the Raft log is not purged
+                // until a build succeeds, and keeps growing.
+                tracing::error!(
+                    failures = n,
+                    need_bytes = need,
+                    volume = %dir.display(),
+                    retry_in_s = wait.as_secs(),
+                    loud = n >= SNAPSHOT_FAILURES_LOUD,
+                    "{why}; retrying after a back-off (the Raft log is not purged meanwhile)"
+                );
+                node.snapshots.set_blocked(Some(why));
                 not_before = Some(std::time::Instant::now() + wait);
             } else if builds.running() {
                 // Still building, however long it takes.
@@ -1346,6 +1358,8 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                     if !disk_refused {
                         tracing::warn!(error = %e, "snapshot postponed");
                         disk_refused = true;
+                        node.snapshots
+                            .set_blocked(Some(format!("snapshot postponed: {e}")));
                     }
                 }
             }
@@ -1369,6 +1383,32 @@ struct Pending {
     builds: super::snapshot_dir::BuildState,
     /// When the policy first saw the build ended well.
     done: Option<std::time::Instant>,
+}
+
+/// What a failed build says (the log, `cluster status`, `snapshot_now`):
+/// its error, and the space a build needs (one copy of the store,
+/// estimated from the store file's length, an overestimate, plus
+/// `--min-free-disk`) on which volume.
+fn build_failed_message(disk: &DiskGuard, st: &super::snapshot_dir::BuildState) -> String {
+    let (need, dir) = disk.snapshot_need();
+    format!(
+        "snapshot build failed ({} in a row): {}; a build needs about {need} bytes free \
+         (one copy of the store plus --min-free-disk) on the volume of `{}`",
+        st.consecutive_failures.max(1),
+        st.last_error.as_deref().unwrap_or("unknown error"),
+        dir.display()
+    )
+}
+
+/// [`build_failed_message`] as an error: a full disk is `disk full ...`
+/// (`RESOURCE_EXHAUSTED` on the wire).
+fn build_failed_error(disk: &DiskGuard, st: &super::snapshot_dir::BuildState) -> StoreError {
+    let msg = build_failed_message(disk, st);
+    if graph_proto::error::is_disk_full(st.last_error.as_deref().unwrap_or("")) {
+        StoreError::Storage(format!("disk full: {msg}"))
+    } else {
+        StoreError::Storage(msg)
+    }
 }
 
 /// The wait after the `failures`th failed build in a row: `first`,

@@ -476,10 +476,14 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
     /// result), so one disk-full export stopped the whole node. A failed
     /// build is counted and logged by [`SnapshotDir::build`] (which also
     /// removes its temp file), and answers the current snapshot instead, or
-    /// an empty one when there is none: either is no newer than what
-    /// openraft already has, so it changes nothing and purges nothing, and
-    /// openraft's "building" flag is cleared so the snapshot policy can
-    /// retry (with backoff, `node::snapshot_policy`).
+    /// an empty one when there is none. The empty one is never newer than
+    /// what openraft has, so it is dropped. The current pair is normally
+    /// what openraft already has; it can be newer when an install promoted
+    /// a pair while this build ran (the install race), and then openraft
+    /// adopts that complete, committed pair, which is a valid snapshot (the
+    /// store already holds it). Either way nothing is purged that a snapshot
+    /// does not cover, and openraft's "building" flag is cleared so the
+    /// snapshot policy can retry (with back-off, `node::snapshot_policy`).
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError> {
         let slot = Arc::clone(&self.slot);
         let snaps = Arc::clone(&self.snapshots);
