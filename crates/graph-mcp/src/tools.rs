@@ -151,6 +151,14 @@ pub trait McpBackend {
     fn writes_enabled(&self) -> bool {
         false
     }
+
+    /// Whether `tools/list` leaves tool `name` out although it exists
+    /// (ADR 0013 D5: a write tool the caller has no permit for anywhere).
+    /// A hidden tool is still callable, and refused by its own check.
+    fn hides_tool(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
 }
 
 /// The typed code of a store error in an `isError` result: the
@@ -971,6 +979,8 @@ pub struct StoreBackend {
     stale_reads: Option<StaleCounter>,
     /// The write tools, when on (story 33).
     writes: Option<WriteAccess>,
+    /// Tools `tools/list` leaves out (ADR 0013 D5).
+    hidden: Vec<String>,
 }
 
 impl StoreBackend {
@@ -980,6 +990,7 @@ impl StoreBackend {
             store,
             stale_reads: None,
             writes: None,
+            hidden: Vec::new(),
         }
     }
 
@@ -990,6 +1001,14 @@ impl StoreBackend {
         self
     }
 
+    /// Leave these tools out of `tools/list` (ADR 0013 D5: write tools the
+    /// caller has no permit for anywhere); calling one still works and is
+    /// refused by its own policy check.
+    pub fn with_hidden(mut self, tools: Vec<String>) -> Self {
+        self.hidden = tools;
+        self
+    }
+
     /// A store behind a server: a call is `stale_possible` when the counter
     /// grew while it ran.
     pub fn remote(store: Box<dyn StoreRead + Send>, stale_reads: StaleCounter) -> Self {
@@ -997,6 +1016,7 @@ impl StoreBackend {
             store,
             stale_reads: Some(stale_reads),
             writes: None,
+            hidden: Vec::new(),
         }
     }
 
@@ -1053,6 +1073,10 @@ impl StoreBackend {
     /// The repo node of `org`/`repo`, or an `invalid_argument` naming what
     /// is there.
     fn repo_node(&self, org: &str, repo: &str) -> Result<graph_core::Node, ToolError> {
+        // ADR 0013 D5: on a scoped store, naming an existing hidden repo is
+        // `PermissionDenied` (a missing one falls through to the
+        // `invalid_argument` below, today's answer).
+        self.store.describe(Some(org), Some(repo))?;
         let orgs = self.store.roots()?;
         let Some(o) = orgs
             .iter()
@@ -1093,6 +1117,10 @@ impl StoreBackend {
                 json!({ "repos": infos })
             }
             ToolCall::ListRepos { org, page } => {
+                if let Some(o) = org {
+                    // ADR 0013 D5: an existing hidden org is refused.
+                    self.store.describe(Some(o), None)?;
+                }
                 let mut items = Vec::new();
                 let mut org_found = false;
                 for o in self.store.roots()? {
@@ -1253,6 +1281,10 @@ impl StoreBackend {
 impl McpBackend for StoreBackend {
     fn writes_enabled(&self) -> bool {
         self.writes.is_some()
+    }
+
+    fn hides_tool(&self, name: &str) -> bool {
+        self.hidden.iter().any(|h| h == name)
     }
 
     fn read(&self, call: &ToolCall) -> Result<Value, ToolError> {

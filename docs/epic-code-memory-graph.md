@@ -1085,7 +1085,7 @@ So that I can navigate what I may see, and hidden data stays out of every count.
 
 <a id="story-74c"></a>
 **74c. Scoped reads: MCP read tools (2 pts)**
-Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5, D9.
+Status: In review (ADR 0013 PR 3c, branch `adr13-pr3c`). Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5, D9.
 As an AI agent using MCP with a scoped token
 I want the read tools to see exactly my scope
 So that I can neither leak nor be confused by hidden repos.
@@ -1095,7 +1095,7 @@ So that I can neither leak nor be confused by hidden repos.
 
 <a id="story-75"></a>
 **75. Policy operator docs and `auth check` in CI (2 pts)**
-Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md).
+Status: In review (ADR 0013 PR 3c, branch `adr13-pr3c`). Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md).
 As an operator
 I want a policy guide with worked examples
 So that I can write, check and roll out policies safely.

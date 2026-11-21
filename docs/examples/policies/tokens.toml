@@ -1,0 +1,21 @@
+# Worked example for docs/security.md (ADR 0013): the token file.
+# The sha256 values are placeholders (the hash of no real token).
+# `cargo test -p graph-cli` runs `memory-graph auth check` on this pair and
+# checks every decision listed in expected.txt.
+
+[[token]]
+id = "web-ci"
+role = "write"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
+
+[[token]]
+id = "alice"
+role = "read"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
+groups = ["acme-readers"]
+
+[[token]]
+id = "ops"
+role = "write"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000003"
+groups = ["operators"]
