@@ -510,3 +510,125 @@ fn role_groups_follow_d1() {
     client(&e, &e.f.write).admin_status().unwrap();
     client(&e, &e.f.read).admin_status().unwrap();
 }
+
+/// ADR 0013 D2 (Q6): a revoking reload stops an open `Index` stream at the
+/// next file; the files after it are refused and nothing of the stream is
+/// applied (its pending batch never commits).
+#[test]
+fn a_revoking_reload_stops_an_index_stream_at_the_next_file() {
+    use graph_proto::pb;
+    use std::time::Duration;
+    let e = env_with(POLICIES, false);
+    let ep = e.ts.endpoint();
+    let token = e.f.write.clone();
+    let file = |p: &str| pb::IndexRequest {
+        msg: Some(pb::index_request::Msg::File(pb::FileBytes {
+            path: p.into(),
+            bytes: format!("fn f_{}() {{}}", p.replace('.', "_")).into_bytes(),
+            ..Default::default()
+        })),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<pb::IndexRequest>(8);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let call = runtime.spawn(async move {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut c = pb::write_client::WriteClient::with_interceptor(ch, graph_proto::SendVersion);
+        let mut req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        c.index(req).await.map(|r| r.into_inner())
+    });
+    runtime.block_on(async {
+        tx.send(pb::IndexRequest {
+            msg: Some(pb::index_request::Msg::Header(pb::IndexHeader {
+                org: "acme".into(),
+                repo: "web".into(),
+                options: None,
+            })),
+        })
+        .await
+        .unwrap();
+        tx.send(file("a.rs")).await.unwrap();
+        tx.send(file("b.rs")).await.unwrap();
+    });
+    // The first files are admitted; now the grant goes away (the token
+    // stays in the file: only the policy changes).
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(
+        &e.policies,
+        POLICIES.replace(
+            "resource == Repo::\"acme/web\"",
+            "resource == Repo::\"acme/other\"",
+        ),
+    )
+    .unwrap();
+    assert_eq!(reload(&e).0, Some(Reload::Reloaded));
+    runtime.block_on(async {
+        for p in ["c.rs", "d.rs"] {
+            // The server may already have answered and closed the stream.
+            let _ = tx.send(file(p)).await;
+        }
+        drop(tx);
+    });
+    let r = runtime.block_on(call).unwrap();
+    match r {
+        Err(st) => {
+            assert_eq!(st.code(), tonic::Code::PermissionDenied, "{st:?}");
+            assert!(st.message().contains("action `index`"), "{st:?}");
+        }
+        Ok(resp) => panic!(
+            "the stream was not stopped: {} files applied",
+            resp.results.len()
+        ),
+    }
+    // Nothing of the stream was applied: not the refused files, and not
+    // the admitted ones still pending in the uncommitted batch.
+    let w2 = client(&e, &e.f.write2);
+    for p in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+        assert_eq!(w2.file_tokens("acme", "web", p).unwrap(), None, "{p}");
+    }
+    assert!(w2.describe(Some("acme"), Some("web")).unwrap().is_empty());
+}
+
+/// D4 end to end: a `read` token with a permit for everything is still
+/// refused writes and `admin`/`snapshot` cluster actions by the server.
+#[test]
+fn the_role_ceiling_holds_end_to_end() {
+    let e = env_with(
+        r#"permit(principal == Token::"r", action, resource);"#,
+        false,
+    );
+    let r = client(&e, &e.f.read);
+    assert!(matches!(
+        r.index_bytes("acme", "web", "a.rs", b"fn a() {}", None),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert!(matches!(
+        r.delete_scope("acme", None, true),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert!(matches!(
+        r.vacuum(),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert!(matches!(
+        r.admin_compact(),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert!(matches!(
+        r.admin_trigger_snapshot(None),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    // Within the ceiling the permit applies.
+    r.admin_status().unwrap();
+    r.admin_list_backups().ok();
+    assert!(r.roots().unwrap().is_empty());
+}

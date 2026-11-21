@@ -3425,3 +3425,87 @@ fn symbols_prefix_and_infix_match_but_a_bare_fragment_does_not() {
         assert_eq!(out.contains("Gadget.cs"), found, "{args:?}: {out}");
     }
 }
+
+/// ADR 0013: `auth check` exit codes. 0 for a valid pair, with or without
+/// --explain and whatever the decision; 1 for an invalid pair; an
+/// unreadable file is an error (non-zero).
+#[test]
+fn auth_check_exit_codes() {
+    let d = tempfile::tempdir().unwrap();
+    let toks = d.path().join("tokens.toml");
+    let pols = d.path().join("policies.cedar");
+    let t = toks.to_str().unwrap();
+    let p = pols.to_str().unwrap();
+    let (ok, _, e) = run(&[
+        "auth",
+        "new-token",
+        "--id",
+        "ci",
+        "--role",
+        "write",
+        "--append",
+        t,
+    ]);
+    assert!(ok, "{e}");
+    std::fs::write(
+        &pols,
+        "@id(\"web\")\npermit(principal == Token::\"ci\", action == Action::\"index\", resource == Repo::\"acme/web\");\n",
+    )
+    .unwrap();
+    let code = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_memory-graph"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let o = code(&["auth", "check", "--tokens", t, "--policies", p]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&o.stdout).starts_with("ok: 1 policies"));
+    let o = code(&[
+        "auth",
+        "check",
+        "--tokens",
+        t,
+        "--policies",
+        p,
+        "--explain",
+        "ci",
+        "index",
+        "Repo::\"acme/web\"",
+    ]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("allow:"));
+    let o = code(&[
+        "auth",
+        "check",
+        "--tokens",
+        t,
+        "--policies",
+        p,
+        "--explain",
+        "ci",
+        "index",
+        "Repo::\"acme/api\"",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "a deny still exits 0");
+    assert!(String::from_utf8_lossy(&o.stdout).contains("deny:"));
+    std::fs::write(
+        &pols,
+        "@id(\"bad\")\npermit(principal, action, resource) when { true };",
+    )
+    .unwrap();
+    let o = code(&["auth", "check", "--tokens", t, "--policies", p]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("@id `bad`") && err.contains("line 2"), "{err}");
+    let missing = d.path().join("nope.cedar");
+    let o = code(&[
+        "auth",
+        "check",
+        "--tokens",
+        t,
+        "--policies",
+        missing.to_str().unwrap(),
+    ]);
+    assert!(!o.status.success());
+}

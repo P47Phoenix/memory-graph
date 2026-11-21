@@ -192,8 +192,10 @@ enum AuthCmd {
     },
     /// Validate a token file and a policy file as the pair `serve --auth-tokens --auth-policies`
     /// would load (ADR 0013), offline: exit 0 and the policy_hash when valid (warnings on
-    /// stderr), exit 1 naming the line and @id when not. With --explain, also print the
-    /// decision and the matching policy @ids for one request
+    /// stderr), exit 1 naming the line and @id when not (or a file cannot be read). With
+    /// --explain, also print the decision ("allow: ..." or "deny: ...") and the matching
+    /// policy @ids for one request; the exit code is still 0 on a deny (it reports whether the
+    /// pair is valid, not the decision)
     Check {
         /// The token file (`--auth-tokens`)
         #[arg(long, value_name = "FILE")]
@@ -3620,6 +3622,53 @@ mod worker_threads_tests {
             }
         };
         assert_eq!(run(&["--worker-threads", "5"]), Some(5));
+        // ADR 0013 (Q1): --auth-builtins defaults off, and needs --auth-policies.
+        let serve = |extra: &[&str]| {
+            let mut a = vec![
+                "memory-graph",
+                "serve",
+                "--db",
+                "g.redb",
+                "--auth-tokens",
+                "t.toml",
+            ];
+            a.extend_from_slice(extra);
+            Cli::try_parse_from(a)
+        };
+        match serve(&["--auth-policies", "p.cedar"]).unwrap().cmd {
+            Cmd::Serve {
+                auth_builtins,
+                auth_policies,
+                ..
+            } => {
+                assert!(!auth_builtins);
+                assert_eq!(auth_policies, Some(PathBuf::from("p.cedar")));
+            }
+            _ => unreachable!(),
+        }
+        match serve(&["--auth-policies", "p.cedar", "--auth-builtins"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Serve { auth_builtins, .. } => assert!(auth_builtins),
+            _ => unreachable!(),
+        }
+        assert!(
+            serve(&["--auth-builtins"]).is_err(),
+            "needs --auth-policies"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "memory-graph",
+                "serve",
+                "--db",
+                "g.redb",
+                "--auth-policies",
+                "p.cedar"
+            ])
+            .is_err(),
+            "needs --auth-tokens"
+        );
         if std::env::var_os("MEMORY_GRAPH_WORKER_THREADS").is_none() {
             assert_eq!(run(&[]), Some(3));
         }
