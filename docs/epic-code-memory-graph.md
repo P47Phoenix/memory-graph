@@ -1060,7 +1060,7 @@ So that a scoped token cannot change what it was not granted, even through a fol
 
 <a id="story-74a"></a>
 **74a. Scoped reads: query push-down, named-read refusal, strong differential (8 pts)**
-Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5 (owner decision Q2). Part of PR 3; lifts story 72's interim rule.
+Status: In review (ADR 0013 PR 3a, branch `adr13-pr3a`). Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5 (owner decision Q2). Part of PR 3; lifts story 72's interim rule.
 As an operator granting read access to some orgs only
 I want hidden repos filtered out of every aggregate query inside the store, and named requests for them refused
 So that out-of-scope data never shows up in results, counts, pages or limits.

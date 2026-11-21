@@ -28,6 +28,13 @@ use graph_core::tokenizer::tokenize;
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind, Span, SymbolDecl, SymbolKind};
 use std::collections::{BTreeMap, HashSet};
 
+#[path = "conformance_scoped.rs"]
+mod scoped;
+pub use scoped::{
+    fixed_scopes, run_scoped_crash_rerun_differential, run_scoped_differential,
+    run_search_insertion_order, scoped_queries, seed_scoped, SCOPED_REPOS,
+};
+
 type Opened = Result<Box<dyn Store>, StoreError>;
 type OpenFn = dyn Fn(Vec<Box<dyn Extractor>>) -> Opened;
 type Case = fn(&Harness);
@@ -114,6 +121,7 @@ pub const CASES: &[(&str, Case)] = &[
         "extractor_gaps_name_a_missing_extractor",
         extractor_gaps_name_a_missing_extractor,
     ),
+    ("scoped_extractor_gaps", scoped_extractor_gaps),
     ("space_usage_is_consistent", space_usage_is_consistent),
     ("encoded_files", encoded_files),
     (
@@ -2715,6 +2723,58 @@ fn extractor_gaps_name_a_missing_extractor(h: &Harness) {
     )
     .unwrap();
     assert!(s.extractor_gaps(Some("o"), Some("r2")).unwrap().is_empty());
+}
+
+/// Extractor gaps under a scope (ADR 0013 D5): gaps in a visible repo and
+/// in a hidden repo that shares its name with a visible one in another
+/// org. Unfiltered and repo-only `extractor_gaps_with` list only the
+/// visible gaps; the hidden org named is refused; a missing one is today's
+/// answer.
+fn scoped_extractor_gaps(h: &Harness) {
+    let s = (h.open)(vec![Box::new(ToyExtractor)]).expect("open store");
+    for (o, r) in [("vis", "r"), ("hid", "r"), ("vis", "r2")] {
+        s.index_bytes(o, r, "a.toy", b"alpha beta\n", None).unwrap();
+    }
+    drop(s);
+    let s = open(h);
+    let g = |org: &str, repo: &str| crate::ExtractorGap {
+        org: org.into(),
+        repo: repo.into(),
+        language: "toylang".into(),
+        stored_version: "toy-1".into(),
+        symbols: 1,
+    };
+    assert_eq!(
+        s.extractor_gaps(None, None).unwrap(),
+        vec![g("hid", "r"), g("vis", "r"), g("vis", "r2")],
+        "unscoped: every gap"
+    );
+    let opts = crate::ReadOpts::scoped(crate::ReadScope::from_rules(crate::ScopeRules {
+        orgs: ["vis".to_string()].into(),
+        ..Default::default()
+    }));
+    assert_eq!(
+        s.extractor_gaps_with(None, None, &opts).unwrap(),
+        vec![g("vis", "r"), g("vis", "r2")]
+    );
+    assert_eq!(
+        s.extractor_gaps_with(None, Some("r"), &opts).unwrap(),
+        vec![g("vis", "r")],
+        "repo-only filter: the visible match only"
+    );
+    match s.extractor_gaps_with(Some("hid"), None, &opts) {
+        Err(StoreError::PermissionDenied { action, .. }) => assert_eq!(action, "read"),
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+    assert!(s
+        .extractor_gaps_with(Some("nope"), None, &opts)
+        .unwrap()
+        .is_empty());
+    let all = crate::ReadOpts::default();
+    assert_eq!(
+        s.extractor_gaps_with(None, None, &all).unwrap(),
+        s.extractor_gaps(None, None).unwrap()
+    );
 }
 
 /// #90: `space_usage`, where a backend reports it, is consistent (live

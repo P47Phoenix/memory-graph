@@ -291,6 +291,9 @@ impl TryFrom<pb::Query> for Query {
             symbol_kind: q.symbol_kind,
             limit: opt_usize("Query.limit", q.limit)?,
             offset: opt_usize("Query.offset", q.offset)?,
+            // Never on the wire (ADR 0013 D5): the server sets it from the
+            // caller, so a client can never widen it.
+            scope: graph_store::ReadScope::All,
         })
     }
 }
@@ -324,6 +327,7 @@ impl TryFrom<pb::SymbolQuery> for SymbolQuery {
             limit: opt_usize("SymbolQuery.limit", q.limit)?,
             offset: opt_usize("SymbolQuery.offset", q.offset)?,
             exact_case: q.exact_case,
+            scope: graph_store::ReadScope::All,
         })
     }
 }

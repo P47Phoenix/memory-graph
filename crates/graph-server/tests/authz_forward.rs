@@ -7,7 +7,7 @@
 //! and the read-barrier marker are pinned against one server in
 //! `tests/authz.rs`.
 use graph_client::{ClientConfig, RemoteStore};
-use graph_core::{Extractor, NodeKind};
+use graph_core::Extractor;
 use graph_server::testing::auth::{stanza, AuthFixture};
 use graph_server::testing::ClusterTestbed;
 use graph_store::{Store, StoreError, StoreRead};
@@ -38,7 +38,7 @@ permit(principal == Token::"r", action == Action::"index", resource);
 @id("ghost")
 permit(principal == Token::"ghost", action == Action::"index", resource);
 @id("lin")
-permit(principal == Token::"lin", action in [Action::"read", Action::"search"], resource);
+permit(principal == Token::"lin", action in [Action::"read", Action::"search"], resource == Repo::"acme/web");
 "#;
 
 /// Only on the followers: `ix` may run membership changes there.
@@ -233,14 +233,23 @@ fn forwarded_calls_are_rechecked_by_the_leader() {
     let w1 = client(&tb, leader, &t.f.write, &t);
     assert_eq!(repos(&w1), ["acme/web"]);
 
-    // A scoped reader keeps `--read linearizable` through a follower: the
-    // forwarded barrier is marked with the read's action, not `status`
-    // (which `lin` does not hold).
+    // A scoped reader (ADR 0013 D5: `lin` reads `acme/web` only) keeps
+    // `--read linearizable` through a follower: the forwarded barrier is
+    // marked with the read's action, not `status` (which `lin` does not
+    // hold), and the read is scoped on the follower.
     let mut cfg = ClientConfig::new(tb.node(fol).endpoint());
     cfg.credentials = Some(t.f.creds(&t.lin));
     cfg.read_mode = graph_client::ReadMode::Linearizable;
     let lin = RemoteStore::connect(cfg).unwrap();
-    assert!(lin.count_nodes(NodeKind::File).unwrap() >= 1);
+    assert_eq!(repos(&lin), ["acme/web"]);
+    let hits = lin.search(&graph_store::Query::new("a")).unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits
+        .iter()
+        .all(|h| h.org == "acme" && h.repo.as_deref() == Some("web")));
+    let mut q = graph_store::Query::new("a");
+    q.org = Some("acme".into());
+    assert_eq!(lin.search(&q).unwrap(), hits);
     assert!(matches!(
         lin.admin_status(),
         Err(StoreError::PermissionDenied { .. })
@@ -396,4 +405,77 @@ fn reload_racing_forwarded_writes() {
         }
         assert!(c.file_tokens("acme", "web", "after.rs").unwrap().is_none());
     }
+}
+
+/// `ExtractorGaps` is forwarded to the leader (#165) and scoped on both
+/// nodes (ADR 0013 D5, D7): here the leader's policies let `lin` read
+/// `other` too, the follower's do not, so only the follower's own filter
+/// keeps `other/x` out; naming `other` is refused on the follower.
+#[test]
+fn forwarded_extractor_gaps_are_scoped_by_the_follower() {
+    let t = Tokens::new();
+    let tokens = t.file("tokens.toml", &t.leader_tokens());
+    let leader_pol = t.file(
+        "leader.cedar",
+        &(BASE.to_string()
+            + "permit(principal == Token::\"lin\", action == Action::\"read\", resource in Org::\"other\");\n"),
+    );
+    let follower_pol = t.file("follower.cedar", BASE);
+    let mut tb = ClusterTestbed::with_config(3, rust(), |id, c| {
+        c.auth = t.f.config();
+        c.auth.tokens = Some(tokens.clone());
+        c.auth.policies = Some(if id == 1 {
+            leader_pol.clone()
+        } else {
+            follower_pol.clone()
+        });
+    });
+    tb.set_client_credentials(Some(t.f.creds(&t.f.write)));
+    tb.form();
+    assert_eq!(tb.leader(), 1);
+    let w = client(&tb, 1, &t.f.write, &t);
+    for (o, r) in [("acme", "web"), ("other", "x")] {
+        w.index_bytes(o, r, "a.rs", b"fn a() {}\nfn b() {}\n", None)
+            .unwrap();
+    }
+    tb.wait_applied(tb.leader_last_log_index(), Duration::from_secs(10));
+    // The leader restarts without the Rust extractor: both repos now have
+    // gaps there (the leader answers `ExtractorGaps`).
+    tb.node_mut(1).stop();
+    tb.node_mut(1).set_extractors(Vec::new());
+    tb.node_mut(1).restart();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let leader = loop {
+        let l = tb.wait_leader(Duration::from_secs(10));
+        if l == 1 {
+            break l;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 never led again"
+        );
+        let _ = client(&tb, l, &t.f.write, &t).admin_transfer_leader(1);
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let fol = 2;
+    let all: Vec<String> = client(&tb, leader, &t.f.write, &t)
+        .extractor_gaps(None, None)
+        .unwrap()
+        .into_iter()
+        .map(|g| format!("{}/{}", g.org, g.repo))
+        .collect();
+    assert_eq!(all, ["acme/web", "other/x"], "the leader has gaps for both");
+    let lin = client(&tb, fol, &t.lin, &t);
+    let gaps: Vec<String> = lin
+        .extractor_gaps(None, None)
+        .unwrap()
+        .into_iter()
+        .map(|g| format!("{}/{}", g.org, g.repo))
+        .collect();
+    assert_eq!(gaps, ["acme/web"]);
+    assert!(matches!(
+        lin.extractor_gaps(Some("other"), None),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert!(lin.extractor_gaps(Some("nope"), None).unwrap().is_empty());
 }

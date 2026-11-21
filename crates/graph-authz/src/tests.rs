@@ -319,25 +319,137 @@ fn org_wide_prune_and_delete_follow_d6() {
 }
 
 #[test]
-fn the_interim_read_rule() {
-    for ok in [
-        "permit(principal, action in [Action::\"read\", Action::\"search\"], resource);",
-        "forbid(principal == Token::\"x\", action == Action::\"read\", resource);",
-        "permit(principal, action == Action::\"index\", resource == Repo::\"a/b\");",
-        "permit(principal, action in [], resource == Repo::\"a/b\");",
+fn resource_constrained_read_policies_load() {
+    // ADR 0013 PR 3 lifted the PR 1 interim rule: a read or search policy
+    // may constrain its resource.
+    for text in [
+        "permit(principal, action == Action::\"read\", resource in Org::\"a\");",
+        "forbid(principal, action == Action::\"search\", resource == Repo::\"a/b\");",
+        "permit(principal, action, resource == Repo::\"a/b\");",
     ] {
-        set(ok).check_interim_read_rule().unwrap();
+        parse(text.as_bytes()).unwrap();
     }
-    for bad in [
-        "@id(\"r\")\npermit(principal, action == Action::\"read\", resource in Org::\"a\");",
-        "@id(\"r\")\nforbid(principal, action == Action::\"search\", resource == Repo::\"a/b\");",
-        "@id(\"r\")\npermit(principal, action, resource == Repo::\"a/b\");",
-        "@id(\"r\")\nforbid(principal, action in [Action::\"index\", Action::\"read\"], resource == Cluster::\"this\");",
-    ] {
-        let e = set(bad).check_interim_read_rule().unwrap_err();
-        assert_eq!(e.id.as_deref(), Some("r"), "{bad}");
-        assert_eq!(e.line, 1);
-        assert!(e.to_string().contains("@id `r`"));
+}
+
+#[test]
+fn a_read_policy_on_the_cluster_warns() {
+    let s = set("@id(\"c\")\npermit(principal, action in [Action::\"read\", Action::\"status\"], resource == Cluster::\"this\");\npermit(principal, action == Action::\"status\", resource == Cluster::\"this\");");
+    let w = s.lint(&|_| true, &|_| true);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("@id `c`") && w[0].contains("matches no org or repo"),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn read_rules_follow_the_policy_forms() {
+    let none: Vec<String> = Vec::new();
+    let p = who("t", &none, Role::Read);
+    let r = set(
+        r#"permit(principal, action == Action::"read", resource in Org::"a");
+forbid(principal, action == Action::"read", resource == Repo::"a/x");
+permit(principal, action == Action::"read", resource == Org::"b");
+permit(principal, action == Action::"read", resource == Repo::"c/y");
+permit(principal, action == Action::"search", resource);
+permit(principal, action == Action::"read", resource == Cluster::"this");"#,
+    )
+    .read_rules(&p, Action::Read);
+    assert!(r.repo_visible("a", "w") && !r.repo_visible("a", "x"));
+    assert!(r.org_granted("a"), "a repo forbid does not deny the org");
+    assert!(
+        r.org_granted("b") && !r.repo_visible("b", "w"),
+        "== Org: the org alone"
+    );
+    assert!(r.repo_visible("c", "y") && !r.org_granted("c") && !r.repo_visible("c", "z"));
+    assert!(
+        !r.any,
+        "a search permit is not a read permit; Cluster grants no repo"
+    );
+    // A role below the action gets nothing.
+    let w = set("permit(principal, action, resource);");
+    assert_eq!(w.read_rules(&p, Action::Index), crate::ReadRules::default());
+}
+
+mod read_rules_oracle {
+    use super::*;
+
+    const ORGS: &[&str] = &["a", "b", "c"];
+    const REPOS: &[(&str, &str)] = &[("a", "x"), ("a", "y"), ("b", "x"), ("c", "z")];
+
+    fn resource() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("resource".to_string()),
+            Just("resource == Cluster::\"this\"".to_string()),
+            proptest::sample::select(ORGS).prop_flat_map(|o| prop_oneof![
+                Just(format!("resource == Org::\"{o}\"")),
+                Just(format!("resource in Org::\"{o}\"")),
+            ]),
+            proptest::sample::select(REPOS).prop_flat_map(|(o, r)| prop_oneof![
+                Just(format!("resource == Repo::\"{o}/{r}\"")),
+                Just(format!("resource in Repo::\"{o}/{r}\"")),
+            ]),
+        ]
+    }
+
+    fn policy() -> impl Strategy<Value = String> {
+        (
+            any::<bool>(),
+            prop_oneof![
+                Just("principal"),
+                Just("principal == Token::\"t\""),
+                Just("principal == Token::\"u\""),
+                Just("principal in Group::\"g\""),
+                Just("principal in Role::\"read\""),
+                Just("principal in Role::\"write\""),
+            ],
+            prop_oneof![
+                Just("action"),
+                Just("action == Action::\"read\""),
+                Just("action == Action::\"search\""),
+                Just("action in [Action::\"read\", Action::\"index\"]"),
+            ],
+            resource(),
+        )
+            .prop_map(|(permit, p, a, r)| {
+                format!(
+                    "{}({p}, {a}, {r});",
+                    if permit { "permit" } else { "forbid" }
+                )
+            })
+    }
+
+    proptest! {
+        /// The compiled scope decides exactly as `decide` for every org and
+        /// repo name (ADR 0013 D3, D10 mutation targets).
+        #[test]
+        fn read_rules_agree_with_decide(
+            pols in proptest::collection::vec(policy(), 0..8),
+            write in any::<bool>(),
+            in_group in any::<bool>(),
+        ) {
+            let text = pols.join("\n");
+            let s = set(&text);
+            let groups: Vec<String> = if in_group { vec!["g".into()] } else { vec![] };
+            let p = who("t", &groups, if write { Role::Write } else { Role::Read });
+            for action in [Action::Read, Action::Search] {
+                let r = s.read_rules(&p, action);
+                for (o, rp) in REPOS.iter().chain(&[("a", "new"), ("d", "x")]) {
+                    prop_assert_eq!(
+                        r.repo_visible(o, rp),
+                        s.decide(&p, action, &Resource::Repo(o, rp)).allowed,
+                        "{} on {}/{}", text, o, rp
+                    );
+                }
+                for o in ORGS.iter().chain(&["d"]) {
+                    prop_assert_eq!(
+                        r.org_granted(o),
+                        s.decide(&p, action, &Resource::Org(o)).allowed,
+                        "{} on org {}", text, o
+                    );
+                }
+            }
+        }
     }
 }
 

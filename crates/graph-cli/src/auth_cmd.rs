@@ -308,16 +308,14 @@ mod tests {
         let r = check(&toks, &pols, false, None).unwrap();
         let e = r.error.unwrap();
         assert!(e.contains("line 3") && e.contains("@id `bad`"), "{e}");
-        // The interim read rule.
+        // A resource-constrained read policy loads (ADR 0013 PR 3 lifted
+        // the PR 1 interim rule) and is explained per resource.
         std::fs::write(
             &pols,
             "@id(\"r\")\npermit(principal, action == Action::\"read\", resource in Org::\"a\");",
         )
         .unwrap();
-        assert!(check(&toks, &pols, false, None)
-            .unwrap()
-            .error
-            .unwrap()
-            .contains("@id `r`"));
+        let r = check(&toks, &pols, false, None).unwrap();
+        assert!(r.error.is_none(), "{:?}", r.error);
     }
 }

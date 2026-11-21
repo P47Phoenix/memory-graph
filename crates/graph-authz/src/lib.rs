@@ -81,7 +81,7 @@ impl Action {
 /// Every action.
 pub const ALL_ACTIONS: ActionSet = (1 << 8) - 1;
 
-/// The actions reads use: the PR 1 interim rule is about these.
+/// The actions reads use (`read`, `search`): the ones scoped per repo (D5).
 pub const READ_ACTIONS: ActionSet = 1 << (Action::Read as u16) | 1 << (Action::Search as u16);
 
 /// A token's role: the ceiling its policies grant within (D4).
@@ -289,6 +289,40 @@ pub struct PolicySet {
     any: Vec<usize>,
 }
 
+/// One principal's read grants as name sets (ADR 0013 D3): see
+/// [`PolicySet::read_rules`]. `org_only` / `deny_org_only` are the
+/// `resource == Org::"o"` forms, which cover the org but not its repos.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadRules {
+    pub any: bool,
+    pub orgs: BTreeSet<String>,
+    pub org_only: BTreeSet<String>,
+    pub repos: BTreeSet<(String, String)>,
+    pub deny_all: bool,
+    pub deny_orgs: BTreeSet<String>,
+    pub deny_org_only: BTreeSet<String>,
+    pub deny_repos: BTreeSet<(String, String)>,
+}
+
+impl ReadRules {
+    /// Whether repo `repo` of org `org` is visible.
+    pub fn repo_visible(&self, org: &str, repo: &str) -> bool {
+        let key = (org.to_owned(), repo.to_owned());
+        (self.any || self.orgs.contains(org) || self.repos.contains(&key))
+            && !self.deny_all
+            && !self.deny_orgs.contains(org)
+            && !self.deny_repos.contains(&key)
+    }
+
+    /// Whether the action is allowed on the `Org` itself.
+    pub fn org_granted(&self, org: &str) -> bool {
+        (self.any || self.orgs.contains(org) || self.org_only.contains(org))
+            && !self.deny_all
+            && !self.deny_orgs.contains(org)
+            && !self.deny_org_only.contains(org)
+    }
+}
+
 /// The answer to one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
@@ -444,25 +478,67 @@ impl PolicySet {
         on_org
     }
 
-    /// The PR 1 interim rule (ADR 0013 Rollout, Q9): until reads are
-    /// scoped (PR 3), a `permit` or `forbid` whose actions include `read`
-    /// or `search` must not constrain `resource`, or it would be accepted
-    /// and silently not enforced on reads. The error names the line and
-    /// the `@id`.
-    pub fn check_interim_read_rule(&self) -> Result<(), ParseError> {
-        for p in &self.policies {
-            if p.actions() & READ_ACTIONS != 0 && p.resource != Scope::Any {
-                return Err(ParseError {
-                    line: p.line,
-                    id: Some(p.id.clone()),
-                    msg: "a policy for `read` or `search` must not constrain `resource` in this \
-                          version (reads are all-or-nothing per principal until scoped reads \
-                          land, ADR 0013 PR 3)"
-                        .into(),
-                });
+    /// The read scope of `p` for the read action `action` (ADR 0013 D3,
+    /// D5): the principal's matching policies as name sets, which the store
+    /// tests per repo. [`ReadRules::repo_visible`] equals
+    /// `decide(p, action, Repo(o, r)).allowed` and [`ReadRules::org_granted`]
+    /// equals `decide(p, action, Org(o)).allowed` for every name (a property
+    /// test checks both). A role below `action` gets the empty rules
+    /// (nothing visible).
+    pub fn read_rules(&self, p: &Principal<'_>, action: Action) -> ReadRules {
+        let mut r = ReadRules::default();
+        if p.role.ceiling() & action.bit() == 0 {
+            return r;
+        }
+        for bucket in self.buckets(p) {
+            for &i in bucket {
+                let pol = &self.policies[i];
+                if pol.actions() & action.bit() == 0 {
+                    continue;
+                }
+                let permit = pol.effect == Effect::Permit;
+                match &pol.resource {
+                    Scope::Any => {
+                        if permit {
+                            r.any = true;
+                        } else {
+                            r.deny_all = true;
+                        }
+                    }
+                    Scope::Eq(e) | Scope::In(e) => {
+                        let is_in = matches!(pol.resource, Scope::In(_));
+                        match e.ty {
+                            // `in Org` covers the org and its repos; `== Org`
+                            // the org alone.
+                            Ty::Org => {
+                                let set = match (permit, is_in) {
+                                    (true, true) => &mut r.orgs,
+                                    (true, false) => &mut r.org_only,
+                                    (false, true) => &mut r.deny_orgs,
+                                    (false, false) => &mut r.deny_org_only,
+                                };
+                                set.insert(e.id.clone());
+                            }
+                            // A repo has no members: `in` is `==`.
+                            Ty::Repo => {
+                                if let Some((o, rp)) = e.repo_parts() {
+                                    let key = (o.to_owned(), rp.to_owned());
+                                    if permit {
+                                        r.repos.insert(key);
+                                    } else {
+                                        r.deny_repos.insert(key);
+                                    }
+                                }
+                            }
+                            // `Cluster::"this"` (and principal-side types,
+                            // refused at load) match no org or repo.
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
-        Ok(())
+        r
     }
 
     /// Warnings for an accepted set (D2), given the token file's ids and
@@ -497,6 +573,16 @@ impl PolicySet {
             }
             if p.action == ActionScope::In(Vec::new()) {
                 w.push(format!("{at}: `action in []` matches no action"));
+            }
+            // Reads are decided per repo (D5): a read/search grant or
+            // forbid on the cluster matches no org or repo.
+            if p.actions() & READ_ACTIONS != 0
+                && matches!(&p.resource, Scope::Eq(e) | Scope::In(e) if e.ty == Ty::Cluster)
+            {
+                w.push(format!(
+                    "{at}: `read`/`search` on `Cluster::\"this\"` matches no org or repo \
+                     (reads are decided per repo); use `resource` or `Org::`/`Repo::`"
+                ));
             }
             for e in [&p.principal, &p.resource]
                 .into_iter()

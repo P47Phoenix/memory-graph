@@ -2053,8 +2053,11 @@ impl R {
                         repo.parent
                             .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
                     )?;
+                    // ADR 0013 D5: the scope is pushed down here, once per
+                    // repo, before ranking, `limit` and paging.
                     let s = if q.org.as_deref().is_some_and(|o| org.name != o)
                         || q.repo.as_deref().is_some_and(|r| repo.name != r)
+                        || !q.scope.repo_visible(&org.name, &repo.name)
                     {
                         None
                     } else {
@@ -2234,8 +2237,11 @@ impl R {
                         repo.parent
                             .ok_or_else(|| StoreError::Corrupt("repo without org".into()))?,
                     )?;
+                    // ADR 0013 D5: the scope is pushed down here, once per
+                    // repo, before ranking, `limit` and paging.
                     let s = if q.org.as_deref().is_some_and(|o| org.name != o)
                         || q.repo.as_deref().is_some_and(|r| repo.name != r)
+                        || !q.scope.repo_visible(&org.name, &repo.name)
                     {
                         None
                     } else {
@@ -5102,6 +5108,23 @@ impl V2Store {
     }
 }
 
+/// ADR 0013 D5: a search filter naming an existing hidden org or repo is
+/// refused; existence is judged in the read's own transaction (so a
+/// snapshot judges it against its snapshot).
+fn named_check(
+    rt: &ReadTransaction,
+    scope: &crate::ReadScope,
+    org: &Option<String>,
+    repo: &Option<String>,
+    action: &str,
+) -> Result<()> {
+    if scope.is_all() || (org.is_none() && repo.is_none()) {
+        return Ok(());
+    }
+    let existing = describe_in(rt, org.as_deref(), repo.as_deref())?;
+    scope.check_named(org.as_deref(), repo.as_deref(), &existing, action)
+}
+
 macro_rules! store_read {
     ($ty:ty, |$s:ident| $rt:expr, names: |$sn:ident| $names:expr) => {
         impl StoreRead for $ty {
@@ -5194,6 +5217,7 @@ macro_rules! store_read {
                     let $sn = self;
                     $sn.check_not_expired()?;
                     let (g, names) = $names;
+                    named_check(&g, &q.scope, &q.org, &q.repo, "search")?;
                     R::new(&g)?.search_symbols(q, names)
                 })
             }
@@ -5202,6 +5226,7 @@ macro_rules! store_read {
                     let $s = self;
                     $s.check_not_expired()?;
                     let g = $rt;
+                    named_check(&g, &q.scope, &q.org, &q.repo, "search")?;
                     R::new(&g)?.search(q)
                 })
             }
