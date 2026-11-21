@@ -1112,9 +1112,15 @@ permit(principal in Role::"write", action == Action::"status", resource);"#,
         false,
     );
     let ep = e.ts.endpoint();
-    let secret = ("authorization", format!("Bearer {}", e.f.secret).into_bytes());
+    let secret = (
+        "authorization",
+        format!("Bearer {}", e.f.secret).into_bytes(),
+    );
     let fwd = |role: &str| vec![secret.clone(), h(BY, "2"), h(ROLE, role), h(ID, "w2")];
     // A standalone `ReadIndex` is `status` (and needs only the `read` role).
     assert_eq!(raw_call(&ep, READ_INDEX, &fwd("write")), Code::Ok);
-    assert_eq!(raw_call(&ep, READ_INDEX, &fwd("read")), Code::PermissionDenied);
+    assert_eq!(
+        raw_call(&ep, READ_INDEX, &fwd("read")),
+        Code::PermissionDenied
+    );
 }

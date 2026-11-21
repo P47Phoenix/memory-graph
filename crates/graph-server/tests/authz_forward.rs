@@ -41,6 +41,12 @@ permit(principal == Token::"ghost", action == Action::"index", resource);
 permit(principal == Token::"lin", action in [Action::"read", Action::"search"], resource);
 "#;
 
+/// Only on the followers: `ix` may run membership changes there.
+const FOLLOWER_ONLY: &str = r#"
+@id("follower-admin")
+permit(principal == Token::"ix", action == Action::"admin", resource == Cluster::"this");
+"#;
+
 /// Only on the leader: the follower refuses `acme/lo` before forwarding.
 const LEADER_ONLY: &str = r#"
 @id("leader-only")
@@ -134,7 +140,7 @@ fn forwarded_calls_are_rechecked_by_the_leader() {
     let leader_tokens = t.file("leader.toml", &t.leader_tokens());
     let follower_tokens = t.file("follower.toml", &t.follower_tokens());
     let leader_pol = t.file("leader.cedar", &(BASE.to_string() + LEADER_ONLY));
-    let follower_pol = t.file("follower.cedar", BASE);
+    let follower_pol = t.file("follower.cedar", &(BASE.to_string() + FOLLOWER_ONLY));
     let mut tb = ClusterTestbed::with_config(3, rust(), |id, c| {
         c.auth = t.f.config();
         let (tok, pol) = if id == 1 {
@@ -194,6 +200,29 @@ fn forwarded_calls_are_rechecked_by_the_leader() {
         Err(StoreError::PermissionDenied { .. }) => {}
         other => panic!("role ceiling at the leader: {other:?}"),
     }
+    // A forwarded `Index` stream is re-checked per file at the leader too.
+    let files: Vec<graph_store::BatchFile<'_>> = ["s1.rs", "s2.rs"]
+        .iter()
+        .map(|p| graph_store::BatchFile {
+            path: p,
+            bytes: src,
+            ..Default::default()
+        })
+        .collect();
+    let opts = graph_store::IndexOptions::default();
+    for r in ix.index_batch("acme", "web", &files, opts).unwrap() {
+        r.unwrap();
+    }
+    denied(
+        ix.index_batch("acme", "api", &files, opts).map(|_| ()),
+        "a forwarded stream, follower-only group",
+    );
+    // A forwarded membership change the follower allows (`ix` holds
+    // `admin` there) is refused by the leader, which grants it nothing.
+    match ix.admin_promote(3) {
+        Err(StoreError::PermissionDenied { action, .. }) => assert_eq!(action, "admin"),
+        other => panic!("admin at the leader: {other:?}"),
+    }
     // A token only the follower knows is denied at the leader (Q7).
     let ghost = client(&tb, fol, &t.ghost, &t);
     denied(
@@ -243,4 +272,11 @@ fn forwarded_calls_are_rechecked_by_the_leader() {
     );
     assert_eq!(repos(&w1), ["acme/web"]);
     assert!(w1.file_tokens("acme", "web", "b.rs").unwrap().is_none());
+
+    // A forwarded `TransferLeader`: the leader asks the target to campaign
+    // on behalf of the same principal (the forwarded id travels on), which
+    // the target re-checks with its own files.
+    let w2 = client(&tb, fol, &t.f.write, &t);
+    w2.admin_transfer_leader(3).unwrap();
+    assert_eq!(tb.wait_leader(Duration::from_secs(10)), 3);
 }
