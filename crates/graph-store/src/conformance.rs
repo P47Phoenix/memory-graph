@@ -28,6 +28,13 @@ use graph_core::tokenizer::tokenize;
 use graph_core::{Extraction, Extractor, Node, NodeId, NodeKind, Span, SymbolDecl, SymbolKind};
 use std::collections::{BTreeMap, HashSet};
 
+#[path = "conformance_scoped.rs"]
+mod scoped;
+pub use scoped::{
+    fixed_scopes, run_scoped_crash_rerun_differential, run_scoped_differential,
+    run_search_insertion_order, scoped_queries, seed_scoped, SCOPED_REPOS,
+};
+
 type Opened = Result<Box<dyn Store>, StoreError>;
 type OpenFn = dyn Fn(Vec<Box<dyn Extractor>>) -> Opened;
 type Case = fn(&Harness);

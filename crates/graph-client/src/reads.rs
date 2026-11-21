@@ -349,12 +349,28 @@ async fn paging_view(c: &Conn, view: View) -> Result<(View, Option<u64>)> {
     }
 }
 
+/// A read scope is never sent (ADR 0013 D5: the server derives it from the
+/// caller, so a client can never widen it); a query that carries one is
+/// refused rather than silently answered unscoped.
+fn no_client_scope(scope: &graph_store::ReadScope) -> Result<()> {
+    if scope.is_all() {
+        Ok(())
+    } else {
+        Err(graph_store::StoreError::Rejected(
+            "a read scope cannot be sent to a server: the server scopes reads by the \
+             caller's token (ADR 0013)"
+                .into(),
+        ))
+    }
+}
+
 /// `search` with the semantics of the embedded store: a query without a
 /// limit returns every row. When the server applied its default limit, the
 /// first answer is discarded and the query re-run page by page (page size =
 /// the server's default) under one snapshot handle, so no page straddles a
 /// write.
 pub async fn search(c: &Conn, view: View, q: &Query) -> Result<Vec<Hit>> {
+    no_client_scope(&q.scope)?;
     let (hits, applied) = search_page(c, view, q).await?;
     if !applied {
         return Ok(hits);
@@ -375,6 +391,7 @@ pub async fn search(c: &Conn, view: View, q: &Query) -> Result<Vec<Hit>> {
 }
 
 pub async fn search_symbols(c: &Conn, view: View, q: &SymbolQuery) -> Result<Vec<SymbolHit>> {
+    no_client_scope(&q.scope)?;
     let (hits, applied) = search_symbols_page(c, view, q).await?;
     if !applied {
         return Ok(hits);

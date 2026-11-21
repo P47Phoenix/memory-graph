@@ -400,6 +400,39 @@ pub trait StoreRead {
     fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>>;
     /// Token-text search with roll-up to `q.grain`.
     fn search(&self, q: &Query) -> Result<Vec<Hit>>;
+
+    /// [`describe`](Self::describe) under `opts.scope` (ADR 0013 D5):
+    /// unfiltered, hidden repos are absent; naming an existing org or repo
+    /// that is hidden is `PermissionDenied`; naming one that does not exist
+    /// is today's (empty) answer. `ReadScope::All` is `describe` exactly.
+    fn describe_with(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+        opts: &crate::ReadOpts,
+    ) -> Result<Vec<RepoInfo>> {
+        let rows = self.describe(org, repo)?;
+        crate::scope::describe_scoped(rows, org, repo, opts)
+    }
+
+    /// [`describe_by_scan`](Self::describe_by_scan) under `opts.scope`, as
+    /// [`describe_with`](Self::describe_with).
+    #[doc(hidden)]
+    fn describe_by_scan_with(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+        opts: &crate::ReadOpts,
+    ) -> Result<Vec<RepoInfo>> {
+        // Existence is the catalog's answer for the same filter: the scan
+        // must equal it (the conformance suite checks that).
+        if !opts.scope.is_all() && (org.is_some() || repo.is_some()) {
+            let existing = self.describe(org, repo)?;
+            opts.scope.check_named(org, repo, &existing, "read")?;
+        }
+        let rows = self.describe_by_scan(org, repo)?;
+        Ok(opts.scope.filter_rows(rows, |i| (&i.org, &i.repo)))
+    }
 }
 
 /// A shared store reads like the store itself: every method, defaults
@@ -448,6 +481,22 @@ impl<T: StoreRead + ?Sized> StoreRead for std::sync::Arc<T> {
     }
     fn search(&self, q: &Query) -> Result<Vec<Hit>> {
         (**self).search(q)
+    }
+    fn describe_with(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+        opts: &crate::ReadOpts,
+    ) -> Result<Vec<RepoInfo>> {
+        (**self).describe_with(org, repo, opts)
+    }
+    fn describe_by_scan_with(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+        opts: &crate::ReadOpts,
+    ) -> Result<Vec<RepoInfo>> {
+        (**self).describe_by_scan_with(org, repo, opts)
     }
 }
 
@@ -647,6 +696,23 @@ pub trait Store: StoreRead + Send + Sync {
     fn extractor_gaps(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<ExtractorGap>> {
         let _ = (org, repo);
         Ok(Vec::new())
+    }
+
+    /// [`extractor_gaps`](Self::extractor_gaps) under `opts.scope` (ADR
+    /// 0013 D5): only visible repos are listed, and naming an existing
+    /// hidden org or repo is `PermissionDenied`.
+    fn extractor_gaps_with(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+        opts: &crate::ReadOpts,
+    ) -> Result<Vec<ExtractorGap>> {
+        if !opts.scope.is_all() && (org.is_some() || repo.is_some()) {
+            let existing = self.describe(org, repo)?;
+            opts.scope.check_named(org, repo, &existing, "read")?;
+        }
+        let gaps = self.extractor_gaps(org, repo)?;
+        Ok(opts.scope.filter_rows(gaps, |g| (&g.org, &g.repo)))
     }
 
     /// The database file's size and the bytes of it in live pages (#90),

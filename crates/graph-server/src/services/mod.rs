@@ -226,7 +226,7 @@ impl Ctx {
                 let v = tokio::task::spawn_blocking(move || slot.with_store_read(|s| f(s)))
                     .await
                     .map_err(join_err)?
-                    .map_err(status)?;
+                    .map_err(|e| self.read_err(e))?;
                 Ok((v, meta))
             }
             View::Snapshot(id) => {
@@ -248,10 +248,21 @@ impl Ctx {
                 })
                 .await
                 .map_err(join_err)?
-                .map_err(status)?;
+                .map_err(|e| self.read_err(e))?;
                 Ok((v, meta))
             }
         }
+    }
+
+    /// A read's error as a status; a named read the store refused (ADR
+    /// 0013 D5) is counted and audited first (D9).
+    pub fn read_err(&self, e: StoreError) -> Status {
+        if let StoreError::PermissionDenied { action, .. } = &e {
+            if let Some(a) = graph_authz::Action::parse(action) {
+                self.auth.note_read_denied(a);
+            }
+        }
+        status(e)
     }
 
     /// Count one answered read in the request log (ADR 0008 phase 3 gate):

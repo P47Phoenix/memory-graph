@@ -424,3 +424,91 @@ fn store_trait_is_object_safe_send_sync() {
     fn assert_send<T: Send + ?Sized>() {}
     assert_send::<dyn StoreRead + Send>();
 }
+
+/// ADR 0013 D5 (story 74a): scoped search, symbol search and the describe
+/// family equal an index of only the visible repos (strong form), the
+/// unscoped answer filtered (weak form), and refuse named hidden resources,
+/// for every fixed scope, in two configurations (chunk, cache and name
+/// cache sizes differ between A and B, in both directions).
+#[test]
+fn scoped_reads_equal_an_index_of_the_visible_repos() {
+    for (name, scope) in conformance::fixed_scopes() {
+        eprintln!("scope: {name}");
+        let (_d, a, b) = crate::v2_tests::two_configs();
+        conformance::run_scoped_differential(&*a, &*b, &scope);
+        let (_d, a, b) = crate::v2_tests::two_configs();
+        conformance::run_scoped_differential(&*b, &*a, &scope);
+    }
+}
+
+/// The same with A a store whose first batch crashed mid-way and was re-run.
+#[test]
+fn scoped_reads_after_a_crash_and_rerun() {
+    for (name, scope) in conformance::fixed_scopes() {
+        eprintln!("scope: {name}");
+        let (_d, fresh, crashed) = crate::v2_tests::two_configs();
+        conformance::run_scoped_crash_rerun_differential(&*crashed, &*fresh, &scope);
+        let (_d, fresh, crashed) = crate::v2_tests::two_configs();
+        conformance::run_scoped_crash_rerun_differential(&*fresh, &*crashed, &scope);
+    }
+}
+
+/// Search and symbol search answer the same whatever order the inputs were
+/// indexed in (their tie-break is content-defined), in both configurations.
+#[test]
+fn search_order_does_not_depend_on_insertion_order() {
+    let (_d, a, b) = crate::v2_tests::two_configs();
+    conformance::run_search_insertion_order(&*a, &*b);
+    let (_d, a, b) = crate::v2_tests::two_configs();
+    conformance::run_search_insertion_order(&*b, &*a);
+}
+
+mod scoped_props {
+    use super::*;
+    use crate::{ReadScope, ScopeRules};
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    fn names() -> impl Strategy<Value = BTreeSet<String>> {
+        proptest::collection::btree_set(
+            prop_oneof![Just("o1"), Just("o2"), Just("o3"), Just("o4"), Just("o5")]
+                .prop_map(str::to_string),
+            0..3,
+        )
+    }
+
+    fn pairs() -> impl Strategy<Value = BTreeSet<(String, String)>> {
+        proptest::collection::btree_set(
+            proptest::sample::select(conformance::SCOPED_REPOS)
+                .prop_map(|(o, r)| (o.to_string(), r.to_string())),
+            0..4,
+        )
+    }
+
+    fn scopes() -> impl Strategy<Value = ReadScope> {
+        (any::<bool>(), names(), pairs(), names(), pairs(), names()).prop_map(
+            |(any, orgs, repos, deny_orgs, deny_repos, org_only)| {
+                ReadScope::from_rules(ScopeRules {
+                    any,
+                    orgs,
+                    repos,
+                    deny_all: false,
+                    deny_orgs,
+                    deny_org_only: BTreeSet::new(),
+                    deny_repos,
+                    org_only,
+                })
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+        /// Generated scopes (ADR 0013 D5 item 5), forbid holes included.
+        #[test]
+        fn generated_scopes_pass_the_scoped_differential(scope in scopes()) {
+            let (_d, a, b) = crate::v2_tests::two_configs();
+            conformance::run_scoped_differential(&*a, &*b, &scope);
+        }
+    }
+}

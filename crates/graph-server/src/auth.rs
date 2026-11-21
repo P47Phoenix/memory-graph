@@ -727,8 +727,8 @@ impl AuthState {
 }
 
 /// Parse a token file and a policy file together (D2). The policy file is
-/// refused on any parse error and, until scoped reads land, on the interim
-/// read rule (Rollout, Q9); unknown principals only warn.
+/// refused on any parse error; unknown principals only warn. (The PR 1
+/// interim read rule is gone: reads are scoped, ADR 0013 D5.)
 pub fn parse_pair(tokens: &str, policies: &[u8], builtins: bool) -> Result<AuthState, String> {
     let set = parse_token_file(tokens).map_err(|e| format!("token file: {e}"))?;
     let (state, warnings) = pair_from(set, policies, builtins)?;
@@ -747,8 +747,6 @@ pub fn pair_from(
 ) -> Result<(AuthState, Vec<String>), String> {
     let parsed = graph_authz::parse(policies).map_err(|e| format!("policy file: {e}"))?;
     let mut set = graph_authz::PolicySet::new(parsed);
-    set.check_interim_read_rule()
-        .map_err(|e| format!("policy file: {e}"))?;
     let warnings = set.lint(&|t| tokens.entries.iter().any(|e| &*e.id == t), &|g| {
         tokens
             .entries
@@ -1645,32 +1643,80 @@ impl Auth {
         let _ = self.authz.otlp.set(r);
     }
 
-    /// The PR 1 interim read rule: whether the caller may run reads of
-    /// `action` at all (an unconstrained read permit and no read forbid;
-    /// the load rule makes every read policy resource-unconstrained, so the
-    /// decision on `Cluster::"this"` is the decision on every resource).
-    /// `true` with policies off, in-process and for node callers.
-    pub fn read_allowed(&self, action: graph_authz::Action) -> bool {
+    /// The read scope of the current caller for `action` (`read` or
+    /// `search`; ADR 0013 D3, D5), compiled from the current policy set:
+    /// `All` with policies off, in-process and for a principal allowed the
+    /// action on any resource with no `forbid`; the zero-grant scope for a
+    /// caller this node cannot resolve (the cluster secret alone reads
+    /// nothing, D7). Aggregate filtering is silent (D9): no audit line.
+    pub fn read_scope(&self, action: graph_authz::Action) -> graph_store::ReadScope {
         let Some(src) = self.tokens.as_ref() else {
-            return true;
+            return graph_store::ReadScope::All;
         };
         let state = src.cur.load();
         let Some(set) = state.policies.as_ref() else {
-            return true;
+            return graph_store::ReadScope::All;
         };
         let Some(caller) = current_caller() else {
-            return no_caller_allowed();
+            return if no_caller_allowed() {
+                graph_store::ReadScope::All
+            } else {
+                graph_store::ReadScope::nothing()
+            };
         };
-        // A forwarded read (`ExtractorGaps`) is decided for the principal
-        // this node resolves (D7); the cluster secret alone reads nothing.
+        // A forwarded read (`ExtractorGaps`) is scoped for the principal
+        // this node resolves (D7).
         let Ok((e, role)) = self.principal_entry(&state, &caller, action) else {
-            return false;
+            return graph_store::ReadScope::nothing();
         };
         let p = principal_with(e, role);
-        let res = graph_authz::Resource::Cluster;
-        let d = self.decide_timed(|| set.decide(&p, action, &res));
-        self.audit(e, &p, action, &res, &d, caller.peer);
-        d.allowed
+        let t = Instant::now();
+        let r = set.read_rules(&p, action);
+        let secs = t.elapsed().as_secs_f64();
+        self.authz
+            .seconds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(secs);
+        if let Some(o) = self.authz.otlp.get() {
+            o.record_authz(secs);
+        }
+        graph_store::ReadScope::from_rules(graph_store::ScopeRules {
+            any: r.any,
+            orgs: r.orgs,
+            repos: r.repos,
+            deny_all: r.deny_all,
+            deny_orgs: r.deny_orgs,
+            deny_org_only: r.deny_org_only,
+            deny_repos: r.deny_repos,
+            org_only: r.org_only,
+        })
+    }
+
+    /// A named read refused by the store (ADR 0013 D5, D9): counted as a
+    /// `deny` and written to the audit log (rate-limited per peer). The
+    /// store's refusal names no resource, so neither does this line.
+    pub fn note_read_denied(&self, action: graph_authz::Action) {
+        if self.tokens.is_none() {
+            return;
+        }
+        self.count_decision(action, false);
+        let span = tracing::Span::current();
+        span.record("authz.action", action.name());
+        span.record("authz.decision", "deny");
+        let caller = current_caller();
+        let peer = caller.as_ref().and_then(|c| c.peer);
+        let token_id = caller.as_ref().and_then(|c| match &c.kind {
+            CallerKind::Token { id, .. } => Some(id.to_string()),
+            CallerKind::Node {
+                forwarded_token_id: Some(id),
+                ..
+            } => Some(id.to_string()),
+            _ => None,
+        });
+        if let Some(suppressed) = self.audit_limited(peer) {
+            tracing::info!(target: "mg::audit", token_id = ?token_id, action = action.name(), decision = "deny", reason = "named read of a hidden resource", suppressed, "authz");
+        }
     }
 
     /// The caller of an MCP HTTP request, for its tool's in-process service
@@ -2568,7 +2614,7 @@ mod tests {
             assert!(a
                 .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
                 .is_ok());
-            assert!(a.read_allowed(graph_authz::Action::Read));
+            assert!(a.read_scope(graph_authz::Action::Read).is_all());
         }
         // Policies off: allowed with no caller, as before.
         let (off, _d2) = auth_with(&file(&[("w", "write", &t)]), None);
@@ -2576,7 +2622,7 @@ mod tests {
             .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
             .is_ok());
         // Outside the guard: denied (release) / asserts (debug).
-        assert!(!a.read_allowed(graph_authz::Action::Read));
+        assert!(!a.read_scope(graph_authz::Action::Read).is_all());
         assert!(a
             .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
             .is_err());

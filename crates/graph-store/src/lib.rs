@@ -39,6 +39,7 @@ pub use name_cache::DEFAULT_NAME_CACHE_MAX_BYTES;
 mod v2;
 pub use deadline::with_query_deadline;
 mod pattern;
+mod scope;
 pub use api::{
     detect_format, open_store, FingerprintSnapshot, Page, PreparedFile, RemoteParts, SnapshotStats,
     Store, StoreRead,
@@ -55,6 +56,7 @@ pub use pattern::{
     parse_symbol_pattern, SymbolPattern, CAPABILITY_DELETE, CAPABILITY_SYMBOL_INFIX,
     MAX_NEEDLE_BYTES, MIN_NEEDLE_BYTES,
 };
+pub use scope::{permission_denied, ReadOpts, ReadScope, ScopeRules};
 /// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
 #[doc(hidden)]
 pub use v2::precheck_reads;
@@ -301,6 +303,12 @@ pub struct Query {
     /// again on the same snapshot with `offset` advanced by the previous
     /// page's `limit` to fetch the next page of a frozen, consistent view.
     pub offset: Option<usize>,
+    /// What the query may see (ADR 0013 D5). Never sent over the wire nor
+    /// deserialized: the server sets it from the caller. A filter naming an
+    /// existing hidden org or repo is `PermissionDenied`; otherwise the
+    /// scope is applied before ranking, `limit` and paging.
+    #[serde(skip)]
+    pub scope: ReadScope,
 }
 
 impl Query {
@@ -315,6 +323,7 @@ impl Query {
             symbol_kind: None,
             limit: None,
             offset: None,
+            scope: ReadScope::All,
         }
     }
 }
@@ -344,6 +353,9 @@ pub struct SymbolQuery {
     /// `Widget`); every other character still matches exactly.
     #[serde(default)]
     pub exact_case: bool,
+    /// What the query may see; see [`Query::scope`].
+    #[serde(skip)]
+    pub scope: ReadScope,
 }
 
 impl SymbolQuery {
@@ -358,6 +370,7 @@ impl SymbolQuery {
             limit: None,
             offset: None,
             exact_case: false,
+            scope: ReadScope::All,
         }
     }
 }

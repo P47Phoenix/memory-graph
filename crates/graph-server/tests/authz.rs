@@ -1,6 +1,7 @@
 //! Policy authorization, ADR 0013 PR 1 (story 72), against an in-process
-//! server: writes and cluster actions decided by `--auth-policies`, the
-//! interim all-or-nothing read rule, `--auth-builtins`, the paired reload
+//! server: writes and cluster actions decided by `--auth-policies`, a
+//! zero-grant reader (PR 3 scoped reads: `tests/authz_scoped.rs`),
+//! `--auth-builtins`, the paired reload
 //! (keep-last-good, the fail-safe mixed cases, revocation), `policy_hash`,
 //! and MCP tool calls refused as `isError` results.
 use graph_client::{ClientConfig, RemoteStore};
@@ -158,8 +159,12 @@ fn cluster_actions_follow_the_policies() {
     ));
 }
 
+/// A principal allowed reads on any resource reads everything; one with no
+/// read grant (ADR 0013 D5, D10) gets empty aggregates, `PermissionDenied`
+/// for a named read of something that exists, and today's answer for a
+/// missing one.
 #[test]
-fn the_interim_read_rule_is_all_or_nothing() {
+fn unconstrained_and_zero_grant_readers() {
     let e = env_with(POLICIES, false);
     let w2 = client(&e, &e.f.write2);
     w2.index_bytes("acme", "api", "a.rs", b"fn hello() {}", None)
@@ -194,27 +199,47 @@ fn the_interim_read_rule_is_all_or_nothing() {
     assert!(w.search(&q).unwrap().is_empty());
 }
 
+/// ADR 0013 PR 3 lifted the PR 1 interim rule: a resource-constrained
+/// read or search policy loads, and scopes the reads it covers.
 #[test]
-fn a_resource_constrained_read_policy_is_refused_at_load() {
-    for (text, id) in [
-        (
-            "@id(\"scoped-read\")\npermit(principal, action == Action::\"read\", resource in Org::\"acme\");",
-            "scoped-read",
-        ),
-        (
-            "@id(\"scoped-forbid\")\nforbid(principal, action == Action::\"search\", resource == Repo::\"acme/web\");",
-            "scoped-forbid",
-        ),
-    ] {
-        let f = AuthFixture::new();
-        let pol = f.dir.path().join("p.cedar");
-        std::fs::write(&pol, text).unwrap();
-        let mut cfg = f.config();
-        cfg.policies = Some(pol);
-        let e = graph_server::auth::Auth::load(&cfg, false).unwrap_err();
-        let msg = e.to_string();
-        assert!(msg.contains(&format!("@id `{id}`")) && msg.contains("line 1"), "{msg}");
+fn a_resource_constrained_read_policy_loads_and_scopes_reads() {
+    let e = env_with(
+        &(POLICIES.to_string()
+            + r#"
+@id("scoped-read")
+permit(principal == Token::"w", action in [Action::"read", Action::"search"], resource in Org::"acme");
+@id("scoped-forbid")
+forbid(principal == Token::"w", action == Action::"search", resource == Repo::"acme/api");
+"#),
+        false,
+    );
+    let w2 = client(&e, &e.f.write2);
+    for (o, r) in [("acme", "api"), ("acme", "web"), ("other", "x")] {
+        w2.index_bytes(o, r, "a.rs", b"fn hello() {}", None)
+            .unwrap();
     }
+    let w = client(&e, &e.f.write);
+    let repos: Vec<String> = w
+        .describe(None, None)
+        .unwrap()
+        .into_iter()
+        .map(|i| format!("{}/{}", i.org, i.repo))
+        .collect();
+    assert_eq!(repos, ["acme/api", "acme/web"]);
+    // Visibility is per action: acme/api is readable, not searchable.
+    let hits = w.search(&Query::new("hello")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].repo.as_deref(), Some("web"));
+    assert_eq!(w.describe(Some("acme"), Some("api")).unwrap().len(), 1);
+    let mut q = Query::new("hello");
+    q.org = Some("acme".into());
+    q.repo = Some("api".into());
+    denied(w.search(&q), "search");
+    denied(w.describe(Some("other"), None), "read");
+    assert!(w.describe(Some("nope"), None).unwrap().is_empty());
+    denied(w.file_tokens("other", "x", "a.rs"), "read");
+    assert!(w.file_tokens("acme", "web", "a.rs").unwrap().is_some());
+    assert_eq!(w.file_tokens("other", "x", "zz.rs").unwrap(), None);
 }
 
 #[test]

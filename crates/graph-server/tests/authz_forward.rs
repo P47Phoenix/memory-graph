@@ -7,7 +7,7 @@
 //! and the read-barrier marker are pinned against one server in
 //! `tests/authz.rs`.
 use graph_client::{ClientConfig, RemoteStore};
-use graph_core::{Extractor, NodeKind};
+use graph_core::Extractor;
 use graph_server::testing::auth::{stanza, AuthFixture};
 use graph_server::testing::ClusterTestbed;
 use graph_store::{Store, StoreError, StoreRead};
@@ -38,7 +38,7 @@ permit(principal == Token::"r", action == Action::"index", resource);
 @id("ghost")
 permit(principal == Token::"ghost", action == Action::"index", resource);
 @id("lin")
-permit(principal == Token::"lin", action in [Action::"read", Action::"search"], resource);
+permit(principal == Token::"lin", action in [Action::"read", Action::"search"], resource == Repo::"acme/web");
 "#;
 
 /// Only on the followers: `ix` may run membership changes there.
@@ -233,14 +233,23 @@ fn forwarded_calls_are_rechecked_by_the_leader() {
     let w1 = client(&tb, leader, &t.f.write, &t);
     assert_eq!(repos(&w1), ["acme/web"]);
 
-    // A scoped reader keeps `--read linearizable` through a follower: the
-    // forwarded barrier is marked with the read's action, not `status`
-    // (which `lin` does not hold).
+    // A scoped reader (ADR 0013 D5: `lin` reads `acme/web` only) keeps
+    // `--read linearizable` through a follower: the forwarded barrier is
+    // marked with the read's action, not `status` (which `lin` does not
+    // hold), and the read is scoped on the follower.
     let mut cfg = ClientConfig::new(tb.node(fol).endpoint());
     cfg.credentials = Some(t.f.creds(&t.lin));
     cfg.read_mode = graph_client::ReadMode::Linearizable;
     let lin = RemoteStore::connect(cfg).unwrap();
-    assert!(lin.count_nodes(NodeKind::File).unwrap() >= 1);
+    assert_eq!(repos(&lin), ["acme/web"]);
+    let hits = lin.search(&graph_store::Query::new("a")).unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits
+        .iter()
+        .all(|h| h.org == "acme" && h.repo.as_deref() == Some("web")));
+    let mut q = graph_store::Query::new("a");
+    q.org = Some("acme".into());
+    assert_eq!(lin.search(&q).unwrap(), hits);
     assert!(matches!(
         lin.admin_status(),
         Err(StoreError::PermissionDenied { .. })

@@ -184,6 +184,7 @@ fn query() -> impl Strategy<Value = Query> {
                 symbol_kind,
                 limit,
                 offset,
+                scope: Default::default(),
             },
         )
 }
@@ -211,6 +212,7 @@ fn symbol_query() -> impl Strategy<Value = SymbolQuery> {
                 limit,
                 offset,
                 exact_case,
+                scope: Default::default(),
             },
         )
 }
