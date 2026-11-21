@@ -124,7 +124,18 @@ fn mcp_read_tools_follow_the_scope_on_both_transports() {
     let scope = scope();
     let bd = tempfile::tempdir().unwrap();
     let b = graph_store::open_store(&bd.path().join("b.redb"), rust()).unwrap();
-    conformance::seed_scoped(&remote(&f.write2), &*b, &scope);
+    // The oracle: B holds exactly the repos POLICIES lets `r` read,
+    // written out by hand (o1 minus o1/r2, plus o2/r1; o1/doomed is
+    // indexed and deleted in both), not derived from the store's scope.
+    let visible = [("o1", "r1"), ("o1", "r3"), ("o1", "doomed"), ("o2", "r1")];
+    for (o, r) in conformance::SCOPED_REPOS {
+        assert_eq!(
+            scope.repo_visible(o, r),
+            visible.contains(&(*o, *r)),
+            "{o}/{r}"
+        );
+    }
+    conformance::seed_scoped_with(&remote(&f.write2), &*b, &visible);
     let addr = ts.running().unwrap().mcp_addr.unwrap();
 
     let mut want = Stdio::new(Box::new(std::sync::Arc::<dyn graph_store::Store>::from(b)));

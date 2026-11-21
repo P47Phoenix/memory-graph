@@ -554,6 +554,14 @@ pub fn seed_scoped(a: &dyn Store, b: &dyn Store, scope: &ReadScope) {
     scoped_seed(b, &|o, r| scope.repo_visible(o, r));
 }
 
+/// [`seed_scoped`] with B's repos given as a fixed list instead of
+/// derived from a scope, so a visibility bug in the store cannot also
+/// shape the oracle.
+pub fn seed_scoped_with(a: &dyn Store, b: &dyn Store, visible: &[(&str, &str)]) {
+    scoped_seed(a, &|_, _| true);
+    scoped_seed(b, &|o, r| visible.contains(&(o, r)));
+}
+
 /// The strong and weak forms and the named probes (ADR 0013 D5) for
 /// `scope`, with `a` and `b` empty stores in any configuration.
 pub fn run_scoped_differential(a: &dyn Store, b: &dyn Store, scope: &ReadScope) {
