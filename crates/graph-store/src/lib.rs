@@ -192,8 +192,15 @@ pub enum StoreError {
     /// The credential is valid but may not call this method (ADR 0012
     /// D5/D8): its role is too low, or the method is not in the server's
     /// role table. `required_role` is `read`, `write`, `node`, or empty.
+    /// `action` (ADR 0013 D9): the policy action of a policy refusal
+    /// (`read`, `index`, ...), empty for a role refusal; never a resource
+    /// or a policy id.
     #[error("permission denied: {msg}")]
-    PermissionDenied { msg: String, required_role: String },
+    PermissionDenied {
+        msg: String,
+        required_role: String,
+        action: String,
+    },
 }
 
 fn not_leader_hint(id: &Option<u64>, addr: &Option<String>) -> String {

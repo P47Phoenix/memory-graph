@@ -425,6 +425,7 @@ fn register_observables(meter: &Meter, cache: &Arc<SnapshotCache>) {
 pub struct OtlpRecorders {
     rpc: Histogram<f64>,
     apply: Histogram<f64>,
+    authz: Histogram<f64>,
 }
 
 impl std::fmt::Debug for OtlpRecorders {
@@ -437,6 +438,8 @@ impl std::fmt::Debug for OtlpRecorders {
 pub const RPC_DURATION: &str = "rpc.server.call.duration";
 /// `memory_graph.raft.apply.duration`.
 pub const APPLY_DURATION: &str = "memory_graph.raft.apply.duration";
+/// `memory_graph.authz.decision.duration` (ADR 0013 D9).
+pub const AUTHZ_DURATION: &str = "memory_graph.authz.decision.duration";
 
 impl OtlpRecorders {
     fn new(meter: &Meter) -> Self {
@@ -449,6 +452,11 @@ impl OtlpRecorders {
                 .build(),
             apply: meter
                 .f64_histogram(APPLY_DURATION)
+                .with_unit("s")
+                .with_boundaries(bounds.clone())
+                .build(),
+            authz: meter
+                .f64_histogram(AUTHZ_DURATION)
                 .with_unit("s")
                 .with_boundaries(bounds)
                 .build(),
@@ -463,6 +471,11 @@ impl OtlpRecorders {
 
     pub fn record_apply(&self, secs: f64) {
         self.apply.record(clamp(secs), &[]);
+    }
+
+    /// One policy decision (`mg_authz_decision_seconds`).
+    pub fn record_authz(&self, secs: f64) {
+        self.authz.record(clamp(secs), &[]);
     }
 }
 

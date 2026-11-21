@@ -294,6 +294,11 @@ fn a_live_node_exports_every_family_on_the_interval() {
         {
             continue; // nothing observed yet (no peers, no MCP calls)
         }
+        if m.prometheus == "mg_authz_decision_seconds" {
+            // A synchronous histogram with no policy decision recorded yet
+            // (no `--auth-policies` here) exports no point.
+            continue;
+        }
         let metric = got
             .get(otel)
             .unwrap_or_else(|| panic!("{otel} missing: {:?}", got.keys()));

@@ -23,9 +23,18 @@ pub const AUTHORIZATION: &str = "authorization";
 /// authenticated with the cluster secret.
 pub const FORWARDED_ROLE_HEADER: &str = "mg-forwarded-role";
 
-/// On a forwarded call: the id (never the value) of the caller's token,
-/// for the leader's logs.
+/// On a forwarded call: the id (never the value) of the caller's token.
+/// With `--auth-policies` the leader resolves the principal from its own
+/// token file by this id (ADR 0013 D7).
 pub const FORWARDED_TOKEN_ID_HEADER: &str = "mg-forwarded-token-id";
+
+/// On a forwarded `Admin.ReadIndex` that is the barrier of a linearizable
+/// read (ADR 0013 D7): the read's action, `read` or `search`. Without it a
+/// `ReadIndex` is standalone (`status`).
+pub const FORWARDED_ACTION_HEADER: &str = "mg-forwarded-action";
+
+/// The longest value of any `mg-forwarded-*` header (ADR 0013 D7).
+pub const FORWARDED_HEADER_MAX: usize = 128;
 
 /// The prefix of a client token.
 pub const TOKEN_PREFIX: &str = "mgt_";

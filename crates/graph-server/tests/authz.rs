@@ -425,13 +425,34 @@ fn mcp_tool_calls_follow_the_policies() {
         serde_json::json!({"name": "search", "arguments": {"text": "alpha"}}),
     );
     assert!(v.to_string().contains("alpha"), "{v}");
-    // `w` holds none: an isError result with permission_denied, HTTP 200
-    // (the request helper asserts the 200).
+    // `w` holds none. Decided once, by the read rule (PR 2 review): an
+    // aggregate search answers empty; one naming an existing repo is an
+    // isError result with permission_denied, HTTP 200 (the request helper
+    // asserts the 200).
     let mut c = McpHttpClient::with_token(addr, Some(&f.write));
     let v = c.request(
         "tools/call",
         serde_json::json!({"name": "search", "arguments": {"text": "alpha"}}),
     );
+
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let decisions = |a: &str| {
+        ts.running()
+            .unwrap()
+            .auth()
+            .authz_decisions()
+            .into_iter()
+            .filter(|(x, _, _)| a.is_empty() || *x == a)
+            .map(|(_, _, n)| n)
+            .sum::<u64>()
+    };
+    // Every action (the tool names its repo through a `read` first).
+    let before = decisions("");
+    let v = c.request(
+        "tools/call",
+        serde_json::json!({"name": "search", "arguments": {"text": "alpha", "org": "acme", "repo": "api"}}),
+    );
+    assert_eq!(decisions(""), before + 1, "one decision per tool call: {v}");
     assert_eq!(v["result"]["isError"], true, "{v}");
     let text = v["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
@@ -631,4 +652,579 @@ fn the_role_ceiling_holds_end_to_end() {
     r.admin_status().unwrap();
     r.admin_list_backups().ok();
     assert!(r.roots().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0013 PR 2 (story 73): forwarded calls, D7.
+
+/// One raw unary call with `md` appended as given (so a header can repeat,
+/// or carry bytes that are not ASCII); the status code (`Ok` for success).
+fn raw_call(ep: &str, path: &str, md: &[(&str, Vec<u8>)]) -> tonic::Code {
+    let ep = ep.to_string();
+    let path = path.to_string();
+    let md: Vec<(String, Vec<u8>)> = md.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut g = tonic::client::Grpc::new(ch);
+        g.ready().await.unwrap();
+        let mut h = tonic::codegen::http::HeaderMap::new();
+        h.insert(
+            graph_proto::PROTOCOL_VERSION_HEADER,
+            graph_proto::PROTOCOL_VERSION.to_string().parse().unwrap(),
+        );
+        for (k, v) in &md {
+            h.append(
+                tonic::codegen::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                tonic::codegen::http::HeaderValue::from_bytes(v).unwrap(),
+            );
+        }
+        let mut req = tonic::Request::new(());
+        *req.metadata_mut() = tonic::metadata::MetadataMap::from_headers(h);
+        let codec: tonic_prost::ProstCodec<(), ()> = Default::default();
+        let p = tonic::codegen::http::uri::PathAndQuery::from_maybe_shared(path).unwrap();
+        match g.unary(req, p, codec).await {
+            Ok(_) => tonic::Code::Ok,
+            Err(st) => st.code(),
+        }
+    })
+}
+
+/// Raw metadata: names and value bytes, in order.
+type Headers = Vec<(&'static str, Vec<u8>)>;
+
+fn h(k: &'static str, v: &str) -> (&'static str, Vec<u8>) {
+    (k, v.as_bytes().to_vec())
+}
+
+const BY: &str = "mg-forwarded-by";
+const ROLE: &str = "mg-forwarded-role";
+const ID: &str = "mg-forwarded-token-id";
+const ACTION: &str = "mg-forwarded-action";
+const INDEX_FILE: &str = "/memory_graph.v1.Write/IndexFile";
+const READ_INDEX: &str = "/memory_graph.v1.Admin/ReadIndex";
+
+/// D7 header parsing: every `mg-forwarded-*` header exactly once, ASCII,
+/// non-empty, at most 128 bytes, well formed; anything else is
+/// `PERMISSION_DENIED`, never another principal. A valid set passes (the
+/// empty `IndexFile` then fails on its missing file, a protocol error, `FAILED_PRECONDITION`), which
+/// shows each refusal is the header's.
+#[test]
+fn forwarded_headers_are_parsed_strictly() {
+    use tonic::Code;
+    let e = env_with(POLICIES, false);
+    let ep = e.ts.endpoint();
+    let secret = (
+        "authorization",
+        format!("Bearer {}", e.f.secret).into_bytes(),
+    );
+    let base = |id: &str| vec![secret.clone(), h(BY, "2"), h(ROLE, "write"), h(ID, id)];
+    // `w2` may index anywhere (seed): the valid forward reaches the body.
+    assert_eq!(
+        raw_call(&ep, INDEX_FILE, &base("w2")),
+        Code::FailedPrecondition
+    );
+    let long = "x".repeat(129);
+    let cases: Vec<(&str, Headers)> = vec![
+        (
+            "no token id",
+            vec![secret.clone(), h(BY, "2"), h(ROLE, "write")],
+        ),
+        ("no role", vec![secret.clone(), h(BY, "2"), h(ID, "w2")]),
+        ("repeated token id", {
+            let mut v = base("w2");
+            v.push(h(ID, "w2"));
+            v
+        }),
+        ("repeated role", {
+            let mut v = base("w2");
+            v.push(h(ROLE, "write"));
+            v
+        }),
+        ("repeated by", {
+            let mut v = base("w2");
+            v.push(h(BY, "3"));
+            v
+        }),
+        ("empty token id", base("")),
+        ("oversized token id", base(&long)),
+        (
+            "non-ASCII token id",
+            vec![
+                secret.clone(),
+                h(BY, "2"),
+                h(ROLE, "write"),
+                (ID, b"w\xe92".to_vec()),
+            ],
+        ),
+        ("blank around the id", base("w2 ")),
+        ("unknown id", base("nobody")),
+        (
+            "bad role",
+            vec![secret.clone(), h(BY, "2"), h(ROLE, "admin"), h(ID, "w2")],
+        ),
+        (
+            "bad by",
+            vec![secret.clone(), h(BY, "two"), h(ROLE, "write"), h(ID, "w2")],
+        ),
+        ("bad action", {
+            let mut v = base("w2");
+            v.push(h(ACTION, "status"));
+            v
+        }),
+        ("repeated action", {
+            let mut v = base("w2");
+            v.push(h(ACTION, "read"));
+            v.push(h(ACTION, "read"));
+            v
+        }),
+    ];
+    for (what, md) in &cases {
+        assert_eq!(
+            raw_call(&ep, INDEX_FILE, md),
+            Code::PermissionDenied,
+            "{what}"
+        );
+    }
+    // Exactly 128 bytes is accepted by the parser (then unknown: denied by
+    // the lookup, like any id the leader does not know).
+    assert_eq!(
+        graph_server::auth::parse_forwarded(&{
+            let mut m = tonic::codegen::http::HeaderMap::new();
+            for (k, v) in [(BY, "1"), (ROLE, "read"), (ID, &*"y".repeat(128))] {
+                m.insert(k, v.parse().unwrap());
+            }
+            m
+        })
+        .map(|f| f.token_id.len()),
+        Ok(128)
+    );
+    // ... and 129 bytes is refused by the parser itself, whatever the id
+    // (the lookup alone would also refuse an unknown long id).
+    assert_eq!(
+        graph_server::auth::parse_forwarded(&{
+            let mut m = tonic::codegen::http::HeaderMap::new();
+            for (k, v) in [(BY, "1"), (ROLE, "read"), (ID, &*"y".repeat(129))] {
+                m.insert(k, v.parse().unwrap());
+            }
+            m
+        })
+        .map(|f| f.token_id.len()),
+        Err("a forwarded header is too long")
+    );
+    // The cluster secret alone (no valid token id) is never enough, for
+    // every action class: a read, `status` (also a join-probe method),
+    // a write, `admin` (a node-originated `Remove`, `--bootstrap-or-join`).
+    let no_id = vec![secret.clone(), h(BY, "2"), h(ROLE, "write")];
+    for p in [
+        "/memory_graph.v1.Store/Get",
+        "/memory_graph.v1.Admin/Status",
+        "/memory_graph.v1.Admin/Members",
+        INDEX_FILE,
+        "/memory_graph.v1.Admin/Compact",
+        "/memory_graph.v1.Admin/Remove",
+        "/memory_graph.v1.Admin/TriggerSnapshot",
+    ] {
+        assert_eq!(raw_call(&ep, p, &no_id), Code::PermissionDenied, "{p}");
+    }
+    // The join probes (no `mg-forwarded-by`) still work with the secret.
+    assert_eq!(
+        raw_call(
+            &ep,
+            "/memory_graph.v1.Admin/Status",
+            std::slice::from_ref(&secret)
+        ),
+        Code::Ok
+    );
+}
+
+/// D7: the leader's role ceiling is its own role for the id intersected
+/// with the forwarded role; a client token's forwarding headers are
+/// ignored; the read-barrier marker makes `ReadIndex` part of the read,
+/// honoured only on a cluster-secret call.
+#[test]
+fn the_leader_resolves_the_principal_and_the_barrier_marker() {
+    use tonic::Code;
+    let e = env_with(
+        &(POLICIES.to_string()
+            + r#"
+@id("r-index")
+permit(principal == Token::"r", action == Action::"index", resource);
+"#),
+        false,
+    );
+    let ep = e.ts.endpoint();
+    let secret = (
+        "authorization",
+        format!("Bearer {}", e.f.secret).into_bytes(),
+    );
+    let fwd = |id: &str, role: &str| vec![secret.clone(), h(BY, "2"), h(ROLE, role), h(ID, id)];
+    // `r` is `read` here: a forwarded `write` cannot raise it (the ceiling
+    // is this node's role) ...
+    assert_eq!(
+        raw_call(&ep, INDEX_FILE, &fwd("r", "write")),
+        Code::PermissionDenied
+    );
+    // ... and a forwarded `read` lowers `w2`'s `write`.
+    assert_eq!(
+        raw_call(&ep, INDEX_FILE, &fwd("w2", "read")),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        raw_call(&ep, INDEX_FILE, &fwd("w2", "write")),
+        Code::FailedPrecondition
+    );
+    // A client token's forwarding headers are ignored: `w` (no grant on the
+    // empty repo) naming `w2` is still `w`; `w2` naming `w` is still `w2`.
+    let bearer = |t: &str| ("authorization", format!("Bearer {t}").into_bytes());
+    assert_eq!(
+        raw_call(
+            &ep,
+            INDEX_FILE,
+            &[
+                bearer(&e.f.write),
+                h(BY, "2"),
+                h(ROLE, "write"),
+                h(ID, "w2")
+            ]
+        ),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        raw_call(&ep, INDEX_FILE, &[bearer(&e.f.write2), h(ID, "w")]),
+        Code::FailedPrecondition
+    );
+    // `w2` reads and searches but has no `status`: a standalone ReadIndex is
+    // refused, a forwarded barrier marked `read`/`search` is admitted, and
+    // a client's own marker is ignored (still standalone).
+    assert_eq!(
+        raw_call(&ep, READ_INDEX, &[bearer(&e.f.write2)]),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        raw_call(&ep, READ_INDEX, &[bearer(&e.f.write2), h(ACTION, "read")]),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        raw_call(&ep, READ_INDEX, &fwd("w2", "write")),
+        Code::PermissionDenied
+    );
+    for a in ["read", "search"] {
+        let mut md = fwd("w2", "write");
+        md.push(h(ACTION, a));
+        assert_eq!(raw_call(&ep, READ_INDEX, &md), Code::Ok, "{a}");
+    }
+    // `r` holds `status`: its standalone ReadIndex passes.
+    assert_eq!(raw_call(&ep, READ_INDEX, &[bearer(&e.f.read)]), Code::Ok);
+    // D9: refusals are counted by action, and the detail names the action.
+    let auth = e.ts.running().unwrap().auth();
+    let n = |a: &str, d: &str| {
+        auth.authz_decisions()
+            .into_iter()
+            .find(|(x, y, _)| *x == a && *y == d)
+            .unwrap()
+            .2
+    };
+    assert!(n("index", "deny") >= 1 && n("index", "allow") >= 1);
+    assert!(n("status", "deny") >= 2);
+    let w = client(&e, &e.f.write);
+    match w.index_bytes("acme", "api", "a.rs", b"fn a() {}", None) {
+        Err(StoreError::PermissionDenied { action, .. }) => assert_eq!(action, "index"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// D6/D9 for the MCP write tools: `index_path` and `prune` are decided on
+/// their repo for the request's token (on this node, which proposes them
+/// directly): a policy refusal is an `isError` result with
+/// `permission_denied` and HTTP 200 and writes nothing; a role refusal
+/// stays HTTP 403.
+#[test]
+fn mcp_write_tools_are_decided_per_repo() {
+    use graph_server::testing::mcp_http::McpHttpClient;
+    let f = AuthFixture::new();
+    f.write_tokens(&grouped_tokens(&f));
+    let pol = f.dir.path().join("policies.cedar");
+    std::fs::write(&pol, POLICIES).unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("web")).unwrap();
+    std::fs::write(root.path().join("web/a.rs"), b"fn gamma_from_mcp() {}\n").unwrap();
+    let mut cfg = f.config();
+    cfg.policies = Some(pol);
+    let root_path = root.path().to_path_buf();
+    let ts = TestServer::start_with(&d.path().join("g.redb"), rust(), move |c| {
+        c.auth = cfg;
+        let mut m = graph_server::mcp::McpConfig::new("127.0.0.1:0".parse().unwrap());
+        m.index_root = Some(root_path);
+        c.mcp = Some(m);
+    });
+    let addr = ts.running().unwrap().mcp_addr.unwrap();
+    let call = |c: &mut McpHttpClient, name: &str, args: serde_json::Value| {
+        c.request(
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": args}),
+        )
+    };
+    let refused = |v: &serde_json::Value| {
+        assert_eq!(v["result"]["isError"], true, "{v}");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("permission_denied"), "{text}");
+        for leak in ["acme", "legal", "web-index", "seed"] {
+            assert!(!text.contains(leak), "{text}");
+        }
+    };
+    let mut w = McpHttpClient::with_token(addr, Some(&f.write));
+    // `w` (web-team) may index acme/web, not acme/api.
+    let v = call(
+        &mut w,
+        "index_path",
+        serde_json::json!({"org": "acme", "repo": "api", "path": "web"}),
+    );
+    refused(&v);
+    let v = call(
+        &mut w,
+        "index_path",
+        serde_json::json!({"org": "acme", "repo": "web", "path": "web"}),
+    );
+    assert_eq!(v["result"]["structuredContent"]["indexed"], 1, "{v}");
+    // Prune: `w` holds prune in acme but the forbid on acme/legal wins;
+    // `w2` holds no prune at all.
+    let v = call(
+        &mut w,
+        "prune",
+        serde_json::json!({"org": "acme", "repo": "legal", "path": "web", "dry_run": true}),
+    );
+    refused(&v);
+    let v = call(
+        &mut w,
+        "prune",
+        serde_json::json!({"org": "acme", "repo": "web", "path": "web", "dry_run": true}),
+    );
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let mut w2 = McpHttpClient::with_token(addr, Some(&f.write2));
+    let v = call(
+        &mut w2,
+        "prune",
+        serde_json::json!({"org": "acme", "repo": "web", "path": "web", "dry_run": true}),
+    );
+    refused(&v);
+    // Only acme/web was written.
+    let mut cc = ClientConfig::new(ts.endpoint());
+    cc.credentials = Some(f.creds(&f.write2));
+    let repos: Vec<String> = RemoteStore::connect(cc)
+        .unwrap()
+        .describe(None, None)
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{}/{}", r.org, r.repo))
+        .collect();
+    assert_eq!(repos, ["acme/web"]);
+    // A read token on a write tool: the role refusal, HTTP 403.
+    let reader = McpHttpClient::with_token(addr, Some(&f.read));
+    let r = reader.post(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "index_path", "arguments": {"org": "acme", "repo": "web", "path": "web"}}}));
+    assert_eq!(r.status, 403, "{r:?}");
+}
+
+/// D8: `UploadSnapshot` replaces the store, so it is `admin`;
+/// `TriggerSnapshot` is `snapshot`; `ListBackups` is `status`.
+#[test]
+fn snapshot_and_backup_actions() {
+    use tonic::Code;
+    let e = env_with(
+        r#"@id("snap")
+permit(principal == Token::"w", action == Action::"snapshot", resource == Cluster::"this");
+@id("st")
+permit(principal == Token::"w2", action == Action::"status", resource);"#,
+        false,
+    );
+    let ep = e.ts.endpoint();
+    let bearer = |t: &str| ("authorization", format!("Bearer {t}").into_bytes());
+    let up = "/memory_graph.v1.Admin/UploadSnapshot";
+    let trig = "/memory_graph.v1.Admin/TriggerSnapshot";
+    let list = "/memory_graph.v1.Admin/ListBackups";
+    // `w` may snapshot, but upload needs `admin`.
+    assert_eq!(
+        raw_call(&ep, up, &[bearer(&e.f.write)]),
+        Code::PermissionDenied
+    );
+    assert_ne!(
+        raw_call(&ep, trig, &[bearer(&e.f.write)]),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        raw_call(&ep, list, &[bearer(&e.f.write)]),
+        Code::PermissionDenied
+    );
+    // `w2` has `status` only.
+    assert_eq!(
+        raw_call(&ep, trig, &[bearer(&e.f.write2)]),
+        Code::PermissionDenied
+    );
+    assert_ne!(
+        raw_call(&ep, list, &[bearer(&e.f.write2)]),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        raw_call(&ep, up, &[bearer(&e.f.write2)]),
+        Code::PermissionDenied
+    );
+}
+/// D9: the `mg_authz_*` families exist and carry only their bounded labels
+/// (`action`, `decision`, `result`, and `le` on the histogram): no token,
+/// group, resource or policy id, whatever was decided.
+#[test]
+fn authz_metrics_carry_only_bounded_labels() {
+    let e = env_with(POLICIES, false);
+    let w = client(&e, &e.f.write);
+    w.index_bytes("acme", "web", "a.rs", b"fn a() {}", None)
+        .unwrap();
+    denied(
+        w.index_bytes("acme", "legal", "a.rs", b"fn a() {}", None),
+        "index",
+    );
+    reload(&e);
+    let text = client(&e, &e.f.read).admin_metrics().unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.lines().filter(|l| l.starts_with("mg_authz_")) {
+        let name = line.split(['{', ' ']).next().unwrap();
+        seen.insert(
+            name.trim_end_matches("_bucket")
+                .trim_end_matches("_sum")
+                .trim_end_matches("_count")
+                .to_string(),
+        );
+        if let Some(labels) = line
+            .split_once('{')
+            .map(|(_, r)| r.split_once('}').unwrap().0)
+        {
+            for kv in labels.split(',') {
+                let k = kv.split('=').next().unwrap();
+                assert!(
+                    ["action", "decision", "result", "le"].contains(&k),
+                    "{line}"
+                );
+            }
+        }
+        for leak in ["acme", "web", "legal", "seed", "readers", "\"w\"", "\"w2\""] {
+            assert!(!line.contains(leak), "{line}");
+        }
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [
+            "mg_authz_decision_seconds",
+            "mg_authz_decisions_total",
+            "mg_authz_policies",
+            "mg_authz_reload_total"
+        ]
+    );
+    assert!(
+        text.contains("mg_authz_decisions_total{action=\"index\",decision=\"deny\"} 1"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("mg_authz_policies {}", 5)), "{text}");
+}
+
+/// D4 + D7: the role a forwarded principal is decided with is the
+/// intersection, also for policies on `Role::"write"`: a `write` token
+/// forwarded as `read` is not in `Role::"write"` at the leader.
+#[test]
+fn a_forwarded_principal_is_decided_with_the_intersected_role() {
+    use tonic::Code;
+    let e = env_with(
+        r#"@id("writers-status")
+permit(principal in Role::"write", action == Action::"status", resource);"#,
+        false,
+    );
+    let ep = e.ts.endpoint();
+    let secret = (
+        "authorization",
+        format!("Bearer {}", e.f.secret).into_bytes(),
+    );
+    let fwd = |role: &str| vec![secret.clone(), h(BY, "2"), h(ROLE, role), h(ID, "w2")];
+    // A standalone `ReadIndex` is `status` (and needs only the `read` role).
+    assert_eq!(raw_call(&ep, READ_INDEX, &fwd("write")), Code::Ok);
+    assert_eq!(
+        raw_call(&ep, READ_INDEX, &fwd("read")),
+        Code::PermissionDenied
+    );
+}
+
+/// ADR 0013 D7, owner decision 2026-11-21: a node's own calls (the
+/// `--bootstrap-or-join` removal of its lost incarnation) present
+/// `--auth-node-token-id`, a token of the node's own file, and the leader
+/// decides `admin` on `Cluster::"this"` for it: allowed with an admin
+/// grant, refused without one, refused for an id the leader does not know.
+#[test]
+fn a_nodes_own_call_presents_its_node_token() {
+    use graph_server::auth::{Auth, NodeHeaders};
+    let remove_code = |e: &Env, node_tokens: &std::path::Path, id: &str| {
+        let mut cfg = e.f.config();
+        cfg.tokens = Some(node_tokens.to_path_buf());
+        cfg.node_token_id = Some(id.to_string());
+        let auth = Auth::load(&cfg, true).unwrap();
+        let ep = e.ts.endpoint();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let headers = NodeHeaders {
+                auth,
+                forwarded_by: Some(9),
+            };
+            let mut c = graph_proto::pb::admin_client::AdminClient::with_interceptor(ch, headers);
+            match c
+                .remove(graph_proto::pb::RemoveRequest {
+                    node_id: 9,
+                    force: true,
+                })
+                .await
+            {
+                Ok(_) => tonic::Code::Ok,
+                Err(st) => st.code(),
+            }
+        })
+    };
+    let admin = r#"@id("node-admin")
+permit(principal == Token::"w2", action == Action::"admin", resource == Cluster::"this");"#;
+    // Granted: the call passes authorization (this `--db` server then
+    // refuses the removal itself, which is not a permission refusal).
+    let e = env_with(admin, false);
+    let code = remove_code(&e, &e.f.tokens, "w2");
+    assert_ne!(code, tonic::Code::PermissionDenied, "{code:?}");
+    assert_ne!(code, tonic::Code::Unauthenticated, "{code:?}");
+    // No admin grant for the node token: refused.
+    let e = env_with(POLICIES, false);
+    assert_eq!(
+        remove_code(&e, &e.f.tokens, "w2"),
+        tonic::Code::PermissionDenied
+    );
+    // An id in the node's own file that the leader does not know: refused.
+    let e = env_with(admin, false);
+    let own = e.f.dir.path().join("node-tokens.toml");
+    let node_token = graph_server::auth::new_credential("mgt_").to_string();
+    std::fs::write(&own, stanza("node9", "write", &node_token, None)).unwrap();
+    assert_eq!(
+        remove_code(&e, &own, "node9"),
+        tonic::Code::PermissionDenied
+    );
+    // The id must be in the node's own token file.
+    let mut cfg = e.f.config();
+    cfg.node_token_id = Some("nobody".into());
+    assert!(Auth::load(&cfg, true).is_err());
 }

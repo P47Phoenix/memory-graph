@@ -50,7 +50,7 @@ pub use counting::{
 };
 pub use metrics::{
     rpc_attributes, status_code, CollectionCounts, OtlpMetrics, OtlpRecorders, SnapshotSource,
-    APPLY_DURATION, RPC_DURATION,
+    APPLY_DURATION, AUTHZ_DURATION, RPC_DURATION,
 };
 /// A per-layer filter that is asked again for every span and event it may
 /// want, instead of caching `Interest::always` for the callsite (#309,
@@ -847,7 +847,7 @@ const fn map(
 }
 
 /// Every `/metrics` family, in [`crate::observe::METRIC_NAMES`] order.
-pub const METRIC_MAPPING: [MetricMapping; 38] = {
+pub const METRIC_MAPPING: [MetricMapping; 42] = {
     use OtelInstrument::{Counter, Gauge, Histogram, UpDownCounter};
     [
         map(
@@ -973,6 +973,34 @@ pub const METRIC_MAPPING: [MetricMapping; 38] = {
             Counter,
             "{call}",
             &["reason"],
+        ),
+        map(
+            "mg_authz_decisions_total",
+            "memory_graph.authz.decisions",
+            Counter,
+            "{decision}",
+            &["action", "decision"],
+        ),
+        map(
+            "mg_authz_policies",
+            "memory_graph.authz.policies",
+            Gauge,
+            "{policy}",
+            &[],
+        ),
+        map(
+            "mg_authz_reload_total",
+            "memory_graph.authz.reloads",
+            Counter,
+            "{reload}",
+            &["result"],
+        ),
+        map(
+            "mg_authz_decision_seconds",
+            AUTHZ_DURATION,
+            Histogram,
+            "s",
+            &[],
         ),
         map(
             "mg_quorum_probes_total",

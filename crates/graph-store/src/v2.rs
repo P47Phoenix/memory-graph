@@ -4714,10 +4714,61 @@ impl V2Store {
     ) -> Result<DeleteStats> {
         let wt = self.db.begin_write()?;
         Self::stamp_marker(&wt, marker, membership)?;
-        let stats = Self::delete_in(&wt, org, repo, false)?;
+        let stats = Self::delete_in(&wt, org, repo, None, false)?;
         self.before_marked_commit(&marker)?;
         wt.commit()?;
         Ok(stats)
+    }
+
+    /// An org-wide delete limited to `repos` (ADR 0013 D6): the repos of
+    /// `org` the leader listed at admission, plus the marker, in one
+    /// transaction. A repo of `org` not in the list (created after
+    /// admission) is kept, and so is the org node then; a listed repo that
+    /// is gone already is skipped. The org node goes only when no repo is
+    /// left, as for [`Store::delete_scope`]. The list holds names, so a repo
+    /// deleted and re-created under the same name between admission and
+    /// apply is still deleted.
+    pub fn delete_repos_marked(
+        &self,
+        org: &str,
+        repos: &[String],
+        marker: RaftMarker,
+        membership: Option<&[u8]>,
+    ) -> Result<DeleteStats> {
+        let wt = self.db.begin_write()?;
+        Self::stamp_marker(&wt, marker, membership)?;
+        let stats = Self::delete_in(&wt, org, None, Some(repos), false)?;
+        self.before_marked_commit(&marker)?;
+        wt.commit()?;
+        Ok(stats)
+    }
+
+    /// The names of the repos of `org` now (the org node's children), in
+    /// name order: the admission-time list of an org-wide delete (ADR 0013
+    /// D6). Empty for an org that does not exist.
+    pub fn org_repo_names(&self, org: &str) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let rt = self.db.begin_read()?;
+        let names = rt.open_table(NAMES)?;
+        let Some(org_id) = names
+            .get(name_key(None, NodeKind::Org, org).as_str())?
+            .map(|v| v.value())
+        else {
+            return Ok(out);
+        };
+        let children = rt.open_multimap_table(CHILDREN)?;
+        let nodes = rt.open_table(NODES)?;
+        for id in children.get(org_id)? {
+            let id = id?.value();
+            if let Some(v) = nodes.get(id)? {
+                let n = dec(v.value())?;
+                if n.kind == NodeKind::Repo {
+                    out.push(n.name);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// The body of [`Store::delete_scope`] inside the caller's transaction
@@ -4726,6 +4777,7 @@ impl V2Store {
         wt: &redb::WriteTransaction,
         org: &str,
         repo: Option<&str>,
+        only: Option<&[String]>,
         dry_run: bool,
     ) -> Result<DeleteStats> {
         if org.is_empty() || repo == Some("") {
@@ -4755,9 +4807,17 @@ impl V2Store {
                 all.push((id, n.name));
             }
         }
-        let targets: Vec<(NodeId, String)> = match repo {
-            Some(r) => all.iter().filter(|(_, n)| n == r).cloned().collect(),
-            None => all.clone(),
+        let targets: Vec<(NodeId, String)> = match (repo, only) {
+            (Some(r), _) => all.iter().filter(|(_, n)| n == r).cloned().collect(),
+            (None, Some(list)) => {
+                let list: std::collections::HashSet<&str> =
+                    list.iter().map(String::as_str).collect();
+                all.iter()
+                    .filter(|(_, n)| list.contains(n.as_str()))
+                    .cloned()
+                    .collect()
+            }
+            (None, None) => all.clone(),
         };
         if repo.is_some() && targets.is_empty() {
             return Ok(stats);
@@ -5325,7 +5385,7 @@ impl Store for V2Store {
     }
     fn delete_scope(&self, org: &str, repo: Option<&str>, dry_run: bool) -> Result<DeleteStats> {
         let wt = self.db.begin_write()?;
-        let stats = Self::delete_in(&wt, org, repo, dry_run)?;
+        let stats = Self::delete_in(&wt, org, repo, None, dry_run)?;
         if dry_run {
             wt.abort()?;
         } else {

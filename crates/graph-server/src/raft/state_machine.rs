@@ -395,7 +395,15 @@ impl StoreStateMachine {
             }
             Cmd::Noop(_) => store.mark_only(marker, None).map(|()| LogResponse::Marked),
             Cmd::Delete(c) => {
-                let stats = store.delete_scope_marked(&c.org, c.repo.as_deref(), marker, None)?;
+                // ADR 0013 D6: an org-wide delete acts on exactly the repos
+                // the leader listed at admission (an entry without a list
+                // predates it: the whole org, as before).
+                let stats = match (c.repo.as_deref(), c.repos) {
+                    (None, Some(list)) => {
+                        store.delete_repos_marked(&c.org, &list.names, marker, None)?
+                    }
+                    (repo, _) => store.delete_scope_marked(&c.org, repo, marker, None)?,
+                };
                 Ok(LogResponse::Delete(stats))
             }
         }
@@ -560,6 +568,55 @@ mod tests {
             let (_, sm) = sm_at(d.path());
             Ok((d, log, sm))
         }
+    }
+
+    /// ADR 0013 D6: an org-wide `Delete` with the leader's admission-time
+    /// repo list deletes exactly those repos (a repo created after
+    /// admission survives); one without a list (an entry from before the
+    /// list existed) deletes the whole org, as before; a one-repo delete
+    /// ignores any list.
+    #[test]
+    fn an_org_wide_delete_applies_its_admission_time_list() {
+        let d = tempfile::tempdir().unwrap();
+        let (slot, _) = sm_at(d.path());
+        let repos = |org: &str| slot.with_store(|s| s.org_repo_names(org)).unwrap();
+        slot.with_store(|s| {
+            for (o, r) in [
+                ("o", "a"),
+                ("o", "late"),
+                ("p", "a"),
+                ("p", "b"),
+                ("q", "a"),
+            ] {
+                graph_store::Store::index_bytes(s, o, r, "x.txt", b"alpha", None)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let del = |org: &str, repo: Option<&str>, list: Option<&[&str]>| pb::LogCommand {
+            cmd: Some(pb::log_command::Cmd::Delete(pb::log_command::Delete {
+                org: org.into(),
+                repo: repo.map(str::to_string),
+                repos: list.map(|l| pb::log_command::RepoList {
+                    names: l.iter().map(|s| s.to_string()).collect(),
+                }),
+            })),
+        };
+        let m = |index| RaftMarker {
+            term: 1,
+            index,
+            node_id: 1,
+        };
+        slot.with_store(|s| {
+            StoreStateMachine::apply_command(s, del("o", None, Some(&["a"])), m(1))?;
+            StoreStateMachine::apply_command(s, del("p", None, None), m(2))?;
+            StoreStateMachine::apply_command(s, del("q", Some("a"), Some(&[])), m(3))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(repos("o"), ["late"], "created after admission: kept");
+        assert!(repos("p").is_empty(), "no list: the whole org");
+        assert!(repos("q").is_empty(), "one repo: the list is ignored");
     }
 
     /// openraft's own storage conformance suite over the log store and the

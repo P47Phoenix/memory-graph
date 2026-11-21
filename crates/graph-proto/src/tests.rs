@@ -493,8 +493,13 @@ fn store_error() -> impl Strategy<Value = StoreError> {
         (text(), text()).prop_map(|(expected, found)| StoreError::WrongCluster { expected, found }),
         text().prop_map(StoreError::DeadlineExceeded),
         text().prop_map(StoreError::Unauthenticated),
-        (text(), text())
-            .prop_map(|(msg, required_role)| StoreError::PermissionDenied { msg, required_role }),
+        (text(), text(), text()).prop_map(|(msg, required_role, action)| {
+            StoreError::PermissionDenied {
+                msg,
+                required_role,
+                action,
+            }
+        }),
     ]
 }
 
@@ -854,6 +859,7 @@ fn code_table_matches_adr_0004() {
             E::PermissionDenied {
                 msg: "x".into(),
                 required_role: "write".into(),
+                action: String::new(),
             }
             .into(),
             Code::PermissionDenied,

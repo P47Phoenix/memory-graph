@@ -61,8 +61,11 @@ pub fn extractors_hash(extractors: &[Arc<dyn Extractor>]) -> String {
 /// every peer Raft RPC (AppendEntries included), join and snapshot install
 /// compare, so a node that could not apply a command (it would refuse the
 /// entry and keep what the others changed) is refused instead of
-/// replicating. 2: `LogCommand.Delete` (issue #323).
-pub const LOG_COMMANDS_VERSION: u32 = 2;
+/// replicating. 2: `LogCommand.Delete` (issue #323). 3: the admission-time
+/// repo list of an org-wide `Delete` (ADR 0013 D6): a node that ignored it
+/// would delete the whole org where the others keep a repo created after
+/// admission.
+pub const LOG_COMMANDS_VERSION: u32 = 3;
 
 fn hash_with(extractors: &[Arc<dyn Extractor>], decoder_version: u32, log_commands: u32) -> String {
     let mut lines: Vec<String> = extractors
@@ -133,7 +136,9 @@ mod tests {
         // gets another hash, so its peers refuse it.
         let a: Vec<Arc<dyn Extractor>> = vec![Arc::new(Toy("a", "1"))];
         let now = graph_core::encoding::DECODER_VERSION;
-        assert_eq!(LOG_COMMANDS_VERSION, 2);
+        // ADR 0013 D6: the org-wide delete's repo list (log commands 3).
+        assert_eq!(LOG_COMMANDS_VERSION, 3);
         assert_ne!(hash_with(&a, now, 2), hash_with(&a, now, 1));
+        assert_ne!(hash_with(&a, now, 3), hash_with(&a, now, 2));
     }
 }
