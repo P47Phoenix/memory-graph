@@ -522,3 +522,12 @@ mod scoped_props {
         }
     }
 }
+
+/// ADR 0013 story 74b: deleted and pruned hidden repos get today's answer,
+/// and a snapshot judges existence against its own snapshot.
+#[test]
+fn scoped_view_deleted_repos_and_snapshots() {
+    let (_d, a, b) = crate::v2_tests::two_configs();
+    conformance::run_scoped_deleted_and_snapshot(&*a);
+    conformance::run_scoped_deleted_and_snapshot(&*b);
+}

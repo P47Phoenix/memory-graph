@@ -20,8 +20,12 @@
 //!   same whatever order the same inputs were indexed in (their ranking is
 //!   content-defined: repos by (org, repo) name, then path, then position).
 //!
-//! Node-id APIs (`get`, `children`, `roots`, `count_nodes`, ...) are scoped
-//! by the [`StoreRead::scoped`](crate::StoreRead) view of story 74b.
+//! - [`scoped_node_queries`] (story 74b): the node-id APIs (`get`,
+//!   `parent`, `roots`, `children`, `descendants`, their pages, `ancestors`,
+//!   `count_nodes`, `file_tokens`) through [`StoreRead::scoped`], on the
+//!   stable projection, plus node-id probes of every hidden node.
+//! - [`run_scoped_deleted_and_snapshot`]: deleted and pruned hidden repos,
+//!   and existence judged against a snapshot handle's snapshot.
 use super::*;
 use crate::{ReadOpts, ReadScope, RepoInfo, ScopeRules};
 use std::collections::BTreeSet;
@@ -555,6 +559,30 @@ pub fn seed_scoped(a: &dyn Store, b: &dyn Store, scope: &ReadScope) {
 pub fn run_scoped_differential(a: &dyn Store, b: &dyn Store, scope: &ReadScope) {
     seed_scoped(a, b, scope);
     scoped_queries(a, b, scope, true);
+    let av = a.scoped(scope.clone());
+    scoped_node_queries(&*av, Some(a), b, scope);
+    // The view answers the name-filtered reads exactly as the scoped
+    // queries do.
+    for (org, repo) in [(None, None), (Some("o1"), None), (None, Some("r1"))] {
+        let want = a.describe_with(org, repo, &ReadOpts::scoped(scope.clone()));
+        match (av.describe(org, repo), want) {
+            (Ok(x), Ok(y)) => assert_eq!(x, y),
+            (Err(_), Err(_)) => {}
+            (x, y) => panic!("view {x:?} vs describe_with {y:?}"),
+        }
+    }
+    // `ReadScope::All` is the store itself.
+    let all = a.scoped(ReadScope::All);
+    assert_eq!(projs(&all.roots().unwrap()), projs(&a.roots().unwrap()));
+    for k in [
+        NodeKind::Org,
+        NodeKind::Repo,
+        NodeKind::File,
+        NodeKind::Symbol,
+        NodeKind::Token,
+    ] {
+        assert_eq!(all.count_nodes(k).unwrap(), a.count_nodes(k).unwrap());
+    }
 }
 
 /// [`run_scoped_differential`] with A seeded through a batch that crashed
@@ -662,4 +690,263 @@ pub fn fixed_scopes() -> Vec<(&'static str, ReadScope)> {
             }),
         ),
     ]
+}
+
+/// The node-id half of the scoped differential (story 74b): `av` is store
+/// A seen through `scope` (an embedded `A.scoped(scope)`, or a remote
+/// store the server scopes), `b` the visible-only index. With `unscoped`
+/// (A itself), every node of a hidden repo or org is probed too.
+pub fn scoped_node_queries(
+    av: &dyn StoreRead,
+    unscoped: Option<&dyn StoreRead>,
+    b: &dyn StoreRead,
+    scope: &ReadScope,
+) {
+    // Orgs visible only through a grant on the org itself (none of their
+    // repos visible) exist in A but not in B: they are listed with no
+    // children, and set aside before comparing.
+    let granted_only = |n: &Node| {
+        n.kind == NodeKind::Org
+            && !SCOPED_REPOS
+                .iter()
+                .any(|(o, r)| *o == n.name && scope.repo_visible(o, r))
+    };
+    // Roots are compared by name: an org's creation order is set by its
+    // first repo, which may be hidden in A (a residual of ADR 0013 D5's
+    // relative-order rule: B cannot reproduce it).
+    let by_name = |mut v: Vec<Node>| {
+        v.sort_by(|x, y| x.name.cmp(&y.name));
+        v
+    };
+    let a_roots = by_name(av.roots().unwrap());
+    let (extra, a_roots): (Vec<Node>, Vec<Node>) = a_roots.into_iter().partition(granted_only);
+    for o in &extra {
+        assert!(
+            scope.org_granted(&o.name),
+            "org {} listed without a grant",
+            o.name
+        );
+        assert!(
+            av.children(o.id).unwrap().is_empty(),
+            "children of {}",
+            o.name
+        );
+        assert_eq!(av.children_page(o.id, 0, 10).unwrap().items.len(), 0);
+        assert!(av.descendants(o.id).unwrap().is_empty());
+    }
+    let b_roots = by_name(b.roots().unwrap());
+    assert_eq!(projs(&a_roots), projs(&b_roots), "roots");
+    assert_eq!(
+        av.count_nodes(NodeKind::Org).unwrap(),
+        b.count_nodes(NodeKind::Org).unwrap() + extra.len(),
+        "count Org"
+    );
+    for k in [
+        NodeKind::Repo,
+        NodeKind::File,
+        NodeKind::Symbol,
+        NodeKind::Token,
+    ] {
+        assert_eq!(
+            av.count_nodes(k).unwrap(),
+            b.count_nodes(k).unwrap(),
+            "count {k:?}"
+        );
+    }
+    for (ra, rb) in a_roots.iter().zip(&b_roots) {
+        let what = &ra.name;
+        assert_eq!(
+            projs(&av.children(ra.id).unwrap()),
+            projs(&b.children(rb.id).unwrap()),
+            "children {what}"
+        );
+        for (off, lim) in [(0, 1), (1, 1), (0, 2), (1, 10), (5, 3), (0, 100)] {
+            let (pa, pb) = (
+                av.children_page(ra.id, off, lim).unwrap(),
+                b.children_page(rb.id, off, lim).unwrap(),
+            );
+            assert_eq!(
+                projs(&pa.items),
+                projs(&pb.items),
+                "children_page {what} {off}/{lim}"
+            );
+            assert_eq!(
+                pa.has_more, pb.has_more,
+                "children_page more {what} {off}/{lim}"
+            );
+            let (pa, pb) = (
+                av.descendants_page(ra.id, off, lim).unwrap(),
+                b.descendants_page(rb.id, off, lim).unwrap(),
+            );
+            assert_eq!(
+                projs(&pa.items),
+                projs(&pb.items),
+                "descendants_page {what} {off}/{lim}"
+            );
+            assert_eq!(pa.has_more, pb.has_more, "descendants_page more {what}");
+        }
+        let (da, db) = (
+            av.descendants(ra.id).unwrap(),
+            b.descendants(rb.id).unwrap(),
+        );
+        assert_eq!(projs(&da), projs(&db), "descendants {what}");
+        for (na, nb) in da.iter().zip(&db) {
+            if na.kind == NodeKind::Token {
+                continue;
+            }
+            assert_eq!(
+                projs(&av.children(na.id).unwrap()),
+                projs(&b.children(nb.id).unwrap())
+            );
+            assert_eq!(
+                projs(&av.ancestors(na.id).unwrap()),
+                projs(&b.ancestors(nb.id).unwrap())
+            );
+            assert_eq!(av.get(na.id).unwrap().map(|n| proj(&n)), Some(proj(nb)));
+            assert_eq!(
+                av.parent(na.id).unwrap().map(|n| proj(&n)),
+                b.parent(nb.id).unwrap().map(|n| proj(&n))
+            );
+        }
+    }
+    for (o, r) in SCOPED_REPOS {
+        for p in [
+            "a.txt", "lib.rs", "same.txt", "m.txt", "eq.rs", "x.rs", "main.zig",
+        ] {
+            let got = av.file_tokens(o, r, p);
+            if !scope.repo_visible(o, r) {
+                let what = format!("file_tokens {o}/{r}/{p}");
+                match unscoped {
+                    Some(u) if u.file_tokens(o, r, p).unwrap().is_some() => {
+                        assert_denied(got, "read", &what)
+                    }
+                    Some(_) => assert_eq!(got.unwrap(), None, "{what}"),
+                    // Remote: refused if it exists, else today's `None`.
+                    None => {
+                        if !matches!(got, Ok(None)) {
+                            assert_denied(got, "read", &what)
+                        }
+                    }
+                }
+                continue;
+            }
+            let t = |v: Option<Vec<Node>>| v.map(|v| projs(&v));
+            assert_eq!(
+                t(got.unwrap()),
+                t(b.file_tokens(o, r, p).unwrap()),
+                "file_tokens {o}/{r}/{p}"
+            );
+        }
+    }
+    let Some(u) = unscoped else {
+        return;
+    };
+    // Named probes: every node of a hidden repo (and every hidden org) is
+    // refused through every node-id API; never-existing ids keep today's
+    // answer.
+    let mut max_id = 0;
+    for root in u.roots().unwrap() {
+        let org_visible = !(av.roots().unwrap().iter().all(|n| n.id != root.id));
+        let mut all = vec![root.clone()];
+        all.extend(u.descendants(root.id).unwrap());
+        let mut repo_visible = true;
+        for n in &all {
+            max_id = max_id.max(n.id);
+            if n.kind == NodeKind::Repo {
+                repo_visible = scope.repo_visible(&root.name, &n.name);
+            }
+            let visible = if n.kind == NodeKind::Org {
+                org_visible
+            } else {
+                repo_visible
+            };
+            if visible {
+                assert!(av.get(n.id).unwrap().is_some());
+                continue;
+            }
+            let what = format!("node {} ({:?} {})", n.id, n.kind, n.name);
+            assert_denied(av.get(n.id), "read", &what);
+            assert_denied(av.parent(n.id), "read", &what);
+            assert_denied(av.children(n.id), "read", &what);
+            assert_denied(av.children_page(n.id, 0, 5), "read", &what);
+            assert_denied(av.descendants(n.id), "read", &what);
+            assert_denied(av.descendants_page(n.id, 0, 5), "read", &what);
+            assert_denied(av.ancestors(n.id), "read", &what);
+        }
+    }
+    for id in [max_id + 1, max_id + 1_000_000] {
+        assert_eq!(av.get(id).unwrap(), None);
+        assert_eq!(av.parent(id).unwrap(), None);
+        assert!(av.children(id).unwrap().is_empty());
+        assert!(av.children_page(id, 0, 5).unwrap().items.is_empty());
+        assert!(av.descendants(id).unwrap().is_empty());
+        assert!(av.ancestors(id).unwrap().is_empty());
+        assert_eq!(u.get(id).unwrap(), None, "today's answer");
+    }
+}
+
+/// A deleted or pruned hidden repo gets today's answer, and through a
+/// snapshot handle existence is judged against the handle's snapshot (ADR
+/// 0013 D5, story 74b). `s` is an empty store.
+pub fn run_scoped_deleted_and_snapshot(s: &dyn Store) {
+    let hide = ReadScope::from_rules(ScopeRules {
+        orgs: ["vis".to_string()].into(),
+        ..Default::default()
+    });
+    s.index_bytes("vis", "v", "a.txt", b"foo\n", None).unwrap();
+    let del = s
+        .index_bytes("hid", "d", "a.txt", b"foo\n", None)
+        .unwrap()
+        .file_id;
+    let files = [bf("a.txt", b"foo\n"), bf("keep.txt", b"foo\n")];
+    let r = s
+        .index_batch("hid", "p", &files, IndexOptions::default())
+        .unwrap();
+    let pru = r[0].as_ref().unwrap().file_id;
+    let snap = s.snapshot().unwrap();
+    s.delete_scope("hid", Some("d"), false).unwrap();
+    s.prune_files("hid", "p", &["keep.txt".to_string()].into(), false)
+        .unwrap();
+    let live = s.scoped(hide.clone());
+    // Deleted and pruned: today's answer, the same as a never-existing id.
+    // (Entity ids, org/repo/file, are never reused; checked before the
+    // next write anyway, so the probe does not depend on that.)
+    for id in [del, pru] {
+        assert_eq!(live.get(id).unwrap(), None);
+        assert!(live.children(id).unwrap().is_empty());
+        assert_eq!(s.get(id).unwrap(), None);
+    }
+    let late = s
+        .index_bytes("hid", "late", "a.txt", b"foo\n", None)
+        .unwrap()
+        .file_id;
+    assert!(live.describe(Some("hid"), Some("d")).unwrap().is_empty());
+    assert_eq!(live.file_tokens("hid", "p", "a.txt").unwrap(), None);
+    // Still existing hidden: refused.
+    assert_denied(live.get(late), "read", "late");
+    assert_denied(
+        live.describe(Some("hid"), Some("p")),
+        "read",
+        "pruned repo, still there",
+    );
+    // Through the snapshot: what it holds is judged as of the snapshot.
+    let sv = snap.scoped(hide);
+    assert_denied(sv.get(del), "read", "deleted after the snapshot");
+    assert_denied(sv.get(pru), "read", "pruned after the snapshot");
+    assert_denied(
+        sv.describe(Some("hid"), Some("d")),
+        "read",
+        "snapshot describe",
+    );
+    assert_denied(
+        sv.file_tokens("hid", "d", "a.txt"),
+        "read",
+        "snapshot file_tokens",
+    );
+    assert!(sv.describe(Some("hid"), Some("late")).unwrap().is_empty());
+    let mut q = Query::new("foo");
+    q.repo = Some("late".into());
+    assert!(sv.search(&q).unwrap().is_empty());
+    q.repo = Some("d".into());
+    assert_denied(sv.search(&q), "search", "snapshot search");
 }

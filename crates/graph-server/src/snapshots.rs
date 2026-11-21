@@ -43,6 +43,10 @@ struct Handle {
     /// With auth on (ADR 0012 D5): the token id and connection that
     /// opened it; any other caller is answered as for a missing handle.
     owner: Option<String>,
+    /// The read scopes it was opened with (ADR 0013 D8), for `read` and
+    /// `search`; every call through it intersects them with the caller's
+    /// current scopes, so a narrowing reload applies at the next call.
+    scopes: Option<(graph_store::ReadScope, graph_store::ReadScope)>,
 }
 
 /// The table of open handles.
@@ -138,7 +142,10 @@ impl SnapshotTable {
         store: &V2Store,
         meta: Option<graph_proto::ReadMeta>,
     ) -> Result<u64, Status> {
-        self.open_owned(conn, store, meta, None)
+        // A handle opened outside the Store service (tests, in-process
+        // tools): unscoped, as auth is off there.
+        let all = graph_store::ReadScope::All;
+        self.open_owned(conn, store, meta, None, (all.clone(), all))
     }
 
     /// [`open_with_meta`](Self::open_with_meta) for `owner` (ADR 0012 D5,
@@ -149,6 +156,7 @@ impl SnapshotTable {
         store: &V2Store,
         meta: Option<graph_proto::ReadMeta>,
         owner: Option<String>,
+        scopes: (graph_store::ReadScope, graph_store::ReadScope),
     ) -> Result<u64, Status> {
         self.check_caps(&self.lock(), conn)?;
         let snap = store
@@ -170,6 +178,7 @@ impl SnapshotTable {
                 snap: Arc::new(Mutex::new(snap)),
                 meta,
                 owner,
+                scopes: Some(scopes),
             },
         );
         *t.per_conn.entry(conn).or_insert(0) += 1;
@@ -213,6 +222,22 @@ impl SnapshotTable {
                 age_secs: 0,
                 max_age_secs: self.max_age.as_secs(),
             }),
+        }
+    }
+
+    /// The scope handle `id` was opened with for `search` (`true`) or
+    /// `read`; nothing visible when none was recorded (never `All` by
+    /// default).
+    pub fn scope(&self, id: u64, search: bool) -> graph_store::ReadScope {
+        match self.lock().open.get(&id).and_then(|h| h.scopes.clone()) {
+            Some((r, s)) => {
+                if search {
+                    s
+                } else {
+                    r
+                }
+            }
+            None => graph_store::ReadScope::nothing(),
         }
     }
 

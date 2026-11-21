@@ -211,6 +211,10 @@ impl Ctx {
     {
         let view = View::try_from(view)?;
         let slot = Arc::clone(&self.slot);
+        // ADR 0013 D5: every read runs on the store seen through the
+        // caller's scope for its action (`All` without policies).
+        let scope = self.auth.read_scope(action);
+        let search = action == graph_authz::Action::Search;
         match view {
             View::Local | View::Linearizable => {
                 let mut meta;
@@ -223,10 +227,12 @@ impl Ctx {
                 }
                 // Fails fast (UNAVAILABLE) while a snapshot install swaps
                 // the file (D8): the client moves to its next endpoint.
-                let v = tokio::task::spawn_blocking(move || slot.with_store_read(|s| f(s)))
-                    .await
-                    .map_err(join_err)?
-                    .map_err(|e| self.read_err(e))?;
+                let v = tokio::task::spawn_blocking(move || {
+                    slot.with_store_read(|s| f(&*s.scoped(scope)))
+                })
+                .await
+                .map_err(join_err)?
+                .map_err(|e| self.read_err(e))?;
                 Ok((v, meta))
             }
             View::Snapshot(id) => {
@@ -234,6 +240,9 @@ impl Ctx {
                     .check_owner(id, crate::snapshots::owner_of_current().as_deref())
                     .map_err(status)?;
                 let snap = slot.snapshots().get(id).map_err(status)?;
+                // D8: the handle's own scope intersected with the caller's
+                // current one; existence is judged against its snapshot.
+                let scope = scope.intersect(&slot.snapshots().scope(id, search));
                 // The handle's own freshness, frozen when it opened (a
                 // linearizable handle is never stale_possible).
                 let meta = slot
@@ -244,7 +253,10 @@ impl Ctx {
                     let g = snap
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    f(&*g)
+                    let v = graph_store::StoreRead::scoped(&*g, scope);
+                    let out = f(&*v);
+                    drop(v);
+                    out
                 })
                 .await
                 .map_err(join_err)?

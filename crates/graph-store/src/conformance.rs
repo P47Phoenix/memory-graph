@@ -31,8 +31,9 @@ use std::collections::{BTreeMap, HashSet};
 #[path = "conformance_scoped.rs"]
 mod scoped;
 pub use scoped::{
-    fixed_scopes, run_scoped_crash_rerun_differential, run_scoped_differential,
-    run_search_insertion_order, scoped_queries, seed_scoped, SCOPED_REPOS,
+    fixed_scopes, run_scoped_crash_rerun_differential, run_scoped_deleted_and_snapshot,
+    run_scoped_differential, run_search_insertion_order, scoped_node_queries, scoped_queries,
+    seed_scoped, SCOPED_REPOS,
 };
 
 type Opened = Result<Box<dyn Store>, StoreError>;

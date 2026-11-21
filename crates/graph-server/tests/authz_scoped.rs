@@ -1,5 +1,6 @@
-//! ADR 0013 PR 3, story 74a, against an in-process server: search, symbol
-//! search and the describe family scoped by `--auth-policies` (D5).
+//! ADR 0013 PR 3, stories 74a and 74b, against an in-process server:
+//! search, symbol search, the describe family and the node-id reads
+//! scoped by `--auth-policies` (D5), and snapshot handles (D8).
 //!
 //! Each conformance scope is written as the equivalent policy file for a
 //! `read` token; store A is the server (seeded by an unrestricted writer),
@@ -124,6 +125,7 @@ fn scoped_reads_over_the_wire_equal_an_index_of_the_visible_repos() {
         for mode in [ReadMode::Local, ReadMode::Linearizable] {
             let r = client(&e, &e.f.read, mode);
             conformance::scoped_queries(&r, &*b, &scope, false);
+            conformance::scoped_node_queries(&r, None, &*b, &scope);
         }
     }
 }
@@ -177,4 +179,74 @@ fn a_named_read_refusal_is_counted() {
     // An aggregate read is filtered silently: no decision counted.
     assert!(r.describe(None, None).unwrap().is_empty());
     assert_eq!(deny(&e), before + 1);
+}
+
+/// A snapshot handle keeps the scope it was opened with: a widening reload
+/// does not widen it, a narrowing one narrows its next call (ADR 0013 D8).
+/// Node ids of hidden repos are refused; never-existing ids are today's
+/// answer (story 74b).
+#[test]
+fn snapshot_handles_follow_the_intersection_rule() {
+    let read_a = r#"permit(principal == Token::"w2", action, resource);
+permit(principal == Token::"r", action in [Action::"read", Action::"search"], resource in Org::"a");
+"#;
+    let e = env(read_a);
+    let w2 = client(&e, &e.f.write2, ReadMode::Local);
+    w2.index_bytes("a", "x", "f.txt", b"hello", None).unwrap();
+    let hidden = w2
+        .index_bytes("b", "y", "f.txt", b"hello", None)
+        .unwrap()
+        .file_id;
+    let r = client(&e, &e.f.read, ReadMode::Local);
+    let names = |v: Vec<graph_store::RepoInfo>| -> Vec<String> {
+        v.into_iter()
+            .map(|i| format!("{}/{}", i.org, i.repo))
+            .collect()
+    };
+    assert!(matches!(
+        r.get(hidden),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert_eq!(r.get(hidden + 1_000_000).unwrap(), None);
+    assert_eq!(r.roots().unwrap().len(), 1);
+    assert_eq!(r.count_nodes(graph_core::NodeKind::File).unwrap(), 1);
+    let snap = r.snapshot().unwrap();
+    assert_eq!(names(snap.describe(None, None).unwrap()), ["a/x"]);
+    // SnapshotStats is scoped: no whole-store size for a scoped reader.
+    let stats = r.snapshot_stats();
+    assert_eq!(stats.store_size_bytes, 0);
+    assert!(stats.open_count >= 1);
+    assert!(
+        w2.snapshot_stats().store_size_bytes > 0,
+        "an unscoped reader sees it"
+    );
+    let pol = e.f.dir.path().join("policies.cedar");
+    let reload = |text: &str| {
+        std::fs::write(&pol, text).unwrap();
+        e.ts.running().unwrap().auth().reload_now();
+    };
+    // Widen: the live store shows both, the handle still only `a`.
+    reload(&read_a.replace("resource in Org::\"a\"", "resource"));
+    assert_eq!(names(r.describe(None, None).unwrap()), ["a/x", "b/y"]);
+    assert_eq!(names(snap.describe(None, None).unwrap()), ["a/x"]);
+    assert!(matches!(
+        snap.get(hidden),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    let visible = w2.file_tokens("a", "x", "f.txt").unwrap().unwrap()[0].id;
+    assert!(snap.get(visible).unwrap().is_some());
+    assert_eq!(snap.count_nodes(graph_core::NodeKind::File).unwrap(), 1);
+    // Narrow to nothing: the handle's next call sees nothing.
+    reload("permit(principal == Token::\"w2\", action, resource);\n");
+    assert!(matches!(
+        snap.get(visible),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert_eq!(snap.count_nodes(graph_core::NodeKind::File).unwrap(), 0);
+    assert!(snap.roots().unwrap().is_empty());
+    assert!(snap.describe(None, None).unwrap().is_empty());
+    assert!(matches!(
+        snap.describe(Some("a"), None),
+        Err(StoreError::PermissionDenied { .. })
+    ));
 }
