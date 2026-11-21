@@ -1295,11 +1295,13 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                 // until a build succeeds, and keeps growing.
                 tracing::error!(
                     failures = n,
+                    error = builds.last_error.as_deref().unwrap_or("unknown"),
                     need_bytes = need,
                     volume = %dir.display(),
                     retry_in_s = wait.as_secs(),
                     loud = n >= SNAPSHOT_FAILURES_LOUD,
-                    "{why}; retrying after a back-off (the Raft log is not purged meanwhile)"
+                    "snapshot build failed; retrying after a back-off (a build needs about \
+                     need_bytes free on the volume; the Raft log is not purged meanwhile)"
                 );
                 node.snapshots.set_blocked(Some(why));
                 not_before = Some(std::time::Instant::now() + wait);
