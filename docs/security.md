@@ -69,6 +69,8 @@ memory-graph serve --data-dir /data --bootstrap --auth-tokens tokens.toml \
 
 ## Policies (per-org/repo permissions)
 
+> **In this version, every node of a cluster must run the same policy file (and token file).** Only the node a client calls evaluates policies; a write it forwards is re-checked at the leader by role only, until the leader re-check lands (ADR 0013 PR 2). Compare `policy_hash` in `cluster status` on every node after each change.
+
 [ADR 0013](adr/0013-policy-authorization.md). Without a policy file a token's `role` is all there is (above). With one, rules in a scope-only subset of [Cedar](https://www.cedarpolicy.com/) decide what each token may do:
 
 ```sh
@@ -89,7 +91,7 @@ permit(principal in Group::"readers", action in [Action::"read", Action::"search
 
 - **Model.** Principals: `Token::"<id>"` (the token file's `id`), `Group::"<g>"` (a token's `groups`) and `Role::"read"` / `Role::"write"`. Actions: `read`, `search`, `index`, `prune`, `delete`, `snapshot`, `status`, `admin`. Resources: `Org::"o"`, which contains every `Repo::"o/r"` (the id splits at the first `/`), and `Cluster::"this"`. Anything not permitted is denied; a `forbid` beats any `permit`.
 - **Built-ins.** With a policy file, nothing is allowed that a policy does not permit. `--auth-builtins` adds the two role policies (`read` reads, searches and sees status; `write` may do anything). The role is always a ceiling: a `read` token never gets `index`, `prune`, `delete`, `snapshot` or `admin`, whatever the policies say.
-- **What is checked in this version.** Writes and cluster actions on the node the client calls: `Index` (each file of a stream against the current files), `IndexFile` and `IngestExtraction` on the repo; `Prune`/`Delete` of one repo on the repo, of a whole org only with a grant on the `Org` (or the cluster) and no `forbid` on any repo inside it; `Vacuum`, `Compact`, membership, `UploadSnapshot` and `Shutdown` are `admin`, `TriggerSnapshot` and `ListBackups` are `snapshot`, and `Status`, `Members`, `Leader`, `SysInfo`, `Metrics` and a standalone `ReadIndex` are `status`, all on `Cluster::"this"`.
+- **What is checked in this version.** Writes and cluster actions on the node the client calls: `Index` (each file of a stream against the current files), `IndexFile` and `IngestExtraction` on the repo; `Prune`/`Delete` of one repo on the repo, of a whole org only with a grant on the `Org` (or the cluster) and no `forbid` on any repo inside it; `Vacuum`, `Compact`, membership, `UploadSnapshot` and `Shutdown` are `admin`, `TriggerSnapshot` is `snapshot`, and `Status`, `Members`, `Leader`, `SysInfo`, `Metrics`, `ListBackups` and a standalone `ReadIndex` are `status`, all on `Cluster::"this"`.
 - **Reads are all or nothing per token** until scoped reads land: a `read` or `search` policy must not constrain `resource` (the file is refused otherwise). A token allowed the action reads everything; one that is not gets empty answers from queries that name nothing (an unfiltered search, list all repos), and `PERMISSION_DENIED` when it names something that exists (a node id, a repo, a file); a name that does not exist gets the usual empty answer.
 - **MCP** tool calls are decided on `Cluster::"this"` in this version: a token without the tool's action anywhere gets an `isError` result with `permission_denied` (HTTP 200); a repo-scoped `index` grant does not yet cover the `index_path` tool.
 - **A cluster must run the same policy file on every node** in this version: only the node the client calls evaluates policies, and a forwarded write is re-checked at the leader by role only. `cluster status` prints each node's `policy_hash` (a hash of the policies, the built-ins switch and the token file's ids, roles and groups) so differing nodes stand out.
@@ -102,7 +104,7 @@ memory-graph auth check --tokens tokens.toml --policies policies.cedar --explain
 ```
 
 - An org whose name contains `/` cannot be addressed by a `Repo::` policy; `serve` warns about each at start. Grant it through `Org::"..."` or an unconstrained `resource`.
-- Every decision of a token is logged on target `mg::audit` (token id, groups, action, decision, matched `@id`s; denials and writes at `info`, allowed reads at `debug`), never a token or policy text.
+- Every decision of a token is logged on target `mg::audit` (token id, groups, action, decision, matched `@id`s; denials and writes at `info`, allowed reads at `debug`), never a token or policy text. The audit log is effectively local: none of its fields are in the OTLP log allow-list (`ALLOWED_LOG_FIELDS`), so an OTLP collector receives at most the bare message `authz`. Keep the server's own log output if you need the audit trail.
 
 ## The transport guard
 

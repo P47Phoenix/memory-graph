@@ -142,7 +142,7 @@ fn cluster_actions_follow_the_policies() {
     let w = client(&e, &e.f.write);
     denied(w.admin_status(), "status");
     denied(w.admin_compact(), "admin");
-    denied(w.admin_list_backups(), "snapshot");
+    denied(w.admin_list_backups(), "status");
     denied(w.vacuum(), "admin");
     // The role is a ceiling: a read token never gets admin, even with a
     // permit for it.
@@ -438,4 +438,75 @@ fn mcp_tool_calls_follow_the_policies() {
         text.contains("permission_denied") && !text.contains("acme"),
         "{text}"
     );
+}
+
+/// The leader refuses a malformed `Index` stream (a `File` before the
+/// `Header`, or a second `Header`) before anything is written, with or
+/// without policies.
+#[test]
+fn a_malformed_index_stream_is_refused_before_any_write() {
+    use graph_proto::pb;
+    let e = env_with(POLICIES, false);
+    let ep = e.ts.endpoint();
+    let token = e.f.write2.clone();
+    let header = || pb::IndexRequest {
+        msg: Some(pb::index_request::Msg::Header(pb::IndexHeader {
+            org: "acme".into(),
+            repo: "api".into(),
+            options: None,
+        })),
+    };
+    let file = |p: &str| pb::IndexRequest {
+        msg: Some(pb::index_request::Msg::File(pb::FileBytes {
+            path: p.into(),
+            bytes: b"fn a() {}".to_vec(),
+            ..Default::default()
+        })),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (what, msgs) in [
+        ("file before header", vec![file("a.rs"), header()]),
+        (
+            "second header",
+            vec![header(), file("a.rs"), header(), file("b.rs")],
+        ),
+    ] {
+        let (ep, token) = (ep.clone(), token.clone());
+        let r = rt.block_on(async move {
+            let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut c =
+                pb::write_client::WriteClient::with_interceptor(ch, graph_proto::SendVersion);
+            let mut req = tonic::Request::new(tokio_stream::iter(msgs));
+            req.metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            c.index(req).await
+        });
+        let st = r.expect_err(what);
+        assert_eq!(st.code(), tonic::Code::FailedPrecondition, "{what}: {st:?}");
+        assert!(st.message().contains("malformed message"), "{what}: {st:?}");
+        let w2 = client(&e, &e.f.write2);
+        assert!(
+            w2.describe(None, None).unwrap().is_empty(),
+            "{what}: nothing written"
+        );
+    }
+}
+
+/// ADR D1: a write token is in `Role::"read"` too (a `forbid` on the read
+/// role therefore applies to it).
+#[test]
+fn role_groups_follow_d1() {
+    let e = env_with(
+        r#"permit(principal in Role::"read", action == Action::"status", resource);"#,
+        false,
+    );
+    client(&e, &e.f.write).admin_status().unwrap();
+    client(&e, &e.f.read).admin_status().unwrap();
 }

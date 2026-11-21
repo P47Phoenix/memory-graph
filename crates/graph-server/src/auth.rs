@@ -795,10 +795,12 @@ pub fn cluster_action(path: &str) -> Option<graph_authz::Action> {
     use graph_authz::Action as A;
     if let Some(m) = path.strip_prefix(ADMIN) {
         return match m {
-            "Status" | "Members" | "Leader" | "SysInfo" | "Metrics" | "ReadIndex" => {
-                Some(A::Status)
-            }
-            "TriggerSnapshot" | "ListBackups" => Some(A::Snapshot),
+            // `ListBackups` is `status` (ADR 0013 D1, corrected 2026-11-21):
+            // ADR 0012 lets a `read` token list backups, and the built-in
+            // role policies must equal ADR 0012's roles exactly.
+            "Status" | "Members" | "Leader" | "SysInfo" | "Metrics" | "ReadIndex"
+            | "ListBackups" => Some(A::Status),
+            "TriggerSnapshot" => Some(A::Snapshot),
             "AddLearner" | "Promote" | "Remove" | "TransferLeader" | "TriggerElect"
             | "UploadSnapshot" | "Compact" | "Shutdown" => Some(A::Admin),
             _ => None,
@@ -1204,8 +1206,8 @@ impl Auth {
     }
 
     /// Decide `action` on `res` for a client-token caller against the
-    /// current pair (ADR 0013, PR 1). Allowed with policies off, for a call
-    /// with no caller (in-process) and for a node caller (a forwarded call:
+    /// current pair (ADR 0013, PR 1). Allowed with policies off, inside an
+    /// [`InProcessGuard`] (no caller: denied otherwise) and for a node caller (a forwarded call:
     /// until the leader re-check lands, PR 2, the leader keeps ADR 0012's
     /// `mg-forwarded-role` check). A token removed from the file, or
     /// expired, since the call started is `UNAUTHENTICATED`.
@@ -1242,7 +1244,11 @@ impl Auth {
             return Ok(());
         };
         let Some(caller) = current_caller() else {
-            return Ok(());
+            return if no_caller_allowed() {
+                Ok(())
+            } else {
+                Err(policy_denied(action))
+            };
         };
         let CallerKind::Token { id, .. } = &caller.kind else {
             return Ok(());
@@ -1273,7 +1279,7 @@ impl Auth {
             return true;
         };
         let Some(caller) = current_caller() else {
-            return true;
+            return no_caller_allowed();
         };
         let CallerKind::Token { id, .. } = &caller.kind else {
             return true;
@@ -1542,6 +1548,47 @@ impl Auth {
             }
         }
     }
+}
+
+thread_local! {
+    /// Set while this thread runs a deliberately in-process call (the MCP
+    /// endpoint's tool calls, which are decided for their token before
+    /// they run): the only calls that reach a policy check with no caller.
+    static IN_PROCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the current thread as running in-process calls until dropped
+/// (ADR 0013 PR 1). The MCP endpoint enters it around a tool call it has
+/// already decided ([`Auth::mcp_tool_denied`]); nothing else may.
+pub struct InProcessGuard(bool);
+
+impl InProcessGuard {
+    pub fn enter() -> Self {
+        InProcessGuard(IN_PROCESS.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for InProcessGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        IN_PROCESS.with(|c| c.set(prev));
+    }
+}
+
+/// With policies on, a policy check that finds no caller fails closed,
+/// except inside an [`InProcessGuard`]. Every gRPC call runs with its
+/// caller set by the auth layer, so reaching this otherwise is a bug
+/// (debug builds assert).
+fn no_caller_allowed() -> bool {
+    let ok = IN_PROCESS.with(|c| c.get());
+    if !ok {
+        tracing::error!("authz: a policy check with no caller outside the in-process path; denied");
+        debug_assert!(
+            ok,
+            "a policy check with no caller outside the in-process path"
+        );
+    }
+    ok
 }
 
 /// The policy principal of a token entry.
@@ -2012,7 +2059,7 @@ mod tests {
         );
         assert_eq!(
             method_action("/memory_graph.v1.Admin/ListBackups"),
-            Some(A::Snapshot)
+            Some(A::Status)
         );
         assert_eq!(
             method_action("/memory_graph.v1.Admin/ReadIndex"),
@@ -2027,6 +2074,78 @@ mod tests {
             method_action("/memory_graph.v1.Write/Delete"),
             Some(A::Delete)
         );
+    }
+
+    /// With policies on, a check with no caller fails closed (and debug
+    /// builds assert), except inside the deliberate in-process guard.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "no caller"))]
+    fn a_missing_caller_fails_closed_with_policies() {
+        let t = token(1);
+        let (a, _d) = auth_with_policies(
+            &file(&[("w", "write", &t)]),
+            "permit(principal, action, resource);",
+            false,
+        );
+        {
+            let _g = InProcessGuard::enter();
+            assert!(a
+                .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
+                .is_ok());
+            assert!(a.read_allowed(graph_authz::Action::Read));
+        }
+        // Policies off: allowed with no caller, as before.
+        let (off, _d2) = auth_with(&file(&[("w", "write", &t)]), None);
+        assert!(off
+            .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
+            .is_ok());
+        // Outside the guard: denied (release) / asserts (debug).
+        assert!(!a.read_allowed(graph_authz::Action::Read));
+        assert!(a
+            .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
+            .is_err());
+    }
+
+    /// ADR 0013 D4: with `--auth-builtins` (and nothing else), every client
+    /// RPC is allowed for exactly the roles ADR 0012's table allows it.
+    #[test]
+    fn builtins_equal_adr_0012_roles_on_every_rpc() {
+        let set = graph_authz::PolicySet::builtins();
+        let groups: Vec<String> = Vec::new();
+        for p in graph_proto::rpc_paths() {
+            let Some(need) = need(p) else { continue };
+            if !matches!(need, Need::Read | Need::Write) {
+                continue;
+            }
+            let action = method_action(p).expect("every client RPC has an action");
+            for (role, arole) in [
+                (Role::Read, graph_authz::Role::Read),
+                (Role::Write, graph_authz::Role::Write),
+            ] {
+                let want = role.covers(if need == Need::Read {
+                    Role::Read
+                } else {
+                    Role::Write
+                });
+                let who = graph_authz::Principal {
+                    token: "t",
+                    groups: &groups,
+                    role: arole,
+                };
+                for res in [
+                    graph_authz::Resource::Cluster,
+                    graph_authz::Resource::Org("o"),
+                    graph_authz::Resource::Repo("o", "r"),
+                ] {
+                    assert_eq!(
+                        set.decide(&who, action, &res).allowed,
+                        want,
+                        "{p} for a {} token on {res}",
+                        role.as_str()
+                    );
+                }
+            }
+        }
     }
 
     fn auth_with_policies(

@@ -1011,6 +1011,9 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         // `--mcp-max-inflight` bounds the blocking work.
         let _permit = permit;
         let _write_permit = write_permit;
+        // ADR 0013: this tool call was decided for its token above; its
+        // in-process service calls carry no caller, deliberately.
+        let _in_process = crate::auth::InProcessGuard::enter();
         if let Some(d) = delay {
             std::thread::sleep(d);
         }

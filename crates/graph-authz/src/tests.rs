@@ -367,9 +367,7 @@ fn unknown_principals_warn_and_match_nothing() {
 #[test]
 fn empty_and_comments_only_files_are_empty_sets() {
     assert!(parse(b"").unwrap().is_empty());
-    assert!(parse(b"// nothing\n/* still\nnothing */\n")
-        .unwrap()
-        .is_empty());
+    assert!(parse(b"// nothing\n// still nothing\n").unwrap().is_empty());
     assert!(parse(b"   \r\n\t").unwrap().is_empty());
 }
 
@@ -403,19 +401,25 @@ fn nul_and_invalid_utf8_are_errors() {
 }
 
 #[test]
-fn block_comments_and_unterminated_ones() {
+fn block_comments_are_refused_as_not_valid_cedar() {
+    // ADR 0013 D2 (corrected 2026-11-21): Cedar has only `//` comments.
+    for t in [
+        "/* a */ permit(principal, action, resource);",
+        "permit(/* b */principal, action, resource);",
+        "\n/* never closed\npermit(principal, action, resource);",
+        "/*",
+        "/**/",
+    ] {
+        let e = perr(t);
+        assert!(e.msg.contains("not valid Cedar"), "{t}: {e}");
+    }
+    assert_eq!(perr("\n\n/* x */").line, 3);
     assert_eq!(
-        parse(b"/* a */ permit(/* b */principal, action, resource); // c")
+        parse(b"// a\npermit(principal, action, resource); // c")
             .unwrap()
             .len(),
         1
     );
-    let e = perr("\n/* never closed\npermit(principal, action, resource);");
-    assert!(e.msg.contains("unterminated") && e.line == 2, "{e}");
-    assert!(perr("/*").msg.contains("unterminated"));
-    // A comment's line count advances.
-    let e = perr("/*\n\n*/ permit(principal, action, resource)");
-    assert_eq!(e.line, 3);
 }
 
 #[test]
@@ -1009,14 +1013,8 @@ fn lexer_error_messages() {
         .msg
         .contains("template"));
     for t in ["/**", "/* *", "/*", "/*/"] {
-        assert!(perr(t).msg.contains("unterminated"), "{t}");
+        assert!(perr(t).msg.contains("block comments"), "{t}");
     }
-    assert_eq!(
-        parse(b"/* a * b / c */ permit(principal, action, resource);")
-            .unwrap()
-            .len(),
-        1
-    );
     // A newline inside a string still advances the line.
     let e = perr("permit(principal == Token::\"a\nb\", action == Action::\"x\", resource);");
     assert_eq!(e.line, 2, "{e}");

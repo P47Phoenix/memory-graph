@@ -4,8 +4,8 @@
 //! fails the pure-Rust gate).
 //!
 //! * [`parse`] reads a policy file (D2): `permit`/`forbid` over
-//!   `principal`, `action` and `resource` scopes, annotations, `//` and
-//!   `/* */` comments. Anything else (a condition, `is`, `like`, a template
+//!   `principal`, `action` and `resource` scopes, annotations and `//`
+//!   comments. Anything else (a `/* */` comment, a condition, `is`, `like`, a template
 //!   slot, an unknown entity type or action, a namespaced type) is an error,
 //!   never ignored. Every accepted file is valid Cedar with the same meaning
 //!   (checked against `cedar-policy` by the dev-only oracle, story 72a).
@@ -672,22 +672,13 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ParseError> {
                     i += 1;
                 }
             }
+            // Cedar has only `//` comments: a block comment would make the
+            // file invalid Cedar, so it is refused (ADR 0013 D2, corrected).
             '/' if b.get(i + 1) == Some(&'*') => {
-                let start = line;
-                i += 2;
-                loop {
-                    if i + 1 >= b.len() {
-                        return Err(err(start, "unterminated `/*` comment"));
-                    }
-                    if b[i] == '*' && b[i + 1] == '/' {
-                        i += 2;
-                        break;
-                    }
-                    if b[i] == '\n' {
-                        line += 1;
-                    }
-                    i += 1;
-                }
+                return Err(err(
+                    line,
+                    "block comments (`/* */`) are not valid Cedar; use `//` comments",
+                ));
             }
             '(' | ')' | '[' | ']' | ',' | ';' | '@' => {
                 out.push((
