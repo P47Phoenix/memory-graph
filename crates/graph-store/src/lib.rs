@@ -41,8 +41,8 @@ pub use deadline::with_query_deadline;
 mod pattern;
 mod scope;
 pub use api::{
-    detect_format, open_store, FingerprintSnapshot, Page, PreparedFile, RemoteParts, SnapshotStats,
-    Store, StoreRead,
+    detect_format, open_store, AsStoreRead, FingerprintSnapshot, Page, PreparedFile, RemoteParts,
+    SnapshotStats, Store, StoreRead,
 };
 pub use codec::{encode_posting, POSTING_BLOCK};
 pub(crate) use common::{
@@ -56,7 +56,7 @@ pub use pattern::{
     parse_symbol_pattern, SymbolPattern, CAPABILITY_DELETE, CAPABILITY_SYMBOL_INFIX,
     MAX_NEEDLE_BYTES, MIN_NEEDLE_BYTES,
 };
-pub use scope::{permission_denied, ReadOpts, ReadScope, ScopeRules};
+pub use scope::{permission_denied, ReadOpts, ReadScope, ScopeRules, ScopedView};
 /// Older schema versions an open upgrades in place (see `SCHEMA_VERSION`).
 #[doc(hidden)]
 pub use v2::precheck_reads;

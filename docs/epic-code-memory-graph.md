@@ -1073,7 +1073,7 @@ So that out-of-scope data never shows up in results, counts, pages or limits.
 
 <a id="story-74b"></a>
 **74b. Scoped reads: node-id view, counts, page totals, snapshot handles (5 pts)**
-Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5, D8.
+Status: In review (ADR 0013 PR 3b, branch `adr13-pr3b`). Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5, D8.
 As a scoped reader browsing by node id
 I want node-id reads, counts and pages to respect my scope
 So that I can navigate what I may see, and hidden data stays out of every count.

@@ -242,6 +242,7 @@ fn forwarded_calls_are_rechecked_by_the_leader() {
     cfg.read_mode = graph_client::ReadMode::Linearizable;
     let lin = RemoteStore::connect(cfg).unwrap();
     assert_eq!(repos(&lin), ["acme/web"]);
+    assert!(lin.count_nodes(graph_core::NodeKind::File).unwrap() >= 1);
     let hits = lin.search(&graph_store::Query::new("a")).unwrap();
     assert!(!hits.is_empty());
     assert!(hits

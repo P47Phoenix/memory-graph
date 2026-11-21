@@ -43,6 +43,10 @@ struct Handle {
     /// With auth on (ADR 0012 D5): the token id and connection that
     /// opened it; any other caller is answered as for a missing handle.
     owner: Option<String>,
+    /// The read scopes it was opened with (ADR 0013 D8), for `read` and
+    /// `search`; every call through it intersects them with the caller's
+    /// current scopes, so a narrowing reload applies at the next call.
+    scopes: Option<(graph_store::ReadScope, graph_store::ReadScope)>,
 }
 
 /// The table of open handles.
@@ -170,6 +174,7 @@ impl SnapshotTable {
                 snap: Arc::new(Mutex::new(snap)),
                 meta,
                 owner,
+                scopes: None,
             },
         );
         *t.per_conn.entry(conn).or_insert(0) += 1;
@@ -213,6 +218,34 @@ impl SnapshotTable {
                 age_secs: 0,
                 max_age_secs: self.max_age.as_secs(),
             }),
+        }
+    }
+
+    /// Record the read scopes handle `id` was opened with (`read`,
+    /// `search`; ADR 0013 D8).
+    pub fn set_scopes(
+        &self,
+        id: u64,
+        read: graph_store::ReadScope,
+        search: graph_store::ReadScope,
+    ) {
+        if let Some(h) = self.lock().open.get_mut(&id) {
+            h.scopes = Some((read, search));
+        }
+    }
+
+    /// The scope handle `id` was opened with for `search` (`true`) or
+    /// `read`; `All` when none was recorded.
+    pub fn scope(&self, id: u64, search: bool) -> graph_store::ReadScope {
+        match self.lock().open.get(&id).and_then(|h| h.scopes.clone()) {
+            Some((r, s)) => {
+                if search {
+                    s
+                } else {
+                    r
+                }
+            }
+            None => graph_store::ReadScope::All,
         }
     }
 

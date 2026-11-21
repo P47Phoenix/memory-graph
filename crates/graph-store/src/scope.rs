@@ -229,3 +229,271 @@ pub(crate) fn describe_scoped(
     opts.scope.check_named(org, repo, &rows, "read")?;
     Ok(opts.scope.filter_rows(rows, |i| (&i.org, &i.repo)))
 }
+
+/// A scoped view of a [`StoreRead`](crate::StoreRead) (ADR 0013 D5, story
+/// 74b): every read through it sees only what `scope` makes visible.
+///
+/// - A node id names its repo (an org node names its org): an existing node
+///   of a hidden repo or org is `PermissionDenied`; an id that does not
+///   exist (in the inner store: for a snapshot, in its snapshot) keeps
+///   today's answer.
+/// - `roots`, `children`/`descendants` of a visible org and their page
+///   totals list only visible repos and orgs; `count_nodes` sums the
+///   visible repos' catalog counts (O(repos)).
+/// - Name-filtered reads follow [`ReadScope::check_named`].
+///
+/// With [`ReadScope::All`] every call goes straight to the inner store.
+pub struct ScopedView<'a> {
+    inner: &'a dyn crate::StoreRead,
+    scope: ReadScope,
+    action: &'static str,
+}
+
+impl<'a> ScopedView<'a> {
+    /// A view of `inner` for the read action `action` (`"read"` for the
+    /// node-id and describe APIs; search and symbol search always refuse as
+    /// `"search"`).
+    pub fn new(inner: &'a dyn crate::StoreRead, scope: ReadScope) -> Self {
+        Self {
+            inner,
+            scope,
+            action: "read",
+        }
+    }
+
+    /// The repos of org `org` that exist now (the catalog).
+    fn org_repos(&self, org: &str) -> Result<Vec<RepoInfo>> {
+        self.inner.describe(Some(org), None)
+    }
+
+    fn org_visible(&self, org: &str) -> Result<bool> {
+        if self.scope.is_all() || self.scope.org_granted(org) {
+            return Ok(true);
+        }
+        let rows = self.org_repos(org)?;
+        Ok(self
+            .scope
+            .org_visible(org, rows.iter().map(|i| i.repo.as_str())))
+    }
+
+    /// Whether existing node `n` is visible: an org by D1, anything else by
+    /// the repo it belongs to.
+    fn node_visible(&self, n: &graph_core::Node) -> Result<bool> {
+        use graph_core::NodeKind;
+        if n.kind == NodeKind::Org {
+            return self.org_visible(&n.name);
+        }
+        let mut repo: Option<graph_core::Node> = None;
+        let mut org: Option<graph_core::Node> = None;
+        if n.kind == NodeKind::Repo {
+            repo = Some(n.clone());
+        }
+        for a in self.inner.ancestors(n.id)? {
+            match a.kind {
+                NodeKind::Repo if repo.is_none() => repo = Some(a),
+                NodeKind::Org => org = Some(a),
+                _ => {}
+            }
+        }
+        match (org, repo) {
+            (Some(o), Some(r)) => Ok(self.scope.repo_visible(&o.name, &r.name)),
+            _ => Err(StoreError::Corrupt(format!(
+                "node {} has no repo and org above it",
+                n.id
+            ))),
+        }
+    }
+
+    /// The node-id rule: `Ok(None)` for an id that does not exist,
+    /// `PermissionDenied` for a hidden one, the node for a visible one.
+    fn gate(&self, id: graph_core::NodeId) -> Result<Option<graph_core::Node>> {
+        let Some(n) = self.inner.get(id)? else {
+            return Ok(None);
+        };
+        if self.scope.is_all() || self.node_visible(&n)? {
+            Ok(Some(n))
+        } else {
+            Err(permission_denied(self.action))
+        }
+    }
+
+    /// `children` of an org node, visible repos only.
+    fn org_children(&self, org: &graph_core::Node) -> Result<Vec<graph_core::Node>> {
+        let kids = self.inner.children(org.id)?;
+        Ok(kids
+            .into_iter()
+            .filter(|r| self.scope.repo_visible(&org.name, &r.name))
+            .collect())
+    }
+
+    /// `descendants` of an org node without the hidden repos' subtrees
+    /// (depth first, a node before its children: a repo's subtree runs
+    /// until the next repo).
+    fn org_descendants(&self, org: &graph_core::Node) -> Result<Vec<graph_core::Node>> {
+        let mut keep = true;
+        let mut out = Vec::new();
+        for n in self.inner.descendants(org.id)? {
+            if n.kind == graph_core::NodeKind::Repo {
+                keep = self.scope.repo_visible(&org.name, &n.name);
+            }
+            if keep {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    fn visible_rows(&self) -> Result<Vec<RepoInfo>> {
+        let rows = self.inner.describe(None, None)?;
+        Ok(self.scope.filter_rows(rows, |i| (&i.org, &i.repo)))
+    }
+
+    fn opts(&self, opts: &ReadOpts) -> ReadOpts {
+        ReadOpts::scoped(self.scope.intersect(&opts.scope))
+    }
+}
+
+impl crate::StoreRead for ScopedView<'_> {
+    fn get(&self, id: graph_core::NodeId) -> Result<Option<graph_core::Node>> {
+        self.gate(id)
+    }
+    fn parent(&self, id: graph_core::NodeId) -> Result<Option<graph_core::Node>> {
+        self.gate(id)?;
+        self.inner.parent(id)
+    }
+    fn count_nodes(&self, kind: graph_core::NodeKind) -> Result<usize> {
+        use graph_core::NodeKind;
+        if self.scope.is_all() {
+            return self.inner.count_nodes(kind);
+        }
+        Ok(match kind {
+            NodeKind::Org => self.roots()?.len(),
+            NodeKind::Repo => self.visible_rows()?.len(),
+            NodeKind::File => self.visible_rows()?.iter().map(|i| i.files).sum(),
+            NodeKind::Symbol => self
+                .visible_rows()?
+                .iter()
+                .flat_map(|i| i.languages.values())
+                .map(|l| l.symbols)
+                .sum(),
+            NodeKind::Token => self
+                .visible_rows()?
+                .iter()
+                .flat_map(|i| i.languages.values())
+                .map(|l| l.tokens)
+                .sum(),
+        })
+    }
+    fn roots(&self) -> Result<Vec<graph_core::Node>> {
+        let roots = self.inner.roots()?;
+        if self.scope.is_all() {
+            return Ok(roots);
+        }
+        let rows = self.inner.describe(None, None)?;
+        Ok(roots
+            .into_iter()
+            .filter(|o| {
+                self.scope.org_visible(
+                    &o.name,
+                    rows.iter()
+                        .filter(|i| i.org == o.name)
+                        .map(|i| i.repo.as_str()),
+                )
+            })
+            .collect())
+    }
+    fn children(&self, id: graph_core::NodeId) -> Result<Vec<graph_core::Node>> {
+        match self.gate(id)? {
+            Some(n) if n.kind == graph_core::NodeKind::Org && !self.scope.is_all() => {
+                self.org_children(&n)
+            }
+            _ => self.inner.children(id),
+        }
+    }
+    fn descendants(&self, id: graph_core::NodeId) -> Result<Vec<graph_core::Node>> {
+        match self.gate(id)? {
+            Some(n) if n.kind == graph_core::NodeKind::Org && !self.scope.is_all() => {
+                self.org_descendants(&n)
+            }
+            _ => self.inner.descendants(id),
+        }
+    }
+    fn ancestors(&self, id: graph_core::NodeId) -> Result<Vec<graph_core::Node>> {
+        // The ancestors of a visible node are visible by definition.
+        self.gate(id)?;
+        self.inner.ancestors(id)
+    }
+    fn children_page(
+        &self,
+        id: graph_core::NodeId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<crate::Page<graph_core::Node>> {
+        match self.gate(id)? {
+            Some(n) if n.kind == graph_core::NodeKind::Org && !self.scope.is_all() => {
+                crate::api::page_slice(self.org_children(&n)?, offset, limit)
+            }
+            _ => self.inner.children_page(id, offset, limit),
+        }
+    }
+    fn descendants_page(
+        &self,
+        id: graph_core::NodeId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<crate::Page<graph_core::Node>> {
+        match self.gate(id)? {
+            Some(n) if n.kind == graph_core::NodeKind::Org && !self.scope.is_all() => {
+                crate::api::page_slice(self.org_descendants(&n)?, offset, limit)
+            }
+            _ => self.inner.descendants_page(id, offset, limit),
+        }
+    }
+    fn file_tokens(
+        &self,
+        org: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<Option<Vec<graph_core::Node>>> {
+        let toks = self.inner.file_tokens(org, repo, path)?;
+        if toks.is_some() && !self.scope.repo_visible(org, repo) {
+            return Err(permission_denied(self.action));
+        }
+        Ok(toks)
+    }
+    fn describe(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
+        self.inner
+            .describe_with(org, repo, &ReadOpts::scoped(self.scope.clone()))
+    }
+    fn describe_by_scan(&self, org: Option<&str>, repo: Option<&str>) -> Result<Vec<RepoInfo>> {
+        self.inner
+            .describe_by_scan_with(org, repo, &ReadOpts::scoped(self.scope.clone()))
+    }
+    fn describe_with(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+        opts: &ReadOpts,
+    ) -> Result<Vec<RepoInfo>> {
+        self.inner.describe_with(org, repo, &self.opts(opts))
+    }
+    fn describe_by_scan_with(
+        &self,
+        org: Option<&str>,
+        repo: Option<&str>,
+        opts: &ReadOpts,
+    ) -> Result<Vec<RepoInfo>> {
+        self.inner
+            .describe_by_scan_with(org, repo, &self.opts(opts))
+    }
+    fn search_symbols(&self, q: &crate::SymbolQuery) -> Result<Vec<crate::SymbolHit>> {
+        let mut q = q.clone();
+        q.scope = self.scope.intersect(&q.scope);
+        self.inner.search_symbols(&q)
+    }
+    fn search(&self, q: &crate::Query) -> Result<Vec<crate::Hit>> {
+        let mut q = q.clone();
+        q.scope = self.scope.intersect(&q.scope);
+        self.inner.search(&q)
+    }
+}

@@ -287,7 +287,7 @@ pub struct Page<T> {
     pub has_more: bool,
 }
 
-fn page_slice<T>(mut all: Vec<T>, offset: usize, limit: usize) -> Result<Page<T>> {
+pub(crate) fn page_slice<T>(mut all: Vec<T>, offset: usize, limit: usize) -> Result<Page<T>> {
     let total = all.len();
     if offset >= total {
         return Ok(Page {
@@ -302,8 +302,21 @@ fn page_slice<T>(mut all: Vec<T>, offset: usize, limit: usize) -> Result<Page<T>
     Ok(Page { items, has_more })
 }
 
+/// `&self` as a `&dyn StoreRead`, for the provided [`StoreRead::scoped`]
+/// (a default method cannot coerce `Self` itself). Implemented for every
+/// sized `StoreRead`; a `dyn StoreRead` inherits it through its vtable.
+pub trait AsStoreRead {
+    fn as_store_read(&self) -> &dyn StoreRead;
+}
+
+impl<T: StoreRead> AsStoreRead for T {
+    fn as_store_read(&self) -> &dyn StoreRead {
+        self
+    }
+}
+
 /// Read operations. All results are plain data.
-pub trait StoreRead {
+pub trait StoreRead: AsStoreRead {
     fn get(&self, id: NodeId) -> Result<Option<Node>>;
     /// Parent pointer lookup (one hop).
     fn parent(&self, id: NodeId) -> Result<Option<Node>>;
@@ -400,6 +413,14 @@ pub trait StoreRead {
     fn search_symbols(&self, q: &SymbolQuery) -> Result<Vec<SymbolHit>>;
     /// Token-text search with roll-up to `q.grain`.
     fn search(&self, q: &Query) -> Result<Vec<Hit>>;
+
+    /// This store seen through `scope` (ADR 0013 D5, story 74b): every
+    /// read, the node-id ones included, sees only what `scope` makes
+    /// visible; see [`ScopedView`](crate::ScopedView). Existence is judged
+    /// against `self` (for a snapshot, its snapshot).
+    fn scoped(&self, scope: crate::ReadScope) -> Box<dyn StoreRead + '_> {
+        Box::new(crate::ScopedView::new(self.as_store_read(), scope))
+    }
 
     /// [`describe`](Self::describe) under `opts.scope` (ADR 0013 D5):
     /// unfiltered, hidden repos are absent; naming an existing org or repo
