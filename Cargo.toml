@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/graph-lang-rust", "crates/graph-core", "crates/graph-store", "crates/graph-cli", "examples/toy-extractor", "crates/graph-lang-csharp", "crates/graph-lang-javascript", "crates/graph-lang-html", "crates/graph-lang-aspx", "crates/graph-lang-sql", "crates/graph-lang-shell", "crates/graph-lang-r", "crates/graph-lang-fsharp", "crates/graph-lang-haskell", "crates/graph-lang-elixir", "crates/graph-lang-gdscript", "crates/graph-lang-c", "crates/graph-lang-go", "crates/graph-lang-scala", "crates/graph-lang-cobol", "crates/graph-lang-rpg", "crates/graph-lang-asm", "crates/graph-lang-typescript", "crates/graph-lang-python", "crates/graph-lang-java", "crates/graph-proto", "crates/graph-server", "crates/graph-client", "crates/graph-mcp"]
+members = ["crates/graph-lang-rust", "crates/graph-core", "crates/graph-store", "crates/graph-cli", "examples/toy-extractor", "crates/graph-lang-csharp", "crates/graph-lang-javascript", "crates/graph-lang-html", "crates/graph-lang-aspx", "crates/graph-lang-sql", "crates/graph-lang-shell", "crates/graph-lang-r", "crates/graph-lang-fsharp", "crates/graph-lang-haskell", "crates/graph-lang-elixir", "crates/graph-lang-gdscript", "crates/graph-lang-c", "crates/graph-lang-go", "crates/graph-lang-scala", "crates/graph-lang-cobol", "crates/graph-lang-rpg", "crates/graph-lang-asm", "crates/graph-lang-typescript", "crates/graph-lang-python", "crates/graph-lang-java", "crates/graph-proto", "crates/graph-server", "crates/graph-client", "crates/graph-mcp", "crates/graph-authz"]
+# `tools/authz-oracle` (story 72a) is a dev-only tool on `cedar-policy`, with
+# its own lockfile, outside the workspace and the pure-Rust gate.
 # Dev tooling with its own workspace and lockfile (proto codegen: prost-build,
 # tonic-prost-build, protox); never shipped, never seen by the pure-Rust gate.
-exclude = ["xtask"]
+exclude = ["xtask", "tools/authz-oracle"]
 
 [workspace.package]
 version = "0.1.0"

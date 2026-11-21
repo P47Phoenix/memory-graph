@@ -1,0 +1,13 @@
+// The ADR 0013 D1 model as a Cedar schema (story 72a's oracle). Principals
+// are tokens in groups and the built-in roles; resources are orgs, repos in
+// an org, and the one cluster.
+entity Group, Role;
+entity Token in [Group, Role];
+entity Org;
+entity Repo in [Org];
+entity Cluster;
+
+action read, search, index, prune, delete, snapshot, status, admin appliesTo {
+  principal: [Token],
+  resource: [Org, Repo, Cluster],
+};

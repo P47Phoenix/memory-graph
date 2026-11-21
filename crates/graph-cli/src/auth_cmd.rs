@@ -128,6 +128,93 @@ pub fn write_secret_file(path: &Path, secret: &str) -> Result<()> {
         .with_context(|| format!("writing `{}`", path.display()))
 }
 
+/// What `auth check` found.
+#[derive(Debug, Default)]
+pub struct CheckReport {
+    /// Lines for stdout (the summary, and the `--explain` decision).
+    pub lines: Vec<String>,
+    /// Warnings (unknown principals, `action in []`, forbid-only, NFC).
+    pub warnings: Vec<String>,
+    /// Why the pair is refused (the line and the `@id`), if it is.
+    pub error: Option<String>,
+}
+
+/// `memory-graph auth check` (ADR 0013 D9): validate a token file and a
+/// policy file as `serve` would load the pair, and optionally decide one
+/// request. An unreadable file is an `Err`; an invalid pair is a report
+/// with `error` set.
+pub fn check(
+    tokens: &Path,
+    policies: &Path,
+    builtins: bool,
+    explain: Option<&[String]>,
+) -> Result<CheckReport> {
+    let mut r = CheckReport::default();
+    let ttext = std::fs::read_to_string(tokens)
+        .with_context(|| format!("cannot read `{}`", tokens.display()))?;
+    let pbytes =
+        std::fs::read(policies).with_context(|| format!("cannot read `{}`", policies.display()))?;
+    let set = match graph_server::auth::parse_token_file(&ttext) {
+        Ok(s) => s,
+        Err(e) => {
+            r.error = Some(format!("`{}`: {e}", tokens.display()));
+            return Ok(r);
+        }
+    };
+    let (state, warnings) = match graph_server::auth::pair_from(set, &pbytes, builtins) {
+        Ok(x) => x,
+        Err(e) => {
+            r.error = Some(format!("`{}`: {e}", policies.display()));
+            return Ok(r);
+        }
+    };
+    r.warnings = warnings;
+    let pset = state.policies.as_ref().expect("a pair has policies");
+    r.lines.push(format!(
+        "ok: {} policies ({} built-in), {} tokens; policy_hash {}",
+        pset.len(),
+        if builtins { 2 } else { 0 },
+        state.tokens.entries.len(),
+        state.policy_hash
+    ));
+    if let Some([id, action, resource]) = explain {
+        let Some(a) = graph_authz::Action::parse(action) else {
+            bail!("unknown action `{action}` (read, search, index, prune, delete, snapshot, status, admin)");
+        };
+        let ent = graph_authz::parse_resource(resource)
+            .map_err(|e| anyhow::anyhow!("--explain resource: {}", e.msg))?;
+        let res = ent.as_resource().expect("a resource entity");
+        let Some(e) = state.tokens.entries.iter().find(|e| &*e.id == id.as_str()) else {
+            r.lines.push(format!(
+                "deny: token `{id}` is not in the token file (it is refused before any policy)"
+            ));
+            return Ok(r);
+        };
+        let p = graph_authz::Principal {
+            token: &e.id,
+            groups: &e.groups,
+            role: match e.role {
+                graph_server::auth::Role::Read => graph_authz::Role::Read,
+                graph_server::auth::Role::Write => graph_authz::Role::Write,
+            },
+        };
+        let d = pset.decide(&p, a, &res);
+        let why = if p.role.ceiling() & a.bit() == 0 {
+            format!(" (above the `{}` role's ceiling)", e.role.as_str())
+        } else if d.matched.is_empty() {
+            " (no policy matched: default deny)".to_string()
+        } else {
+            format!(" (matched: {})", d.matched.join(", "))
+        };
+        r.lines.push(format!(
+            "{}: Token::\"{id}\" {} {res}{why}",
+            if d.allowed { "allow" } else { "deny" },
+            a.name()
+        ));
+    }
+    Ok(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +254,70 @@ mod tests {
             write_secret_file(&out, &a.token).is_err(),
             "never overwrites"
         );
+    }
+
+    #[test]
+    fn auth_check_validates_a_pair_and_explains() {
+        let d = tempfile::tempdir().unwrap();
+        let toks = d.path().join("tokens.toml");
+        let pols = d.path().join("policies.cedar");
+        let t = new_token("ci", "write", None, Some(&toks)).unwrap();
+        drop(t);
+        std::fs::write(
+            &pols,
+            "@id(\"web\")\npermit(principal == Token::\"ci\", action == Action::\"index\", resource == Repo::\"acme/web\");\n\
+             @id(\"ghost\")\npermit(principal == Token::\"gone\", action, resource);\n",
+        )
+        .unwrap();
+        let ex = |a: &str, r: &str| -> Vec<String> { vec!["ci".into(), a.into(), r.into()] };
+        let r = check(
+            &toks,
+            &pols,
+            false,
+            Some(&ex("index", "Repo::\"acme/web\"")),
+        )
+        .unwrap();
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert!(r.lines[0].starts_with("ok: 2 policies"), "{:?}", r.lines);
+        assert!(
+            r.lines[1].starts_with("allow:") && r.lines[1].contains("matched: web"),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("gone")),
+            "{:?}",
+            r.warnings
+        );
+        let r = check(
+            &toks,
+            &pols,
+            false,
+            Some(&ex("index", "Repo::\"acme/api\"")),
+        )
+        .unwrap();
+        assert!(r.lines[1].starts_with("deny:") && r.lines[1].contains("default deny"));
+        let r = check(&toks, &pols, true, Some(&ex("admin", "Cluster::\"this\""))).unwrap();
+        assert!(r.lines[1].contains("builtin:write"), "{:?}", r.lines);
+        // An invalid file names the line and @id.
+        std::fs::write(
+            &pols,
+            "\n@id(\"bad\")\npermit(principal, action == Action::\"Read\", resource);",
+        )
+        .unwrap();
+        let r = check(&toks, &pols, false, None).unwrap();
+        let e = r.error.unwrap();
+        assert!(e.contains("line 3") && e.contains("@id `bad`"), "{e}");
+        // The interim read rule.
+        std::fs::write(
+            &pols,
+            "@id(\"r\")\npermit(principal, action == Action::\"read\", resource in Org::\"a\");",
+        )
+        .unwrap();
+        assert!(check(&toks, &pols, false, None)
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("@id `r`"));
     }
 }

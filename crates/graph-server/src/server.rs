@@ -178,6 +178,9 @@ pub struct TestingHooks {
     /// Leave `symbol_infix` out of `Hello`'s capabilities, as a server
     /// older than ADR 0011 would (the client then refuses infix patterns).
     pub without_symbol_infix: bool,
+    /// Leave `delete` out of `Hello`'s capabilities, as a server older than
+    /// issue #323 would (the client then refuses `delete_scope`).
+    pub without_delete: bool,
     /// Let this many write proposals through, then park every later one
     /// forever (a future that never resolves), so a run cannot finish and a
     /// test can kill the server mid-write deterministically. The first
@@ -856,11 +859,17 @@ pub async fn start(
                 .testing
                 .hello_protocol_version
                 .unwrap_or(graph_proto::PROTOCOL_VERSION),
-            capabilities: if cfg.testing.without_symbol_infix {
-                Vec::new()
-            } else {
-                vec![graph_store::CAPABILITY_SYMBOL_INFIX.to_string()]
-            },
+            capabilities: [
+                (
+                    graph_store::CAPABILITY_SYMBOL_INFIX,
+                    cfg.testing.without_symbol_infix,
+                ),
+                (graph_store::CAPABILITY_DELETE, cfg.testing.without_delete),
+            ]
+            .into_iter()
+            .filter(|(_, off)| !off)
+            .map(|(c, _)| c.to_string())
+            .collect(),
             data_dir: paths
                 .data_dir
                 .as_ref()
@@ -884,6 +893,24 @@ pub async fn start(
         auth: Arc::clone(&auth),
     });
     auth.spawn_reloader(shutdown.clone());
+    if auth.policies_on() {
+        // ADR 0013 D1 (Q8): an org whose name holds `/` cannot be named by
+        // a `Repo::` policy (the id splits at the first `/`).
+        let orgs = slot.with_store_read(|s| graph_store::StoreRead::describe(s, None, None));
+        if let Ok(rows) = orgs {
+            let mut seen = std::collections::BTreeSet::new();
+            for r in rows.iter().filter(|r| r.org.contains('/')) {
+                if seen.insert(r.org.clone()) {
+                    tracing::warn!(
+                        org = %r.org,
+                        "auth policies: this org's name contains `/`; a `Repo::` policy cannot \
+                         address its repos (grant it through `Org::` or an unconstrained \
+                         resource)"
+                    );
+                }
+            }
+        }
+    }
     if let Some(otlp) = &cfg.otlp_metrics {
         // A weak link: the exporter must not keep a stopped node alive.
         let node = Arc::downgrade(&ctx);

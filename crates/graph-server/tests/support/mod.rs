@@ -219,6 +219,14 @@ impl Store for Replica {
     ) -> R<Vec<String>> {
         self.synced(self.writes.prune_files(org, repo, keep, dry_run))
     }
+    fn delete_scope(
+        &self,
+        org: &str,
+        repo: Option<&str>,
+        dry_run: bool,
+    ) -> R<graph_store::DeleteStats> {
+        self.synced(self.writes.delete_scope(org, repo, dry_run))
+    }
     fn vacuum(&self) -> R<VacuumStats> {
         self.synced(self.writes.vacuum())
     }

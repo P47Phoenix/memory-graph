@@ -123,7 +123,10 @@ pub fn need(path: &str) -> Option<Need> {
     }
     if let Some(m) = path.strip_prefix(WRITE) {
         return match m {
-            "Index" | "IndexFile" | "IngestExtraction" | "Prune" | "Vacuum" => Some(Need::Write),
+            // `Delete` (issue #323) needs `write` even for a dry run, like `Prune`.
+            "Index" | "IndexFile" | "IngestExtraction" | "Prune" | "Vacuum" | "Delete" => {
+                Some(Need::Write)
+            }
             _ => None,
         };
     }
@@ -235,6 +238,9 @@ pub struct TokenEntry {
     pub role: Role,
     digest: [u8; 32],
     pub expires: Option<SystemTime>,
+    /// The token's groups (`groups = [...]`, ADR 0013 D1), deduplicated, in
+    /// file order; empty when the key is absent.
+    pub groups: Vec<String>,
 }
 
 impl std::fmt::Debug for TokenEntry {
@@ -243,6 +249,7 @@ impl std::fmt::Debug for TokenEntry {
             .field("id", &self.id)
             .field("role", &self.role)
             .field("expires", &self.expires)
+            .field("groups", &self.groups)
             .finish_non_exhaustive()
     }
 }
@@ -307,6 +314,8 @@ struct RawToken {
     expires: Option<toml::Value>,
     #[serde(default)]
     scope: Option<toml::Value>,
+    #[serde(default)]
+    groups: Option<Vec<String>>,
 }
 
 fn line_of(text: &str, at: usize) -> usize {
@@ -351,8 +360,9 @@ pub fn parse_token_file(text: &str) -> Result<TokenSet, String> {
         let at = |what: &str| format!("line {line} (token `{}`): {what}", t.id);
         if t.scope.is_some() {
             return Err(at(
-                "`scope` is reserved for per-org/repo permissions (#289) and not supported in \
-                 this version; refusing the file rather than ignoring it",
+                "`scope` is not supported; per-org/repo permissions are policies in a separate \
+                 file (`serve --auth-policies`, ADR 0013); refusing the file rather than \
+                 ignoring it",
             ));
         }
         if t.id.trim().is_empty() {
@@ -381,11 +391,21 @@ pub fn parse_token_file(text: &str) -> Result<TokenSet, String> {
         if !digests.insert(digest) {
             return Err(at("duplicate `sha256` (two entries for one token)"));
         }
+        let mut groups: Vec<String> = Vec::new();
+        for g in t.groups.iter().flatten() {
+            if g.is_empty() {
+                return Err(at("an empty name in `groups`"));
+            }
+            if !groups.contains(g) {
+                groups.push(g.clone());
+            }
+        }
         entries.push(TokenEntry {
             id: Arc::from(t.id.as_str()),
             role,
             digest,
             expires,
+            groups,
         });
     }
     Ok(TokenSet { entries })
@@ -525,14 +545,29 @@ pub fn new_credential(prefix: &str) -> Zeroizing<String> {
 // ---------------------------------------------------------------------------
 // Reloadable files.
 
+/// Parses the file(s) of a [`Source`]: their bytes, in path order.
+type ParseFn<T> = Box<dyn Fn(&[Vec<u8>]) -> Result<T, String> + Send + Sync>;
+
+/// One reloadable set, read from one file or from a pair of files that are
+/// validated together (the token and policy files, ADR 0013 D2): if either
+/// fails, both keep the last good pair.
 struct Source<T> {
     what: &'static str,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     cur: ArcSwap<T>,
-    /// The content hash of the loaded file, and of the last file that
+    /// The content hash of the loaded file(s), and of the last content that
     /// failed (logged once); the lock also serializes reloads.
     state: Mutex<SourceState>,
-    parse: fn(&str) -> Result<T, String>,
+    parse: ParseFn<T>,
+}
+
+/// Parse one UTF-8 text file with `f`.
+fn text_parser<T: 'static>(f: fn(&str) -> Result<T, String>) -> ParseFn<T> {
+    Box::new(move |files: &[Vec<u8>]| {
+        let text =
+            std::str::from_utf8(&files[0]).map_err(|_| "the file is not UTF-8".to_string())?;
+        f(text)
+    })
 }
 
 #[derive(Default)]
@@ -563,68 +598,92 @@ fn content_hash(bytes: &[u8]) -> [u8; 32] {
     sha2::Sha256::digest(bytes).into()
 }
 
+/// One hash over every file of a source (each length-prefixed, so moving
+/// bytes from one file to the other changes it).
+fn files_hash(files: &[Vec<u8>]) -> [u8; 32] {
+    if let [one] = files {
+        return content_hash(one);
+    }
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for f in files {
+        h.update((f.len() as u64).to_le_bytes());
+        h.update(f);
+    }
+    h.finalize().into()
+}
+
 impl<T> Source<T> {
-    fn load(
-        what: &'static str,
-        path: &Path,
-        parse: fn(&str) -> Result<T, String>,
-    ) -> Result<Self, String> {
-        let bytes =
-            read_file(path).map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
-        let text = String::from_utf8(bytes.clone())
-            .map_err(|_| format!("`{}` is not UTF-8", path.display()))?;
-        let set = parse(&text).map_err(|e| format!("`{}`: {e}", path.display()))?;
-        warn_if_readable_by_others(what, path);
+    fn load(what: &'static str, paths: &[&Path], parse: ParseFn<T>) -> Result<Self, String> {
+        let mut files = Vec::with_capacity(paths.len());
+        for p in paths {
+            files.push(read_file(p).map_err(|e| format!("cannot read `{}`: {e}", p.display()))?);
+        }
+        let set = parse(&files).map_err(|e| match paths {
+            [one] => format!("`{}`: {e}", one.display()),
+            _ => e,
+        })?;
+        for p in paths {
+            warn_if_readable_by_others(what, p);
+        }
         Ok(Self {
             what,
-            path: path.to_path_buf(),
+            paths: paths.iter().map(|p| p.to_path_buf()).collect(),
             cur: ArcSwap::from_pointee(set),
             state: Mutex::new(SourceState {
-                loaded: content_hash(&bytes),
+                loaded: files_hash(&files),
                 ..SourceState::default()
             }),
             parse,
         })
     }
 
+    fn file_label(&self) -> String {
+        self.paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+
     fn reload(&self) -> Reload {
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let bytes = match read_file(&self.path) {
-            Ok(b) => b,
-            Err(e) => {
-                if !st.read_failed {
-                    tracing::error!(
-                        file = %self.path.display(),
-                        error = %e,
-                        what = self.what,
-                        "cannot read the file; keeping the loaded set"
-                    );
+        let mut files = Vec::with_capacity(self.paths.len());
+        for p in &self.paths {
+            match read_file(p) {
+                Ok(b) => files.push(b),
+                Err(e) => {
+                    if !st.read_failed {
+                        tracing::error!(
+                            file = %p.display(),
+                            error = %e,
+                            what = self.what,
+                            "cannot read the file; keeping the loaded set"
+                        );
+                    }
+                    st.read_failed = true;
+                    return Reload::Kept;
                 }
-                st.read_failed = true;
-                return Reload::Kept;
             }
-        };
+        }
         st.read_failed = false;
-        let h = content_hash(&bytes);
+        let h = files_hash(&files);
         if h == st.loaded {
             st.failed = None;
             return Reload::Unchanged;
         }
-        let parsed = std::str::from_utf8(&bytes)
-            .map_err(|_| "the file is not UTF-8".to_string())
-            .and_then(|t| (self.parse)(t));
-        match parsed {
+        match (self.parse)(&files) {
             Ok(set) => {
                 self.cur.store(Arc::new(set));
                 st.loaded = h;
                 st.failed = None;
-                tracing::info!(file = %self.path.display(), what = self.what, "reloaded");
+                tracing::info!(file = %self.file_label(), what = self.what, "reloaded");
                 Reload::Reloaded
             }
             Err(e) => {
                 if st.failed != Some(h) {
                     tracing::error!(
-                        file = %self.path.display(),
+                        file = %self.file_label(),
                         error = %e,
                         what = self.what,
                         "the file failed validation; keeping the loaded set"
@@ -634,6 +693,153 @@ impl<T> Source<T> {
                 Reload::Kept
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The token and policy files as one pair (ADR 0013 D2).
+
+/// The token file and, with `--auth-policies`, the policy set it pairs
+/// with: loaded, validated and swapped together.
+#[derive(Debug, Clone, Default)]
+pub struct AuthState {
+    pub tokens: TokenSet,
+    /// `None`: no `--auth-policies` (ADR 0012 behaviour, nothing evaluated).
+    pub policies: Option<Arc<graph_authz::PolicySet>>,
+    /// SHA-256 (hex) of the normalised policy set, the built-ins switch and
+    /// the token file's id/role/groups (never a digest); empty without
+    /// `--auth-policies`.
+    pub policy_hash: String,
+}
+
+impl AuthState {
+    /// The token entry with this id, if it is in the file and not expired.
+    pub fn entry(&self, id: &str, now: SystemTime) -> Option<&TokenEntry> {
+        self.tokens
+            .entries
+            .iter()
+            .find(|e| &*e.id == id)
+            .filter(|e| !e.expires.is_some_and(|t| now >= t))
+    }
+}
+
+/// Parse a token file and a policy file together (D2). The policy file is
+/// refused on any parse error and, until scoped reads land, on the interim
+/// read rule (Rollout, Q9); unknown principals only warn.
+pub fn parse_pair(tokens: &str, policies: &[u8], builtins: bool) -> Result<AuthState, String> {
+    let set = parse_token_file(tokens).map_err(|e| format!("token file: {e}"))?;
+    let (state, warnings) = pair_from(set, policies, builtins)?;
+    for w in warnings {
+        tracing::warn!(warning = %w, "auth policy file");
+    }
+    Ok(state)
+}
+
+/// [`parse_pair`] without logging: the state and the warnings (for `auth
+/// check`).
+pub fn pair_from(
+    tokens: TokenSet,
+    policies: &[u8],
+    builtins: bool,
+) -> Result<(AuthState, Vec<String>), String> {
+    let parsed = graph_authz::parse(policies).map_err(|e| format!("policy file: {e}"))?;
+    let mut set = graph_authz::PolicySet::new(parsed);
+    set.check_interim_read_rule()
+        .map_err(|e| format!("policy file: {e}"))?;
+    let warnings = set.lint(&|t| tokens.entries.iter().any(|e| &*e.id == t), &|g| {
+        tokens
+            .entries
+            .iter()
+            .any(|e| e.groups.iter().any(|x| x == g))
+    });
+    if builtins {
+        set = set.with_builtins();
+    }
+    let policy_hash = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(set.normalized().as_bytes());
+        h.update(if builtins {
+            "\n#builtins on\n"
+        } else {
+            "\n#builtins off\n"
+        });
+        let mut ids: Vec<String> = tokens
+            .entries
+            .iter()
+            .map(|e| format!("{:?} {} {:?}", &*e.id, e.role.as_str(), e.groups))
+            .collect();
+        ids.sort();
+        for l in ids {
+            h.update(l.as_bytes());
+            h.update(b"\n");
+        }
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    Ok((
+        AuthState {
+            tokens,
+            policies: Some(Arc::new(set)),
+            policy_hash,
+        },
+        warnings,
+    ))
+}
+
+/// The policy action of a method that is decided on `Cluster::"this"` in
+/// the auth layer (ADR 0013 D1): `status`, `snapshot` and `admin`.
+pub fn cluster_action(path: &str) -> Option<graph_authz::Action> {
+    use graph_authz::Action as A;
+    if let Some(m) = path.strip_prefix(ADMIN) {
+        return match m {
+            // `ListBackups` is `status` (ADR 0013 D1, corrected 2026-11-21):
+            // ADR 0012 lets a `read` token list backups, and the built-in
+            // role policies must equal ADR 0012's roles exactly.
+            "Status" | "Members" | "Leader" | "SysInfo" | "Metrics" | "ReadIndex"
+            | "ListBackups" => Some(A::Status),
+            "TriggerSnapshot" => Some(A::Snapshot),
+            "AddLearner" | "Promote" | "Remove" | "TransferLeader" | "TriggerElect"
+            | "UploadSnapshot" | "Compact" | "Shutdown" => Some(A::Admin),
+            _ => None,
+        };
+    }
+    (path == "/memory_graph.v1.Write/Vacuum").then_some(A::Admin)
+}
+
+/// The policy action of every client method (D1): cluster actions, the
+/// per-request write actions (decided in the handler, on the request's
+/// repo or org) and the read actions.
+pub fn method_action(path: &str) -> Option<graph_authz::Action> {
+    use graph_authz::Action as A;
+    if let Some(a) = cluster_action(path) {
+        return Some(a);
+    }
+    if let Some(m) = path.strip_prefix(WRITE) {
+        return match m {
+            "Index" | "IndexFile" | "IngestExtraction" => Some(A::Index),
+            "Prune" => Some(A::Prune),
+            "Delete" => Some(A::Delete),
+            _ => None,
+        };
+    }
+    match need(path) {
+        Some(Need::Read) if path.starts_with(STORE) => Some(match path {
+            "/memory_graph.v1.Store/Search" | "/memory_graph.v1.Store/SearchSymbols" => A::Search,
+            _ => A::Read,
+        }),
+        _ => None,
+    }
+}
+
+/// The message of a policy refusal: the action only, never a resource or a
+/// policy `@id` (D5, D9).
+pub fn policy_denied(action: graph_authz::Action) -> StoreError {
+    StoreError::PermissionDenied {
+        msg: format!("permission denied for action `{}`", action.name()),
+        required_role: String::new(),
     }
 }
 
@@ -670,6 +876,12 @@ pub struct AuthConfig {
     /// The cluster secret file (required with `tokens` in `--data-dir`
     /// mode; sent by every internal client).
     pub cluster_secret: Option<PathBuf>,
+    /// `--auth-policies` (ADR 0013 D2): the policy file paired with the
+    /// token file; `None`: ADR 0012 roles, no policy evaluated.
+    pub policies: Option<PathBuf>,
+    /// `--auth-builtins` (D4, Q1): with a policy file, also load the two
+    /// built-in role policies.
+    pub builtins: bool,
 }
 
 /// Refusal classes, as `mg_auth_refusals_total{reason}` labels.
@@ -712,6 +924,10 @@ impl Reason {
 pub struct Refusal {
     reason: Reason,
     required: Need,
+    /// A policy refusal (ADR 0013): the action denied. Not counted in
+    /// `mg_auth_refusals_total` (its label set is ADR 0012's); audited on
+    /// `mg::audit` when decided.
+    policy: Option<graph_authz::Action>,
 }
 
 impl Refusal {
@@ -719,11 +935,24 @@ impl Refusal {
         Self {
             reason,
             required: Need::Open,
+            policy: None,
         }
     }
 
     fn denied(reason: Reason, required: Need) -> Self {
-        Self { reason, required }
+        Self {
+            reason,
+            required,
+            policy: None,
+        }
+    }
+
+    fn policy(action: graph_authz::Action) -> Self {
+        Self {
+            reason: Reason::Role,
+            required: Need::Write,
+            policy: Some(action),
+        }
     }
 
     /// The reason class (a metric label).
@@ -734,6 +963,9 @@ impl Refusal {
     /// The error answered: `UNAUTHENTICATED` or `PERMISSION_DENIED`, with
     /// a fixed message.
     pub fn error(&self) -> StoreError {
+        if let Some(a) = self.policy {
+            return policy_denied(a);
+        }
         match self.reason {
             Reason::Missing
             | Reason::Malformed
@@ -773,7 +1005,7 @@ enum Cred<'a> {
 /// The node's auth state: the token set, the cluster secret, the refusal
 /// counters and the log rate limiter.
 pub struct Auth {
-    tokens: Option<Source<TokenSet>>,
+    tokens: Option<Source<AuthState>>,
     secret: Option<Source<SecretSet>>,
     refusals: [AtomicU64; REASONS.len()],
     limiter: Mutex<HashMap<Option<IpAddr>, (Instant, u64)>>,
@@ -805,17 +1037,59 @@ impl Auth {
     /// `--data-dir` node, which needs the cluster secret when auth is on.
     pub fn load(cfg: &AuthConfig, clustered: bool) -> Result<Arc<Self>, StoreError> {
         let rejected = |flag: &str, e: String| StoreError::Rejected(format!("{flag} {e}"));
-        let tokens = match &cfg.tokens {
-            Some(p) => Some(
-                Source::load("auth token file", p, parse_token_file)
-                    .map_err(|e| rejected("--auth-tokens", e))?,
+        if cfg.tokens.is_none() && cfg.policies.is_some() {
+            return Err(StoreError::Rejected(
+                "--auth-policies needs --auth-tokens (authentication is off without a token \
+                 file)"
+                    .into(),
+            ));
+        }
+        if cfg.policies.is_none() && cfg.builtins {
+            return Err(StoreError::Rejected(
+                "--auth-builtins needs --auth-policies (without a policy file the built-in \
+                 role policies are all there is)"
+                    .into(),
+            ));
+        }
+        let tokens = match (&cfg.tokens, &cfg.policies) {
+            (Some(p), None) => Some(
+                Source::load(
+                    "auth token file",
+                    &[p.as_path()],
+                    text_parser(|t| {
+                        parse_token_file(t).map(|tokens| AuthState {
+                            tokens,
+                            ..AuthState::default()
+                        })
+                    }),
+                )
+                .map_err(|e| rejected("--auth-tokens", e))?,
             ),
-            None => None,
+            (Some(p), Some(pol)) => {
+                let builtins = cfg.builtins;
+                Some(
+                    Source::load(
+                        "auth token and policy files",
+                        &[p.as_path(), pol.as_path()],
+                        Box::new(move |files: &[Vec<u8>]| {
+                            let t = std::str::from_utf8(&files[0])
+                                .map_err(|_| "token file: the file is not UTF-8".to_string())?;
+                            parse_pair(t, &files[1], builtins)
+                        }),
+                    )
+                    .map_err(|e| rejected("--auth-tokens/--auth-policies", e))?,
+                )
+            }
+            (None, _) => None,
         };
         let secret = match &cfg.cluster_secret {
             Some(p) => Some(
-                Source::load("cluster secret file", p, parse_secret_file)
-                    .map_err(|e| rejected("--cluster-secret-file", e))?,
+                Source::load(
+                    "cluster secret file",
+                    &[p.as_path()],
+                    text_parser(parse_secret_file),
+                )
+                .map_err(|e| rejected("--cluster-secret-file", e))?,
             ),
             None => None,
         };
@@ -905,7 +1179,144 @@ impl Auth {
 
     /// The token set as loaded now (tests).
     pub fn tokens(&self) -> Option<Arc<TokenSet>> {
+        self.tokens
+            .as_ref()
+            .map(|s| Arc::new(s.cur.load().tokens.clone()))
+    }
+
+    /// The token/policy pair as loaded now.
+    pub fn state(&self) -> Option<Arc<AuthState>> {
         self.tokens.as_ref().map(|s| s.cur.load_full())
+    }
+
+    /// Whether policies are evaluated (`--auth-policies`).
+    pub fn policies_on(&self) -> bool {
+        self.tokens
+            .as_ref()
+            .is_some_and(|s| s.cur.load().policies.is_some())
+    }
+
+    /// The `policy_hash` reported by `Admin.Status` (D2); empty without
+    /// `--auth-policies`.
+    pub fn policy_hash(&self) -> String {
+        self.tokens
+            .as_ref()
+            .map(|s| s.cur.load().policy_hash.clone())
+            .unwrap_or_default()
+    }
+
+    /// Decide `action` on `res` for a client-token caller against the
+    /// current pair (ADR 0013, PR 1). Allowed with policies off, inside an
+    /// [`InProcessGuard`] (no caller: denied otherwise) and for a node caller (a forwarded call:
+    /// until the leader re-check lands, PR 2, the leader keeps ADR 0012's
+    /// `mg-forwarded-role` check). A token removed from the file, or
+    /// expired, since the call started is `UNAUTHENTICATED`.
+    pub fn authorize(
+        &self,
+        action: graph_authz::Action,
+        res: graph_authz::Resource<'_>,
+    ) -> Result<(), StoreError> {
+        self.authorize_with(action, |set, p| set.decide(p, action, &res))
+    }
+
+    /// An org-wide `prune` or `delete` (D6): on policy alone.
+    pub fn authorize_org_wide(
+        &self,
+        action: graph_authz::Action,
+        org: &str,
+    ) -> Result<(), StoreError> {
+        self.authorize_with(action, |set, p| set.decide_org_wide(p, action, org))
+    }
+
+    fn authorize_with(
+        &self,
+        action: graph_authz::Action,
+        decide: impl FnOnce(
+            &graph_authz::PolicySet,
+            &graph_authz::Principal<'_>,
+        ) -> graph_authz::Decision,
+    ) -> Result<(), StoreError> {
+        let Some(src) = self.tokens.as_ref() else {
+            return Ok(());
+        };
+        let state = src.cur.load();
+        let Some(set) = state.policies.as_ref() else {
+            return Ok(());
+        };
+        let Some(caller) = current_caller() else {
+            return if no_caller_allowed() {
+                Ok(())
+            } else {
+                Err(policy_denied(action))
+            };
+        };
+        let CallerKind::Token { id, .. } = &caller.kind else {
+            return Ok(());
+        };
+        let Some(e) = state.entry(id, SystemTime::now()) else {
+            return Err(StoreError::Unauthenticated(UNAUTHENTICATED_MSG.into()));
+        };
+        let d = decide(set, &principal_of(e));
+        audit(e, action, &d);
+        if d.allowed {
+            Ok(())
+        } else {
+            Err(policy_denied(action))
+        }
+    }
+
+    /// The PR 1 interim read rule: whether the caller may run reads of
+    /// `action` at all (an unconstrained read permit and no read forbid;
+    /// the load rule makes every read policy resource-unconstrained, so the
+    /// decision on `Cluster::"this"` is the decision on every resource).
+    /// `true` with policies off, in-process and for node callers.
+    pub fn read_allowed(&self, action: graph_authz::Action) -> bool {
+        let Some(src) = self.tokens.as_ref() else {
+            return true;
+        };
+        let state = src.cur.load();
+        let Some(set) = state.policies.as_ref() else {
+            return true;
+        };
+        let Some(caller) = current_caller() else {
+            return no_caller_allowed();
+        };
+        let CallerKind::Token { id, .. } = &caller.kind else {
+            return true;
+        };
+        match state.entry(id, SystemTime::now()) {
+            Some(e) => {
+                let d = set.decide(&principal_of(e), action, &graph_authz::Resource::Cluster);
+                audit(e, action, &d);
+                d.allowed
+            }
+            None => false,
+        }
+    }
+
+    /// With `--auth-policies`, decide an MCP tool call for the token in
+    /// `headers` (PR 1, fail closed): every tool is decided on
+    /// `Cluster::"this"` until the MCP tools are scoped (PR 2 writes, PR 3
+    /// reads). `None`: allowed, or policies off.
+    pub fn mcp_tool_denied(&self, headers: &http::HeaderMap, tool: &str) -> Option<StoreError> {
+        use graph_authz::Action as A;
+        let state = self.tokens.as_ref()?.cur.load();
+        let set = state.policies.as_ref()?;
+        let action = match tool {
+            "search" | "find_symbols" => A::Search,
+            "index_path" => A::Index,
+            "prune" => A::Prune,
+            _ => A::Read,
+        };
+        let raw = headers
+            .get(http::header::AUTHORIZATION)
+            .map(|v| v.as_bytes());
+        let Cred::Token(e) = self.credential(raw, &state.tokens, None, SystemTime::now()) else {
+            return Some(StoreError::Unauthenticated(UNAUTHENTICATED_MSG.into()));
+        };
+        let d = set.decide(&principal_of(e), action, &graph_authz::Resource::Cluster);
+        audit(e, action, &d);
+        (!d.allowed).then(|| policy_denied(action))
     }
 
     fn credential<'a>(
@@ -958,7 +1369,7 @@ impl Auth {
         let raw = headers
             .get(http::header::AUTHORIZATION)
             .map(|v| v.as_bytes());
-        let cred = self.credential(raw, &tokens, secret.as_ref().map(|s| &***s), now);
+        let cred = self.credential(raw, &tokens.tokens, secret.as_ref().map(|s| &***s), now);
         let caller = |kind| Caller { kind, conn };
         let header = |name: &str| {
             headers
@@ -1011,10 +1422,28 @@ impl Auth {
                 };
                 match cred {
                     // A client token's forwarding headers are ignored.
-                    Cred::Token(e) if e.role.covers(required) => Ok(caller(CallerKind::Token {
-                        id: Arc::clone(&e.id),
-                        role: e.role,
-                    })),
+                    Cred::Token(e) if e.role.covers(required) => {
+                        // ADR 0013: with a policy file, a cluster action is
+                        // decided here, on `Cluster::"this"`; writes on a
+                        // repo or org are decided by their handler.
+                        if let (Some(set), Some(action)) =
+                            (tokens.policies.as_ref(), cluster_action(path))
+                        {
+                            let d = set.decide(
+                                &principal_of(e),
+                                action,
+                                &graph_authz::Resource::Cluster,
+                            );
+                            audit(e, action, &d);
+                            if !d.allowed {
+                                return Err(Refusal::policy(action));
+                            }
+                        }
+                        Ok(caller(CallerKind::Token {
+                            id: Arc::clone(&e.id),
+                            role: e.role,
+                        }))
+                    }
                     Cred::Token(_) => Err(Refusal::denied(Reason::Role, need)),
                     Cred::Secret if need == Need::Read && secret_reads(path) => {
                         Ok(caller(CallerKind::Node {
@@ -1045,6 +1474,9 @@ impl Auth {
     /// Count a refusal, and log it at most once per peer per
     /// [`REFUSAL_LOG_WINDOW`] (with the number suppressed since).
     fn note_refusal(&self, r: &Refusal, peer: Option<std::net::SocketAddr>, path: &str) {
+        if r.policy.is_some() {
+            return;
+        }
         self.refusals[r.reason.index()].fetch_add(1, Ordering::Relaxed);
         let ip = peer.map(|p| p.ip());
         let now = Instant::now();
@@ -1102,7 +1534,7 @@ impl Auth {
         let raw = headers
             .get(http::header::AUTHORIZATION)
             .map(|v| v.as_bytes());
-        match self.credential(raw, &tokens, None, SystemTime::now()) {
+        match self.credential(raw, &tokens.tokens, None, SystemTime::now()) {
             Cred::Token(e) => Some(e.role),
             c => {
                 let reason = match c {
@@ -1115,6 +1547,74 @@ impl Auth {
                 None
             }
         }
+    }
+}
+
+thread_local! {
+    /// Set while this thread runs a deliberately in-process call (the MCP
+    /// endpoint's tool calls, which are decided for their token before
+    /// they run): the only calls that reach a policy check with no caller.
+    static IN_PROCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the current thread as running in-process calls until dropped
+/// (ADR 0013 PR 1). The MCP endpoint enters it around a tool call it has
+/// already decided ([`Auth::mcp_tool_denied`]); nothing else may.
+pub struct InProcessGuard(bool);
+
+impl InProcessGuard {
+    pub fn enter() -> Self {
+        InProcessGuard(IN_PROCESS.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for InProcessGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        IN_PROCESS.with(|c| c.set(prev));
+    }
+}
+
+/// With policies on, a policy check that finds no caller fails closed,
+/// except inside an [`InProcessGuard`]. Every gRPC call runs with its
+/// caller set by the auth layer, so reaching this otherwise is a bug
+/// (debug builds assert).
+fn no_caller_allowed() -> bool {
+    let ok = IN_PROCESS.with(|c| c.get());
+    if !ok {
+        tracing::error!("authz: a policy check with no caller outside the in-process path; denied");
+        debug_assert!(
+            ok,
+            "a policy check with no caller outside the in-process path"
+        );
+    }
+    ok
+}
+
+/// The policy principal of a token entry.
+fn principal_of(e: &TokenEntry) -> graph_authz::Principal<'_> {
+    graph_authz::Principal {
+        token: &e.id,
+        groups: &e.groups,
+        role: match e.role {
+            Role::Read => graph_authz::Role::Read,
+            Role::Write => graph_authz::Role::Write,
+        },
+    }
+}
+
+/// The audit line of a decision (D9, target `mg::audit`): denials at
+/// `info`, allowed writes and cluster actions at `info`, allowed reads at
+/// `debug`. Token id, groups, action, decision and the matched `@id`s;
+/// never a token, a digest or policy text. (The resource joins the line
+/// with per-request extraction, PR 2.)
+fn audit(e: &TokenEntry, action: graph_authz::Action, d: &graph_authz::Decision) {
+    use graph_authz::Action as A;
+    let decision = if d.allowed { "allow" } else { "deny" };
+    if d.allowed && matches!(action, A::Read | A::Search) {
+        tracing::debug!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, action = action.name(), decision, matched = ?d.matched, "authz");
+    } else {
+        tracing::info!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, action = action.name(), decision, matched = ?d.matched, "authz");
     }
 }
 
@@ -1384,6 +1884,7 @@ mod tests {
             &AuthConfig {
                 tokens: Some(tp),
                 cluster_secret: sp,
+                ..AuthConfig::default()
             },
             false,
         )
@@ -1517,6 +2018,224 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
         assert_eq!(a.reload_now().0, Some(Reload::Kept));
         assert!(!ok(&old) && ok(&new));
+    }
+
+    #[test]
+    fn groups_in_the_token_file() {
+        let t = token(1);
+        let base = file(&[("ci", "write", &t)]);
+        let set = parse_token_file(&format!("{base}groups = [\"a\", \"b\", \"a\"]\n")).unwrap();
+        assert_eq!(
+            set.entries[0].groups,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(parse_token_file(&base).unwrap().entries[0]
+            .groups
+            .is_empty());
+        let e = parse_token_file(&format!("{base}groups = [\"\"]\n")).unwrap_err();
+        assert!(e.contains("empty name"), "{e}");
+        let e = parse_token_file(&format!("{base}scope = []\n")).unwrap_err();
+        assert!(e.contains("--auth-policies"), "{e}");
+    }
+
+    #[test]
+    fn every_client_rpc_has_an_action() {
+        for p in graph_proto::rpc_paths() {
+            match need(p) {
+                Some(Need::Read | Need::Write) => {
+                    assert!(method_action(p).is_some(), "{p} has no ADR 0013 action")
+                }
+                _ => assert!(method_action(p).is_none(), "{p}"),
+            }
+        }
+        use graph_authz::Action as A;
+        assert_eq!(
+            method_action("/memory_graph.v1.Write/Vacuum"),
+            Some(A::Admin)
+        );
+        assert_eq!(
+            method_action("/memory_graph.v1.Admin/UploadSnapshot"),
+            Some(A::Admin)
+        );
+        assert_eq!(
+            method_action("/memory_graph.v1.Admin/ListBackups"),
+            Some(A::Status)
+        );
+        assert_eq!(
+            method_action("/memory_graph.v1.Admin/ReadIndex"),
+            Some(A::Status)
+        );
+        assert_eq!(
+            method_action("/memory_graph.v1.Store/Search"),
+            Some(A::Search)
+        );
+        assert_eq!(method_action("/memory_graph.v1.Store/Get"), Some(A::Read));
+        assert_eq!(
+            method_action("/memory_graph.v1.Write/Delete"),
+            Some(A::Delete)
+        );
+    }
+
+    /// With policies on, a check with no caller fails closed (and debug
+    /// builds assert), except inside the deliberate in-process guard.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "no caller"))]
+    fn a_missing_caller_fails_closed_with_policies() {
+        let t = token(1);
+        let (a, _d) = auth_with_policies(
+            &file(&[("w", "write", &t)]),
+            "permit(principal, action, resource);",
+            false,
+        );
+        {
+            let _g = InProcessGuard::enter();
+            assert!(a
+                .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
+                .is_ok());
+            assert!(a.read_allowed(graph_authz::Action::Read));
+        }
+        // Policies off: allowed with no caller, as before.
+        let (off, _d2) = auth_with(&file(&[("w", "write", &t)]), None);
+        assert!(off
+            .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
+            .is_ok());
+        // Outside the guard: denied (release) / asserts (debug).
+        assert!(!a.read_allowed(graph_authz::Action::Read));
+        assert!(a
+            .authorize(graph_authz::Action::Index, graph_authz::Resource::Cluster)
+            .is_err());
+    }
+
+    /// ADR 0013 D4: with `--auth-builtins` (and nothing else), every client
+    /// RPC is allowed for exactly the roles ADR 0012's table allows it.
+    #[test]
+    fn builtins_equal_adr_0012_roles_on_every_rpc() {
+        let set = graph_authz::PolicySet::builtins();
+        let groups: Vec<String> = Vec::new();
+        for p in graph_proto::rpc_paths() {
+            let Some(need) = need(p) else { continue };
+            if !matches!(need, Need::Read | Need::Write) {
+                continue;
+            }
+            let action = method_action(p).expect("every client RPC has an action");
+            for (role, arole) in [
+                (Role::Read, graph_authz::Role::Read),
+                (Role::Write, graph_authz::Role::Write),
+            ] {
+                let want = role.covers(if need == Need::Read {
+                    Role::Read
+                } else {
+                    Role::Write
+                });
+                let who = graph_authz::Principal {
+                    token: "t",
+                    groups: &groups,
+                    role: arole,
+                };
+                for res in [
+                    graph_authz::Resource::Cluster,
+                    graph_authz::Resource::Org("o"),
+                    graph_authz::Resource::Repo("o", "r"),
+                ] {
+                    assert_eq!(
+                        set.decide(&who, action, &res).allowed,
+                        want,
+                        "{p} for a {} token on {res}",
+                        role.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    fn auth_with_policies(
+        tokens: &str,
+        policies: &str,
+        builtins: bool,
+    ) -> (Arc<Auth>, tempfile::TempDir) {
+        let d = tempfile::tempdir().unwrap();
+        let tp = d.path().join("tokens.toml");
+        let pp = d.path().join("policies.cedar");
+        std::fs::write(&tp, tokens).unwrap();
+        std::fs::write(&pp, policies).unwrap();
+        let a = Auth::load(
+            &AuthConfig {
+                tokens: Some(tp),
+                policies: Some(pp),
+                builtins,
+                ..AuthConfig::default()
+            },
+            false,
+        )
+        .unwrap();
+        (a, d)
+    }
+
+    #[test]
+    fn cluster_actions_are_decided_in_the_layer() {
+        let (w, r) = (token(1), token(2));
+        let toks = file(&[("w", "write", &w), ("r", "read", &r)]);
+        let (a, _d) = auth_with_policies(
+            &toks,
+            "permit(principal == Token::\"w\", action == Action::\"status\", resource);",
+            false,
+        );
+        let now = SystemTime::now();
+        let check = |p: &str, t: &str| {
+            a.check(p, &hdrs(&[bearer(t)]), 1, now)
+                .map_err(|e| e.error())
+        };
+        assert!(check("/memory_graph.v1.Admin/Status", &w).is_ok());
+        let e = check("/memory_graph.v1.Admin/Compact", &w).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("permission denied for action `admin`"),
+            "{e}"
+        );
+        assert!(check("/memory_graph.v1.Admin/Status", &r).is_err());
+        // Reads and per-request writes are admitted here by role.
+        assert!(check("/memory_graph.v1.Store/Get", &r).is_ok());
+        assert!(check("/memory_graph.v1.Write/Index", &w).is_ok());
+        // The role table still refuses a read token's write.
+        assert_eq!(
+            check("/memory_graph.v1.Write/Index", &r)
+                .unwrap_err()
+                .to_string(),
+            Refusal::denied(Reason::Role, Need::Write)
+                .error()
+                .to_string()
+        );
+        // A policy refusal is not an ADR 0012 refusal count.
+        assert!(a.refusal_counts().iter().all(|(_, n)| *n == 0));
+        assert_eq!(a.policy_hash().len(), 64);
+        assert!(a.policies_on());
+    }
+
+    #[test]
+    fn the_policy_hash_tracks_policies_tokens_and_builtins() {
+        let t = token(1);
+        let toks = file(&[("w", "write", &t)]);
+        let p = "permit(principal, action == Action::\"index\", resource);";
+        let h = |toks: &str, p: &str, b: bool| auth_with_policies(toks, p, b).0.policy_hash();
+        let base = h(&toks, p, false);
+        assert_eq!(
+            base,
+            h(&toks, &format!("// c\n{p}\n"), false),
+            "formatting is normalised"
+        );
+        assert_ne!(base, h(&toks, p, true));
+        assert_ne!(
+            base,
+            h(
+                &toks,
+                "permit(principal, action == Action::\"prune\", resource);",
+                false
+            )
+        );
+        assert_ne!(base, h(&format!("{toks}groups = [\"g\"]\n"), p, false));
+        // The digest of a token never enters it: another secret, same hash.
+        assert_eq!(base, h(&file(&[("w", "write", &token(5))]), p, false));
+        assert_eq!(auth_with(&toks, None).0.policy_hash(), "");
     }
 
     proptest::proptest! {

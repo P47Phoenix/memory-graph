@@ -86,8 +86,16 @@
 | 68 | Infix (substring) symbol search (#278; [ADR 0011](adr/0011-infix-search.md), Accepted 2026-10-10; delivered in #298) | High | 5 | P3 | 61 (preferably) |
 | 69 | Authentication for `serve` (#105; [ADR 0012](adr/0012-authentication.md), Accepted 2026-10-10; delivered in #299) | High | 8 | P3 | 20 |
 | 70 | Faster symbol queries: lazy file-context loading and no full name walk (after #298; [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner); delivered in #307) | High | 5 | P3 | 68 |
+| 71 | Org- and repo-level delete: `memory-graph delete --org O [--repo R]` on `--db` and `--server` (#323) | Medium | 5 | P3 | 20, 22, 69 |
+| 72 | Policy engine, policy file and paired reload (#289; [ADR 0013](adr/0013-policy-authorization.md), Accepted 2026-11-20) | High | 8 | P3 | 69 |
+| 72a | Cedar decision oracle: dev-only CI job and replay fixtures (ADR 0013) | Medium | 2 | P3 | 72 |
+| 73 | Scoped writes, forwarding re-check, snapshot/admin actions, MCP write tools, audit (ADR 0013) | High | 8 | P3 | 72, 71 |
+| 74a | Scoped reads: query push-down, named-read refusal, strong differential (ADR 0013) | High | 8 | P3 | 72 |
+| 74b | Scoped reads: node-id view, counts, page totals, snapshot handles (ADR 0013) | High | 5 | P3 | 74a |
+| 74c | Scoped reads: MCP read tools (ADR 0013) | Medium | 2 | P3 | 74b |
+| 75 | Policy operator docs and `auth check` in CI (ADR 0013) | Medium | 2 | P3 | 74c |
 
-Total: 70 stories, 333 pts (average about 4.8); 328 pts excluding the deferred story 39 (333 - 5; story 33, 3 pts, was deferred until it was delivered in #306, so the old 325 = 333 - 3 - 5 now becomes 325 + 3 = 328). (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each needed an ADR before any code: [ADR 0011](adr/0011-infix-search.md) and [ADR 0012](adr/0012-authentication.md), both Accepted by the owner on 2026-10-10. Story 70 (5 pts) was added on 2026-10-12 at the owner's request, with the [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner), after story 68 measured infix p95 on the A5 index.
+Total: 78 stories, 373 pts (average about 4.8); 368 pts excluding the deferred story 39 (373 - 5; before stories 72-75 it was 338 with story 71, and 333 before story 71; story 33, 3 pts, was deferred until it was delivered in #306, so the old 325 = 333 - 3 - 5 now becomes 325 + 3 = 328). (Correction, 2026-10-09: the previous totals line said 262 pts, but its table summed to 260; the totals now follow the table.) Stories 20-25 (37 pts) were added on 2026-09-28 by [ADR 0004](adr/0004-client-server-and-replication.md), accepted by the user the same day. Stories 26-30 (37 pts) were added on 2026-09-29 at the user's request: symbols for 17 more languages. Stories 31-39 (40 pts; 33 and 39 deferred) were added on 2026-09-29 at the owner's request by [ADR 0005](adr/0005-mcp.md) (MCP) and [ADR 0006](adr/0006-snapshots-object-storage.md) (snapshots to object storage), both Accepted by the owner on 2026-09-29. Stories 40-44 (24 pts) were added on 2026-09-30 at the owner's request by [ADR 0007](adr/0007-source-encodings.md) (indexing files in any source encoding), Accepted by the owner on 2026-09-30. Stories 45-49 (22 pts) were added on 2026-10-05 at the owner's request by [ADR 0008](adr/0008-read-cache.md) (read cache pool), Accepted by the owner on 2026-10-05. Of these, 47-48 are gated on the decode-share measurement, and 49 is optional. Stories 50-54 (27 pts) were proposed on 2026-10-06 by [ADR 0009](adr/0009-opentelemetry.md) (OpenTelemetry), Accepted by the owner on 2026-10-09, and are counted since then. Stories 55-57 (13 pts) were added on 2026-10-08 at the owner's request by [ADR 0010](adr/0010-symbol-lookup-and-positions.md) (enum members, case-insensitive symbol lookup, declaration position; issue #269), Accepted by the owner on 2026-10-09. Stories 58-69 (41 pts) were added on 2026-10-09 from the backlog triage in [plan-next-phase.md](plan-next-phase.md): the owner approved the #262 format change (story 61), put infix search (#278, story 68) in scope and asked for auth (#105, story 69) to be scheduled, and delegated adding the stories to team consensus (architect, developer and QA all voted yes). Stories 68 and 69 each needed an ADR before any code: [ADR 0011](adr/0011-infix-search.md) and [ADR 0012](adr/0012-authentication.md), both Accepted by the owner on 2026-10-10. Story 70 (5 pts) was added on 2026-10-12 at the owner's request, with the [ADR 0011 amendment](adr/0011-infix-search.md#amendment-2026-10-12-approved-by-the-owner), after story 68 measured infix p95 on the A5 index. Story 71 (5 pts) was added on 2026-10-31 at the owner's request (issue #323; CLI only, no MCP tool). Stories 72, 72a, 73, 74a, 74b, 74c and 75 (35 pts) were added on 2026-11-20 by [ADR 0013](adr/0013-policy-authorization.md) (policy-based authorization, issue #289), Accepted by the owner on 2026-11-20 with its stories, points and acceptance lists.
 
 **Next phase (2026-10-09).** Waves, from [plan-next-phase.md](plan-next-phase.md):
 - **W1:** stories 58, 59, 60, 64 and 66, plus drafting ADRs 0011 (infix search) and 0012 (authentication). Delivered: #282-#287; ADRs 0011 and 0012 accepted on 2026-10-10.
@@ -1000,6 +1008,100 @@ Two costs to remove. First, every matching symbol's file context is loaded and e
 - Given any symbol query, When it runs before and after this story, Then the output must be byte-identical (CLI text and `--json`, embedded and `--server`), checked by `run_differential`, by `run_crash_rerun_differential` and by the story 68 brute-force oracle proptest.
 - Given a cache or side table, When files are indexed, replaced, pruned, re-indexed or vacuumed (and, for `sym_tri`, written by an older binary, using story 58's harness), Then the answers must equal a fresh store's.
 - Given the size gate, When it runs, Then the database must stay at or below 15x its source and 105 B/token, with the new B/token recorded.
+<a id="story-71"></a>
+**71. Org- and repo-level delete (5 pts)**
+Status: Delivered in the PR that fixes #323. Added 2026-10-31 at the owner's request: CLI only, no MCP tool. Counted in the totals.
+As an operator of a shared index
+I want to remove an org or a repo from the database
+So that orgs added by mistake or no longer useful stop showing in `describe` and every query, without looping `index --prune --force` over each repo.
+- Given `memory-graph delete --org O --repo R --yes` (or `--org O --yes`), When it runs on `--db` or `--server`, Then `describe`, `list_repos`, `search` and `symbols` must show nothing for the deleted scope, the repo node (and the org node when the org is deleted or left empty) must be gone, and every other org and repo must answer as before (conformance `delete_repo` and `delete_org`, and both differentials).
+- Given `--dry-run`, Then the repos, files, symbols and tokens that would go must be printed and nothing changed; given neither `--dry-run` nor `--yes`, Then the command must refuse with exit 1.
+- Given an org or repo that does not exist, Then the delete must be a no-op with empty stats and exit 0 (conformance `delete_missing`).
+- Given `--compact`, Then the space must be reclaimed as `vacuum --compact` does.
+- Given a cluster, When the delete is sent to a follower, Then it must be forwarded to the leader, replicate as one `LogCommand.Delete` applied exactly once on every node, and need the `write` role under auth (dry run included). The wire protocol version stays 1, so older CLIs keep working: the server lists a `delete` capability in `Hello`, and a client refuses `delete` against a server without it (exit 5). Peers are guarded by `LOG_COMMANDS_VERSION` in the extractors hash, so an older node is refused as a cluster member rather than diverging.
+
+
+<a id="story-72"></a>
+**72. Policy engine, policy file and paired reload (8 pts)**
+Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md), Accepted by the owner on 2026-11-20 (D1-D4, D10). PR 1 of ADR 0013's rollout, with story 72a.
+As an operator of a shared server
+I want to write permit/forbid policies over tokens, groups, actions and org/repo/cluster resources
+So that each token gets only the access it needs.
+- Given the D2 grammar and its edge-case list (empty, comments-only, BOM, CRLF, NUL, invalid UTF-8, `/* */`, NFC/NFD, escapes, namespaced types, action case, `action in []`, `principal in` a non-group, limits at N and N+1, annotations), When each is loaded, Then it must be accepted or refused exactly as D2 says, naming the line and `@id` in the server log only.
+- Given a policy that names a token, When that token is removed from the token file and `reload_now()` runs, Then its next call must be `UNAUTHENTICATED` and the reload must succeed (an unknown principal only warns).
+- Given a half-written, deleted or invalid token or policy file, When it is reloaded, Then the last good pair must be kept; and Given a mixed old/new pair, Then each of D2's three mixed cases must fail safe.
+- Given a policy file, When `serve` starts without `--auth-builtins`, Then the built-in role policies must not apply, and with the flag they must; Given no policy file, Then every ADR 0012 test must pass unchanged.
+- Given a `read` token and a policy permitting `index`, When it indexes, Then it must be `PERMISSION_DENIED` (the role is a ceiling).
+- Given the interim rule, When a file has a resource-constrained read/search permit or forbid, Then it must fail to load naming the `@id`; and reads must be all-or-nothing per principal as ADR 0013's rollout defines (aggregate reads empty, named reads `PERMISSION_DENIED` when found and today's answer when missing, for a principal with no read grant).
+- Given a cluster, When `cluster status` runs, Then each node's `policy_hash` must be shown.
+- Given the evaluator and parser, When the parser fuzz, `cargo mutants` (ADR 0013 D10 targets for the evaluator and parser) and the policies-visited gate (500 wildcard policies visit exactly 500) run, Then they must pass; `check-no-c-deps.py` and `cargo tree -i ring` / `-i aws-lc-sys` must stay clean.
+
+<a id="story-72a"></a>
+**72a. Cedar decision oracle (2 pts)**
+Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D10 (owner decision Q5).
+As a maintainer of the in-house evaluator
+I want its decisions compared with Cedar's own
+So that every accepted policy file means what Cedar says it means.
+- Given a separate CI workflow outside the workspace and the gate, When it runs `cedar-policy` and our evaluator on generated (policy set, principal, action, resource) triples with the checked-in schema and entities file, Then their decisions must agree.
+- Given a disagreement, When it is found, Then it must be fixed and kept under `testdata/authz/` as a replay fixture that `cargo test` runs without Cedar.
+
+<a id="story-73"></a>
+**73. Scoped writes, forwarding re-check, snapshot/admin actions, MCP write tools, audit (8 pts)**
+Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D6-D9. PR 2 of the rollout. Uses `Write.Delete` from story 71.
+As an operator
+I want writes, deletes and cluster operations checked per org and repo, on every node a call passes through
+So that a scoped token cannot change what it was not granted, even through a follower.
+- Given each write and cluster action and each resource class (permitted repo, sibling repo, other org, cluster), When it is called (table-driven from the action table), Then it must be allowed or `PERMISSION_DENIED` exactly as the policies say, and `UploadSnapshot` must need `admin`.
+- Given an org-wide prune or delete, When the principal has the action only on each current repo, or a `forbid` on one repo inside the org, Then it must be refused; with the action on the `Org` or `Cluster` it must be allowed, and the `LogCommand` must carry the admission-time repo list, so a repo created before apply survives.
+- Given a forwarded write, When the follower and the leader decide differently, Then it must be applied only if both allow it; the leader must use its own token file for role and groups, deny an unknown id, and refuse missing, repeated or malformed `mg-forwarded-*` headers; a cluster-secret call without `mg-forwarded-token-id` must be refused for every scoped action; a client token's forwarded headers must be ignored.
+- Given an `Index` stream, When a revoking reload lands mid-stream, Then both the follower and the leader must stop it at the next file.
+- Given a denial or an allowed write, When it happens, Then an `mg::audit` line and `mg_authz_decisions_total` must record it, with the metric-label and span-attribute leak checks passing and no `@id` in client-facing errors.
+- Given MCP write tools, When a policy refuses one, Then it must return `isError` with `PERMISSION_DENIED` (HTTP 200 over `/mcp`), and 403 must remain only for a role refusal.
+
+<a id="story-74a"></a>
+**74a. Scoped reads: query push-down, named-read refusal, strong differential (8 pts)**
+Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5 (owner decision Q2). Part of PR 3; lifts story 72's interim rule.
+As an operator granting read access to some orgs only
+I want hidden repos filtered out of every aggregate query inside the store, and named requests for them refused
+So that out-of-scope data never shows up in results, counts, pages or limits.
+- Given `Query`, `SymbolQuery` and the describe family with a `ReadScope`, When a request names an existing hidden org or repo, Then it must return `PermissionDenied` (exit 9 from the CLI), and When it names one that does not exist, Then it must return today's answer.
+- Given store A with all repos and store B with only the visible repos indexed in A's relative order, When every aggregate query and every named query of a visible resource runs, Then `A.scoped(scope)` and B must answer identically on the stable key (no node ids), under the `run_differential` matrix and `run_crash_rerun_differential`, including the same-content case.
+- Given `search` and `search_symbols`, When the same inputs are indexed in two orders, Then the answers must be equal (or the case is dropped and recorded if their tie-break uses node ids; no query-visible order changes).
+- Given a repo-only filter (`org = None`) that matches visible and hidden repos, When it runs, Then it must return the visible matches, and be refused only when every existing match is hidden.
+- Given a principal granted the action on `Org::"x"` where `x` has no repos, When it runs `describe` on `x`, Then it must be answered, not refused.
+- Given a scoped token, When it reads with `--read linearizable`, directly and through a follower, Then the read must succeed.
+
+<a id="story-74b"></a>
+**74b. Scoped reads: node-id view, counts, page totals, snapshot handles (5 pts)**
+Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5, D8.
+As a scoped reader browsing by node id
+I want node-id reads, counts and pages to respect my scope
+So that I can navigate what I may see, and hidden data stays out of every count.
+- Given `StoreRead::scoped`, When a node id of a hidden repo is read through any node-id API, Then it must be `PermissionDenied`, and a never-existing id must return today's answer.
+- Given an org whose repos are all hidden, When `roots`, `describe` and `children` run, Then it must be absent from the aggregates and refused when named; children and describe aggregates must count only visible repos.
+- Given a scoped view, When `count_nodes`, page totals and `SnapshotStats` run, Then they must count visible repos only; a zero-grant principal must get empty aggregates.
+- Given a hidden repo that was deleted or pruned, When it is named, Then it must get today's answer; and Given a snapshot handle, When a resource is named through it, Then existence must be judged against the handle's snapshot.
+- Given a snapshot handle, When a narrowing or widening reload happens, Then the next call must follow ADR 0013 D8's intersection rule and re-check expiry.
+
+<a id="story-74c"></a>
+**74c. Scoped reads: MCP read tools (2 pts)**
+Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md) D5, D9.
+As an AI agent using MCP with a scoped token
+I want the read tools to see exactly my scope
+So that I can neither leak nor be confused by hidden repos.
+- Given each MCP read tool over stdio and `/mcp`, When it runs as an aggregate (`list_repos`, unfiltered `describe`, `search`, `find_symbols`), Then it must answer like the scoped differential, and a zero-grant token must get empty results.
+- Given a named tool (`list_files`, `file_outline`, `file_tokens`, a filtered search) on an existing hidden repo, When it runs, Then it must return `isError` with `PERMISSION_DENIED`, HTTP 200 over `/mcp`.
+- Given a principal with no `index`/`prune` permit, When `tools/list` runs, Then the write tools must be hidden.
+
+<a id="story-75"></a>
+**75. Policy operator docs and `auth check` in CI (2 pts)**
+Status: Not started. Added 2026-11-20 (#289). Counted in the totals. Design: [ADR 0013](adr/0013-policy-authorization.md).
+As an operator
+I want a policy guide with worked examples
+So that I can write, check and roll out policies safely.
+- Given `docs/security.md`, When it is read, Then it must cover the policy model, `--auth-policies` and `--auth-builtins`, the threat model (the cluster secret is full trust), the residuals including the Q2 existence leak, the `/` rule and per-node rollout with `policy_hash`.
+- Given the worked examples, When CI runs `memory-graph auth check` on them, Then each must validate and its `--explain` output must match the documented decision.
+
 ### Rationale
 - **Order:** the three P1 items with no dependencies (both spikes and the CI gate) come first because they fix the parser, storage and pure-Rust constraints. The fallback tokenizer is in the MVP because it proves the any-language claim without any language knowledge.
 - **Language-agnostic by construction:** the schema uses a language tag plus a generic kind vocabulary with an optional language-specific kind string. Only extractors know about a language, and story 16 checks this by requiring zero schema, storage or query changes.

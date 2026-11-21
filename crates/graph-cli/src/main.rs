@@ -190,6 +190,37 @@ enum AuthCmd {
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
+    /// Validate a token file and a policy file as the pair `serve --auth-tokens --auth-policies`
+    /// would load (ADR 0013), offline: exit 0 and the policy_hash when valid (warnings on
+    /// stderr), exit 1 naming the line and @id when not (or a file cannot be read). With
+    /// --explain, also print the decision ("allow: ..." or "deny: ...") and the matching
+    /// policy @ids for one request; the exit code is still 0 on a deny (it reports whether the
+    /// pair is valid, not the decision)
+    Check {
+        /// The token file (`--auth-tokens`)
+        #[arg(long, value_name = "FILE")]
+        tokens: PathBuf,
+        /// The policy file (`--auth-policies`)
+        #[arg(long, value_name = "FILE")]
+        policies: PathBuf,
+        /// As `serve --auth-builtins`: also load the built-in role policies
+        #[arg(long)]
+        builtins: bool,
+        /// A request to decide: a token id, an action (read, search, index, prune, delete,
+        /// snapshot, status, admin) and a resource (`Org::"o"`, `Repo::"o/r"` or
+        /// `Cluster::"this"`)
+        #[arg(long, num_args = 3, value_names = ["TOKEN_ID", "ACTION", "RESOURCE"])]
+        explain: Option<Vec<String>>,
+    },
+}
+
+/// `cluster status --json` with `policy_hash` added only when the node has
+/// a policy file, so the output without one is unchanged.
+fn with_policy_hash(mut v: serde_json::Value, hash: &str) -> serde_json::Value {
+    if !hash.is_empty() {
+        v["policy_hash"] = hash.into();
+    }
+    v
 }
 
 /// `memory-graph auth ...`.
@@ -227,6 +258,29 @@ fn auth_cmd(cmd: &AuthCmd) -> Result<i32> {
                 None => out!("{}", *s),
             }
             Ok(0)
+        }
+        AuthCmd::Check {
+            tokens,
+            policies,
+            builtins,
+            explain,
+        } => {
+            let r = graph_cli::auth_cmd::check(tokens, policies, *builtins, explain.as_deref())?;
+            for w in &r.warnings {
+                eprintln!("warning: {w}");
+            }
+            match r.error {
+                Some(e) => {
+                    eprintln!("error: {e}");
+                    Ok(1)
+                }
+                None => {
+                    for l in &r.lines {
+                        out!("{l}");
+                    }
+                    Ok(0)
+                }
+            }
         }
     }
 }
@@ -561,6 +615,18 @@ enum Cmd {
         /// (current, then next) during a rotation. The same file on every node
         #[arg(long, value_name = "FILE", requires = "auth_tokens")]
         cluster_secret_file: Option<PathBuf>,
+        /// With --auth-tokens: per-org/repo permissions as policies (ADR 0013), a scope-only
+        /// subset of Cedar, conventionally `policies.cedar` next to the token file. Validated
+        /// with the token file and reloaded with it as one pair (a bad pair keeps the last good
+        /// one). Without --auth-builtins nothing is allowed that a policy does not permit. In
+        /// this version read/search policies must not constrain `resource`, and every node of a
+        /// cluster must run the same policy file (`memory-graph auth check` validates a pair)
+        #[arg(long, value_name = "FILE", requires = "auth_tokens")]
+        auth_policies: Option<PathBuf>,
+        /// With --auth-policies: also load the two built-in role policies (a `read` token reads,
+        /// searches and sees status everywhere; a `write` token may do anything)
+        #[arg(long, requires = "auth_policies")]
+        auth_builtins: bool,
         /// With --auth-tokens: allow --listen, --advertise, --mcp-listen and --metrics-listen on
         /// addresses other than loopback. This server has no TLS: tokens, the cluster secret and
         /// all data then cross the network in clear text unless a TLS-terminating proxy or a
@@ -832,6 +898,32 @@ enum Cmd {
         /// (single-process rebuild-then-rename)
         #[arg(long)]
         compact: bool,
+    },
+    /// Delete a repo (`--org O --repo R`) or a whole org and every repo in it (`--org O`): its files,
+    /// symbols and tokens, the repo node(s), and the org node when the org is deleted or its last repo
+    /// is. Needs `--yes` (or `--dry-run` to only print what would go). Deleting an org or repo that does
+    /// not exist changes nothing and exits 0. Works on --db and --server (a cluster follower forwards
+    /// it to the leader; `write` role under auth)
+    Delete {
+        /// The org to delete (or the org of `--repo`); names are case-sensitive, as indexed
+        #[arg(long)]
+        org: String,
+        /// Only this repo of the org; without it the whole org is deleted
+        #[arg(long)]
+        repo: Option<String>,
+        /// Print the repos, files, symbols and tokens that would be removed, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm the delete (required unless --dry-run)
+        #[arg(long)]
+        yes: bool,
+        /// Afterwards, reclaim the space as `vacuum --compact` does (on --server, the server's own
+        /// vacuum and `Admin.Compact`)
+        #[arg(long, conflicts_with = "dry_run")]
+        compact: bool,
+        /// Print JSON (the counts, `dry_run` and, with --compact, the file sizes) instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Show what is indexed: per repo, the languages present and each language's symbol kinds
     Describe {
@@ -1354,6 +1446,8 @@ fn run() -> Result<i32> {
         mcp_allow_remote,
         auth_tokens,
         cluster_secret_file,
+        auth_policies,
+        auth_builtins,
         insecure_transport,
         mcp_allow_origin,
         mcp_read,
@@ -1661,6 +1755,8 @@ fn run() -> Result<i32> {
         cfg.auth = graph_server::AuthConfig {
             tokens: auth_tokens.clone(),
             cluster_secret: cluster_secret_file.clone(),
+            policies: auth_policies.clone(),
+            builtins: *auth_builtins,
         };
         cfg.insecure_transport = *insecure_transport;
         cfg.snapshot_max_age = *snapshot_max_age;
@@ -1911,62 +2007,65 @@ fn run() -> Result<i32> {
                     if json {
                         out!(
                             "{}",
-                            serde_json::to_string(&serde_json::json!({
-                                "server": addr,
-                                "node_id": st.node_id,
-                                "cluster_id": st.cluster_id,
-                                "state": st.state,
-                                "leader_id": st.leader_id,
-                                "leader_addr": st.leader_addr,
-                                "current_term": st.current_term,
-                                "applied_index": st.applied_index,
-                                "applied_term": st.applied_term,
-                                "committed_index": st.committed_index,
-                                "last_log_index": st.last_log_index,
-                                "server_version": st.server_version,
-                                "protocol_version": st.protocol_version,
-                                "store_format_version": st.store_format_version,
-                                "extractors_hash": st.extractors_hash,
-                                "db_path": st.db_path,
-                                "listen_addr": st.listen_addr,
-                                "uptime_secs": st.uptime_secs,
-                                "snapshot_handles": st.snapshot_handles,
-                                "role": st.role,
-                                "advertise": st.advertise,
-                                "data_dir": st.data_dir,
-                                "snapshot_index": st.snapshot_index,
-                                "purged_index": st.purged_index,
-                                "log_bytes": st.log_bytes,
-                                "store_bytes": st.store_bytes,
-                                "writes_forwarded_total": st.writes_forwarded_total,
-                                "rpcs_total": st.rpcs_total,
-                                "entries_applied_total": st.entries_applied_total,
-                                "mcp_addr": st.mcp_addr,
-                                "disk_stalled": st.disk_stalled,
-                                "disk_stall_message": st.disk_stall_message,
-                                "snapshot_blocked": st.snapshot_blocked,
-                                "members": st.members.iter().map(|m| serde_json::json!({
-                                    "node_id": m.node_id,
-                                    "addr": m.addr,
-                                    "role": m.role,
-                                    "extractors_hash": m.extractors_hash,
-                                })).collect::<Vec<_>>(),
-                                "replication": st.replication.iter().map(|p| serde_json::json!({
-                                    "node_id": p.node_id,
-                                    "matched_index": p.matched_index,
-                                    "lag": p.lag,
-                                    "last_error": p.last_error,
-                                })).collect::<Vec<_>>(),
-                                "backup": st.backup.as_ref().map(|b| serde_json::json!({
-                                    "url": b.url,
-                                    "on": b.on,
-                                    "last_index": b.last_index,
-                                    "last_success_unix": b.last_success_unix,
-                                    "failures_total": b.failures_total,
-                                    "bytes_total": b.bytes_total,
-                                    "last_backup_error": b.last_backup_error,
-                                })),
-                            }))?
+                            serde_json::to_string(&with_policy_hash(
+                                serde_json::json!({
+                                    "server": addr,
+                                    "node_id": st.node_id,
+                                    "cluster_id": st.cluster_id,
+                                    "state": st.state,
+                                    "leader_id": st.leader_id,
+                                    "leader_addr": st.leader_addr,
+                                    "current_term": st.current_term,
+                                    "applied_index": st.applied_index,
+                                    "applied_term": st.applied_term,
+                                    "committed_index": st.committed_index,
+                                    "last_log_index": st.last_log_index,
+                                    "server_version": st.server_version,
+                                    "protocol_version": st.protocol_version,
+                                    "store_format_version": st.store_format_version,
+                                    "extractors_hash": st.extractors_hash,
+                                    "db_path": st.db_path,
+                                    "listen_addr": st.listen_addr,
+                                    "uptime_secs": st.uptime_secs,
+                                    "snapshot_handles": st.snapshot_handles,
+                                    "role": st.role,
+                                    "advertise": st.advertise,
+                                    "data_dir": st.data_dir,
+                                    "snapshot_index": st.snapshot_index,
+                                    "purged_index": st.purged_index,
+                                    "log_bytes": st.log_bytes,
+                                    "store_bytes": st.store_bytes,
+                                    "writes_forwarded_total": st.writes_forwarded_total,
+                                    "rpcs_total": st.rpcs_total,
+                                    "entries_applied_total": st.entries_applied_total,
+                                    "mcp_addr": st.mcp_addr,
+                                    "disk_stalled": st.disk_stalled,
+                                    "disk_stall_message": st.disk_stall_message,
+                                    "snapshot_blocked": st.snapshot_blocked,
+                                    "members": st.members.iter().map(|m| serde_json::json!({
+                                        "node_id": m.node_id,
+                                        "addr": m.addr,
+                                        "role": m.role,
+                                        "extractors_hash": m.extractors_hash,
+                                    })).collect::<Vec<_>>(),
+                                    "replication": st.replication.iter().map(|p| serde_json::json!({
+                                        "node_id": p.node_id,
+                                        "matched_index": p.matched_index,
+                                        "lag": p.lag,
+                                        "last_error": p.last_error,
+                                    })).collect::<Vec<_>>(),
+                                    "backup": st.backup.as_ref().map(|b| serde_json::json!({
+                                        "url": b.url,
+                                        "on": b.on,
+                                        "last_index": b.last_index,
+                                        "last_success_unix": b.last_success_unix,
+                                        "failures_total": b.failures_total,
+                                        "bytes_total": b.bytes_total,
+                                        "last_backup_error": b.last_backup_error,
+                                    })),
+                                }),
+                                &st.policy_hash
+                            ))?
                         );
                     } else {
                         out!("{}", server_header(&addr, &st));
@@ -2043,6 +2142,9 @@ fn run() -> Result<i32> {
                             st.store_format_version,
                             st.extractors_hash
                         );
+                        if !st.policy_hash.is_empty() {
+                            out!("  policies  {} (ADR 0013 policy_hash)", st.policy_hash);
+                        }
                         out!(
                             "  store     {} (up {}s, {} snapshot handles)",
                             st.db_path,
@@ -2555,6 +2657,91 @@ fn run() -> Result<i32> {
                     cst.before_bytes,
                     cst.after_bytes
                 );
+            }
+        }
+        Cmd::Delete {
+            org,
+            repo,
+            dry_run,
+            yes,
+            compact,
+            json,
+        } => {
+            let scope = match &repo {
+                Some(r) => format!("{org}/{r}"),
+                None => format!("org {org}"),
+            };
+            if !dry_run && !yes {
+                bail!(
+                    "refusing to delete {scope} without --yes (run with --dry-run to see what would be removed)"
+                );
+            }
+            let (st, cst) = match &target {
+                Target::Remote { addr, read } => {
+                    let s = remote(addr, *read, overrides)?;
+                    let st = s.delete_scope(&org, repo.as_deref(), dry_run)?;
+                    let cst = if compact {
+                        s.vacuum()?;
+                        Some(s.admin_compact()?)
+                    } else {
+                        None
+                    };
+                    (st, cst)
+                }
+                Target::Embedded(db) => {
+                    if !db.is_file() {
+                        bail!("database `{}` does not exist", db.display());
+                    }
+                    let s = graph_cli::target::open_embedded(db, || open_v2(db, overrides))
+                        .with_context(|| format!("opening database `{}`", db.display()))?;
+                    let st = s.delete_scope(&org, repo.as_deref(), dry_run)?;
+                    let cst = if compact {
+                        s.vacuum()?;
+                        Some(s.compact()?.1)
+                    } else {
+                        None
+                    };
+                    (st, cst)
+                }
+            };
+            if json {
+                let mut v = serde_json::json!({ "dry_run": dry_run, "deleted": st });
+                if let Some(c) = cst {
+                    v["compact"] = serde_json::json!({
+                        "before_bytes": c.before_bytes,
+                        "after_bytes": c.after_bytes,
+                    });
+                }
+                out!("{}", serde_json::to_string(&v)?);
+            } else if st.repos.is_empty() && !st.org_removed {
+                out!("nothing to delete: {scope} not found");
+            } else {
+                let verb = if dry_run { "would delete" } else { "deleted" };
+                out!(
+                    "{verb} {scope}: {} repos ({}), {} files, {} symbols, {} tokens",
+                    st.repos.len(),
+                    st.repos.join(", "),
+                    st.files,
+                    st.symbols,
+                    st.tokens
+                );
+                if st.org_removed {
+                    let verb = if dry_run {
+                        "would be removed"
+                    } else {
+                        "removed"
+                    };
+                    out!("org {org} {verb}");
+                }
+            }
+            if let Some(cst) = cst {
+                if !json {
+                    out!(
+                        "compact: {} bytes -> {} bytes",
+                        cst.before_bytes,
+                        cst.after_bytes
+                    );
+                }
             }
         }
         Cmd::Describe { org, repo, json } => {
@@ -3440,6 +3627,53 @@ mod worker_threads_tests {
             }
         };
         assert_eq!(run(&["--worker-threads", "5"]), Some(5));
+        // ADR 0013 (Q1): --auth-builtins defaults off, and needs --auth-policies.
+        let serve = |extra: &[&str]| {
+            let mut a = vec![
+                "memory-graph",
+                "serve",
+                "--db",
+                "g.redb",
+                "--auth-tokens",
+                "t.toml",
+            ];
+            a.extend_from_slice(extra);
+            Cli::try_parse_from(a)
+        };
+        match serve(&["--auth-policies", "p.cedar"]).unwrap().cmd {
+            Cmd::Serve {
+                auth_builtins,
+                auth_policies,
+                ..
+            } => {
+                assert!(!auth_builtins);
+                assert_eq!(auth_policies, Some(PathBuf::from("p.cedar")));
+            }
+            _ => unreachable!(),
+        }
+        match serve(&["--auth-policies", "p.cedar", "--auth-builtins"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Serve { auth_builtins, .. } => assert!(auth_builtins),
+            _ => unreachable!(),
+        }
+        assert!(
+            serve(&["--auth-builtins"]).is_err(),
+            "needs --auth-policies"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "memory-graph",
+                "serve",
+                "--db",
+                "g.redb",
+                "--auth-policies",
+                "p.cedar"
+            ])
+            .is_err(),
+            "needs --auth-tokens"
+        );
         if std::env::var_os("MEMORY_GRAPH_WORKER_THREADS").is_none() {
             assert_eq!(run(&[]), Some(3));
         }

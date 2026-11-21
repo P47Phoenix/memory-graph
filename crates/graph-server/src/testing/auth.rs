@@ -74,6 +74,7 @@ impl AuthFixture {
         AuthConfig {
             tokens: Some(self.tokens.clone()),
             cluster_secret: Some(self.secret_file.clone()),
+            ..AuthConfig::default()
         }
     }
 

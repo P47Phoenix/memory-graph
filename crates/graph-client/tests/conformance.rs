@@ -830,7 +830,11 @@ fn infix_needs_a_server_that_lists_the_capability() {
         c.testing.without_symbol_infix = true;
     });
     let r = connect(&ts);
-    assert!(r.hello().capabilities.is_empty());
+    assert!(!r
+        .hello()
+        .capabilities
+        .iter()
+        .any(|c| c == graph_store::CAPABILITY_SYMBOL_INFIX));
     for p in ["*get*", "*get"] {
         match r.search_symbols(&graph_store::SymbolQuery::new(p)) {
             Err(StoreError::Rejected(m)) => assert_eq!(
@@ -846,4 +850,97 @@ fn infix_needs_a_server_that_lists_the_capability() {
             .len(),
         1
     );
+}
+
+/// Issue #323: a server lists `delete` in `Hello`, and the client sends
+/// `Write.Delete` only to one that does. Against an older server
+/// (simulated by a hook) `delete_scope` refuses with a `Protocol` error
+/// (CLI exit 5) before sending anything, dry run or not, and every other
+/// call still works.
+#[test]
+fn delete_needs_a_server_that_lists_the_capability() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("g.redb");
+    {
+        let ts = TestServer::start(&db, rust());
+        let r = connect(&ts);
+        assert!(r
+            .hello()
+            .capabilities
+            .iter()
+            .any(|c| c == graph_store::CAPABILITY_DELETE));
+        for o in ["gone", "keep", "old"] {
+            r.index_bytes(o, "r", "a.rs", b"fn a() {}", None).unwrap();
+        }
+        let st = r.delete_scope("gone", None, false).unwrap();
+        assert!(st.org_removed);
+        assert_eq!(r.describe(None, None).unwrap().len(), 2);
+    }
+    let ts = TestServer::start_with(&db, rust(), |c| {
+        c.testing.without_delete = true;
+    });
+    let r = connect(&ts);
+    assert!(!r
+        .hello()
+        .capabilities
+        .iter()
+        .any(|c| c == graph_store::CAPABILITY_DELETE));
+    for dry in [true, false] {
+        match r.delete_scope("old", None, dry) {
+            Err(StoreError::Protocol(m)) => {
+                assert_eq!(m, "this server does not support delete; upgrade it")
+            }
+            other => panic!("dry={dry}: {other:?}"),
+        }
+    }
+    assert_eq!(r.describe(None, None).unwrap().len(), 2, "nothing deleted");
+    r.index_bytes("old", "r", "b.rs", b"fn b() {}", None)
+        .unwrap();
+}
+
+/// Issue #323 keeps the wire protocol version: a client that predates the
+/// `delete` capability (it sends protocol version 1 and never looks at
+/// `capabilities`) still connects, reads and writes.
+#[test]
+fn an_old_style_client_still_connects() {
+    let d = tempfile::tempdir().unwrap();
+    let server = TestServer::start(&d.path().join("s.redb"), rust());
+    assert_eq!(PROTOCOL_VERSION, 1);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{}", server.endpoint()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut s = pb::store_client::StoreClient::new(ch.clone());
+        let h = s
+            .hello(pb::HelloRequest {
+                protocol_version: 1,
+                client_version: "0.0.0-old".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(h.protocol_version, 1);
+        let mut w = pb::write_client::WriteClient::new(ch);
+        w.index_file(pb::IndexFileRequest {
+            org: "o".into(),
+            repo: "r".into(),
+            file: Some(pb::FileBytes {
+                path: "a.rs".into(),
+                bytes: b"fn a() {}".to_vec(),
+                ..Default::default()
+            }),
+            options: None,
+        })
+        .await
+        .unwrap();
+        let d = s
+            .describe(pb::DescribeRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(d.repos.len(), 1);
+    });
 }

@@ -165,6 +165,69 @@ fn three_nodes_replicate_and_answer_identically() {
     run_differential(embedded.as_ref(), &replica(&tb, 2));
 }
 
+/// Issue #323: a delete sent to a follower is forwarded to the leader,
+/// replicated, and applied on every node; other orgs are untouched. A dry
+/// run on a follower is answered locally and changes nothing.
+#[test]
+fn delete_sent_to_a_follower_applies_everywhere() {
+    let mut tb = ClusterTestbed::new(3, exts());
+    tb.form();
+    let leader = tb.leader();
+    let files: Vec<_> = (0..4).map(small_file).collect();
+    for (o, r) in [("gone", "a"), ("gone", "b"), ("keep", "a"), ("keep", "b")] {
+        index_files(&tb.client(leader), o, r, &files);
+    }
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let follower = tb.ids().into_iter().find(|i| *i != leader).unwrap();
+    let f = tb.client(follower);
+    let dry = f.delete_scope("gone", None, true).unwrap();
+    assert_eq!(dry.repos, ["a", "b"]);
+    assert_eq!(dry.files, 8);
+    assert!(dry.org_removed);
+    let before = summary(&tb.client(leader));
+    assert_eq!(before.1.len(), 4, "the dry run changed nothing");
+    // A repo, then the org, both through the follower.
+    let st = f.delete_scope("keep", Some("b"), false).unwrap();
+    assert_eq!((st.repos.len(), st.files, st.org_removed), (1, 4, false));
+    let st = f.delete_scope("gone", None, false).unwrap();
+    assert_eq!(st, dry, "the real run removed what the dry run named");
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    let want = summary(&tb.client(leader));
+    assert_eq!(want.1.len(), 1, "{:?}", want.1);
+    assert_eq!(
+        (want.1[0].org.as_str(), want.1[0].repo.as_str()),
+        ("keep", "a")
+    );
+    assert_eq!(want.1[0].files, 4);
+    for id in tb.ids() {
+        let c = tb.client(id);
+        assert_eq!(summary(&c), want, "node {id}");
+        assert!(
+            c.describe(Some("gone"), None).unwrap().is_empty(),
+            "node {id}"
+        );
+        assert!(
+            c.roots().unwrap().iter().all(|n| n.name != "gone"),
+            "node {id}"
+        );
+        let mut q = Query::new("x");
+        q.org = Some("gone".into());
+        assert!(c.search(&q).unwrap().is_empty(), "node {id}");
+        let mut sq = SymbolQuery::new("*");
+        sq.org = Some("gone".into());
+        assert!(c.search_symbols(&sq).unwrap().is_empty(), "node {id}");
+    }
+    // Retrying is a no-op on every node.
+    assert_eq!(
+        f.delete_scope("gone", None, false).unwrap(),
+        graph_store::DeleteStats::default()
+    );
+    tb.wait_applied(tb.leader_last_log_index(), CLUSTER_WAIT);
+    for id in tb.ids() {
+        assert_eq!(summary(&tb.client(id)), want, "node {id} after the retry");
+    }
+}
+
 #[test]
 fn leader_loss_elects_and_writes_resume() {
     let mut tb = ClusterTestbed::new(3, exts());
