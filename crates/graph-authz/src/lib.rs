@@ -478,6 +478,18 @@ impl PolicySet {
         on_org
     }
 
+    /// Whether any `permit` for `action` matches `p` on some resource
+    /// (within its role's ceiling): `tools/list` hides a write tool from a
+    /// principal with none (ADR 0013 D5). A `forbid` does not count: the
+    /// call itself is decided per resource.
+    pub fn any_permit(&self, p: &Principal<'_>, action: Action) -> bool {
+        p.role.ceiling() & action.bit() != 0
+            && self.buckets(p).into_iter().flatten().any(|&i| {
+                let pol = &self.policies[i];
+                pol.effect == Effect::Permit && pol.actions() & action.bit() != 0
+            })
+    }
+
     /// The read scope of `p` for the read action `action` (ADR 0013 D3,
     /// D5): the principal's matching policies as name sets, which the store
     /// tests per repo. [`ReadRules::repo_visible`] equals

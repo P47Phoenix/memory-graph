@@ -1684,6 +1684,27 @@ impl Auth {
         scope_of_rules(r)
     }
 
+    /// Whether the caller has a permit for `action` on any resource
+    /// (ADR 0013 D5: `tools/list` hides `index_path`/`prune` otherwise).
+    /// `true` with policies off; `false` for a caller this node cannot
+    /// resolve.
+    pub fn any_permit(&self, action: graph_authz::Action) -> bool {
+        let Some(src) = self.tokens.as_ref() else {
+            return true;
+        };
+        let state = src.cur.load();
+        let Some(set) = state.policies.as_ref() else {
+            return true;
+        };
+        let Some(caller) = current_caller() else {
+            return no_caller_allowed();
+        };
+        match self.principal_entry(&state, &caller, action) {
+            Ok((e, role)) => set.any_permit(&principal_with(e, role), action),
+            Err(_) => false,
+        }
+    }
+
     /// A named read refused by the store (ADR 0013 D5, D9): counted as a
     /// `deny` and written to the audit log (rate-limited per peer). The
     /// store's refusal names no resource, so neither does this line.

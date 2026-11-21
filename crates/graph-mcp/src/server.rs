@@ -219,7 +219,13 @@ impl<B: McpBackend> McpServer<B> {
                 format!("`{method}` before `initialize`: send initialize first"),
                 None,
             )),
-            "tools/list" => Ok(json!({ "tools": listed_tools(self.backend.writes_enabled()) })),
+            "tools/list" => {
+                let tools: Vec<Value> = listed_tools(self.backend.writes_enabled())
+                    .into_iter()
+                    .filter(|t| !t["name"].as_str().is_some_and(|n| self.backend.hides_tool(n)))
+                    .collect();
+                Ok(json!({ "tools": tools }))
+            }
             "tools/call" => self.call(params),
             other => Err((
                 METHOD_NOT_FOUND,

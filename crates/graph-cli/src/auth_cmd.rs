@@ -256,6 +256,36 @@ mod tests {
         );
     }
 
+    /// Story 75: the worked examples of `docs/security.md` validate, and every
+    /// decision in `docs/examples/policies/expected.txt` matches `--explain`.
+    #[test]
+    fn worked_examples() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/policies");
+        let (toks, pols) = (dir.join("tokens.toml"), dir.join("policies.cedar"));
+        let r = check(&toks, &pols, false, None).unwrap();
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let expected = std::fs::read_to_string(dir.join("expected.txt")).unwrap();
+        let mut n = 0;
+        for line in expected
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let (req, want) = line.split_once(" => ").unwrap();
+            let parts: Vec<String> = req.splitn(3, ' ').map(str::to_string).collect();
+            let mut want = want.split(' ');
+            let decision = want.next().unwrap();
+            let r = check(&toks, &pols, false, Some(&parts)).unwrap();
+            let got = &r.lines[1];
+            assert!(got.starts_with(&format!("{decision}:")), "{line}: {got}");
+            for id in want.filter(|w| *w != "-") {
+                assert!(got.contains(id), "{line}: {got}");
+            }
+            n += 1;
+        }
+        assert!(n >= 10);
+    }
+
     #[test]
     fn auth_check_validates_a_pair_and_explains() {
         let d = tempfile::tempdir().unwrap();

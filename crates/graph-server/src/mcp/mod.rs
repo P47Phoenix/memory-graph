@@ -983,6 +983,24 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     } else {
         st.call_timeout
     };
+    // ADR 0013 D5: hide the write tools the token has no permit for
+    // anywhere (still callable, and refused by their own check).
+    let hidden: Vec<String> = {
+        let compute = || {
+            [
+                ("index_path", graph_authz::Action::Index),
+                ("prune", graph_authz::Action::Prune),
+            ]
+            .into_iter()
+            .filter(|(_, a)| !st.ctx.auth.any_permit(*a))
+            .map(|(t, _)| t.to_string())
+            .collect()
+        };
+        match &caller {
+            Some(c) => crate::auth::CALLER.sync_scope(c.clone(), compute),
+            None => compute(),
+        }
+    };
     let rt = tokio::runtime::Handle::current();
     let svc = Arc::clone(&st.svc);
     let write_svc = Arc::clone(&st.write_svc);
@@ -1013,6 +1031,7 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
                 Err(e) => tracing::warn!(error = %e, "MCP index root"),
             }
         }
+        let backend = backend.with_hidden(hidden);
         let mut server = McpServer::resumed(backend, name, version, protocol)
             .expect("a session holds a supported version");
         server.handle_bytes(&bytes)

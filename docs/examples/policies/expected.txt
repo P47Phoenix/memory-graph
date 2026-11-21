@@ -1,0 +1,12 @@
+# token action resource => decision (matched @ids, space separated, or -)
+# Checked by `cargo test -p graph-cli` (auth_cmd::worked_examples).
+web-ci index Repo::"acme/web" => allow web-ci
+web-ci index Repo::"acme/api" => deny -
+web-ci read Repo::"acme/web" => deny -
+alice read Repo::"acme/api" => allow acme-read
+alice search Repo::"acme/legal" => deny acme-read legal-hidden
+alice read Org::"acme" => allow acme-read
+alice read Repo::"other/x" => deny -
+alice index Repo::"acme/api" => deny -
+ops admin Cluster::"this" => allow ops
+ops index Repo::"acme/legal" => deny legal-frozen
