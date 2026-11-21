@@ -97,10 +97,40 @@ impl DiskGuard {
         self.check_need(what, extra, &format!("{extra} bytes for the {what}"))
     }
 
+    /// The check before a snapshot build: like [`check`](Self::check), but
+    /// with the guard off (`min_free` 0, the `--db` default) it still
+    /// requires room for the copy itself. A build is a full copy of the
+    /// store; one started without that room fills the disk, fails with
+    /// ENOSPC and leaves nothing behind but a log that cannot be purged
+    /// (issue #330), so it is postponed instead.
+    /// What a snapshot build needs free, and the directory whose volume is
+    /// checked: one copy of the store, estimated from the store file's
+    /// length (an overestimate: the copy leaves out free pages), plus
+    /// `min_free`.
+    pub fn snapshot_need(&self) -> (u64, &Path) {
+        (
+            self.min_free.saturating_add(Self::size(&self.store)),
+            &self.dir,
+        )
+    }
+
+    pub fn check_snapshot(&self) -> Result<(), StoreError> {
+        let store = Self::size(&self.store);
+        self.check_need_always(
+            "snapshot",
+            store,
+            &format!("one snapshot copy of the {store}-byte store"),
+        )
+    }
+
     fn check_need(&self, what: &str, extra: u64, why: &str) -> Result<(), StoreError> {
         if self.min_free == 0 {
             return Ok(());
         }
+        self.check_need_always(what, extra, why)
+    }
+
+    fn check_need_always(&self, what: &str, extra: u64, why: &str) -> Result<(), StoreError> {
         let Some(free) = (self.probe)(&self.dir) else {
             return Ok(());
         };
@@ -137,6 +167,26 @@ mod tests {
         assert!(g.check("write").is_ok(), "off at 0");
         let g = DiskGuard::new(1000, Arc::new(|_| None), d.path(), &store, &log);
         assert!(g.check("write").is_ok(), "unknown passes");
+    }
+
+    /// Issue #330: with the guard off (the `--db` default) a snapshot
+    /// build still needs room for its copy; writes are not checked.
+    #[test]
+    fn a_snapshot_build_needs_room_for_its_copy_even_with_the_guard_off() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path().join("g.redb");
+        std::fs::write(&store, vec![0u8; 100]).unwrap();
+        let log = d.path().join("raft.redb");
+        let g = DiskGuard::new(0, Arc::new(|_| Some(99)), d.path(), &store, &log);
+        assert!(g.check("write").is_ok(), "writes: off at 0");
+        let e = g.check_snapshot().unwrap_err();
+        assert!(graph_proto::error::is_disk_full(&e.to_string()), "{e}");
+        let g = DiskGuard::new(0, Arc::new(|_| Some(100)), d.path(), &store, &log);
+        assert!(g.check_snapshot().is_ok());
+        let g = DiskGuard::new(10, Arc::new(|_| Some(109)), d.path(), &store, &log);
+        assert!(g.check_snapshot().is_err(), "min_free adds to the copy");
+        let g = DiskGuard::new(0, Arc::new(|_| None), d.path(), &store, &log);
+        assert!(g.check_snapshot().is_ok(), "unknown passes");
     }
 
     #[test]

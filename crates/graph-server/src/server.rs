@@ -126,6 +126,12 @@ pub struct ServeConfig {
     /// [`crate::raft::state_machine::TestingApplyGate`]).
     #[doc(hidden)]
     pub testing_apply_gate: Option<crate::raft::state_machine::TestingApplyGate>,
+    /// Testing only, not a supported API: called on the blocking pool just
+    /// before the start-up compaction of the Raft log (a test holds it to
+    /// probe health meanwhile). Set, the compaction step runs whatever the
+    /// log's size.
+    #[doc(hidden)]
+    pub testing_start_compaction_gate: Option<Arc<dyn Fn() + Send + Sync>>,
     /// `--backup-url` and friends (ADR 0006): upload snapshots; `None`: off.
     pub backup: Option<crate::backup::BackupConfig>,
     /// `--restore-allow-extractor-mismatch`: a verified restore accepts a
@@ -254,6 +260,7 @@ impl ServeConfig {
             mcp: None,
             ready_max_lag: crate::DEFAULT_READY_MAX_LAG,
             testing_apply_gate: None,
+            testing_start_compaction_gate: None,
             backup: None,
             restore_allow_extractor_mismatch: false,
             restore_s3: crate::backup::S3Options::default(),
@@ -762,6 +769,19 @@ pub async fn start(
         RaftSettings::standalone()
     });
     let obs = crate::observe::Observability::new();
+    // Before the Raft core runs (nothing appends, so nothing stalls): shrink
+    // a log file a past purge left mostly empty, however large its live
+    // part (issues #330, #331). Health answers NOT_SERVING meanwhile.
+    let listener = if cfg.storage_backend.is_none() {
+        compact_log_at_start(
+            &paths.log,
+            listener,
+            cfg.testing_start_compaction_gate.clone(),
+        )
+        .await
+    } else {
+        listener
+    };
     let mut raft = RaftNode::start(NodeStart {
         node_id,
         advertise: advertise.clone(),
@@ -1380,6 +1400,100 @@ pub fn check_transport(cfg: &ServeConfig, auth_on: bool) -> Result<(), StoreErro
          --insecure-transport to acknowledge it (docs/security.md)",
         exposed.join(", ")
     )))
+}
+
+/// A Raft log file smaller than this is never worth a start-up compaction.
+const START_COMPACT_MIN: u64 = 1 << 20;
+
+/// The start-up compaction of the Raft log (issues #330, #331):
+/// [`RedbLogStore::compact_on_start`], before the Raft core runs, so its
+/// write lock stalls nobody whatever the live log's size. It can take a
+/// while on a large, mostly empty file, so meanwhile a health-only server
+/// answers on the main listener: both health names `NOT_SERVING`, at once,
+/// instead of a probe hanging on a listener nobody accepts on (Docker and
+/// Kubernetes probes would time out and could restart the node in a loop).
+/// Returns the listener for the real server.
+async fn compact_log_at_start(
+    log: &Path,
+    listener: TcpListener,
+    gate: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> TcpListener {
+    let size = std::fs::metadata(log).map_or(0, |m| m.len());
+    if size < START_COMPACT_MIN && gate.is_none() {
+        return listener;
+    }
+    let (reporter, health) = tonic_health::server::health_reporter();
+    reporter
+        .set_service_status("", ServingStatus::NotServing)
+        .await;
+    reporter
+        .set_service_status(READY_SERVICE, ServingStatus::NotServing)
+        .await;
+    // Connections are accepted by a task of ours (and handed over by a
+    // channel), so the listener comes back once it is stopped.
+    let listener = Arc::new(listener);
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<tokio::net::TcpStream>>(16);
+    let accept = {
+        let l = Arc::clone(&listener);
+        tokio::spawn(async move {
+            loop {
+                let r = l.accept().await.map(|(s, _)| s);
+                if tx.send(r).await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(health)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+                async move {
+                    let _ = stop_rx.await;
+                },
+            ),
+    );
+    tracing::info!(
+        log = %log.display(),
+        file = size,
+        "starting: checking the Raft log for a start-up compaction; health answers \
+         NOT_SERVING until it is done"
+    );
+    let path = log.to_path_buf();
+    let done = tokio::task::spawn_blocking(move || {
+        if let Some(g) = gate {
+            g();
+        }
+        match RedbLogStore::open(&path) {
+            Ok(l) => {
+                l.compact_on_start();
+            }
+            Err(e) => tracing::warn!(error = %e, "start-up compaction: could not open the log"),
+        }
+    })
+    .await;
+    if let Err(e) = done {
+        tracing::warn!(error = %e, "start-up compaction task failed");
+    }
+    // Hand-back: up to 16 connections accepted but not yet served (queued
+    // in the channel) are reset here. Accepted: they are probes or clients
+    // that retry, and the window is a moment at the end of the start-up.
+    accept.abort();
+    let _ = accept.await;
+    let _ = stop_tx.send(());
+    if tokio::time::timeout(Duration::from_secs(2), &mut server)
+        .await
+        .is_err()
+    {
+        server.abort();
+        let _ = server.await;
+    }
+    match Arc::try_unwrap(listener) {
+        Ok(l) => l,
+        Err(_) => unreachable!("the accept task, the only other owner, has ended"),
+    }
 }
 
 /// Whether `memory-graph.ready` is `SERVING`: a leader is known (and the

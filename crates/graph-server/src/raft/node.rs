@@ -61,6 +61,10 @@ pub struct RaftSettings {
     /// affected: heartbeats keep the quorum acknowledgement fresh however
     /// long an entry takes (`--quorum-loss-timeout`).
     pub quorum_loss_ms: Option<u64>,
+    /// The first back-off after a failed snapshot build, ms (default 30 s);
+    /// it doubles with each failure in a row up to
+    /// [`SNAPSHOT_RETRY_MAX`] (issues #330, #331). Not a `serve` flag.
+    pub snapshot_retry_ms: u64,
 }
 
 impl RaftSettings {
@@ -81,6 +85,7 @@ impl RaftSettings {
             purge_batch_size: 1,
             max_payload_entries: 64,
             quorum_loss_ms: None,
+            snapshot_retry_ms: SNAPSHOT_RETRY.as_millis() as u64,
         }
     }
 
@@ -548,7 +553,7 @@ impl RaftNode {
                 // Best effort: an outdated snapshot only delays a laggard
                 // (the policy's next build replaces it), so a failed or
                 // disk-refused rebuild is logged and serve goes on.
-                if let Err(e) = repair_outdated_snapshot(&slot, &snaps, || disk.check("snapshot")) {
+                if let Err(e) = repair_outdated_snapshot(&slot, &snaps, || disk.check_snapshot()) {
                     tracing::warn!(
                         error = %e,
                         "could not replace a snapshot made by another build at start-up; \
@@ -1055,21 +1060,35 @@ impl RaftNode {
     /// Build a snapshot now (after the disk guard) and wait until the
     /// current snapshot covers what was applied when asked; returns its
     /// `(index, term)`.
+    ///
+    /// A build that fails while this waits answers its error at once (a
+    /// full disk as `disk full ...`, `RESOURCE_EXHAUSTED` on the wire), not a
+    /// timeout (issues #330, #331).
     pub async fn snapshot_now(&self, timeout: Duration) -> Result<(u64, u64), StoreError> {
-        self.disk.check("snapshot")?;
+        self.disk.check_snapshot()?;
         let applied = self.metrics().last_applied.map_or(0, |l| l.index);
+        let before = self.snapshots.build_state();
         self.raft.trigger().snapshot().await.map_err(fatal)?;
-        let m = self
-            .raft
-            .wait(Some(timeout))
-            .metrics(
-                |m| m.snapshot.is_some_and(|s| s.index >= applied),
-                "snapshot covers the applied index",
-            )
-            .await
-            .map_err(|e| fatal(format!("waiting for the snapshot: {e}")))?;
-        let s = m.snapshot.unwrap_or_default();
-        Ok((s.index, s.leader_id.term))
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut rx = self.raft.metrics();
+        loop {
+            if let Some(s) = rx.borrow().snapshot.filter(|s| s.index >= applied) {
+                return Ok((s.index, s.leader_id.term));
+            }
+            let now = self.snapshots.build_state();
+            if now.failed > before.failed {
+                return Err(build_failed_error(&self.disk, &now));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(fatal(format!(
+                    "waiting for the snapshot: no snapshot at or above {applied} after {timeout:?}"
+                )));
+            }
+            tokio::select! {
+                r = rx.changed() => if r.is_err() { return Err(fatal("raft stopped")) },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
     }
 
     /// openraft's read barrier (ADR 0004 D8, `LINEARIZABLE`): confirms
@@ -1170,18 +1189,38 @@ impl RaftNode {
 /// It re-evaluates on every metrics change (an append, an apply, a new
 /// snapshot), and every [`POLICY_TICK`] only while it waits on something
 /// time can change: a build the disk guard refused is retried once space
-/// frees up even on an idle cluster, and a triggered build that never
-/// produced a snapshot (openraft logs a failed build and carries on) is
-/// retried after [`SNAPSHOT_RETRY`]. With neither, an idle node does not
-/// wake it (issue #205). The byte count covers the applied entries above
-/// the last snapshot whenever they were appended, so neither a restart, a
-/// build nor a lagging apply loses any of them.
+/// frees up even on an idle cluster, a running build is followed until it
+/// ends, and a back-off runs out. With none of these, an idle node does
+/// not wake it (issue #205). The byte count covers the applied entries
+/// above the last snapshot whenever they were appended, so neither a
+/// restart, a build nor a lagging apply loses any of them.
+///
+/// Builds are followed through [`SnapshotDir::build_state`] (issues #330,
+/// #331), not a timer: a build that runs for an hour on a large store is
+/// waited for, not reported as failed and re-triggered. A build that
+/// failed (the builder never fails openraft's command, which would stop
+/// the Raft core; see `SnapshotBuilder::build_snapshot`) is retried after
+/// [`snapshot_backoff`]: `snapshot_retry_ms`, doubling per failure in a
+/// row up to [`SNAPSHOT_RETRY_MAX`], forever; each failure is logged at
+/// error with the space a build needs and the volume, and recorded as the
+/// reason `cluster status` shows ([`SnapshotDir::blocked`]). After a
+/// successful build that took longer than [`DUTY_FLOOR_MIN`], the next one
+/// waits as long as that one took, so builds on a large store never run
+/// back to back (at most half the time is spent building). A build
+/// openraft never started (its trigger was ignored) is triggered again
+/// after `snapshot_retry_ms`.
 async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
     let mut rx = node.raft.metrics();
     let entries = s.snapshot_log_entries.max(1);
+    let retry = Duration::from_millis(s.snapshot_retry_ms.max(1));
     let mut last_snap = rx.borrow().snapshot.map(|l| l.index);
     let mut counted = AppliedBytes::new(last_snap.unwrap_or(0));
-    let mut pending: Option<(u64, std::time::Instant)> = None;
+    let mut pending: Option<Pending> = None;
+    // No build before this (a back-off after a failure, or the duty floor
+    // after a long build).
+    let mut not_before: Option<std::time::Instant> = None;
+    // The build counters as last seen (the duty floor starts at an end).
+    let mut seen = node.snapshots.build_state();
     let mut disk_refused = false;
     loop {
         let (applied, snap, running) = {
@@ -1214,15 +1253,80 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
                 bytes: 0,
             });
         }
+        let builds = node.snapshots.build_state();
+        if builds.finished > seen.finished {
+            // The duty floor, from the build's own end (not from openraft
+            // publishing the snapshot, which comes a moment later: a tick
+            // in between must not start the next build at once).
+            if builds.failed == seen.failed {
+                if let Some(d) = builds.last_duration.filter(|d| *d >= DUTY_FLOOR_MIN) {
+                    tracing::info!(
+                        took_s = d.as_secs(),
+                        "snapshot policy: the next build waits as long as this one took"
+                    );
+                    let until = std::time::Instant::now() + d;
+                    not_before = Some(not_before.map_or(until, |t| t.max(until)));
+                }
+            }
+            seen = builds.clone();
+        }
         if snap != last_snap {
             last_snap = snap;
-            if pending.is_some_and(|(p, _)| snap.unwrap_or(0) >= p) {
+            if pending
+                .as_ref()
+                .is_some_and(|p| snap.unwrap_or(0) >= p.applied)
+            {
                 pending = None;
             }
+            if snap.is_some() && builds.consecutive_failures == 0 {
+                node.snapshots.set_blocked(None);
+            }
         }
-        if pending.is_some_and(|(_, at)| at.elapsed() >= SNAPSHOT_RETRY) {
-            tracing::warn!("a triggered snapshot build produced no snapshot; retrying");
-            pending = None;
+        // Only a build this policy triggered (and waits for) sets the
+        // back-off: a failed `cluster snapshot` (`snapshot_now`) or start-up
+        // repair answers its own caller and does not delay the policy.
+        if let Some(mut p) = pending.take() {
+            if builds.failed > p.builds.failed {
+                let n = builds.consecutive_failures.max(1);
+                let wait = snapshot_backoff(retry, n);
+                let why = build_failed_message(&node.disk, &builds);
+                let (need, dir) = node.disk.snapshot_need();
+                // Every failure is an error: the Raft log is not purged
+                // until a build succeeds, and keeps growing.
+                tracing::error!(
+                    failures = n,
+                    error = builds.last_error.as_deref().unwrap_or("unknown"),
+                    need_bytes = need,
+                    volume = %dir.display(),
+                    retry_in_s = wait.as_secs(),
+                    loud = n >= SNAPSHOT_FAILURES_LOUD,
+                    "snapshot build failed; retrying after a back-off (a build needs about \
+                     need_bytes free on the volume; the Raft log is not purged meanwhile)"
+                );
+                node.snapshots.set_blocked(Some(why));
+                not_before = Some(std::time::Instant::now() + wait);
+            } else if builds.running() {
+                // Still building, however long it takes.
+                pending = Some(p);
+            } else if builds.finished > p.builds.finished {
+                // Built; openraft publishes the snapshot a moment later.
+                let done = *p.done.get_or_insert_with(std::time::Instant::now);
+                if done.elapsed() < retry {
+                    pending = Some(p);
+                } else {
+                    tracing::warn!(
+                        "a snapshot build ended without a newer snapshot; triggering again"
+                    );
+                }
+            } else if p.at.elapsed() < retry {
+                // Not started yet.
+                pending = Some(p);
+            } else {
+                tracing::warn!("a triggered snapshot build never started; triggering again");
+            }
+        }
+        if not_before.is_some_and(|t| std::time::Instant::now() >= t) {
+            not_before = None;
         }
         let since = applied.saturating_sub(snap.unwrap_or(0));
         let bytes = counted.bytes;
@@ -1234,32 +1338,95 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
             applied > snap.unwrap_or(0) && (since >= entries || bytes >= s.snapshot_log_bytes);
         if !due {
             // Nothing to retry (a snapshot arrived some other way).
+            if disk_refused {
+                node.snapshots.set_blocked(None);
+            }
             disk_refused = false;
         }
-        if due && pending.is_none() {
-            match node.disk.check("snapshot") {
+        if due && pending.is_none() && not_before.is_none() {
+            match node.disk.check_snapshot() {
                 Ok(()) => {
+                    if disk_refused {
+                        // The postponement is over (space freed).
+                        node.snapshots.set_blocked(None);
+                    }
                     disk_refused = false;
                     tracing::info!(applied, since, bytes, "building a snapshot");
+                    let builds = node.snapshots.build_state();
                     if node.raft.trigger().snapshot().await.is_err() {
                         return;
                     }
-                    pending = Some((applied, std::time::Instant::now()));
+                    pending = Some(Pending {
+                        applied,
+                        at: std::time::Instant::now(),
+                        builds,
+                        done: None,
+                    });
                 }
                 Err(e) => {
                     if !disk_refused {
                         tracing::warn!(error = %e, "snapshot postponed");
                         disk_refused = true;
+                        node.snapshots
+                            .set_blocked(Some(format!("snapshot postponed: {e}")));
                     }
                 }
             }
         }
-        let waiting = disk_refused || pending.is_some();
+        let waiting = disk_refused || pending.is_some() || not_before.is_some();
         tokio::select! {
             r = rx.changed() => if r.is_err() { return },
             _ = tokio::time::sleep(POLICY_TICK), if waiting => {}
         }
     }
+}
+
+/// A build the policy triggered and waits for.
+#[derive(Debug, Clone)]
+struct Pending {
+    /// The applied index when it was triggered: a snapshot at or above it
+    /// ends the wait.
+    applied: u64,
+    at: std::time::Instant,
+    /// The build counters when it was triggered.
+    builds: super::snapshot_dir::BuildState,
+    /// When the policy first saw the build ended well.
+    done: Option<std::time::Instant>,
+}
+
+/// What a failed build says (the log, `cluster status`, `snapshot_now`):
+/// its error, and the space a build needs (one copy of the store,
+/// estimated from the store file's length, an overestimate, plus
+/// `--min-free-disk`) on which volume.
+fn build_failed_message(disk: &DiskGuard, st: &super::snapshot_dir::BuildState) -> String {
+    let (need, dir) = disk.snapshot_need();
+    format!(
+        "snapshot build failed ({} in a row): {}; a build needs about {need} bytes free \
+         (one copy of the store plus --min-free-disk) on the volume of `{}`",
+        st.consecutive_failures.max(1),
+        st.last_error.as_deref().unwrap_or("unknown error"),
+        dir.display()
+    )
+}
+
+/// [`build_failed_message`] as an error: a full disk is `disk full ...`
+/// (`RESOURCE_EXHAUSTED` on the wire).
+fn build_failed_error(disk: &DiskGuard, st: &super::snapshot_dir::BuildState) -> StoreError {
+    let msg = build_failed_message(disk, st);
+    if graph_proto::error::is_disk_full(st.last_error.as_deref().unwrap_or("")) {
+        StoreError::Storage(format!("disk full: {msg}"))
+    } else {
+        StoreError::Storage(msg)
+    }
+}
+
+/// The wait after the `failures`th failed build in a row: `first`,
+/// doubling per failure, at most [`SNAPSHOT_RETRY_MAX`].
+pub fn snapshot_backoff(first: Duration, failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(20);
+    first
+        .saturating_mul(1u32 << shift)
+        .min(SNAPSHOT_RETRY_MAX.max(first))
 }
 
 /// The byte trigger's count: the encoded bytes of the applied log entries
@@ -1323,8 +1490,20 @@ impl AppliedBytes {
 /// refused or pending.
 pub const POLICY_TICK: Duration = Duration::from_secs(1);
 
-/// A triggered build that produced no snapshot is retried after this.
+/// The default first back-off after a failed build
+/// ([`RaftSettings::snapshot_retry_ms`]); also how long a trigger openraft
+/// never acted on is waited for.
 pub const SNAPSHOT_RETRY: Duration = Duration::from_secs(30);
+
+/// The longest back-off between failed builds.
+pub const SNAPSHOT_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// From this many failed builds in a row, each failure logs at error.
+pub const SNAPSHOT_FAILURES_LOUD: u32 = 3;
+
+/// A successful build that took at least this long makes the next one wait
+/// as long as it took (the duty floor; issue #331).
+pub const DUTY_FLOOR_MIN: Duration = Duration::from_secs(5);
 
 /// Start-up repair of a crash between a snapshot install's store swap and
 /// the promotion of the received file to the current snapshot (ADR 0004
@@ -1461,6 +1640,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// Issues #330/#331: the back-off after failed builds doubles from the
+    /// first retry, is capped, and never overflows.
+    #[test]
+    fn the_snapshot_backoff_doubles_up_to_its_cap() {
+        let s = Duration::from_secs;
+        assert_eq!(snapshot_backoff(s(30), 0), s(30));
+        assert_eq!(snapshot_backoff(s(30), 1), s(30));
+        assert_eq!(snapshot_backoff(s(30), 2), s(60));
+        assert_eq!(snapshot_backoff(s(30), 3), s(120));
+        assert_eq!(snapshot_backoff(s(30), 6), s(960));
+        assert_eq!(snapshot_backoff(s(30), 7), SNAPSHOT_RETRY_MAX);
+        assert_eq!(snapshot_backoff(s(30), u32::MAX), SNAPSHOT_RETRY_MAX);
+        assert_eq!(
+            snapshot_backoff(Duration::MAX, u32::MAX),
+            Duration::MAX,
+            "a first retry above the cap is kept"
+        );
+        assert_eq!(
+            snapshot_backoff(Duration::from_millis(200), 3),
+            Duration::from_millis(800)
+        );
+    }
 
     /// Issue #211: the byte trigger counts every applied entry above the
     /// snapshot exactly once, whenever it was appended: a backlog applied

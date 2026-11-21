@@ -712,7 +712,8 @@ enum Cmd {
         quorum_loss_timeout: Option<u64>,
         /// Refuse writes and snapshot builds (RESOURCE_EXHAUSTED) while the volume has less than
         /// this free plus one snapshot copy: a size (K/M/G) or a percentage of the volume such as
-        /// 5%. --data-dir default: 5% of the volume, clamped to 2-32 GiB. --db default: off
+        /// 5%. --data-dir default: 5% of the volume, clamped to 2-32 GiB. --db default: off (a
+        /// snapshot build still waits for room for one copy of the store)
         #[arg(long, value_parser = graph_cli::diskinfo::parse_min_free)]
         min_free_disk: Option<graph_cli::diskinfo::MinFree>,
         /// How long an open snapshot handle (a paging client's frozen view) may live: seconds, or with
@@ -2040,6 +2041,7 @@ fn run() -> Result<i32> {
                                     "mcp_addr": st.mcp_addr,
                                     "disk_stalled": st.disk_stalled,
                                     "disk_stall_message": st.disk_stall_message,
+                                    "snapshot_blocked": st.snapshot_blocked,
                                     "members": st.members.iter().map(|m| serde_json::json!({
                                         "node_id": m.node_id,
                                         "addr": m.addr,
@@ -2091,6 +2093,9 @@ fn run() -> Result<i32> {
                                 st.disk_stalled.join(", "),
                                 st.disk_stall_message
                             );
+                        }
+                        if !st.snapshot_blocked.is_empty() {
+                            out!("  SNAPSHOTS BLOCKED {}", st.snapshot_blocked);
                         }
                         for m in &st.members {
                             let lag = st

@@ -915,6 +915,7 @@ impl pb::admin_server::Admin for AdminService {
             entries_applied_total: self.ctx.raft.obs.apply_total(),
             disk_stalled: self.ctx.raft.disk_stall.sources(),
             disk_stall_message: self.ctx.raft.disk_stall.current().unwrap_or_default(),
+            snapshot_blocked: self.ctx.raft.snapshots.blocked().unwrap_or_default(),
             policy_hash: self.ctx.auth.policy_hash(),
             mcp_addr: self
                 .ctx

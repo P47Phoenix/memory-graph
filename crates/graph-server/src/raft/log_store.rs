@@ -456,6 +456,20 @@ impl RedbLogStore {
     /// compacted; a failure is logged, never fatal (the log is intact
     /// either way).
     pub fn compact_if_sparse(&self) -> bool {
+        self.compact_sparse(false)
+    }
+
+    /// [`compact_if_sparse`](Self::compact_if_sparse) without the
+    /// [`COMPACT_MAX_LIVE`] cap, for start-up, before the Raft core runs:
+    /// nothing appends yet, so a large live log stalls nobody. Without it a
+    /// log whose live part never gets under the cap (large entries kept
+    /// below each snapshot, issues #330/#331: 260 MB live in a 16 GB file)
+    /// never shrinks, restart or not.
+    pub fn compact_on_start(&self) -> bool {
+        self.compact_sparse(true)
+    }
+
+    fn compact_sparse(&self, uncapped: bool) -> bool {
         #[cfg(test)]
         self.record_skip(None);
         if self.closing.load(Ordering::SeqCst) {
@@ -500,7 +514,7 @@ impl RedbLogStore {
             return self.skip("within twice live");
         }
         let max_live = self.max_live.load(Ordering::Relaxed);
-        if live > max_live && !self.gated() {
+        if live > max_live && !uncapped && !self.gated() {
             tracing::info!(
                 file,
                 live,
@@ -525,6 +539,19 @@ impl RedbLogStore {
         if self.closing.load(Ordering::SeqCst) {
             return self.skip("closing");
         }
+        let when = if uncapped {
+            "at start-up"
+        } else {
+            "after a purge"
+        };
+        if uncapped {
+            // Start-up waits for it (the node serves once it is done).
+            tracing::info!(
+                file,
+                live,
+                "raft log: compacting a mostly empty log file at start-up"
+            );
+        }
         // `compact` itself loops until a pass makes no progress.
         let started = std::time::Instant::now();
         if let Err(e) = db.compact() {
@@ -538,7 +565,8 @@ impl RedbLogStore {
             after,
             live,
             took_ms = started.elapsed().as_millis() as u64,
-            "raft log compacted after a purge"
+            when,
+            "raft log compacted"
         );
         true
     }
@@ -1196,6 +1224,40 @@ mod tests {
         log.set_compact_max_live(COMPACT_MAX_LIVE);
         assert!(log.compact_if_sparse(), "compacts within the cap");
         assert!(log.file_bytes() < before / 2);
+    }
+
+    /// Issues #330/#331: a log whose live part stays above the cap is
+    /// never compacted after a purge, so a restart compacts it (before the
+    /// Raft core runs, nothing waits on the write lock), cap or not; the
+    /// entries and the purge point survive.
+    #[test]
+    fn a_restart_compacts_a_sparse_log_above_the_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("raft.redb");
+        let mut log = RedbLogStore::open(&path).unwrap();
+        fill_24_mib(&log);
+        log.set_compact_max_live(1 << 20);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let purged = LogId::new(CommittedLeaderId::new(1, 1), 20);
+        rt.block_on(log.purge(purged)).unwrap();
+        wait_compacted(&log);
+        let before = log.file_bytes();
+        assert!(before > 24 << 20, "not compacted: {before} B");
+        drop(log);
+        let mut log = RedbLogStore::open(&path).unwrap();
+        log.set_compact_max_live(1 << 20);
+        assert!(log.compact_on_start(), "compacts above the cap");
+        assert!(log.file_bytes() < before / 2, "{}", log.file_bytes());
+        let st = rt.block_on(log.get_log_state()).unwrap();
+        assert_eq!(st.last_purged_log_id, Some(purged));
+        let rest = rt.block_on(log.try_get_log_entries(0..100)).unwrap();
+        assert_eq!(
+            rest.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            [21, 22, 23, 24]
+        );
+        assert!(!log.compact_on_start(), "nothing left to gain");
     }
 
     /// CI (Linux): dropping the log right after a purge, while its

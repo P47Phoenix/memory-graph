@@ -3646,6 +3646,12 @@ pub struct StatusResponse {
     /// no --auth-policies (or the server predates the field).
     #[prost(string, tag = "36")]
     pub policy_hash: ::prost::alloc::string::String,
+    /// Issues #330/#331: why snapshots are blocked right now (the last build
+    /// failed, or one is postponed for lack of disk space), with the space a
+    /// build needs and the volume's path; empty: not blocked (or the server
+    /// predates the field). The Raft log is not purged meanwhile.
+    #[prost(string, tag = "37")]
+    pub snapshot_blocked: ::prost::alloc::string::String,
 }
 /// This node's snapshot backups since it started.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

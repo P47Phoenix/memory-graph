@@ -476,12 +476,60 @@ pub struct SnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
+    /// Never an `Err` (issues #330, #331): openraft 0.9 ends its Raft core
+    /// on a failed build (`RaftCore` propagates the state machine's command
+    /// result), so one disk-full export stopped the whole node. A failed
+    /// build is counted and logged by [`SnapshotDir::build`] (which also
+    /// removes its temp file), and answers the current snapshot instead, or
+    /// an empty one when there is none. The empty one is never newer than
+    /// what openraft has, so it is dropped. The current pair is normally
+    /// what openraft already has; it can be newer when an install promoted
+    /// a pair while this build ran (the install race), and then openraft
+    /// adopts that complete, committed pair, which is a valid snapshot (the
+    /// store already holds it). Either way nothing is purged that a snapshot
+    /// does not cover, and openraft's "building" flag is cleared so the
+    /// snapshot policy can retry (with back-off, `node::snapshot_policy`).
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError> {
         let slot = Arc::clone(&self.slot);
         let snaps = Arc::clone(&self.snapshots);
-        tokio::task::spawn_blocking(move || snaps.build(&slot).map_err(sm_err))
-            .await
-            .map_err(|e| sm_err(std::io::Error::other(format!("snapshot task: {e}"))))?
+        let r = tokio::task::spawn_blocking(move || match snaps.build(&slot) {
+            Ok(s) => s,
+            Err(_) => not_built(&snaps),
+        })
+        .await;
+        Ok(match r {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "snapshot build task failed");
+                let snaps = Arc::clone(&self.snapshots);
+                tokio::task::spawn_blocking(move || not_built(&snaps))
+                    .await
+                    .unwrap_or_else(|_| empty_snapshot(&self.snapshots))
+            }
+        })
+    }
+}
+
+/// What a failed build answers openraft: the current snapshot, or an empty
+/// one (see [`SnapshotBuilder::build_snapshot`]).
+fn not_built(snaps: &SnapshotDir) -> Snapshot<TypeConfig> {
+    snaps
+        .current_snapshot()
+        .unwrap_or_else(|| empty_snapshot(snaps))
+}
+
+/// A snapshot with no last log id: never newer than any snapshot openraft
+/// holds, so it is dropped without being read.
+fn empty_snapshot(snaps: &SnapshotDir) -> Snapshot<TypeConfig> {
+    Snapshot {
+        meta: SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "not-built".into(),
+        },
+        snapshot: Box::new(SnapshotFile {
+            path: snaps.dir().join("not-built"),
+        }),
     }
 }
 
