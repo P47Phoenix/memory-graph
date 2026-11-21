@@ -922,3 +922,119 @@ fn parse_resource_for_explain() {
         "Repo::\"a/b\\\"c\""
     );
 }
+
+// --- Mutation-testing kills (cargo mutants over lib.rs) ---------------------
+
+#[test]
+fn a_repeated_action_still_matches() {
+    let s = set(r#"permit(principal, action in [Action::"index", Action::"index"], resource);"#);
+    assert!(
+        s.decide(
+            &who("t", &[], Role::Write),
+            Action::Index,
+            &Resource::Cluster
+        )
+        .allowed
+    );
+    assert_eq!(
+        ActionScope::In(vec![Action::Read, Action::Read]).set(),
+        Action::Read.bit()
+    );
+}
+
+#[test]
+fn small_accessors() {
+    assert_eq!(Role::Read.name(), "read");
+    assert_eq!(Role::Write.name(), "write");
+    assert!(set("").is_empty());
+    assert!(!set("permit(principal, action, resource);").is_empty());
+    assert_eq!(READ_ACTIONS, Action::Read.bit() | Action::Search.bit());
+}
+
+#[test]
+fn org_wide_visits_and_matches_are_counted_once() {
+    let s = set(r#"@id("any") permit(principal, action, resource);
+@id("f") forbid(principal, action == Action::"prune", resource == Repo::"p/x");"#);
+    let d = s.decide_org_wide(&who("t", &[], Role::Write), Action::Prune, "o");
+    assert!(d.allowed);
+    // decide(Org) 2 + the repo-forbid scan 2 + decide(Cluster) 2.
+    assert_eq!(d.visited, 6);
+    assert_eq!(d.matched, vec!["any".to_string()], "no duplicates");
+    // Above the ceiling: nothing visited at all.
+    let d = s.decide_org_wide(&who("t", &[], Role::Read), Action::Prune, "o");
+    assert_eq!(d.visited, 0);
+    assert!(!d.allowed);
+}
+
+#[test]
+fn lint_cases() {
+    let s = set(r#"permit(principal in Group::"team", action, resource);"#);
+    assert!(s.lint(&|_| true, &|g| g == "team").is_empty());
+    let s = set(r#"permit(principal == Group::"team", action, resource);"#);
+    let w = s.lint(&|_| true, &|_| true);
+    assert!(w.iter().any(|m| m.contains("never matches")), "{w:?}");
+    let s = set(r#"permit(principal in Role::"read", action, resource);"#);
+    assert!(s.lint(&|_| true, &|_| true).is_empty());
+    let s = set(r#"permit(principal == Role::"read", action, resource);"#);
+    assert!(s
+        .lint(&|_| true, &|_| true)
+        .iter()
+        .any(|m| m.contains("never matches")));
+}
+
+#[test]
+fn control_characters_print_as_unicode_escapes() {
+    assert_eq!(escape("a\u{1}b"), "a\\u{1}b");
+    let s = set("permit(principal == Token::\"\\u{1}\", action, resource);");
+    let printed = s.policies()[0].to_string();
+    assert!(printed.contains("\\u{1}"), "{printed}");
+    assert_eq!(
+        strip(parse(printed.as_bytes()).unwrap()),
+        strip(s.policies().to_vec())
+    );
+}
+
+#[test]
+fn lexer_error_messages() {
+    assert!(perr("/ permit(principal, action, resource);")
+        .msg
+        .contains("unexpected character"));
+    assert!(perr("permit(principal = Token::\"a\", action, resource);")
+        .msg
+        .contains("unexpected character"));
+    assert!(perr("permit(principal == Token:\"a\", action, resource);")
+        .msg
+        .contains("unexpected character"));
+    assert!(perr("permit(?principal, action, resource);")
+        .msg
+        .contains("template"));
+    for t in ["/**", "/* *", "/*", "/*/"] {
+        assert!(perr(t).msg.contains("unterminated"), "{t}");
+    }
+    assert_eq!(
+        parse(b"/* a * b / c */ permit(principal, action, resource);")
+            .unwrap()
+            .len(),
+        1
+    );
+    // A newline inside a string still advances the line.
+    let e = perr("permit(principal == Token::\"a\nb\", action == Action::\"x\", resource);");
+    assert_eq!(e.line, 2, "{e}");
+    for kw in ["when", "unless"] {
+        let e = perr(&format!(
+            "permit(principal, action, resource) {kw} {{ true }};"
+        ));
+        assert!(e.msg.contains("conditions"), "{kw}: {e}");
+    }
+}
+
+#[test]
+fn escape_edge_cases() {
+    for bad in ["\\x+4", "\\u{0000041}", "\\u{+41}"] {
+        let t = format!("permit(principal == Token::\"{bad}\", action, resource);");
+        assert!(parse(t.as_bytes()).is_err(), "{bad}");
+    }
+    // An escape near the start of the input (no index underflow).
+    assert_eq!(parse_resource("Org::\"\\u{41}\"").unwrap().id, "A");
+    assert_eq!(parse_resource("Org::\"\\x41\"").unwrap().id, "A");
+}

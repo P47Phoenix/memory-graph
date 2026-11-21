@@ -642,6 +642,8 @@ enum Tok {
     Semi,
     At,
     EqEq,
+    /// Only so a condition reaches the parser and gets its own message.
+    Brace,
 }
 
 fn err(line: usize, msg: impl Into<String>) -> ParseError {
@@ -709,6 +711,10 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ParseError> {
             '=' if b.get(i + 1) == Some(&'=') => {
                 out.push((Tok::EqEq, line));
                 i += 2;
+            }
+            '{' | '}' => {
+                out.push((Tok::Brace, line));
+                i += 1;
             }
             '?' => {
                 return Err(err(
@@ -879,9 +885,6 @@ impl Parser {
                 Some(Tok::Str(s)) => break Ok((path.join("::"), s)),
                 Some(Tok::Ident(n)) => path.push(n),
                 _ => return self.fail("expected a string id after `::`"),
-            }
-            if path.len() > 1 && self.peek() != Some(&Tok::ColonColon) {
-                return self.fail("expected `::`");
             }
         }
         .and_then(|(ty, id)| {
