@@ -493,18 +493,21 @@ impl pb::store_server::Store for StoreService {
         let mut meta = self.ctx.raft.read_meta();
         meta.stale_possible &= !linearizable;
         let slot = Arc::clone(&self.ctx.slot);
-        let id = tokio::task::spawn_blocking(move || {
-            slot.with_store_read(|s| Ok(slot.snapshots().open_owned(conn, s, Some(meta), owner)))
-                .map_err(|e| graph_proto::store_error_to_status(&e))?
-        })
-        .await
-        .map_err(|e| Status::internal(format!("blocking task failed: {e}")))??;
         // ADR 0013 D8: the handle keeps the scopes it was opened with.
-        self.ctx.slot.snapshots().set_scopes(
-            id,
+        let scopes = (
             self.ctx.auth.read_scope(graph_authz::Action::Read),
             self.ctx.auth.read_scope(graph_authz::Action::Search),
         );
+        let id = tokio::task::spawn_blocking(move || {
+            slot.with_store_read(|s| {
+                Ok(slot
+                    .snapshots()
+                    .open_owned(conn, s, Some(meta), owner, scopes))
+            })
+            .map_err(|e| graph_proto::store_error_to_status(&e))?
+        })
+        .await
+        .map_err(|e| Status::internal(format!("blocking task failed: {e}")))??;
         Ok(Response::new(pb::OpenSnapshotResponse { snapshot_id: id }))
     }
 
