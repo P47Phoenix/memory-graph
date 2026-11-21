@@ -66,6 +66,8 @@ impl WriteService {
             .deadline(req.metadata(), crate::forward::FORWARD_INDEX_TIMEOUT);
         let mut incoming = req.into_inner();
         let mut client = self.ctx.fwd.write_client(addr)?;
+        let auth = Arc::clone(&self.ctx.auth);
+        let mut target: Option<(String, String)> = None;
         let (tx, rx) = tokio::sync::mpsc::channel::<pb::IndexRequest>(FORWARD_BUFFER);
         let call = crate::forward::within(
             self.ctx.fwd.me(),
@@ -80,7 +82,11 @@ impl WriteService {
         // sender is dropped and the forwarded stream ends too.
         let pump = async move {
             while let Some(msg) = incoming.next().await {
-                if tx.send(msg?).await.is_err() {
+                let msg = msg?;
+                // ADR 0013: the forwarding node checks each file against
+                // its current pair before it is forwarded.
+                check_index_msg(&auth, &mut target, &msg)?;
+                if tx.send(msg).await.is_err() {
                     // The leader answered already (an early error); the
                     // call below carries it.
                     break;
@@ -126,6 +132,8 @@ impl WriteService {
             None => return Err(ConvertError("empty Index stream".into()).into()),
         };
         let reindex = header.options.map(|o| o.reindex).unwrap_or(false);
+        let target = (header.org.clone(), header.repo.clone());
+        authorize_index(&self.ctx.auth, &target)?;
         let mut results = Vec::new();
         let mut applied_index = 0;
         let mut entries = 0usize;
@@ -139,6 +147,9 @@ impl WriteService {
                 }
                 None => return Err(ConvertError("empty IndexRequest".into()).into()),
             };
+            // ADR 0013 (Q6): each file is checked against the current pair
+            // as it is read, so a revocation stops the stream here.
+            authorize_index(&self.ctx.auth, &target)?;
             // A bad encoding hint is refused before anything is proposed.
             file.resolved_encoding_hint()?;
             if !pending.is_empty() && pending_bytes + file.bytes.len() > RAFT_ENTRY_MAX_BYTES {
@@ -284,6 +295,53 @@ impl WriteService {
     }
 }
 
+/// ADR 0013: `index` on the request's repo (a no-op without policies).
+fn authorize_index(auth: &crate::auth::Auth, (org, repo): &(String, String)) -> Result<(), Status> {
+    auth.authorize(
+        graph_authz::Action::Index,
+        graph_authz::Resource::Repo(org, repo),
+    )
+    .map_err(status)
+}
+
+/// The forwarding side of [`authorize_index`]: the header names the repo,
+/// and every file after it is checked again.
+fn check_index_msg(
+    auth: &crate::auth::Auth,
+    target: &mut Option<(String, String)>,
+    msg: &pb::IndexRequest,
+) -> Result<(), Status> {
+    match &msg.msg {
+        Some(pb::index_request::Msg::Header(h)) if target.is_none() => {
+            *target = Some((h.org.clone(), h.repo.clone()));
+        }
+        Some(pb::index_request::Msg::File(_)) => {}
+        // A malformed stream is the leader's to refuse.
+        _ => return Ok(()),
+    }
+    match target {
+        Some(t) => authorize_index(auth, t),
+        None => Ok(()),
+    }
+}
+
+/// ADR 0013 D6: `prune`/`delete` decided on policy alone: one repo on the
+/// `Repo`, an org-wide operation by the org-wide rule, a store-wide one on
+/// `Cluster::"this"`.
+fn authorize_scope(
+    auth: &crate::auth::Auth,
+    action: graph_authz::Action,
+    org: &str,
+    repo: Option<&str>,
+) -> Result<(), Status> {
+    match (org, repo) {
+        ("", _) => auth.authorize(action, graph_authz::Resource::Cluster),
+        (o, Some(r)) if !r.is_empty() => auth.authorize(action, graph_authz::Resource::Repo(o, r)),
+        (o, _) => auth.authorize_org_wide(action, o),
+    }
+    .map_err(status)
+}
+
 /// Cut `files` into chunks of at most `RAFT_ENTRY_MAX_BYTES` of source
 /// bytes (a larger single file alone): the same soft cap as `--chunk-bytes`.
 pub fn cut_chunks(files: Vec<pb::FileBytes>) -> Vec<Vec<pb::FileBytes>> {
@@ -330,6 +388,10 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<pb::IndexFileRequest>,
     ) -> Result<Response<pb::IndexFileResponse>, Status> {
+        authorize_index(
+            &self.ctx.auth,
+            &(req.get_ref().org.clone(), req.get_ref().repo.clone()),
+        )?;
         if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
             forward_unary!(self, addr, index_file, req);
         }
@@ -355,6 +417,10 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<pb::IngestExtractionRequest>,
     ) -> Result<Response<pb::IngestExtractionResponse>, Status> {
+        authorize_index(
+            &self.ctx.auth,
+            &(req.get_ref().org.clone(), req.get_ref().repo.clone()),
+        )?;
         if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
             forward_unary!(self, addr, ingest_extraction, req);
         }
@@ -385,6 +451,11 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<pb::PruneRequest>,
     ) -> Result<Response<pb::PruneResponse>, Status> {
+        {
+            let r = req.get_ref();
+            let action = graph_authz::Action::Prune;
+            authorize_scope(&self.ctx.auth, action, &r.org, Some(&r.repo))?;
+        }
         if !req.get_ref().dry_run {
             if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
                 forward_unary!(self, addr, prune, req);
@@ -428,6 +499,14 @@ impl pb::write_server::Write for WriteService {
         &self,
         req: Request<pb::DeleteRequest>,
     ) -> Result<Response<pb::DeleteResponse>, Status> {
+        {
+            // An empty org is the store's own refusal, below.
+            let r = req.get_ref();
+            if !r.org.is_empty() {
+                let action = graph_authz::Action::Delete;
+                authorize_scope(&self.ctx.auth, action, &r.org, r.repo.as_deref())?;
+            }
+        }
         if !req.get_ref().dry_run {
             if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
                 forward_unary!(self, addr, delete, req);

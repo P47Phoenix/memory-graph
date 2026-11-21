@@ -7,6 +7,7 @@ description = "memory-graph server (ADR 0004): the tonic services over a store r
 
 [dependencies]
 graph-core = { path = "../graph-core" }
+graph-authz = { path = "../graph-authz" }
 graph-store = { path = "../graph-store" }
 graph-proto = { path = "../graph-proto" }
 # `testing::ClusterTestbed::client` hands tests a RemoteStore.

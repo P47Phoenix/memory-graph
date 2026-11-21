@@ -127,6 +127,11 @@ message StatusResponse {
   // meanwhile, with `disk_stall_message`.
   repeated string disk_stalled = 34;
   string disk_stall_message = 35;
+  // ADR 0013 D2: SHA-256 (hex) of this node's normalised policy set, its
+  // --auth-builtins switch and its token file's ids, roles and groups
+  // (never a token digest), so an operator sees which nodes differ. Empty:
+  // no --auth-policies (or the server predates the field).
+  string policy_hash = 36;
 }
 
 // This node's snapshot backups since it started.

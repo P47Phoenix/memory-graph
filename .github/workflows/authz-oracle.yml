@@ -1,0 +1,26 @@
+name: authz oracle
+# ADR 0013 story 72a: a dev-only job comparing graph-authz's decisions with
+# cedar-policy on generated policy sets and requests. cedar-policy fails the
+# pure-Rust gate (stacker/psm build C), so the tool lives outside the
+# workspace with its own lockfile (tools/authz-oracle), like xtask; the
+# shipped binary never depends on it.
+on:
+  push:
+    branches: [main]
+    paths: ["crates/graph-authz/**", "tools/authz-oracle/**", "testdata/authz/**", ".github/workflows/authz-oracle.yml"]
+  pull_request:
+    paths: ["crates/graph-authz/**", "tools/authz-oracle/**", "testdata/authz/**", ".github/workflows/authz-oracle.yml"]
+jobs:
+  oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "tools/authz-oracle" }
+      - name: Compare decisions with cedar-policy
+        run: cargo run --release --manifest-path tools/authz-oracle/Cargo.toml -- --cases 5000 --seed ${{ github.run_number }}
+      - name: Keep any disagreement as a replay fixture
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: authz-oracle-fixtures, path: testdata/authz/oracle-* }

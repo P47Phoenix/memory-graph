@@ -1,0 +1,19 @@
+[
+  { "uid": { "type": "Token", "id": "t0" }, "attrs": {}, "parents": [{ "type": "Group", "id": "g0" }, { "type": "Role", "id": "read" }, { "type": "Role", "id": "write" }] },
+  { "uid": { "type": "Token", "id": "t1" }, "attrs": {}, "parents": [{ "type": "Group", "id": "g0" }, { "type": "Group", "id": "g1" }, { "type": "Role", "id": "read" }] },
+  { "uid": { "type": "Token", "id": "t2" }, "attrs": {}, "parents": [{ "type": "Role", "id": "read" }, { "type": "Role", "id": "write" }] },
+  { "uid": { "type": "Token", "id": "t3" }, "attrs": {}, "parents": [{ "type": "Group", "id": "g2" }, { "type": "Role", "id": "read" }, { "type": "Role", "id": "write" }] },
+  { "uid": { "type": "Group", "id": "g0" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Group", "id": "g1" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Group", "id": "g2" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Role", "id": "read" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Role", "id": "write" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Org", "id": "o0" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Org", "id": "o1" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Org", "id": "o0/x" }, "attrs": {}, "parents": [] },
+  { "uid": { "type": "Repo", "id": "o0/r0" }, "attrs": {}, "parents": [{ "type": "Org", "id": "o0" }] },
+  { "uid": { "type": "Repo", "id": "o0/r1" }, "attrs": {}, "parents": [{ "type": "Org", "id": "o0" }] },
+  { "uid": { "type": "Repo", "id": "o1/r0" }, "attrs": {}, "parents": [{ "type": "Org", "id": "o1" }] },
+  { "uid": { "type": "Repo", "id": "o1/a/b" }, "attrs": {}, "parents": [{ "type": "Org", "id": "o1" }] },
+  { "uid": { "type": "Cluster", "id": "this" }, "attrs": {}, "parents": [] }
+]

@@ -716,6 +716,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-authz"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "graph-cli"
 version = "0.1.0"
 dependencies = [
@@ -725,6 +732,7 @@ dependencies = [
  "crossbeam-channel",
  "encoding_rs",
  "globset",
+ "graph-authz",
  "graph-client",
  "graph-core",
  "graph-lang-asm",
@@ -1028,6 +1036,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "graph-authz",
  "graph-client",
  "graph-core",
  "graph-lang-csharp",

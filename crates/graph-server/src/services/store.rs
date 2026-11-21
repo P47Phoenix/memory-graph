@@ -51,9 +51,57 @@ fn nodes_into(v: Vec<Node>) -> Vec<pb::Node> {
     v.into_iter().map(Into::into).collect()
 }
 
+/// ADR 0013 PR 1 interim rule: a principal without an unconstrained read
+/// permit gets empty aggregate reads, and a named read is refused if the
+/// named node exists (a missing one keeps today's answer).
+fn named_node_gate(
+    open: bool,
+    s: &dyn graph_store::StoreRead,
+    id: graph_core::NodeId,
+) -> Result<(), StoreError> {
+    if !open && s.get(id)?.is_some() {
+        return Err(crate::auth::policy_denied(graph_authz::Action::Read));
+    }
+    Ok(())
+}
+
+/// The same for a read naming an org and/or a repo: refused if anything it
+/// names exists (`describe` with the same filter is non-empty).
+fn named_scope_gate(
+    action: graph_authz::Action,
+    s: &dyn graph_store::StoreRead,
+    org: Option<&str>,
+    repo: Option<&str>,
+) -> Result<(), StoreError> {
+    if !s.describe(org, repo)?.is_empty() {
+        return Err(crate::auth::policy_denied(action));
+    }
+    Ok(())
+}
+
 fn usize_of(what: &str, v: u64) -> Result<usize, Status> {
     usize::try_from(v)
         .map_err(|_| ConvertError(format!("`{what}` = {v} does not fit usize")).into())
+}
+
+/// The interim rule for the describe family: an unfiltered call answers
+/// empty, a filtered one that found something is refused.
+fn gate_rows<T>(
+    open: bool,
+    org: &Option<String>,
+    repo: &Option<String>,
+    rows: Vec<T>,
+) -> Result<Vec<T>, StoreError> {
+    if open {
+        return Ok(rows);
+    }
+    if org.is_none() && repo.is_none() {
+        return Ok(Vec::new());
+    }
+    if !rows.is_empty() {
+        return Err(crate::auth::policy_denied(graph_authz::Action::Read));
+    }
+    Ok(rows)
 }
 
 #[tonic::async_trait]
@@ -101,7 +149,14 @@ impl pb::store_server::Store for StoreService {
     async fn get(&self, req: Request<pb::GetRequest>) -> Result<Response<pb::GetResponse>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::Get, r);
-        let (node, meta) = self.ctx.read(r.view, move |s| s.get(r.id)).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
+        let (node, meta) = self
+            .ctx
+            .read(r.view, move |s| {
+                named_node_gate(open, s, r.id)?;
+                s.get(r.id)
+            })
+            .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::GetResponse {
@@ -117,7 +172,14 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::ParentResponse>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::Parent, r);
-        let (node, meta) = self.ctx.read(r.view, move |s| s.parent(r.id)).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
+        let (node, meta) = self
+            .ctx
+            .read(r.view, move |s| {
+                named_node_gate(open, s, r.id)?;
+                s.parent(r.id)
+            })
+            .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::ParentResponse {
@@ -134,7 +196,20 @@ impl pb::store_server::Store for StoreService {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::CountNodes, r);
         let kind = Wire::<NodeKind>::try_from(r.kind)?.0;
-        let (count, meta) = self.ctx.read(r.view, move |s| s.count_nodes(kind)).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
+        let (count, meta) = self
+            .ctx
+            .read(
+                r.view,
+                move |s| {
+                    if open {
+                        s.count_nodes(kind)
+                    } else {
+                        Ok(0)
+                    }
+                },
+            )
+            .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::CountNodesResponse {
@@ -150,7 +225,14 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::RootsResponse>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::Roots, r);
-        let (nodes, meta) = self.ctx.read(r.view, |s| s.roots()).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
+        let (nodes, meta) = self
+            .ctx
+            .read(
+                r.view,
+                move |s| if open { s.roots() } else { Ok(Vec::new()) },
+            )
+            .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::RootsResponse {
@@ -166,7 +248,14 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::ChildrenResponse>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::Children, r);
-        let (nodes, meta) = self.ctx.read(r.view, move |s| s.children(r.id)).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
+        let (nodes, meta) = self
+            .ctx
+            .read(r.view, move |s| {
+                named_node_gate(open, s, r.id)?;
+                s.children(r.id)
+            })
+            .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::ChildrenResponse {
@@ -182,10 +271,14 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::NodePage>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::ChildrenPage, r);
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
         let (page, meta) = self
             .ctx
-            .read(r.view, move |s| s.children_page(r.id, offset, limit))
+            .read(r.view, move |s| {
+                named_node_gate(open, s, r.id)?;
+                s.children_page(r.id, offset, limit)
+            })
             .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(page.into(), meta))
@@ -199,7 +292,14 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<Self::DescendantsStream>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::Descendants, r);
-        let (nodes, meta) = self.ctx.read(r.view, move |s| s.descendants(r.id)).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
+        let (nodes, meta) = self
+            .ctx
+            .read(r.view, move |s| {
+                named_node_gate(open, s, r.id)?;
+                s.descendants(r.id)
+            })
+            .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(batches(nodes), meta))
     }
@@ -210,10 +310,14 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::NodePage>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::DescendantsPage, r);
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
         let (offset, limit) = (usize_of("offset", r.offset)?, usize_of("limit", r.limit)?);
         let (page, meta) = self
             .ctx
-            .read(r.view, move |s| s.descendants_page(r.id, offset, limit))
+            .read(r.view, move |s| {
+                named_node_gate(open, s, r.id)?;
+                s.descendants_page(r.id, offset, limit)
+            })
             .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(page.into(), meta))
@@ -225,7 +329,14 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::AncestorsResponse>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::Ancestors, r);
-        let (nodes, meta) = self.ctx.read(r.view, move |s| s.ancestors(r.id)).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
+        let (nodes, meta) = self
+            .ctx
+            .read(r.view, move |s| {
+                named_node_gate(open, s, r.id)?;
+                s.ancestors(r.id)
+            })
+            .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
             pb::AncestorsResponse {
@@ -243,9 +354,16 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<Self::FileTokensStream>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::FileTokens, r);
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
         let (toks, meta) = self
             .ctx
-            .read(r.view, move |s| s.file_tokens(&r.org, &r.repo, &r.path))
+            .read(r.view, move |s| {
+                let toks = s.file_tokens(&r.org, &r.repo, &r.path)?;
+                if !open && toks.is_some() {
+                    return Err(crate::auth::policy_denied(graph_authz::Action::Read));
+                }
+                Ok(toks)
+            })
             .await?;
         self.ctx.note_query(key, &meta);
         Ok(reply(
@@ -266,10 +384,12 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::DescribeResponse>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::Describe, r);
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
         let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
-                s.describe(r.org.as_deref(), r.repo.as_deref())
+                let rows = s.describe(r.org.as_deref(), r.repo.as_deref())?;
+                gate_rows(open, &r.org, &r.repo, rows)
             })
             .await?;
         self.ctx.note_query(key, &meta);
@@ -287,10 +407,12 @@ impl pb::store_server::Store for StoreService {
     ) -> Result<Response<pb::DescribeResponse>, Status> {
         let mut r = req.into_inner();
         let key = view_free_key!(ReadRpc::DescribeByScan, r);
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Read);
         let (repos, meta) = self
             .ctx
             .read(r.view, move |s| {
-                s.describe_by_scan(r.org.as_deref(), r.repo.as_deref())
+                let rows = s.describe_by_scan(r.org.as_deref(), r.repo.as_deref())?;
+                gate_rows(open, &r.org, &r.repo, rows)
             })
             .await?;
         self.ctx.note_query(key, &meta);
@@ -311,6 +433,24 @@ impl pb::store_server::Store for StoreService {
         req: Request<pb::ExtractorGapsRequest>,
     ) -> Result<Response<pb::ExtractorGapsResponse>, Status> {
         use crate::forward::{forward_error, within, Forwarder, Route, FORWARD_UNARY_TIMEOUT};
+        // ADR 0013 PR 1: the node the client called applies the interim
+        // read rule before forwarding.
+        if !self.ctx.auth.read_allowed(graph_authz::Action::Read) {
+            let (org, repo) = (req.get_ref().org.clone(), req.get_ref().repo.clone());
+            if org.is_none() && repo.is_none() {
+                return Ok(Response::new(pb::ExtractorGapsResponse { gaps: vec![] }));
+            }
+            self.ctx
+                .read(None, move |s| {
+                    named_scope_gate(
+                        graph_authz::Action::Read,
+                        s,
+                        org.as_deref(),
+                        repo.as_deref(),
+                    )
+                })
+                .await?;
+        }
         if let Route::Leader { addr, .. } = self.ctx.fwd.route(&self.ctx.raft, &req)? {
             let deadline = self.ctx.fwd.deadline(req.metadata(), FORWARD_UNARY_TIMEOUT);
             let mut client = self.ctx.fwd.store_client(&addr)?;
@@ -357,6 +497,7 @@ impl pb::store_server::Store for StoreService {
             q.limit.get_or_insert(DEFAULT_SEARCH_LIMIT as u64);
         }
         let key = view_free_key!(ReadRpc::SearchSymbols, r);
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Search);
         let q: SymbolQuery = r
             .query
             .ok_or_else(|| {
@@ -368,6 +509,13 @@ impl pb::store_server::Store for StoreService {
         let (hits, meta) = self
             .ctx
             .read(r.view, move |s| {
+                if !open {
+                    if q.org.is_none() && q.repo.is_none() {
+                        return Ok(Vec::new());
+                    }
+                    let action = graph_authz::Action::Search;
+                    named_scope_gate(action, s, q.org.as_deref(), q.repo.as_deref())?;
+                }
                 graph_store::with_query_deadline(deadline, || s.search_symbols(&q))
             })
             .await?;
@@ -410,7 +558,20 @@ impl pb::store_server::Store for StoreService {
             .try_into()?;
         // Only a page the default limit filled is reported as defaulted, so a
         // small answer needs no paging round trips.
-        let (hits, meta) = self.ctx.read(r.view, move |s| s.search(&q)).await?;
+        let open = self.ctx.auth.read_allowed(graph_authz::Action::Search);
+        let (hits, meta) = self
+            .ctx
+            .read(r.view, move |s| {
+                if !open {
+                    if q.org.is_none() && q.repo.is_none() {
+                        return Ok(Vec::new());
+                    }
+                    let action = graph_authz::Action::Search;
+                    named_scope_gate(action, s, q.org.as_deref(), q.repo.as_deref())?;
+                }
+                s.search(&q)
+            })
+            .await?;
         self.ctx.note_query(key, &meta);
         let hits_len = hits.len();
         let omit = self.ctx.omit_name_pos;

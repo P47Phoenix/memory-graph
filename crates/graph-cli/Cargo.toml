@@ -39,6 +39,7 @@ lang-asm = ["dep:graph-lang-asm"]
 
 [dependencies]
 graph-core = { path = "../graph-core" }
+graph-authz = { path = "../graph-authz" }
 graph-store = { path = "../graph-store" }
 graph-server = { path = "../graph-server" }
 graph-client = { path = "../graph-client" }

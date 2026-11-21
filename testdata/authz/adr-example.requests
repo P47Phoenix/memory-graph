@@ -1,0 +1,11 @@
+# token	groups	role	action	resource	decision
+bob	acme-readers	read	read	Repo::"acme/web"	allow
+bob	acme-readers	read	search	Org::"acme"	allow
+bob	acme-readers	read	read	Repo::"other/web"	deny
+web-ci		write	index	Repo::"acme/web"	allow
+web-ci		write	read	Repo::"acme/web"	deny
+web-ci		write	index	Repo::"acme/api"	deny
+legal-ci		write	index	Repo::"acme/legal"	deny
+legal-ci		write	read	Repo::"acme/legal"	allow
+legal-ci		write	delete	Org::"acme"	allow
+legal-ci		write	index	Cluster::"this"	deny

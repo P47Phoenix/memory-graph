@@ -873,6 +873,24 @@ pub async fn start(
         auth: Arc::clone(&auth),
     });
     auth.spawn_reloader(shutdown.clone());
+    if auth.policies_on() {
+        // ADR 0013 D1 (Q8): an org whose name holds `/` cannot be named by
+        // a `Repo::` policy (the id splits at the first `/`).
+        let orgs = slot.with_store_read(|s| graph_store::StoreRead::describe(s, None, None));
+        if let Ok(rows) = orgs {
+            let mut seen = std::collections::BTreeSet::new();
+            for r in rows.iter().filter(|r| r.org.contains('/')) {
+                if seen.insert(r.org.clone()) {
+                    tracing::warn!(
+                        org = %r.org,
+                        "auth policies: this org's name contains `/`; a `Repo::` policy cannot \
+                         address its repos (grant it through `Org::` or an unconstrained \
+                         resource)"
+                    );
+                }
+            }
+        }
+    }
     if let Some(otlp) = &cfg.otlp_metrics {
         // A weak link: the exporter must not keep a stopped node alive.
         let node = Arc::downgrade(&ctx);
