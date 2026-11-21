@@ -425,13 +425,34 @@ fn mcp_tool_calls_follow_the_policies() {
         serde_json::json!({"name": "search", "arguments": {"text": "alpha"}}),
     );
     assert!(v.to_string().contains("alpha"), "{v}");
-    // `w` holds none: an isError result with permission_denied, HTTP 200
-    // (the request helper asserts the 200).
+    // `w` holds none. Decided once, by the read rule (PR 2 review): an
+    // aggregate search answers empty; one naming an existing repo is an
+    // isError result with permission_denied, HTTP 200 (the request helper
+    // asserts the 200).
     let mut c = McpHttpClient::with_token(addr, Some(&f.write));
     let v = c.request(
         "tools/call",
         serde_json::json!({"name": "search", "arguments": {"text": "alpha"}}),
     );
+
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let decisions = |a: &str| {
+        ts.running()
+            .unwrap()
+            .auth()
+            .authz_decisions()
+            .into_iter()
+            .filter(|(x, _, _)| a.is_empty() || *x == a)
+            .map(|(_, _, n)| n)
+            .sum::<u64>()
+    };
+    // Every action (the tool names its repo through a `read` first).
+    let before = decisions("");
+    let v = c.request(
+        "tools/call",
+        serde_json::json!({"name": "search", "arguments": {"text": "alpha", "org": "acme", "repo": "api"}}),
+    );
+    assert_eq!(decisions(""), before + 1, "one decision per tool call: {v}");
     assert_eq!(v["result"]["isError"], true, "{v}");
     let text = v["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
@@ -1123,4 +1144,74 @@ permit(principal in Role::"write", action == Action::"status", resource);"#,
         raw_call(&ep, READ_INDEX, &fwd("read")),
         Code::PermissionDenied
     );
+}
+
+/// ADR 0013 D7, owner decision 2026-11-21: a node's own calls (the
+/// `--bootstrap-or-join` removal of its lost incarnation) present
+/// `--auth-node-token-id`, a token of the node's own file, and the leader
+/// decides `admin` on `Cluster::"this"` for it: allowed with an admin
+/// grant, refused without one, refused for an id the leader does not know.
+#[test]
+fn a_nodes_own_call_presents_its_node_token() {
+    use graph_server::auth::{Auth, NodeHeaders};
+    let remove_code = |e: &Env, node_tokens: &std::path::Path, id: &str| {
+        let mut cfg = e.f.config();
+        cfg.tokens = Some(node_tokens.to_path_buf());
+        cfg.node_token_id = Some(id.to_string());
+        let auth = Auth::load(&cfg, true).unwrap();
+        let ep = e.ts.endpoint();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let ch = tonic::transport::Endpoint::from_shared(format!("http://{ep}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let headers = NodeHeaders {
+                auth,
+                forwarded_by: Some(9),
+            };
+            let mut c = graph_proto::pb::admin_client::AdminClient::with_interceptor(ch, headers);
+            match c
+                .remove(graph_proto::pb::RemoveRequest {
+                    node_id: 9,
+                    force: true,
+                })
+                .await
+            {
+                Ok(_) => tonic::Code::Ok,
+                Err(st) => st.code(),
+            }
+        })
+    };
+    let admin = r#"@id("node-admin")
+permit(principal == Token::"w2", action == Action::"admin", resource == Cluster::"this");"#;
+    // Granted: the call passes authorization (this `--db` server then
+    // refuses the removal itself, which is not a permission refusal).
+    let e = env_with(admin, false);
+    let code = remove_code(&e, &e.f.tokens, "w2");
+    assert_ne!(code, tonic::Code::PermissionDenied, "{code:?}");
+    assert_ne!(code, tonic::Code::Unauthenticated, "{code:?}");
+    // No admin grant for the node token: refused.
+    let e = env_with(POLICIES, false);
+    assert_eq!(
+        remove_code(&e, &e.f.tokens, "w2"),
+        tonic::Code::PermissionDenied
+    );
+    // An id in the node's own file that the leader does not know: refused.
+    let e = env_with(admin, false);
+    let own = e.f.dir.path().join("node-tokens.toml");
+    let node_token = graph_server::auth::new_credential("mgt_").to_string();
+    std::fs::write(&own, stanza("node9", "write", &node_token, None)).unwrap();
+    assert_eq!(
+        remove_code(&e, &own, "node9"),
+        tonic::Code::PermissionDenied
+    );
+    // The id must be in the node's own token file.
+    let mut cfg = e.f.config();
+    cfg.node_token_id = Some("nobody".into());
+    assert!(Auth::load(&cfg, true).is_err());
 }

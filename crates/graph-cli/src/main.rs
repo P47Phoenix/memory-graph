@@ -627,6 +627,12 @@ enum Cmd {
         /// searches and sees status everywhere; a `write` token may do anything)
         #[arg(long, requires = "auth_policies")]
         auth_builtins: bool,
+        /// With --auth-tokens: the id of a token in this node's own token file that the node
+        /// presents (as mg-forwarded-token-id) on calls it makes on its own behalf, today the
+        /// --bootstrap-or-join removal of its lost incarnation. With --auth-policies the leader
+        /// decides `admin` on Cluster::"this" for that token; without it such a call is refused
+        #[arg(long, value_name = "ID", requires = "auth_tokens")]
+        auth_node_token_id: Option<String>,
         /// With --auth-tokens: allow --listen, --advertise, --mcp-listen and --metrics-listen on
         /// addresses other than loopback. This server has no TLS: tokens, the cluster secret and
         /// all data then cross the network in clear text unless a TLS-terminating proxy or a
@@ -1447,6 +1453,7 @@ fn run() -> Result<i32> {
         cluster_secret_file,
         auth_policies,
         auth_builtins,
+        auth_node_token_id,
         insecure_transport,
         mcp_allow_origin,
         mcp_read,
@@ -1756,6 +1763,7 @@ fn run() -> Result<i32> {
             cluster_secret: cluster_secret_file.clone(),
             policies: auth_policies.clone(),
             builtins: *auth_builtins,
+            node_token_id: auth_node_token_id.clone(),
         };
         cfg.insecure_transport = *insecure_transport;
         cfg.snapshot_max_age = *snapshot_max_age;

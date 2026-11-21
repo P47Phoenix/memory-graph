@@ -4725,7 +4725,9 @@ impl V2Store {
     /// transaction. A repo of `org` not in the list (created after
     /// admission) is kept, and so is the org node then; a listed repo that
     /// is gone already is skipped. The org node goes only when no repo is
-    /// left, as for [`Store::delete_scope`].
+    /// left, as for [`Store::delete_scope`]. The list holds names, so a repo
+    /// deleted and re-created under the same name between admission and
+    /// apply is still deleted.
     pub fn delete_repos_marked(
         &self,
         org: &str,
@@ -4807,11 +4809,14 @@ impl V2Store {
         }
         let targets: Vec<(NodeId, String)> = match (repo, only) {
             (Some(r), _) => all.iter().filter(|(_, n)| n == r).cloned().collect(),
-            (None, Some(list)) => all
-                .iter()
-                .filter(|(_, n)| list.iter().any(|l| l == n))
-                .cloned()
-                .collect(),
+            (None, Some(list)) => {
+                let list: std::collections::HashSet<&str> =
+                    list.iter().map(String::as_str).collect();
+                all.iter()
+                    .filter(|(_, n)| list.contains(n.as_str()))
+                    .cloned()
+                    .collect()
+            }
             (None, None) => all.clone(),
         };
         if repo.is_some() && targets.is_empty() {

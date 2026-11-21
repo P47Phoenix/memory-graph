@@ -971,6 +971,14 @@ pub struct AuthConfig {
     /// `--auth-builtins` (D4, Q1): with a policy file, also load the two
     /// built-in role policies.
     pub builtins: bool,
+    /// `--auth-node-token-id` (ADR 0013 D7, owner decision 2026-11-21): the
+    /// id of a token in this node's own token file that the node presents
+    /// as `mg-forwarded-token-id` on the calls it makes on its own behalf
+    /// (the `--bootstrap-or-join` removal of its lost incarnation). The
+    /// leader decides `admin` on `Cluster::"this"` for it, as for any
+    /// forwarded principal. `None`: such calls carry no principal and are
+    /// refused under `--auth-policies`.
+    pub node_token_id: Option<String>,
 }
 
 /// Refusal classes, as `mg_auth_refusals_total{reason}` labels.
@@ -1103,6 +1111,8 @@ pub struct Auth {
     limiter: Mutex<HashMap<Option<IpAddr>, (Instant, u64)>>,
     reload_lock: tokio::sync::Mutex<()>,
     authz: AuthzStats,
+    /// `--auth-node-token-id`.
+    node_token_id: Option<String>,
 }
 
 impl std::fmt::Debug for Auth {
@@ -1124,6 +1134,7 @@ impl Auth {
             limiter: Mutex::default(),
             reload_lock: tokio::sync::Mutex::new(()),
             authz: AuthzStats::default(),
+            node_token_id: None,
         })
     }
 
@@ -1194,6 +1205,18 @@ impl Auth {
                     .into(),
             ));
         }
+        if let Some(id) = &cfg.node_token_id {
+            let known = tokens
+                .as_ref()
+                .is_some_and(|s| s.cur.load().entry(id, SystemTime::now()).is_some());
+            if !known {
+                return Err(StoreError::Rejected(
+                    "--auth-node-token-id must name a token (not expired) in this node's \
+                     --auth-tokens file"
+                        .into(),
+                ));
+            }
+        }
         if tokens.is_some() && secret.is_none() && clustered {
             return Err(StoreError::Rejected(
                 "--auth-tokens on a --data-dir node needs --cluster-secret-file: every node of \
@@ -1208,6 +1231,7 @@ impl Auth {
             limiter: Mutex::default(),
             reload_lock: tokio::sync::Mutex::new(()),
             authz: AuthzStats::default(),
+            node_token_id: cfg.node_token_id.clone(),
         }))
     }
 
@@ -1435,12 +1459,13 @@ impl Auth {
                 if let Some(a) = a {
                     self.count_decision(a, false);
                 }
-                if self.audit_limited(peer) {
+                if let Some(suppressed) = self.audit_limited(peer) {
                     tracing::info!(
                         target: "mg::audit",
                         action = a.map_or("", graph_authz::Action::name),
                         decision = "deny",
                         reason = why,
+                        suppressed,
                         "authz: forwarded headers refused"
                     );
                 }
@@ -1513,31 +1538,14 @@ impl Auth {
     }
 
     /// Whether a denial line from `peer` may be logged now (ADR 0012's
-    /// per-peer window); suppressed lines are counted into the next one.
-    fn audit_limited(&self, peer: Option<IpAddr>) -> bool {
-        let now = Instant::now();
-        let mut g = self
-            .authz
+    /// per-peer window): `Some(n)`, with `n` the lines suppressed since the
+    /// last one (logged as `suppressed`), or `None` to suppress this one.
+    fn audit_limited(&self, peer: Option<IpAddr>) -> Option<u64> {
+        self.authz
             .limiter
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if g.len() > 10_000 {
-            g.retain(|_, (at, _)| now.duration_since(*at) < REFUSAL_LOG_WINDOW);
-        }
-        match g.get_mut(&peer) {
-            Some((at, n)) if now.duration_since(*at) < REFUSAL_LOG_WINDOW => {
-                *n += 1;
-                false
-            }
-            Some(e) => {
-                *e = (now, 0);
-                true
-            }
-            None => {
-                g.insert(peer, (now, 0));
-                true
-            }
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .admit(peer, Instant::now())
     }
 
     /// The audit line of a decision (D9, target `mg::audit`): token id,
@@ -1564,8 +1572,10 @@ impl Auth {
         let role = p.role.name();
         if d.allowed && matches!(action, A::Read | A::Search) {
             tracing::debug!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, role, action = action.name(), resource = %res, decision, matched = ?d.matched, "authz");
-        } else if d.allowed || self.audit_limited(peer) {
+        } else if d.allowed {
             tracing::info!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, role, action = action.name(), resource = %res, decision, matched = ?d.matched, "authz");
+        } else if let Some(suppressed) = self.audit_limited(peer) {
+            tracing::info!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, role, action = action.name(), resource = %res, decision, matched = ?d.matched, suppressed, "authz");
         }
     }
 
@@ -1575,12 +1585,13 @@ impl Auth {
         let span = tracing::Span::current();
         span.record("authz.action", action.name());
         span.record("authz.decision", "deny");
-        if self.audit_limited(peer) {
+        if let Some(suppressed) = self.audit_limited(peer) {
             tracing::info!(
                 target: "mg::audit",
                 action = action.name(),
                 decision = "deny",
                 reason = "no known principal",
+                suppressed,
                 "authz"
             );
         }
@@ -1667,7 +1678,7 @@ impl Auth {
     /// caller, so every policy check and every forward to the leader treat
     /// the tool call exactly as a gRPC call of that token. `None` with auth
     /// off or without a valid token (the endpoint answers 401 first).
-    pub fn mcp_caller(&self, headers: &http::HeaderMap) -> Option<Caller> {
+    pub fn mcp_caller(&self, headers: &http::HeaderMap, peer: Option<IpAddr>) -> Option<Caller> {
         let state = self.tokens.as_ref()?.cur.load();
         let raw = headers
             .get(http::header::AUTHORIZATION)
@@ -1679,38 +1690,10 @@ impl Auth {
                     role: e.role,
                 },
                 conn: 0,
-                peer: None,
+                peer,
             }),
             _ => None,
         }
-    }
-
-    /// With `--auth-policies`, decide an MCP read tool call for the token in
-    /// `headers` under the PR 1 interim read rule (all or nothing, on
-    /// `Cluster::"this"`) until the read tools are scoped (PR 3). The write
-    /// tools (`index_path`, `prune`) are decided per repo by the Write
-    /// service they call, with the token as the caller (PR 2): `None` here.
-    /// `None`: allowed, or policies off.
-    pub fn mcp_tool_denied(&self, headers: &http::HeaderMap, tool: &str) -> Option<StoreError> {
-        use graph_authz::Action as A;
-        let state = self.tokens.as_ref()?.cur.load();
-        let set = state.policies.as_ref()?;
-        let action = match tool {
-            "search" | "find_symbols" => A::Search,
-            t if graph_mcp::is_write_tool(t) => return None,
-            _ => A::Read,
-        };
-        let raw = headers
-            .get(http::header::AUTHORIZATION)
-            .map(|v| v.as_bytes());
-        let Cred::Token(e) = self.credential(raw, &state.tokens, None, SystemTime::now()) else {
-            return Some(StoreError::Unauthenticated(UNAUTHENTICATED_MSG.into()));
-        };
-        let p = principal_of(e);
-        let res = graph_authz::Resource::Cluster;
-        let d = self.decide_timed(|| set.decide(&p, action, &res));
-        self.audit(e, &p, action, &res, &d, None);
-        (!d.allowed).then(|| policy_denied(action))
     }
 
     fn credential<'a>(
@@ -1979,8 +1962,9 @@ thread_local! {
 }
 
 /// Marks the current thread as running in-process calls until dropped
-/// (ADR 0013 PR 1). The MCP endpoint enters it around a tool call it has
-/// already decided ([`Auth::mcp_tool_denied`]); nothing else may.
+/// (ADR 0013 PR 1). Since PR 2 the MCP endpoint runs its tool calls with
+/// the token as the caller instead ([`Auth::mcp_caller`]); kept for an
+/// in-process caller that has already been decided.
 pub struct InProcessGuard(bool);
 
 impl InProcessGuard {
@@ -2047,7 +2031,55 @@ struct AuthzStats {
     seconds: Mutex<crate::observe::Histogram>,
     otlp: std::sync::OnceLock<crate::telemetry::OtlpRecorders>,
     /// The per-peer window of audit denial lines.
-    limiter: Mutex<HashMap<Option<IpAddr>, (Instant, u64)>>,
+    limiter: Mutex<AuditLimiter>,
+}
+
+/// At most this many peers in the audit window; past it, a denial from a
+/// new peer is suppressed (and counted) instead of tracked.
+const AUDIT_LIMITER_CAP: usize = 4096;
+
+/// The per-peer window of audit denial lines (ADR 0013 D9): peer ->
+/// (window start, lines suppressed since), never more than
+/// [`AUDIT_LIMITER_CAP`] peers. Expired entries are swept only when the
+/// map is full, and at most once per window, so no call pays an O(n) sweep
+/// under a flood.
+#[derive(Default)]
+struct AuditLimiter {
+    peers: HashMap<Option<IpAddr>, (Instant, u64)>,
+    swept: Option<Instant>,
+    /// Lines suppressed because the map was full; reported (as
+    /// `suppressed`) on the next line that is logged.
+    overflow: u64,
+}
+
+impl AuditLimiter {
+    fn admit(&mut self, peer: Option<IpAddr>, now: Instant) -> Option<u64> {
+        if let Some((at, n)) = self.peers.get_mut(&peer) {
+            if now.duration_since(*at) < REFUSAL_LOG_WINDOW {
+                *n += 1;
+                return None;
+            }
+            let s = std::mem::take(n) + std::mem::take(&mut self.overflow);
+            *at = now;
+            return Some(s);
+        }
+        if self.peers.len() >= AUDIT_LIMITER_CAP {
+            if self
+                .swept
+                .is_none_or(|s| now.duration_since(s) >= REFUSAL_LOG_WINDOW)
+            {
+                self.swept = Some(now);
+                self.peers
+                    .retain(|_, (at, _)| now.duration_since(*at) < REFUSAL_LOG_WINDOW);
+            }
+            if self.peers.len() >= AUDIT_LIMITER_CAP {
+                self.overflow += 1;
+                return None;
+            }
+        }
+        self.peers.insert(peer, (now, 0));
+        Some(std::mem::take(&mut self.overflow))
+    }
 }
 
 /// Stamp the cluster secret (when this node has one) on outgoing metadata.
@@ -2089,6 +2121,17 @@ impl tonic::service::Interceptor for NodeHeaders {
                 wire::FORWARDED_ROLE_HEADER,
                 MetadataValue::from_static(Role::Write.as_str()),
             );
+            // ADR 0013 D7 (owner decision 2026-11-21): the node's own
+            // principal, from its own token file, so a leader with
+            // `--auth-policies` decides the call for it.
+            if let Some(v) = self
+                .auth
+                .node_token_id
+                .as_deref()
+                .and_then(|id| id.parse().ok())
+            {
+                md.insert(wire::FORWARDED_TOKEN_ID_HEADER, v);
+            }
         }
         Ok(req)
     }
@@ -2679,5 +2722,40 @@ mod tests {
             let _ = parse_secret_file(&s);
             let _ = parse_rfc3339(&s);
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_limiter_tests {
+    use super::*;
+
+    /// D9 review: one line per peer per window, the suppressed count on
+    /// the next line, and a hard cap on tracked peers (new peers past it
+    /// are suppressed and counted, never tracked).
+    #[test]
+    fn the_audit_window_is_per_peer_counted_and_bounded() {
+        let mut l = AuditLimiter::default();
+        let t0 = Instant::now();
+        let a = Some(IpAddr::from([10, 0, 0, 1]));
+        assert_eq!(l.admit(a, t0), Some(0));
+        assert_eq!(l.admit(a, t0), None);
+        assert_eq!(l.admit(a, t0), None);
+        let later = t0 + REFUSAL_LOG_WINDOW;
+        assert_eq!(l.admit(a, later), Some(2), "two suppressed since");
+        // Fill to the cap with live peers.
+        for i in 0..AUDIT_LIMITER_CAP - 1 {
+            let ip = IpAddr::from((i as u32 + 1).to_be_bytes());
+            assert_eq!(l.admit(Some(ip), later), Some(0));
+        }
+        assert_eq!(l.peers.len(), AUDIT_LIMITER_CAP);
+        let new = Some(IpAddr::from([192, 168, 0, 1]));
+        assert_eq!(l.admit(new, later), None, "full: suppressed");
+        assert_eq!(l.admit(new, later), None);
+        assert_eq!(l.peers.len(), AUDIT_LIMITER_CAP, "never grows past the cap");
+        // A window later the expired peers are swept and the overflow is
+        // reported on the next line.
+        let much_later = later + REFUSAL_LOG_WINDOW;
+        assert_eq!(l.admit(new, much_later), Some(2));
+        assert_eq!(l.peers.len(), 1);
     }
 }

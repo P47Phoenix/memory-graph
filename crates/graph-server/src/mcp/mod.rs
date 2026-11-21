@@ -326,6 +326,11 @@ struct McpState {
     session_idle: Duration,
 }
 
+/// The HTTP peer of an MCP request (a request extension): the key of the
+/// per-peer audit window (ADR 0013 D9).
+#[derive(Debug, Clone, Copy)]
+struct McpPeer(Option<IpAddr>);
+
 /// Serve `/mcp` on `listener` until `shutdown`.
 pub async fn serve(listener: TcpListener, cfg: McpConfig, ctx: Arc<Ctx>, shutdown: ShutdownHandle) {
     let bound = match listener.local_addr() {
@@ -510,8 +515,10 @@ async fn serve_connection(
         last_done: Mutex::new(tokio::time::Instant::now()),
     });
     let svc_activity = Arc::clone(&activity);
-    let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+    let peer = McpPeer(stream.peer_addr().ok().map(|a| a.ip()));
+    let svc = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
         let mut app = app.clone();
+        req.extensions_mut().insert(peer);
         let busy = InFlight::start(&svc_activity);
         // `busy` drops when the response head is ready, not when its body
         // has been written; that is safe because the idle timeout closes
@@ -775,14 +782,13 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     } else {
         None
     };
-    // ADR 0013 PR 1: with a policy file, a tool call is decided for the
-    // token before it runs (kept only then; nothing changes without one).
-    let policy_headers = st.ctx.auth.policies_on().then(|| req.headers().clone());
     // ADR 0013 PR 2: the tool's in-process service calls run with the token
-    // as their caller, so the Write service decides `index_path`/`prune` per
-    // repo, and a follower forwards the principal to the leader, exactly
-    // as for a gRPC call of that token. `None` with auth off.
-    let caller = st.ctx.auth.mcp_caller(req.headers());
+    // as their caller (and the HTTP peer, for the per-peer audit window),
+    // so the services decide every tool exactly as a gRPC call of that
+    // token, once: reads by the read rule, `index_path`/`prune` per repo;
+    // a follower forwards the principal to the leader. `None` with auth off.
+    let peer = req.extensions().get::<McpPeer>().and_then(|p| p.0);
+    let caller = st.ctx.auth.mcp_caller(req.headers(), peer);
     let session = req
         .headers()
         .get(SESSION_HEADER)
@@ -921,33 +927,6 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
                     need.as_str()
                 ),
             );
-        }
-    }
-    if let (Some(h), Some(n)) = (
-        policy_headers.as_ref(),
-        parsed
-            .as_ref()
-            .filter(|_| tool.is_some())
-            .and_then(|v| v.pointer("/params/name"))
-            .and_then(Value::as_str),
-    ) {
-        if let Some(e) = st.ctx.auth.mcp_tool_denied(h, n) {
-            // D9: a policy refusal is an `isError` tool result, HTTP 200.
-            if let Some(t) = &tool {
-                st.ctx.raft.obs.observe_mcp_call(t, "error");
-            }
-            let body = graph_mcp::tools::error_body(&graph_mcp::ToolError::Store(e))
-                .expect("a store error has a body");
-            let id = parsed.as_ref().and_then(|v| v.get("id")).cloned();
-            let reply = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "content": [{ "type": "text", "text": body.to_string() }],
-                    "isError": true
-                }
-            });
-            return json_reply(StatusCode::OK, reply.to_string());
         }
     }
     // Taken only now: a request with a bad session gets its own error.
