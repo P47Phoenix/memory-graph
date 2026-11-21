@@ -280,3 +280,120 @@ fn forwarded_calls_are_rechecked_by_the_leader() {
     w2.admin_transfer_leader(3).unwrap();
     assert_eq!(tb.wait_leader(Duration::from_secs(10)), 3);
 }
+
+/// revocation is not retroactive to committed log entries. An
+/// entry admitted before a revocation is applied by a replica that catches
+/// up after the revocation landed on every node.
+#[test]
+fn revocation_is_not_retroactive_to_log_entries() {
+    let t = Tokens::new();
+    let lt = t.file("leader.toml", &t.leader_tokens());
+    let ft = t.file("follower.toml", &t.follower_tokens());
+    let lp = t.file("leader.cedar", BASE);
+    let fp = t.file("follower.cedar", BASE);
+    let mut tb = ClusterTestbed::with_config(3, rust(), |id, c| {
+        c.auth = t.f.config();
+        let (tok, pol) = if id == 1 { (&lt, &lp) } else { (&ft, &fp) };
+        c.auth.tokens = Some(tok.clone());
+        c.auth.policies = Some(pol.clone());
+    });
+    tb.set_client_credentials(Some(t.f.creds(&t.f.write)));
+    tb.form();
+    assert_eq!(tb.leader(), 1);
+    tb.node_mut(3).stop();
+    let ix = client(&tb, 2, &t.f.write2, &t);
+    ix.index_bytes("acme", "web", "a.rs", b"fn a() {}", None)
+        .unwrap();
+    let committed = tb.leader_last_log_index();
+    let revoked = BASE.replace(
+        "permit(principal in Group::\"web\"",
+        "forbid(principal in Group::\"web\"",
+    );
+    std::fs::write(&lp, &revoked).unwrap();
+    std::fs::write(&fp, &revoked).unwrap();
+    for id in [1, 2] {
+        tb.node(id).running().unwrap().auth().reload_now();
+    }
+    denied(
+        ix.index_bytes("acme", "web", "b.rs", b"fn b() {}", None),
+        "after revocation",
+    );
+    tb.node_mut(3).restart();
+    tb.wait_applied(committed, Duration::from_secs(20));
+    let n3 = client(&tb, 3, &t.f.write, &t);
+    assert!(
+        n3.file_tokens("acme", "web", "a.rs").unwrap().is_some(),
+        "applied after revocation"
+    );
+    assert!(n3.file_tokens("acme", "web", "b.rs").unwrap().is_none());
+}
+
+/// reloads on the leader racing forwarded writes. Every write
+/// either lands on all replicas or is refused with PermissionDenied(index);
+/// after the final revoking reload returns, nothing is admitted.
+#[test]
+fn reload_racing_forwarded_writes() {
+    let t = Tokens::new();
+    let lt = t.file("leader.toml", &t.leader_tokens());
+    let ft = t.file("follower.toml", &t.follower_tokens());
+    let lp = t.file("leader.cedar", BASE);
+    let fp = t.file("follower.cedar", BASE);
+    let mut tb = ClusterTestbed::with_config(3, rust(), |id, c| {
+        c.auth = t.f.config();
+        let (tok, pol) = if id == 1 { (&lt, &lp) } else { (&ft, &fp) };
+        c.auth.tokens = Some(tok.clone());
+        c.auth.policies = Some(pol.clone());
+    });
+    tb.set_client_credentials(Some(t.f.creds(&t.f.write)));
+    tb.form();
+    assert_eq!(tb.leader(), 1);
+    let revoked = BASE.replace(
+        "permit(principal in Group::\"web\"",
+        "forbid(principal in Group::\"web\"",
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ok = std::thread::scope(|s| {
+        let st = std::sync::Arc::clone(&stop);
+        let ix = client(&tb, 2, &t.f.write2, &t);
+        let h = s.spawn(move || {
+            let mut ok = Vec::new();
+            let mut i = 0;
+            while !st.load(std::sync::atomic::Ordering::SeqCst) {
+                let p = format!("f{i}.rs");
+                match ix.index_bytes("acme", "web", &p, b"fn a() {}", None) {
+                    Ok(_) => ok.push(p),
+                    Err(StoreError::PermissionDenied { action, .. }) => assert_eq!(action, "index"),
+                    Err(e) => panic!("unexpected: {e:?}"),
+                }
+                i += 1;
+            }
+            ok
+        });
+        for k in 0..10 {
+            std::fs::write(&lp, if k % 2 == 0 { revoked.as_str() } else { BASE }).unwrap();
+            tb.node(1).running().unwrap().auth().reload_now();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        std::fs::write(&lp, &revoked).unwrap();
+        tb.node(1).running().unwrap().auth().reload_now();
+        let ix2 = client(&tb, 2, &t.f.write2, &t);
+        denied(
+            ix2.index_bytes("acme", "web", "after.rs", b"x", None),
+            "after final revoke",
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        h.join().unwrap()
+    });
+    eprintln!("{} writes admitted during the race", ok.len());
+    tb.wait_applied(tb.leader_last_log_index(), Duration::from_secs(20));
+    for id in [1, 2, 3] {
+        let c = client(&tb, id, &t.f.write, &t);
+        for p in &ok {
+            assert!(
+                c.file_tokens("acme", "web", p).unwrap().is_some(),
+                "node {id} {p}"
+            );
+        }
+        assert!(c.file_tokens("acme", "web", "after.rs").unwrap().is_none());
+    }
+}

@@ -806,6 +806,19 @@ fn forwarded_headers_are_parsed_strictly() {
         .map(|f| f.token_id.len()),
         Ok(128)
     );
+    // ... and 129 bytes is refused by the parser itself, whatever the id
+    // (the lookup alone would also refuse an unknown long id).
+    assert_eq!(
+        graph_server::auth::parse_forwarded(&{
+            let mut m = tonic::codegen::http::HeaderMap::new();
+            for (k, v) in [(BY, "1"), (ROLE, "read"), (ID, &*"y".repeat(129))] {
+                m.insert(k, v.parse().unwrap());
+            }
+            m
+        })
+        .map(|f| f.token_id.len()),
+        Err("a forwarded header is too long")
+    );
     // The cluster secret alone (no valid token id) is never enough, for
     // every action class: a read, `status` (also a join-probe method),
     // a write, `admin` (a node-originated `Remove`, `--bootstrap-or-join`).
