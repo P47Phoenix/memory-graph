@@ -909,7 +909,8 @@ pub fn run_scoped_deleted_and_snapshot(s: &dyn Store) {
         .unwrap();
     let live = s.scoped(hide.clone());
     // Deleted and pruned: today's answer, the same as a never-existing id.
-    // (Checked before the next write: node ids may be reused.)
+    // (Entity ids, org/repo/file, are never reused; checked before the
+    // next write anyway, so the probe does not depend on that.)
     for id in [del, pru] {
         assert_eq!(live.get(id).unwrap(), None);
         assert!(live.children(id).unwrap().is_empty());

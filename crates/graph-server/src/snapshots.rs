@@ -142,7 +142,10 @@ impl SnapshotTable {
         store: &V2Store,
         meta: Option<graph_proto::ReadMeta>,
     ) -> Result<u64, Status> {
-        self.open_owned(conn, store, meta, None)
+        // A handle opened outside the Store service (tests, in-process
+        // tools): unscoped, as auth is off there.
+        let all = graph_store::ReadScope::All;
+        self.open_owned(conn, store, meta, None, (all.clone(), all))
     }
 
     /// [`open_with_meta`](Self::open_with_meta) for `owner` (ADR 0012 D5,
@@ -153,6 +156,7 @@ impl SnapshotTable {
         store: &V2Store,
         meta: Option<graph_proto::ReadMeta>,
         owner: Option<String>,
+        scopes: (graph_store::ReadScope, graph_store::ReadScope),
     ) -> Result<u64, Status> {
         self.check_caps(&self.lock(), conn)?;
         let snap = store
@@ -174,7 +178,7 @@ impl SnapshotTable {
                 snap: Arc::new(Mutex::new(snap)),
                 meta,
                 owner,
-                scopes: None,
+                scopes: Some(scopes),
             },
         );
         *t.per_conn.entry(conn).or_insert(0) += 1;
@@ -221,21 +225,9 @@ impl SnapshotTable {
         }
     }
 
-    /// Record the read scopes handle `id` was opened with (`read`,
-    /// `search`; ADR 0013 D8).
-    pub fn set_scopes(
-        &self,
-        id: u64,
-        read: graph_store::ReadScope,
-        search: graph_store::ReadScope,
-    ) {
-        if let Some(h) = self.lock().open.get_mut(&id) {
-            h.scopes = Some((read, search));
-        }
-    }
-
     /// The scope handle `id` was opened with for `search` (`true`) or
-    /// `read`; `All` when none was recorded.
+    /// `read`; nothing visible when none was recorded (never `All` by
+    /// default).
     pub fn scope(&self, id: u64, search: bool) -> graph_store::ReadScope {
         match self.lock().open.get(&id).and_then(|h| h.scopes.clone()) {
             Some((r, s)) => {
@@ -245,7 +237,7 @@ impl SnapshotTable {
                     r
                 }
             }
-            None => graph_store::ReadScope::All,
+            None => graph_store::ReadScope::nothing(),
         }
     }
 

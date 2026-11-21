@@ -233,8 +233,17 @@ permit(principal == Token::"r", action in [Action::"read", Action::"search"], re
         snap.get(hidden),
         Err(StoreError::PermissionDenied { .. })
     ));
+    let visible = w2.file_tokens("a", "x", "f.txt").unwrap().unwrap()[0].id;
+    assert!(snap.get(visible).unwrap().is_some());
+    assert_eq!(snap.count_nodes(graph_core::NodeKind::File).unwrap(), 1);
     // Narrow to nothing: the handle's next call sees nothing.
     reload("permit(principal == Token::\"w2\", action, resource);\n");
+    assert!(matches!(
+        snap.get(visible),
+        Err(StoreError::PermissionDenied { .. })
+    ));
+    assert_eq!(snap.count_nodes(graph_core::NodeKind::File).unwrap(), 0);
+    assert!(snap.roots().unwrap().is_empty());
     assert!(snap.describe(None, None).unwrap().is_empty());
     assert!(matches!(
         snap.describe(Some("a"), None),

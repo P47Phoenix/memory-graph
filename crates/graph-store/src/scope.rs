@@ -250,9 +250,10 @@ pub struct ScopedView<'a> {
 }
 
 impl<'a> ScopedView<'a> {
-    /// A view of `inner` for the read action `action` (`"read"` for the
-    /// node-id and describe APIs; search and symbol search always refuse as
-    /// `"search"`).
+    /// A view of `inner` through `scope`. Its own refusals (node ids,
+    /// `file_tokens`, the describe family) name the action `read`; search
+    /// and symbol search are refused by the store as `search`. The server
+    /// builds one view per call with the scope of that call's action.
     pub fn new(inner: &'a dyn crate::StoreRead, scope: ReadScope) -> Self {
         Self {
             inner,
@@ -326,19 +327,16 @@ impl<'a> ScopedView<'a> {
             .collect())
     }
 
-    /// `descendants` of an org node without the hidden repos' subtrees
-    /// (depth first, a node before its children: a repo's subtree runs
-    /// until the next repo).
+    /// `descendants` of an org node without the hidden repos' subtrees:
+    /// each visible repo (in `children` order) followed by its own
+    /// descendants, the depth-first order `descendants` documents, built
+    /// without assuming how the inner store orders an org's descendants.
     fn org_descendants(&self, org: &graph_core::Node) -> Result<Vec<graph_core::Node>> {
-        let mut keep = true;
         let mut out = Vec::new();
-        for n in self.inner.descendants(org.id)? {
-            if n.kind == graph_core::NodeKind::Repo {
-                keep = self.scope.repo_visible(&org.name, &n.name);
-            }
-            if keep {
-                out.push(n);
-            }
+        for repo in self.org_children(org)? {
+            let id = repo.id;
+            out.push(repo);
+            out.extend(self.inner.descendants(id)?);
         }
         Ok(out)
     }
