@@ -1681,16 +1681,7 @@ impl Auth {
         if let Some(o) = self.authz.otlp.get() {
             o.record_authz(secs);
         }
-        graph_store::ReadScope::from_rules(graph_store::ScopeRules {
-            any: r.any,
-            orgs: r.orgs,
-            repos: r.repos,
-            deny_all: r.deny_all,
-            deny_orgs: r.deny_orgs,
-            deny_org_only: r.deny_org_only,
-            deny_repos: r.deny_repos,
-            org_only: r.org_only,
-        })
+        scope_of_rules(r)
     }
 
     /// A named read refused by the store (ADR 0013 D5, D9): counted as a
@@ -2040,6 +2031,21 @@ fn no_caller_allowed() -> bool {
         );
     }
     ok
+}
+
+/// The store's scope from the evaluator's compiled rules (ADR 0013 D3):
+/// field for field; a property test checks that visibility is preserved.
+pub fn scope_of_rules(r: graph_authz::ReadRules) -> graph_store::ReadScope {
+    graph_store::ReadScope::from_rules(graph_store::ScopeRules {
+        any: r.any,
+        orgs: r.orgs,
+        repos: r.repos,
+        deny_all: r.deny_all,
+        deny_orgs: r.deny_orgs,
+        deny_org_only: r.deny_org_only,
+        deny_repos: r.deny_repos,
+        org_only: r.org_only,
+    })
 }
 
 /// The policy principal of a token entry.
@@ -2803,5 +2809,54 @@ mod audit_limiter_tests {
         let much_later = later + REFUSAL_LOG_WINDOW;
         assert_eq!(l.admit(new, much_later), Some(2));
         assert_eq!(l.peers.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod scope_conversion {
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    const NAMES: &[&str] = &["a", "b", "c"];
+
+    fn orgs() -> impl Strategy<Value = BTreeSet<String>> {
+        proptest::collection::btree_set(
+            proptest::sample::select(NAMES).prop_map(str::to_string),
+            0..3,
+        )
+    }
+
+    fn repos() -> impl Strategy<Value = BTreeSet<(String, String)>> {
+        proptest::collection::btree_set(
+            (
+                proptest::sample::select(NAMES),
+                proptest::sample::select(NAMES),
+            )
+                .prop_map(|(o, r)| (o.to_string(), r.to_string())),
+            0..4,
+        )
+    }
+
+    proptest! {
+        /// `ReadRules` -> `ReadScope` keeps every repo's and org's
+        /// visibility (ADR 0013 D3).
+        #[test]
+        fn conversion_preserves_visibility(
+            any in any::<bool>(), deny_all in any::<bool>(),
+            o in orgs(), oo in orgs(), r in repos(),
+            d in orgs(), dd in orgs(), dr in repos(),
+        ) {
+            let rules = graph_authz::ReadRules {
+                any, orgs: o, org_only: oo, repos: r, deny_all,
+                deny_orgs: d, deny_org_only: dd, deny_repos: dr,
+            };
+            let scope = super::scope_of_rules(rules.clone());
+            for org in NAMES.iter().chain(&["z"]) {
+                prop_assert_eq!(scope.org_granted(org), rules.org_granted(org));
+                for repo in NAMES.iter().chain(&["z"]) {
+                    prop_assert_eq!(scope.repo_visible(org, repo), rules.repo_visible(org, repo));
+                }
+            }
+        }
     }
 }

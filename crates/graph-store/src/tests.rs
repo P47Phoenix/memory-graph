@@ -486,24 +486,34 @@ mod scoped_props {
     }
 
     fn scopes() -> impl Strategy<Value = ReadScope> {
-        (any::<bool>(), names(), pairs(), names(), pairs(), names()).prop_map(
-            |(any, orgs, repos, deny_orgs, deny_repos, org_only)| {
-                ReadScope::from_rules(ScopeRules {
-                    any,
-                    orgs,
-                    repos,
-                    deny_all: false,
-                    deny_orgs,
-                    deny_org_only: BTreeSet::new(),
-                    deny_repos,
-                    org_only,
-                })
-            },
+        (
+            any::<bool>(),
+            names(),
+            pairs(),
+            names(),
+            pairs(),
+            names(),
+            proptest::bool::weighted(0.1),
+            names(),
         )
+            .prop_map(
+                |(any, orgs, repos, deny_orgs, deny_repos, org_only, deny_all, deny_org_only)| {
+                    ReadScope::from_rules(ScopeRules {
+                        any,
+                        orgs,
+                        repos,
+                        deny_all,
+                        deny_orgs,
+                        deny_org_only,
+                        deny_repos,
+                        org_only,
+                    })
+                },
+            )
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
         /// Generated scopes (ADR 0013 D5 item 5), forbid holes included.
         #[test]
         fn generated_scopes_pass_the_scoped_differential(scope in scopes()) {

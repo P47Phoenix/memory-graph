@@ -332,6 +332,17 @@ fn resource_constrained_read_policies_load() {
 }
 
 #[test]
+fn a_read_policy_on_the_cluster_warns() {
+    let s = set("@id(\"c\")\npermit(principal, action in [Action::\"read\", Action::\"status\"], resource == Cluster::\"this\");\npermit(principal, action == Action::\"status\", resource == Cluster::\"this\");");
+    let w = s.lint(&|_| true, &|_| true);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("@id `c`") && w[0].contains("matches no org or repo"),
+        "{w:?}"
+    );
+}
+
+#[test]
 fn read_rules_follow_the_policy_forms() {
     let none: Vec<String> = Vec::new();
     let p = who("t", &none, Role::Read);

@@ -574,6 +574,16 @@ impl PolicySet {
             if p.action == ActionScope::In(Vec::new()) {
                 w.push(format!("{at}: `action in []` matches no action"));
             }
+            // Reads are decided per repo (D5): a read/search grant or
+            // forbid on the cluster matches no org or repo.
+            if p.actions() & READ_ACTIONS != 0
+                && matches!(&p.resource, Scope::Eq(e) | Scope::In(e) if e.ty == Ty::Cluster)
+            {
+                w.push(format!(
+                    "{at}: `read`/`search` on `Cluster::\"this\"` matches no org or repo \
+                     (reads are decided per repo); use `resource` or `Org::`/`Repo::`"
+                ));
+            }
             for e in [&p.principal, &p.resource]
                 .into_iter()
                 .filter_map(|s| match s {
