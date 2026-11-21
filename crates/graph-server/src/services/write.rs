@@ -198,6 +198,10 @@ impl WriteService {
         reindex: bool,
         files: Vec<pb::FileBytes>,
     ) -> Result<Vec<pb::FileResult>, Status> {
+        // ADR 0013 PR 2: the MCP `index_path` tool is decided on its repo,
+        // for the token the endpoint runs the call as (on the leader too,
+        // where it is proposed directly).
+        authorize_index(&self.ctx.auth, &(org.to_string(), repo.to_string()))?;
         for f in &files {
             f.resolved_encoding_hint()?;
         }
@@ -534,10 +538,24 @@ impl pb::write_server::Write for WriteService {
                 applied_index: 0,
             }));
         }
+        // ADR 0013 D6: an org-wide delete is decided on policy alone; its
+        // repo list is fixed here, at admission, so apply never deletes a
+        // repo created after the decision.
+        let repos = if r.repo.is_none() {
+            let org = r.org.clone();
+            let names = self
+                .ctx
+                .blocking(move |slot| slot.with_store(|s| s.org_repo_names(&org)))
+                .await?;
+            Some(pb::log_command::RepoList { names })
+        } else {
+            None
+        };
         let (resp, applied_index) = self
             .propose(Cmd::Delete(pb::log_command::Delete {
                 org: r.org,
                 repo: r.repo,
+                repos,
             }))
             .await?;
         match resp {

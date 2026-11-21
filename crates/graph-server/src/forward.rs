@@ -128,6 +128,9 @@ pub struct ForwardHeaders {
     /// no role, so the receiving node refuses it (fail closed, ADR 0012
     /// D3). A known caller's own role always wins.
     pub node_role: Option<crate::auth::Role>,
+    /// The read barrier's action (`mg-forwarded-action`, ADR 0013 D7): set
+    /// only on the `ReadIndex` a linearizable read forwards.
+    pub action: Option<graph_authz::Action>,
 }
 
 impl Interceptor for ForwardHeaders {
@@ -165,13 +168,25 @@ impl Interceptor for ForwardHeaders {
                     tonic::metadata::MetadataValue::from_static(role.as_str()),
                 );
             }
-            if let Some(id) = caller.and_then(|c| match c.kind {
-                crate::auth::CallerKind::Token { id, .. } => Some(id),
-                _ => None,
-            }) {
-                if let Ok(v) = id.parse() {
-                    md.insert(graph_proto::auth::FORWARDED_TOKEN_ID_HEADER, v);
-                }
+            // The principal: a client token's id, or the forwarded id this
+            // node itself was given (a leader's call to a transfer target on
+            // behalf of a forwarded `TransferLeader`), so the receiver
+            // resolves the same principal (ADR 0013 D7).
+            let id: Option<String> = caller.and_then(|c| match c.kind {
+                crate::auth::CallerKind::Token { id, .. } => Some(id.to_string()),
+                crate::auth::CallerKind::Node {
+                    forwarded_token_id, ..
+                } => forwarded_token_id,
+                crate::auth::CallerKind::Anonymous => None,
+            });
+            if let Some(v) = id.and_then(|id| id.parse().ok()) {
+                md.insert(graph_proto::auth::FORWARDED_TOKEN_ID_HEADER, v);
+            }
+            if let Some(a) = self.action {
+                md.insert(
+                    graph_proto::auth::FORWARDED_ACTION_HEADER,
+                    tonic::metadata::MetadataValue::from_static(a.name()),
+                );
             }
         }
         Ok(req)
@@ -352,14 +367,40 @@ impl Forwarder {
         addr: &str,
         node_role: Option<crate::auth::Role>,
     ) -> Result<ForwardChannel, Status> {
+        self.intercepted_for(addr, node_role, None)
+    }
+
+    fn intercepted_for(
+        &self,
+        addr: &str,
+        node_role: Option<crate::auth::Role>,
+        action: Option<graph_authz::Action>,
+    ) -> Result<ForwardChannel, Status> {
         Ok(InterceptedService::new(
             self.channel(addr)?,
             ForwardHeaders {
                 me: self.me,
                 auth: std::sync::Arc::clone(&self.auth),
                 node_role,
+                action,
             },
         ))
+    }
+
+    /// An `Admin` client for the read barrier (`ReadIndex`) of a read of
+    /// `action` (`read` or `search`): marked with `mg-forwarded-action`, so
+    /// the leader admits it as part of that read, not as `status` (ADR 0013
+    /// D7). The caller's own role and id travel as on any forward.
+    pub fn admin_client_for_read(
+        &self,
+        addr: &str,
+        action: graph_authz::Action,
+    ) -> Result<AdminClient<ForwardChannel>, Status> {
+        Ok(
+            AdminClient::new(self.intercepted_for(addr, None, Some(action))?)
+                .max_decoding_message_size(NO_LIMIT)
+                .max_encoding_message_size(NO_LIMIT),
+        )
     }
 
     /// A `Write` client of the leader at `addr`.
@@ -505,6 +546,7 @@ mod tests {
             me: 3,
             auth: crate::auth::Auth::disabled(),
             node_role: None,
+            action: None,
         }
         .call(Request::new(()))
         .unwrap();
@@ -531,6 +573,7 @@ mod tests {
             me: 2,
             auth: std::sync::Arc::clone(&auth),
             node_role,
+            action: None,
         };
         let role_of = |mut h: ForwardHeaders| {
             h.call(Request::new(()))
@@ -545,6 +588,7 @@ mod tests {
                 role: Role::Read,
             },
             conn: 1,
+            peer: None,
         };
         let h = headers(None);
         let (inside, spawned) = CALLER
@@ -565,6 +609,7 @@ mod tests {
                 role: Role::Read,
             },
             conn: 1,
+            peer: None,
         };
         let h = headers(Some(Role::Write));
         let r = CALLER.scope(reader, async move { role_of(h) }).await;

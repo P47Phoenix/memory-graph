@@ -313,12 +313,15 @@ impl WireError {
                 StoreError::Unauthenticated(msg) => {
                     K::Unauthenticated(d::Unauthenticated { msg: msg.clone() })
                 }
-                StoreError::PermissionDenied { msg, required_role } => {
-                    K::PermissionDenied(d::PermissionDenied {
-                        msg: msg.clone(),
-                        required_role: required_role.clone(),
-                    })
-                }
+                StoreError::PermissionDenied {
+                    msg,
+                    required_role,
+                    action,
+                } => K::PermissionDenied(d::PermissionDenied {
+                    msg: msg.clone(),
+                    required_role: required_role.clone(),
+                    action: action.clone(),
+                }),
             },
             WireError::NotLeader {
                 leader_id,
@@ -361,6 +364,7 @@ impl WireError {
             Code::PermissionDenied => WireError::Store(StoreError::PermissionDenied {
                 msg,
                 required_role: String::new(),
+                action: String::new(),
             }),
             other if is_transport_loss(other, &msg) => WireError::Store(StoreError::Storage(
                 format!("connection lost ({other:?}): {msg}"),
@@ -437,6 +441,7 @@ impl TryFrom<pb::StoreErrorDetail> for WireError {
             K::PermissionDenied(x) => StoreError::PermissionDenied {
                 msg: x.msg,
                 required_role: x.required_role,
+                action: x.action,
             }
             .into(),
         })
@@ -564,9 +569,14 @@ pub fn wire_view(e: &StoreError) -> WireError {
             found: found.clone(),
         },
         StoreError::Unauthenticated(m) => StoreError::Unauthenticated(m.clone()),
-        StoreError::PermissionDenied { msg, required_role } => StoreError::PermissionDenied {
+        StoreError::PermissionDenied {
+            msg,
+            required_role,
+            action,
+        } => StoreError::PermissionDenied {
             msg: msg.clone(),
             required_role: required_role.clone(),
+            action: action.clone(),
         },
         StoreError::SnapshotExpired {
             age_secs,
@@ -659,12 +669,24 @@ mod tests {
         let e = StoreError::PermissionDenied {
             msg: "needs write".into(),
             required_role: "write".into(),
+            action: String::new(),
         };
         let st = store_error_to_status(&e);
         assert_eq!(st.code(), Code::PermissionDenied);
         assert!(matches!(
             status_to_store_error(&st),
-            StoreError::PermissionDenied { ref required_role, .. } if required_role == "write"
+            StoreError::PermissionDenied { ref required_role, ref action, .. }
+                if required_role == "write" && action.is_empty()
+        ));
+        // ADR 0013 D9: a policy refusal's action round-trips in the detail.
+        let e = StoreError::PermissionDenied {
+            msg: "permission denied for action `prune`".into(),
+            required_role: String::new(),
+            action: "prune".into(),
+        };
+        assert!(matches!(
+            status_to_store_error(&store_error_to_status(&e)),
+            StoreError::PermissionDenied { ref action, .. } if action == "prune"
         ));
         assert!(matches!(
             status_to_store_error(&Status::unauthenticated("proxy")),

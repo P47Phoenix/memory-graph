@@ -36,6 +36,10 @@ Logs go to stderr. Stdout carries only the `listening on` start line, and `metri
 | `mg_rpc_total{rpc,outcome}` | counter | gRPC calls served |
 | `mg_writes_forwarded_total` | counter | Writes and membership changes forwarded to the leader |
 | `mg_auth_refusals_total` | counter | Calls refused by authentication or the role table (ADR 0012), by `reason` |
+| `mg_authz_decisions_total` | counter | Policy decisions (ADR 0013), by `action` and `decision` (`allow`, `deny`); zero without `--auth-policies` |
+| `mg_authz_policies` | gauge | Policies in the loaded set (0 without `--auth-policies`) |
+| `mg_authz_reload_total` | counter | Reloads of the token and policy file pair, by `result` (`ok`, `error`: the last good pair kept) |
+| `mg_authz_decision_seconds` | histogram | Time to decide one policy request |
 | `mg_quorum_probes_total{outcome}` | counter | Leader only: health probes of voters that went silent while a write waited (`--quorum-loss-timeout`); `outcome` `alive` (answered `SERVING`) or `dead` |
 | `mg_apply_duration_seconds` | histogram | Time to apply one committed log entry |
 | `mg_build_info{version,protocol,store_format}` | gauge | Always 1 |

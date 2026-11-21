@@ -625,3 +625,51 @@ fn clear_raft_state_drops_the_table_and_is_a_noop_without_it() {
     assert_eq!(s.raft_membership().unwrap(), None);
     assert_eq!(s.count_nodes(NodeKind::File).unwrap(), 1);
 }
+
+/// ADR 0013 D6: an org-wide delete applied with its admission-time repo
+/// list deletes exactly those repos; a repo created after admission (not
+/// in the list) survives, and so does the org node; a listed repo already
+/// gone is skipped; with every repo listed the org goes too.
+#[test]
+fn an_org_wide_delete_acts_on_the_admission_time_repo_list() {
+    let d = tempfile::tempdir().unwrap();
+    let s = V2Store::open(d.path().join("g.redb")).unwrap();
+    for r in ["a", "b", "late"] {
+        s.index_bytes("o", r, "x.txt", b"alpha", None).unwrap();
+    }
+    s.index_bytes("p", "a", "x.txt", b"alpha", None).unwrap();
+    assert_eq!(s.org_repo_names("o").unwrap(), ["a", "b", "late"]);
+    assert!(s.org_repo_names("nope").unwrap().is_empty());
+    // Admitted when `o` held a, b and gone (deleted since); `late` came after.
+    let list: Vec<String> = ["a", "b", "gone"].map(String::from).to_vec();
+    let st = s.delete_repos_marked("o", &list, marker(1), None).unwrap();
+    assert_eq!(st.repos, ["a", "b"]);
+    assert!(!st.org_removed, "the org keeps `late`");
+    assert_eq!(s.org_repo_names("o").unwrap(), ["late"]);
+    let left: Vec<(String, String)> = s
+        .describe(None, None)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.org, r.repo))
+        .collect();
+    assert_eq!(
+        left,
+        [
+            ("o".to_string(), "late".to_string()),
+            ("p".into(), "a".into())
+        ]
+    );
+    // An empty list deletes nothing, a full one removes the org node.
+    let st = s.delete_repos_marked("o", &[], marker(2), None).unwrap();
+    assert!(st.repos.is_empty() && !st.org_removed);
+    let st = s
+        .delete_repos_marked("o", &["late".to_string()], marker(3), None)
+        .unwrap();
+    assert!(st.org_removed);
+    assert!(s.roots().unwrap().iter().all(|n| n.name != "o"));
+    assert_eq!(
+        s.org_repo_names("p").unwrap(),
+        ["a"],
+        "another org untouched"
+    );
+}

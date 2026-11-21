@@ -190,6 +190,43 @@ pub(super) fn render(ctx: &Ctx, read_stats: &graph_store::read_stats::ReadStats)
     }
     head(
         &mut out,
+        "mg_authz_decisions_total",
+        "counter",
+        super::AUTHZ_DECISIONS_HELP,
+    );
+    for (action, decision, n) in ctx.auth.authz_decisions() {
+        let _ = writeln!(
+            out,
+            "mg_authz_decisions_total{{action=\"{action}\",decision=\"{decision}\"}} {n}"
+        );
+    }
+    head(
+        &mut out,
+        "mg_authz_policies",
+        "gauge",
+        super::AUTHZ_POLICIES_HELP,
+    );
+    let _ = writeln!(out, "mg_authz_policies {}", ctx.auth.authz_policies());
+    head(
+        &mut out,
+        "mg_authz_reload_total",
+        "counter",
+        super::AUTHZ_RELOAD_HELP,
+    );
+    for (result, n) in ctx.auth.authz_reloads() {
+        let _ = writeln!(out, "mg_authz_reload_total{{result=\"{result}\"}} {n}");
+    }
+    head(
+        &mut out,
+        "mg_authz_decision_seconds",
+        "histogram",
+        super::AUTHZ_SECONDS_HELP,
+    );
+    ctx.auth
+        .authz_seconds()
+        .render(&mut out, "mg_authz_decision_seconds", "");
+    head(
+        &mut out,
         "mg_quorum_probes_total",
         "counter",
         "Leader liveness probes of silent voters while a write waited (quorum-loss check), by outcome.",

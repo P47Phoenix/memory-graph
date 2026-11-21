@@ -591,13 +591,18 @@ pub mod store_error_detail {
     }
     /// ADR 0012 D5/D8: the credential is valid but its role is too low, or
     /// the method is not in the server's role table. `required_role` is
-    /// `read`, `write`, `node` or empty (an unlisted method).
+    /// `read`, `write`, `node` or empty (an unlisted method). `action`
+    /// (ADR 0013 D9): on a policy refusal, the policy action denied (`read`,
+    /// `search`, `index`, `prune`, `delete`, `snapshot`, `status`, `admin`);
+    /// empty for a role refusal. Never a resource name or a policy `@id`.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct PermissionDenied {
         #[prost(string, tag = "1")]
         pub msg: ::prost::alloc::string::String,
         #[prost(string, tag = "2")]
         pub required_role: ::prost::alloc::string::String,
+        #[prost(string, tag = "3")]
+        pub action: ::prost::alloc::string::String,
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
@@ -5738,6 +5743,20 @@ pub mod log_command {
         pub org: ::prost::alloc::string::String,
         #[prost(string, optional, tag = "2")]
         pub repo: ::core::option::Option<::prost::alloc::string::String>,
+        /// ADR 0013 D6: an org-wide delete (`repo` unset) carries the repos the
+        /// leader resolved at admission, and apply deletes exactly those (a
+        /// repo created after admission survives, and so does the org then).
+        /// Unset on an entry written before ADR 0013 PR 2: the whole org, as
+        /// before. Ignored when `repo` is set.
+        #[prost(message, optional, tag = "3")]
+        pub repos: ::core::option::Option<RepoList>,
+    }
+    /// The admission-time repo list of an org-wide `Delete` (a message, so
+    /// "no list" and "an empty list" differ).
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct RepoList {
+        #[prost(string, repeated, tag = "1")]
+        pub names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     }
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Cmd {

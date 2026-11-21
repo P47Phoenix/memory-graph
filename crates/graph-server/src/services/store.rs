@@ -508,7 +508,7 @@ impl pb::store_server::Store for StoreService {
         // small answer needs no paging round trips.
         let (hits, meta) = self
             .ctx
-            .read(r.view, move |s| {
+            .read_as(graph_authz::Action::Search, r.view, move |s| {
                 if !open {
                     if q.org.is_none() && q.repo.is_none() {
                         return Ok(Vec::new());
@@ -561,7 +561,7 @@ impl pb::store_server::Store for StoreService {
         let open = self.ctx.auth.read_allowed(graph_authz::Action::Search);
         let (hits, meta) = self
             .ctx
-            .read(r.view, move |s| {
+            .read_as(graph_authz::Action::Search, r.view, move |s| {
                 if !open {
                     if q.org.is_none() && q.repo.is_none() {
                         return Ok(Vec::new());
@@ -607,7 +607,9 @@ impl pb::store_server::Store for StoreService {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("linearizable"));
         if linearizable {
-            self.ctx.linearizable_barrier().await?;
+            self.ctx
+                .linearizable_barrier(graph_authz::Action::Read)
+                .await?;
         }
         // Frozen into the handle: its reads report the state it opened at.
         let mut meta = self.ctx.raft.read_meta();

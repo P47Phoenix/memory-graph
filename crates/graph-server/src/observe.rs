@@ -35,7 +35,7 @@ pub const DURATION_BUCKETS: [f64; 14] = [
 ];
 
 /// Every metric family `/metrics` exports (the contract).
-pub const METRIC_NAMES: [&str; 38] = [
+pub const METRIC_NAMES: [&str; 42] = [
     "mg_raft_term",
     "mg_raft_leader_id",
     "mg_raft_role",
@@ -53,6 +53,10 @@ pub const METRIC_NAMES: [&str; 38] = [
     "mg_rpc_total",
     "mg_writes_forwarded_total",
     "mg_auth_refusals_total",
+    "mg_authz_decisions_total",
+    "mg_authz_policies",
+    "mg_authz_reload_total",
+    "mg_authz_decision_seconds",
     "mg_quorum_probes_total",
     "mg_apply_duration_seconds",
     "mg_build_info",
@@ -708,6 +712,25 @@ fn cluster_families(ctx: &Ctx) -> Vec<MetricFamily> {
     for (reason, n) in ctx.auth.refusal_counts() {
         refusals.push(vec![("reason", reason.into())], SampleValue::Int(n));
     }
+    let mut decisions = MetricFamily::new(
+        "mg_authz_decisions_total",
+        MetricKind::Counter,
+        AUTHZ_DECISIONS_HELP,
+    );
+    for (action, decision, n) in ctx.auth.authz_decisions() {
+        decisions.push(
+            vec![("action", action.into()), ("decision", decision.into())],
+            SampleValue::Int(n),
+        );
+    }
+    let mut reloads = MetricFamily::new(
+        "mg_authz_reload_total",
+        MetricKind::Counter,
+        AUTHZ_RELOAD_HELP,
+    );
+    for (result, n) in ctx.auth.authz_reloads() {
+        reloads.push(vec![("result", result.into())], SampleValue::Int(n));
+    }
     vec![
         counter(
             "mg_writes_forwarded_total",
@@ -715,10 +738,31 @@ fn cluster_families(ctx: &Ctx) -> Vec<MetricFamily> {
             SampleValue::Int(ctx.fwd.forwarded_total()),
         ),
         refusals,
+        decisions,
+        gauge(
+            "mg_authz_policies",
+            AUTHZ_POLICIES_HELP,
+            ctx.auth.authz_policies(),
+        ),
+        reloads,
+        MetricFamily::new(
+            "mg_authz_decision_seconds",
+            MetricKind::Histogram,
+            AUTHZ_SECONDS_HELP,
+        )
+        .with_sample(Vec::new(), SampleValue::Histogram(ctx.auth.authz_seconds())),
         probes,
         mcp,
     ]
 }
+
+/// Help texts of the `mg_authz_*` families (ADR 0013 D9), shared with the
+/// golden renderer.
+pub const AUTHZ_DECISIONS_HELP: &str = "Policy decisions (ADR 0013), by action and decision (allow, deny; a refused named read and a forwarded call with no known principal count as deny); zero without --auth-policies.";
+pub const AUTHZ_POLICIES_HELP: &str =
+    "Policies in the loaded set (built-ins included with --auth-builtins); 0 without --auth-policies.";
+pub const AUTHZ_RELOAD_HELP: &str = "Reloads of the token and policy file pair, by result (ok: a new pair swapped in, error: the last good pair kept); zero without --auth-policies.";
+pub const AUTHZ_SECONDS_HELP: &str = "Time to decide one policy request.";
 
 /// `mg_apply_duration_seconds` and `mg_build_info`.
 fn apply_and_build_families(obs: &Observability) -> Vec<MetricFamily> {
@@ -1073,6 +1117,8 @@ macro_rules! rpc_span {
             server.address = tracing::field::Empty,
             auth.token_id = tracing::field::Empty,
             auth.role = tracing::field::Empty,
+            authz.action = tracing::field::Empty,
+            authz.decision = tracing::field::Empty,
         )
     };
 }

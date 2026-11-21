@@ -141,6 +141,17 @@ message LogCommand {
   message Delete {
     string org = 1;
     optional string repo = 2;
+    // ADR 0013 D6: an org-wide delete (`repo` unset) carries the repos the
+    // leader resolved at admission, and apply deletes exactly those (a
+    // repo created after admission survives, and so does the org then).
+    // Unset on an entry written before ADR 0013 PR 2: the whole org, as
+    // before. Ignored when `repo` is set.
+    RepoList repos = 3;
+  }
+  // The admission-time repo list of an org-wide `Delete` (a message, so
+  // "no list" and "an empty list" differ).
+  message RepoList {
+    repeated string names = 1;
   }
 
   oneof cmd {

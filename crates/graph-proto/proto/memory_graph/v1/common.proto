@@ -397,8 +397,11 @@ message StoreErrorDetail {
   message Unauthenticated { string msg = 1; }
   // ADR 0012 D5/D8: the credential is valid but its role is too low, or
   // the method is not in the server's role table. `required_role` is
-  // `read`, `write`, `node` or empty (an unlisted method).
-  message PermissionDenied { string msg = 1; string required_role = 2; }
+  // `read`, `write`, `node` or empty (an unlisted method). `action`
+  // (ADR 0013 D9): on a policy refusal, the policy action denied (`read`,
+  // `search`, `index`, `prune`, `delete`, `snapshot`, `status`, `admin`);
+  // empty for a role refusal. Never a resource name or a policy `@id`.
+  message PermissionDenied { string msg = 1; string required_role = 2; string action = 3; }
 
   oneof kind {
     Locked locked = 1;

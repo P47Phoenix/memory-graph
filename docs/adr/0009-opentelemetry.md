@@ -174,6 +174,10 @@ Exact pins in `[workspace.dependencies]`, as the workspace does for tonic and pr
 | `mg_rpc_total` | none (the exception: the histogram's count) | none | none | none |
 | `mg_writes_forwarded_total` | `memory_graph.writes.forwarded` | counter | `{write}` | none |
 | `mg_auth_refusals_total` | `memory_graph.auth.refusals` | counter | `{call}` | `reason` |
+| `mg_authz_decisions_total` (ADR 0013 D9) | `memory_graph.authz.decisions` | counter | `{decision}` | `action`, `decision` |
+| `mg_authz_policies` (ADR 0013 D9) | `memory_graph.authz.policies` | gauge | `{policy}` | none |
+| `mg_authz_reload_total` (ADR 0013 D9) | `memory_graph.authz.reloads` | counter | `{reload}` | `result` |
+| `mg_authz_decision_seconds` (ADR 0013 D9) | `memory_graph.authz.decision.duration` | histogram (synchronous) | `s` | none |
 | `mg_quorum_probes_total` | `memory_graph.quorum.probes` | counter | `{probe}` | `outcome` |
 | `mg_apply_duration_seconds` | `memory_graph.raft.apply.duration` | histogram (synchronous) | `s` | none |
 | `mg_build_info` | `memory_graph.build.info` | gauge (always 1) | `1` | `version`, `protocol`, `store_format` |
@@ -196,7 +200,7 @@ Exact pins in `[workspace.dependencies]`, as the workspace does for tonic and pr
 | `mg_otel_export_failures_total` (new, D8) | `memory_graph.otel.export.failures` | counter | `{export}` | `signal` |
 | `mg_otel_dropped_total` (new, D8) | `memory_graph.otel.dropped` | counter | `{item}` | `signal` |
 
-Sizes that can shrink (`mg_store_bytes`, `mg_log_bytes`, open handles) are up-down counters, following the OTel guidance for additive values. Values that are not additive (indexes, the term, the leader id, timestamps) are gauges. The two new families join `METRIC_NAMES`, which then has 36 entries; 35 of them have an OTLP twin.
+Sizes that can shrink (`mg_store_bytes`, `mg_log_bytes`, open handles) are up-down counters, following the OTel guidance for additive values. Values that are not additive (indexes, the term, the leader id, timestamps) are gauges. The two new families join `METRIC_NAMES`, which then has 36 entries; 35 of them have an OTLP twin. (Note, 2026-11-21: ADR 0013 D9 adds the four `mg_authz_*` rows above; `mg_authz_decision_seconds` is a third synchronous histogram, recorded where each policy decision is made.)
 
 - **Cardinality.** Every attribute has a bounded value set:
 

@@ -512,6 +512,7 @@ mod tests {
         let e = anyhow::Error::from(StoreError::PermissionDenied {
             msg: "x".into(),
             required_role: "write".into(),
+            action: String::new(),
         });
         assert_eq!(exit_code(&e), exit::PERMISSION_DENIED);
     }

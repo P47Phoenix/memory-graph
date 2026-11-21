@@ -9,6 +9,7 @@
 //! The tool core is synchronous, so a call runs on the blocking pool and
 //! drives the async service with [`Handle::block_on`] (allowed there; never
 //! from a runtime worker). `RemoteStore` is not used inside `serve`.
+use crate::auth::Caller;
 use crate::services::store::StoreService;
 use crate::services::write::WriteService;
 use graph_core::{Node, NodeId, NodeKind};
@@ -36,6 +37,18 @@ pub struct InProcessStore {
     view: View,
     /// Reads so far whose `ReadMeta` said `stale_possible`.
     stale: Arc<AtomicU64>,
+    /// The MCP request's token as the caller of every service call (ADR
+    /// 0013 PR 2); `None` with auth off.
+    caller: Option<Caller>,
+}
+
+/// Drive `f` to completion on `rt` with `caller` in scope (the
+/// [`crate::auth::CALLER`] task-local every policy check and forward reads).
+fn block_on_as<F: std::future::Future>(rt: &Handle, caller: &Option<Caller>, f: F) -> F::Output {
+    match caller {
+        Some(c) => rt.block_on(crate::auth::CALLER.scope(c.clone(), f)),
+        None => rt.block_on(f),
+    }
 }
 
 fn conv<T, M: TryInto<T, Error = ConvertError>>(m: M) -> Result<T> {
@@ -57,7 +70,14 @@ impl InProcessStore {
             rt,
             view,
             stale: Arc::new(AtomicU64::new(0)),
+            caller: None,
         }
+    }
+
+    /// Run every call as `caller` (ADR 0013 PR 2).
+    pub fn with_caller(mut self, caller: Option<Caller>) -> Self {
+        self.caller = caller;
+        self
     }
 
     /// The counter of `stale_possible` reads, for
@@ -81,7 +101,7 @@ impl InProcessStore {
     where
         F: std::future::Future<Output = std::result::Result<Response<M>, Status>>,
     {
-        let r = self.rt.block_on(f).map_err(err)?;
+        let r = block_on_as(&self.rt, &self.caller, f).map_err(err)?;
         self.note(ReadMeta::from_metadata(r.metadata()));
         Ok(r.into_inner())
     }
@@ -93,7 +113,7 @@ impl InProcessStore {
         S: tokio_stream::Stream<Item = std::result::Result<pb::NodeBatch, Status>> + Unpin,
         F: std::future::Future<Output = std::result::Result<Response<S>, Status>>,
     {
-        self.rt.block_on(async {
+        block_on_as(&self.rt, &self.caller, async {
             let r = f.await.map_err(err)?;
             self.note(ReadMeta::from_metadata(r.metadata()));
             let mut stream = r.into_inner();
@@ -138,9 +158,7 @@ impl InProcessStore {
                 tonic::metadata::MetadataValue::from_static("linearizable"),
             );
         }
-        let id = self
-            .rt
-            .block_on(self.svc.open_snapshot(req))
+        let id = block_on_as(&self.rt, &self.caller, self.svc.open_snapshot(req))
             .map_err(err)?
             .into_inner()
             .snapshot_id;
@@ -157,7 +175,9 @@ impl InProcessStore {
                 at += n;
             }
         })();
-        let _ = self.rt.block_on(
+        let _ = block_on_as(
+            &self.rt,
+            &self.caller,
             self.svc
                 .close_snapshot(Request::new(pb::CloseSnapshotRequest { snapshot_id: id })),
         );
@@ -325,11 +345,23 @@ impl StoreRead for InProcessStore {
 pub struct InProcessWriter {
     svc: Arc<WriteService>,
     rt: Handle,
+    caller: Option<Caller>,
 }
 
 impl InProcessWriter {
     pub fn new(svc: Arc<WriteService>, rt: Handle) -> Self {
-        Self { svc, rt }
+        Self {
+            svc,
+            rt,
+            caller: None,
+        }
+    }
+
+    /// Run every write as `caller` (ADR 0013 PR 2): the Write service
+    /// decides `index`/`prune` on the request's repo for this token.
+    pub fn with_caller(mut self, caller: Option<Caller>) -> Self {
+        self.caller = caller;
+        self
     }
 }
 
@@ -350,10 +382,12 @@ impl McpWriter for InProcessWriter {
                 ..Default::default()
             })
             .collect();
-        let results = self
-            .rt
-            .block_on(self.svc.index_files(org, repo, reindex, files))
-            .map_err(err)?;
+        let results = block_on_as(
+            &self.rt,
+            &self.caller,
+            self.svc.index_files(org, repo, reindex, files),
+        )
+        .map_err(err)?;
         results.into_iter().map(conv).collect()
     }
 
@@ -366,9 +400,10 @@ impl McpWriter for InProcessWriter {
     ) -> Result<Vec<String>> {
         let mut keep: Vec<String> = keep.iter().cloned().collect();
         keep.sort();
-        let r = self
-            .rt
-            .block_on(WriteRpc::prune(
+        let r = block_on_as(
+            &self.rt,
+            &self.caller,
+            WriteRpc::prune(
                 &*self.svc,
                 Request::new(pb::PruneRequest {
                     org: org.into(),
@@ -376,8 +411,9 @@ impl McpWriter for InProcessWriter {
                     keep,
                     dry_run,
                 }),
-            ))
-            .map_err(err)?;
+            ),
+        )
+        .map_err(err)?;
         Ok(r.into_inner().removed)
     }
 }

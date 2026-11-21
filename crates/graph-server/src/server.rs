@@ -897,6 +897,7 @@ pub async fn start(
         let recorders = otlp.attach(Box::new(move || {
             node.upgrade().map(|ctx| crate::observe::snapshot(&ctx))
         }));
+        ctx.auth.set_otlp(recorders.clone());
         ctx.raft.obs.set_otlp(recorders);
     }
 

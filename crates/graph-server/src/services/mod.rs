@@ -114,7 +114,12 @@ impl Ctx {
     /// The forwarded `ReadIndex` gets the bounded default deadline; the
     /// client's own `grpc-timeout` is enforced on this handler by tonic's
     /// server (which drops, and so cancels, the forwarded call with it).
-    pub async fn linearizable_barrier(&self) -> Result<(), Status> {
+    ///
+    /// `action` is the read's own (`read` or `search`): a forwarded barrier
+    /// carries it as `mg-forwarded-action`, so the leader admits it as part
+    /// of that read for the caller's principal, not as `status` (ADR 0013
+    /// D7).
+    pub async fn linearizable_barrier(&self, action: graph_authz::Action) -> Result<(), Status> {
         use crate::forward::{within, Forwarder, Route, FORWARD_UNARY_TIMEOUT};
         if self.raft.withhold_leader {
             self.raft.ensure_linearizable().await.map_err(status)?;
@@ -132,11 +137,9 @@ impl Ctx {
         let deadline = self
             .fwd
             .deadline(&tonic::metadata::MetadataMap::new(), FORWARD_UNARY_TIMEOUT);
-        // An in-process read (the MCP endpoint) has no client caller: the
-        // barrier asks for `read` only, explicitly.
-        let mut client = self
-            .fwd
-            .admin_client_as_node(&addr, crate::auth::Role::Read)?;
+        // The caller's role and token id travel as on any forward (the MCP
+        // endpoint runs its tool calls with the token as the caller).
+        let mut client = self.fwd.admin_client_for_read(&addr, action)?;
         let index = within(
             self.fwd.me(),
             deadline,
@@ -191,13 +194,28 @@ impl Ctx {
         T: Send + 'static,
         F: FnOnce(&dyn StoreRead) -> Result<T, StoreError> + Send + 'static,
     {
+        self.read_as(graph_authz::Action::Read, view, f).await
+    }
+
+    /// [`read`](Self::read) for a read of `action` (`search` for the two
+    /// search RPCs): the action its linearizable barrier carries.
+    pub async fn read_as<T, F>(
+        &self,
+        action: graph_authz::Action,
+        view: Option<graph_proto::pb::View>,
+        f: F,
+    ) -> Result<(T, ReadMeta), Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn StoreRead) -> Result<T, StoreError> + Send + 'static,
+    {
         let view = View::try_from(view)?;
         let slot = Arc::clone(&self.slot);
         match view {
             View::Local | View::Linearizable => {
                 let mut meta;
                 if view == View::Linearizable {
-                    self.linearizable_barrier().await?;
+                    self.linearizable_barrier(action).await?;
                     meta = self.raft.read_meta();
                     meta.stale_possible = false;
                 } else {

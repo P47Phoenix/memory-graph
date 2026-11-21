@@ -778,6 +778,11 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     // ADR 0013 PR 1: with a policy file, a tool call is decided for the
     // token before it runs (kept only then; nothing changes without one).
     let policy_headers = st.ctx.auth.policies_on().then(|| req.headers().clone());
+    // ADR 0013 PR 2: the tool's in-process service calls run with the token
+    // as their caller, so the Write service decides `index_path`/`prune` per
+    // repo, and a follower forwards the principal to the leader, exactly
+    // as for a gRPC call of that token. `None` with auth off.
+    let caller = st.ctx.auth.mcp_caller(req.headers());
     let session = req
         .headers()
         .get(SESSION_HEADER)
@@ -1011,20 +1016,17 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
         // `--mcp-max-inflight` bounds the blocking work.
         let _permit = permit;
         let _write_permit = write_permit;
-        // ADR 0013: this tool call was decided for its token above; its
-        // in-process service calls carry no caller, deliberately.
-        let _in_process = crate::auth::InProcessGuard::enter();
         if let Some(d) = delay {
             std::thread::sleep(d);
         }
-        let store = backend::InProcessStore::new(svc, rt.clone(), view);
+        let store = backend::InProcessStore::new(svc, rt.clone(), view).with_caller(caller.clone());
         let stale = store.stale_counter();
         let mut backend = StoreBackend::remote(
             Box::new(store),
             Box::new(move || stale.load(Ordering::SeqCst)),
         );
         if let Some(root) = index_root {
-            let writer = backend::InProcessWriter::new(write_svc, rt);
+            let writer = backend::InProcessWriter::new(write_svc, rt).with_caller(caller);
             match graph_mcp::WriteAccess::new(&root, Box::new(writer)) {
                 Ok(w) => backend = backend.with_writes(w.with_excluded(excluded)),
                 // The root was checked at start; if it is gone now, the

@@ -184,6 +184,9 @@ pub struct Caller {
     pub kind: CallerKind,
     /// The connection it arrived on.
     pub conn: u64,
+    /// The peer address, when known (the per-peer rate limit of audit
+    /// denial lines, ADR 0013 D9).
+    pub peer: Option<IpAddr>,
 }
 
 impl Caller {
@@ -840,8 +843,94 @@ pub fn policy_denied(action: graph_authz::Action) -> StoreError {
     StoreError::PermissionDenied {
         msg: format!("permission denied for action `{}`", action.name()),
         required_role: String::new(),
+        action: action.name().into(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Forwarded principals (ADR 0013 D7).
+
+/// The identity a forwarding node claims on a cluster-secret call, parsed
+/// strictly (with `--auth-policies` only; ADR 0012's lenient reading is
+/// unchanged without a policy file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forwarded {
+    /// `mg-forwarded-role`: the role the forwarding node granted.
+    pub role: Role,
+    /// `mg-forwarded-token-id`: looked up in the receiving node's own file.
+    pub token_id: String,
+    /// `mg-forwarded-action`: the read barrier's action (`read`/`search`).
+    pub action: Option<graph_authz::Action>,
+}
+
+/// Why a set of `mg-forwarded-*` headers was refused (for the audit line;
+/// never sent to the client, never a header value).
+pub type ForwardedRefusal = &'static str;
+
+/// Parse the `mg-forwarded-*` headers of a cluster-secret call (D7): each
+/// present exactly once (`mg-forwarded-action` is optional, but at most
+/// once), non-empty, printable ASCII, at most [`wire::FORWARDED_HEADER_MAX`]
+/// bytes; `mg-forwarded-by` a node id (digits), `mg-forwarded-role` `read`
+/// or `write`, `mg-forwarded-token-id` with no surrounding blanks (the
+/// token file's id syntax; it must then match an id exactly),
+/// `mg-forwarded-action` `read` or `search`. Anything else is refused,
+/// never read as another principal.
+pub fn parse_forwarded(headers: &http::HeaderMap) -> Result<Forwarded, ForwardedRefusal> {
+    fn one<'a>(
+        h: &'a http::HeaderMap,
+        name: &str,
+        required: bool,
+    ) -> Result<Option<&'a str>, ForwardedRefusal> {
+        let mut all = h.get_all(name).iter();
+        let Some(v) = all.next() else {
+            return if required {
+                Err("a forwarded header is missing")
+            } else {
+                Ok(None)
+            };
+        };
+        if all.next().is_some() {
+            return Err("a forwarded header is repeated");
+        }
+        let b = v.as_bytes();
+        if b.is_empty() {
+            return Err("a forwarded header is empty");
+        }
+        if b.len() > wire::FORWARDED_HEADER_MAX {
+            return Err("a forwarded header is too long");
+        }
+        if !b.iter().all(|c| (0x20..0x7f).contains(c)) {
+            return Err("a forwarded header is not printable ASCII");
+        }
+        Ok(std::str::from_utf8(b).ok())
+    }
+    let by = one(headers, crate::forward::FORWARDED_BY_HEADER, true)?.unwrap_or_default();
+    if !by.bytes().all(|c| c.is_ascii_digit()) {
+        return Err("mg-forwarded-by is not a node id");
+    }
+    let role = one(headers, wire::FORWARDED_ROLE_HEADER, true)?
+        .and_then(Role::parse)
+        .ok_or("mg-forwarded-role is not a role")?;
+    let token_id = one(headers, wire::FORWARDED_TOKEN_ID_HEADER, true)?.unwrap_or_default();
+    if token_id.trim() != token_id {
+        return Err("mg-forwarded-token-id is malformed");
+    }
+    let action = match one(headers, wire::FORWARDED_ACTION_HEADER, false)? {
+        None => None,
+        Some("read") => Some(graph_authz::Action::Read),
+        Some("search") => Some(graph_authz::Action::Search),
+        Some(_) => return Err("mg-forwarded-action is not read or search"),
+    };
+    Ok(Forwarded {
+        role,
+        token_id: token_id.to_string(),
+        action,
+    })
+}
+
+/// `Admin.ReadIndex`: standalone (`status`), or a read barrier with the
+/// `mg-forwarded-action` marker on a cluster-secret call (D7).
+const READ_INDEX: &str = "/memory_graph.v1.Admin/ReadIndex";
 
 #[cfg(unix)]
 fn warn_if_readable_by_others(what: &str, path: &Path) {
@@ -975,14 +1064,17 @@ impl Refusal {
             Reason::Role => StoreError::PermissionDenied {
                 msg: format!("this method needs the `{}` role", self.required.as_str()),
                 required_role: self.required.as_str().into(),
+                action: String::new(),
             },
             Reason::SecretDirect => StoreError::PermissionDenied {
                 msg: "the cluster secret is accepted here only on a forwarded call".into(),
                 required_role: self.required.as_str().into(),
+                action: String::new(),
             },
             Reason::Unlisted | Reason::InvalidOnOpen => StoreError::PermissionDenied {
                 msg: "this method is not in the server's role table".into(),
                 required_role: String::new(),
+                action: String::new(),
             },
         }
     }
@@ -1010,6 +1102,7 @@ pub struct Auth {
     refusals: [AtomicU64; REASONS.len()],
     limiter: Mutex<HashMap<Option<IpAddr>, (Instant, u64)>>,
     reload_lock: tokio::sync::Mutex<()>,
+    authz: AuthzStats,
 }
 
 impl std::fmt::Debug for Auth {
@@ -1030,6 +1123,7 @@ impl Auth {
             refusals: Default::default(),
             limiter: Mutex::default(),
             reload_lock: tokio::sync::Mutex::new(()),
+            authz: AuthzStats::default(),
         })
     }
 
@@ -1113,6 +1207,7 @@ impl Auth {
             refusals: Default::default(),
             limiter: Mutex::default(),
             reload_lock: tokio::sync::Mutex::new(()),
+            authz: AuthzStats::default(),
         }))
     }
 
@@ -1124,10 +1219,20 @@ impl Auth {
     /// Re-read both files now; returns what happened to (tokens, secret).
     /// A file that cannot be read or validated keeps the loaded set.
     pub fn reload_now(&self) -> (Option<Reload>, Option<Reload>) {
-        (
-            self.tokens.as_ref().map(Source::reload),
-            self.secret.as_ref().map(Source::reload),
-        )
+        let tokens = self.tokens.as_ref().map(Source::reload);
+        // `mg_authz_reload_total{result}` counts the token/policy pair only.
+        if self.policies_on() {
+            match tokens {
+                Some(Reload::Reloaded) => {
+                    self.authz.reloads[0].fetch_add(1, Ordering::Relaxed);
+                }
+                Some(Reload::Kept) => {
+                    self.authz.reloads[1].fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        (tokens, self.secret.as_ref().map(Source::reload))
     }
 
     /// The reloader: every [`RELOAD_POLL`] and on SIGHUP (Unix), until
@@ -1216,7 +1321,7 @@ impl Auth {
         action: graph_authz::Action,
         res: graph_authz::Resource<'_>,
     ) -> Result<(), StoreError> {
-        self.authorize_with(action, |set, p| set.decide(p, action, &res))
+        self.authorize_with(action, &res, |set, p| set.decide(p, action, &res))
     }
 
     /// An org-wide `prune` or `delete` (D6): on policy alone.
@@ -1225,12 +1330,14 @@ impl Auth {
         action: graph_authz::Action,
         org: &str,
     ) -> Result<(), StoreError> {
-        self.authorize_with(action, |set, p| set.decide_org_wide(p, action, org))
+        let res = graph_authz::Resource::Org(org);
+        self.authorize_with(action, &res, |set, p| set.decide_org_wide(p, action, org))
     }
 
     fn authorize_with(
         &self,
         action: graph_authz::Action,
+        res: &graph_authz::Resource<'_>,
         decide: impl FnOnce(
             &graph_authz::PolicySet,
             &graph_authz::Principal<'_>,
@@ -1250,19 +1357,281 @@ impl Auth {
                 Err(policy_denied(action))
             };
         };
-        let CallerKind::Token { id, .. } = &caller.kind else {
-            return Ok(());
-        };
-        let Some(e) = state.entry(id, SystemTime::now()) else {
-            return Err(StoreError::Unauthenticated(UNAUTHENTICATED_MSG.into()));
-        };
-        let d = decide(set, &principal_of(e));
-        audit(e, action, &d);
+        let (e, role) = self.principal_entry(&state, &caller, action)?;
+        let p = principal_with(e, role);
+        let d = self.decide_timed(|| decide(set, &p));
+        self.audit(e, &p, action, res, &d, caller.peer);
         if d.allowed {
             Ok(())
         } else {
             Err(policy_denied(action))
         }
+    }
+
+    /// The token entry and effective role a policy decision is made for
+    /// (ADR 0013 D7): a client token's own entry; on a forwarded call the
+    /// entry this node's token file has for `mg-forwarded-token-id` (an id
+    /// it does not know, or that has expired here, is denied), with the role
+    /// ceiling the intersection of this node's role for it and the
+    /// forwarded role. Re-read from the current pair on every check, so a
+    /// revocation or expiry takes effect at the next file of a stream.
+    fn principal_entry<'s>(
+        &self,
+        state: &'s AuthState,
+        caller: &Caller,
+        action: graph_authz::Action,
+    ) -> Result<(&'s TokenEntry, Role), StoreError> {
+        let now = SystemTime::now();
+        match &caller.kind {
+            CallerKind::Token { id, .. } => match state.entry(id, now) {
+                Some(e) => Ok((e, e.role)),
+                None => Err(StoreError::Unauthenticated(UNAUTHENTICATED_MSG.into())),
+            },
+            CallerKind::Node {
+                role: Some(r),
+                forwarded_token_id: Some(id),
+            } => match state.entry(id, now) {
+                Some(e) => Ok((e, e.role.min(*r))),
+                None => {
+                    self.count_decision(action, false);
+                    self.audit_unknown(action, caller.peer);
+                    Err(policy_denied(action))
+                }
+            },
+            // A node caller with no forwarded principal (the cluster secret
+            // alone), or an anonymous one: never a scoped action (D7).
+            _ => {
+                self.count_decision(action, false);
+                self.audit_unknown(action, caller.peer);
+                Err(policy_denied(action))
+            }
+        }
+    }
+
+    /// The leader side of a forwarded call with `--auth-policies` (ADR 0013
+    /// D7): strict header parsing, the principal from this node's own token
+    /// file (groups never travel), the role ceiling as the intersection,
+    /// and the cluster action decided here. The handler re-checks repo and
+    /// org writes with the same principal ([`Self::principal_entry`]).
+    #[allow(clippy::too_many_arguments)]
+    fn check_forwarded(
+        &self,
+        state: &AuthState,
+        set: &graph_authz::PolicySet,
+        path: &str,
+        headers: &http::HeaderMap,
+        need: Need,
+        peer: Option<IpAddr>,
+        now: SystemTime,
+    ) -> Result<CallerKind, Refusal> {
+        let deny = |a: Option<graph_authz::Action>| match a {
+            Some(a) => Refusal::policy(a),
+            None => Refusal::denied(Reason::Role, need),
+        };
+        let fwd = match parse_forwarded(headers) {
+            Ok(f) => f,
+            Err(why) => {
+                let a = method_action(path);
+                if let Some(a) = a {
+                    self.count_decision(a, false);
+                }
+                if self.audit_limited(peer) {
+                    tracing::info!(
+                        target: "mg::audit",
+                        action = a.map_or("", graph_authz::Action::name),
+                        decision = "deny",
+                        reason = why,
+                        "authz: forwarded headers refused"
+                    );
+                }
+                return Err(deny(a));
+            }
+        };
+        // `ReadIndex` with the marker is the barrier of a read: admitted for
+        // any principal whose role covers `read` (D1, D7), scoped by the
+        // read itself. Without it, standalone: `status`.
+        let (action, decide_here) = if path == READ_INDEX {
+            match fwd.action {
+                Some(a) => (Some(a), None),
+                None => (
+                    Some(graph_authz::Action::Status),
+                    Some(graph_authz::Action::Status),
+                ),
+            }
+        } else {
+            (method_action(path), cluster_action(path))
+        };
+        let Some(e) = state.entry(&fwd.token_id, now) else {
+            if let Some(a) = action {
+                self.count_decision(a, false);
+                self.audit_unknown(a, peer);
+            }
+            return Err(deny(action));
+        };
+        let role = e.role.min(fwd.role);
+        let required = if need == Need::Read {
+            Role::Read
+        } else {
+            Role::Write
+        };
+        if !role.covers(required) {
+            return Err(Refusal::denied(Reason::Role, need));
+        }
+        if let Some(a) = decide_here {
+            let p = principal_with(e, role);
+            let d = self.decide_timed(|| set.decide(&p, a, &graph_authz::Resource::Cluster));
+            self.audit(e, &p, a, &graph_authz::Resource::Cluster, &d, peer);
+            if !d.allowed {
+                return Err(Refusal::policy(a));
+            }
+        }
+        Ok(CallerKind::Node {
+            role: Some(role),
+            forwarded_token_id: Some(fwd.token_id),
+        })
+    }
+
+    /// Run one decision, timed into `mg_authz_decision_seconds` and counted
+    /// into `mg_authz_decisions_total`.
+    fn decide_timed(&self, f: impl FnOnce() -> graph_authz::Decision) -> graph_authz::Decision {
+        let t = Instant::now();
+        let d = f();
+        let secs = t.elapsed().as_secs_f64();
+        self.authz
+            .seconds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(secs);
+        if let Some(o) = self.authz.otlp.get() {
+            o.record_authz(secs);
+        }
+        d
+    }
+
+    fn count_decision(&self, action: graph_authz::Action, allowed: bool) {
+        self.authz.decisions[action as usize][usize::from(allowed)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether a denial line from `peer` may be logged now (ADR 0012's
+    /// per-peer window); suppressed lines are counted into the next one.
+    fn audit_limited(&self, peer: Option<IpAddr>) -> bool {
+        let now = Instant::now();
+        let mut g = self
+            .authz
+            .limiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if g.len() > 10_000 {
+            g.retain(|_, (at, _)| now.duration_since(*at) < REFUSAL_LOG_WINDOW);
+        }
+        match g.get_mut(&peer) {
+            Some((at, n)) if now.duration_since(*at) < REFUSAL_LOG_WINDOW => {
+                *n += 1;
+                false
+            }
+            Some(e) => {
+                *e = (now, 0);
+                true
+            }
+            None => {
+                g.insert(peer, (now, 0));
+                true
+            }
+        }
+    }
+
+    /// The audit line of a decision (D9, target `mg::audit`): token id,
+    /// groups, action, resource, decision and the matched `@id`s; never a
+    /// token, a digest or policy text. Denials at `info` (rate-limited per
+    /// peer), allowed writes and cluster actions at `info`, allowed reads at
+    /// `debug`. Also records `authz.action`/`authz.decision` on the current
+    /// span and counts the decision.
+    fn audit(
+        &self,
+        e: &TokenEntry,
+        p: &graph_authz::Principal<'_>,
+        action: graph_authz::Action,
+        res: &graph_authz::Resource<'_>,
+        d: &graph_authz::Decision,
+        peer: Option<IpAddr>,
+    ) {
+        use graph_authz::Action as A;
+        self.count_decision(action, d.allowed);
+        let decision = if d.allowed { "allow" } else { "deny" };
+        let span = tracing::Span::current();
+        span.record("authz.action", action.name());
+        span.record("authz.decision", decision);
+        let role = p.role.name();
+        if d.allowed && matches!(action, A::Read | A::Search) {
+            tracing::debug!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, role, action = action.name(), resource = %res, decision, matched = ?d.matched, "authz");
+        } else if d.allowed || self.audit_limited(peer) {
+            tracing::info!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, role, action = action.name(), resource = %res, decision, matched = ?d.matched, "authz");
+        }
+    }
+
+    /// The audit line of a forwarded call whose principal this node does
+    /// not know (D7): no token id is echoed (it came from the wire).
+    fn audit_unknown(&self, action: graph_authz::Action, peer: Option<IpAddr>) {
+        let span = tracing::Span::current();
+        span.record("authz.action", action.name());
+        span.record("authz.decision", "deny");
+        if self.audit_limited(peer) {
+            tracing::info!(
+                target: "mg::audit",
+                action = action.name(),
+                decision = "deny",
+                reason = "no known principal",
+                "authz"
+            );
+        }
+    }
+
+    /// `mg_authz_decisions_total{action,decision}`, every pair.
+    pub fn authz_decisions(&self) -> Vec<(&'static str, &'static str, u64)> {
+        let mut out = Vec::new();
+        for a in graph_authz::Action::ALL {
+            for (i, d) in ["deny", "allow"].iter().enumerate() {
+                out.push((
+                    a.name(),
+                    *d,
+                    self.authz.decisions[a as usize][i].load(Ordering::Relaxed),
+                ));
+            }
+        }
+        out
+    }
+
+    /// `mg_authz_policies`: policies in the loaded set (0 without
+    /// `--auth-policies`).
+    pub fn authz_policies(&self) -> u64 {
+        self.tokens
+            .as_ref()
+            .and_then(|s| s.cur.load().policies.as_ref().map(|p| p.len() as u64))
+            .unwrap_or(0)
+    }
+
+    /// `mg_authz_reload_total{result}`: `ok` (a new pair swapped in) and
+    /// `error` (a pair that failed to read or validate; the last good one
+    /// stays). Zero without `--auth-policies`.
+    pub fn authz_reloads(&self) -> [(&'static str, u64); 2] {
+        [
+            ("ok", self.authz.reloads[0].load(Ordering::Relaxed)),
+            ("error", self.authz.reloads[1].load(Ordering::Relaxed)),
+        ]
+    }
+
+    /// `mg_authz_decision_seconds`.
+    pub fn authz_seconds(&self) -> crate::observe::Histogram {
+        self.authz
+            .seconds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record `mg_authz_decision_seconds` over OTLP too (ADR 0009 D6).
+    pub fn set_otlp(&self, r: crate::telemetry::OtlpRecorders) {
+        let _ = self.authz.otlp.set(r);
     }
 
     /// The PR 1 interim read rule: whether the caller may run reads of
@@ -1281,31 +1650,54 @@ impl Auth {
         let Some(caller) = current_caller() else {
             return no_caller_allowed();
         };
-        let CallerKind::Token { id, .. } = &caller.kind else {
-            return true;
+        // A forwarded read (`ExtractorGaps`) is decided for the principal
+        // this node resolves (D7); the cluster secret alone reads nothing.
+        let Ok((e, role)) = self.principal_entry(&state, &caller, action) else {
+            return false;
         };
-        match state.entry(id, SystemTime::now()) {
-            Some(e) => {
-                let d = set.decide(&principal_of(e), action, &graph_authz::Resource::Cluster);
-                audit(e, action, &d);
-                d.allowed
-            }
-            None => false,
+        let p = principal_with(e, role);
+        let res = graph_authz::Resource::Cluster;
+        let d = self.decide_timed(|| set.decide(&p, action, &res));
+        self.audit(e, &p, action, &res, &d, caller.peer);
+        d.allowed
+    }
+
+    /// The caller of an MCP HTTP request, for its tool's in-process service
+    /// calls (ADR 0013 PR 2): the token in `headers` as a client-token
+    /// caller, so every policy check and every forward to the leader treat
+    /// the tool call exactly as a gRPC call of that token. `None` with auth
+    /// off or without a valid token (the endpoint answers 401 first).
+    pub fn mcp_caller(&self, headers: &http::HeaderMap) -> Option<Caller> {
+        let state = self.tokens.as_ref()?.cur.load();
+        let raw = headers
+            .get(http::header::AUTHORIZATION)
+            .map(|v| v.as_bytes());
+        match self.credential(raw, &state.tokens, None, SystemTime::now()) {
+            Cred::Token(e) => Some(Caller {
+                kind: CallerKind::Token {
+                    id: Arc::clone(&e.id),
+                    role: e.role,
+                },
+                conn: 0,
+                peer: None,
+            }),
+            _ => None,
         }
     }
 
-    /// With `--auth-policies`, decide an MCP tool call for the token in
-    /// `headers` (PR 1, fail closed): every tool is decided on
-    /// `Cluster::"this"` until the MCP tools are scoped (PR 2 writes, PR 3
-    /// reads). `None`: allowed, or policies off.
+    /// With `--auth-policies`, decide an MCP read tool call for the token in
+    /// `headers` under the PR 1 interim read rule (all or nothing, on
+    /// `Cluster::"this"`) until the read tools are scoped (PR 3). The write
+    /// tools (`index_path`, `prune`) are decided per repo by the Write
+    /// service they call, with the token as the caller (PR 2): `None` here.
+    /// `None`: allowed, or policies off.
     pub fn mcp_tool_denied(&self, headers: &http::HeaderMap, tool: &str) -> Option<StoreError> {
         use graph_authz::Action as A;
         let state = self.tokens.as_ref()?.cur.load();
         let set = state.policies.as_ref()?;
         let action = match tool {
             "search" | "find_symbols" => A::Search,
-            "index_path" => A::Index,
-            "prune" => A::Prune,
+            t if graph_mcp::is_write_tool(t) => return None,
             _ => A::Read,
         };
         let raw = headers
@@ -1314,8 +1706,10 @@ impl Auth {
         let Cred::Token(e) = self.credential(raw, &state.tokens, None, SystemTime::now()) else {
             return Some(StoreError::Unauthenticated(UNAUTHENTICATED_MSG.into()));
         };
-        let d = set.decide(&principal_of(e), action, &graph_authz::Resource::Cluster);
-        audit(e, action, &d);
+        let p = principal_of(e);
+        let res = graph_authz::Resource::Cluster;
+        let d = self.decide_timed(|| set.decide(&p, action, &res));
+        self.audit(e, &p, action, &res, &d, None);
         (!d.allowed).then(|| policy_denied(action))
     }
 
@@ -1354,10 +1748,23 @@ impl Auth {
         conn: u64,
         now: SystemTime,
     ) -> Result<Caller, Refusal> {
+        self.check_from(path, headers, conn, None, now)
+    }
+
+    /// [`check`](Self::check) for a call from `peer`.
+    pub fn check_from(
+        &self,
+        path: &str,
+        headers: &http::HeaderMap,
+        conn: u64,
+        peer: Option<IpAddr>,
+        now: SystemTime,
+    ) -> Result<Caller, Refusal> {
         let Some(tokens) = self.tokens.as_ref() else {
             return Ok(Caller {
                 kind: CallerKind::Anonymous,
                 conn,
+                peer,
             });
         };
         let Some(need) = need(path) else {
@@ -1370,7 +1777,7 @@ impl Auth {
             .get(http::header::AUTHORIZATION)
             .map(|v| v.as_bytes());
         let cred = self.credential(raw, &tokens.tokens, secret.as_ref().map(|s| &***s), now);
-        let caller = |kind| Caller { kind, conn };
+        let caller = |kind| Caller { kind, conn, peer };
         let header = |name: &str| {
             headers
                 .get(name)
@@ -1429,12 +1836,11 @@ impl Auth {
                         if let (Some(set), Some(action)) =
                             (tokens.policies.as_ref(), cluster_action(path))
                         {
-                            let d = set.decide(
-                                &principal_of(e),
-                                action,
-                                &graph_authz::Resource::Cluster,
-                            );
-                            audit(e, action, &d);
+                            let p = principal_of(e);
+                            let d = self.decide_timed(|| {
+                                set.decide(&p, action, &graph_authz::Resource::Cluster)
+                            });
+                            self.audit(e, &p, action, &graph_authz::Resource::Cluster, &d, peer);
                             if !d.allowed {
                                 return Err(Refusal::policy(action));
                             }
@@ -1445,13 +1851,28 @@ impl Auth {
                         }))
                     }
                     Cred::Token(_) => Err(Refusal::denied(Reason::Role, need)),
-                    Cred::Secret if need == Need::Read && secret_reads(path) => {
+                    // The join probes (no `mg-forwarded-by`). With a policy
+                    // file, a forwarded call is never one of them (D7).
+                    Cred::Secret
+                        if need == Need::Read
+                            && secret_reads(path)
+                            && !(tokens.policies.is_some()
+                                && headers.contains_key(crate::forward::FORWARDED_BY_HEADER)) =>
+                    {
                         Ok(caller(CallerKind::Node {
                             role: None,
                             forwarded_token_id: None,
                         }))
                     }
                     Cred::Secret => {
+                        if !headers.contains_key(crate::forward::FORWARDED_BY_HEADER) {
+                            return Err(Refusal::denied(Reason::SecretDirect, need));
+                        }
+                        if let Some(set) = tokens.policies.as_ref() {
+                            return self
+                                .check_forwarded(&tokens, set, path, headers, need, peer, now)
+                                .map(caller);
+                        }
                         if header(crate::forward::FORWARDED_BY_HEADER).is_none() {
                             return Err(Refusal::denied(Reason::SecretDirect, need));
                         }
@@ -1603,19 +2024,30 @@ fn principal_of(e: &TokenEntry) -> graph_authz::Principal<'_> {
     }
 }
 
-/// The audit line of a decision (D9, target `mg::audit`): denials at
-/// `info`, allowed writes and cluster actions at `info`, allowed reads at
-/// `debug`. Token id, groups, action, decision and the matched `@id`s;
-/// never a token, a digest or policy text. (The resource joins the line
-/// with per-request extraction, PR 2.)
-fn audit(e: &TokenEntry, action: graph_authz::Action, d: &graph_authz::Decision) {
-    use graph_authz::Action as A;
-    let decision = if d.allowed { "allow" } else { "deny" };
-    if d.allowed && matches!(action, A::Read | A::Search) {
-        tracing::debug!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, action = action.name(), decision, matched = ?d.matched, "authz");
-    } else {
-        tracing::info!(target: "mg::audit", token_id = %e.id, groups = ?e.groups, action = action.name(), decision, matched = ?d.matched, "authz");
+/// The principal of a token entry acting with `role` (its own role, or on
+/// a forwarded call the intersection with the forwarded role, D7).
+fn principal_with(e: &TokenEntry, role: Role) -> graph_authz::Principal<'_> {
+    graph_authz::Principal {
+        role: match role {
+            Role::Read => graph_authz::Role::Read,
+            Role::Write => graph_authz::Role::Write,
+        },
+        ..principal_of(e)
     }
+}
+
+/// The decision counters and timings behind the `mg_authz_*` metrics
+/// (ADR 0013 D9): no per-token, group, resource or policy label.
+#[derive(Default)]
+struct AuthzStats {
+    /// `[action][deny=0 | allow=1]`.
+    decisions: [[AtomicU64; 2]; 8],
+    /// `[ok, error]` reloads of the token/policy pair.
+    reloads: [AtomicU64; 2],
+    seconds: Mutex<crate::observe::Histogram>,
+    otlp: std::sync::OnceLock<crate::telemetry::OtlpRecorders>,
+    /// The per-peer window of audit denial lines.
+    limiter: Mutex<HashMap<Option<IpAddr>, (Instant, u64)>>,
 }
 
 /// Stamp the cluster secret (when this node has one) on outgoing metadata.
@@ -1722,10 +2154,11 @@ where
         }
         let conn = req.extensions().get::<ConnInfo>().cloned();
         let path = req.uri().path().to_string();
-        match self.auth.check(
+        match self.auth.check_from(
             &path,
             req.headers(),
             conn.as_ref().map_or(0, |c| c.id),
+            conn.as_ref().and_then(|c| c.peer).map(|p| p.ip()),
             SystemTime::now(),
         ) {
             Ok(caller) => {
