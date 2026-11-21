@@ -1076,7 +1076,7 @@ impl RaftNode {
                 return Ok((s.index, s.leader_id.term));
             }
             let now = self.snapshots.build_state();
-            if now.failed > before.failed && !now.running() {
+            if now.failed > before.failed {
                 return Err(build_failed_error(&self.disk, &now));
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1336,11 +1336,18 @@ async fn snapshot_policy(node: RaftNode, s: RaftSettings) {
             applied > snap.unwrap_or(0) && (since >= entries || bytes >= s.snapshot_log_bytes);
         if !due {
             // Nothing to retry (a snapshot arrived some other way).
+            if disk_refused {
+                node.snapshots.set_blocked(None);
+            }
             disk_refused = false;
         }
         if due && pending.is_none() && not_before.is_none() {
             match node.disk.check_snapshot() {
                 Ok(()) => {
+                    if disk_refused {
+                        // The postponement is over (space freed).
+                        node.snapshots.set_blocked(None);
+                    }
                     disk_refused = false;
                     tracing::info!(applied, since, bytes, "building a snapshot");
                     let builds = node.snapshots.build_state();

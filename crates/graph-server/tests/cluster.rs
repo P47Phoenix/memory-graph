@@ -2255,6 +2255,9 @@ fn a_snapshot_build_without_room_for_its_copy_is_postponed_with_the_guard_off() 
     poll_until("the postponed snapshot", || {
         node.metrics().snapshot.is_some()
     });
+    poll_until("the postponement cleared from status", || {
+        c.admin_status().unwrap().snapshot_blocked.is_empty()
+    });
 }
 
 /// Review of #333: `cluster snapshot` (`snapshot_now`) checks for room for
@@ -2368,6 +2371,7 @@ fn health_answers_not_serving_during_the_start_up_compaction() {
         c.raft = Some(recovery_raft());
     });
     let endpoint = tb.node(1).endpoint();
+    let same_port = endpoint.clone();
     tb.node_mut(1).stop();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -2399,8 +2403,11 @@ fn health_answers_not_serving_during_the_start_up_compaction() {
         assert_eq!(r, Ok(false), "{service:?}: NOT_SERVING");
         assert!(took < Duration::from_secs(2), "{service:?} took {took:?}");
     }
+    // The same port, now the real server: SERVING.
+    assert_eq!(tb.node(1).endpoint(), same_port);
     assert!(
-        graph_client::probe_health(&tb.node(1).endpoint(), "", Duration::from_secs(2)).unwrap()
+        graph_client::probe_health(&same_port, "", Duration::from_secs(2)).unwrap(),
+        "SERVING after the hand-back"
     );
     let f = small_file(1);
     tb.client(1)

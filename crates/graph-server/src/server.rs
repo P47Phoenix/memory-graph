@@ -1450,6 +1450,9 @@ async fn compact_log_at_start(
     if let Err(e) = done {
         tracing::warn!(error = %e, "start-up compaction task failed");
     }
+    // Hand-back: up to 16 connections accepted but not yet served (queued
+    // in the channel) are reset here. Accepted: they are probes or clients
+    // that retry, and the window is a moment at the end of the start-up.
     accept.abort();
     let _ = accept.await;
     let _ = stop_tx.send(());
