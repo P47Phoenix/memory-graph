@@ -3640,6 +3640,12 @@ pub struct StatusResponse {
     pub disk_stalled: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "35")]
     pub disk_stall_message: ::prost::alloc::string::String,
+    /// ADR 0013 D2: SHA-256 (hex) of this node's normalised policy set, its
+    /// --auth-builtins switch and its token file's ids, roles and groups
+    /// (never a token digest), so an operator sees which nodes differ. Empty:
+    /// no --auth-policies (or the server predates the field).
+    #[prost(string, tag = "36")]
+    pub policy_hash: ::prost::alloc::string::String,
 }
 /// This node's snapshot backups since it started.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

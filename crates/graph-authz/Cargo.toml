@@ -1,0 +1,11 @@
+[package]
+name = "graph-authz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The policy language of ADR 0013: a strict Cedar subset (scope-only), its parser, printer and evaluator. No dependencies."
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true

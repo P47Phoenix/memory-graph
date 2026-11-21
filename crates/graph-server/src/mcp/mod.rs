@@ -775,6 +775,9 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
     } else {
         None
     };
+    // ADR 0013 PR 1: with a policy file, a tool call is decided for the
+    // token before it runs (kept only then; nothing changes without one).
+    let policy_headers = st.ctx.auth.policies_on().then(|| req.headers().clone());
     let session = req
         .headers()
         .get(SESSION_HEADER)
@@ -913,6 +916,33 @@ async fn handle(State(st): State<Arc<McpState>>, req: Request) -> Response {
                     need.as_str()
                 ),
             );
+        }
+    }
+    if let (Some(h), Some(n)) = (
+        policy_headers.as_ref(),
+        parsed
+            .as_ref()
+            .filter(|_| tool.is_some())
+            .and_then(|v| v.pointer("/params/name"))
+            .and_then(Value::as_str),
+    ) {
+        if let Some(e) = st.ctx.auth.mcp_tool_denied(h, n) {
+            // D9: a policy refusal is an `isError` tool result, HTTP 200.
+            if let Some(t) = &tool {
+                st.ctx.raft.obs.observe_mcp_call(t, "error");
+            }
+            let body = graph_mcp::tools::error_body(&graph_mcp::ToolError::Store(e))
+                .expect("a store error has a body");
+            let id = parsed.as_ref().and_then(|v| v.get("id")).cloned();
+            let reply = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": body.to_string() }],
+                    "isError": true
+                }
+            });
+            return json_reply(StatusCode::OK, reply.to_string());
         }
     }
     // Taken only now: a request with a bad session gets its own error.

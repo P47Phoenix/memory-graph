@@ -18,6 +18,8 @@ cargo test -p graph-cli --test corpus                      # public-repo corpus 
 cargo test -p graph-cli --test e2e                          # CLI end-to-end tests
 cargo test -p graph-cli --test serve_e2e                    # memory-graph serve + --server end to end (real binary, free port)
 cargo test -p graph-client --test conformance               # run_all / run_differential against RemoteStore over an in-process server
+cargo test -p graph-authz                                  # policy parser/evaluator, D2 edge cases, fuzz, the policies-visited gate, oracle replay fixtures
+cargo test -p graph-server --test authz                     # ADR 0013 PR 1: write/cluster enforcement, interim reads, paired reload, MCP
 cargo test -p graph-mcp                                    # MCP protocol, proptest over request bytes, tool differential vs StoreRead (embedded + RemoteStore)
 cargo test -p graph-cli --test mcp_e2e                      # memory-graph mcp over stdio with the real binary (--db and --server) on the corpus
 cargo test -p graph-cli --test mcp_rmcp_e2e                 # a real MCP client (rmcp, dev-dependency only, no TLS) over stdio and serve --mcp-listen
@@ -68,6 +70,7 @@ CI (`.github/workflows/ci.yml`) runs all of the above (fmt, clippy, `cargo test 
   - `testing::TestServer` is an in-process server for other crates' tests, and `testing::ClusterTestbed` is n in-process nodes with stop, kill, restart and fault injection.
 - **graph-client**: `RemoteStore`, a `Store` + `StoreRead` over gRPC with a synchronous facade (it owns a small tokio runtime and panics if called from inside one), retries, read modes and snapshot paging.
 - **graph-mcp**: MCP (ADR 0005) as a library, hand-rolled on `serde_json` with no SDK: `McpServer` (JSON-RPC 2.0 framing, the lifecycle with version negotiation, `tools/list`, `tools/call`), the seven read-only tools with input/output schemas (`tools.rs`), `StoreBackend` answering them from any `StoreRead`, `serve_stdio`, and a small JSON Schema checker for tests (`schema.rs`). Depends on graph-store types only. `memory-graph mcp` (graph-cli) is the stdio transport; see `docs/mcp.md`.
+- **graph-authz**: the policy language of ADR 0013, with no dependencies: a strict scope-only Cedar subset (`parse`, a printer, `PolicySet::decide` over per-principal buckets with a policies-visited counter, the org-wide prune/delete rule, the PR 1 interim read rule). graph-server pairs it with the token file (`--auth-policies`, `--auth-builtins`, one reload); `memory-graph auth check` validates a pair. `tools/authz-oracle` (outside the workspace, its own lockfile, like xtask) compares its decisions with `cedar-policy` in the `authz oracle` workflow; disagreements become replay fixtures under `testdata/authz/`.
 - **graph-cli**: the `memory-graph` binary. `lib.rs` holds the testable logic (`index_dir`, etc.); `target.rs` resolves `--db` / `--server` / env into a `Target`, opens it (embedded with a lock retry, or a `RemoteStore`) and maps errors to exit codes; `main.rs` is argument parsing (clap) and wiring. That includes:
   - `serve`: `--db`, or `--data-dir` with `--bootstrap`, `--restore`, `--join <peer>` (`--auto-promote` / `--standby`, `--accept-snapshot-overwrite`, `--join-timeout`), `--node-id`, `--advertise`, the snapshot, log and election knobs, and `--min-free-disk`;
   - `health`;

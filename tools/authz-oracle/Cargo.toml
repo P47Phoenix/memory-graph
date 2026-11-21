@@ -1,0 +1,15 @@
+[package]
+name = "authz-oracle"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Dev-only (ADR 0013 story 72a): compares graph-authz decisions with cedar-policy on generated requests. Outside the workspace and the pure-Rust gate."
+
+# Its own workspace and lockfile: `cedar-policy` (which needs `stacker`/`psm`,
+# C build scripts) never reaches the root Cargo.lock or the shipped binary.
+[workspace]
+
+[dependencies]
+graph-authz = { path = "../../crates/graph-authz" }
+cedar-policy = "4"

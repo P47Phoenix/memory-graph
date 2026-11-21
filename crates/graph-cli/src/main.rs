@@ -190,6 +190,35 @@ enum AuthCmd {
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
+    /// Validate a token file and a policy file as the pair `serve --auth-tokens --auth-policies`
+    /// would load (ADR 0013), offline: exit 0 and the policy_hash when valid (warnings on
+    /// stderr), exit 1 naming the line and @id when not. With --explain, also print the
+    /// decision and the matching policy @ids for one request
+    Check {
+        /// The token file (`--auth-tokens`)
+        #[arg(long, value_name = "FILE")]
+        tokens: PathBuf,
+        /// The policy file (`--auth-policies`)
+        #[arg(long, value_name = "FILE")]
+        policies: PathBuf,
+        /// As `serve --auth-builtins`: also load the built-in role policies
+        #[arg(long)]
+        builtins: bool,
+        /// A request to decide: a token id, an action (read, search, index, prune, delete,
+        /// snapshot, status, admin) and a resource (`Org::"o"`, `Repo::"o/r"` or
+        /// `Cluster::"this"`)
+        #[arg(long, num_args = 3, value_names = ["TOKEN_ID", "ACTION", "RESOURCE"])]
+        explain: Option<Vec<String>>,
+    },
+}
+
+/// `cluster status --json` with `policy_hash` added only when the node has
+/// a policy file, so the output without one is unchanged.
+fn with_policy_hash(mut v: serde_json::Value, hash: &str) -> serde_json::Value {
+    if !hash.is_empty() {
+        v["policy_hash"] = hash.into();
+    }
+    v
 }
 
 /// `memory-graph auth ...`.
@@ -227,6 +256,29 @@ fn auth_cmd(cmd: &AuthCmd) -> Result<i32> {
                 None => out!("{}", *s),
             }
             Ok(0)
+        }
+        AuthCmd::Check {
+            tokens,
+            policies,
+            builtins,
+            explain,
+        } => {
+            let r = graph_cli::auth_cmd::check(tokens, policies, *builtins, explain.as_deref())?;
+            for w in &r.warnings {
+                eprintln!("warning: {w}");
+            }
+            match r.error {
+                Some(e) => {
+                    eprintln!("error: {e}");
+                    Ok(1)
+                }
+                None => {
+                    for l in &r.lines {
+                        out!("{l}");
+                    }
+                    Ok(0)
+                }
+            }
         }
     }
 }
@@ -561,6 +613,18 @@ enum Cmd {
         /// (current, then next) during a rotation. The same file on every node
         #[arg(long, value_name = "FILE", requires = "auth_tokens")]
         cluster_secret_file: Option<PathBuf>,
+        /// With --auth-tokens: per-org/repo permissions as policies (ADR 0013), a scope-only
+        /// subset of Cedar, conventionally `policies.cedar` next to the token file. Validated
+        /// with the token file and reloaded with it as one pair (a bad pair keeps the last good
+        /// one). Without --auth-builtins nothing is allowed that a policy does not permit. In
+        /// this version read/search policies must not constrain `resource`, and every node of a
+        /// cluster must run the same policy file (`memory-graph auth check` validates a pair)
+        #[arg(long, value_name = "FILE", requires = "auth_tokens")]
+        auth_policies: Option<PathBuf>,
+        /// With --auth-policies: also load the two built-in role policies (a `read` token reads,
+        /// searches and sees status everywhere; a `write` token may do anything)
+        #[arg(long, requires = "auth_policies")]
+        auth_builtins: bool,
         /// With --auth-tokens: allow --listen, --advertise, --mcp-listen and --metrics-listen on
         /// addresses other than loopback. This server has no TLS: tokens, the cluster secret and
         /// all data then cross the network in clear text unless a TLS-terminating proxy or a
@@ -1379,6 +1443,8 @@ fn run() -> Result<i32> {
         mcp_allow_remote,
         auth_tokens,
         cluster_secret_file,
+        auth_policies,
+        auth_builtins,
         insecure_transport,
         mcp_allow_origin,
         mcp_read,
@@ -1686,6 +1752,8 @@ fn run() -> Result<i32> {
         cfg.auth = graph_server::AuthConfig {
             tokens: auth_tokens.clone(),
             cluster_secret: cluster_secret_file.clone(),
+            policies: auth_policies.clone(),
+            builtins: *auth_builtins,
         };
         cfg.insecure_transport = *insecure_transport;
         cfg.snapshot_max_age = *snapshot_max_age;
@@ -1936,61 +2004,64 @@ fn run() -> Result<i32> {
                     if json {
                         out!(
                             "{}",
-                            serde_json::to_string(&serde_json::json!({
-                                "server": addr,
-                                "node_id": st.node_id,
-                                "cluster_id": st.cluster_id,
-                                "state": st.state,
-                                "leader_id": st.leader_id,
-                                "leader_addr": st.leader_addr,
-                                "current_term": st.current_term,
-                                "applied_index": st.applied_index,
-                                "applied_term": st.applied_term,
-                                "committed_index": st.committed_index,
-                                "last_log_index": st.last_log_index,
-                                "server_version": st.server_version,
-                                "protocol_version": st.protocol_version,
-                                "store_format_version": st.store_format_version,
-                                "extractors_hash": st.extractors_hash,
-                                "db_path": st.db_path,
-                                "listen_addr": st.listen_addr,
-                                "uptime_secs": st.uptime_secs,
-                                "snapshot_handles": st.snapshot_handles,
-                                "role": st.role,
-                                "advertise": st.advertise,
-                                "data_dir": st.data_dir,
-                                "snapshot_index": st.snapshot_index,
-                                "purged_index": st.purged_index,
-                                "log_bytes": st.log_bytes,
-                                "store_bytes": st.store_bytes,
-                                "writes_forwarded_total": st.writes_forwarded_total,
-                                "rpcs_total": st.rpcs_total,
-                                "entries_applied_total": st.entries_applied_total,
-                                "mcp_addr": st.mcp_addr,
-                                "disk_stalled": st.disk_stalled,
-                                "disk_stall_message": st.disk_stall_message,
-                                "members": st.members.iter().map(|m| serde_json::json!({
-                                    "node_id": m.node_id,
-                                    "addr": m.addr,
-                                    "role": m.role,
-                                    "extractors_hash": m.extractors_hash,
-                                })).collect::<Vec<_>>(),
-                                "replication": st.replication.iter().map(|p| serde_json::json!({
-                                    "node_id": p.node_id,
-                                    "matched_index": p.matched_index,
-                                    "lag": p.lag,
-                                    "last_error": p.last_error,
-                                })).collect::<Vec<_>>(),
-                                "backup": st.backup.as_ref().map(|b| serde_json::json!({
-                                    "url": b.url,
-                                    "on": b.on,
-                                    "last_index": b.last_index,
-                                    "last_success_unix": b.last_success_unix,
-                                    "failures_total": b.failures_total,
-                                    "bytes_total": b.bytes_total,
-                                    "last_backup_error": b.last_backup_error,
-                                })),
-                            }))?
+                            serde_json::to_string(&with_policy_hash(
+                                serde_json::json!({
+                                    "server": addr,
+                                    "node_id": st.node_id,
+                                    "cluster_id": st.cluster_id,
+                                    "state": st.state,
+                                    "leader_id": st.leader_id,
+                                    "leader_addr": st.leader_addr,
+                                    "current_term": st.current_term,
+                                    "applied_index": st.applied_index,
+                                    "applied_term": st.applied_term,
+                                    "committed_index": st.committed_index,
+                                    "last_log_index": st.last_log_index,
+                                    "server_version": st.server_version,
+                                    "protocol_version": st.protocol_version,
+                                    "store_format_version": st.store_format_version,
+                                    "extractors_hash": st.extractors_hash,
+                                    "db_path": st.db_path,
+                                    "listen_addr": st.listen_addr,
+                                    "uptime_secs": st.uptime_secs,
+                                    "snapshot_handles": st.snapshot_handles,
+                                    "role": st.role,
+                                    "advertise": st.advertise,
+                                    "data_dir": st.data_dir,
+                                    "snapshot_index": st.snapshot_index,
+                                    "purged_index": st.purged_index,
+                                    "log_bytes": st.log_bytes,
+                                    "store_bytes": st.store_bytes,
+                                    "writes_forwarded_total": st.writes_forwarded_total,
+                                    "rpcs_total": st.rpcs_total,
+                                    "entries_applied_total": st.entries_applied_total,
+                                    "mcp_addr": st.mcp_addr,
+                                    "disk_stalled": st.disk_stalled,
+                                    "disk_stall_message": st.disk_stall_message,
+                                    "members": st.members.iter().map(|m| serde_json::json!({
+                                        "node_id": m.node_id,
+                                        "addr": m.addr,
+                                        "role": m.role,
+                                        "extractors_hash": m.extractors_hash,
+                                    })).collect::<Vec<_>>(),
+                                    "replication": st.replication.iter().map(|p| serde_json::json!({
+                                        "node_id": p.node_id,
+                                        "matched_index": p.matched_index,
+                                        "lag": p.lag,
+                                        "last_error": p.last_error,
+                                    })).collect::<Vec<_>>(),
+                                    "backup": st.backup.as_ref().map(|b| serde_json::json!({
+                                        "url": b.url,
+                                        "on": b.on,
+                                        "last_index": b.last_index,
+                                        "last_success_unix": b.last_success_unix,
+                                        "failures_total": b.failures_total,
+                                        "bytes_total": b.bytes_total,
+                                        "last_backup_error": b.last_backup_error,
+                                    })),
+                                }),
+                                &st.policy_hash
+                            ))?
                         );
                     } else {
                         out!("{}", server_header(&addr, &st));
@@ -2064,6 +2135,9 @@ fn run() -> Result<i32> {
                             st.store_format_version,
                             st.extractors_hash
                         );
+                        if !st.policy_hash.is_empty() {
+                            out!("  policies  {} (ADR 0013 policy_hash)", st.policy_hash);
+                        }
                         out!(
                             "  store     {} (up {}s, {} snapshot handles)",
                             st.db_path,
